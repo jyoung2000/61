@@ -16,3 +16,6 @@ tests/real_content/*.mkv
 tests/real_content/*.webm
 tests/real_content/extraction_cache/
 tests/real_content/ground_truth/
+
+# Vendored VideoLLaMA2 source (cloned at Docker build with ENABLE_VIDEOLLAMA2=1)
+backend/services/VideoLLaMA2/

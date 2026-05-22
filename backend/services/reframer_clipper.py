@@ -405,12 +405,21 @@ class VideoLLaMA2Discovery:
         self._loaded = False
 
     def is_available(self) -> bool:
-        """Check if videollama2 package is importable."""
-        try:
-            import videollama2
+        """Check if the videollama2 package can be imported.
+
+        Detects both a pip-installed package and a repo vendored at
+        backend/services/VideoLLaMA2/ (added to sys.path on demand).
+        Uses find_spec so the heavy package is not actually imported here.
+        """
+        import importlib.util
+        if importlib.util.find_spec("videollama2") is not None:
             return True
-        except ImportError:
-            return False
+        vl2_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "VideoLLaMA2")
+        if os.path.isdir(os.path.join(vl2_dir, "videollama2")):
+            if vl2_dir not in sys.path:
+                sys.path.insert(0, vl2_dir)
+            return importlib.util.find_spec("videollama2") is not None
+        return False
 
     def load(self):
         """Load model with INT8 quantization for RTX 4070."""

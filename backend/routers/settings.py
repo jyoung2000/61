@@ -459,17 +459,44 @@ def _key_is_set(key: str) -> bool:
 
 
 def _check_videollama2_available() -> bool:
-    """True only when VideoLLaMA2 is installed and the GPU has the VRAM for it."""
+    """True when VideoLLaMA2 can actually run, and logs why when it can't.
+
+    Requires a CUDA GPU with ~10GB free VRAM and the ``videollama2`` package
+    importable — either pip-installed or vendored at
+    backend/services/VideoLLaMA2/. ``find_spec`` is used so the heavy package
+    is not imported just to render the settings page.
+    """
     try:
         import torch
         if not torch.cuda.is_available():
+            logger.info("VideoLLaMA2 check: no CUDA GPU available")
             return False
         free_mb = torch.cuda.mem_get_info()[0] / 1024 / 1024
         if free_mb < 9000:  # VideoLLaMA2.1-7B-AV (int8) needs ~10GB
+            logger.info(
+                "VideoLLaMA2 check: only %.0f MB VRAM free (need ~9000) — "
+                "free GPU memory or stop other models", free_mb,
+            )
             return False
-        import videollama2  # noqa: F401
+        import importlib.util
+        import os as _os
+        import sys as _sys
+        if importlib.util.find_spec("videollama2") is None:
+            vl2_dir = _os.path.join(
+                _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+                "services", "VideoLLaMA2",
+            )
+            if _os.path.isdir(_os.path.join(vl2_dir, "videollama2")) and vl2_dir not in _sys.path:
+                _sys.path.insert(0, vl2_dir)
+            if importlib.util.find_spec("videollama2") is None:
+                logger.info(
+                    "VideoLLaMA2 check: 'videollama2' package not installed — "
+                    "rebuild the image with --build-arg ENABLE_VIDEOLLAMA2=1"
+                )
+                return False
         return True
-    except Exception:
+    except Exception as e:
+        logger.info("VideoLLaMA2 check failed: %s", e)
         return False
 
 

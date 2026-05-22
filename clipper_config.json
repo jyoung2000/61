@@ -1,5 +1,5 @@
 {
-  "videollama2_enabled": false,
+  "videollama2_enabled": true,
   "videollama2_model": "DAMO-NLP-SG/VideoLLaMA2.1-7B-AV",
   "videollama2_quantize": "int8",
   "chunk_duration_s": 600,
