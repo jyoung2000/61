@@ -322,6 +322,33 @@ def to_fez_scenes(perception, reframer_plan, video_path: str, frames_dir: str) -
     return out
 
 
+def to_fez_subject_track(perception, reframer_plan) -> list:
+    """Dense subject-position track for the NLE crop editor.
+
+    One sample per reframer crop keyframe: ``{t, x, source}`` where ``x``
+    is the crop-window centre as a 0-100 percent of source width — the
+    same encoding as ``SceneDescription.subject_x`` so the editor's dense
+    and per-scene crop paths agree.
+    """
+    src_w = max(1, _to_int(getattr(perception, "src_w", 0) or getattr(reframer_plan, "source_width", 1920)))
+    src_h = max(1, _to_int(getattr(perception, "src_h", 0) or getattr(reframer_plan, "source_height", 1080)))
+    crop_w = max(2, min(_to_int(getattr(reframer_plan, "crop_w", 0)) or int(src_h * 9 / 16), src_w))
+    keyframes = sorted(
+        (getattr(reframer_plan, "keyframes", None) or []),
+        key=lambda k: k.get("time_ms", 0),
+    )
+    track = []
+    for kf in keyframes:
+        kf_x = _to_int(kf.get("x", (src_w - crop_w) // 2))
+        center_pct = _clamp((kf_x + crop_w / 2) / src_w * 100.0, 0, 100)
+        track.append({
+            "t": round(_to_int(kf.get("time_ms", 0)) / 1000.0, 3),
+            "x": round(center_pct, 2),
+            "source": "reframer",
+        })
+    return track
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  Function 3 — reframer transcript segments  →  Fez TranscriptSegment dicts
 # ═══════════════════════════════════════════════════════════════════════════

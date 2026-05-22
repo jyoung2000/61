@@ -1262,6 +1262,7 @@ async def _run_analysis_inner(job_id: str):
     from backend.services.reframer_engine import ReframeEngine
     from backend.services.reframer_bridge import (
         to_fez_render_plan, to_fez_scenes, to_fez_transcript, to_fez_clips,
+        to_fez_subject_track,
     )
 
     _log_gpu_memory(job_id, "pre-reframer")
@@ -1365,6 +1366,7 @@ async def _run_analysis_inner(job_id: str):
             perception.transcript_segments,
             getattr(perception, "speaker_timeline", None),
         )
+        subject_track = to_fez_subject_track(perception, reframer_plan)
 
     # JobResult has no render_plan field, so persist the plan as a sidecar
     # JSON the /api/jobs/{id}/render_plan endpoint can serve to the NLE editor.
@@ -1383,6 +1385,7 @@ async def _run_analysis_inner(job_id: str):
         job_id,
         scenes=scenes,
         transcript=transcript,
+        subject_track=subject_track,
         speaker_names=speaker_names,
         language=getattr(perception, "detected_language", "") or "",
         default_layout_mode="single",
