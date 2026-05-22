@@ -1454,7 +1454,9 @@ async def _run_analysis_inner(job_id: str):
             # clipper_config.json file — overlay it so the clipper sees it.
             clipper_config.replicate_api_key = settings.REPLICATE_API_KEY
             clipper_config.replicate_model = settings.REPLICATE_MODEL
-            clipper_config.replicate_enabled = settings.REPLICATE_ENABLED
+            clipper_config.replicate_enabled = (
+                settings.REPLICATE_ENABLED
+                and settings.resolve_ai_source("clip") == "cloud")
             # Clip-generation defaults from Settings > Clip Generation.
             if settings.CLIP_MIN_DURATION:
                 clipper_config.min_duration_s = settings.CLIP_MIN_DURATION

@@ -6,6 +6,7 @@ import CostTracker from '../components/CostTracker';
 import CloudStorageSection from '../components/cloud/CloudStorageSection';
 import UserManagementPanel from '../components/UserManagementPanel';
 import ClipGenerationSettings from '../components/ClipGenerationSettings';
+import SelfHostedSettings from '../components/SelfHostedSettings';
 import { useAuth } from '../auth/AuthContext';
 import { showToast } from '../components/Toast';
 import useResponsive from '../hooks/useResponsive';
@@ -1781,6 +1782,8 @@ export default function Settings() {
                   )}
                 </div>
               </div>
+
+              <SelfHostedSettings />
 
               <ClipGenerationSettings />
 

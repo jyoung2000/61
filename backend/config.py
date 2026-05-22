@@ -103,6 +103,13 @@ class Settings(BaseSettings):
     CLIP_PREFERRED_SUBJECTS: str = ""  # topics to prioritize, comma-separated
     CLIP_AVOID_SUBJECTS: str = ""      # topics to skip, comma-separated
     CLIP_DISCOVERY_PROMPT: str = ""    # custom VideoLLaMA3 prompt; "" = built-in default
+
+    # ── Self-hosted mode — route the analysis pipeline to local AI ──
+    # The master toggle flips every "auto" engine local; a per-engine
+    # override ("local" / "cloud") wins over the master when set.
+    SELF_HOSTED_MODE: bool = False
+    CLIP_ENGINE_SOURCE: str = "auto"    # auto | local | cloud
+    EDITORIAL_AI_SOURCE: str = "auto"   # auto | local | cloud
     # Adaptive frame extraction
     MIN_FRAMES: int = 30               # minimum for any video
     FRAMES_PER_MINUTE: float = 6       # target density (first 30 min; diminishes for longer videos)
@@ -164,7 +171,21 @@ class Settings(BaseSettings):
 
     @property
     def active_provider_chain(self) -> list[str]:
+        # Self-hosted mode routes every editorial LLM task to local Ollama.
+        if self.resolve_ai_source("editorial") == "local":
+            return ["ollama"]
         return [p.strip() for p in self.AI_FALLBACK_CHAIN.split(",") if p.strip()]
+
+    def resolve_ai_source(self, engine: str) -> str:
+        """Return 'local' or 'cloud' for an engine ('clip' | 'editorial'),
+        honoring its per-engine override or, when 'auto', SELF_HOSTED_MODE."""
+        override = {
+            "clip": self.CLIP_ENGINE_SOURCE,
+            "editorial": self.EDITORIAL_AI_SOURCE,
+        }.get(engine, "auto")
+        if override in ("local", "cloud"):
+            return override
+        return "local" if self.SELF_HOSTED_MODE else "cloud"
 
     class Config:
         env_file = ".env"

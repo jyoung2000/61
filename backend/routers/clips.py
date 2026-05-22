@@ -1054,7 +1054,8 @@ async def generate_clips_endpoint(
 
             heartbeat_task = asyncio.create_task(_heartbeat())
             try:
-                if settings.REPLICATE_ENABLED and settings.REPLICATE_API_KEY:
+                if (settings.REPLICATE_ENABLED and settings.REPLICATE_API_KEY
+                        and settings.resolve_ai_source("clip") == "cloud"):
                     # VideoLLaMA3 (Replicate) re-discovery — watches the
                     # video and honors the user's length / count / focus.
                     _discovery = _discover_clips_videollama3(

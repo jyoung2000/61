@@ -55,6 +55,7 @@ _PERSISTABLE_KEYS = [
     "WHISPER_VAD_FILTER", "FRAME_SAMPLE_RATE", "SUBJECT_TRACKING_ENABLED",
     "CLIP_MIN_DURATION", "CLIP_MAX_DURATION", "CLIP_COUNT",
     "CLIP_PREFERRED_SUBJECTS", "CLIP_AVOID_SUBJECTS", "CLIP_DISCOVERY_PROMPT",
+    "SELF_HOSTED_MODE", "CLIP_ENGINE_SOURCE", "EDITORIAL_AI_SOURCE",
     "FFMPEG_PRESET", "FFMPEG_CRF", "FFMPEG_THREADS", "FFMPEG_FASTSTART",
     "GPU_ACCELERATION_ENABLED", "GPU_VENDOR_OVERRIDE",
     "GPU_HWDECODE_ENABLED", "GPU_HEVC_FOR_4K", "GPU_DEVICE_INDEX",
@@ -2156,6 +2157,50 @@ async def save_clip_generation_settings(req: SaveClipGenerationRequest):
     _invalidate_status_cache()
     _persist_user_settings()
     return {"status": "saved", **_clip_generation_state()}
+
+
+# ── Self-Hosted Mode (route the analysis pipeline to local AI) ────
+
+class SaveSelfHostedRequest(BaseModel):
+    self_hosted_mode: Optional[bool] = None
+    clip_engine_source: Optional[str] = None     # auto | local | cloud
+    editorial_ai_source: Optional[str] = None    # auto | local | cloud
+
+
+def _self_hosted_state() -> dict:
+    """Current self-hosted settings plus each engine's resolved source."""
+    return {
+        "self_hosted_mode": settings.SELF_HOSTED_MODE,
+        "clip_engine_source": settings.CLIP_ENGINE_SOURCE,
+        "editorial_ai_source": settings.EDITORIAL_AI_SOURCE,
+        "resolved": {
+            "clip_engine": settings.resolve_ai_source("clip"),
+            "editorial_ai": settings.resolve_ai_source("editorial"),
+        },
+        "ollama_host": getattr(settings, "OLLAMA_HOST", "") or "",
+    }
+
+
+@router.get("/self-hosted/settings")
+async def get_self_hosted_settings():
+    """Self-hosted-mode settings + the resolved local/cloud source per engine."""
+    return _self_hosted_state()
+
+
+@router.post("/self-hosted/settings")
+async def save_self_hosted_settings(req: SaveSelfHostedRequest):
+    """Save self-hosted-mode settings. Routing is read live via
+    settings.resolve_ai_source(), so no restart is needed."""
+    _allowed = {"auto", "local", "cloud"}
+    if req.self_hosted_mode is not None:
+        settings.SELF_HOSTED_MODE = bool(req.self_hosted_mode)
+    if req.clip_engine_source in _allowed:
+        settings.CLIP_ENGINE_SOURCE = req.clip_engine_source
+    if req.editorial_ai_source in _allowed:
+        settings.EDITORIAL_AI_SOURCE = req.editorial_ai_source
+    _invalidate_status_cache()
+    _persist_user_settings()
+    return {"status": "saved", **_self_hosted_state()}
 
 
 # ── Encoding Settings ─────────────────────────────────────────────
