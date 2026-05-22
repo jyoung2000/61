@@ -31,7 +31,11 @@ services:
       - whisper_models:/root/.cache/huggingface
     environment:
       - PYTHONUNBUFFERED=1
-      - NVIDIA_VISIBLE_DEVICES=GPU-08b18de7-af3b-aa16-9b88-d214ab78711c
+      # GPU selection — set CLIPAI_GPU_ID in .env to a GPU index (0, 1, ...)
+      # or a UUID from `nvidia-smi -L` to pin ClipAI to one card (e.g. a
+      # GTX 1650). This is what stops a multi-GPU host from also spinning
+      # up other cards.
+      - NVIDIA_VISIBLE_DEVICES=${CLIPAI_GPU_ID:-GPU-08b18de7-af3b-aa16-9b88-d214ab78711c}
       - NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
       # Tell PyTorch to release memory back to OS aggressively.
       # Without this, torch caches 1.6GB+ VRAM after Whisper, starving Ollama.
@@ -64,7 +68,7 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              device_ids: ['GPU-08b18de7-af3b-aa16-9b88-d214ab78711c']
+              device_ids: ['${CLIPAI_GPU_ID:-GPU-08b18de7-af3b-aa16-9b88-d214ab78711c}']
               capabilities: [gpu, video, compute]
     env_file:
       - path: .env
@@ -88,7 +92,7 @@ services:
     volumes:
       - ollama_models:/root/.ollama
     environment:
-      - NVIDIA_VISIBLE_DEVICES=GPU-08b18de7-af3b-aa16-9b88-d214ab78711c
+      - NVIDIA_VISIBLE_DEVICES=${CLIPAI_GPU_ID:-GPU-08b18de7-af3b-aa16-9b88-d214ab78711c}
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - OLLAMA_KEEP_ALIVE=30s
       - OLLAMA_MAX_LOADED_MODELS=1
@@ -118,7 +122,7 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              device_ids: ['GPU-08b18de7-af3b-aa16-9b88-d214ab78711c']
+              device_ids: ['${CLIPAI_GPU_ID:-GPU-08b18de7-af3b-aa16-9b88-d214ab78711c}']
               capabilities: [gpu, compute]
     # Add CPU quota to fix the cgroup parsing warning
     cpus: '4.0'
