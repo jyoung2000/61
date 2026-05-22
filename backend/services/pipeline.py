@@ -1266,12 +1266,22 @@ async def _run_analysis_inner(job_id: str):
 
     _log_gpu_memory(job_id, "pre-reframer")
     _loop = asyncio.get_running_loop()
+    _perceive_t0 = _time.monotonic()
+
+    def _fmt_eta(secs: float) -> str:
+        secs = int(max(0, secs))
+        if secs >= 3600:
+            return f"{secs // 3600}h {(secs % 3600) // 60}m"
+        if secs >= 60:
+            return f"{secs // 60}m {secs % 60}s"
+        return f"{secs}s"
 
     def _engine_progress(*pargs):
         """Thread-safe progress relay from the (blocking) reframer engine.
 
         The Perceiver reports a 0.0-1.0 fraction; map it onto 15-58% of the
-        overall pipeline bar and schedule the async update on the event loop.
+        overall pipeline bar, derive an ETA from the observed rate, and
+        schedule the async update on the event loop.
         """
         frac = 0.0
         if pargs:
@@ -1282,23 +1292,39 @@ async def _run_analysis_inner(job_id: str):
         if frac > 1.5:          # tolerate a 0-100 percentage just in case
             frac /= 100.0
         frac = max(0.0, min(1.0, frac))
+        msg = f"Analyzing video — faces, audio, motion ({int(frac * 100)}%)"
+        elapsed = _time.monotonic() - _perceive_t0
+        # Once there's a real sample of progress, project a remaining time.
+        if frac >= 0.02 and elapsed > 15:
+            eta = elapsed * (1.0 - frac) / frac
+            msg += f" — about {_fmt_eta(eta)} left"
         try:
             asyncio.run_coroutine_threadsafe(
                 _update_progress(
                     job_id, JobStatus.ANALYZING_SCENES,
-                    int(15 + frac * 43),
-                    f"Analyzing video — faces, audio, motion ({int(frac * 100)}%)",
+                    int(15 + frac * 43), msg,
                 ),
                 _loop,
             )
         except Exception:
             pass  # progress is best-effort — never break analysis over it
 
+    # Adaptive sampling — the Perceiver cost scales with the number of frames
+    # it analyses. Cap the total at ~3600 samples so a long video stays
+    # tractable; short videos keep the full 5 fps detail.
+    _sample_fps = 5.0
+    if video_duration > 0:
+        _sample_fps = max(2.0, min(5.0, 3600.0 / video_duration))
+    logger.info(
+        "[%s] Reframer sample rate: %.2f fps (%.1f min video)",
+        job_id, _sample_fps, video_duration / 60.0,
+    )
+
     await _update_progress(
         job_id, JobStatus.ANALYZING_SCENES, 15,
         "Starting reframer analysis (faces, transcription, motion)...",
     )
-    engine = ReframeEngine(video_path, sample_fps=5.0, aspect_ratio="9:16")
+    engine = ReframeEngine(video_path, sample_fps=_sample_fps, aspect_ratio="9:16")
     async with _stage_timer(job_id, "reframer_analysis"):
         reframer_plan = await asyncio.to_thread(engine.analyze, _engine_progress)
     perception = engine.perception

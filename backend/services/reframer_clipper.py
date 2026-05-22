@@ -79,9 +79,9 @@ class ClipperConfig:
     # ── Clip Preferences ──
     platforms: list = field(default_factory=lambda: ["tiktok", "reels", "shorts"])
     max_clips: int = 0                   # 0 = auto (scales with video length)
-    min_duration_s: int = 15
+    min_duration_s: int = 60             # 1 minute
     max_duration_s: int = 300            # 5 minutes
-    ideal_duration_s: int = 60           # 1 minute
+    ideal_duration_s: int = 150          # 2.5 minutes
 
     # ── Optional Content Preferences ──
     preferred_subjects: str = ""         # e.g. "funny moments, hot takes, drama"
@@ -617,7 +617,7 @@ class VideoLLaMA2Discovery:
 TRANSCRIPT FOR THIS SEGMENT:
 {transcript_slice}
 
-Watch and listen carefully to this segment. Identify the 2-3 most compelling moments that would make strong standalone short-form clips (15-60 seconds) for {platform_str}.
+Watch and listen carefully to this segment. Identify the 2-3 most compelling moments that would make strong standalone short-form clips (1-5 minutes) for {platform_str}.
 
 Look for:
 - Emotional peaks (laughter, surprise, anger, excitement)
@@ -631,7 +631,7 @@ Look for:
 
 For each moment, respond in this exact JSON format:
 [
-  {{"timestamp": "MM:SS", "duration": 30, "reason": "one sentence why this is clip-worthy", "hook": "suggested opening line for the clip"}},
+  {{"timestamp": "MM:SS", "duration": 150, "reason": "one sentence why this is clip-worthy", "hook": "suggested opening line for the clip"}},
   ...
 ]
 
@@ -795,7 +795,7 @@ class ReplicateDiscovery:
 TRANSCRIPT FOR THIS SEGMENT:
 {transcript_slice}
 
-Watch and listen carefully to this segment. Identify the 2-3 most compelling moments that would make strong standalone short-form clips (15-60 seconds) for {platform_str}.
+Watch and listen carefully to this segment. Identify the 2-3 most compelling moments that would make strong standalone short-form clips (1-5 minutes) for {platform_str}.
 
 Look for:
 - Emotional peaks (laughter, surprise, anger, excitement)
@@ -809,7 +809,7 @@ Look for:
 
 For each moment, respond in this exact JSON format:
 [
-  {{"timestamp": "MM:SS", "duration": 30, "reason": "one sentence why this is clip-worthy", "hook": "suggested opening line for the clip"}},
+  {{"timestamp": "MM:SS", "duration": 150, "reason": "one sentence why this is clip-worthy", "hook": "suggested opening line for the clip"}},
   ...
 ]
 
@@ -890,10 +890,10 @@ class OllamaDiscovery:
                 f"{_fmt_time(start_s)} to {_fmt_time(end_s)}.\n\n"
                 f"TRANSCRIPT:\n{transcript_slice}\n\n"
                 f"These keyframes show the visual content. Identify 2-3 "
-                f"clip-worthy moments (15-60s) for {platform_str}.\n"
+                f"clip-worthy moments (1-5 min) for {platform_str}.\n"
                 f"{pref}{avoid}\n\n"
                 f"Respond ONLY with JSON:\n"
-                f'[{{"timestamp":"MM:SS","duration":30,"reason":"...","hook":"..."}}]'
+                f'[{{"timestamp":"MM:SS","duration":150,"reason":"...","hook":"..."}}]'
                 f"\nTimestamps relative to {_fmt_time(start_s)}."
             )
 
