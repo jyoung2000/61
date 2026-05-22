@@ -34,11 +34,12 @@ def _pick_yolo_device():
     Returns ``0`` (first CUDA GPU) when a GPU with enough free VRAM is
     present, else ``'cpu'``. GPU inference is ~20x faster than CPU for the
     per-frame subject pass and produces identical detections, so it is the
-    single biggest analysis-speed win on a capable GPU.
+    single biggest analysis-speed win.
 
     Override with the ``CLIPAI_REFRAMER_YOLO_DEVICE`` env var
-    (``cpu`` | ``cuda`` | ``auto``). The 6.5GB free-VRAM gate keeps small
-    cards (e.g. a 4GB GTX 1650) on CPU so YOLO never starves the VLM stage.
+    (``cpu`` | ``cuda`` | ``auto``). The 3.5GB free-VRAM gate lets a 4GB
+    card (e.g. a GTX 1650) use the GPU — the YOLO model is released after
+    the perception pass, so it never competes with the later VLM stage.
     """
     forced = os.environ.get("CLIPAI_REFRAMER_YOLO_DEVICE", "auto").strip().lower()
     if forced == "cpu":
@@ -47,7 +48,7 @@ def _pick_yolo_device():
         import torch
         if torch.cuda.is_available():
             free_mb = torch.cuda.mem_get_info()[0] / 1024 / 1024
-            if forced in ("cuda", "gpu", "0") or free_mb >= 6500:
+            if forced in ("cuda", "gpu", "0") or free_mb >= 3500:
                 return 0
     except Exception:
         pass
