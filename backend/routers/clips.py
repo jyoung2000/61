@@ -1647,13 +1647,30 @@ EDITOR_STATE_DIR = "/data/uploads"
 
 @router.put("/jobs/{job_id}/clips/{clip_id}/editor-state")
 async def save_editor_state(job_id: str, clip_id: int, state: dict):
-    """Persist editor timeline state for cross-session recovery."""
+    """Persist editor timeline state for cross-session recovery.
+
+    Merges into any existing state instead of overwriting. The full NLE
+    timeline (tracks / items / mediaLibrary) and the Analysis-page clip
+    preview (trim / volume / speed / segments) both PUT here with only
+    their own subset of keys — a blind overwrite let one clobber the
+    other, so a partial save wiped the saved subtitle and crop tracks.
+    """
     import json
     state_dir = os.path.join(EDITOR_STATE_DIR, job_id, "editor-state")
     os.makedirs(state_dir, exist_ok=True)
     state_file = os.path.join(state_dir, f"clip_{clip_id}.json")
+    merged: dict = {}
+    if os.path.isfile(state_file):
+        try:
+            with open(state_file, "r") as f:
+                existing = json.load(f)
+            if isinstance(existing, dict):
+                merged = existing
+        except Exception:
+            pass
+    merged.update(state or {})
     with open(state_file, "w") as f:
-        json.dump(state, f)
+        json.dump(merged, f)
     logger.info("Saved editor state for job %s clip %d", job_id, clip_id)
     return {"status": "saved", "job_id": job_id, "clip_id": clip_id}
 
