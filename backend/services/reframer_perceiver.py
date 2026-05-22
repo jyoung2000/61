@@ -1,0 +1,1312 @@
+"""ClipAI Reframer — Perceiver (Stage 1 — perception).
+
+Extracted from clipai_reframer.py (jyoung2000/60) for the Fez engine
+transplant. The original Tkinter GUI is not part of this module.
+"""
+
+import cv2
+import numpy as np
+import json
+import subprocess
+import threading
+import os
+import sys
+import math
+import logging
+import time as _time
+from datetime import datetime, timedelta
+from dataclasses import dataclass, field, asdict
+from typing import List, Optional, Tuple, Callable, Dict
+from pathlib import Path
+
+from backend.services.reframer_models import (
+    ReframeLogger, get_logger, reset_logger, RenderPlan,
+    interpolate_x, clamp_x, _face_overlaps_person,
+    LedgerBin, CoverageLedger, PerceptionResult, SceneSignals, AdaptiveParams,
+)
+from backend.services.reframer_face import FaceDetector
+from backend.services.reframer_audio import AudioIntelligence
+from backend.services.reframer_diarizer import SpeakerDiarizer
+
+logger = logging.getLogger("clipai.reframer_perceiver")
+
+
+class Perceiver:
+    """
+    Stage 1: Extract faces, scenes, motion from video.
+
+    Face detection: DNN ResNet-10 SSD (auto-downloaded, ~50x more accurate
+    than Haar cascades). Falls back to Haar if model download fails.
+
+    Performance:
+      - SEEK to sample frames (skip non-analyzed frames)
+      - Downscale to 640px for detection, scale coords back
+      - Frame differencing for motion + spatial hotspot
+      - Temporal smoothing + persistent track IDs
+    """
+
+    def __init__(self, video_path: str, sample_fps: float = 5.0,
+                 source_language: str = 'auto'):
+        self.path = video_path
+        self.sample_fps = sample_fps
+        self.source_language = source_language
+        self.cancelled = False
+
+        # Tiered face detector: YOLO → DNN → Haar
+        self.face_detector = FaceDetector()
+
+        # Audio intelligence: Whisper transcription for speech detection
+        self.audio_intel = AudioIntelligence()
+
+        # Speaker diarization (optional — needs pyannote + HF token)
+        self.diarizer = SpeakerDiarizer()
+
+        # Track state
+        self._next_track_id = 0
+        self._active_tracks: List[dict] = []
+        self._prev_gray_for_motion = None
+        self._prev_frame_for_face_motion = None
+
+    def run(self, on_progress: Callable = None) -> PerceptionResult:
+        log = get_logger()
+        log.start_timer('perceive')
+        log.log_stage('PERCEIVE', f'Starting analysis: {self.path}',
+                       sample_fps=self.sample_fps)
+
+        cap = cv2.VideoCapture(self.path)
+        if not cap.isOpened():
+            log.log_error('PERCEIVE', f'Cannot open: {self.path}')
+            raise FileNotFoundError(f"Cannot open: {self.path}")
+
+        r = PerceptionResult()
+        r.fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        r.src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        r.src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        r.total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        r.duration_ms = int(r.total_frames / r.fps * 1000)
+
+        log.log_stage('PERCEIVE', f'Source: {r.src_w}x{r.src_h} @ {r.fps:.1f}fps, '
+                       f'{r.total_frames} frames, {r.duration_ms/1000:.1f}s')
+        log.log_stage('PERCEIVE', f'Face detector: {self.face_detector.tier}')
+
+        # Detection resolution: scale down for speed, but keep enough pixels
+        # to resolve small faces on high-res sources. 720p/1080p → 640px wide,
+        # 1440p+ → 960px wide, 4K+ → 1280px wide. The extra pixels matter
+        # most for tiled and YOLO-assisted YuNet passes.
+        if r.src_w >= 3840:
+            target_det_w = 1280
+        elif r.src_w >= 2560:
+            target_det_w = 960
+        else:
+            target_det_w = 640
+        det_scale = min(1.0, float(target_det_w) / r.src_w)
+        det_w = int(r.src_w * det_scale)
+        det_h = int(r.src_h * det_scale)
+        log.log_stage('PERCEIVE', f'Detection resolution: {det_w}x{det_h} '
+                       f'(scale {det_scale:.2f}x)')
+
+        # Min/max face sizes at detection resolution
+        min_face = max(20, int(det_w * 0.04))
+        max_face = int(det_w * 0.80)
+
+        # Compute which frames to sample (seek directly to them)
+        sample_interval_ms = 1000.0 / self.sample_fps
+        sample_times_ms = []
+        t = 0.0
+        while t < r.duration_ms:
+            sample_times_ms.append(int(t))
+            t += sample_interval_ms
+        total_samples = len(sample_times_ms)
+        log.log_stage('PERCEIVE', f'Will analyze {total_samples} samples '
+                       f'({self.sample_fps} fps, every {sample_interval_ms:.0f}ms)')
+
+        prev_gray_small = None
+        prev_hist = None
+        recent_raw: List[List[dict]] = []
+        self._prev_hotspot_cx = None
+        self._prev_hotspot_cy = None
+
+        # ════════════════════════════════════════════════════════════════
+        #  YOLO-World Auto-Discovery Pass
+        #  Sample a few frames, run YOLO-World with a broad vocabulary,
+        #  identify what's actually in the video, then narrow the vocab
+        #  to just those classes for the full analysis.
+        #
+        #  Like a human editor watching 30 seconds to understand:
+        #  "this is about marbles" or "this is a mecha anime"
+        # ════════════════════════════════════════════════════════════════
+        if (self.face_detector._yolo_model is not None
+                and hasattr(self.face_detector, '_yolo_classes')
+                and self.face_detector._yolo_classes):
+
+            # Broad discovery vocabulary — covers all common subjects
+            _DISCOVERY_VOCAB = [
+                # People
+                "person", "head", "face", "character", "child",
+                # Vehicles
+                "car", "truck", "bus", "motorcycle", "bicycle",
+                "boat", "airplane", "train", "spacecraft",
+                # Animals
+                "dog", "cat", "bird", "horse", "fish", "animal",
+                # Objects
+                "ball", "marble", "toy", "bottle", "cup", "phone",
+                "book", "bag", "box", "food",
+                # Equipment / tech
+                "camera", "microphone", "instrument", "computer", "screen",
+                # Anime / gaming
+                "robot", "mecha", "weapon", "sword", "gun", "armor", "helmet",
+                # Nature / structures
+                "tree", "flower", "building", "sign",
+                # Sports
+                "goal", "net", "racket",
+                # Background surfaces with face-like content (false positive suppression)
+                "painting", "poster", "picture", "frame", "artwork", "display",
+            ]
+
+            try:
+                # Sample 8 evenly-spaced frames for discovery
+                discovery_times = []
+                for di in range(8):
+                    dt = int(r.duration_ms * (di + 1) / 9)
+                    discovery_times.append(dt)
+
+                # Set broad vocab for discovery
+                self.face_detector._yolo_model.set_classes(_DISCOVERY_VOCAB)
+
+                class_counts = {}
+                class_confs = {}
+
+                # Save and hide CUDA for YOLO CPU inference
+                _disco_cuda = os.environ.get('CUDA_VISIBLE_DEVICES')
+                os.environ['CUDA_VISIBLE_DEVICES'] = ''
+
+                for dt in discovery_times:
+                    cap.set(cv2.CAP_PROP_POS_MSEC, dt)
+                    ret, frame = cap.read()
+                    if not ret or frame is None:
+                        continue
+
+                    # Resize for speed
+                    if frame.shape[1] > 640:
+                        scale = 640 / frame.shape[1]
+                        frame = cv2.resize(frame, (640, int(frame.shape[0] * scale)))
+
+                    try:
+                        os.environ['CUDA_VISIBLE_DEVICES'] = ''
+                        results = self.face_detector._yolo_model.predict(
+                            frame, verbose=False, conf=0.25, max_det=20, device='cpu')
+                        for r_det in results:
+                            if r_det.boxes is not None:
+                                for box in r_det.boxes:
+                                    cls_id = int(box.cls[0])
+                                    conf_val = float(box.conf[0])
+                                    if cls_id < len(_DISCOVERY_VOCAB):
+                                        cls_name = _DISCOVERY_VOCAB[cls_id]
+                                        class_counts[cls_name] = class_counts.get(cls_name, 0) + 1
+                                        class_confs[cls_name] = max(
+                                            class_confs.get(cls_name, 0), conf_val)
+                    except Exception:
+                        pass
+
+                # Restore CUDA for other tools
+                if _disco_cuda is not None:
+                    os.environ['CUDA_VISIBLE_DEVICES'] = _disco_cuda
+                elif 'CUDA_VISIBLE_DEVICES' in os.environ:
+                    del os.environ['CUDA_VISIBLE_DEVICES']
+
+                # Build final vocab: always include "person" + "head",
+                # plus any class detected 2+ times with decent confidence
+                final_classes = ["person", "head", "face"]
+                for cls_name, count in sorted(class_counts.items(),
+                                              key=lambda x: -x[1]):
+                    if cls_name in final_classes:
+                        continue
+                    if count >= 2 or class_confs.get(cls_name, 0) > 0.5:
+                        final_classes.append(cls_name)
+                    if len(final_classes) >= 15:
+                        break
+
+                # Set the narrowed vocab for the full analysis
+                self.face_detector._yolo_model.set_classes(final_classes)
+                self.face_detector._yolo_classes = final_classes
+
+                discovered = [f"{c}({class_counts.get(c, 0)})"
+                             for c in final_classes if c in class_counts]
+                log.log_stage('PERCEIVE',
+                    f'YOLO-World auto-discovery: found {len(class_counts)} object types '
+                    f'in 8 sample frames → tracking: {", ".join(discovered) or "person, head, face (defaults)"}')
+
+                # Reset video position
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+            except Exception as e:
+                log.log_stage('PERCEIVE',
+                    f'Auto-discovery failed: {e}. Using default classes.')
+                # Reset video position
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+        for i, time_ms in enumerate(sample_times_ms):
+            if self.cancelled:
+                break
+
+            # Smart frame reading: sequential read when samples are close together,
+            # seek only when jumping more than 5 frames ahead
+            target_frame = int(time_ms / 1000.0 * r.fps)
+            current_pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+            gap = target_frame - current_pos
+
+            if gap < 0 or gap > 5:
+                # Need to seek — we're behind or too far ahead
+                cap.set(cv2.CAP_PROP_POS_FRAMES, min(target_frame, r.total_frames - 1))
+            elif gap > 1:
+                # Skip a few frames by grabbing without decoding
+                for _ in range(gap - 1):
+                    cap.grab()
+
+            ret, frame = cap.read()
+            if not ret:
+                continue
+
+            # Downscale ONCE — INTER_LINEAR is 2x faster than INTER_AREA
+            # and visually identical at this scale ratio
+            small_bgr = cv2.resize(frame, (det_w, det_h), interpolation=cv2.INTER_LINEAR)
+            gray_small = cv2.cvtColor(small_bgr, cv2.COLOR_BGR2GRAY)
+
+            # ── Face detection at low res ──
+            raw_faces = self._detect_faces_fast(
+                gray_small, small_bgr, min_face, max_face, det_w, det_h, det_scale)
+
+            # Temporal smoothing
+            recent_raw.append(raw_faces)
+            if len(recent_raw) > 4:
+                recent_raw.pop(0)
+            confirmed = self._temporal_filter(recent_raw)
+
+            # Track assignment
+            tracked = self._assign_tracks(confirmed, time_ms)
+            r.face_timeline[time_ms] = tracked
+
+            # ── Scene cuts (histogram at low res — very fast) ──
+            hist = cv2.calcHist([gray_small], [0], None, [32], [0, 256])
+            cv2.normalize(hist, hist)
+            if prev_hist is not None:
+                diff = cv2.compareHist(prev_hist, hist, cv2.HISTCMP_BHATTACHARYYA)
+                if diff > 0.35:
+                    r.scene_cuts.append(time_ms)
+                    # Nonhuman subject positions from the previous scene
+                    # don't apply after a cut — reset the spatial cache.
+                    self.face_detector.clear_nonhuman_cache()
+            prev_hist = hist.copy()
+
+            # ── Motion (vectorized frame diff + hotspot + weighted centroid) ──
+            if prev_gray_small is not None:
+                diff_frame = cv2.absdiff(prev_gray_small, gray_small)
+                motion_mag = float(np.mean(diff_frame)) / 255.0 * 10.0
+                r.motion_timeline[time_ms] = motion_mag
+
+                # Vectorized motion hotspot: reshape into grid, sum each cell
+                grid_rows, grid_cols = 3, 6
+                cell_h = det_h // grid_rows
+                cell_w = det_w // grid_cols
+                # Crop to exact grid size
+                cropped_diff = diff_frame[:cell_h * grid_rows, :cell_w * grid_cols]
+                # Reshape into (grid_rows, cell_h, grid_cols, cell_w) and mean over cells
+                grid = cropped_diff.reshape(grid_rows, cell_h, grid_cols, cell_w)
+                cell_means = grid.mean(axis=(1, 3))  # (grid_rows, grid_cols)
+                best_idx = np.argmax(cell_means)
+                best_gy, best_gx = divmod(best_idx, grid_cols)
+                best_intensity = float(cell_means[best_gy, best_gx])
+
+                # Weighted centroid — center of mass of all motion, not just argmax.
+                # More stable than argmax for distributed motion (e.g. camera pan).
+                total_motion = float(cell_means.sum())
+                if total_motion > 0.1:
+                    gy_indices, gx_indices = np.mgrid[0:grid_rows, 0:grid_cols]
+                    centroid_gx = float(np.sum(gx_indices * cell_means)) / total_motion
+                    centroid_gy = float(np.sum(gy_indices * cell_means)) / total_motion
+                    centroid_cx = int((centroid_gx + 0.5) * cell_w / det_scale)
+                    centroid_cy = int((centroid_gy + 0.5) * cell_h / det_scale)
+                else:
+                    centroid_cx = int((best_gx + 0.5) * cell_w / det_scale)
+                    centroid_cy = int((best_gy + 0.5) * cell_h / det_scale)
+
+                # EMA smooth the hotspot to prevent frame-to-frame jumping
+                # Dynamic alpha: high motion = more responsive tracking
+                raw_cx = centroid_cx
+                raw_cy = centroid_cy
+                motion_intensity = best_intensity / 255.0
+                alpha_hs = min(0.7, 0.25 + motion_intensity * 0.8)  # 0.25–0.70
+                if hasattr(self, '_prev_hotspot_cx') and self._prev_hotspot_cx is not None:
+                    raw_cx = int(alpha_hs * centroid_cx + (1 - alpha_hs) * self._prev_hotspot_cx)
+                    raw_cy = int(alpha_hs * centroid_cy + (1 - alpha_hs) * self._prev_hotspot_cy)
+                self._prev_hotspot_cx = raw_cx
+                self._prev_hotspot_cy = raw_cy
+
+                r.motion_hotspot[time_ms] = {
+                    'cx': raw_cx,
+                    'cy': raw_cy,
+                    'intensity': round(best_intensity / 255.0, 4),
+                }
+
+            # ── Non-face subject tracking (YOLO-World + saliency) ──
+            # When no face is detected, use YOLO-World for subject detection.
+            # Throttled to every 4th sample (1.25fps) because YOLO-World on
+            # CPU is ~3x slower than yolov8n. Between samples, reuse the last
+            # known person detections (subjects don't teleport in 800ms).
+            has_faces = bool(tracked)
+
+            if not has_faces:
+                # Run YOLO-World every 4th sample, reuse last result between
+                run_yolo_this_frame = (i % 4 == 0) or not hasattr(self, '_last_person_bboxes')
+                if run_yolo_this_frame and self.face_detector._yolo_model is not None:
+                    person_bboxes = self.face_detector._get_person_bboxes(small_bgr)
+                    self._last_person_bboxes = person_bboxes
+                    self._last_person_time = time_ms
+                else:
+                    # Reuse last detection if recent (< 1 second old)
+                    person_bboxes = getattr(self, '_last_person_bboxes', [])
+                    last_t = getattr(self, '_last_person_time', 0)
+                    if time_ms - last_t > 1000:
+                        person_bboxes = []  # too old, don't reuse
+                if person_bboxes:
+                    persons = []
+                    for px1, py1, px2, py2 in person_bboxes:
+                        pw, ph = px2 - px1, py2 - py1
+                        # Scale back to source resolution
+                        sx1 = int(px1 / det_scale)
+                        sy1 = int(py1 / det_scale)
+                        sw = int(pw / det_scale)
+                        sh = int(ph / det_scale)
+                        persons.append({
+                            'x': sx1, 'y': sy1, 'w': sw, 'h': sh,
+                            'cx': sx1 + sw // 2, 'cy': sy1 + sh // 2,
+                            'area': sw * sh,
+                        })
+                    r.person_timeline[time_ms] = persons
+
+                # Spectral residual saliency (pure numpy, ~2ms per frame)
+                # Finds the most "visually unexpected" region — works for any
+                # content type without genre-specific tuning.
+                if not person_bboxes:
+                    try:
+                        # Spectral residual: FFT → log amplitude → smooth → residual → IFFT
+                        sal_size = 128  # higher res = better object localization
+                        sal_gray = cv2.resize(gray_small, (sal_size, sal_size))
+                        sal_f = np.fft.fft2(sal_gray.astype(np.float32))
+                        log_amp = np.log(np.abs(sal_f) + 1e-5)
+                        phase = np.angle(sal_f)
+                        # Smooth the log amplitude spectrum
+                        kernel = np.ones((3, 3)) / 9.0
+                        smooth_amp = cv2.filter2D(log_amp, -1, kernel)
+                        # Spectral residual = original - smoothed
+                        residual = log_amp - smooth_amp
+                        # Reconstruct saliency map from residual
+                        sal_complex = np.exp(residual + 1j * phase)
+                        sal_map = np.abs(np.fft.ifft2(sal_complex)) ** 2
+                        sal_map = cv2.GaussianBlur(sal_map.astype(np.float32), (7, 7), 3.0)
+                        # Normalize
+                        sal_max = sal_map.max()
+                        if sal_max > 0:
+                            sal_map /= sal_max
+                        # ── Text/watermark saliency suppression ──
+                        # Bottom 15%: subtitles, watermarks, channel logos
+                        # Top 5%: letterbox bars, UI chrome
+                        # Text has high edge energy that attracts the saliency
+                        # detector, but a camera op ignores it.
+                        sh = sal_map.shape[0]
+                        sal_map[int(sh * 0.85):, :] *= 0.1   # bottom 15%
+                        sal_map[:int(sh * 0.05), :] *= 0.3   # top 5%
+                        # Find peak saliency location
+                        peak_idx = np.argmax(sal_map)
+                        peak_y, peak_x = divmod(peak_idx, sal_size)
+                        # Scale to source resolution
+                        sal_cx = int(peak_x / sal_size * r.src_w)
+                        sal_cy = int(peak_y / sal_size * r.src_h)
+                        sal_intensity = float(sal_map[peak_y, peak_x])
+
+                        if sal_intensity > 0.10:
+                            r.saliency_hotspot[time_ms] = {
+                                'cx': sal_cx, 'cy': sal_cy,
+                                'intensity': round(sal_intensity, 4),
+                            }
+                    except Exception:
+                        pass  # Saliency is optional — never crash the pipeline
+
+            prev_gray_small = gray_small  # cvtColor creates new array each iteration
+
+            if on_progress and i % 20 == 0:
+                on_progress(i / total_samples)
+
+            # Periodic progress log every 25%
+            if i > 0 and total_samples > 20 and i % (total_samples // 4) == 0:
+                pct = int(i / total_samples * 100)
+                faces_so_far = sum(1 for t2 in list(r.face_timeline.keys())[:i+1]
+                                   if r.face_timeline.get(t2))
+                log.log_stage('PERCEIVE',
+                    f'  Face detection {pct}%: {faces_so_far} samples with faces '
+                    f'({i+1}/{total_samples} processed)')
+
+        cap.release()
+        if on_progress:
+            on_progress(1.0)
+
+        # Face detection summary
+        total_face_samples = sum(1 for faces in r.face_timeline.values() if faces)
+        total_faces_detected = sum(len(faces) for faces in r.face_timeline.values())
+        unique_tracks = set()
+        track_sample_counts = {}
+        for faces in r.face_timeline.values():
+            for f in faces:
+                tid = f.get('track_id', -1)
+                if tid >= 0:
+                    unique_tracks.add(tid)
+                    track_sample_counts[tid] = track_sample_counts.get(tid, 0) + 1
+
+        log.log_stage('PERCEIVE',
+            f'Face detection complete:\n'
+            f'  Total samples: {len(r.face_timeline)}\n'
+            f'  Samples with faces: {total_face_samples} '
+            f'({total_face_samples*100//max(1,len(r.face_timeline))}%)\n'
+            f'  Total detections: {total_faces_detected}\n'
+            f'  Unique tracks: {len(unique_tracks)}\n'
+            f'  Scene cuts: {len(r.scene_cuts)}\n'
+            f'  Detector tier: {self.face_detector.tier}')
+
+        # Log each track's stats
+        if track_sample_counts:
+            for tid in sorted(track_sample_counts.keys()):
+                count = track_sample_counts[tid]
+                log.log_stage('PERCEIVE',
+                    f'  Track {tid}: {count} samples '
+                    f'({count*100//max(1,len(r.face_timeline))}% of video)')
+
+        # ── Track consolidation across scene cuts ──
+        # Merge fragmented tracks that are clearly the same person
+        self._consolidate_tracks_across_cuts(r)
+
+        # ── Audio intelligence (Whisper transcription) ──
+        if self.audio_intel.try_load():
+            audio_result = self.audio_intel.transcribe(
+                self.path, r.duration_ms,
+                language=self.source_language,
+                on_progress=on_progress)
+            r.speech_active = audio_result.get('speech_active', {})
+            r.transcript_segments = audio_result.get('segments', [])
+            r.detected_language = audio_result.get('language', '')
+            r.coverage_ledger = audio_result.get('coverage_ledger')
+            r.audio_events = audio_result.get('audio_events', {})
+
+        # ── Speaker diarization (audio-based) ──
+        if self.diarizer.try_load():
+            r.speaker_timeline = self.diarizer.diarize(self.path, r.duration_ms)
+
+            # Link tracks to speakers: for each tracked face, find which speaker
+            # is active at the times when that face has the most mouth motion
+            if r.speaker_timeline:
+                self._link_tracks_to_speakers(r)
+
+        # ── Spatial pseudo-diarization (fallback when pyannote unavailable) ──
+        # If real diarization didn't produce results, cluster tracks by spatial
+        # position to build a pseudo track_speaker_map for speaker lock
+        if not r.track_speaker_map:
+            self._build_spatial_speakers(r)
+
+        # ── Audio-visual correlation for speaker identification ──
+        # Extract per-100ms RMS energy from the audio track, then correlate
+        # each face track's mouth-motion time series with the audio energy.
+        # The track with the highest Pearson correlation IS the active speaker.
+        # This works without pyannote, without HF tokens — just numpy.
+        if r.speech_active and not r.track_speaker_map:
+            self._extract_audio_rms(r)
+            if r.audio_rms:
+                self._correlate_audio_visual(r)
+
+        elapsed = log.stop_timer('perceive')
+        total_faces = sum(1 for faces in r.face_timeline.values() if faces)
+        log.log_stage('PERCEIVE', 'Analysis complete',
+                       elapsed_sec=round(elapsed, 2),
+                       face_samples=len(r.face_timeline),
+                       samples_with_faces=total_faces,
+                       scene_cuts=len(r.scene_cuts),
+                       motion_samples=len(r.motion_timeline),
+                       source_resolution=f'{r.src_w}x{r.src_h}',
+                       detection_resolution=f'{det_w}x{det_h}',
+                       source_fps=r.fps,
+                       duration_sec=round(r.duration_ms / 1000, 2))
+
+        return r
+
+    def _detect_faces_fast(self, gray, frame_bgr, min_face, max_face,
+                       det_w, det_h, scale) -> List[dict]:
+        """Detect faces at detection resolution (BGR input, no conversion needed).
+        Computes mouth motion from YuNet landmarks (MAR) when available,
+        with pixel-diff fallback for non-YuNet detections."""
+        raw_faces = self.face_detector.detect(frame_bgr)
+
+        validated = []
+        for face in raw_faces:
+            fx, fy, fw, fh = face['x'], face['y'], face['w'], face['h']
+
+            if fy + fh > det_h * 0.92 and fh < det_h * 0.12:
+                continue
+
+            motion_score = 0.0
+            mouth_motion = 0.0
+
+            # ── Landmark-based MAR (Mouth Aspect Ratio) ──
+            # YuNet gives us mouth corner coordinates. By tracking how the
+            # mouth width and nose-to-mouth distance change frame-to-frame,
+            # we get a direct speech signal instead of a noisy pixel-diff
+            # proxy. This is scale-invariant and lighting-invariant.
+            has_landmarks = 'right_mouth' in face and 'left_mouth' in face and 'nose' in face
+            used_landmark_mar = False
+
+            if has_landmarks and self._prev_frame_for_face_motion is not None:
+                try:
+                    rm = face['right_mouth']
+                    lm = face['left_mouth']
+                    nose = face['nose']
+                    mouth_w = math.sqrt((rm[0]-lm[0])**2 + (rm[1]-lm[1])**2)
+                    mouth_mid = ((rm[0]+lm[0])/2, (rm[1]+lm[1])/2)
+                    nose_mouth_dist = math.sqrt((nose[0]-mouth_mid[0])**2 +
+                                                 (nose[1]-mouth_mid[1])**2)
+                    # Normalize by face width for scale invariance
+                    norm_mouth_w = mouth_w / max(1, fw)
+                    norm_nose_mouth = nose_mouth_dist / max(1, fh)
+
+                    # Compare with previous frame's landmarks for this face region
+                    face_key = (fx // max(1, fw // 2), fy // max(1, fh // 2))  # spatial bucket
+                    if hasattr(self, '_prev_landmarks') and face_key in self._prev_landmarks:
+                        prev_mw, prev_nm = self._prev_landmarks[face_key]
+                        # MAR delta: change in mouth width + change in mouth opening
+                        mar_delta = abs(norm_mouth_w - prev_mw) + abs(norm_nose_mouth - prev_nm)
+                        # Scale to 0-1 range comparable to pixel-diff values
+                        # Typical speaking MAR delta is 0.02-0.15
+                        mouth_motion = min(1.0, mar_delta * 5.0)
+                        used_landmark_mar = True
+
+                    # Store for next frame
+                    if not hasattr(self, '_prev_landmarks'):
+                        self._prev_landmarks = {}
+                    self._prev_landmarks[face_key] = (norm_mouth_w, norm_nose_mouth)
+                except (IndexError, ValueError, TypeError):
+                    pass
+
+            if self._prev_frame_for_face_motion is not None:
+                prev_g = self._prev_frame_for_face_motion
+                try:
+                    cur_roi = gray[fy:fy+fh, fx:fx+fw]
+                    prev_roi = prev_g[fy:fy+fh, fx:fx+fw]
+                    if cur_roi.shape == prev_roi.shape and cur_roi.size > 0:
+                        target = (96, 96)
+                        cur_n = cv2.resize(cur_roi, target,
+                                           interpolation=cv2.INTER_LINEAR)
+                        prev_n = cv2.resize(prev_roi, target,
+                                            interpolation=cv2.INTER_LINEAR)
+                        diff = cv2.absdiff(cur_n, prev_n)
+                        motion_score = float(np.mean(diff)) / 255.0
+
+                    # Pixel-diff mouth fallback when landmarks unavailable
+                    if not used_landmark_mar:
+                        mouth_y = fy + int(fh * 0.6)
+                        cur_m = gray[mouth_y:fy+fh, fx:fx+fw]
+                        prev_m = prev_g[mouth_y:fy+fh, fx:fx+fw]
+                        if cur_m.shape == prev_m.shape and cur_m.size > 0:
+                            target_m = (64, 24)
+                            cur_mn = cv2.resize(cur_m, target_m,
+                                                interpolation=cv2.INTER_LINEAR)
+                            prev_mn = cv2.resize(prev_m, target_m,
+                                                 interpolation=cv2.INTER_LINEAR)
+                            diff_m = cv2.absdiff(cur_mn, prev_mn)
+                            mouth_motion = float(np.mean(diff_m)) / 255.0
+                except (IndexError, ValueError, cv2.error):
+                    pass
+
+            self._prev_frame_for_face_motion = gray  # reuse, don't copy
+
+            inv_scale = 1.0 / scale
+            src_x = int(fx * inv_scale)
+            src_y = int(fy * inv_scale)
+            src_w = int(fw * inv_scale)
+            src_h = int(fh * inv_scale)
+
+            area_score = (src_w * src_h) / max(1, (det_w * det_h) * inv_scale * inv_scale)
+            raw_saliency = area_score * 0.3 + motion_score * 0.3 + mouth_motion * 0.4
+            # Weight saliency by detection confidence — faces with reduced
+            # confidence (background artwork, failed liveness) get lower saliency
+            # throughout the pipeline.
+            det_conf = face.get('confidence', 0.5)
+            saliency = raw_saliency * max(0.2, det_conf)
+
+            # Compute SFace embedding for track identity matching.
+            # Uses detection-resolution coordinates and frame.
+            embedding = None
+            if hasattr(self, '_embedding_counter'):
+                self._embedding_counter += 1
+            else:
+                self._embedding_counter = 0
+            # Sample 1 in 3 faces for embedding (balances speed vs coverage)
+            if self._embedding_counter % 3 == 0:
+                embedding = self.face_detector.compute_embedding(frame_bgr, face)
+
+            result = {
+                'x': src_x, 'y': src_y,
+                'w': src_w, 'h': src_h,
+                'cx': src_x + src_w // 2,
+                'cy': src_y + src_h // 2,
+                'area': src_w * src_h,
+                'confidence': face.get('confidence', 0.5),
+                'motion': round(motion_score, 4),
+                'mouth_motion': round(mouth_motion, 4),
+                'saliency': round(saliency, 4),
+            }
+            if embedding is not None:
+                result['embedding'] = embedding
+            validated.append(result)
+
+        return validated
+
+    def _temporal_filter(self, recent_raw: List[List[dict]]) -> List[dict]:
+        """Confirm faces by requiring persistence across multiple recent samples.
+
+        A face is kept only if it has a near-position match in at least one
+        of the last few samples. The current sample is the candidate set;
+        we look back over recent_raw[:-1] for confirmation.
+
+        Critical: when the previous sample is empty (e.g. right after a
+        scene cut), we DO NOT auto-accept the current sample's faces —
+        that previously let ghost detections through unfiltered. Instead
+        we look further back to find ANY recent confirmation.
+        """
+        if not recent_raw:
+            return []
+        current = recent_raw[-1]
+        if not current:
+            return []
+
+        # Look back at the last 3 samples for confirmation. With 5 fps
+        # sampling that's a 600ms window — enough to bridge a single
+        # missed detection without letting ghosts through.
+        history = recent_raw[-4:-1] if len(recent_raw) >= 4 else recent_raw[:-1]
+        prev_pool = []
+        for sample in history:
+            prev_pool.extend(sample)
+
+        # If we have no history at all (literally the first sample of a
+        # video), accept current — there's nothing to compare against.
+        if not prev_pool and len(recent_raw) <= 1:
+            return current
+
+        # If history exists but is empty (scene cut just happened),
+        # require the current sample to have multiple coherent faces
+        # before accepting any. Single-face detections after an empty
+        # window are the highest-risk false positives.
+        if not prev_pool:
+            if len(current) < 2:
+                return []
+            return current
+
+        confirmed = []
+        for face in current:
+            for pf in prev_pool:
+                # Manhattan distance is faster than sqrt and good enough
+                dist = abs(face['cx'] - pf['cx']) + abs(face['cy'] - pf['cy'])
+                # Slightly tighter linking (was 3.0 face widths) — at
+                # 5 fps a face shouldn't move more than ~2 widths between
+                # samples unless it's a scene cut, and scene cuts get
+                # handled by the no-history branch above.
+                if dist < face['w'] * 2.5:
+                    confirmed.append(face)
+                    break
+
+        return confirmed
+
+    def _assign_tracks(self, faces: List[dict], time_ms: int) -> List[dict]:
+        """Assign persistent track IDs via position proximity.
+        Uses wider linking and longer gap tolerance to avoid track fragmentation."""
+        max_gap_ms = 5000    # 5 seconds before a track expires (was 3s)
+        max_link_dist_ratio = 4.0  # 4x face width linking distance (was 2.5x)
+
+        self._active_tracks = [
+            t for t in self._active_tracks
+            if time_ms - t['last_seen_ms'] < max_gap_ms
+        ]
+
+        result = []
+        used_tracks = set()
+
+        for face in faces:
+            best_track = None
+            best_dist = float('inf')
+            for track in self._active_tracks:
+                if track['id'] in used_tracks:
+                    continue
+                dist = math.sqrt(
+                    (face['cx'] - track['cx'])**2 + (face['cy'] - track['cy'])**2)
+                max_dist = max(face['w'], track['w']) * max_link_dist_ratio
+                if dist < max_dist and dist < best_dist:
+                    best_dist = dist
+                    best_track = track
+
+            if best_track:
+                track_id = best_track['id']
+                # Smooth track position with exponential moving average
+                # This prevents the track from jumping on noisy detections
+                alpha = 0.6  # 60% new position, 40% old
+                best_track.update({
+                    'cx': int(face['cx'] * alpha + best_track['cx'] * (1 - alpha)),
+                    'cy': int(face['cy'] * alpha + best_track['cy'] * (1 - alpha)),
+                    'w': int(face['w'] * alpha + best_track['w'] * (1 - alpha)),
+                    'h': int(face['h'] * alpha + best_track['h'] * (1 - alpha)),
+                    'last_seen_ms': time_ms,
+                })
+                used_tracks.add(track_id)
+            else:
+                track_id = self._next_track_id
+                self._next_track_id += 1
+                self._active_tracks.append({
+                    'id': track_id, 'cx': face['cx'], 'cy': face['cy'],
+                    'w': face['w'], 'h': face['h'],
+                    'last_seen_ms': time_ms,
+                })
+
+            result.append({**face, 'track_id': track_id})
+
+        return result
+
+    def _consolidate_tracks_across_cuts(self, r: PerceptionResult):
+        """Merge face tracks that are clearly the same person.
+
+        The tracker creates new track IDs whenever it loses a face for a few
+        frames (occlusion, head turn, detection dropout) or when faces are
+        close enough to confuse. A 2-person podcast generates 74 tracks
+        instead of 2-3.
+
+        Strategy: merge tracks that are spatially close AND never appear in
+        the same frame simultaneously. If two tracks occupy the same position
+        but are never on screen at the same time, they're the same person
+        with fragmented tracking. If they DO appear simultaneously, they're
+        definitely different people.
+
+        This replaces the scene-cut-based approach which failed because
+        tracks don't actually break at scene cuts — they break from tracker
+        confusion between nearby faces."""
+        log = get_logger()
+        sorted_times = sorted(r.face_timeline.keys())
+        if not sorted_times:
+            return
+
+        # Build per-track info
+        track_info = {}
+        track_active_times = {}  # track_id → set of times
+        for t in sorted_times:
+            for f in r.face_timeline[t]:
+                tid = f.get('track_id', -1)
+                if tid < 0:
+                    continue
+                if tid not in track_info:
+                    track_info[tid] = {'cxs': [], 'cys': [], 'ws': [], 'count': 0}
+                info = track_info[tid]
+                info['cxs'].append(f['cx'])
+                info['cys'].append(f['cy'])
+                info['ws'].append(f['w'])
+                info['count'] += 1
+                track_active_times.setdefault(tid, set()).add(t)
+
+        if len(track_info) < 2:
+            return
+
+        # Compute medians
+        for tid, info in track_info.items():
+            info['median_cx'] = int(np.median(info['cxs']))
+            info['median_cy'] = int(np.median(info['cys']))
+            info['median_w'] = int(np.median(info['ws']))
+
+        # Collect per-track SFace embeddings for identity matching
+        track_embeddings = {}  # track_id → list of embedding arrays
+        for t in sorted_times:
+            for f in r.face_timeline[t]:
+                tid = f.get('track_id', -1)
+                emb = f.get('embedding')
+                if tid >= 0 and emb is not None:
+                    track_embeddings.setdefault(tid, []).append(emb)
+
+        # Compute representative embedding per track (mean of up to 10 samples)
+        track_rep_embedding = {}
+        sface_available = False
+        for tid, embs in track_embeddings.items():
+            if len(embs) >= 2:
+                # Use up to 10 embeddings for a robust representative
+                sampled = embs[:10]
+                rep = np.mean(sampled, axis=0)
+                # L2 normalize
+                norm = np.linalg.norm(rep)
+                if norm > 0:
+                    track_rep_embedding[tid] = rep / norm
+                    sface_available = True
+
+        if sface_available:
+            log.log_stage('PERCEIVE',
+                f'SFace embeddings: {len(track_rep_embedding)} tracks with identity vectors')
+
+        # Sort tracks by sample count (descending) — merge small into large
+        sorted_tids = sorted(track_info.keys(),
+                             key=lambda t: track_info[t]['count'], reverse=True)
+
+        # Greedy merge: for each track, try to merge it into a larger track
+        # that has a similar position and no temporal overlap
+        merge_map = {}  # small_tid → large_tid
+
+        for i, small_tid in enumerate(sorted_tids):
+            if small_tid in merge_map:
+                continue
+            small = track_info[small_tid]
+            small_times = track_active_times[small_tid]
+
+            for large_tid in sorted_tids[:i]:  # only larger tracks
+                if large_tid in merge_map:
+                    # Chase to canonical
+                    canon = large_tid
+                    seen = set()
+                    while canon in merge_map and canon not in seen:
+                        seen.add(canon)
+                        canon = merge_map[canon]
+                    large_tid = canon
+
+                large = track_info.get(large_tid, None)
+                if large is None:
+                    continue
+                large_times = track_active_times.get(large_tid, set())
+
+                # Check spatial proximity OR embedding similarity
+                # SFace embedding match is the primary check — it works even
+                # when camera angles change (same person, different position).
+                # Spatial proximity is the fallback when embeddings unavailable.
+                identity_match = False
+
+                if small_tid in track_rep_embedding and large_tid in track_rep_embedding:
+                    # Cosine similarity between representative embeddings
+                    sim = float(np.dot(track_rep_embedding[small_tid],
+                                       track_rep_embedding[large_tid]))
+                    if sim > 0.50:  # same person threshold (0.30 was too loose)
+                        identity_match = True
+
+                if not identity_match:
+                    # Fall back to spatial proximity: within 3x face width
+                    dx = abs(small['median_cx'] - large['median_cx'])
+                    dy = abs(small['median_cy'] - large['median_cy'])
+                    dist = math.sqrt(dx*dx + dy*dy)
+                    avg_w = (small['median_w'] + large['median_w']) / 2
+                    if dist > avg_w * 3.0:
+                        continue  # too far apart spatially and no embedding match
+
+                # ── Spatial consistency guard ──
+                # Even if SFace says "same person," reject the merge if it would
+                # create a track with positions spread across the frame. Real
+                # people sit in one spot; a track jumping from cx=800 to cx=3000
+                # means two different people got merged.
+                combined_cxs = list(track_info[small_tid]['cxs'])
+                # Include the large track's positions (already in track_info)
+                large_info = track_info.get(large_tid)
+                if large_info:
+                    combined_cxs.extend(large_info['cxs'])
+                if len(combined_cxs) >= 5:
+                    cx_std = float(np.std(combined_cxs))
+                    if cx_std > r.src_w * 0.25:
+                        continue
+
+                # Check temporal overlap: do they EVER appear simultaneously?
+                overlap = small_times & large_times
+                overlap_ratio = len(overlap) / max(1, min(len(small_times), len(large_times)))
+
+                # Allow up to 5% overlap (detection noise can put both tracks
+                # in the same frame briefly). Strict zero overlap is too rigid.
+                if overlap_ratio > 0.05:
+                    continue  # they appear together → different people
+
+                # Merge small into large
+                merge_map[small_tid] = large_tid
+                # Merge the active times so subsequent comparisons see the
+                # combined temporal footprint
+                track_active_times.setdefault(large_tid, set()).update(small_times)
+                break
+
+        if not merge_map:
+            log.log_stage('PERCEIVE',
+                f'Track consolidation: {len(track_info)} tracks, 0 merges '
+                f'(all tracks are temporally overlapping or spatially distant)')
+            return
+
+        # Chase merge chains to canonical roots
+        def canonical(tid):
+            seen = set()
+            while tid in merge_map and tid not in seen:
+                seen.add(tid)
+                tid = merge_map[tid]
+            return tid
+
+        # Apply
+        reassigned = 0
+        for t in sorted_times:
+            for f in r.face_timeline[t]:
+                old_tid = f.get('track_id', -1)
+                if old_tid >= 0 and old_tid in merge_map:
+                    f['track_id'] = canonical(old_tid)
+                    reassigned += 1
+
+        # Count unique tracks after consolidation
+        post_tracks = set()
+        for t in sorted_times:
+            for f in r.face_timeline[t]:
+                tid = f.get('track_id', -1)
+                if tid >= 0:
+                    post_tracks.add(tid)
+
+        pre_count = len(track_info)
+        post_count = len(post_tracks)
+        log.log_stage('PERCEIVE',
+            f'Track consolidation: {pre_count} → {post_count} tracks '
+            f'({len(merge_map)} merges, {reassigned} face records reassigned)')
+
+        # ── Static-face filter ──
+        # A figurine, poster, or mannequin produces a face track whose
+        # per-scene positional variance is near-zero (only detector jitter).
+        # A real human — even seated — has head micro-movements, expression
+        # changes, and breathing that create measurably higher variance.
+        # This filter catches non-human faces that slipped past the YOLO
+        # gates (e.g. YOLO misclassified the figurine as "person").
+        self._filter_static_face_tracks(r)
+
+    def _filter_static_face_tracks(self, r: PerceptionResult):
+        """Remove face tracks whose per-scene positional variance is
+        near-zero, indicating a static object (figurine, poster, mask)
+        rather than a living person.
+
+        Strategy:
+          - Group each track's detections by scene (between scene cuts)
+          - For each scene segment with ≥10 samples, compute cx variance
+          - If a track's MEDIAN per-scene cx-variance is below threshold,
+            it's static — remove it from the face_timeline
+
+        Threshold rationale (at detection resolution 1280×720):
+          - YuNet jitter on a static object: σ ≈ 2-4px → var ≈ 4-16
+          - Seated human micro-movements:    σ ≈ 8-20px → var ≈ 64-400
+          - Threshold of 30 sits between jitter (16) and movement (64)
+        """
+        import numpy as np
+        log = get_logger()
+
+        STATIC_VAR_THRESHOLD = 30  # px² at detection resolution
+
+        # Build scene boundaries
+        scene_bounds = sorted(set([0] + r.scene_cuts + [r.duration_ms]))
+
+        # Collect per-track, per-scene face positions
+        track_scene_cxs = {}  # {track_id: {scene_idx: [cx, cx, ...]}}
+        for t_ms, faces in r.face_timeline.items():
+            # Find which scene this timestamp belongs to
+            scene_idx = 0
+            for i in range(len(scene_bounds) - 1):
+                if scene_bounds[i] <= t_ms < scene_bounds[i + 1]:
+                    scene_idx = i
+                    break
+            for f in faces:
+                tid = f.get('track_id', -1)
+                if tid < 0:
+                    continue
+                track_scene_cxs.setdefault(tid, {}).setdefault(
+                    scene_idx, []).append(f['cx'])
+
+        # Evaluate each track
+        static_tracks = set()
+        for tid, scene_data in track_scene_cxs.items():
+            # Compute per-scene variance (only scenes with ≥10 samples)
+            scene_vars = []
+            for scene_idx, cxs in scene_data.items():
+                if len(cxs) >= 10:
+                    scene_vars.append(float(np.var(cxs)))
+
+            if not scene_vars:
+                continue  # not enough data to judge
+
+            median_var = float(np.median(scene_vars))
+            if median_var < STATIC_VAR_THRESHOLD:
+                static_tracks.add(tid)
+
+        if not static_tracks:
+            return
+
+        # Remove static tracks from face_timeline
+        removed = 0
+        for t_ms in list(r.face_timeline.keys()):
+            orig = r.face_timeline[t_ms]
+            filtered = [f for f in orig if f.get('track_id', -1)
+                        not in static_tracks]
+            if len(filtered) < len(orig):
+                removed += len(orig) - len(filtered)
+                if filtered:
+                    r.face_timeline[t_ms] = filtered
+                else:
+                    del r.face_timeline[t_ms]
+
+        if removed:
+            log.log_stage('PERCEIVE',
+                f'Static-face filter: removed {len(static_tracks)} static '
+                f'tracks ({removed} face records) — likely figurines/posters')
+
+    def _build_spatial_speakers(self, r: PerceptionResult):
+        """Build pseudo-diarization from spatial clustering when pyannote is unavailable.
+
+        For multi-person content (especially 2-person podcasts), the face tracks
+        cluster into spatial groups — left seat, right seat. By assigning each
+        cluster a pseudo-speaker ID and linking tracks to their cluster, we get
+        a track_speaker_map that the speaker lock and S2 can use.
+
+        Only activates when:
+          - No pyannote diarization produced any results
+          - There are 2+ real tracks with clear spatial separation
+        """
+        log = get_logger()
+        if r.track_speaker_map:
+            return  # real diarization already ran
+
+        # Build per-track median positions using only tracks with enough samples
+        sorted_times = sorted(r.face_timeline.keys())
+        track_positions = {}
+        for t in sorted_times:
+            for f in r.face_timeline[t]:
+                tid = f.get('track_id', -1)
+                if tid >= 0:
+                    track_positions.setdefault(tid, []).append(f['cx'])
+
+        # Filter to tracks with ≥25 samples (real tracks)
+        real_tracks = {tid: cxs for tid, cxs in track_positions.items()
+                       if len(cxs) >= 25}
+        if len(real_tracks) < 2:
+            return
+
+        # Compute median x for each real track
+        track_medians = {tid: int(np.median(cxs)) for tid, cxs in real_tracks.items()}
+
+        # Simple 2-cluster split: sort tracks by median_cx, split at the largest gap
+        sorted_tids = sorted(track_medians.keys(), key=lambda t: track_medians[t])
+        sorted_cxs = [track_medians[t] for t in sorted_tids]
+
+        # Find the largest gap between consecutive track medians
+        if len(sorted_cxs) < 2:
+            return
+        gaps = [(sorted_cxs[i+1] - sorted_cxs[i], i)
+                for i in range(len(sorted_cxs) - 1)]
+        max_gap, split_idx = max(gaps, key=lambda g: g[0])
+
+        # Require meaningful spatial separation (at least 8% of source width).
+        # Lowered from 15% — podcast guests on a couch can be quite close
+        # (492px gap on 3840px = 12.8%, which was rejected at 15%).
+        if max_gap < r.src_w * 0.08:
+            log.log_stage('PERCEIVE',
+                f'Spatial speakers: gap too small ({max_gap}px), skipping')
+            return
+
+        # Assign pseudo-speaker IDs
+        left_tids = set(sorted_tids[:split_idx + 1])
+        right_tids = set(sorted_tids[split_idx + 1:])
+
+        for tid in left_tids:
+            r.track_speaker_map[tid] = 'SPEAKER_LEFT'
+        for tid in right_tids:
+            r.track_speaker_map[tid] = 'SPEAKER_RIGHT'
+
+        # Build speaker_timeline from mouth motion: at each sample, the
+        # track with the most mouth motion determines the active speaker
+        for t in sorted_times:
+            faces = r.face_timeline.get(t, [])
+            best_mouth = 0.0
+            best_speaker = None
+            for f in faces:
+                tid = f.get('track_id', -1)
+                if tid in r.track_speaker_map:
+                    mm = f.get('mouth_motion', 0)
+                    if mm > best_mouth:
+                        best_mouth = mm
+                        best_speaker = r.track_speaker_map[tid]
+            if best_speaker and best_mouth > 0.005:
+                r.speaker_timeline[t] = best_speaker
+
+        log.log_stage('PERCEIVE',
+            f'Spatial speakers: {len(left_tids)} left tracks, '
+            f'{len(right_tids)} right tracks, '
+            f'{len(r.speaker_timeline)} timeline entries '
+            f'(gap={max_gap}px)')
+
+    def _extract_audio_rms(self, r: PerceptionResult):
+        """Extract per-100ms RMS audio energy from the video's audio track.
+        Used for audio-visual correlation — no external dependencies, just numpy."""
+        log = get_logger()
+        try:
+            import tempfile, wave, struct
+            audio_path = tempfile.mktemp(suffix='.wav')
+            result = subprocess.run([
+                'ffmpeg', '-y', '-i', self.path,
+                '-vn', '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le',
+                audio_path
+            ], capture_output=True, timeout=120)
+
+            if not os.path.exists(audio_path):
+                return
+
+            with wave.open(audio_path, 'rb') as wf:
+                n_frames = wf.getnframes()
+                sample_rate = wf.getframerate()
+                raw_data = wf.readframes(n_frames)
+
+            try:
+                os.remove(audio_path)
+            except Exception:
+                pass
+
+            # Convert to numpy float array
+            samples = np.frombuffer(raw_data, dtype=np.int16).astype(np.float32) / 32768.0
+
+            # Compute RMS per 100ms window
+            window_samples = int(sample_rate * 0.1)
+            for i in range(0, len(samples) - window_samples, window_samples):
+                time_ms = int(i / sample_rate * 1000)
+                chunk = samples[i:i + window_samples]
+                rms = float(np.sqrt(np.mean(chunk ** 2)))
+                r.audio_rms[time_ms] = rms
+
+            log.log_stage('PERCEIVE',
+                f'Audio RMS: {len(r.audio_rms)} windows extracted')
+        except Exception as e:
+            log.log_stage('PERCEIVE', f'Audio RMS extraction skipped: {str(e)[:80]}')
+
+    def _correlate_audio_visual(self, r: PerceptionResult):
+        """Identify speakers by correlating audio RMS with per-track mouth motion.
+
+        For each face track, build a time series of mouth-motion values. Then
+        compute Pearson correlation between that series and the audio RMS series.
+        The track with the highest correlation is the one whose mouth moves in
+        sync with the audio — i.e., the speaker.
+
+        This replaces pyannote for speaker identification using only numpy.
+        Works because a speaking person's mouth motion is temporally correlated
+        with audio energy; a listener's mouth motion has near-zero correlation.
+        """
+        log = get_logger()
+        sorted_times = sorted(r.face_timeline.keys())
+
+        # Build per-track mouth motion time series aligned with audio RMS
+        track_mouth_series = {}
+        common_times = sorted(set(sorted_times) & set(r.audio_rms.keys()))
+
+        if len(common_times) < 20:  # not enough data for meaningful correlation
+            return
+
+        # Build aligned audio array
+        audio_arr = np.array([r.audio_rms.get(t, 0) for t in common_times])
+
+        # Build per-track arrays
+        track_cxs = {}
+        for t in common_times:
+            for f in r.face_timeline.get(t, []):
+                tid = f.get('track_id', -1)
+                if tid >= 0:
+                    track_mouth_series.setdefault(tid, {})[t] = f.get('mouth_motion', 0)
+                    track_cxs.setdefault(tid, []).append(f['cx'])
+
+        # Compute Pearson correlation for each track
+        track_correlations = {}
+        for tid, mouth_dict in track_mouth_series.items():
+            if len(mouth_dict) < 20:
+                continue
+            mouth_arr = np.array([mouth_dict.get(t, 0) for t in common_times])
+            # Pearson correlation
+            if np.std(audio_arr) > 0 and np.std(mouth_arr) > 0:
+                corr = float(np.corrcoef(audio_arr, mouth_arr)[0, 1])
+                track_correlations[tid] = corr
+
+        if not track_correlations:
+            return
+
+        # Sort tracks by correlation
+        sorted_tracks = sorted(track_correlations.items(), key=lambda x: x[1], reverse=True)
+
+        # Build track_speaker_map: tracks with positive correlation are speakers
+        # Cluster by spatial position (left vs right)
+        speaker_tracks = [(tid, corr) for tid, corr in sorted_tracks if corr > 0.05]
+        if not speaker_tracks:
+            return
+
+        # Assign speaker labels by spatial position
+        for tid, corr in speaker_tracks:
+            if tid in track_cxs:
+                median_cx = int(np.median(track_cxs[tid]))
+                if median_cx < r.src_w * 0.5:
+                    r.track_speaker_map[tid] = 'SPEAKER_LEFT'
+                else:
+                    r.track_speaker_map[tid] = 'SPEAKER_RIGHT'
+
+        # Build speaker timeline from correlations
+        for t in sorted_times:
+            faces = r.face_timeline.get(t, [])
+            best_corr = -1
+            best_speaker = None
+            for f in faces:
+                tid = f.get('track_id', -1)
+                if tid in track_correlations and tid in r.track_speaker_map:
+                    corr = track_correlations[tid]
+                    mouth = f.get('mouth_motion', 0)
+                    # Weight by both correlation strength and current mouth motion
+                    score = corr * 0.5 + mouth * 0.5
+                    if score > best_corr:
+                        best_corr = score
+                        best_speaker = r.track_speaker_map[tid]
+            if best_speaker and best_corr > 0:
+                r.speaker_timeline[t] = best_speaker
+
+        log.log_stage('PERCEIVE',
+            f'Audio-visual correlation: {len(speaker_tracks)} speaker tracks identified, '
+            f'{len(r.speaker_timeline)} timeline entries, '
+            f'top correlation={sorted_tracks[0][1]:.3f}')
+
+    def _link_tracks_to_speakers(self, r: PerceptionResult):
+        """Link face tracks to audio speakers.
+        For each track, find which speaker is most often active when that
+        track's face has high mouth motion (= that face is speaking)."""
+        track_speaker_votes = {}  # track_id → {speaker_id: vote_count}
+
+        for time_ms, faces in r.face_timeline.items():
+            # Find nearest speaker label (within 200ms)
+            speaker = None
+            for offset in [0, -200, 200, -400, 400]:
+                t = time_ms + offset
+                if t in r.speaker_timeline:
+                    speaker = r.speaker_timeline[t]
+                    break
+            if not speaker:
+                continue
+
+            # Vote: the face with most mouth motion at this time gets the speaker label
+            speaking_faces = [f for f in faces if f.get('mouth_motion', 0) > 0.01]
+            if speaking_faces:
+                best = max(speaking_faces, key=lambda f: f.get('mouth_motion', 0))
+                tid = best.get('track_id', -1)
+                if tid >= 0:
+                    track_speaker_votes.setdefault(tid, {})
+                    track_speaker_votes[tid][speaker] = track_speaker_votes[tid].get(speaker, 0) + 1
+
+        # Assign each track to its most-voted speaker
+        for tid, votes in track_speaker_votes.items():
+            if votes:
+                best_speaker = max(votes, key=votes.get)
+                r.track_speaker_map[tid] = best_speaker
+
+        log = get_logger()
+        log.log_stage('PERCEIVE', f'Track-speaker links: {len(r.track_speaker_map)} tracks mapped',
+                       mapping={str(k): v for k, v in r.track_speaker_map.items()})
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  STAGE 2+3 — CLASSIFY + DECIDE  (scene → strategy → keyframes)
+# ═══════════════════════════════════════════════════════════════════════════
+
