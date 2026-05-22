@@ -4,7 +4,9 @@ The preview player fetches the plan as soon as segments are computed,
 before any export happens, so the user sees exactly what will be exported.
 """
 
+import json
 import logging
+import os
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query
@@ -48,6 +50,20 @@ async def get_render_plan(
     cached_plan = getattr(job, "render_plan", None)
     if cached_plan and mode == "full":
         return cached_plan
+
+    # The reframer pipeline writes the real keyframed RenderPlan to a
+    # sidecar JSON under the job's upload dir (JobResult has no
+    # render_plan field). Serve that for full-video mode — the on-demand
+    # rebuild below only reconstructs a coarse plan from scene metadata
+    # via an inert builder stub, so it would return an empty timeline.
+    if mode == "full":
+        sidecar = os.path.join("/data/uploads", job_id, "render_plan.json")
+        if os.path.isfile(sidecar):
+            try:
+                with open(sidecar) as _f:
+                    return json.load(_f)
+            except Exception as e:
+                logger.warning("[%s] render_plan sidecar unreadable: %s", job_id, e)
 
     # Build on-demand from reframe segments
     segments = _extract_segments(job)
