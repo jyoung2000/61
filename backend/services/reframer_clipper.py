@@ -87,6 +87,11 @@ class ClipperConfig:
     preferred_subjects: str = ""         # e.g. "funny moments, hot takes, drama"
     avoid_subjects: str = ""             # e.g. "sponsor segments, dead air"
 
+    # ── Replicate (cloud GPU) ──
+    replicate_api_key: str = ""
+    replicate_model: str = "lucataco/videollama3-7b"
+    replicate_enabled: bool = True
+
     def save(self, path: str):
         with open(path, 'w') as f:
             json.dump(asdict(self), f, indent=2)
@@ -649,6 +654,167 @@ Respond ONLY with the JSON array, no other text."""
                 torch.cuda.empty_cache()
             except Exception:
                 pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  REPLICATE CLOUD GPU DISCOVERY
+# ═══════════════════════════════════════════════════════════════════════════
+
+class ReplicateDiscovery:
+    """Cloud GPU VideoLLaMA via Replicate API.
+
+    Sends video chunks to Replicate's hosted VideoLLaMA3-7B model.
+    No local GPU required — ideal for GTX 1650 and other low-VRAM systems.
+    Costs ~$0.02 per chunk (~23s processing time per chunk).
+    """
+
+    def __init__(self, api_key: str, model_id: str = "lucataco/videollama3-7b"):
+        self.api_key = api_key
+        self.model_id = model_id
+
+    def is_available(self) -> bool:
+        """True when a Replicate API key is configured."""
+        return bool(self.api_key and self.api_key.strip())
+
+    def discover_clips(self, video_path: str, transcript_segments: list,
+                       signal_timeline: 'SignalTimeline',
+                       chunk_duration_s: int = 600,
+                       max_vlm_chunks: int = 6,
+                       preferred_subjects: str = "",
+                       avoid_subjects: str = "",
+                       platforms: list = None,
+                       on_progress: Callable = None) -> List['ClipCandidate']:
+        """Process video hotspots via Replicate cloud GPU.
+
+        Same two-pass architecture as VideoLLaMA2Discovery:
+        1. signal_timeline ranks chunks by signal density
+        2. Top max_vlm_chunks are uploaded to Replicate for VLM analysis
+        """
+        import replicate as replicate_sdk
+
+        os.environ["REPLICATE_API_TOKEN"] = self.api_key
+
+        duration_s = _get_video_duration(video_path)
+        n_total_chunks = max(1, math.ceil(duration_s / chunk_duration_s))
+
+        # ── Rank chunks by signal density ──
+        chunk_scores = []
+        for i in range(n_total_chunks):
+            start_s = int(i * chunk_duration_s)
+            end_s = int(min((i + 1) * chunk_duration_s, duration_s))
+            score = score_chunk_signals(signal_timeline, start_s, end_s)
+            chunk_scores.append((i, start_s, end_s, score))
+
+        chunk_scores.sort(key=lambda x: x[3], reverse=True)
+
+        n_to_process = min(n_total_chunks, max_vlm_chunks)
+        selected_chunks = chunk_scores[:n_to_process]
+        selected_chunks.sort(key=lambda x: x[1])  # re-sort by time
+
+        logger.info(
+            f"Replicate VLM: {n_total_chunks} total chunks, "
+            f"processing top {n_to_process} by signal density"
+        )
+
+        all_candidates = []
+
+        for idx, (chunk_idx, start_s, end_s, sig_score) in enumerate(selected_chunks):
+            if on_progress:
+                on_progress(idx / max(1, n_to_process))
+
+            chunk_path = None
+            try:
+                chunk_path = _extract_chunk(video_path, start_s, end_s)
+
+                transcript_slice = _slice_transcript(
+                    transcript_segments, start_s, end_s)
+
+                prompt = self._build_discovery_prompt(
+                    start_s, end_s, transcript_slice,
+                    preferred_subjects, avoid_subjects, platforms)
+
+                # Upload video chunk to Replicate
+                logger.info(
+                    f"Replicate: sending chunk {chunk_idx+1} "
+                    f"({_fmt_time(start_s)}–{_fmt_time(end_s)}) to {self.model_id}"
+                )
+
+                with open(chunk_path, "rb") as f:
+                    output = replicate_sdk.run(
+                        self.model_id,
+                        input={
+                            "video": f,
+                            "prompt": prompt,
+                            "max_new_tokens": 1024,
+                            "temperature": 0.1,
+                        },
+                        use_file_output=False,
+                    )
+
+                # Replicate returns an iterator for streaming models
+                if hasattr(output, '__iter__') and not isinstance(output, (str, dict)):
+                    response_text = "".join(str(chunk) for chunk in output)
+                else:
+                    response_text = str(output)
+
+                logger.info(f"Replicate chunk {chunk_idx+1} response: {response_text[:200]}...")
+
+                candidates = _parse_vlm_response(response_text, start_s, end_s)
+                for c in candidates:
+                    c.signal_score = sig_score
+                all_candidates.extend(candidates)
+
+            except Exception as e:
+                logger.warning(f"Replicate error on chunk {chunk_idx+1}: {e}")
+            finally:
+                if chunk_path and os.path.exists(chunk_path):
+                    try:
+                        os.remove(chunk_path)
+                    except OSError:
+                        pass
+
+        if on_progress:
+            on_progress(1.0)
+
+        return all_candidates
+
+    def _build_discovery_prompt(self, start_s, end_s, transcript_slice,
+                                preferred_subjects="", avoid_subjects="",
+                                platforms=None):
+        """Build the same discovery prompt used by VideoLLaMA2Discovery."""
+        platform_str = _format_platforms(platforms)
+        pref_line = ""
+        if preferred_subjects.strip():
+            pref_line = f"\nPRIORITIZE moments with: {preferred_subjects.strip()}"
+        avoid_line = ""
+        if avoid_subjects.strip():
+            avoid_line = f"\nAVOID: {avoid_subjects.strip()}"
+
+        return f"""You are a viral video editor analyzing a video segment from {_fmt_time(start_s)} to {_fmt_time(end_s)}.
+
+TRANSCRIPT FOR THIS SEGMENT:
+{transcript_slice}
+
+Watch and listen carefully to this segment. Identify the 2-3 most compelling moments that would make strong standalone short-form clips (15-60 seconds) for {platform_str}.
+
+Look for:
+- Emotional peaks (laughter, surprise, anger, excitement)
+- Strong opinions or hot takes
+- Funny or unexpected moments
+- "Aha" revelations or surprising facts
+- Confrontation or debate
+- Music/audio energy spikes
+- Visual moments that would stop someone from scrolling
+{pref_line}{avoid_line}
+
+For each moment, respond in this exact JSON format:
+[
+  {{"timestamp": "MM:SS", "duration": 30, "reason": "one sentence why this is clip-worthy", "hook": "suggested opening line for the clip"}},
+  ...
+]
+
+Timestamps are relative to the START of this segment ({_fmt_time(start_s)}).
+Respond ONLY with the JSON array, no other text."""
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1602,7 +1768,32 @@ class ClipExtractor:
         # ── PASS 2: VLM DISCOVERY (GPU, capped) ──────────────
         vlm_candidates = []
 
-        if self.config.videollama2_enabled:
+        # Priority 1: Replicate cloud GPU (no local VRAM needed)
+        if self.config.replicate_enabled and self.config.replicate_api_key:
+            rep = ReplicateDiscovery(
+                api_key=self.config.replicate_api_key,
+                model_id=self.config.replicate_model)
+            if rep.is_available():
+                try:
+                    logger.info("Pass 2: Replicate cloud VideoLLaMA discovery...")
+                    vlm_candidates = rep.discover_clips(
+                        self.video_path,
+                        self.transcript,
+                        signal_timeline=signals,
+                        chunk_duration_s=self.config.chunk_duration_s,
+                        max_vlm_chunks=self.config.max_vlm_chunks,
+                        preferred_subjects=self.config.preferred_subjects,
+                        avoid_subjects=self.config.avoid_subjects,
+                        platforms=self.config.platforms,
+                        on_progress=lambda p: on_progress(
+                            0.15 + p * 0.40) if on_progress else None
+                    )
+                    logger.info(f"Replicate discovered {len(vlm_candidates)} candidates")
+                except Exception as e:
+                    logger.warning(f"Replicate VLM failed: {e} — falling back to local")
+
+        # Priority 2: Local VideoLLaMA2 (needs ≥10GB VRAM)
+        if not vlm_candidates and self.config.videollama2_enabled:
             vlm = VideoLLaMA2Discovery(
                 model_id=self.config.videollama2_model,
                 quantize=self.config.videollama2_quantize)

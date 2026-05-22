@@ -335,6 +335,7 @@ _PROVIDER_KEY_ENV = {
     "anthropic": "ANTHROPIC_API_KEY",
     "gemini": "GEMINI_API_KEY",
     "groq": "GROQ_API_KEY",
+    "replicate": "REPLICATE_API_KEY",
     "huggingface": "HF_AUTH_TOKEN",
 }
 
@@ -562,6 +563,15 @@ async def provider_status():
     else:
         statuses["groq"] = {"status": "not_configured"}
 
+    # Replicate (cloud GPU for VideoLLaMA)
+    if _key_is_set(settings.REPLICATE_API_KEY):
+        statuses["replicate"] = {
+            "status": "configured",
+            "model": settings.REPLICATE_MODEL,
+        }
+    else:
+        statuses["replicate"] = {"status": "not_configured"}
+
     # HuggingFace (speaker diarization)
     hf_token = settings.HF_AUTH_TOKEN
     if hf_token and hf_token.strip():
@@ -612,8 +622,11 @@ async def provider_status():
         "primary_model": active_primary_model or "",
         "editorial_model": active_editorial_model or "",
         "videollama2_available": _videollama2_ok,
+        "replicate_available": _key_is_set(settings.REPLICATE_API_KEY) and settings.REPLICATE_ENABLED,
+        "replicate_model": settings.REPLICATE_MODEL if _key_is_set(settings.REPLICATE_API_KEY) else "",
         "primary_type": (
-            "videollama2" if _videollama2_ok
+            "replicate" if (_key_is_set(settings.REPLICATE_API_KEY) and settings.REPLICATE_ENABLED)
+            else "videollama2" if _videollama2_ok
             else ("ollama" if active_provider == "ollama" else "cloud")
         ),
         # ── Backward-compat keys — kept so any UI not yet migrated to the
@@ -645,6 +658,8 @@ async def test_provider(provider_name: str):
         return await _test_gemini()
     elif provider_name == "groq":
         return await _test_groq()
+    elif provider_name == "replicate":
+        return await _test_replicate()
     elif provider_name == "huggingface":
         return await _test_huggingface()
     else:
@@ -856,6 +871,40 @@ async def _test_groq():
                 return {"status": "error", "message": f"Groq responded with status {resp.status_code}."}
     except Exception as e:
         return {"status": "error", "message": f"Connection failed: {str(e)[:200]}"}
+
+
+async def _test_replicate():
+    """Test Replicate API connectivity by hitting their /v1/models endpoint."""
+    key = settings.REPLICATE_API_KEY
+    if not _key_is_set(key):
+        return {"status": "not_configured", "message": "No Replicate API key set"}
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            # Hit the model version endpoint to verify key + model access
+            model_id = settings.REPLICATE_MODEL
+            resp = await client.get(
+                f"https://api.replicate.com/v1/models/{model_id}",
+                headers={"Authorization": f"Bearer {key}"},
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                desc = data.get("description", "")[:80]
+                return {
+                    "status": "connected",
+                    "message": f"Replicate connected — model: {model_id} — {desc}",
+                }
+            elif resp.status_code == 401:
+                return {"status": "invalid_key", "message": "Invalid Replicate API token"}
+            elif resp.status_code == 404:
+                return {
+                    "status": "error",
+                    "message": f"Model '{model_id}' not found on Replicate. Check the model ID.",
+                }
+            else:
+                return {"status": "error", "message": f"Replicate returned HTTP {resp.status_code}"}
+    except Exception as e:
+        return {"status": "error", "message": f"Cannot reach Replicate API: {e}"}
 
 
 async def _test_huggingface():

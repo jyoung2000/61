@@ -16,6 +16,7 @@ const PROVIDER_KEYS = [
   { name: 'openrouter', label: 'OpenRouter', placeholder: 'sk-or-v1-...', helpUrl: 'https://openrouter.ai/keys', helpText: '300+ AI models through one key — free tier available' },
   { name: 'anthropic', label: 'Anthropic', placeholder: 'sk-ant-...', helpUrl: 'https://console.anthropic.com/settings/keys', helpText: 'Claude models — best for complex reasoning' },
   { name: 'gemini', label: 'Google Gemini', placeholder: 'AIza...', helpUrl: 'https://aistudio.google.com/apikey', helpText: 'Gemini models — great vision + long context' },
+  { name: 'replicate', label: 'Replicate (Cloud GPU)', placeholder: 'r8_...', helpUrl: 'https://replicate.com/account/api-tokens', helpText: 'Cloud GPU for VideoLLaMA — no local VRAM needed (~$0.02/clip chunk)' },
 ];
 
 // Shared styles
@@ -404,6 +405,7 @@ export default function Settings() {
     anthropic:  'ANTHROPIC_API_KEY',
     gemini:     'GEMINI_API_KEY',
     groq:       'GROQ_API_KEY',
+    replicate:  'REPLICATE_API_KEY',
     huggingface: 'HF_AUTH_TOKEN',
   };
 
@@ -1094,9 +1096,11 @@ export default function Settings() {
                 { label: 'Transcript', model: active.transcript_model || currentModels.transcript_model || 'small', color: 'var(--accent-amber)' },
                 {
                   label: 'Primary AI',
-                  model: active.videollama2_available
-                    ? 'VideoLLaMA2.1-7B-AV'
-                    : (active.primary_model || currentModels.primary_model),
+                  model: active.replicate_available
+                    ? `Replicate: ${(active.replicate_model || 'videollama3-7b').replace(/^.*\//, '')}`
+                    : active.videollama2_available
+                      ? 'VideoLLaMA2.1-7B-AV'
+                      : (active.primary_model || currentModels.primary_model),
                   color: 'var(--accent-cyan)',
                 },
                 { label: 'Editorial AI', model: active.editorial_model || currentModels.editorial_model, color: 'var(--success)' },
@@ -1514,7 +1518,7 @@ export default function Settings() {
                 )}
               </div>
 
-              {/* ── VideoLLaMA2 (Primary AI) status ── */}
+              {/* ── Primary AI (Replicate / VideoLLaMA2) status ── */}
               <div style={{
                 background: 'var(--bg-elevated)', border: '1px solid var(--border)',
                 borderRadius: 'var(--radius-sm)', padding: '12px 14px', marginBottom: 12,
@@ -1522,22 +1526,30 @@ export default function Settings() {
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
                   <div>
                     <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 2 }}>
-                      VideoLLaMA2 (Primary AI)
+                      {active.replicate_available ? 'Replicate Cloud GPU (Primary AI)' : 'VideoLLaMA2 (Primary AI)'}
                     </div>
                     <div style={{ fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.4 }}>
-                      Audio-visual AI that watches and listens to your video — detects laughter,
-                      applause, music energy and visual moments. Requires ≥10GB VRAM (RTX 4070+);
-                      falls back to Ollama or cloud on smaller GPUs.
+                      {active.replicate_available
+                        ? `Using ${(active.replicate_model || 'videollama3-7b').replace(/^.*\//, '')} on Replicate cloud GPU — no local VRAM needed.`
+                        : 'Audio-visual AI that watches and listens to your video. Requires ≥10GB VRAM (RTX 4070+); add a Replicate API key above to use cloud GPU instead.'
+                      }
                     </div>
                   </div>
                   <div style={{
                     padding: '4px 10px', borderRadius: 'var(--radius-sm)', fontSize: 10,
                     fontWeight: 600, fontFamily: 'var(--font-mono)', whiteSpace: 'nowrap',
-                    background: active.videollama2_available ? 'rgba(34,197,94,0.15)' : 'rgba(239,68,68,0.15)',
-                    color: active.videollama2_available ? 'var(--success)' : 'var(--danger)',
-                    border: `1px solid ${active.videollama2_available ? 'rgba(34,197,94,0.3)' : 'rgba(239,68,68,0.3)'}`,
+                    background: (active.replicate_available || active.videollama2_available)
+                      ? 'rgba(34,197,94,0.15)' : 'rgba(239,68,68,0.15)',
+                    color: (active.replicate_available || active.videollama2_available)
+                      ? 'var(--success)' : 'var(--danger)',
+                    border: `1px solid ${(active.replicate_available || active.videollama2_available)
+                      ? 'rgba(34,197,94,0.3)' : 'rgba(239,68,68,0.3)'}`,
                   }}>
-                    {active.videollama2_available ? '● Available' : '○ Using fallback'}
+                    {active.replicate_available
+                      ? '● Cloud GPU'
+                      : active.videollama2_available
+                        ? '● Local GPU'
+                        : '○ Using fallback'}
                   </div>
                 </div>
               </div>
@@ -1548,7 +1560,7 @@ export default function Settings() {
                 pendingValue={pendingModels.primary_model}
                 savedValue={currentModels.primary_model}
                 label="Primary AI Fallback"
-                desc="Used when VideoLLaMA2 is not available. Analyzes video frames for clip discovery and scene understanding. Requires a vision-capable model."
+                desc="Used when Replicate and VideoLLaMA2 are not available. Analyzes video frames for clip discovery and scene understanding. Requires a vision-capable model."
               />
               <ModelDropdown
                 task="editorial"

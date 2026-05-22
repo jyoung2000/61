@@ -46,6 +46,14 @@ class Settings(BaseSettings):
     VIDEOLLAMA2_MODEL: str = "DAMO-NLP-SG/VideoLLaMA2.1-7B-AV"
     VIDEOLLAMA2_QUANTIZE: str = "int8"
 
+    # Replicate — cloud GPU inference for VideoLLaMA.
+    # When set, the clipper sends video chunks to Replicate's hosted
+    # VideoLLaMA3-7B instead of requiring a local 10GB+ VRAM GPU.
+    # This is the recommended path for GTX 1650 / low-VRAM systems.
+    REPLICATE_API_KEY: str = ""
+    REPLICATE_MODEL: str = "lucataco/videollama3-7b"
+    REPLICATE_ENABLED: bool = True   # user toggle — disable to skip Replicate even if key is set
+
     # Fallback chain (ollama excluded by default — user can enable it in Settings)
     AI_FALLBACK_CHAIN: str = "openrouter,gemini,groq"
 

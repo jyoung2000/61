@@ -1403,6 +1403,11 @@ async def _run_analysis_inner(job_id: str):
             from backend.services.reframer_clipper import ClipExtractor, ClipperConfig
             clipper_config = ClipperConfig.load(
                 os.path.join(_PROJECT_ROOT, "clipper_config.json"))
+            # Replicate cloud GPU is configured via app settings, not the
+            # clipper_config.json file — overlay it so the clipper sees it.
+            clipper_config.replicate_api_key = settings.REPLICATE_API_KEY
+            clipper_config.replicate_model = settings.REPLICATE_MODEL
+            clipper_config.replicate_enabled = settings.REPLICATE_ENABLED
             clip_extractor = ClipExtractor(
                 video_path=video_path,
                 perception=perception,
