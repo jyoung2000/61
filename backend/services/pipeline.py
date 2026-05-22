@@ -1408,9 +1408,10 @@ async def _run_analysis_inner(job_id: str):
                 "[%s] VLM summary failed (%s) — falling back to transcript summary",
                 job_id, _se,
             )
-    if summary is None or not has_real_summary_content(summary):
+    summary_dict = summary.model_dump() if hasattr(summary, "model_dump") else summary
+    if summary is None or not has_real_summary_content(summary_dict):
         try:
-            summary = build_summary_from_transcript(transcript)
+            summary = VideoSummary(**build_summary_from_transcript(transcript, scenes))
         except Exception:
             summary = VideoSummary(
                 overview="Summary unavailable for this video.",
