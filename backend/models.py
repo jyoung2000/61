@@ -233,6 +233,9 @@ class JobResult(BaseModel):
     #          "conf": 0..1, "source": "face"|"saliency"|"object"|"scene"|"hold"}]
     subject_track: list[dict] = []
     tracking_mode: str = ""  # "continuous" | "multi_cluster" | "gameplay" — set by pipeline after face analysis
+    # Reframe quality grade — A-F grade, 0-100 overall score and per-axis
+    # sub-scores produced by reframe_evaluator after the reframer plan is built.
+    reframe_report: Optional[dict] = None
     # Phase 1 + 2 — content-type override pipeline.
     # ``content_type_override`` accepts every UI dropdown value: the
     # legacy ones (gameplay / podcast / movie) PLUS the Phase 2

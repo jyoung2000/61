@@ -9,6 +9,7 @@ import ProgressBar from '../components/ProgressBar';
 import SceneCard from '../components/SceneCard';
 import TranscriptViewer from '../components/TranscriptViewer';
 import ClipCard from '../components/ClipCard';
+import ReframeGrade from '../components/ReframeGrade';
 import sanitizeJob, { sanitizeSubtitleSettings } from '../utils/sanitizeJob';
 import { sendNotification, requestNotificationPermission } from '../utils/notifications';
 import ClipSettingsPanel from '../components/ClipSettingsPanel';
@@ -2933,6 +2934,9 @@ export default function Analysis() {
             <div style={{ textAlign: 'center', padding: 48, color: 'var(--text-muted)' }}>
               {isProcessing ? 'Generating summary...' : 'No summary available'}
             </div>
+          )}
+          {job.reframe_report && (
+            <ReframeGrade report={job.reframe_report} isMobile={isMobile} />
           )}
         </div>
       )}
