@@ -1,0 +1,19 @@
+{
+  "videollama2_enabled": false,
+  "videollama2_model": "DAMO-NLP-SG/VideoLLaMA2.1-7B-AV",
+  "videollama2_quantize": "int8",
+  "chunk_duration_s": 600,
+  "max_vlm_chunks": 6,
+  "cloud_backend": "openrouter",
+  "google_ai_key": "",
+  "google_ai_model": "gemini-2.0-flash",
+  "openrouter_key": "",
+  "openrouter_model": "google/gemini-3-flash-preview",
+  "platforms": ["tiktok", "reels", "shorts"],
+  "max_clips": 0,
+  "min_duration_s": 45,
+  "max_duration_s": 300,
+  "ideal_duration_s": 60,
+  "preferred_subjects": "",
+  "avoid_subjects": ""
+}
