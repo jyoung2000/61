@@ -176,10 +176,6 @@ class Perceiver:
                 class_counts = {}
                 class_confs = {}
 
-                # Save and hide CUDA for YOLO CPU inference
-                _disco_cuda = os.environ.get('CUDA_VISIBLE_DEVICES')
-                os.environ['CUDA_VISIBLE_DEVICES'] = ''
-
                 for dt in discovery_times:
                     cap.set(cv2.CAP_PROP_POS_MSEC, dt)
                     ret, frame = cap.read()
@@ -192,9 +188,10 @@ class Perceiver:
                         frame = cv2.resize(frame, (640, int(frame.shape[0] * scale)))
 
                     try:
-                        os.environ['CUDA_VISIBLE_DEVICES'] = ''
-                        results = self.face_detector._yolo_model.predict(
-                            frame, verbose=False, conf=0.25, max_det=20, device='cpu')
+                        # _yolo_predict() runs on the FaceDetector's chosen
+                        # device (GPU when available) and handles CPU fallback.
+                        results = self.face_detector._yolo_predict(
+                            frame, verbose=False, conf=0.25, max_det=20)
                         for r_det in results:
                             if r_det.boxes is not None:
                                 for box in r_det.boxes:
@@ -207,12 +204,6 @@ class Perceiver:
                                             class_confs.get(cls_name, 0), conf_val)
                     except Exception:
                         pass
-
-                # Restore CUDA for other tools
-                if _disco_cuda is not None:
-                    os.environ['CUDA_VISIBLE_DEVICES'] = _disco_cuda
-                elif 'CUDA_VISIBLE_DEVICES' in os.environ:
-                    del os.environ['CUDA_VISIBLE_DEVICES']
 
                 # Build final vocab: always include "person" + "head",
                 # plus any class detected 2+ times with decent confidence

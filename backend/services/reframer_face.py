@@ -28,6 +28,32 @@ from backend.services.reframer_models import (
 logger = logging.getLogger("clipai.reframer_face")
 
 
+def _pick_yolo_device():
+    """Choose the device for YOLO-World inference.
+
+    Returns ``0`` (first CUDA GPU) when a GPU with enough free VRAM is
+    present, else ``'cpu'``. GPU inference is ~20x faster than CPU for the
+    per-frame subject pass and produces identical detections, so it is the
+    single biggest analysis-speed win on a capable GPU.
+
+    Override with the ``CLIPAI_REFRAMER_YOLO_DEVICE`` env var
+    (``cpu`` | ``cuda`` | ``auto``). The 6.5GB free-VRAM gate keeps small
+    cards (e.g. a 4GB GTX 1650) on CPU so YOLO never starves the VLM stage.
+    """
+    forced = os.environ.get("CLIPAI_REFRAMER_YOLO_DEVICE", "auto").strip().lower()
+    if forced == "cpu":
+        return "cpu"
+    try:
+        import torch
+        if torch.cuda.is_available():
+            free_mb = torch.cuda.mem_get_info()[0] / 1024 / 1024
+            if forced in ("cuda", "gpu", "0") or free_mb >= 6500:
+                return 0
+    except Exception:
+        pass
+    return "cpu"
+
+
 class FaceDetector:
     """
     Tiered face detector — prioritizes ACTUAL face detectors over person detectors.
@@ -47,6 +73,7 @@ class FaceDetector:
         self.confidence = confidence
         self.tier = 'none'
         self._yolo_model = None
+        self._yolo_device = _pick_yolo_device()  # 0 (GPU) or 'cpu'
         self._dnn_net = None
         self._haar_face = None
         self._haar_eye = None
@@ -125,8 +152,10 @@ class FaceDetector:
                 if not os.path.exists(world_path):
                     world_path = "yolov8n.pt"
 
-            # Hide GPU from YOLO to prevent torchvision::nms CUDA backend error
-            os.environ['CUDA_VISIBLE_DEVICES'] = ''
+            # Hide the GPU from YOLO only when CPU is the chosen device. With
+            # a GPU selected, leave CUDA visible so .predict(device=0) works.
+            if self._yolo_device == 'cpu':
+                os.environ['CUDA_VISIBLE_DEVICES'] = ''
             self._yolo_model = YOLO(world_path)
 
             # Set broad scene-understanding classes for YOLO-World
@@ -158,20 +187,22 @@ class FaceDetector:
             else:
                 is_world_model = False
 
-            # Test inference
+            # Test inference — confirms the chosen device works and triggers
+            # the CPU fallback now (not mid-run) if the GPU path is broken.
             test = np.zeros((64, 64, 3), dtype=np.uint8)
-            self._yolo_model.predict(test, verbose=False, device='cpu')
+            self._yolo_predict(test, verbose=False)
+            _yolo_dev_label = 'GPU' if self._yolo_device != 'cpu' else 'CPU'
 
             if is_world_model:
                 log.log_stage('PERCEIVE',
-                    'YOLO-World v2 loaded as scene-aware subject detector (CPU)')
+                    f'YOLO-World v2 loaded as scene-aware subject detector ({_yolo_dev_label})')
             elif self.tier == 'yunet':
                 log.log_stage('PERCEIVE',
-                    'YOLO loaded as person-detection helper for YuNet (CPU)')
+                    f'YOLO loaded as person-detection helper for YuNet ({_yolo_dev_label})')
             else:
                 self.tier = 'yolo_only'
                 log.log_stage('PERCEIVE',
-                    'Face detector: YOLO + Haar combined (CPU)')
+                    f'Face detector: YOLO + Haar combined ({_yolo_dev_label})')
         except Exception as e:
             log.log_stage('PERCEIVE', f'YOLO unavailable: {str(e)[:100]}')
         finally:
@@ -222,6 +253,26 @@ class FaceDetector:
                 log.log_stage('PERCEIVE', 'SFace face recognizer loaded')
         except Exception as e:
             log.log_stage('PERCEIVE', f'SFace unavailable (track identity disabled): {str(e)[:80]}')
+
+    def _yolo_predict(self, *args, **kwargs):
+        """Run YOLO ``.predict()`` on the configured device.
+
+        If a GPU inference call fails (e.g. a torchvision NMS CUDA backend
+        mismatch), permanently fall back to CPU for the rest of this run so
+        analysis degrades gracefully instead of crashing.
+        """
+        kwargs.pop('device', None)
+        try:
+            return self._yolo_predict(*args, device=self._yolo_device, **kwargs)
+        except Exception as e:
+            if self._yolo_device != 'cpu':
+                logger.warning(
+                    "YOLO GPU inference failed (%s) — falling back to CPU",
+                    str(e)[:140],
+                )
+                self._yolo_device = 'cpu'
+                return self._yolo_predict(*args, device='cpu', **kwargs)
+            raise
 
     def compute_embedding(self, frame_bgr, face_dict: dict) -> Optional[np.ndarray]:
         """Compute a 128-dim face embedding for identity matching.
@@ -477,7 +528,7 @@ class FaceDetector:
             kwargs = dict(verbose=False, conf=0.3, max_det=15, device='cpu')
             if not has_world_classes:
                 kwargs['classes'] = [0]  # person only for standard YOLO
-            results = self._yolo_model.predict(frame_bgr, **kwargs)
+            results = self._yolo_predict(frame_bgr, **kwargs)
         except Exception:
             return [], []
         person_boxes = []
@@ -527,7 +578,7 @@ class FaceDetector:
             kwargs = dict(verbose=False, conf=0.3, max_det=15, device='cpu')
             if not has_world_classes:
                 kwargs['classes'] = [0]  # person only for standard YOLO
-            results = self._yolo_model.predict(frame_bgr, **kwargs)
+            results = self._yolo_predict(frame_bgr, **kwargs)
         except Exception:
             return []
         boxes = []
@@ -1083,7 +1134,7 @@ class FaceDetector:
         """Use YOLO to find people, then run DNN face detector on each person region.
         Catches faces that DNN misses at full-frame scale (angled, small, occluded)."""
         h, w = frame_bgr.shape[:2]
-        results = self._yolo_model.predict(
+        results = self._yolo_predict(
             frame_bgr, verbose=False, conf=0.4, classes=[0], max_det=10,
             device='cpu')
 
@@ -1139,7 +1190,7 @@ class FaceDetector:
     def _detect_yolo_assisted_haar(self, frame_bgr, conf) -> List[dict]:
         """Use YOLO to find people, then run relaxed Haar inside each person's head region."""
         h, w = frame_bgr.shape[:2]
-        results = self._yolo_model.predict(
+        results = self._yolo_predict(
             frame_bgr, verbose=False, conf=0.3, classes=[0], max_det=10,
             device='cpu')
 
