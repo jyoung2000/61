@@ -1455,6 +1455,21 @@ async def _run_analysis_inner(job_id: str):
             clipper_config.replicate_api_key = settings.REPLICATE_API_KEY
             clipper_config.replicate_model = settings.REPLICATE_MODEL
             clipper_config.replicate_enabled = settings.REPLICATE_ENABLED
+            # Clip-generation defaults from Settings > Clip Generation.
+            if settings.CLIP_MIN_DURATION:
+                clipper_config.min_duration_s = settings.CLIP_MIN_DURATION
+            if settings.CLIP_MAX_DURATION:
+                clipper_config.max_duration_s = settings.CLIP_MAX_DURATION
+            clipper_config.ideal_duration_s = max(
+                clipper_config.min_duration_s,
+                min(clipper_config.max_duration_s,
+                    (clipper_config.min_duration_s + clipper_config.max_duration_s) // 2))
+            clipper_config.max_clips = settings.CLIP_COUNT
+            if settings.CLIP_PREFERRED_SUBJECTS:
+                clipper_config.preferred_subjects = settings.CLIP_PREFERRED_SUBJECTS
+            if settings.CLIP_AVOID_SUBJECTS:
+                clipper_config.avoid_subjects = settings.CLIP_AVOID_SUBJECTS
+            clipper_config.discovery_prompt = settings.CLIP_DISCOVERY_PROMPT
             clip_extractor = ClipExtractor(
                 video_path=video_path,
                 perception=perception,

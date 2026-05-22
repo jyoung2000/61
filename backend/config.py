@@ -93,6 +93,16 @@ class Settings(BaseSettings):
     WHISPER_AUTO_UPGRADE: bool = True
     FRAME_SAMPLE_RATE: int = 10        # seconds between frames (lower=more detail, slower)
     MAX_CLIP_CANDIDATES: int = 12
+
+    # ── Clip generation (Primary AI / VideoLLaMA3) defaults ──
+    # Exposed in Settings > Clip Generation and overlaid onto the clipper
+    # config so the upload pipeline + the regenerate path both honor them.
+    CLIP_MIN_DURATION: int = 60        # seconds — shortest clip
+    CLIP_MAX_DURATION: int = 300       # seconds — longest clip
+    CLIP_COUNT: int = 0                # 0 = auto (scales with video length)
+    CLIP_PREFERRED_SUBJECTS: str = ""  # topics to prioritize, comma-separated
+    CLIP_AVOID_SUBJECTS: str = ""      # topics to skip, comma-separated
+    CLIP_DISCOVERY_PROMPT: str = ""    # custom VideoLLaMA3 prompt; "" = built-in default
     # Adaptive frame extraction
     MIN_FRAMES: int = 30               # minimum for any video
     FRAMES_PER_MINUTE: float = 6       # target density (first 30 min; diminishes for longer videos)

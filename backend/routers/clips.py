@@ -775,6 +775,18 @@ async def _discover_clips_videollama3(job_id, job, transcript, duration, req):
 
     cfg = ClipperConfig.load(os.path.join(
         os.path.dirname(__file__), "..", "..", "clipper_config.json"))
+    # Global defaults from Settings > Clip Generation.
+    if settings.CLIP_MIN_DURATION:
+        cfg.min_duration_s = settings.CLIP_MIN_DURATION
+    if settings.CLIP_MAX_DURATION:
+        cfg.max_duration_s = settings.CLIP_MAX_DURATION
+    cfg.max_clips = settings.CLIP_COUNT
+    if settings.CLIP_PREFERRED_SUBJECTS:
+        cfg.preferred_subjects = settings.CLIP_PREFERRED_SUBJECTS
+    if settings.CLIP_AVOID_SUBJECTS:
+        cfg.avoid_subjects = settings.CLIP_AVOID_SUBJECTS
+    cfg.discovery_prompt = settings.CLIP_DISCOVERY_PROMPT
+    # Per-request overrides from the Analysis-page controls.
     if req.min_duration:
         cfg.min_duration_s = int(req.min_duration)
     if req.max_duration:
@@ -801,6 +813,7 @@ async def _discover_clips_videollama3(job_id, job, transcript, duration, req):
             min_dur_s=cfg.min_duration_s,
             max_dur_s=cfg.max_duration_s,
             ideal_dur_s=cfg.ideal_duration_s,
+            discovery_prompt=cfg.discovery_prompt,
         )
 
     candidates = await asyncio.to_thread(_run)

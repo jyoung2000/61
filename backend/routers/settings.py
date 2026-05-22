@@ -53,6 +53,8 @@ _PERSISTABLE_KEYS = [
     "OPENROUTER_SUMMARY_MODEL", "OLLAMA_PRIMARY_MODEL", "OLLAMA_EDITORIAL_MODEL", "OLLAMA_TRANSLATION_MODEL",
     "WHISPER_MODEL", "WHISPER_MODEL_USER_SET", "WHISPER_BEAM_SIZE",
     "WHISPER_VAD_FILTER", "FRAME_SAMPLE_RATE", "SUBJECT_TRACKING_ENABLED",
+    "CLIP_MIN_DURATION", "CLIP_MAX_DURATION", "CLIP_COUNT",
+    "CLIP_PREFERRED_SUBJECTS", "CLIP_AVOID_SUBJECTS", "CLIP_DISCOVERY_PROMPT",
     "FFMPEG_PRESET", "FFMPEG_CRF", "FFMPEG_THREADS", "FFMPEG_FASTSTART",
     "GPU_ACCELERATION_ENABLED", "GPU_VENDOR_OVERRIDE",
     "GPU_HWDECODE_ENABLED", "GPU_HEVC_FOR_4K", "GPU_DEVICE_INDEX",
@@ -2090,6 +2092,70 @@ async def save_transcription_settings(req: SaveTranscriptionSettingsRequest):
         "vad_filter": settings.WHISPER_VAD_FILTER,
         "frame_sample_rate": settings.FRAME_SAMPLE_RATE,
     }
+
+
+# ── Clip Generation Settings (Primary AI / VideoLLaMA3) ───────────
+
+class SaveClipGenerationRequest(BaseModel):
+    min_duration: Optional[int] = None
+    max_duration: Optional[int] = None
+    clip_count: Optional[int] = None
+    preferred_subjects: Optional[str] = None
+    avoid_subjects: Optional[str] = None
+    discovery_prompt: Optional[str] = None  # "" = revert to the built-in default
+
+
+def _clip_generation_state() -> dict:
+    """Current clip-generation settings plus the built-in defaults the
+    UI needs to drive its reset-to-default button."""
+    from backend.services.reframer_clipper import DEFAULT_DISCOVERY_PROMPT
+    return {
+        "min_duration": settings.CLIP_MIN_DURATION,
+        "max_duration": settings.CLIP_MAX_DURATION,
+        "clip_count": settings.CLIP_COUNT,
+        "preferred_subjects": settings.CLIP_PREFERRED_SUBJECTS,
+        "avoid_subjects": settings.CLIP_AVOID_SUBJECTS,
+        "discovery_prompt": settings.CLIP_DISCOVERY_PROMPT,
+        "default_discovery_prompt": DEFAULT_DISCOVERY_PROMPT,
+        "defaults": {
+            "min_duration": 60,
+            "max_duration": 300,
+            "clip_count": 0,
+            "preferred_subjects": "",
+            "avoid_subjects": "",
+        },
+    }
+
+
+@router.get("/clip-generation/settings")
+async def get_clip_generation_settings():
+    """Return the clip-generation (Primary AI) settings + their defaults."""
+    return _clip_generation_state()
+
+
+@router.post("/clip-generation/settings")
+async def save_clip_generation_settings(req: SaveClipGenerationRequest):
+    """Save clip-generation settings. They are overlaid onto the clipper
+    config so the upload pipeline and the regenerate path both honor them.
+    An empty discovery_prompt reverts VideoLLaMA3 to its built-in prompt."""
+    if req.min_duration is not None:
+        settings.CLIP_MIN_DURATION = max(5, min(1800, int(req.min_duration)))
+    if req.max_duration is not None:
+        settings.CLIP_MAX_DURATION = max(5, min(3600, int(req.max_duration)))
+    if settings.CLIP_MIN_DURATION > settings.CLIP_MAX_DURATION:
+        settings.CLIP_MIN_DURATION, settings.CLIP_MAX_DURATION = (
+            settings.CLIP_MAX_DURATION, settings.CLIP_MIN_DURATION)
+    if req.clip_count is not None:
+        settings.CLIP_COUNT = max(0, min(100, int(req.clip_count)))
+    if req.preferred_subjects is not None:
+        settings.CLIP_PREFERRED_SUBJECTS = req.preferred_subjects.strip()
+    if req.avoid_subjects is not None:
+        settings.CLIP_AVOID_SUBJECTS = req.avoid_subjects.strip()
+    if req.discovery_prompt is not None:
+        settings.CLIP_DISCOVERY_PROMPT = req.discovery_prompt.strip()
+    _invalidate_status_cache()
+    _persist_user_settings()
+    return {"status": "saved", **_clip_generation_state()}
 
 
 # ── Encoding Settings ─────────────────────────────────────────────

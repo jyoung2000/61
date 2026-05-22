@@ -87,6 +87,9 @@ class ClipperConfig:
     preferred_subjects: str = ""         # e.g. "funny moments, hot takes, drama"
     avoid_subjects: str = ""             # e.g. "sponsor segments, dead air"
 
+    # ── Editable VideoLLaMA discovery prompt ("" = built-in default) ──
+    discovery_prompt: str = ""
+
     # ── Replicate (cloud GPU) ──
     replicate_api_key: str = ""
     replicate_model: str = "lucataco/videollama3-7b"
@@ -660,6 +663,33 @@ Respond ONLY with the JSON array, no other text."""
 #  REPLICATE CLOUD GPU DISCOVERY
 # ═══════════════════════════════════════════════════════════════════════════
 
+DEFAULT_DISCOVERY_PROMPT = """You are a viral video editor analyzing a video segment from {start} to {end}.
+
+TRANSCRIPT FOR THIS SEGMENT:
+{transcript}
+
+Watch and listen carefully to this segment. Identify the 2-3 most compelling moments that would make strong standalone short-form clips, each {min_duration}-{max_duration} seconds long (ideally about {ideal_duration}s), for {platforms}.
+
+Look for:
+- Emotional peaks (laughter, surprise, anger, excitement)
+- Strong opinions or hot takes
+- Funny or unexpected moments
+- "Aha" revelations or surprising facts
+- Confrontation or debate
+- Music/audio energy spikes
+- Visual moments that would stop someone from scrolling
+{preferred}{avoid}
+
+For each moment, respond in this exact JSON format:
+[
+  {"timestamp": "MM:SS", "duration": {ideal_duration}, "reason": "one sentence why this is clip-worthy", "hook": "suggested opening line for the clip"},
+  ...
+]
+
+Timestamps are relative to the START of this segment ({start}).
+Respond ONLY with the JSON array, no other text."""
+
+
 class ReplicateDiscovery:
     """Cloud GPU VideoLLaMA via Replicate API.
 
@@ -686,6 +716,7 @@ class ReplicateDiscovery:
                        min_dur_s: int = 60,
                        max_dur_s: int = 300,
                        ideal_dur_s: int = 150,
+                       discovery_prompt: str = "",
                        on_progress: Callable = None) -> List['ClipCandidate']:
         """Process video hotspots via Replicate cloud GPU.
 
@@ -735,7 +766,8 @@ class ReplicateDiscovery:
                 prompt = self._build_discovery_prompt(
                     start_s, end_s, transcript_slice,
                     preferred_subjects, avoid_subjects, platforms,
-                    min_dur_s, max_dur_s, ideal_dur_s)
+                    min_dur_s, max_dur_s, ideal_dur_s,
+                    template=discovery_prompt)
 
                 # Upload video chunk to Replicate
                 logger.info(
@@ -785,41 +817,34 @@ class ReplicateDiscovery:
     def _build_discovery_prompt(self, start_s, end_s, transcript_slice,
                                 preferred_subjects="", avoid_subjects="",
                                 platforms=None, min_dur_s=60, max_dur_s=300,
-                                ideal_dur_s=150):
-        """Build the same discovery prompt used by VideoLLaMA2Discovery."""
+                                ideal_dur_s=150, template=""):
+        """Render the VideoLLaMA discovery prompt.
+
+        Uses the operator-supplied ``template`` when set, else the
+        built-in DEFAULT_DISCOVERY_PROMPT. Placeholders are substituted
+        literally (str.replace) so a custom template can never raise.
+        """
         platform_str = _format_platforms(platforms)
-        pref_line = ""
-        if preferred_subjects.strip():
-            pref_line = f"\nPRIORITIZE moments with: {preferred_subjects.strip()}"
-        avoid_line = ""
-        if avoid_subjects.strip():
-            avoid_line = f"\nAVOID: {avoid_subjects.strip()}"
-
-        return f"""You are a viral video editor analyzing a video segment from {_fmt_time(start_s)} to {_fmt_time(end_s)}.
-
-TRANSCRIPT FOR THIS SEGMENT:
-{transcript_slice}
-
-Watch and listen carefully to this segment. Identify the 2-3 most compelling moments that would make strong standalone short-form clips, each {min_dur_s}-{max_dur_s} seconds long (ideally about {ideal_dur_s}s), for {platform_str}.
-
-Look for:
-- Emotional peaks (laughter, surprise, anger, excitement)
-- Strong opinions or hot takes
-- Funny or unexpected moments
-- "Aha" revelations or surprising facts
-- Confrontation or debate
-- Music/audio energy spikes
-- Visual moments that would stop someone from scrolling
-{pref_line}{avoid_line}
-
-For each moment, respond in this exact JSON format:
-[
-  {{"timestamp": "MM:SS", "duration": {ideal_dur_s}, "reason": "one sentence why this is clip-worthy", "hook": "suggested opening line for the clip"}},
-  ...
-]
-
-Timestamps are relative to the START of this segment ({_fmt_time(start_s)}).
-Respond ONLY with the JSON array, no other text."""
+        pref_line = (f"\nPRIORITIZE moments with: {preferred_subjects.strip()}"
+                     if preferred_subjects and preferred_subjects.strip() else "")
+        avoid_line = (f"\nAVOID: {avoid_subjects.strip()}"
+                      if avoid_subjects and avoid_subjects.strip() else "")
+        tpl = template.strip() if (template and template.strip()) else DEFAULT_DISCOVERY_PROMPT
+        # Structural placeholders first, free-text content last so a
+        # transcript / subject string can't be re-substituted.
+        for key, val in (
+            ("{start}", _fmt_time(start_s)),
+            ("{end}", _fmt_time(end_s)),
+            ("{platforms}", platform_str),
+            ("{min_duration}", str(min_dur_s)),
+            ("{max_duration}", str(max_dur_s)),
+            ("{ideal_duration}", str(ideal_dur_s)),
+            ("{preferred}", pref_line),
+            ("{avoid}", avoid_line),
+            ("{transcript}", transcript_slice or "(no speech in this segment)"),
+        ):
+            tpl = tpl.replace(key, val)
+        return tpl
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1793,6 +1818,7 @@ class ClipExtractor:
                         min_dur_s=self.config.min_duration_s,
                         max_dur_s=self.config.max_duration_s,
                         ideal_dur_s=self.config.ideal_duration_s,
+                        discovery_prompt=self.config.discovery_prompt,
                         on_progress=lambda p: on_progress(
                             0.15 + p * 0.40) if on_progress else None
                     )
