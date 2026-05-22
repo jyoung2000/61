@@ -467,11 +467,13 @@ export default function Layout({ children }) {
                 <span style={{ color: 'var(--border-strong)' }}>|</span>
                 <span>
                   <span style={{ color: 'var(--accent-cyan)' }}>P:</span>{' '}
-                  {activeModel.videollama2_available
-                    ? 'VideoLLaMA2'
-                    : ((activeModel.primary_model || activeModel.vision_model)
-                        ? String(shortModel(activeModel.primary_model || activeModel.vision_model))
-                        : '\u2014')}
+                  {activeModel.replicate_available
+                    ? String(shortModel(activeModel.replicate_model || 'videollama3-7b'))
+                    : activeModel.videollama2_available
+                      ? 'VideoLLaMA2'
+                      : ((activeModel.primary_model || activeModel.vision_model)
+                          ? String(shortModel(activeModel.primary_model || activeModel.vision_model))
+                          : '\u2014')}
                 </span>
                 <span style={{ color: 'var(--border-strong)' }}>|</span>
                 <span>

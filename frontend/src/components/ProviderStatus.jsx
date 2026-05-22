@@ -57,7 +57,7 @@ export default function ProviderStatus({ collapsed, onActiveChange }) {
           {/* Active model indicator */}
           {active.provider && active.provider !== 'none' && (
             <div
-              title={`T: ${active.transcript_model || 'whisper-small'} | P: ${active.videollama2_available ? 'VideoLLaMA2' : shortModel(active.primary_model || active.vision_model)} | E: ${shortModel(active.editorial_model || active.text_model)}`}
+              title={`T: ${active.transcript_model || 'whisper-small'} | P: ${active.replicate_available ? shortModel(active.replicate_model || 'videollama3-7b') : active.videollama2_available ? 'VideoLLaMA2' : shortModel(active.primary_model || active.vision_model)} | E: ${shortModel(active.editorial_model || active.text_model)}`}
               style={{
                 width: 20,
                 height: 20,
@@ -128,15 +128,17 @@ export default function ProviderStatus({ collapsed, onActiveChange }) {
                     {active.transcript_model || 'whisper-small'}
                   </span>
                 </div>
-                {/* Primary AI (VideoLLaMA2 / Ollama / cloud) */}
+                {/* Primary AI (Replicate / VideoLLaMA2 / Ollama / cloud) */}
                 <div style={{ fontSize: 10, fontFamily: 'var(--font-mono)', lineHeight: 1.5 }}>
                   <span style={{ color: 'var(--accent-cyan)', fontWeight: 600 }}>primary:</span>{' '}
                   <span style={{ color: 'var(--text-secondary)' }}>
-                    {active.videollama2_available
-                      ? 'VideoLLaMA2'
-                      : ((active.primary_model || active.vision_model)
-                          ? shortModel(active.primary_model || active.vision_model)
-                          : 'signal-only')}
+                    {active.replicate_available
+                      ? `${shortModel(active.replicate_model || 'videollama3-7b')} (Replicate)`
+                      : active.videollama2_available
+                        ? 'VideoLLaMA2'
+                        : ((active.primary_model || active.vision_model)
+                            ? shortModel(active.primary_model || active.vision_model)
+                            : 'signal-only')}
                   </span>
                 </div>
                 {/* Editorial AI (scoring, summary, polish) */}
