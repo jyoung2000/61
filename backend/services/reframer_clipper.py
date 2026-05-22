@@ -192,8 +192,8 @@ class SignalTimeline:
         # ── Speech density (words per second from transcript) ──
         if perception.transcript_segments:
             for seg in perception.transcript_segments:
-                s_start = int(seg.get('start', 0))
-                s_end = int(seg.get('end', s_start + 1))
+                s_start = int(seg.get('start_sec', seg.get('start', 0)))
+                s_end = int(seg.get('end_sec', seg.get('end', s_start + 1)))
                 text = seg.get('text', '')
                 word_count = len(text.split())
                 span = max(1, s_end - s_start)
@@ -213,8 +213,8 @@ class SignalTimeline:
         if perception.transcript_segments:
             for seg in perception.transcript_segments:
                 text = seg.get('text', '').lower()
-                s_start = int(seg.get('start', 0))
-                s_end = int(seg.get('end', s_start + 1))
+                s_start = int(seg.get('start_sec', seg.get('start', 0)))
+                s_end = int(seg.get('end_sec', seg.get('end', s_start + 1)))
                 score = 0.0
                 for pattern in hook_patterns:
                     if re.search(pattern, text, re.IGNORECASE):
@@ -230,8 +230,8 @@ class SignalTimeline:
                 text = seg.get('text', '')
                 q_count = text.count('?')
                 if q_count > 0:
-                    s_start = int(seg.get('start', 0))
-                    s_end = int(seg.get('end', s_start + 1))
+                    s_start = int(seg.get('start_sec', seg.get('start', 0)))
+                    s_end = int(seg.get('end_sec', seg.get('end', s_start + 1)))
                     span = max(1, s_end - s_start)
                     qps = q_count / span
                     for sec in range(max(0, s_start), min(n, s_end)):
@@ -267,8 +267,8 @@ class SignalTimeline:
                 neg = len(words & neg_words)
                 if pos > 0 or neg > 0:
                     val = (pos - neg) / max(1, pos + neg)
-                    s_start = int(seg.get('start', 0))
-                    s_end = int(seg.get('end', s_start + 1))
+                    s_start = int(seg.get('start_sec', seg.get('start', 0)))
+                    s_end = int(seg.get('end_sec', seg.get('end', s_start + 1)))
                     for sec in range(max(0, s_start), min(n, s_end)):
                         st.sentiment[sec] = val
 
@@ -1389,8 +1389,8 @@ def _slice_transcript(segments: list, start_s: float, end_s: float) -> str:
     """Extract transcript text for a time window."""
     lines = []
     for seg in segments:
-        seg_start = seg.get('start', 0)
-        seg_end = seg.get('end', 0)
+        seg_start = seg.get('start_sec', seg.get('start', 0))
+        seg_end = seg.get('end_sec', seg.get('end', 0))
         if seg_end > start_s and seg_start < end_s:
             rel_start = max(0, seg_start - start_s)
             m, s = divmod(int(rel_start), 60)
