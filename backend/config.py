@@ -29,12 +29,13 @@ class Settings(BaseSettings):
     GROQ_EDITORIAL_MODEL: str = ""             # blank → "llama-3.3-70b-versatile"
 
     # Ollama — Primary AI (video/vision) + Editorial AI (scoring/summary).
-    # On a 4GB GTX 1650 the reframer engine frees Whisper VRAM before the
-    # VLM stage, so llava:7b (~4GB) gets exclusive GPU access for Primary AI.
-    # qwen2.5:3b-instruct (~1.8GB) handles Editorial AI. Users with 8GB+
-    # VRAM can switch to larger models in Settings.
+    # Defaults are sized to fit a 4GB GTX 1650 so the same image runs
+    # everywhere: moondream:1.8b (~1.8GB) for Primary AI and
+    # qwen2.5:3b-instruct (~1.8GB) for Editorial AI. The pipeline frees
+    # Whisper VRAM before the VLM stage, so each gets the GPU in turn.
+    # On 6GB+ GPUs switch Primary AI to llava:7b (or larger) in Settings.
     OLLAMA_HOST: str = "http://ollama:11434"
-    OLLAMA_PRIMARY_MODEL: str = "llava:7b"
+    OLLAMA_PRIMARY_MODEL: str = "moondream:1.8b"
     OLLAMA_EDITORIAL_MODEL: str = "qwen2.5:3b-instruct"
     OLLAMA_TRANSLATION_MODEL: str = "qwen2.5:3b"  # Dedicated model for subtitle translation (multilingual)
 

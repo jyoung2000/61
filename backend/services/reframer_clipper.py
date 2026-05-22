@@ -405,12 +405,39 @@ class VideoLLaMA2Discovery:
         self._loaded = False
 
     def is_available(self) -> bool:
-        """Check if the videollama2 package can be imported.
+        """True only when VideoLLaMA2 can realistically run on THIS machine.
 
-        Detects both a pip-installed package and a repo vendored at
-        backend/services/VideoLLaMA2/ (added to sys.path on demand).
-        Uses find_spec so the heavy package is not actually imported here.
+        Two gates:
+          1. The GPU has ~9GB+ free VRAM. The 7B-AV model is a fixed ~7-8GB
+             (INT8) cost — it cannot be shrunk by chunking the input. On a
+             4GB card (e.g. GTX 1650) this returns False so the clipper goes
+             straight to the Ollama / cloud / signal fallback instead of
+             attempting a load that would OOM.
+          2. The ``videollama2`` package is importable — pip-installed, or a
+             repo vendored at backend/services/VideoLLaMA2/ (added to
+             sys.path on demand). find_spec is used so the heavy package is
+             not imported just for this probe.
+
+        This lets one container image self-adapt: it uses VideoLLaMA2 on a
+        big GPU and silently falls back on a small one.
         """
+        try:
+            import torch
+            if not torch.cuda.is_available():
+                logger.info("VideoLLaMA2 skipped: no CUDA GPU on this host")
+                return False
+            free_mb = torch.cuda.mem_get_info()[0] / 1024 / 1024
+            if free_mb < 9000:
+                logger.info(
+                    "VideoLLaMA2 skipped: %.0f MB VRAM free (need ~9000) — "
+                    "the 7B model will not fit; using Ollama/cloud/signal fallback",
+                    free_mb,
+                )
+                return False
+        except Exception as e:
+            logger.info("VideoLLaMA2 VRAM probe failed (%s) — skipping", e)
+            return False
+
         import importlib.util
         if importlib.util.find_spec("videollama2") is not None:
             return True
@@ -419,6 +446,7 @@ class VideoLLaMA2Discovery:
             if vl2_dir not in sys.path:
                 sys.path.insert(0, vl2_dir)
             return importlib.util.find_spec("videollama2") is not None
+        logger.info("VideoLLaMA2 skipped: 'videollama2' package not installed")
         return False
 
     def load(self):
