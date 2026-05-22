@@ -1,6 +1,5 @@
 import React, { useRef, useState, useEffect, useMemo, useCallback } from 'react';
 import { processKeyframes, interpolateSubjectX, isDynamic, safeSubjectX, subjectXToCenterPct, computeLayoutAtTime, computeFaceYCenter, faceYToCenterPct } from '../utils/subjectTracking';
-import { RenderPlanRenderer } from '../utils/renderPlanRenderer';
 import ReframeDebugOverlay from './ReframeDebugOverlay';
 import useTimelineStore from '../stores/timelineStore';
 import { outlineTextShadow } from '../utils/textOutline';
@@ -286,8 +285,6 @@ export default function ClipPreview({
   const splitBottomVideoRef = useRef(null);
   const containerRef = useRef(null);
   const fullscreenRef = useRef(null);
-  const canvasRef = useRef(null);
-  const renderPlanRendererRef = useRef(null);
   const [renderPlanData, setRenderPlanData] = useState(null);
 
   // ── RenderPlan fetch: get the plan from the backend when jobId is available ──
@@ -312,30 +309,14 @@ export default function ClipPreview({
     return () => { cancelled = true; };
   }, [jobId, clipIndex, aspectRatio]);
 
-  // ── RenderPlan Canvas rendering via rAF ──
-  useEffect(() => {
-    if (!renderPlanData) return;
-    const canvas = canvasRef.current;
-    const video = fgVideoRef.current;
-    if (!canvas || !video) return;
-
-    const renderer = new RenderPlanRenderer(canvas, video, renderPlanData);
-    renderPlanRendererRef.current = renderer;
-
-    let animId;
-    const tick = () => {
-      const relTime = video.currentTime - clipStart;
-      renderer.draw(Math.max(0, relTime));
-      animId = requestAnimationFrame(tick);
-    };
-    animId = requestAnimationFrame(tick);
-
-    return () => {
-      cancelAnimationFrame(animId);
-      renderer.dispose();
-      renderPlanRendererRef.current = null;
-    };
-  }, [renderPlanData, clipStart]);
+  // Canvas-based render-plan preview was removed: drawing video frames to a
+  // canvas on every requestAnimationFrame (with the source <video> hidden
+  // behind display:none) caused choppy playback and audio drift — the browser
+  // throttled decode of the hidden element and the rAF clock ran independent
+  // of the audio sink. The preview now uses the native <video> directly with
+  // CSS object-fit/object-position for crop tracking, so playback is smooth
+  // like an MP4 or YouTube. The render plan is still fetched and used by the
+  // debug overlay and by the export pipeline.
 
   // Dynamic subject tracking keyframes
   const subjectKeyframes = useMemo(
@@ -1363,22 +1344,9 @@ export default function ClipPreview({
           src={src}
           preload="auto"
           playsInline
-          style={renderPlanData ? { ...videoStyle, display: 'none' } : videoStyle}
+          style={videoStyle}
           onClick={togglePlay}
         />
-        {/* RenderPlan Canvas: shown when render plan is available for pixel-perfect preview */}
-        {renderPlanData && (
-          <canvas
-            ref={canvasRef}
-            onClick={togglePlay}
-            style={{
-              width: '100%',
-              height: '100%',
-              display: 'block',
-              objectFit: 'contain',
-            }}
-          />
-        )}
       </div>
     );
   };
