@@ -759,6 +759,69 @@ async def delete_clips_bulk(job_id: str, req: DeleteClipsRequest):
     }
 
 
+async def _discover_clips_videollama3(job_id, job, transcript, duration, req):
+    """Re-discover viral clips with VideoLLaMA3 (Replicate cloud GPU).
+
+    Runs the same ReplicateDiscovery engine the upload pipeline uses, with
+    the user's regenerate settings overlaid onto the clipper config so clip
+    length, count and focus actually steer the model. Returns
+    ``(clips, provider)`` to match AIOrchestrator.detect_viral_clips.
+    """
+    from backend.services.reframer_clipper import (
+        ClipperConfig, ReplicateDiscovery, SignalTimeline,
+    )
+    from backend.services.reframer_bridge import to_fez_clips
+    from backend.models import ClipCandidate
+
+    cfg = ClipperConfig.load(os.path.join(
+        os.path.dirname(__file__), "..", "..", "clipper_config.json"))
+    if req.min_duration:
+        cfg.min_duration_s = int(req.min_duration)
+    if req.max_duration:
+        cfg.max_duration_s = int(req.max_duration)
+    cfg.ideal_duration_s = max(cfg.min_duration_s, min(
+        cfg.max_duration_s, (cfg.min_duration_s + cfg.max_duration_s) // 2))
+    if req.clip_count:
+        cfg.max_clips = int(req.clip_count)
+    if req.clip_focus and req.clip_focus.strip():
+        cfg.preferred_subjects = req.clip_focus.strip()
+
+    rep = ReplicateDiscovery(
+        api_key=settings.REPLICATE_API_KEY, model_id=settings.REPLICATE_MODEL)
+    signals = SignalTimeline(max(1, int(duration or 1)))
+
+    def _run():
+        return rep.discover_clips(
+            job.file_path, transcript, signals,
+            chunk_duration_s=cfg.chunk_duration_s,
+            max_vlm_chunks=cfg.max_vlm_chunks,
+            preferred_subjects=cfg.preferred_subjects,
+            avoid_subjects=cfg.avoid_subjects,
+            platforms=cfg.platforms,
+            min_dur_s=cfg.min_duration_s,
+            max_dur_s=cfg.max_duration_s,
+            ideal_dur_s=cfg.ideal_duration_s,
+        )
+
+    candidates = await asyncio.to_thread(_run)
+
+    # Keep clips inside the requested duration window, best first,
+    # capped to the requested clip count.
+    candidates = [
+        c for c in candidates
+        if cfg.min_duration_s <= getattr(c, "duration_s", 0) <= cfg.max_duration_s
+    ]
+    candidates.sort(
+        key=lambda c: getattr(c, "composite_score", 0) or getattr(c, "signal_score", 0),
+        reverse=True,
+    )
+    candidates = candidates[:cfg.effective_max_clips(float(duration or 0))]
+
+    clips = [ClipCandidate(**d) for d in to_fez_clips(candidates)]
+    logger.info("[%s] VideoLLaMA3 re-discovery produced %d clips", job_id, len(clips))
+    return clips, "videollama3"
+
+
 @router.post("/jobs/{job_id}/generate-clips")
 async def generate_clips_endpoint(
     job_id: str,
@@ -978,8 +1041,13 @@ async def generate_clips_endpoint(
 
             heartbeat_task = asyncio.create_task(_heartbeat())
             try:
-                clips, clips_provider = await asyncio.wait_for(
-                    orchestrator.detect_viral_clips(
+                if settings.REPLICATE_ENABLED and settings.REPLICATE_API_KEY:
+                    # VideoLLaMA3 (Replicate) re-discovery — watches the
+                    # video and honors the user's length / count / focus.
+                    _discovery = _discover_clips_videollama3(
+                        job_id, job, transcript, duration, req)
+                else:
+                    _discovery = orchestrator.detect_viral_clips(
                         transcript, scenes, duration, job_id,
                         clip_count=req.clip_count,
                         min_duration=req.min_duration,
@@ -995,8 +1063,9 @@ async def generate_clips_endpoint(
                         viral_score_min=req.viral_score_min,
                         viral_score_max=req.viral_score_max,
                         min_relevance=req.min_relevance,
-                    ),
-                    timeout=_CLIP_DETECTION_TIMEOUT,
+                    )
+                clips, clips_provider = await asyncio.wait_for(
+                    _discovery, timeout=_CLIP_DETECTION_TIMEOUT,
                 )
             except asyncio.TimeoutError:
                 timeout_min = _CLIP_DETECTION_TIMEOUT // 60

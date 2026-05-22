@@ -683,6 +683,9 @@ class ReplicateDiscovery:
                        preferred_subjects: str = "",
                        avoid_subjects: str = "",
                        platforms: list = None,
+                       min_dur_s: int = 60,
+                       max_dur_s: int = 300,
+                       ideal_dur_s: int = 150,
                        on_progress: Callable = None) -> List['ClipCandidate']:
         """Process video hotspots via Replicate cloud GPU.
 
@@ -731,7 +734,8 @@ class ReplicateDiscovery:
 
                 prompt = self._build_discovery_prompt(
                     start_s, end_s, transcript_slice,
-                    preferred_subjects, avoid_subjects, platforms)
+                    preferred_subjects, avoid_subjects, platforms,
+                    min_dur_s, max_dur_s, ideal_dur_s)
 
                 # Upload video chunk to Replicate
                 logger.info(
@@ -780,7 +784,8 @@ class ReplicateDiscovery:
 
     def _build_discovery_prompt(self, start_s, end_s, transcript_slice,
                                 preferred_subjects="", avoid_subjects="",
-                                platforms=None):
+                                platforms=None, min_dur_s=60, max_dur_s=300,
+                                ideal_dur_s=150):
         """Build the same discovery prompt used by VideoLLaMA2Discovery."""
         platform_str = _format_platforms(platforms)
         pref_line = ""
@@ -795,7 +800,7 @@ class ReplicateDiscovery:
 TRANSCRIPT FOR THIS SEGMENT:
 {transcript_slice}
 
-Watch and listen carefully to this segment. Identify the 2-3 most compelling moments that would make strong standalone short-form clips (1-5 minutes) for {platform_str}.
+Watch and listen carefully to this segment. Identify the 2-3 most compelling moments that would make strong standalone short-form clips, each {min_dur_s}-{max_dur_s} seconds long (ideally about {ideal_dur_s}s), for {platform_str}.
 
 Look for:
 - Emotional peaks (laughter, surprise, anger, excitement)
@@ -809,7 +814,7 @@ Look for:
 
 For each moment, respond in this exact JSON format:
 [
-  {{"timestamp": "MM:SS", "duration": 150, "reason": "one sentence why this is clip-worthy", "hook": "suggested opening line for the clip"}},
+  {{"timestamp": "MM:SS", "duration": {ideal_dur_s}, "reason": "one sentence why this is clip-worthy", "hook": "suggested opening line for the clip"}},
   ...
 ]
 
@@ -1785,6 +1790,9 @@ class ClipExtractor:
                         preferred_subjects=self.config.preferred_subjects,
                         avoid_subjects=self.config.avoid_subjects,
                         platforms=self.config.platforms,
+                        min_dur_s=self.config.min_duration_s,
+                        max_dur_s=self.config.max_duration_s,
+                        ideal_dur_s=self.config.ideal_duration_s,
                         on_progress=lambda p: on_progress(
                             0.15 + p * 0.40) if on_progress else None
                     )
