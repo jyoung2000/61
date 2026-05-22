@@ -193,7 +193,7 @@ def _load_model_capabilities() -> dict[str, dict]:
 #     unavailability on a given OpenRouter key degrades gracefully.
 #   - Content-type routing (ANIME, GAMEPLAY → Qwen3-VL; everything
 #     else → preset default) is applied AFTER preset selection via
-#     select_vision_model_for_content() below.
+#     select_primary_model_for_content() below.
 #
 # NOTE: OpenRouter model identifiers evolve — if a preview model is
 # retired, _call_with_fallback walks the _fallbacks list. We always
@@ -316,7 +316,7 @@ _CONTENT_TYPE_VISION_OVERRIDES = {
 }
 
 
-def select_vision_model_for_content(content_type, preset_default: str) -> str:
+def select_primary_model_for_content(content_type, preset_default: str) -> str:
     """Return the vision model id to use for a given content type.
 
     ``content_type`` accepts a ClipContentType enum, its ``.value``
@@ -533,9 +533,9 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
         #
         # Fall back to preset defaults only when settings are empty/unset
         # (e.g. fresh container with no persisted user_settings.json).
-        self._vision_model = settings.OPENROUTER_VISION_MODEL or preset["vision"]
-        self._text_model = settings.OPENROUTER_TEXT_MODEL or preset["text"]
-        self._summary_model = settings.OPENROUTER_SUMMARY_MODEL or self._text_model
+        self._primary_model = settings.OPENROUTER_PRIMARY_MODEL or preset["vision"]
+        self._editorial_model = settings.OPENROUTER_EDITORIAL_MODEL or preset["text"]
+        self._summary_model = settings.OPENROUTER_SUMMARY_MODEL or self._editorial_model
 
         # Store fallback model lists from preset.
         # Support both old single-fallback keys and new list keys.
@@ -549,8 +549,8 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
         self._vision_fallbacks = _to_list("vision_fallbacks", "vision_fallback")
         # Preserve the original preset-resolved vision model so we can
         # reset it after a content-type-specific override. Phase 2.
-        self._base_vision_model = self._vision_model
-        self._active_vision_model_override = None  # content-type key last applied
+        self._base_primary_model = self._primary_model
+        self._active_primary_model_override = None  # content-type key last applied
         self._text_fallbacks = _to_list("text_fallbacks", "text_fallback")
         self._summary_fallbacks = _to_list(
             "summary_fallbacks", "summary_fallback", self._text_fallbacks,
@@ -589,12 +589,12 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
         )
         logger.info(
             "  vision: %s [%s] (+%d fallbacks)",
-            self._vision_model, _model_constraints(self._vision_model, "vision"),
+            self._primary_model, _model_constraints(self._primary_model, "vision"),
             len(self._vision_fallbacks),
         )
         logger.info(
             "  text:   %s [%s] (+%d fallbacks)",
-            self._text_model, _model_constraints(self._text_model, "text"),
+            self._editorial_model, _model_constraints(self._editorial_model, "text"),
             len(self._text_fallbacks),
         )
         logger.info(
@@ -614,12 +614,12 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
         self._ws_broadcast = ws_broadcast
         self._job_id = job_id
 
-    def apply_vision_model_override(self, content_type) -> str:
+    def apply_primary_model_override(self, content_type) -> str:
         """Swap the active vision model based on ``content_type``.
 
         Phase 2 — content-type routing. ANIME and GAMEPLAY content
         routes to Qwen3-VL regardless of preset; everything else
-        reverts to the preset-resolved ``_base_vision_model`` captured
+        reverts to the preset-resolved ``_base_primary_model`` captured
         in ``__init__``. Returns the model id that will be used for
         the next analyze_frames call.
 
@@ -631,10 +631,10 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
         fallback list when we apply an override, guaranteeing the
         original model is always reachable from the new primary.
         """
-        resolved = select_vision_model_for_content(
-            content_type, self._base_vision_model,
+        resolved = select_primary_model_for_content(
+            content_type, self._base_primary_model,
         )
-        previous = self._vision_model
+        previous = self._primary_model
         if resolved == previous:
             logger.info(
                 "Using vision model for %s: %s (preset default)",
@@ -646,17 +646,17 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
         # Apply override. Preserve the original fallbacks and inject
         # the preset default at the front so a routed model that 401s
         # falls through to whatever the user originally selected.
-        self._vision_model = resolved
-        self._active_vision_model_override = getattr(
+        self._primary_model = resolved
+        self._active_primary_model_override = getattr(
             content_type, "value", content_type,
         )
         # Only modify the fallback chain the first time we override.
-        if self._base_vision_model not in self._vision_fallbacks:
-            self._vision_fallbacks = [self._base_vision_model] + list(self._vision_fallbacks)
+        if self._base_primary_model not in self._vision_fallbacks:
+            self._vision_fallbacks = [self._base_primary_model] + list(self._vision_fallbacks)
         logger.info(
             "Using vision model for %s: %s (overrode preset default %s)",
-            self._active_vision_model_override,
-            resolved, self._base_vision_model,
+            self._active_primary_model_override,
+            resolved, self._base_primary_model,
         )
         return resolved
 
@@ -672,7 +672,7 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
         """Generic text completion using the text model with fallback chain."""
         messages = [{"role": "user", "content": prompt}]
         return await self._call_with_fallback(
-            self._text_model, self._text_fallbacks, messages,
+            self._editorial_model, self._text_fallbacks, messages,
             max_tokens=max_tokens, timeout=timeout,
         )
 
@@ -687,7 +687,7 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
     @property
     def text_model_name(self) -> str:
         """Return the user's configured OpenRouter text model ID."""
-        return self._text_model
+        return self._editorial_model
 
     _API_TIMEOUT = 180  # 3 minutes per API call
 
@@ -875,8 +875,8 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
     ) -> list[SceneDescription]:
         instruction = custom_prompt if custom_prompt else DEFAULT_FRAME_ANALYSIS_PROMPT
         # Model-aware batch size: some models (reka-edge) only support 2-3 images
-        batch_size = self._get_max_images(self._vision_model)
-        vision_max_tokens = self._get_vision_max_tokens(self._vision_model)
+        batch_size = self._get_max_images(self._primary_model)
+        vision_max_tokens = self._get_vision_max_tokens(self._primary_model)
 
         # Reduce batch size for multi-speaker content so the model
         # analyzes fewer frames per call with more attention per frame
@@ -896,7 +896,7 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
 
         logger.info(
             "Vision batch config for '%s': batch_size=%d, max_tokens=%d",
-            self._vision_model, batch_size, vision_max_tokens,
+            self._primary_model, batch_size, vision_max_tokens,
         )
         total = len(frames)
         num_batches = (total + batch_size - 1) // batch_size
@@ -1006,7 +1006,7 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
             messages = [{"role": "user", "content": content}]
             try:
                 raw = await self._call_with_fallback(
-                    self._vision_model, self._vision_fallbacks, messages,
+                    self._primary_model, self._vision_fallbacks, messages,
                     max_tokens=vision_max_tokens,
                     is_vision=True, cancel_check=cancel_check,
                 )
@@ -1316,7 +1316,7 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                 logger.warning(
                     "Vision quality: %.0f%% of frames (%d/%d) returned center defaults "
                     "(subject_x 47-53). Model '%s' may have poor spatial reasoning.",
-                    center_pct_log, center_count, len(all_sx), self._vision_model,
+                    center_pct_log, center_count, len(all_sx), self._primary_model,
                 )
             else:
                 logger.info(
@@ -1487,7 +1487,7 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                     ]
                     try:
                         reraw = await self._call_with_fallback(
-                            self._vision_model, self._vision_fallbacks,
+                            self._primary_model, self._vision_fallbacks,
                             [{"role": "user", "content": content}],
                             max_tokens=256, is_vision=True, cancel_check=cancel_check,
                         )
@@ -1843,7 +1843,7 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
         # Scale prompt size to the model's context window.
         # The system prompt + JSON schema + instructions take ~2000 chars,
         # so the remaining budget goes to transcript + scenes + enrichments.
-        context_budget = self._get_context_budget(self._text_model)
+        context_budget = self._get_context_budget(self._editorial_model)
         # Account for video summary in overhead if present
         summary_overhead = len(video_summary) + 50 if video_summary else 0
         energy_overhead = len(energy_text) if energy_text else 0
@@ -1858,7 +1858,7 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
         logger.info(
             "Clip detection context budget for model '%s': %d chars "
             "(transcript=%d, scenes=%d, energy=%d, av_peaks=%d, summary=%d, existing=%d)",
-            self._text_model, context_budget,
+            self._editorial_model, context_budget,
             transcript_budget, scene_budget, energy_overhead, av_overhead,
             summary_overhead, existing_overhead,
         )
@@ -1975,7 +1975,7 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
             ]
 
             raw = await self._call_with_fallback(
-                self._text_model, self._text_fallbacks, messages,
+                self._editorial_model, self._text_fallbacks, messages,
                 max_tokens=8192, cancel_check=cancel_check,
                 timeout=self._get_clip_timeout(len(transcript_text)),
             )
@@ -2060,7 +2060,7 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
         is_description = video_summary.startswith("DESCRIPTION_OVERRIDE")
 
         # Cap data to fit model context
-        context_budget = self._get_context_budget(self._text_model)
+        context_budget = self._get_context_budget(self._editorial_model)
         if is_description:
             # Description override: video_summary IS the prompt, give it
             # the majority of the budget; transcript supplements it.
@@ -2097,7 +2097,7 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
         # too few for the actual description at the default 4096 limit.
         tokens = 16384 if is_description else 4096
         raw = await self._call_with_fallback(
-            self._text_model, self._text_fallbacks, messages,
+            self._editorial_model, self._text_fallbacks, messages,
             max_tokens=tokens, cancel_check=cancel_check,
         )
         try:

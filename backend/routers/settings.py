@@ -49,8 +49,8 @@ _PLACEHOLDER_KEYS = {"sk-or-...", "sk-ant-...", "AIza...", "gsk_...", ""}
 _PERSISTABLE_KEYS = [
     "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "GROQ_API_KEY",
     "HF_AUTH_TOKEN",
-    "OPENROUTER_PRESET", "OPENROUTER_VISION_MODEL", "OPENROUTER_TEXT_MODEL",
-    "OPENROUTER_SUMMARY_MODEL", "OLLAMA_VISION_MODEL", "OLLAMA_TEXT_MODEL", "OLLAMA_TRANSLATION_MODEL",
+    "OPENROUTER_PRESET", "OPENROUTER_PRIMARY_MODEL", "OPENROUTER_EDITORIAL_MODEL",
+    "OPENROUTER_SUMMARY_MODEL", "OLLAMA_PRIMARY_MODEL", "OLLAMA_EDITORIAL_MODEL", "OLLAMA_TRANSLATION_MODEL",
     "WHISPER_MODEL", "WHISPER_MODEL_USER_SET", "WHISPER_BEAM_SIZE",
     "WHISPER_VAD_FILTER", "FRAME_SAMPLE_RATE", "SUBJECT_TRACKING_ENABLED",
     "FFMPEG_PRESET", "FFMPEG_CRF", "FFMPEG_THREADS", "FFMPEG_FASTSTART",
@@ -201,7 +201,7 @@ def _restore_user_settings():
         # Log what's in the file for diagnostics
         api_keys_in_file = [k for k in _API_KEY_FIELDS if k in data and _is_real_value(k, data[k])]
         model_keys_in_file = [
-            k for k in ["WHISPER_MODEL", "OPENROUTER_VISION_MODEL", "OPENROUTER_TEXT_MODEL",
+            k for k in ["WHISPER_MODEL", "OPENROUTER_PRIMARY_MODEL", "OPENROUTER_EDITORIAL_MODEL",
                          "AI_FALLBACK_CHAIN", "WHISPER_MODEL_USER_SET"]
             if k in data
         ]
@@ -458,6 +458,21 @@ def _key_is_set(key: str) -> bool:
     return bool(key) and key not in _PLACEHOLDER_KEYS
 
 
+def _check_videollama2_available() -> bool:
+    """True only when VideoLLaMA2 is installed and the GPU has the VRAM for it."""
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return False
+        free_mb = torch.cuda.mem_get_info()[0] / 1024 / 1024
+        if free_mb < 9000:  # VideoLLaMA2.1-7B-AV (int8) needs ~10GB
+            return False
+        import videollama2  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
 @router.get("/providers/status")
 async def provider_status():
     global _status_cache, _status_cache_ts
@@ -489,8 +504,8 @@ async def provider_status():
     if _key_is_set(settings.OPENROUTER_API_KEY):
         preset_name = settings.OPENROUTER_PRESET
         preset = PRESETS.get(preset_name, PRESETS["free"])
-        vision_model = settings.OPENROUTER_VISION_MODEL or preset["vision"]
-        text_model = settings.OPENROUTER_TEXT_MODEL or preset["text"]
+        vision_model = settings.OPENROUTER_PRIMARY_MODEL or preset["vision"]
+        text_model = settings.OPENROUTER_EDITORIAL_MODEL or preset["text"]
         summary_model = settings.OPENROUTER_SUMMARY_MODEL or text_model
         statuses["openrouter"] = {
             "status": "configured",
@@ -530,8 +545,8 @@ async def provider_status():
     # Determine the active provider and models based on fallback chain
     chain = settings.active_provider_chain
     active_provider = None
-    active_vision_model = None
-    active_text_model = None
+    active_primary_model = None
+    active_editorial_model = None
     active_summary_model = None
     for name in chain:
         info = statuses.get(name, {})
@@ -539,35 +554,46 @@ async def provider_status():
         if st in ("connected", "configured"):
             active_provider = name
             if name == "openrouter":
-                active_vision_model = info.get("vision_model", "")
+                active_primary_model = info.get("vision_model", "")
                 active_summary_model = info.get("summary_model", "")
-                active_text_model = info.get("text_model", "")
+                active_editorial_model = info.get("text_model", "")
             elif name == "ollama":
-                active_vision_model = settings.OLLAMA_VISION_MODEL
-                active_text_model = settings.OLLAMA_TEXT_MODEL
-                active_summary_model = settings.OLLAMA_TEXT_MODEL
+                active_primary_model = settings.OLLAMA_PRIMARY_MODEL
+                active_editorial_model = settings.OLLAMA_EDITORIAL_MODEL
+                active_summary_model = settings.OLLAMA_EDITORIAL_MODEL
             elif name == "gemini":
-                active_vision_model = "gemini-2.5-flash"
-                active_text_model = "gemini-2.5-flash"
+                active_primary_model = "gemini-2.5-flash"
+                active_editorial_model = "gemini-2.5-flash"
                 active_summary_model = "gemini-2.5-flash"
             elif name == "anthropic":
-                active_vision_model = "claude-sonnet-4"
-                active_text_model = "claude-sonnet-4"
+                active_primary_model = "claude-sonnet-4"
+                active_editorial_model = "claude-sonnet-4"
                 active_summary_model = "claude-sonnet-4"
             elif name == "groq":
-                active_vision_model = ""
-                active_text_model = "llama-3.1-8b-instant"
+                active_primary_model = ""
+                active_editorial_model = "llama-3.1-8b-instant"
                 active_summary_model = "llama-3.1-8b-instant"
             break
 
+    _videollama2_ok = _check_videollama2_available()
     statuses["_active"] = {
         "provider": active_provider or "none",
         "transcript_model": settings.WHISPER_MODEL,
         "whisper_beam_size": settings.WHISPER_BEAM_SIZE,
         "whisper_vad_filter": settings.WHISPER_VAD_FILTER,
-        "vision_model": active_vision_model or "",
+        # ── Primary AI (video/vision) + Editorial AI (scoring/summary) ──
+        "primary_model": active_primary_model or "",
+        "editorial_model": active_editorial_model or "",
+        "videollama2_available": _videollama2_ok,
+        "primary_type": (
+            "videollama2" if _videollama2_ok
+            else ("ollama" if active_provider == "ollama" else "cloud")
+        ),
+        # ── Backward-compat keys — kept so any UI not yet migrated to the
+        #    primary/editorial naming keeps rendering. ──
+        "vision_model": active_primary_model or "",
+        "text_model": active_editorial_model or "",
         "summary_model": active_summary_model or "",
-        "text_model": active_text_model or "",
         "preset": settings.OPENROUTER_PRESET if active_provider == "openrouter" else "",
         "fallback_chain": chain,
         "ollama_enabled": "ollama" in chain,
@@ -644,7 +670,7 @@ async def _test_openrouter():
             preset = PRESETS.get(preset_name, PRESETS["free"])
 
             # Build a list of models to try: current text model from settings, then fallbacks
-            effective_text = settings.OPENROUTER_TEXT_MODEL or preset["text"]
+            effective_text = settings.OPENROUTER_EDITORIAL_MODEL or preset["text"]
             test_models = [effective_text]
             for fb in (preset.get("text_fallbacks") or []):
                 if fb not in test_models:
@@ -682,7 +708,7 @@ async def _test_openrouter():
                     model_error = f"Timeout testing {test_model}"
                     logger.info(model_error)
 
-            effective_vision = settings.OPENROUTER_VISION_MODEL or preset["vision"]
+            effective_vision = settings.OPENROUTER_PRIMARY_MODEL or preset["vision"]
             effective_summary = settings.OPENROUTER_SUMMARY_MODEL or effective_text
             return {
                 "status": "connected" if model_ok else "key_valid_model_error",
@@ -720,7 +746,7 @@ async def _test_ollama():
                 "status": "connected",
                 "message": f"Ollama connected with {len(models)} model(s) loaded.",
                 "models": models,
-                "has_vision_model": has_vision,
+                "has_primary_model": has_vision,
                 "host": settings.OLLAMA_HOST,
             }
     except Exception as e:
@@ -933,16 +959,16 @@ async def save_preset(req: SavePresetRequest):
     text_model = req.text_model or preset_dict["text"]
     summary_model = req.summary_model or preset_dict.get("summary", text_model)
 
-    settings.OPENROUTER_VISION_MODEL = vision_model
-    settings.OPENROUTER_TEXT_MODEL = text_model
+    settings.OPENROUTER_PRIMARY_MODEL = vision_model
+    settings.OPENROUTER_EDITORIAL_MODEL = text_model
     settings.OPENROUTER_SUMMARY_MODEL = summary_model
     _invalidate_status_cache()
 
     env_path = _find_env_file()
     if env_path:
         _upsert_env_var(env_path, "OPENROUTER_PRESET", req.preset)
-        _upsert_env_var(env_path, "OPENROUTER_VISION_MODEL", vision_model)
-        _upsert_env_var(env_path, "OPENROUTER_TEXT_MODEL", text_model)
+        _upsert_env_var(env_path, "OPENROUTER_PRIMARY_MODEL", vision_model)
+        _upsert_env_var(env_path, "OPENROUTER_EDITORIAL_MODEL", text_model)
         _upsert_env_var(env_path, "OPENROUTER_SUMMARY_MODEL", summary_model)
 
     _persist_user_settings()
@@ -995,7 +1021,7 @@ def _pull_ollama_models_background(models: list[str] | None = None):
     """
     if models is None:
         models = []
-        for m in (settings.OLLAMA_VISION_MODEL, settings.OLLAMA_TEXT_MODEL,
+        for m in (settings.OLLAMA_PRIMARY_MODEL, settings.OLLAMA_EDITORIAL_MODEL,
                   settings.OLLAMA_TRANSLATION_MODEL):
             if m and m not in models:
                 models.append(m)
@@ -1431,7 +1457,7 @@ async def refresh_models():
         "status": "refreshed",
         "total_models": len(models),
         "vision_models": vision_count,
-        "free_vision_models": free_vision_count,
+        "free_primary_models": free_vision_count,
         "message": f"Loaded {len(models)} models ({vision_count} with vision, {free_vision_count} free vision)",
     }
 
@@ -1724,8 +1750,8 @@ async def available_models():
         # pulled yet (e.g. Ollama was just toggled on and pulls are in progress).
         # This lets the user select them in the dropdown immediately.
         _defaults = [
-            (settings.OLLAMA_VISION_MODEL, True),   # (model_name, is_vision)
-            (settings.OLLAMA_TEXT_MODEL, False),
+            (settings.OLLAMA_PRIMARY_MODEL, True),   # (model_name, is_vision)
+            (settings.OLLAMA_EDITORIAL_MODEL, False),
         ]
         for _def_name, _def_is_vision in _defaults:
             if not _def_name:
@@ -1773,15 +1799,15 @@ async def available_models():
     ollama_is_primary = chain and chain[0] == "ollama"
     ollama_models_set = (
         "ollama" in chain
-        and settings.OLLAMA_VISION_MODEL
-        and settings.OLLAMA_TEXT_MODEL
+        and settings.OLLAMA_PRIMARY_MODEL
+        and settings.OLLAMA_EDITORIAL_MODEL
     )
     if ollama_is_primary or (ollama_models_set and not _key_is_set(settings.OPENROUTER_API_KEY)):
-        current_vision = f"ollama/{settings.OLLAMA_VISION_MODEL}"
-        current_text = f"ollama/{settings.OLLAMA_TEXT_MODEL}"
+        current_vision = f"ollama/{settings.OLLAMA_PRIMARY_MODEL}"
+        current_text = f"ollama/{settings.OLLAMA_EDITORIAL_MODEL}"
     else:
-        current_vision = settings.OPENROUTER_VISION_MODEL
-        current_text = settings.OPENROUTER_TEXT_MODEL
+        current_vision = settings.OPENROUTER_PRIMARY_MODEL
+        current_text = settings.OPENROUTER_EDITORIAL_MODEL
 
     return {
         "transcript": transcript,
@@ -1832,28 +1858,28 @@ async def save_models(req: SaveModelsRequest):
         if req.vision_model.startswith("ollama/"):
             # Strip the "ollama/" prefix to get the raw model name
             ollama_model = req.vision_model[len("ollama/"):]
-            settings.OLLAMA_VISION_MODEL = ollama_model
+            settings.OLLAMA_PRIMARY_MODEL = ollama_model
             if env_path:
-                _upsert_env_var(env_path, "OLLAMA_VISION_MODEL", ollama_model)
+                _upsert_env_var(env_path, "OLLAMA_PRIMARY_MODEL", ollama_model)
         else:
-            settings.OPENROUTER_VISION_MODEL = req.vision_model
+            settings.OPENROUTER_PRIMARY_MODEL = req.vision_model
             settings.OPENROUTER_PRESET = "custom"
             if env_path:
-                _upsert_env_var(env_path, "OPENROUTER_VISION_MODEL", req.vision_model)
+                _upsert_env_var(env_path, "OPENROUTER_PRIMARY_MODEL", req.vision_model)
                 _upsert_env_var(env_path, "OPENROUTER_PRESET", "custom")
 
     if req.text_model:
         if req.text_model.startswith("ollama/"):
             ollama_model = req.text_model[len("ollama/"):]
-            settings.OLLAMA_TEXT_MODEL = ollama_model
+            settings.OLLAMA_EDITORIAL_MODEL = ollama_model
             if env_path:
-                _upsert_env_var(env_path, "OLLAMA_TEXT_MODEL", ollama_model)
+                _upsert_env_var(env_path, "OLLAMA_EDITORIAL_MODEL", ollama_model)
         else:
-            settings.OPENROUTER_TEXT_MODEL = req.text_model
+            settings.OPENROUTER_EDITORIAL_MODEL = req.text_model
             settings.OPENROUTER_SUMMARY_MODEL = req.text_model
             settings.OPENROUTER_PRESET = "custom"
             if env_path:
-                _upsert_env_var(env_path, "OPENROUTER_TEXT_MODEL", req.text_model)
+                _upsert_env_var(env_path, "OPENROUTER_EDITORIAL_MODEL", req.text_model)
                 _upsert_env_var(env_path, "OPENROUTER_SUMMARY_MODEL", req.text_model)
                 _upsert_env_var(env_path, "OPENROUTER_PRESET", "custom")
 
@@ -1927,14 +1953,14 @@ async def save_models(req: SaveModelsRequest):
         return {
             "status": "saved",
             "transcript_model": settings.WHISPER_MODEL,
-            "vision_model": f"ollama/{settings.OLLAMA_VISION_MODEL}",
-            "text_model": f"ollama/{settings.OLLAMA_TEXT_MODEL}",
+            "vision_model": f"ollama/{settings.OLLAMA_PRIMARY_MODEL}",
+            "text_model": f"ollama/{settings.OLLAMA_EDITORIAL_MODEL}",
         }
     return {
         "status": "saved",
         "transcript_model": settings.WHISPER_MODEL,
-        "vision_model": settings.OPENROUTER_VISION_MODEL,
-        "text_model": settings.OPENROUTER_TEXT_MODEL,
+        "vision_model": settings.OPENROUTER_PRIMARY_MODEL,
+        "text_model": settings.OPENROUTER_EDITORIAL_MODEL,
     }
 
 

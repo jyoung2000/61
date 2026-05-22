@@ -146,7 +146,7 @@ async def _trigger_ollama_gpu_rediscovery(job_id: str, provider):
         return False
     try:
         host = provider._host
-        vision_model = provider._vision_model
+        vision_model = provider._primary_model
         logger.info("[%s] Triggering Ollama GPU re-discovery after VRAM release...", job_id)
 
         # First clear any CPU-loaded models
@@ -408,7 +408,7 @@ async def _background_post_processing(job_id: str, transcript: list, orchestrato
                 "message": "Polishing transcript in background...",
             })
 
-            _polish_info = orchestrator.get_text_model_info()
+            _polish_info = orchestrator.get_editorial_model_info()
             _batch_size = _adaptive_batch_size(len(transcript))
             _total_batches = -(-len(transcript) // _batch_size)
             _remaining_waves = -(- max(0, _total_batches - 1) // 3)

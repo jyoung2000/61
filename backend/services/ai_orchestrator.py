@@ -203,10 +203,10 @@ class AIOrchestrator:
         """Get human-readable model info string for a provider."""
         pname = provider.provider_name
         parts = []
-        if hasattr(provider, '_vision_model'):
-            parts.append(f"vision={provider._vision_model}")
-        if hasattr(provider, '_text_model'):
-            parts.append(f"text={provider._text_model}")
+        if hasattr(provider, '_primary_model'):
+            parts.append(f"vision={provider._primary_model}")
+        if hasattr(provider, '_editorial_model'):
+            parts.append(f"text={provider._editorial_model}")
         if parts:
             return f"{pname} ({', '.join(parts)})"
         return pname
@@ -220,18 +220,18 @@ class AIOrchestrator:
         pname = provider.provider_name
         if pname == "openrouter":
             if task in ("scenes", "vision", "scene_analysis"):
-                model = getattr(provider, '_vision_model', None)
+                model = getattr(provider, '_primary_model', None)
             elif task in ("summary",):
-                model = getattr(provider, '_summary_model', None) or getattr(provider, '_text_model', None)
+                model = getattr(provider, '_summary_model', None) or getattr(provider, '_editorial_model', None)
             else:  # clips, seo, text
-                model = getattr(provider, '_text_model', None)
+                model = getattr(provider, '_editorial_model', None)
             if model:
                 return f"{model} via openrouter"
         elif pname == "ollama":
             if task in ("scenes", "vision", "scene_analysis"):
-                model = getattr(provider, '_vision_model', None)
+                model = getattr(provider, '_primary_model', None)
             else:
-                model = getattr(provider, '_text_model', None)
+                model = getattr(provider, '_editorial_model', None)
             if model:
                 return f"{model} via ollama"
         return pname
@@ -274,7 +274,7 @@ class AIOrchestrator:
                         return ("", "⚠ OpenRouter API key is not set — cloud models will fail")
                     # Probe the TEXT model. Vision-model id is also
                     # validated below so we don't burn 100 batches on a
-                    # bad ``OPENROUTER_VISION_MODEL`` (e.g. "gpt-4o"
+                    # bad ``OPENROUTER_PRIMARY_MODEL`` (e.g. "gpt-4o"
                     # instead of "openai/gpt-4o").
                     try:
                         await asyncio.wait_for(
@@ -292,7 +292,7 @@ class AIOrchestrator:
                     # validate_models never becomes the reason a job
                     # can't start.
                     try:
-                        vision_id = getattr(provider, "_vision_model", None)
+                        vision_id = getattr(provider, "_primary_model", None)
                         if vision_id:
                             ok = await _openrouter_model_exists(vision_id)
                             if ok is False:
@@ -319,7 +319,7 @@ class AIOrchestrator:
                     # pulled. Avoids 30s of batch failures on first
                     # use of a model the user hasn't downloaded.
                     try:
-                        vision_id = getattr(provider, "_vision_model", None)
+                        vision_id = getattr(provider, "_primary_model", None)
                         if vision_id:
                             # Ollama's /api/show uses the ``model`` key and
                             # expects a bare tag (no ``ollama/`` prefix).
@@ -418,7 +418,7 @@ class AIOrchestrator:
         """
         self._circuit_breaker.force_reset_all()
 
-    def get_text_model_info(self) -> dict:
+    def get_editorial_model_info(self) -> dict:
         """Return info about the text model that will handle the next text_completion call.
 
         Used by transcript correction to:
@@ -500,7 +500,7 @@ class AIOrchestrator:
         string / None). When provided, the OpenRouter provider uses
         it to route ANIME / GAMEPLAY jobs to Qwen3-VL and leaves
         every other content type on the preset default. See
-        ``select_vision_model_for_content`` in openrouter_provider.py.
+        ``select_primary_model_for_content`` in openrouter_provider.py.
         """
         self._wire_ws_to_providers(job_id)
         frame_prompt = self._custom_prompts.frame_analysis if self._custom_prompts else None
@@ -525,8 +525,8 @@ class AIOrchestrator:
                 # targeted call; other providers ignore the kwarg.
                 _routing_ct = content_type
                 try:
-                    if hasattr(provider, "apply_vision_model_override"):
-                        provider.apply_vision_model_override(_routing_ct)
+                    if hasattr(provider, "apply_primary_model_override"):
+                        provider.apply_primary_model_override(_routing_ct)
                 except Exception as err:
                     logger.debug("Vision model override skipped: %s", err)
 
@@ -1057,8 +1057,8 @@ class AIOrchestrator:
             if pname == "ollama" and self._current_model_override:
                 model_name = self._current_model_override
                 # Temporarily override the provider's text model
-                original_model = provider._text_model
-                provider._text_model = self._current_model_override
+                original_model = provider._editorial_model
+                provider._editorial_model = self._current_model_override
             else:
                 original_model = None
             try:
@@ -1098,7 +1098,7 @@ class AIOrchestrator:
             finally:
                 # Restore original model if we overrode it
                 if original_model is not None:
-                    provider._text_model = original_model
+                    provider._editorial_model = original_model
         raise AllProvidersFailedError("All providers failed for text completion")
 
     async def generate_seo(

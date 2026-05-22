@@ -155,8 +155,8 @@ def _ollama_base_url() -> str:
     return os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
 
 
-def _ollama_vision_model() -> str:
-    return os.environ.get("OLLAMA_VISION_MODEL", "llava:7b")
+def _ollama_primary_model() -> str:
+    return os.environ.get("OLLAMA_PRIMARY_MODEL", "llava:7b")
 
 
 def _ollama_reachable() -> bool:
@@ -191,7 +191,7 @@ def _score_frame_vlm_ollama(sample: FrameSample) -> Optional[FrameScore]:
         with open(sample.frame_path, "rb") as f:
             img_b64 = base64.b64encode(f.read()).decode("ascii")
         payload = {
-            "model": _ollama_vision_model(),
+            "model": _ollama_primary_model(),
             "prompt": _VLM_PROMPT,
             "images": [img_b64],
             "stream": False,

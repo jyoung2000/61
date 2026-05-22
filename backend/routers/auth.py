@@ -214,18 +214,18 @@ async def update_my_settings(
         # AI chain / model choices
         "AI_FALLBACK_CHAIN",
         "OPENROUTER_PRESET",
-        "OPENROUTER_VISION_MODEL",
-        "OPENROUTER_TEXT_MODEL",
+        "OPENROUTER_PRIMARY_MODEL",
+        "OPENROUTER_EDITORIAL_MODEL",
         "OPENROUTER_SUMMARY_MODEL",
-        "OLLAMA_VISION_MODEL",
-        "OLLAMA_TEXT_MODEL",
+        "OLLAMA_PRIMARY_MODEL",
+        "OLLAMA_EDITORIAL_MODEL",
         "OLLAMA_TRANSLATION_MODEL",
         # Per-user model picks for the cloud providers that previously
         # had no override path (Anthropic / Gemini / Groq).
         "ANTHROPIC_MODEL",
-        "GEMINI_TEXT_MODEL",
+        "GEMINI_EDITORIAL_MODEL",
         "GEMINI_VIDEO_MODEL",
-        "GROQ_TEXT_MODEL",
+        "GROQ_EDITORIAL_MODEL",
         # Per-user AI provider API keys. Each user has their own,
         # otherwise everyone shares the admin's billing.
         "OPENROUTER_API_KEY",

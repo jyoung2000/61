@@ -389,14 +389,14 @@ async def _startup_preload():
             host = cfg.OLLAMA_HOST
             if _ollama_is_primary:
                 # Ollama is primary — pull all configured models + extras
-                models = [cfg.OLLAMA_VISION_MODEL, cfg.OLLAMA_TEXT_MODEL]
+                models = [cfg.OLLAMA_PRIMARY_MODEL, cfg.OLLAMA_EDITORIAL_MODEL]
                 for extra in ("llava", "llama3.2:3b", cfg.OLLAMA_TRANSLATION_MODEL):
                     if extra and extra not in models:
                         models.append(extra)
             else:
                 # Cloud provider is primary — only pull the configured fallback models
                 # Don't pull extras to save bandwidth and avoid unnecessary GPU loading
-                models = [cfg.OLLAMA_VISION_MODEL, cfg.OLLAMA_TEXT_MODEL]
+                models = [cfg.OLLAMA_PRIMARY_MODEL, cfg.OLLAMA_EDITORIAL_MODEL]
                 logger.info("Cloud provider is primary — pulling only Ollama fallback models: %s", models)
             for model in models:
                 try:

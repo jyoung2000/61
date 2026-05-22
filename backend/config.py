@@ -11,8 +11,8 @@ class Settings(BaseSettings):
     # OpenRouter (uses OpenAI-compatible API — set your key from openrouter.ai)
     OPENROUTER_API_KEY: str = ""
     OPENROUTER_PRESET: str = "balanced"  # free | efficient | balanced | premium | custom
-    OPENROUTER_VISION_MODEL: str = "google/gemini-2.5-flash"
-    OPENROUTER_TEXT_MODEL: str = "google/gemini-2.5-pro"
+    OPENROUTER_PRIMARY_MODEL: str = "google/gemini-2.5-flash"
+    OPENROUTER_EDITORIAL_MODEL: str = "google/gemini-2.5-pro"
     OPENROUTER_SUMMARY_MODEL: str = "google/gemini-2.5-flash"
 
     # Direct provider keys
@@ -22,21 +22,28 @@ class Settings(BaseSettings):
     # different model on the same backend without restarting.
     ANTHROPIC_MODEL: str = ""             # blank → provider's MODEL constant default
     GEMINI_API_KEY: str = ""
-    GEMINI_TEXT_MODEL: str = ""           # blank → "gemini-2.0-flash"
+    GEMINI_EDITORIAL_MODEL: str = ""           # blank → "gemini-2.0-flash"
     GEMINI_VIDEO_MODEL: str = ""          # blank → "gemini-2.5-flash"
     GEMINI_USE_NATIVE_VIDEO: bool = False
     GROQ_API_KEY: str = ""
-    GROQ_TEXT_MODEL: str = ""             # blank → "llama-3.3-70b-versatile"
+    GROQ_EDITORIAL_MODEL: str = ""             # blank → "llama-3.3-70b-versatile"
 
-    # Ollama — defaults sized for 4GB VRAM (GTX 1650 class).
-    # moondream:1.8b (~1GB) fits entirely in 4GB VRAM for fast GPU vision inference.
-    # qwen2.5:3b-instruct (~1.8GB) fits in VRAM alongside moondream for GPU text inference.
-    # Both together = ~3.1GB < 4GB VRAM, so both get full GPU acceleration.
-    # Users with 8GB+ VRAM can switch to llava:7b + llama3.1:8b in Settings.
+    # Ollama — Primary AI (video/vision) + Editorial AI (scoring/summary).
+    # On a 4GB GTX 1650 the reframer engine frees Whisper VRAM before the
+    # VLM stage, so llava:7b (~4GB) gets exclusive GPU access for Primary AI.
+    # qwen2.5:3b-instruct (~1.8GB) handles Editorial AI. Users with 8GB+
+    # VRAM can switch to larger models in Settings.
     OLLAMA_HOST: str = "http://ollama:11434"
-    OLLAMA_VISION_MODEL: str = "moondream:1.8b"
-    OLLAMA_TEXT_MODEL: str = "qwen2.5:3b-instruct"
+    OLLAMA_PRIMARY_MODEL: str = "llava:7b"
+    OLLAMA_EDITORIAL_MODEL: str = "qwen2.5:3b-instruct"
     OLLAMA_TRANSLATION_MODEL: str = "qwen2.5:3b"  # Dedicated model for subtitle translation (multilingual)
+
+    # VideoLLaMA2 — optional local audio-visual model for Primary AI.
+    # Requires ~10GB VRAM (RTX 4070+); on smaller GPUs the engine falls
+    # back to the Ollama vision model, then cloud, then signal-only scoring.
+    VIDEOLLAMA2_ENABLED: bool = True
+    VIDEOLLAMA2_MODEL: str = "DAMO-NLP-SG/VideoLLaMA2.1-7B-AV"
+    VIDEOLLAMA2_QUANTIZE: str = "int8"
 
     # Fallback chain (ollama excluded by default — user can enable it in Settings)
     AI_FALLBACK_CHAIN: str = "openrouter,gemini,groq"

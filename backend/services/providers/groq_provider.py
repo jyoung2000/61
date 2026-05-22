@@ -31,8 +31,8 @@ class GroqProvider(ChunkedClipDetectionMixin, AIProvider):
     def __init__(self):
         self._client = AsyncGroq(api_key=settings.GROQ_API_KEY)
         # Per-user model override via the settings overlay
-        # (``GROQ_TEXT_MODEL``). Falls back to the install default.
-        self._model = getattr(settings, "GROQ_TEXT_MODEL", "") or MODEL
+        # (``GROQ_EDITORIAL_MODEL``). Falls back to the install default.
+        self._model = getattr(settings, "GROQ_EDITORIAL_MODEL", "") or MODEL
         self._total_tokens = 0
 
     @property

@@ -90,7 +90,7 @@ def _normalize_ollama_model(model: Optional[str]) -> str:
 # Maps content type → Ollama model id. All entries must be quantized
 # 4-bit variants that fit in <3GB VRAM (GTX 1650 has 4GB total and
 # qwen2.5:3b-instruct text model occupies ~1.8GB during co-residence).
-# Users without these models pulled fall through to OLLAMA_VISION_MODEL.
+# Users without these models pulled fall through to OLLAMA_PRIMARY_MODEL.
 _OLLAMA_CONTENT_TYPE_VISION_OVERRIDES = {
     # Anime / animation: minicpm-v handles non-photographic content
     # (cel-shaded faces, mascots) better than llava/moondream.
@@ -110,12 +110,12 @@ _OLLAMA_CONTENT_TYPE_VISION_OVERRIDES = {
 }
 
 
-def select_ollama_vision_model_for_content(content_type, preset_default: str) -> str:
+def select_ollama_primary_model_for_content(content_type, preset_default: str) -> str:
     """Return the Ollama vision model id for a given content type.
 
-    Mirrors ``openrouter_provider.select_vision_model_for_content``.
+    Mirrors ``openrouter_provider.select_primary_model_for_content``.
     Unknown types always return the preset default
-    (``settings.OLLAMA_VISION_MODEL``).
+    (``settings.OLLAMA_PRIMARY_MODEL``).
     """
     if content_type is None:
         return preset_default
@@ -210,12 +210,12 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
 
     def __init__(self):
         self._host = settings.OLLAMA_HOST
-        self._vision_model = _normalize_ollama_model(settings.OLLAMA_VISION_MODEL)
-        # Capture the configured default so ``apply_vision_model_override``
+        self._primary_model = _normalize_ollama_model(settings.OLLAMA_PRIMARY_MODEL)
+        # Capture the configured default so ``apply_primary_model_override``
         # can revert when ``content_type`` is None.
-        self._base_vision_model = _normalize_ollama_model(settings.OLLAMA_VISION_MODEL)
-        self._text_model = _normalize_ollama_model(settings.OLLAMA_TEXT_MODEL)
-        self._summary_model = self._text_model
+        self._base_primary_model = _normalize_ollama_model(settings.OLLAMA_PRIMARY_MODEL)
+        self._editorial_model = _normalize_ollama_model(settings.OLLAMA_EDITORIAL_MODEL)
+        self._summary_model = self._editorial_model
         self._total_tokens = 0
         self._model_ctx: dict[str, int] = {}
         self._capabilities_detected = False
@@ -242,10 +242,10 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
         """Close the shared HTTP client. Call when provider is no longer needed."""
         await self._client.aclose()
 
-    def apply_vision_model_override(self, content_type) -> str:
+    def apply_primary_model_override(self, content_type) -> str:
         """Swap the active vision model based on ``content_type`` (Phase 2 parity).
 
-        Mirrors ``OpenRouterProvider.apply_vision_model_override``. The
+        Mirrors ``OpenRouterProvider.apply_primary_model_override``. The
         orchestrator already calls this on every analyze_frames invocation;
         we just need to honor it. If the requested model isn't pulled in
         Ollama, ``_call_vision`` will get a 404 and the orchestrator will
@@ -257,26 +257,26 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
         ``__init__``.
         """
         resolved = _normalize_ollama_model(
-            select_ollama_vision_model_for_content(
-                content_type, self._base_vision_model,
+            select_ollama_primary_model_for_content(
+                content_type, self._base_primary_model,
             )
         )
-        if resolved == self._vision_model:
+        if resolved == self._primary_model:
             return resolved
 
         logger.info(
             "Ollama: routing %s content to vision model %s (was %s). "
             "If this model is not pulled, run: ollama pull %s",
             getattr(content_type, "value", content_type) or "unknown",
-            resolved, self._vision_model, resolved,
+            resolved, self._primary_model, resolved,
         )
-        self._vision_model = resolved
+        self._primary_model = resolved
         # _ensure_model_active will swap it into VRAM on the next vision call
         return resolved
 
     async def unload_models(self):
         """Unload all models from VRAM so other processes (Whisper) can use the GPU."""
-        for model in (self._vision_model, self._text_model):
+        for model in (self._primary_model, self._editorial_model):
             try:
                 await self._client.post(f"{self._host}/api/generate", json={
                     "model": model,
@@ -441,7 +441,7 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
 
             # Step 2: Load smallest model with explicit GPU request
             # Use vision model (moondream ~788MB) as it's the smallest
-            probe_model = self._vision_model
+            probe_model = self._primary_model
             resp = await self._client.post(
                 f"{self._host}/api/generate",
                 json={
@@ -643,7 +643,7 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
         On 4GB VRAM GPUs, only one model can be resident at a time.
         Explicitly unloading before loading prevents OOM crashes.
         """
-        other_model = self._text_model if model_name == self._vision_model else self._vision_model
+        other_model = self._editorial_model if model_name == self._primary_model else self._primary_model
         if other_model == model_name:
             return
         try:
@@ -657,7 +657,7 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
 
         # When loading vision model after Whisper release, check if VRAM is
         # available and reset force_cpu flag so CLIP can use GPU
-        if model_name == self._vision_model and self._force_cpu:
+        if model_name == self._primary_model and self._force_cpu:
             free_mb = 0
             # Method 1: nvidia-smi
             try:
@@ -696,7 +696,7 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
 
     @property
     def text_model_name(self) -> str:
-        return self._text_model
+        return self._editorial_model
 
     async def warmup(self):
         """Pre-load models with VRAM-aware offloading to avoid cold start OOM.
@@ -714,14 +714,14 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
             large_vision = ["llava:7b", "llava:13b", "llava-v1.6"]
             large_text = ["llama3.1:8b", "llama3:8b", "mistral:7b", "gemma:7b",
                          "deepseek:7b", "qwen2.5:7b"]
-            vision_lower = self._vision_model.lower()
-            text_lower = self._text_model.lower()
+            vision_lower = self._primary_model.lower()
+            text_lower = self._editorial_model.lower()
             for pattern in large_vision:
                 if pattern in vision_lower:
                     logger.warning(
                         "VRAM WARNING: Vision model '%s' (~4GB) exceeds %dMB VRAM — "
                         "will run on CPU (very slow). Recommend: moondream:1.8b (~1GB)",
-                        self._vision_model, self._available_vram_mb,
+                        self._primary_model, self._available_vram_mb,
                     )
                     break
             for pattern in large_text:
@@ -729,17 +729,17 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                     logger.warning(
                         "VRAM WARNING: Text model '%s' (~4GB) exceeds %dMB VRAM — "
                         "will run on CPU (slow). Recommend: qwen2.5:3b-instruct (~1.8GB)",
-                        self._text_model, self._available_vram_mb,
+                        self._editorial_model, self._available_vram_mb,
                     )
                     break
 
-        vision_num_gpu = self._get_num_gpu(self._vision_model)
-        text_num_gpu = self._get_num_gpu(self._text_model)
+        vision_num_gpu = self._get_num_gpu(self._primary_model)
+        text_num_gpu = self._get_num_gpu(self._editorial_model)
 
         logger.info(
             "Ollama warmup: vision=%s (num_gpu=%s), text=%s (num_gpu=%s), force_cpu=%s",
-            self._vision_model, vision_num_gpu,
-            self._text_model, text_num_gpu,
+            self._primary_model, vision_num_gpu,
+            self._editorial_model, text_num_gpu,
             self._force_cpu,
         )
 
@@ -749,7 +749,7 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
             if vision_num_gpu >= 0:
                 options["num_gpu"] = vision_num_gpu
             resp = await self._client.post(f"{self._host}/api/chat", json={
-                "model": self._vision_model,
+                "model": self._primary_model,
                 "messages": [{"role": "user", "content": "test"}],
                 "stream": False,
                 "options": options,
@@ -757,14 +757,14 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
             if resp.status_code == 500 and self._is_oom_error(resp.text[:500]):
                 logger.warning(
                     "Vision model %s OOM during warmup — forcing CPU-only for all models",
-                    self._vision_model,
+                    self._primary_model,
                 )
                 self._force_cpu = True
                 # Retry with CPU
                 options["num_gpu"] = 0
                 await asyncio.sleep(3)
                 await self._client.post(f"{self._host}/api/chat", json={
-                    "model": self._vision_model,
+                    "model": self._primary_model,
                     "messages": [{"role": "user", "content": "test"}],
                     "stream": False,
                     "options": options,
@@ -781,7 +781,7 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
             # Warm up text model (unload vision first to free VRAM)
             try:
                 await self._client.post(f"{self._host}/api/generate", json={
-                    "model": self._vision_model,
+                    "model": self._primary_model,
                     "keep_alive": 0,
                 }, timeout=10.0)
             except Exception:
@@ -793,13 +793,13 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
             if self._force_cpu:
                 options["num_gpu"] = 0
             resp = await self._client.post(f"{self._host}/api/chat", json={
-                "model": self._text_model,
+                "model": self._editorial_model,
                 "messages": [{"role": "user", "content": "test"}],
                 "stream": False,
                 "options": options,
             }, timeout=120.0)
             if resp.status_code == 500 and self._is_oom_error(resp.text[:500]):
-                logger.warning("Text model %s OOM during warmup — forcing CPU-only", self._text_model)
+                logger.warning("Text model %s OOM during warmup — forcing CPU-only", self._editorial_model)
                 self._force_cpu = True
         except Exception as e:
             error_str = str(e)
@@ -812,7 +812,7 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
         mode = "CPU-only (num_gpu=0)" if self._force_cpu else "GPU-assisted"
         logger.info(
             "Ollama models warmed up: vision=%s, text=%s, mode=%s",
-            self._vision_model, self._text_model, mode,
+            self._primary_model, self._editorial_model, mode,
         )
 
     def _get_effective_ctx(self, model_name: str) -> int:
@@ -859,7 +859,7 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
     async def _detect_capabilities(self):
         """Probe Ollama for model capabilities to adapt prompt sizing."""
         try:
-            for model_name in [self._vision_model, self._text_model]:
+            for model_name in [self._primary_model, self._editorial_model]:
                 resp = await self._client.post(f"{self._host}/api/show", json={"model": model_name})
                 if resp.status_code == 200:
                     info = resp.json()
@@ -888,17 +888,17 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
         else:
             vision_timeout = 60.0   # GPU: moondream takes 4-5s/frame, 60s is generous
 
-        num_gpu = self._get_num_gpu(self._vision_model)
+        num_gpu = self._get_num_gpu(self._primary_model)
 
         # Determine if model supports format: "json" reliably.
         # moondream supports it well. Larger llava models may not.
-        vision_lower = self._vision_model.lower()
+        vision_lower = self._primary_model.lower()
         use_json_format = "moondream" in vision_lower
 
         for attempt in range(2):  # At most 2 attempts: GPU then CPU
             try:
                 options = {
-                    "num_ctx": self._get_effective_ctx(self._vision_model),
+                    "num_ctx": self._get_effective_ctx(self._primary_model),
                     "num_gpu": 99,  # Force all layers on GPU (Ollama caps at actual count)
                     "num_thread": 4,
                 }
@@ -908,7 +908,7 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                     logger.info("Retrying vision call with num_gpu=0 (CPU-only) after OOM")
 
                 payload = {
-                    "model": self._vision_model,
+                    "model": self._primary_model,
                     "messages": [
                         {
                             "role": "user",
@@ -940,13 +940,13 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                     if self._is_oom_error(error_text) and attempt == 0:
                         logger.warning(
                             "Ollama vision CUDA OOM (model=%s) — clearing VRAM and retrying on GPU. Error: %s",
-                            self._vision_model, error_text[:200],
+                            self._primary_model, error_text[:200],
                         )
                         # Clear all models (likely text model still resident) and retry on GPU
                         await self.clear_vram()
                         await asyncio.sleep(3)
                         self._force_cpu = False
-                        options["num_gpu"] = self._get_num_gpu(self._vision_model)
+                        options["num_gpu"] = self._get_num_gpu(self._primary_model)
                         continue
                     # Non-OOM 500 or second attempt 500 — raise
                     response.raise_for_status()
@@ -959,7 +959,7 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
             except httpx.TimeoutException:
                 raise ProviderError(
                     f"Ollama vision timeout after {vision_timeout}s "
-                    f"(model={self._vision_model}) — consider using a smaller model"
+                    f"(model={self._primary_model}) — consider using a smaller model"
                 )
             except httpx.HTTPStatusError as e:
                 error_text = e.response.text[:500] if e.response else ""
@@ -981,7 +981,7 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                     continue
                 raise ProviderError(f"Ollama vision error: {e}")
 
-        raise ProviderError(f"Ollama vision failed after 2 attempts (model={self._vision_model})")
+        raise ProviderError(f"Ollama vision failed after 2 attempts (model={self._primary_model})")
 
     async def _call_text(self, prompt: str, system: str = "", max_tokens: int = 4096,
                          timeout: float = 90.0, json_mode: bool = False,
@@ -1013,15 +1013,15 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
         base_stall = self.STALL_TIMEOUT_GPU if gpu_available else self.STALL_TIMEOUT_CPU
         stall_timeout = max(base_stall, effective_timeout * 0.3)
 
-        num_gpu = self._get_num_gpu(self._text_model)
+        num_gpu = self._get_num_gpu(self._editorial_model)
 
         payload = {
-            "model": self._text_model,
+            "model": self._editorial_model,
             "messages": messages,
             "stream": True,
             "options": {
                 "num_predict": max_tokens,
-                "num_ctx": self._get_effective_ctx(self._text_model),
+                "num_ctx": self._get_effective_ctx(self._editorial_model),
                 "num_gpu": 99,  # Force all layers on GPU (overrides poisoned scheduler)
                 "num_batch": 256,  # Reduce from 512 to lower compute graph VRAM (~150MB vs ~300MB)
                 "num_thread": 4,          # CPU threads for any remaining CPU work
@@ -1036,7 +1036,7 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
         logger.debug(
             "Ollama _call_text (streaming): model=%s, prompt_len=%d, system_len=%d, "
             "effective_timeout=%.0fs, stall_timeout=%.0fs, num_gpu=%s",
-            self._text_model, len(prompt), len(system), effective_timeout, stall_timeout, num_gpu,
+            self._editorial_model, len(prompt), len(system), effective_timeout, stall_timeout, num_gpu,
         )
 
         for attempt in range(2):  # At most 2 attempts: GPU then CPU
@@ -1063,13 +1063,13 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                         if self._is_oom_error(error_text) and attempt == 0:
                             logger.warning(
                                 "Ollama text OOM (model=%s) — switching to CPU-only: %s",
-                                self._text_model, error_text[:200],
+                                self._editorial_model, error_text[:200],
                             )
                             self._force_cpu = True
                             await asyncio.sleep(3)
                             continue
                         raise ProviderError(
-                            f"Ollama text HTTP 500 (model={self._text_model}): "
+                            f"Ollama text HTTP 500 (model={self._editorial_model}): "
                             f"{error_text[:200]}"
                         )
 
@@ -1085,16 +1085,16 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                             logger.warning(
                                 "Ollama text model %r not found (HTTP 404). "
                                 "Ensure the model is pulled: `ollama pull %s`. Body: %s",
-                                self._text_model, self._text_model, error_text[:200],
+                                self._editorial_model, self._editorial_model, error_text[:200],
                             )
                             raise ProviderError(
-                                f"Ollama text model {self._text_model!r} is not pulled "
-                                f"(HTTP 404). Run `ollama pull {self._text_model}` or pick "
+                                f"Ollama text model {self._editorial_model!r} is not pulled "
+                                f"(HTTP 404). Run `ollama pull {self._editorial_model}` or pick "
                                 "a model that's already downloaded."
                             )
                         raise ProviderError(
                             f"Ollama text HTTP {response.status_code} "
-                            f"(model={self._text_model}): {error_text[:200]}"
+                            f"(model={self._editorial_model}): {error_text[:200]}"
                         )
 
                     response.raise_for_status()
@@ -1128,7 +1128,7 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                 result = "".join(collected_text)
 
                 if not result:
-                    logger.warning("Ollama streaming returned empty response for model=%s", self._text_model)
+                    logger.warning("Ollama streaming returned empty response for model=%s", self._editorial_model)
                 else:
                     logger.debug(
                         "Ollama streaming complete: %d chars, %d prompt_tokens, %d eval_tokens",
@@ -1138,7 +1138,7 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                     # Record speed measurement for dynamic timeout calculation
                     if total_eval_tokens > 0 and token_count > 0:
                         record_speed_measurement(
-                            self._text_model, total_prompt_tokens, total_eval_tokens,
+                            self._editorial_model, total_prompt_tokens, total_eval_tokens,
                             token_count / 12.0  # rough elapsed estimate
                         )
 
@@ -1151,15 +1151,15 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                         "Ollama text stalled (no data for %.0fs) — attempting overload recovery",
                         stall_timeout,
                     )
-                    recovered = await self.recover_from_overload(self._text_model)
+                    recovered = await self.recover_from_overload(self._editorial_model)
                     if recovered:
                         continue  # Retry with recovered model
                 raise ProviderError(
                     f"Ollama text stalled (no data for {stall_timeout:.0f}s) — "
-                    f"model={self._text_model}, the model may be overloaded"
+                    f"model={self._editorial_model}, the model may be overloaded"
                 )
             except httpx.TimeoutException:
-                raise ProviderError(f"Ollama text timeout after {effective_timeout:.0f}s (model={self._text_model})")
+                raise ProviderError(f"Ollama text timeout after {effective_timeout:.0f}s (model={self._editorial_model})")
             except httpx.HTTPStatusError as e:
                 # e.response may be a streaming response that hasn't been
                 # consumed yet. Accessing ``.text`` directly raises
@@ -1191,7 +1191,7 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                     # Reset force_cpu so retry uses GPU
                     self._force_cpu = False
                     # Rebuild payload with GPU layers
-                    payload["options"]["num_gpu"] = self._get_num_gpu(self._text_model)
+                    payload["options"]["num_gpu"] = self._get_num_gpu(self._editorial_model)
                     continue
                 # Second OOM or non-OOM error — fall back to CPU
                 if self._is_oom_error(error_text):
@@ -1199,12 +1199,12 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                     self._force_cpu = True
                 if status_code == 404:
                     raise ProviderError(
-                        f"Ollama text model {self._text_model!r} is not pulled "
-                        f"(HTTP 404). Run `ollama pull {self._text_model}` or pick "
+                        f"Ollama text model {self._editorial_model!r} is not pulled "
+                        f"(HTTP 404). Run `ollama pull {self._editorial_model}` or pick "
                         "a model that's already downloaded."
                     )
                 raise ProviderError(
-                    f"Ollama HTTP {status_code} (model={self._text_model}): {error_text[:200]}"
+                    f"Ollama HTTP {status_code} (model={self._editorial_model}): {error_text[:200]}"
                 )
             except Exception as e:
                 error_str = str(e)
@@ -1216,11 +1216,11 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                     await self.clear_vram()
                     await asyncio.sleep(3)
                     self._force_cpu = False
-                    payload["options"]["num_gpu"] = self._get_num_gpu(self._text_model)
+                    payload["options"]["num_gpu"] = self._get_num_gpu(self._editorial_model)
                     continue
                 raise ProviderError(f"Ollama text error ({type(e).__name__}): {e}")
 
-        raise ProviderError(f"Ollama text failed after 2 attempts (model={self._text_model})")
+        raise ProviderError(f"Ollama text failed after 2 attempts (model={self._editorial_model})")
 
     async def text_complete(self, prompt: str, max_tokens: int = 4096, timeout: int | None = None) -> str:
         return await self._call_text(prompt, max_tokens=max_tokens)
@@ -1237,14 +1237,14 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
         _speed_limited_indices = None
         if total > 10 and frames[0].base64:
             import time as _t
-            await self._ensure_model_active(self._vision_model)
+            await self._ensure_model_active(self._primary_model)
             t0 = _t.monotonic()
             try:
                 # Use the ACTUAL prompt for speed testing (not a simplified version)
                 # The real prompt is 3-4x longer and triggers different tokenization
                 _test_suffix = (
                     _VISION_JSON_SUFFIX_SIMPLE
-                    if "moondream" in self._vision_model.lower()
+                    if "moondream" in self._primary_model.lower()
                     else _VISION_JSON_SUFFIX
                 )
                 test_prompt = (
@@ -1260,7 +1260,7 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                 elapsed = _t.monotonic() - t0
                 logger.info(
                     "Ollama vision speed test: %.1fs for 1 frame (model=%s)",
-                    elapsed, self._vision_model,
+                    elapsed, self._primary_model,
                 )
 
                 if elapsed > 60:
@@ -1304,7 +1304,7 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                     "Ollama vision speed test timed out (>120s, model=%s) — "
                     "CLIP likely on CPU due to GPU scheduler poisoning. "
                     "Attempting GPU scheduler reset...",
-                    self._vision_model,
+                    self._primary_model,
                 )
                 # GPU scheduler is likely poisoned from a prior OOM.
                 # Reset it before retrying.
@@ -1325,7 +1325,7 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                     elapsed_retry = _t.monotonic() - t0
                     logger.info(
                         "Ollama vision retry after reload: %.1fs (model=%s)",
-                        elapsed_retry, self._vision_model,
+                        elapsed_retry, self._primary_model,
                     )
                     # If still slow, cap to 20 frames
                     if elapsed_retry > 60:
@@ -1374,7 +1374,7 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                         "Ollama vision speed test returned server error (model=%s): %s — "
                         "moondream may have crashed or CLIP is stuck on CPU. "
                         "Falling back to timestamp-based descriptions.",
-                        self._vision_model, error_str[:200],
+                        self._primary_model, error_str[:200],
                     )
                     scenes = []
                     for i, frame in enumerate(frames):
@@ -1403,7 +1403,7 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
             except Exception as e:
                 logger.warning("Vision speed test failed (%s) — proceeding with all frames", e)
 
-        await self._ensure_model_active(self._vision_model)
+        await self._ensure_model_active(self._primary_model)
         # Use simplified prompt for small local models — they can't reason about
         # "social media potential" or "spectacle" but CAN describe what's visible
         if custom_prompt:
@@ -1587,7 +1587,7 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                     )
 
                 # Select prompt based on model size/capability
-                vision_lower = self._vision_model.lower()
+                vision_lower = self._primary_model.lower()
                 if "moondream" in vision_lower:
                     # Moondream 1.8B: very short prompt to fit in 2048 context
                     # The image tokens consume most of the context window
@@ -1610,7 +1610,7 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                 face_hint = ""
                 fd = getattr(frame, 'face_data', None)
                 if fd and hasattr(fd, 'faces') and fd.faces:
-                    vision_lower_fh = self._vision_model.lower()
+                    vision_lower_fh = self._primary_model.lower()
                     if "moondream" in vision_lower_fh:
                         # Ultra-compact for small models
                         if len(fd.faces) == 1:
@@ -1867,13 +1867,13 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                 logger.warning(
                     "[SubjectTracking] Moondream quality issue: %d/%d frames (%.0f%%) have subject_x=50. "
                     "Subject tracking will be limited. Model: %s",
-                    at_center, len(sx_values), center_pct, self._vision_model,
+                    at_center, len(sx_values), center_pct, self._primary_model,
                 )
             elif unique_sx <= 2 and len(sx_values) > 5:
                 logger.warning(
                     "[SubjectTracking] Low subject_x diversity: only %d unique values across %d frames. "
                     "Model: %s",
-                    unique_sx, len(sx_values), self._vision_model,
+                    unique_sx, len(sx_values), self._primary_model,
                 )
             else:
                 non_center = [sx for sx in sx_values if sx != 50]
@@ -1883,7 +1883,7 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                         "(range %d-%d, %d unique), model=%s",
                         len(non_center), len(sx_values),
                         min(non_center), max(non_center), unique_sx,
-                        self._vision_model,
+                        self._primary_model,
                     )
 
         # Fill in cold-zone frames with interpolated descriptions from nearest analyzed frames
@@ -2073,12 +2073,12 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
             logger.info("Generating summary from %d scenes only (no transcript)", len(real_scenes))
 
         # Unload vision model before text-heavy summary generation
-        await self._unload_model(self._vision_model)
-        await self._ensure_model_active(self._text_model)
+        await self._unload_model(self._primary_model)
+        await self._ensure_model_active(self._editorial_model)
         instruction = custom_prompt if custom_prompt else DEFAULT_SUMMARY_PROMPT
 
         # Dynamic context budget based on effective context length
-        ctx_tokens = self._get_effective_ctx(self._text_model)
+        ctx_tokens = self._get_effective_ctx(self._editorial_model)
         overhead_tokens = 400  # prompt template + JSON format
         output_reserve = min(800, ctx_tokens // 3)  # reserve 1/3 for output
         available_tokens = ctx_tokens - overhead_tokens - output_reserve
@@ -2160,8 +2160,8 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
         _partial_results: Optional[list] = None,
     ) -> list[ClipCandidate]:
         # Unload vision model before text-heavy clip detection
-        await self._unload_model(self._vision_model)
-        await self._ensure_model_active(self._text_model)
+        await self._unload_model(self._primary_model)
+        await self._ensure_model_active(self._editorial_model)
         # For videos > 5 min, use multi-pass detection via mixin (sequential for VRAM safety)
         if video_duration > 300:
             logger.info("Ollama: video %.0fs (>5min) — using sequential multi-pass clip detection", video_duration)
@@ -2216,11 +2216,11 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
         progress_callback=None,
         **kwargs,
     ) -> list[ClipCandidate]:
-        await self._ensure_model_active(self._text_model)
+        await self._ensure_model_active(self._editorial_model)
         instruction = custom_prompt if custom_prompt else DEFAULT_VIRAL_CLIP_PROMPT
 
         # Context-aware budget calculation based on detected model context
-        ctx_tokens = self._get_effective_ctx(self._text_model)
+        ctx_tokens = self._get_effective_ctx(self._editorial_model)
         input_budget_tokens = int(ctx_tokens * 0.55)  # reserve 45% for output
         input_budget_chars = input_budget_tokens * 4
         overhead_chars = 2000  # system prompt + JSON schema

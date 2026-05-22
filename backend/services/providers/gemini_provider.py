@@ -64,10 +64,10 @@ class GeminiProvider(ChunkedClipDetectionMixin, AIProvider):
     def __init__(self):
         genai.configure(api_key=settings.GEMINI_API_KEY)
         # Per-user model overrides via the settings overlay
-        # (``GEMINI_TEXT_MODEL`` / ``GEMINI_VIDEO_MODEL``). Falls back
+        # (``GEMINI_EDITORIAL_MODEL`` / ``GEMINI_VIDEO_MODEL``). Falls back
         # to sensible defaults so older installs without the overlay
         # keys keep working.
-        text_model_id = getattr(settings, "GEMINI_TEXT_MODEL", "") or "gemini-2.0-flash"
+        text_model_id = getattr(settings, "GEMINI_EDITORIAL_MODEL", "") or "gemini-2.0-flash"
         video_model_id = getattr(settings, "GEMINI_VIDEO_MODEL", "") or "gemini-2.5-flash"
         self._model_name = text_model_id
         self._video_model_name = video_model_id

@@ -125,7 +125,7 @@ async def _get_gpu_info() -> dict:
                 resp = await client.post(
                     f"{settings.OLLAMA_HOST}/api/generate",
                     json={
-                        "model": settings.OLLAMA_VISION_MODEL,
+                        "model": settings.OLLAMA_PRIMARY_MODEL,
                         "prompt": "hi",
                         "stream": False,
                         "options": {"num_gpu": 99, "num_predict": 1},
@@ -144,7 +144,7 @@ async def _get_gpu_info() -> dict:
                     # Clean up probe
                     await client.post(
                         f"{settings.OLLAMA_HOST}/api/generate",
-                        json={"model": settings.OLLAMA_VISION_MODEL, "keep_alive": 0},
+                        json={"model": settings.OLLAMA_PRIMARY_MODEL, "keep_alive": 0},
                     )
                     await asyncio.sleep(2)
         except Exception:
@@ -266,7 +266,7 @@ def _sse_event(event_type: str, data: dict) -> str:
     return f"data: {json.dumps(payload)}\n\n"
 
 
-async def _test_vision_model(model: str) -> dict:
+async def _test_primary_model(model: str) -> dict:
     """Test vision model: load, analyze a tiny test image, check GPU status."""
     start = time.time()
     try:
@@ -342,7 +342,7 @@ async def _test_vision_model(model: str) -> dict:
         }
 
 
-async def _test_text_model(model: str) -> dict:
+async def _test_editorial_model(model: str) -> dict:
     """Test text model: load, run a short completion, check GPU status."""
     start = time.time()
     try:
@@ -665,12 +665,12 @@ async def test_pipeline(request: Request):
     _primary_provider = _chain[0] if _chain else "ollama"
 
     if _primary_provider == "ollama":
-        vision_model = settings.OLLAMA_VISION_MODEL
-        text_model = settings.OLLAMA_TEXT_MODEL
+        vision_model = settings.OLLAMA_PRIMARY_MODEL
+        text_model = settings.OLLAMA_EDITORIAL_MODEL
         provider_label = "ollama"
     elif _primary_provider == "openrouter":
-        vision_model = settings.OPENROUTER_VISION_MODEL or "openrouter/default"
-        text_model = settings.OPENROUTER_TEXT_MODEL or "openrouter/default"
+        vision_model = settings.OPENROUTER_PRIMARY_MODEL or "openrouter/default"
+        text_model = settings.OPENROUTER_EDITORIAL_MODEL or "openrouter/default"
         provider_label = "openrouter"
     elif _primary_provider == "anthropic":
         vision_model = "claude-3-haiku"
@@ -682,11 +682,11 @@ async def test_pipeline(request: Request):
         provider_label = "gemini"
     elif _primary_provider == "groq":
         vision_model = "llava-v1.5-7b-4096-preview"
-        text_model = settings.GROQ_TEXT_MODEL if hasattr(settings, 'GROQ_TEXT_MODEL') else "llama3-8b-8192"
+        text_model = settings.GROQ_EDITORIAL_MODEL if hasattr(settings, 'GROQ_EDITORIAL_MODEL') else "llama3-8b-8192"
         provider_label = "groq"
     else:
-        vision_model = settings.OLLAMA_VISION_MODEL
-        text_model = settings.OLLAMA_TEXT_MODEL
+        vision_model = settings.OLLAMA_PRIMARY_MODEL
+        text_model = settings.OLLAMA_EDITORIAL_MODEL
         provider_label = "ollama"
 
     uses_ollama = _primary_provider == "ollama"
@@ -1091,7 +1091,7 @@ async def test_pipeline(request: Request):
             # ══════════════════════════════════════════════════════════
             yield _phase("vision_model", f"Testing vision model — {vision_model} (scene analysis) via {provider_label}...")
             if uses_ollama:
-                vision_result = await _test_vision_model(vision_model)
+                vision_result = await _test_primary_model(vision_model)
             else:
                 # Non-Ollama: test via AIOrchestrator
                 vision_result = await _test_cloud_vision(vision_model, provider_label)
@@ -1123,7 +1123,7 @@ async def test_pipeline(request: Request):
             # ══════════════════════════════════════════════════════════
             yield _phase("text_summary", f"Testing text model — {text_model} (summary generation) via {provider_label}...")
             if uses_ollama:
-                summary_result = await _test_text_model(text_model)
+                summary_result = await _test_editorial_model(text_model)
             else:
                 # Non-Ollama: test via AIOrchestrator
                 summary_result = await _test_cloud_text(text_model, provider_label)
@@ -1331,7 +1331,7 @@ async def test_subject_tracking():
     (25%, 50%, 75%), sends each to the vision model, and compares
     the returned subject_x against ground truth.
     """
-    vision_model = settings.OLLAMA_VISION_MODEL
+    vision_model = settings.OLLAMA_PRIMARY_MODEL
     is_moondream = "moondream" in vision_model.lower()
 
     # 5 test images simulating a subject moving left-to-right across the frame

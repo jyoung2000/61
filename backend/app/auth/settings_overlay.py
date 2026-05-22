@@ -42,11 +42,11 @@ logger = logging.getLogger(__name__)
 OVERLAYABLE_KEYS: tuple[str, ...] = (
     "AI_FALLBACK_CHAIN",
     "OPENROUTER_PRESET",
-    "OPENROUTER_VISION_MODEL",
-    "OPENROUTER_TEXT_MODEL",
+    "OPENROUTER_PRIMARY_MODEL",
+    "OPENROUTER_EDITORIAL_MODEL",
     "OPENROUTER_SUMMARY_MODEL",
-    "OLLAMA_VISION_MODEL",
-    "OLLAMA_TEXT_MODEL",
+    "OLLAMA_PRIMARY_MODEL",
+    "OLLAMA_EDITORIAL_MODEL",
     "OLLAMA_TRANSLATION_MODEL",
     "OPENROUTER_API_KEY",
     "ANTHROPIC_API_KEY",
@@ -67,15 +67,15 @@ OVERLAYABLE_KEYS: tuple[str, ...] = (
     # via the settings overlay, leaving cloud-only providers stuck
     # on whatever the install default ``MODEL`` constant was.
     "ANTHROPIC_MODEL",
-    "GEMINI_TEXT_MODEL",
+    "GEMINI_EDITORIAL_MODEL",
     "GEMINI_VIDEO_MODEL",
-    "GROQ_TEXT_MODEL",
+    "GROQ_EDITORIAL_MODEL",
 )
 
 
 _OLLAMA_MODEL_KEYS = (
-    "OLLAMA_VISION_MODEL",
-    "OLLAMA_TEXT_MODEL",
+    "OLLAMA_PRIMARY_MODEL",
+    "OLLAMA_EDITORIAL_MODEL",
     "OLLAMA_TRANSLATION_MODEL",
 )
 
