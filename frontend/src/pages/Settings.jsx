@@ -83,16 +83,10 @@ export default function Settings() {
   const [ffmpegThreadsSaving, setFfmpegThreadsSaving] = useState(false);
 
   // Prompt customization state
-  const [prompts, setPrompts] = useState({ frame_analysis: '', viral_clip_detection: '', subject_tracking: '', summary: '', seo: '' });
-  const [promptDefaults, setPromptDefaults] = useState({ frame_analysis: '', viral_clip_detection: '', subject_tracking: '', summary: '', seo: '' });
+  const [prompts, setPrompts] = useState({ frame_analysis: '', viral_clip_detection: '', summary: '', seo: '' });
+  const [promptDefaults, setPromptDefaults] = useState({ frame_analysis: '', viral_clip_detection: '', summary: '', seo: '' });
   const [promptsSaving, setPromptsSaving] = useState(false);
   const [promptsLoaded, setPromptsLoaded] = useState(false);
-
-  // Subject tracking toggle
-  const [subjectTrackingEnabled, setSubjectTrackingEnabled] = useState(true);
-  const [subjectTrackingSaving, setSubjectTrackingSaving] = useState(false);
-  const [trackingTest, setTrackingTest] = useState(null);
-  const [trackingTestRunning, setTrackingTestRunning] = useState(false);
 
   // Font management state
   const [customFonts, setCustomFonts] = useState([]);
@@ -259,14 +253,6 @@ export default function Settings() {
         setPromptDefaults(data.defaults);
         setPromptsLoaded(true);
       })
-      .catch(() => {});
-  }, []);
-
-  // Load subject tracking toggle
-  useEffect(() => {
-    fetch('/api/subject-tracking')
-      .then((r) => r.json())
-      .then((data) => setSubjectTrackingEnabled(data.enabled))
       .catch(() => {});
   }, []);
 
@@ -672,40 +658,6 @@ export default function Settings() {
       if (res.ok) { const data = await res.json(); setPrompts(data.prompts); showToast('Prompts reset', 'success'); }
     } catch { showToast('Failed to reset', 'error'); }
     finally { setPromptsSaving(false); }
-  };
-
-  const handleToggleSubjectTracking = async (enabled) => {
-    setSubjectTrackingSaving(true);
-    try {
-      const res = await fetch('/api/subject-tracking', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ enabled }),
-      });
-      if (res.ok) {
-        setSubjectTrackingEnabled(enabled);
-        showToast(`Subject tracking ${enabled ? 'enabled' : 'disabled'}`, 'success');
-      }
-    } catch { showToast('Failed to update subject tracking', 'error'); }
-    finally { setSubjectTrackingSaving(false); }
-  };
-
-  const handleTestSubjectTracking = async () => {
-    setTrackingTestRunning(true);
-    setTrackingTest(null);
-    try {
-      const res = await fetch('/api/diagnostics/test-subject-tracking', { method: 'POST' });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
-      setTrackingTest(data);
-    } catch (e) {
-      setTrackingTest({
-        overall_status: 'fail',
-        summary: `Test failed: ${e.message}`,
-        results: [],
-      });
-    }
-    setTrackingTestRunning(false);
   };
 
   const handleToggleGpu = async (enabled) => {
@@ -1620,46 +1572,6 @@ export default function Settings() {
             The JSON output format and clip duration constraints are enforced separately.
           </p>
 
-          {/* Subject Tracking Toggle */}
-          <div style={{
-            background: 'var(--bg-panel)', border: '1px solid var(--border)',
-            borderRadius: 'var(--radius-md)', padding: '14px 18px', marginBottom: 24,
-          }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-              <div>
-                <h4 style={{ fontSize: 13, margin: 0, color: 'var(--text-primary)' }}>
-                  Intelligent Dynamic Subject Tracking
-                </h4>
-                <p style={{ fontSize: 11, color: 'var(--text-muted)', margin: '4px 0 0', lineHeight: 1.5 }}>
-                  AI tracks the main subject across frames to keep it centered when cropping to different aspect ratios.
-                </p>
-              </div>
-              <button
-                onClick={() => handleToggleSubjectTracking(!subjectTrackingEnabled)}
-                disabled={subjectTrackingSaving}
-                style={{
-                  position: 'relative', width: 44, height: 24, borderRadius: 12, border: 'none',
-                  background: subjectTrackingEnabled ? 'var(--accent-cyan)' : 'var(--bg-elevated)',
-                  cursor: subjectTrackingSaving ? 'default' : 'pointer', flexShrink: 0, marginLeft: 16,
-                  transition: 'background 0.2s',
-                  opacity: subjectTrackingSaving ? 0.5 : 1,
-                }}
-              >
-                <div style={{
-                  position: 'absolute', top: 3, left: subjectTrackingEnabled ? 23 : 3,
-                  width: 18, height: 18, borderRadius: '50%', background: 'var(--nav-active-icon-text)',
-                  transition: 'left 0.2s', boxShadow: '0 1px 3px rgba(0,0,0,0.2)',
-                }} />
-              </button>
-            </div>
-            <div style={{
-              marginTop: 8, fontSize: 10, fontFamily: 'var(--font-mono)',
-              color: subjectTrackingEnabled ? 'var(--accent-cyan)' : 'var(--text-muted)',
-            }}>
-              {subjectTrackingEnabled ? 'Enabled — subjects will be tracked and centered during crop' : 'Disabled — crops will use center of frame'}
-            </div>
-          </div>
-
           {!promptsLoaded ? (
             <div style={{ padding: 16, color: 'var(--text-muted)', fontSize: 12 }}>Loading prompts...</div>
           ) : (
@@ -1706,7 +1618,7 @@ export default function Settings() {
               {/* Video Summary Prompt */}
               <div style={{ marginBottom: 28 }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
-                  <h4 style={{ fontSize: 13, margin: 0, color: 'var(--text-primary)' }}>Video Summary</h4>
+                  <h4 style={{ fontSize: 13, margin: 0, color: 'var(--text-primary)' }}>Editorial AI</h4>
                   <button
                     onClick={() => setPrompts((prev) => ({ ...prev, summary: promptDefaults.summary }))}
                     disabled={prompts.summary === promptDefaults.summary}
@@ -1720,7 +1632,7 @@ export default function Settings() {
                   </button>
                 </div>
                 <p style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 8, lineHeight: 1.5 }}>
-                  Controls how the AI summarizes your video — the overview, topics, tone, audience, and category.
+                  Controls how the Editorial AI summarizes your video — the overview, topics, tone, audience, and category.
                   Write in a conversational style to get natural, human-readable summaries.
                 </p>
                 <textarea
@@ -1833,45 +1745,6 @@ export default function Settings() {
                 </div>
               </div>
 
-              {/* Subject Tracking Prompt */}
-              <div style={{ marginBottom: 28, opacity: subjectTrackingEnabled ? 1 : 0.4, pointerEvents: subjectTrackingEnabled ? 'auto' : 'none' }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
-                  <h4 style={{ fontSize: 13, margin: 0, color: 'var(--text-primary)' }}>Subject Tracking</h4>
-                  <button
-                    onClick={() => setPrompts((prev) => ({ ...prev, subject_tracking: promptDefaults.subject_tracking }))}
-                    disabled={prompts.subject_tracking === promptDefaults.subject_tracking}
-                    style={{
-                      padding: '3px 10px', background: 'var(--bg-elevated)', color: 'var(--text-secondary)',
-                      border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', fontSize: 11,
-                      opacity: prompts.subject_tracking === promptDefaults.subject_tracking ? 0.4 : 1,
-                    }}
-                  >
-                    Reset to Default
-                  </button>
-                </div>
-                <p style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 8, lineHeight: 1.5 }}>
-                  Instructions for estimating subject position in each frame. Used for smart cropping across aspect ratios.
-                </p>
-                <textarea
-                  value={prompts.subject_tracking}
-                  onChange={(e) => setPrompts((prev) => ({ ...prev, subject_tracking: e.target.value }))}
-                  rows={6}
-                  style={{
-                    width: '100%', minHeight: 100, maxHeight: 400, padding: '10px 12px', resize: 'vertical',
-                    background: 'var(--bg-panel)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)',
-                    color: 'var(--text-primary)', fontSize: 12, fontFamily: 'var(--font-mono)', lineHeight: 1.6, boxSizing: 'border-box',
-                  }}
-                />
-                <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 4 }}>
-                  <span style={{ fontSize: 10, color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>
-                    {prompts.subject_tracking.length.toLocaleString()} / 10,000
-                  </span>
-                  {prompts.subject_tracking !== promptDefaults.subject_tracking && (
-                    <span style={{ fontSize: 10, color: 'var(--accent-amber)' }}>Modified</span>
-                  )}
-                </div>
-              </div>
-
               {/* Action buttons */}
               <div style={{ display: 'flex', gap: 8 }}>
                 <button
@@ -1886,11 +1759,11 @@ export default function Settings() {
                 </button>
                 <button
                   onClick={handleResetAllPrompts}
-                  disabled={promptsSaving || (prompts.frame_analysis === promptDefaults.frame_analysis && prompts.viral_clip_detection === promptDefaults.viral_clip_detection && prompts.subject_tracking === promptDefaults.subject_tracking && prompts.summary === promptDefaults.summary && prompts.seo === promptDefaults.seo)}
+                  disabled={promptsSaving || (prompts.frame_analysis === promptDefaults.frame_analysis && prompts.viral_clip_detection === promptDefaults.viral_clip_detection && prompts.summary === promptDefaults.summary && prompts.seo === promptDefaults.seo)}
                   style={{
                     padding: '8px 16px', background: 'var(--bg-elevated)', color: 'var(--text-secondary)',
                     border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', fontSize: 12,
-                    opacity: (promptsSaving || (prompts.frame_analysis === promptDefaults.frame_analysis && prompts.viral_clip_detection === promptDefaults.viral_clip_detection && prompts.subject_tracking === promptDefaults.subject_tracking && prompts.summary === promptDefaults.summary && prompts.seo === promptDefaults.seo)) ? 0.4 : 1,
+                    opacity: (promptsSaving || (prompts.frame_analysis === promptDefaults.frame_analysis && prompts.viral_clip_detection === promptDefaults.viral_clip_detection && prompts.summary === promptDefaults.summary && prompts.seo === promptDefaults.seo)) ? 0.4 : 1,
                   }}
                 >
                   Reset All to Defaults
@@ -2409,123 +2282,6 @@ export default function Settings() {
             {/* ── Pipeline Diagnostics ── */}
             <PipelineDiagnostics />
 
-            {/* ── Subject Tracking Validation ── */}
-            {subjectTrackingEnabled && (
-              <div style={{
-                background: 'var(--bg-panel)', border: '1px solid var(--border)',
-                borderRadius: 'var(--radius-md)', padding: '14px 18px', marginBottom: 32,
-              }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
-                  <div>
-                    <h4 style={{ fontSize: 13, margin: 0, color: 'var(--text-primary)' }}>
-                      Subject Tracking Validation
-                    </h4>
-                    <p style={{ fontSize: 11, color: 'var(--text-muted)', margin: '4px 0 0', lineHeight: 1.5 }}>
-                      Tests whether your vision AI can detect a moving subject across 5 positions (far left to far right) using synthetic images.
-                    </p>
-                  </div>
-                  <button
-                    onClick={handleTestSubjectTracking}
-                    disabled={trackingTestRunning}
-                    style={{
-                      padding: '6px 14px', fontSize: 11, fontWeight: 500,
-                      background: trackingTestRunning ? 'var(--bg-elevated)' : 'var(--accent-cyan)',
-                      color: trackingTestRunning ? 'var(--text-muted)' : '#fff',
-                      border: 'none', borderRadius: 'var(--radius-sm)',
-                      cursor: trackingTestRunning ? 'default' : 'pointer',
-                      opacity: trackingTestRunning ? 0.6 : 1,
-                      flexShrink: 0, marginLeft: 16,
-                    }}
-                  >
-                    {trackingTestRunning ? 'Testing...' : 'Run Test'}
-                  </button>
-                </div>
-
-                {trackingTestRunning && (
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '12px 0' }}>
-                    <div style={{
-                      width: 16, height: 16,
-                      border: '2px solid var(--border)', borderTopColor: 'var(--accent-cyan)',
-                      borderRadius: '50%', animation: 'spin 0.8s linear infinite',
-                    }} />
-                    <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-                      Sending 5 test images to vision model... (may take 20-60s)
-                    </span>
-                  </div>
-                )}
-
-                {trackingTest && !trackingTestRunning && (
-                  <div>
-                    <div style={{
-                      display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px',
-                      background: trackingTest.overall_status === 'pass' ? 'rgba(16,185,129,0.08)'
-                        : trackingTest.overall_status === 'warn' ? 'rgba(245,158,11,0.08)'
-                        : 'rgba(239,68,68,0.08)',
-                      borderRadius: 'var(--radius-sm)', marginBottom: 10,
-                    }}>
-                      <span style={{ fontSize: 14 }}>
-                        {trackingTest.overall_status === 'pass' ? '\u2705'
-                          : trackingTest.overall_status === 'warn' ? '\u26a0\ufe0f' : '\u274c'}
-                      </span>
-                      <span style={{
-                        fontSize: 12, fontWeight: 500,
-                        color: trackingTest.overall_status === 'pass' ? 'var(--success)'
-                          : trackingTest.overall_status === 'warn' ? '#f59e0b' : '#ef4444',
-                      }}>
-                        {trackingTest.summary}
-                      </span>
-                    </div>
-
-                    <div style={{ display: 'flex', gap: 16, marginBottom: 10, flexWrap: 'wrap' }}>
-                      <div style={{ fontSize: 10, fontFamily: 'var(--font-mono)', color: 'var(--text-muted)' }}>
-                        Model: <span style={{ color: 'var(--text-secondary)' }}>{trackingTest.model || '?'}</span>
-                      </div>
-                      <div style={{ fontSize: 10, fontFamily: 'var(--font-mono)', color: 'var(--text-muted)' }}>
-                        JSON: <span style={{ color: 'var(--text-secondary)' }}>{trackingTest.json_compliance || '?'}</span>
-                      </div>
-                      <div style={{ fontSize: 10, fontFamily: 'var(--font-mono)', color: 'var(--text-muted)' }}>
-                        Avg error: <span style={{ color: 'var(--text-secondary)' }}>
-                          {trackingTest.avg_error != null ? `${trackingTest.avg_error}%` : 'N/A'}
-                        </span>
-                      </div>
-                      <div style={{ fontSize: 10, fontFamily: 'var(--font-mono)', color: 'var(--text-muted)' }}>
-                        Speed: <span style={{ color: 'var(--text-secondary)' }}>
-                          {trackingTest.avg_speed_ms ? `${(trackingTest.avg_speed_ms / 1000).toFixed(1)}s/frame` : 'N/A'}
-                        </span>
-                      </div>
-                      {trackingTest.format_json_used && (
-                        <div style={{ fontSize: 10, fontFamily: 'var(--font-mono)', color: 'var(--accent-cyan)' }}>
-                          format:json active
-                        </div>
-                      )}
-                    </div>
-
-                    {trackingTest.results?.map((r, i) => (
-                      <div key={i} style={{
-                        display: 'flex', alignItems: 'center', gap: 8,
-                        padding: '5px 0', borderTop: i > 0 ? '1px solid rgba(128,128,128,0.1)' : 'none',
-                      }}>
-                        <span style={{ fontSize: 12, width: 18, textAlign: 'center', flexShrink: 0 }}>
-                          {r.status === 'pass' ? '\u2705' : r.status === 'warn' ? '\u26a0\ufe0f' : '\u274c'}
-                        </span>
-                        <span style={{
-                          fontSize: 11, fontWeight: 500, width: 50, flexShrink: 0,
-                          color: 'var(--text-primary)', textTransform: 'capitalize',
-                        }}>
-                          {r.label}
-                        </span>
-                        <span style={{ fontSize: 10, fontFamily: 'var(--font-mono)', color: 'var(--text-muted)', flex: 1 }}>
-                          {r.message}
-                        </span>
-                        <span style={{ fontSize: 10, fontFamily: 'var(--font-mono)', color: 'var(--text-muted)', flexShrink: 0 }}>
-                          {r.duration_ms}ms
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            )}
 
             {/* ── Client GPU (Browser) ── */}
             <div style={{ marginBottom: 32 }}>

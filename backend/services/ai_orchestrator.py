@@ -504,12 +504,6 @@ class AIOrchestrator:
         """
         self._wire_ws_to_providers(job_id)
         frame_prompt = self._custom_prompts.frame_analysis if self._custom_prompts else None
-        # Append subject tracking instructions when enabled
-        if settings.SUBJECT_TRACKING_ENABLED:
-            st_prompt = (self._custom_prompts.subject_tracking if self._custom_prompts else None) or ""
-            if st_prompt:
-                base = frame_prompt or ""
-                frame_prompt = f"{base}\n\n4. Subject position — {st_prompt}" if base else st_prompt
         for provider in self._get_active_chain():
             if not provider.supports_vision:
                 continue

@@ -52,7 +52,7 @@ _PERSISTABLE_KEYS = [
     "OPENROUTER_PRESET", "OPENROUTER_PRIMARY_MODEL", "OPENROUTER_EDITORIAL_MODEL",
     "OPENROUTER_SUMMARY_MODEL", "OLLAMA_PRIMARY_MODEL", "OLLAMA_EDITORIAL_MODEL", "OLLAMA_TRANSLATION_MODEL",
     "WHISPER_MODEL", "WHISPER_MODEL_USER_SET", "WHISPER_BEAM_SIZE",
-    "WHISPER_VAD_FILTER", "FRAME_SAMPLE_RATE", "SUBJECT_TRACKING_ENABLED",
+    "WHISPER_VAD_FILTER", "FRAME_SAMPLE_RATE",
     "CLIP_MIN_DURATION", "CLIP_MAX_DURATION", "CLIP_COUNT",
     "CLIP_PREFERRED_SUBJECTS", "CLIP_AVOID_SUBJECTS", "CLIP_DISCOVERY_PROMPT",
     "SELF_HOSTED_MODE", "CLIP_ENGINE_SOURCE", "EDITORIAL_AI_SOURCE",
@@ -2263,27 +2263,6 @@ async def save_encoding_settings(req: SaveEncodingSettingsRequest):
     }
 
 
-# ── Subject Tracking ──────────────────────────────────────────────
-
-
-@router.get("/subject-tracking")
-async def get_subject_tracking():
-    """Return current subject tracking enabled state."""
-    return {"enabled": settings.SUBJECT_TRACKING_ENABLED}
-
-
-class SubjectTrackingRequest(BaseModel):
-    enabled: bool
-
-
-@router.post("/subject-tracking")
-async def set_subject_tracking(req: SubjectTrackingRequest):
-    """Toggle subject tracking on/off."""
-    settings.SUBJECT_TRACKING_ENABLED = req.enabled
-    _persist_user_settings()
-    return {"status": "saved", "enabled": settings.SUBJECT_TRACKING_ENABLED}
-
-
 # ── GPU Hardware Acceleration ────────────────────────────────────
 
 
@@ -2761,7 +2740,6 @@ async def gpu_qa_validation():
 class SavePromptsRequest(BaseModel):
     frame_analysis: Optional[str] = None
     viral_clip_detection: Optional[str] = None
-    subject_tracking: Optional[str] = None
     summary: Optional[str] = None
     seo: Optional[str] = None
 
@@ -2800,15 +2778,6 @@ async def update_prompts(req: SavePromptsRequest):
                 "message": f"Viral clip detection prompt exceeds {MAX_PROMPT_LENGTH} characters",
             }
         current.viral_clip_detection = text if text else defaults.viral_clip_detection
-
-    if req.subject_tracking is not None:
-        text = req.subject_tracking.strip()
-        if len(text) > MAX_PROMPT_LENGTH:
-            return {
-                "status": "error",
-                "message": f"Subject tracking prompt exceeds {MAX_PROMPT_LENGTH} characters",
-            }
-        current.subject_tracking = text if text else defaults.subject_tracking
 
     if req.summary is not None:
         text = req.summary.strip()

@@ -35,75 +35,6 @@ DEFAULT_FRAME_ANALYSIS_PROMPT = (
 )
 
 # ── VLM upgrade Phase 1 — grounding-output prompt ──
-# The legacy prompt asked for a 0-100 ``subject_x`` percentage, which
-# modern vision models happily hallucinate and then get overridden by
-# face detection anyway. The new prompt asks for a normalized bounding
-# box with a confidence score — this unlocks the visual-grounding
-# capability that Qwen3-VL and Gemini 3 are explicitly trained on,
-# feeds Phase 3's confidence-weighted fusion, and gives Phase 5 a
-# region to score the final crop against.
-DEFAULT_SUBJECT_TRACKING_PROMPT = (
-    "For each frame, return a JSON object identifying the primary subject — "
-    "the person, character, or object the viewer's eye should follow if the "
-    "frame is cropped to a vertical 9:16 window.\n\n"
-    "Coordinate system: normalized bounding box [x1, y1, x2, y2] where (0, 0) "
-    "is the top-left corner and (1, 1) is the bottom-right corner of the frame.\n\n"
-    "Required fields:\n\n"
-    "- subject_box: [x1, y1, x2, y2] for the primary subject's FACE (preferred) "
-    "or HEAD-AND-SHOULDERS region. Tight box, not the whole body.\n"
-    "- subject_confidence: 0.0-1.0. Use 0.9+ when a clearly visible face is "
-    "centered and unambiguous; 0.6-0.8 when the face is visible but small, "
-    "partially occluded, or one of several; 0.3-0.5 when you're inferring from "
-    "body/posture without a clear face; below 0.3 when you're guessing.\n"
-    "- secondary_subjects: list of 0-3 objects, each {\"box\": [...], "
-    "\"confidence\": 0.0-1.0, \"label\": \"person\" | \"speaker\" | \"object\" | "
-    "\"text\"}. Use this when multiple plausible subjects exist "
-    "(panel discussions, crowd shots).\n"
-    "- no_subject_reason: null when a subject is found, otherwise one of "
-    "\"empty_frame\" (no people or focal objects), \"abstract\" (geometric or "
-    "non-representational content), \"transition\" (motion blur, fade, dissolve), "
-    "\"occluded\" (subject blocked by foreground or HUD).\n\n"
-    "When the SPEAKER can be identified (mouth movement, body language, mic "
-    "position, gaze of others), put their box in subject_box and tag them as "
-    "\"speaker\" if also returning them in secondary_subjects. Otherwise put "
-    "the most visually prominent person in subject_box.\n\n"
-    "Do NOT return [0, 0, 1, 1] as a \"safe default.\" If you cannot identify "
-    "a subject, set subject_box to null and populate no_subject_reason."
-)
-
-# Legacy prompt kept around for providers that still use the old 0-100
-# subject_x schema (Ollama local fallback and any provider whose backend
-# model doesn't support structured grounding output). parse_scene_dict()
-# in backend.services.providers.base derives subject_box from subject_x
-# when only the legacy field is returned, so the downstream pipeline
-# stays uniform regardless of which prompt the provider used.
-LEGACY_SUBJECT_TRACKING_PROMPT = (
-    "For each frame, estimate where the CENTER of the main subject's FACE is located "
-    "horizontally as a percentage from 0 to 100. This value is used to crop the video "
-    "to portrait (9:16) by placing a narrow vertical window centered on the subject's face.\n\n"
-    "COORDINATE SYSTEM — think of the frame as divided into zones:\n"
-    "  0-10  = far left edge of the frame\n"
-    "  25    = left quarter\n"
-    "  33    = left third\n"
-    "  50    = exact horizontal center of the frame\n"
-    "  67    = right third\n"
-    "  75    = right quarter\n"
-    "  90-100 = far right edge of the frame\n\n"
-    "CRITICAL: You MUST carefully look at each frame and determine the actual horizontal "
-    "position of the subject. Do NOT default to 50 for every frame. Subjects are frequently "
-    "positioned off-center — in interview setups, the subject is often at 35-45 or 55-65. "
-    "Only return 50 if the subject's face is truly at the exact center of the frame.\n\n"
-    "HOW TO ESTIMATE:\n"
-    "1. Find the main subject's FACE (not body, not shoulders — the FACE/HEAD)\n"
-    "2. Imagine a vertical line through the center of the face\n"
-    "3. Estimate where that vertical line falls as a percentage of frame width\n"
-    "4. Examples: face in left third = ~33. Face slightly right of center = ~58. Face in right third = ~67.\n\n"
-    "PRIORITY:\n"
-    "1. If a person's FACE is visible, use the horizontal center of their face\n"
-    "2. If multiple people are visible, focus on the SPEAKING person or primary subject\n"
-    "3. If no face is visible, use the center of the most important visual element\n\n"
-    "Keep values in the 10-90 range to prevent the subject being cut off at frame edges."
-)
 
 # ── 4-axis scoring rubric (Phase 1 of OpusClip parity gap) ───────────
 # Every genre prompt below shares this base. The LLM must return the
@@ -439,7 +370,6 @@ DEFAULT_SEO_PROMPT = (
 class PromptSet(BaseModel):
     frame_analysis: str = Field(default=DEFAULT_FRAME_ANALYSIS_PROMPT)
     viral_clip_detection: str = Field(default=DEFAULT_VIRAL_CLIP_PROMPT)
-    subject_tracking: str = Field(default=DEFAULT_SUBJECT_TRACKING_PROMPT)
     summary: str = Field(default=DEFAULT_SUMMARY_PROMPT)
     seo: str = Field(default=DEFAULT_SEO_PROMPT)
 
@@ -468,7 +398,6 @@ def get_defaults() -> PromptSet:
     return PromptSet(
         frame_analysis=DEFAULT_FRAME_ANALYSIS_PROMPT,
         viral_clip_detection=DEFAULT_VIRAL_CLIP_PROMPT,
-        subject_tracking=DEFAULT_SUBJECT_TRACKING_PROMPT,
         summary=DEFAULT_SUMMARY_PROMPT,
         seo=DEFAULT_SEO_PROMPT,
     )
