@@ -6,7 +6,7 @@ services:
       dockerfile: Dockerfile.gpu
     runtime: nvidia
     environment:
-      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_VISIBLE_DEVICES=GPU-08b18de7-af3b-aa16-9b88-d214ab78711c
       - NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
       - GPU_ACCELERATION_ENABLED=true
       # ClipAI v4 universal reframing: enable all editorial signals by default.
@@ -24,7 +24,7 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              count: all
+              device_ids: ['GPU-08b18de7-af3b-aa16-9b88-d214ab78711c']
               capabilities: [gpu, video, compute]
 
   ollama:
@@ -33,5 +33,5 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              count: all
+              device_ids: ['GPU-08b18de7-af3b-aa16-9b88-d214ab78711c']
               capabilities: [gpu, compute]
