@@ -463,11 +463,23 @@ export default function Layout({ children }) {
                 title="Click to change AI models"
               >
                 <div style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--success)', flexShrink: 0 }} />
-                <span><span style={{ color: 'var(--accent-amber)' }}>T:</span> {String(activeModel.transcript_model || 'whisper-base')}</span>
+                <span><span style={{ color: 'var(--accent-amber)' }}>T:</span> {String(activeModel.transcript_model || 'whisper-small')}</span>
                 <span style={{ color: 'var(--border-strong)' }}>|</span>
-                <span><span style={{ color: 'var(--accent-cyan)' }}>V:</span> {activeModel.vision_model ? String(shortModel(activeModel.vision_model)) : '\u2014'}</span>
+                <span>
+                  <span style={{ color: 'var(--accent-cyan)' }}>P:</span>{' '}
+                  {activeModel.videollama2_available
+                    ? 'VideoLLaMA2'
+                    : ((activeModel.primary_model || activeModel.vision_model)
+                        ? String(shortModel(activeModel.primary_model || activeModel.vision_model))
+                        : '\u2014')}
+                </span>
                 <span style={{ color: 'var(--border-strong)' }}>|</span>
-                <span><span style={{ color: 'var(--success)' }}>Tx:</span> {activeModel.text_model ? String(shortModel(activeModel.text_model)) : '\u2014'}</span>
+                <span>
+                  <span style={{ color: 'var(--success)' }}>E:</span>{' '}
+                  {(activeModel.editorial_model || activeModel.text_model)
+                    ? String(shortModel(activeModel.editorial_model || activeModel.text_model))
+                    : '\u2014'}
+                </span>
               </Link>
             )}
             {clientGpu.enabled && clientGpu.selectedGpuName && (

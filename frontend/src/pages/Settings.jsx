@@ -60,9 +60,9 @@ export default function Settings() {
   const [providerResults, setProviderResults] = useState({});
 
   // Per-task model selection
-  const [availableModels, setAvailableModels] = useState({ transcript: [], vision: [], text: [] });
-  const [currentModels, setCurrentModels] = useState({ transcript_model: '', vision_model: '', text_model: '' });
-  const [pendingModels, setPendingModels] = useState({ transcript_model: '', vision_model: '', text_model: '' });
+  const [availableModels, setAvailableModels] = useState({ transcript: [], primary: [], editorial: [] });
+  const [currentModels, setCurrentModels] = useState({ transcript_model: '', primary_model: '', editorial_model: '' });
+  const [pendingModels, setPendingModels] = useState({ transcript_model: '', primary_model: '', editorial_model: '' });
   const [modelsSaving, setModelsSaving] = useState(false);
   const [modelsLoading, setModelsLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
@@ -365,10 +365,19 @@ export default function Settings() {
       const res = await fetch('/api/providers/models/available');
       if (res.ok) {
         const data = await res.json();
-        setAvailableModels({ transcript: data.transcript || [], vision: data.vision || [], text: data.text || [] });
+        setAvailableModels({
+          transcript: data.transcript || [],
+          primary: data.primary || data.vision || [],
+          editorial: data.editorial || data.text || [],
+        });
         if (data.current) {
-          setCurrentModels(data.current);
-          setPendingModels(data.current);
+          const cur = {
+            transcript_model: data.current.transcript_model || '',
+            primary_model: data.current.primary_model || data.current.vision_model || '',
+            editorial_model: data.current.editorial_model || data.current.text_model || '',
+          };
+          setCurrentModels(cur);
+          setPendingModels(cur);
         }
       }
     } catch {} finally {
@@ -469,8 +478,8 @@ export default function Settings() {
   // Check if any model selection has changed from the saved state
   const modelsHaveChanges =
     pendingModels.transcript_model !== currentModels.transcript_model ||
-    pendingModels.vision_model !== currentModels.vision_model ||
-    pendingModels.text_model !== currentModels.text_model;
+    pendingModels.primary_model !== currentModels.primary_model ||
+    pendingModels.editorial_model !== currentModels.editorial_model;
 
   // Build the per-user env-var patch for a model selection. Picks
   // the right OPENROUTER_*_MODEL vs OLLAMA_*_MODEL key by inspecting
@@ -497,10 +506,14 @@ export default function Settings() {
     const body = {};
     if (pendingModels.transcript_model !== currentModels.transcript_model)
       body.transcript_model = pendingModels.transcript_model;
-    if (pendingModels.vision_model !== currentModels.vision_model)
-      body.vision_model = pendingModels.vision_model;
-    if (pendingModels.text_model !== currentModels.text_model)
-      body.text_model = pendingModels.text_model;
+    if (pendingModels.primary_model !== currentModels.primary_model) {
+      body.primary_model = pendingModels.primary_model;
+      body.vision_model = pendingModels.primary_model;  // legacy alias for the save endpoint
+    }
+    if (pendingModels.editorial_model !== currentModels.editorial_model) {
+      body.editorial_model = pendingModels.editorial_model;
+      body.text_model = pendingModels.editorial_model;  // legacy alias
+    }
 
     try {
       const res = await fetch('/api/providers/models/save', {
@@ -513,8 +526,8 @@ export default function Settings() {
         // Persist per-user picks alongside the global save.
         const userPatch = {
           ..._perUserModelPatch('transcript', body.transcript_model),
-          ..._perUserModelPatch('vision', body.vision_model),
-          ..._perUserModelPatch('text', body.text_model),
+          ..._perUserModelPatch('primary', body.primary_model),
+          ..._perUserModelPatch('editorial', body.editorial_model),
         };
         await savePerUserSettings(userPatch);
 
@@ -540,8 +553,8 @@ export default function Settings() {
   const handleSaveModel = async (task, modelId) => {
     const body = {};
     if (task === 'transcript') body.transcript_model = modelId;
-    if (task === 'vision') body.vision_model = modelId;
-    if (task === 'text') body.text_model = modelId;
+    if (task === 'primary') { body.primary_model = modelId; body.vision_model = modelId; }
+    if (task === 'editorial') { body.editorial_model = modelId; body.text_model = modelId; }
     try {
       const res = await fetch('/api/providers/models/save', {
         method: 'POST',
@@ -874,13 +887,13 @@ export default function Settings() {
         if (visionPick || textPick || transPick) {
           setPendingModels((prev) => ({
             transcript_model: transPick || prev.transcript_model,
-            vision_model:     visionPick || prev.vision_model,
-            text_model:       textPick   || prev.text_model,
+            primary_model:     visionPick || prev.primary_model,
+            editorial_model:       textPick   || prev.editorial_model,
           }));
           setCurrentModels((prev) => ({
             transcript_model: transPick || prev.transcript_model,
-            vision_model:     visionPick || prev.vision_model,
-            text_model:       textPick   || prev.text_model,
+            primary_model:     visionPick || prev.primary_model,
+            editorial_model:       textPick   || prev.editorial_model,
           }));
         }
 
@@ -980,7 +993,7 @@ export default function Settings() {
               const provider = m.provider !== 'local' ? ` (${m.provider})` : '';
               const speed = speedBadge(m);
               const stars = m.quality_score ? qualityStars(m.quality_score) : '';
-              const tracking = task === 'vision' && m.tracking_score
+              const tracking = task === 'primary' && m.tracking_score
                 ? m.tracking_score >= 4 ? '[TRACK:\u2605\u2605]' : m.tracking_score >= 2 ? '[TRACK:\u2605]' : '[TRACK:\u26A0]'
                 : '';
               return (
@@ -1078,9 +1091,15 @@ export default function Settings() {
             </div>
             <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : '1fr 1fr 1fr', gap: 12 }}>
               {[
-                { label: 'Transcript', model: active.transcript_model || currentModels.transcript_model || 'base', color: 'var(--accent-amber)' },
-                { label: 'Vision', model: active.vision_model || currentModels.vision_model, color: 'var(--accent-cyan)' },
-                { label: 'Text', model: active.text_model || currentModels.text_model, color: 'var(--success)' },
+                { label: 'Transcript', model: active.transcript_model || currentModels.transcript_model || 'small', color: 'var(--accent-amber)' },
+                {
+                  label: 'Primary AI',
+                  model: active.videollama2_available
+                    ? 'VideoLLaMA2.1-7B-AV'
+                    : (active.primary_model || currentModels.primary_model),
+                  color: 'var(--accent-cyan)',
+                },
+                { label: 'Editorial AI', model: active.editorial_model || currentModels.editorial_model, color: 'var(--success)' },
               ].map(({ label, model, color }) => (
                 <div key={label}>
                   <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 2 }}>{label}</div>
@@ -1495,21 +1514,49 @@ export default function Settings() {
                 )}
               </div>
 
+              {/* ── VideoLLaMA2 (Primary AI) status ── */}
+              <div style={{
+                background: 'var(--bg-elevated)', border: '1px solid var(--border)',
+                borderRadius: 'var(--radius-sm)', padding: '12px 14px', marginBottom: 12,
+              }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+                  <div>
+                    <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 2 }}>
+                      VideoLLaMA2 (Primary AI)
+                    </div>
+                    <div style={{ fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.4 }}>
+                      Audio-visual AI that watches and listens to your video — detects laughter,
+                      applause, music energy and visual moments. Requires ≥10GB VRAM (RTX 4070+);
+                      falls back to Ollama or cloud on smaller GPUs.
+                    </div>
+                  </div>
+                  <div style={{
+                    padding: '4px 10px', borderRadius: 'var(--radius-sm)', fontSize: 10,
+                    fontWeight: 600, fontFamily: 'var(--font-mono)', whiteSpace: 'nowrap',
+                    background: active.videollama2_available ? 'rgba(34,197,94,0.15)' : 'rgba(239,68,68,0.15)',
+                    color: active.videollama2_available ? 'var(--success)' : 'var(--danger)',
+                    border: `1px solid ${active.videollama2_available ? 'rgba(34,197,94,0.3)' : 'rgba(239,68,68,0.3)'}`,
+                  }}>
+                    {active.videollama2_available ? '● Available' : '○ Using fallback'}
+                  </div>
+                </div>
+              </div>
+
               <ModelDropdown
-                task="vision"
-                models={availableModels.vision}
-                pendingValue={pendingModels.vision_model}
-                savedValue={currentModels.vision_model}
-                label="Vision AI"
-                desc="Analyzes video frames for visual content, importance, and social media potential. Requires a vision-capable model."
+                task="primary"
+                models={availableModels.primary}
+                pendingValue={pendingModels.primary_model}
+                savedValue={currentModels.primary_model}
+                label="Primary AI Fallback"
+                desc="Used when VideoLLaMA2 is not available. Analyzes video frames for clip discovery and scene understanding. Requires a vision-capable model."
               />
               <ModelDropdown
-                task="text"
-                models={availableModels.text}
-                pendingValue={pendingModels.text_model}
-                savedValue={currentModels.text_model}
-                label="Text AI"
-                desc="Generates content summaries and detects viral clip candidates. Any text model works — smarter models find better clips."
+                task="editorial"
+                models={availableModels.editorial}
+                pendingValue={pendingModels.editorial_model}
+                savedValue={currentModels.editorial_model}
+                label="Editorial AI"
+                desc="Scores clips, generates summaries and tags, and polishes transcripts. Any LLM works — smarter models produce better editorial judgment."
               />
 
               {/* ── Save Button ── */}
@@ -1537,7 +1584,7 @@ export default function Settings() {
                     You have unsaved changes
                   </span>
                 )}
-                {!modelsHaveChanges && !modelsSaving && currentModels.vision_model && (
+                {!modelsHaveChanges && !modelsSaving && currentModels.primary_model && (
                   <span style={{ fontSize: 11, color: 'var(--success)' }}>
                     All models saved
                   </span>
@@ -2985,13 +3032,13 @@ export default function Settings() {
             </p>
 
             <div style={{ marginBottom: 24 }}>
-              <h4 style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 8 }}>Vision Model</h4>
-              <ModelBrowser type="vision" onSelect={(id) => { handleSaveModel('vision', id); }} />
+              <h4 style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 8 }}>Primary Model</h4>
+              <ModelBrowser type="primary" onSelect={(id) => { handleSaveModel('primary', id); }} />
             </div>
 
             <div style={{ marginBottom: 24 }}>
-              <h4 style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 8 }}>Text Model</h4>
-              <ModelBrowser type="text" onSelect={(id) => { handleSaveModel('text', id); }} />
+              <h4 style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 8 }}>Editorial Model</h4>
+              <ModelBrowser type="editorial" onSelect={(id) => { handleSaveModel('editorial', id); }} />
             </div>
 
             <h3 style={{ fontSize: 14, marginBottom: 16, color: 'var(--text-secondary)' }}>Analysis Settings</h3>

@@ -57,7 +57,7 @@ export default function ProviderStatus({ collapsed, onActiveChange }) {
           {/* Active model indicator */}
           {active.provider && active.provider !== 'none' && (
             <div
-              title={`T: ${active.transcript_model || 'whisper-base'} | V: ${shortModel(active.vision_model)} | Tx: ${shortModel(active.text_model)}`}
+              title={`T: ${active.transcript_model || 'whisper-small'} | P: ${active.videollama2_available ? 'VideoLLaMA2' : shortModel(active.primary_model || active.vision_model)} | E: ${shortModel(active.editorial_model || active.text_model)}`}
               style={{
                 width: 20,
                 height: 20,
@@ -125,21 +125,27 @@ export default function ProviderStatus({ collapsed, onActiveChange }) {
                 <div style={{ fontSize: 10, fontFamily: 'var(--font-mono)', lineHeight: 1.5 }}>
                   <span style={{ color: 'var(--accent-amber)', fontWeight: 600 }}>transcript:</span>{' '}
                   <span style={{ color: 'var(--text-secondary)' }}>
-                    {active.transcript_model || 'whisper-base'}
+                    {active.transcript_model || 'whisper-small'}
                   </span>
                 </div>
-                {/* Vision AI */}
-                {active.vision_model && (
+                {/* Primary AI (VideoLLaMA2 / Ollama / cloud) */}
+                <div style={{ fontSize: 10, fontFamily: 'var(--font-mono)', lineHeight: 1.5 }}>
+                  <span style={{ color: 'var(--accent-cyan)', fontWeight: 600 }}>primary:</span>{' '}
+                  <span style={{ color: 'var(--text-secondary)' }}>
+                    {active.videollama2_available
+                      ? 'VideoLLaMA2'
+                      : ((active.primary_model || active.vision_model)
+                          ? shortModel(active.primary_model || active.vision_model)
+                          : 'signal-only')}
+                  </span>
+                </div>
+                {/* Editorial AI (scoring, summary, polish) */}
+                {(active.editorial_model || active.text_model || active.primary_model) && (
                   <div style={{ fontSize: 10, fontFamily: 'var(--font-mono)', lineHeight: 1.5 }}>
-                    <span style={{ color: 'var(--accent-cyan)', fontWeight: 600 }}>vision:</span>{' '}
-                    <span style={{ color: 'var(--text-secondary)' }}>{shortModel(active.vision_model)}</span>
-                  </div>
-                )}
-                {/* Text AI (clip detection) */}
-                {active.text_model && (
-                  <div style={{ fontSize: 10, fontFamily: 'var(--font-mono)', lineHeight: 1.5 }}>
-                    <span style={{ color: 'var(--success)', fontWeight: 600 }}>text:</span>{' '}
-                    <span style={{ color: 'var(--text-secondary)' }}>{shortModel(active.text_model)}</span>
+                    <span style={{ color: 'var(--success)', fontWeight: 600 }}>editorial:</span>{' '}
+                    <span style={{ color: 'var(--text-secondary)' }}>
+                      {shortModel(active.editorial_model || active.text_model || active.primary_model)}
+                    </span>
                   </div>
                 )}
               </div>

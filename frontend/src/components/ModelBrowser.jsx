@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useMemo } from 'react';
 
-export default function ModelBrowser({ onSelect, type = 'text' }) {
-  const [models, setModels] = useState({ vision_models: [], text_models: [] });
+export default function ModelBrowser({ onSelect, type = 'editorial' }) {
+  const [models, setModels] = useState({ primary_models: [], editorial_models: [] });
   const [search, setSearch] = useState('');
   const [freeOnly, setFreeOnly] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -11,7 +11,10 @@ export default function ModelBrowser({ onSelect, type = 'text' }) {
     setLoading(true);
     fetch('/api/providers/models')
       .then((r) => r.json())
-      .then(setModels)
+      .then((d) => setModels({
+        primary_models: d.primary_models || d.vision_models || [],
+        editorial_models: d.editorial_models || d.text_models || [],
+      }))
       .catch(() => {})
       .finally(() => setLoading(false));
   };
@@ -30,12 +33,13 @@ export default function ModelBrowser({ onSelect, type = 'text' }) {
     }
   };
 
-  const list = type === 'vision' ? models.vision_models : models.text_models;
+  const isPrimary = type === 'primary' || type === 'vision';
+  const list = isPrimary ? models.primary_models : models.editorial_models;
 
   const filtered = useMemo(() => {
     let result = list || [];
-    // For vision models, filter out those with context too small for subject tracking
-    if (type === 'vision') {
+    // For Primary AI models, filter out context too small for subject tracking
+    if (isPrimary) {
       result = result.filter((m) => {
         const ctx = m.context_length || 0;
         // Allow models with unknown context (Ollama, auto-routers) or >= 16K
