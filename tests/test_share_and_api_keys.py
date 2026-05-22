@@ -127,14 +127,17 @@ def test_expired_link_filtered():
 def test_overlay_apply_restore_roundtrip():
     snapshot = settings_overlay.apply_overlay_dict({
         "OPENROUTER_API_KEY": "sk-or-USERA",
+        "REPLICATE_API_KEY": "r8-USERA",
         "WHISPER_MODEL": "large-v3",
     })
     assert getattr(cfg.settings, "OPENROUTER_API_KEY", None) == "sk-or-USERA"
+    assert getattr(cfg.settings, "REPLICATE_API_KEY", None) == "r8-USERA"
     assert getattr(cfg.settings, "WHISPER_MODEL", None) == "large-v3"
     assert os.environ.get("OPENROUTER_API_KEY") == "sk-or-USERA"
     settings_overlay.restore_overlay(snapshot)
     # Values revert.
     assert getattr(cfg.settings, "OPENROUTER_API_KEY", None) != "sk-or-USERA"
+    assert getattr(cfg.settings, "REPLICATE_API_KEY", None) != "r8-USERA"
 
 
 def test_overlay_dict_ignores_disallowed_keys():
@@ -369,22 +372,25 @@ def test_api_keys_persist_and_mask(app_client):
 
     client.post("/api/auth/login", json={"username": "alice", "password": "supersecret"})
 
-    # Save a per-user API key.
+    # Save per-user API keys.
     r = client.put("/api/auth/me/settings", json={
         "data": {
             "OPENROUTER_API_KEY": "sk-or-ALICE-LIVE",
+            "REPLICATE_API_KEY": "r8-ALICE-LIVE",
             "WHISPER_MODEL": "large-v3",
         },
     })
     assert r.status_code == 200, r.text
     body = r.json()["settings"]
-    # Secret is masked on the wire.
+    # Secrets are masked on the wire.
     assert body["OPENROUTER_API_KEY"] == "<set>"
+    assert body["REPLICATE_API_KEY"] == "<set>"
     assert body["WHISPER_MODEL"] == "large-v3"
 
     # GET also masks.
     r2 = client.get("/api/auth/me/settings")
     assert r2.json()["settings"]["OPENROUTER_API_KEY"] == "<set>"
+    assert r2.json()["settings"]["REPLICATE_API_KEY"] == "<set>"
 
     # Subsequent PUT with the masked sentinel must NOT overwrite the
     # stored value with the literal "<set>" string. Behavior:

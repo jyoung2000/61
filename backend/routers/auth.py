@@ -233,6 +233,7 @@ async def update_my_settings(
         "GEMINI_API_KEY",
         "GROQ_API_KEY",
         "HF_AUTH_TOKEN",
+        "REPLICATE_API_KEY",
         # Whisper
         "WHISPER_MODEL",
         "WHISPER_BEAM_SIZE",
@@ -255,6 +256,7 @@ async def update_my_settings(
 _SECRET_FIELDS = {
     "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY",
     "GEMINI_API_KEY", "GROQ_API_KEY", "HF_AUTH_TOKEN",
+    "REPLICATE_API_KEY",
 }
 
 
