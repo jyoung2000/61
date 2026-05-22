@@ -194,6 +194,29 @@ class AudioIntelligence:
 
             audio_size = os.path.getsize(audio_path)
             log.log_stage('AUDIO', f'Audio extracted: {audio_size/1048576:.1f} MB')
+
+            # Pre-flight: low-VRAM GPUs (the GTX 1650 = 4 GB, etc.) can't fit
+            # Whisper medium under batched inference. Reload on CPU before
+            # transcribing so we don't burn an attempt on a doomed CUDA call.
+            if self.device_used.startswith('cuda'):
+                try:
+                    import torch as _torch
+                    if _torch.cuda.is_available():
+                        _free_bytes, _ = _torch.cuda.mem_get_info()
+                        _free_gb = _free_bytes / 1_073_741_824
+                        _needed = {'large': 5.5, 'large-v2': 5.5, 'large-v3': 5.5,
+                                   'medium': 3.0, 'small': 1.8,
+                                   'base': 1.0, 'tiny': 0.6,
+                                   }.get(self.model_name, 3.0)
+                        if _free_gb < _needed:
+                            log.log_stage('AUDIO',
+                                f'Only {_free_gb:.1f} GB VRAM free '
+                                f'(need ~{_needed:.1f} GB for {self.model_name}) '
+                                '— using CPU to avoid OOM')
+                            self._reload_on_cpu()
+                except Exception:
+                    pass
+
             log.log_stage('AUDIO', f'Transcribing with {self.model_name} ({self.device_used})...'
                            f' language={whisper_lang or "auto"}')
 
@@ -223,11 +246,16 @@ class AudioIntelligence:
             except Exception as e:
                 err_str = str(e)
                 log.log_stage('AUDIO', f'Batched inference failed: {err_str[:120]}')
-                if 'cublas' in err_str.lower() or 'cuda' in err_str.lower():
+                # CUDA out-of-memory or any other CUDA error — reload on CPU
+                # so the sequential fallback below doesn't hit the same wall.
+                if self.device_used.startswith('cuda') and (
+                    'out of memory' in err_str.lower()
+                    or 'cublas' in err_str.lower()
+                    or 'cuda' in err_str.lower()
+                ):
                     log.log_stage('AUDIO',
-                        'FIX: Install CUDA PyTorch for 4x faster transcription:\n'
-                        '  pip install torch --index-url https://download.pytorch.org/whl/cu121\n'
-                        '  (Your PyTorch is CPU-only but CTranslate2 has CUDA)')
+                        'CUDA out of memory — reloading Whisper on CPU')
+                    self._reload_on_cpu()
                 log.log_stage('AUDIO', 'Falling back to sequential transcription (slower)')
                 segments_iter, info = self.engine.transcribe(
                     audio_path, language=whisper_lang,
@@ -454,6 +482,24 @@ class AudioIntelligence:
             log.log_error('AUDIO', f'Transcription failed: {e}')
             return {'speech_active': {}, 'segments': [], 'language': ''}
 
+    def _reload_on_cpu(self) -> None:
+        """Reload Whisper on CPU int8 — used when CUDA runs out of memory.
+        Low-VRAM GPUs (the GTX 1650 = 4 GB, for instance) can't fit Whisper
+        medium under batched inference; CPU is slower but always completes."""
+        try:
+            import torch as _torch
+            if hasattr(self, 'engine'):
+                del self.engine
+            if _torch.cuda.is_available():
+                _torch.cuda.empty_cache()
+        except Exception:
+            pass
+        from faster_whisper import WhisperModel
+        self.engine = WhisperModel(self.model_name, device='cpu', compute_type='int8')
+        self.device_used = 'cpu_int8'
+        AudioIntelligence._cached_device = self.device_used
+        log.log_stage('AUDIO', f'Whisper reloaded on CPU int8 ({self.model_name})')
+
     def whisper_translate(self, video_path: str, source_lang: str = None,
                           on_progress=None) -> List[dict]:
         """Direct audio→English translation using Whisper's native translate task.
@@ -497,6 +543,22 @@ class AudioIntelligence:
             # Use the same model but with task="translate"
             whisper_lang = source_lang if source_lang and source_lang != 'auto' else None
 
+            # Pre-flight VRAM check — mirrors transcribe(). On low-VRAM GPUs,
+            # batched translate OOMs just as readily as batched transcribe.
+            if self.device_used.startswith('cuda'):
+                try:
+                    import torch as _torch
+                    if _torch.cuda.is_available():
+                        _free_bytes, _ = _torch.cuda.mem_get_info()
+                        _free_gb = _free_bytes / 1_073_741_824
+                        if _free_gb < 3.0:
+                            log.log_stage('TRANSLATE',
+                                f'Only {_free_gb:.1f} GB VRAM free '
+                                '— using CPU for translation')
+                            self._reload_on_cpu()
+                except Exception:
+                    pass
+
             try:
                 from faster_whisper import BatchedInferencePipeline
                 batched = BatchedInferencePipeline(model=self.engine)
@@ -513,7 +575,16 @@ class AudioIntelligence:
                     condition_on_previous_text=True,
                     no_speech_threshold=0.5,
                 )
-            except Exception:
+            except Exception as e:
+                err_str = str(e)
+                if self.device_used.startswith('cuda') and (
+                    'out of memory' in err_str.lower()
+                    or 'cublas' in err_str.lower()
+                    or 'cuda' in err_str.lower()
+                ):
+                    log.log_stage('TRANSLATE',
+                        'CUDA out of memory — reloading Whisper on CPU')
+                    self._reload_on_cpu()
                 # Fallback to sequential
                 segments_iter, info = self.engine.transcribe(
                     audio_path, language=whisper_lang,
