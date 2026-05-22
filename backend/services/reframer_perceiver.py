@@ -19,6 +19,7 @@ from dataclasses import dataclass, field, asdict
 from typing import List, Optional, Tuple, Callable, Dict
 from pathlib import Path
 
+from backend.config import settings
 from backend.services.reframer_models import (
     ReframeLogger, get_logger, reset_logger, RenderPlan,
     interpolate_x, clamp_x, _face_overlaps_person,
@@ -55,8 +56,9 @@ class Perceiver:
         # Tiered face detector: YOLO → DNN → Haar
         self.face_detector = FaceDetector()
 
-        # Audio intelligence: Whisper transcription for speech detection
-        self.audio_intel = AudioIntelligence()
+        # Audio intelligence: Whisper transcription for speech detection.
+        # Model is the one picked in Settings > Models (persisted as WHISPER_MODEL).
+        self.audio_intel = AudioIntelligence(model_name=settings.WHISPER_MODEL or 'small')
 
         # Speaker diarization (optional — needs pyannote + HF token)
         self.diarizer = SpeakerDiarizer()
