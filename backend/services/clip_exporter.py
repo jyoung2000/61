@@ -2428,7 +2428,7 @@ def _speaker_aware_keyframes(
     2. Elif transcript has speech at this time -> pick face with highest lip aperture
     3. Else -> fall back to largest face (primary_face_idx)
     """
-    from backend.services.active_speaker import get_active_slot_at_time
+    from backend.services.compat_stubs import get_active_slot_at_time
 
     keyframes = []
     face_ys = []
@@ -2578,7 +2578,7 @@ def _dense_face_detection_for_clip(
     num_frames = min(30, max(5, int(duration / sample_rate)))
 
     try:
-        from backend.services.face_detector import detect_faces_batch
+        from backend.services.compat_stubs import detect_faces_batch
     except ImportError:
         logger.debug("Face detector unavailable for dense clip detection")
         return []
@@ -2645,7 +2645,7 @@ def _keyframes_from_cached_render_plan(
     pulling in the rest of ``clip_exporter``'s heavyweight dependency
     graph (cv2 / MediaPipe / ffmpeg / pydantic_settings).
     """
-    from backend.services.render_plan_keyframes import (
+    from backend.services.compat_stubs import (
         keyframes_from_cached_render_plan,
     )
     return keyframes_from_cached_render_plan(
@@ -3976,7 +3976,7 @@ def _build_screenshare_filter(
 # in ``backend.services.gameplay_filters`` so they're unit-testable
 # without the database / aiofiles import chain. Re-exported here so
 # existing callers can keep importing them from clip_exporter.
-from backend.services.gameplay_filters import (
+from backend.services.compat_stubs import (
     build_gameplay_blurfill_filter as _build_gameplay_blurfill_filter,
     build_gameplay_wide_zoom_filter as _build_gameplay_wide_zoom_filter,
 )
@@ -6371,7 +6371,7 @@ async def export_clip(
         try:
             from backend.services.render_plan import USE_RENDER_PLAN
             if USE_RENDER_PLAN and subject_scenes and aspect_ratio:
-                from backend.services.render_plan_builder import build_render_plan
+                from backend.services.compat_stubs import build_render_plan
                 from backend.services.ffmpeg_filter_builder import build_ffmpeg_command as _build_rp_cmd, cleanup_filter_script
                 _rp_segments = _extract_render_plan_segments(subject_scenes)
                 if _rp_segments:
@@ -6586,7 +6586,7 @@ async def export_clip(
                 # Dense detection extracts frames at 0.5s intervals for the clip
                 # and runs speaker-aware face detection, giving 60+ accurate positions.
                 try:
-                    from backend.services.face_detector import detect_faces_dense as _dense_detect
+                    from backend.services.compat_stubs import detect_faces_dense as _dense_detect
                     _dense_results = _dense_detect(
                         video_path, start, end,
                         sample_rate=0.5,
@@ -6596,7 +6596,7 @@ async def export_clip(
                     # Reconstruct face_registry for slot center snapping
                     _clip_face_registry = None
                     if face_registry_data:
-                        from backend.services.face_registry import FaceRegistry, FaceSlot
+                        from backend.services.compat_stubs import FaceRegistry, FaceSlot
                         _clip_slots = [
                             FaceSlot(slot_id=s["id"], x_center=s["x"], x_min=s["x"], x_max=s["x"],
                                      frame_count=s.get("frames", 0), avg_width=0, avg_height=0)
@@ -6914,7 +6914,7 @@ async def export_clip(
                     if layout_mode == "auto" and layout_timeline_data:
                         # Reconstruct LayoutTimeline from serialized data
                         from backend.services.layout_engine import LayoutTimeline, LayoutSegment
-                        from backend.services.face_registry import FaceRegistry, FaceSlot
+                        from backend.services.compat_stubs import FaceRegistry, FaceSlot
                         _reg = None
                         if face_registry_data:
                             _slots = [
@@ -6935,7 +6935,7 @@ async def export_clip(
                     elif layout_mode in ("split", "triple", "pip", "screenshare") and face_registry_data:
                         # User forced a specific layout — build a single-segment timeline
                         from backend.services.layout_engine import LayoutTimeline, LayoutSegment
-                        from backend.services.face_registry import FaceRegistry, FaceSlot
+                        from backend.services.compat_stubs import FaceRegistry, FaceSlot
                         _slots = [
                             FaceSlot(slot_id=s["id"], x_center=s["x"], x_min=s["x"], x_max=s["x"],
                                      frame_count=s.get("frames", 0), avg_width=0, avg_height=0)
@@ -6988,7 +6988,7 @@ async def export_clip(
                     _gp_tracking = getattr(_job_for_gp, "tracking_mode", "") if _job_for_gp else ""
                     _gp_game_type = getattr(_job_for_gp, "game_type", "") if _job_for_gp else ""
                     if _gp_tracking == "gameplay":
-                        from backend.services.game_layouts import get_hud_layout
+                        from backend.services.compat_stubs import get_hud_layout
                         _gp_layout = get_hud_layout(_gp_game_type or "generic_fps")
                         dims_t = ASPECT_RATIO_DIMS_BY_QUALITY.get(export_quality, ASPECT_RATIO_DIMS)
                         _gp_out_w, _gp_out_h = dims_t.get(aspect_ratio, (1080, 1920))

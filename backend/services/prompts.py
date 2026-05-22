@@ -331,7 +331,7 @@ def get_genre_prompt(content_type) -> str:
     # content_classifier module is several hundred lines of heuristics
     # we do not need just to look up an enum.
     try:
-        from backend.services.content_classifier import ClipContentType
+        from backend.services.compat_stubs import ClipContentType
     except Exception:
         return DEFAULT_VIRAL_CLIP_PROMPT
 

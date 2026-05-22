@@ -353,7 +353,7 @@ async def _startup_preload():
             cfg.WHISPER_MODEL,
         )
         # Populate whisper_device_info for status display without loading the model
-        from backend.services.transcription import _detect_cuda_available, whisper_device_info, is_whisper_model_cached, ensure_whisper_model_downloaded
+        from backend.services.compat_stubs import _detect_cuda_available, whisper_device_info, is_whisper_model_cached, ensure_whisper_model_downloaded
         try:
             cuda_ok, cuda_count, gpu_name, best_idx = _detect_cuda_available()
             if cuda_ok:
@@ -374,7 +374,7 @@ async def _startup_preload():
                 ensure_whisper_model_downloaded(cfg.WHISPER_MODEL, timeout=600)
             threading.Thread(target=_bg_download, daemon=True, name="whisper-startup-download").start()
     else:
-        from backend.services.transcription import preload_model
+        from backend.services.compat_stubs import preload_model
         threading.Thread(target=preload_model, daemon=True).start()
 
     # Pull Ollama models in the background only if Ollama is in the fallback chain.

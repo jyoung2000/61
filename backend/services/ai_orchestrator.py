@@ -763,7 +763,7 @@ class AIOrchestrator:
         from backend.services.prompts import (
             DEFAULT_VIRAL_CLIP_PROMPT, get_genre_prompt,
         )
-        from backend.services.clip_scoring import (
+        from backend.services.compat_stubs import (
             finalize_clip_scores, four_axis_scoring_enabled,
         )
         if custom_user_prompt and custom_user_prompt != DEFAULT_VIRAL_CLIP_PROMPT:

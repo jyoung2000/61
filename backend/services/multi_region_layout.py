@@ -253,7 +253,7 @@ def decide_multi_region_layout(
     code path, replacing the heuristic Stage 3 logic that currently
     decides via face-count + speaker-overlap rules.
     """
-    from backend.services._autoflip_lp import (
+    from backend.services.compat_stubs import (
         MultiRegionLPResult,
         solve_multi_region_camera_path,
     )

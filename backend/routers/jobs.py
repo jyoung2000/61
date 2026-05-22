@@ -13,7 +13,7 @@ from backend.app.auth.deps import get_current_user
 from backend.app.auth.models import Role, User
 from backend.models import FrameData, JobStatus, SceneDescription, TranscriptSegment, WordTimestamp
 from backend.services.pipeline import run_analysis, request_cancel, is_cancel_requested
-from backend.services.retranscribe import retranscribe_job
+from backend.services.compat_stubs import retranscribe_job
 from backend.services.srt_generator import generate_srt
 
 logger = logging.getLogger(__name__)
@@ -224,7 +224,7 @@ async def retranscribe_job_endpoint(
     # 404 to the user synchronously instead of swallowing it into the
     # background task. This avoids a "click does nothing" experience on
     # jobs whose work dir has been pruned.
-    from backend.services.retranscribe import _locate_audio_path
+    from backend.services.compat_stubs import _locate_audio_path
 
     if _locate_audio_path(job) is None:
         raise HTTPException(
@@ -597,8 +597,8 @@ _active_word_refresh: dict[str, asyncio.Task] = {}
 async def _refresh_word_timestamps(job_id: str):
     """Background task: re-run Whisper to extract per-word timestamps and
     merge them onto the existing transcript segments (preserving text/speaker edits)."""
-    from backend.services.transcription import extract_word_timestamps
-    from backend.services.ws_manager import broadcast_ws
+    from backend.services.compat_stubs import extract_word_timestamps
+    from backend.services.pipeline import broadcast_ws
 
     try:
         job = await database.load_job(job_id)
@@ -663,7 +663,7 @@ async def _refresh_word_timestamps(job_id: str):
         })
     except Exception as e:
         logger.exception("[%s] Word timestamp refresh failed: %s", job_id, e)
-        from backend.services.ws_manager import broadcast_ws
+        from backend.services.pipeline import broadcast_ws
         await broadcast_ws(job_id, {
             "type": "error",
             "message": f"Word timestamp refresh failed: {str(e)}",
@@ -752,7 +752,7 @@ async def diarize_job(job_id: str, req: DiarizeRequest):
             detail="Audio file not found — re-upload the video to enable diarization"
         )
 
-    from backend.services.transcription import diarize_transcript_post
+    from backend.services.compat_stubs import diarize_transcript_post
 
     try:
         diarized = await diarize_transcript_post(
@@ -964,7 +964,7 @@ async def _reanalyze_subject_tracking(job_id: str, center_after: bool = False):
     from backend.services.ai_orchestrator import AIOrchestrator
     from backend.services.frame_extractor import frame_to_base64
     from backend.services.prompts import load_prompts
-    from backend.services.ws_manager import broadcast_ws
+    from backend.services.pipeline import broadcast_ws
 
     job = await database.load_job(job_id)
     if not job or not job.scenes:
@@ -1139,8 +1139,8 @@ async def rescore_clips(
         raise HTTPException(status_code=400, detail="Job has no clips to rescore")
 
     from backend.models import ClipCandidate
-    from backend.services.clip_scoring import finalize_clip_scores
-    from backend.services.content_classifier import ClipContentType
+    from backend.services.compat_stubs import finalize_clip_scores
+    from backend.services.compat_stubs import ClipContentType
 
     # Resolve the content_type to use:
     #   1. explicit override from payload

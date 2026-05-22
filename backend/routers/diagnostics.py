@@ -97,7 +97,7 @@ async def _get_gpu_info() -> dict:
                     info["gpu_name"] = f"NVIDIA GPU ({len(nvidia_devs)} device{'s' if len(nvidia_devs) > 1 else ''})"
                 # Try to get VRAM from transcription module's detection
                 try:
-                    from backend.services.transcription import _get_gpu_vram_mb
+                    from backend.services.compat_stubs import _get_gpu_vram_mb
                     vram_mb = _get_gpu_vram_mb()
                     if vram_mb > 0 and info["vram_total_bytes"] == 0:
                         info["vram_total_bytes"] = vram_mb * 1024 * 1024
@@ -842,7 +842,7 @@ async def test_pipeline(request: Request):
                 # then falls back to CTranslate2 and PyTorch.  The main process may not
                 # have a working torch.cuda, but the subprocess can still use CUDA via
                 # CTranslate2's own CUDA context.
-                from backend.services.transcription import _detect_cuda_available
+                from backend.services.compat_stubs import _detect_cuda_available
                 cuda_ok, cuda_count, gpu_name, best_idx = _detect_cuda_available()
                 if cuda_ok and settings.GPU_ACCELERATION_ENABLED:
                     whisper_device = "cuda"
@@ -928,7 +928,7 @@ async def test_pipeline(request: Request):
 
                 t0 = time.time()
                 try:
-                    from backend.services.transcription import transcribe_audio_subprocess
+                    from backend.services.compat_stubs import transcribe_audio_subprocess
                     segments = await asyncio.wait_for(
                         transcribe_audio_subprocess(
                             test_audio, language="", task="transcribe",

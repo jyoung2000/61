@@ -826,8 +826,8 @@ async def generate_clips_endpoint(
     #    every regenerate-mode call gets the same context the LLM had
     #    the first time. Legacy jobs that pre-date the persistence
     #    fields fall back to empty values and the route still works.
-    from backend.services.hot_zone_scorer import HotZone
-    from backend.services.content_classifier import ClipContentType
+    from backend.services.compat_stubs import HotZone
+    from backend.services.compat_stubs import ClipContentType
     _loaded_hot_zones: list = []
     try:
         for z in (job.hot_zones or []):
@@ -865,7 +865,7 @@ async def generate_clips_endpoint(
         try:
             from backend.services.ai_orchestrator import AIOrchestrator
             from backend.services.prompts import load_prompts
-            from backend.services.clip_scoring import deduplicate_overlapping_clips
+            from backend.services.compat_stubs import deduplicate_overlapping_clips
 
             start_time = time.monotonic()
 

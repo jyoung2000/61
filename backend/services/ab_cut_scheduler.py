@@ -35,7 +35,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Optional
 
-from backend.services.reframe_config import ReframeConfig, get_default_config
+from backend.services.compat_stubs import ReframeConfig, get_default_config
 
 logger = logging.getLogger(__name__)
 

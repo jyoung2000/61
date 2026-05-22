@@ -113,7 +113,7 @@ def _fill_content_routing(debug, job, content_profile, normalized_override):
     # reconciles the UI dropdown token with the enum + flags.
     if normalized_override is None and job is not None:
         try:
-            from backend.services.content_type_strings import (
+            from backend.services.compat_stubs import (
                 normalize_ui_content_type,
             )
             _override_token = getattr(job, "content_type_override", "") or ""

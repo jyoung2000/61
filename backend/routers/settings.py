@@ -882,7 +882,7 @@ async def save_provider_key(req: SaveKeyRequest):
     # If the HuggingFace token changed, reload the diarization pipeline
     if env_var == "HF_AUTH_TOKEN":
         try:
-            from backend.services.transcription import reload_diarization
+            from backend.services.compat_stubs import reload_diarization
             reload_diarization()
             logger.info("Reloading pyannote diarization pipeline with new HF token")
         except Exception as e:
@@ -1816,7 +1816,7 @@ async def save_models(req: SaveModelsRequest):
         # Force reload if model changed — without this, the _whisper_model
         # singleton holds the old model and _get_whisper_model() returns it.
         if req.transcript_model != old_model:
-            from backend.services.transcription import reload_model as reload_whisper
+            from backend.services.compat_stubs import reload_model as reload_whisper
             reload_whisper()
             logger.info(
                 "Whisper model changed: '%s' → '%s' — triggering background download",
@@ -2126,7 +2126,7 @@ async def set_gpu_acceleration(req: GpuAccelerationRequest):
     When toggled OFF: clears cache, returns CPU fallback info.
     """
     from backend.services.clip_exporter import detect_gpu_capabilities, _gpu_info_cache_clear
-    from backend.services.transcription import reload_model as reload_whisper_model
+    from backend.services.compat_stubs import reload_model as reload_whisper_model
 
     settings.GPU_ACCELERATION_ENABLED = req.enabled
     if req.vendor_override is not None:
@@ -2213,7 +2213,7 @@ async def report_client_gpu(req: ClientGpuReport):
         try:
             from backend.services.clip_exporter import _gpu_info_cache_clear
             _gpu_info_cache_clear()
-            from backend.services.transcription import reload_model as reload_whisper_model
+            from backend.services.compat_stubs import reload_model as reload_whisper_model
             reload_whisper_model()
         except Exception:
             pass
@@ -2246,7 +2246,7 @@ async def gpu_qa_validation():
         _gpu_encode_args,
         _gpu_decode_args,
     )
-    from backend.services.transcription import whisper_device_info
+    from backend.services.compat_stubs import whisper_device_info
 
     checks = []
     warnings = []
@@ -2292,7 +2292,7 @@ async def gpu_qa_validation():
     cuda_available = False
     cuda_device_count = 0
     try:
-        from backend.services.transcription import _detect_cuda_available
+        from backend.services.compat_stubs import _detect_cuda_available
         cuda_available, cuda_device_count, _ = _detect_cuda_available()
     except Exception:
         pass

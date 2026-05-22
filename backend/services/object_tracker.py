@@ -51,7 +51,7 @@ def track_objects_in_frames(
     Prefer passing the SaliencyRegion list directly as frame_saliency to
     scene_focus.aggregate_scene_focus for full bbox data.
     """
-    from backend.services.saliency_tracker import track_saliency_in_frames
+    from backend.services.compat_stubs import track_saliency_in_frames
 
     try:
         regions = track_saliency_in_frames(frame_paths, face_results)

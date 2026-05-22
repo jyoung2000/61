@@ -20,7 +20,7 @@ from backend.services.providers.base import (
     CLIP_JSON_SCHEMA_FOUR_AXIS, parse_clip_dict,
 )
 from backend.services.prompts import DEFAULT_FRAME_ANALYSIS_PROMPT, DEFAULT_VIRAL_CLIP_PROMPT, DEFAULT_SEO_PROMPT, DEFAULT_SUMMARY_PROMPT
-from backend.services.transcript_utils import analyze_transcript_energy, correlate_scenes_with_transcript, derive_content_guidance
+from backend.services.compat_stubs import analyze_transcript_energy, correlate_scenes_with_transcript, derive_content_guidance
 
 logger = logging.getLogger(__name__)
 
@@ -1346,7 +1346,7 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
             # and gets explicitly cleared.
             _anime_aware_threshold = 25  # 25% default
             try:
-                from backend.services.face_detector import ANIME_MODE_DETECTED
+                from backend.services.compat_stubs import ANIME_MODE_DETECTED
                 if ANIME_MODE_DETECTED:
                     _anime_aware_threshold = 50
                     logger.info(

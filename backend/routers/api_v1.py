@@ -91,7 +91,7 @@ async def health():
     """Basic health check for agents to verify the service is running."""
     whisper_loaded = False
     try:
-        from backend.services.transcription import _model
+        from backend.services.compat_stubs import _model
         whisper_loaded = _model is not None
     except (ImportError, AttributeError):
         pass

@@ -109,7 +109,7 @@ async def health():
     to verify the container is ready and has required API keys configured."""
     whisper_loaded = False
     try:
-        from backend.services.transcription import _model
+        from backend.services.compat_stubs import _model
         whisper_loaded = _model is not None
     except (ImportError, AttributeError):
         pass

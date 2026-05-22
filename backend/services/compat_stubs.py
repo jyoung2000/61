@@ -75,6 +75,10 @@ def normalize_content_type(value="", *args, **kwargs) -> str:
     return str(value or "generic")
 
 
+def normalize_ui_content_type(value="", *args, **kwargs) -> str:
+    return str(value or "generic")
+
+
 def content_type_label(value="", *args, **kwargs) -> str:
     return str(value or "Generic").replace("_", " ").title()
 
@@ -487,3 +491,108 @@ class ReframeConfig:
 
 def get_default_config(*args, **kwargs) -> ReframeConfig:
     return ReframeConfig()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  camera_solver / shot_detector / required_regions / anime_shot_detector
+#  / _autoflip_lp / object_detector / saliency_tracker
+# ═══════════════════════════════════════════════════════════════════════════
+
+class _PermissiveEnumMeta(type):
+    """Metaclass so ``CameraMode.ANYTHING`` resolves to the member name string."""
+
+    def __getattr__(cls, name):
+        return name
+
+
+class CameraMode(metaclass=_PermissiveEnumMeta):
+    """Permissive stand-in for the deleted camera_solver.CameraMode enum."""
+
+
+class ShotCamera:
+    def __init__(self, **kwargs):
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+
+class Shot:
+    def __init__(self, **kwargs):
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+
+class MultiRegionLPResult:
+    def __init__(self, **kwargs):
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+
+CROP_ASPECT = 9 / 16
+USE_ANIME_SHOT_DETECTOR = False
+
+
+def detect_shots(*args, **kwargs) -> list:
+    return []
+
+
+def detect_anime_shots(*args, **kwargs) -> list:
+    return []
+
+
+def solve_all_shots(*args, **kwargs) -> list:
+    return []
+
+
+def get_params_for_content_type(*args, **kwargs) -> dict:
+    return {}
+
+
+def build_required_regions(*args, **kwargs) -> list:
+    return []
+
+
+def promote_preferred_to_required(*args, **kwargs) -> list:
+    return []
+
+
+def solve_multi_region_camera_path(*args, **kwargs):
+    return None
+
+
+def get_detector(*args, **kwargs):
+    return None
+
+
+def _resolve_yolo_device(*args, **kwargs) -> str:
+    return "cpu"
+
+
+def track_saliency_in_frames(*args, **kwargs) -> list:
+    return []
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  clip_scoring / render_plan_keyframes / transcript_corrector / retranscribe
+# ═══════════════════════════════════════════════════════════════════════════
+
+def four_axis_scoring_enabled(*args, **kwargs) -> bool:
+    """The reframer bridge populates the 4 axes directly — legacy path off."""
+    return False
+
+
+def keyframes_from_cached_render_plan(*args, **kwargs) -> list:
+    return []
+
+
+def correct_transcript(segments, *args, **kwargs):
+    """Legacy transcript corrector — the reframer's TACT pass already cleans
+    the transcript, so this is an inert pass-through."""
+    return segments
+
+
+def _adaptive_batch_size(*args, **kwargs) -> int:
+    return 8
+
+
+def _locate_audio_path(*args, **kwargs):
+    return None

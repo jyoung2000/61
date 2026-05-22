@@ -230,7 +230,7 @@ def build_layout_timeline(
     5. Add transition markers at segment boundaries
     """
     from backend.models import LayoutMode
-    from backend.services.active_speaker import get_active_slot_at_time
+    from backend.services.compat_stubs import get_active_slot_at_time
 
     if prefer_single or not face_results or not ALLOW_MULTI_LAYOUT:
         return LayoutTimeline(
@@ -388,11 +388,11 @@ def _plan_layout_impl(
     frame_persons=None,
 ):
     from backend.models import LayoutMode
-    from backend.services.shot_detector import detect_shots
-    from backend.services.camera_solver import (
+    from backend.services.compat_stubs import detect_shots
+    from backend.services.compat_stubs import (
         solve_all_shots, CameraMode, get_params_for_content_type,
     )
-    from backend.services.required_regions import (
+    from backend.services.compat_stubs import (
         build_required_regions, promote_preferred_to_required,
     )
 
@@ -421,11 +421,11 @@ def _plan_layout_impl(
 
     if _is_animated_ct:
         try:
-            from backend.services.anime_shot_detector import (
+            from backend.services.compat_stubs import (
                 USE_ANIME_SHOT_DETECTOR,
                 detect_anime_shots,
             )
-            from backend.services.shot_detector import Shot as _Shot
+            from backend.services.compat_stubs import Shot as _Shot
         except ImportError:
             USE_ANIME_SHOT_DETECTOR = False
             _Shot = None
@@ -514,8 +514,8 @@ def _plan_layout_impl(
     # slot's mean_x. Short cut-between-speakers shots were the dominant
     # source of padded-fallback on the Verzuz run — 57%. A stationary
     # crop on a known seat is always better than padded.
-    from backend.services.content_classifier import ClipContentType
-    from backend.services.camera_solver import (
+    from backend.services.compat_stubs import ClipContentType
+    from backend.services.compat_stubs import (
         ShotCamera as _ShotCamera,
         CameraMode as _CameraMode,
         CROP_ASPECT as _CROP_ASPECT,
@@ -722,7 +722,7 @@ def _build_padded_segment(
     from backend.models import LayoutMode
 
     try:
-        from backend.services.content_classifier import ClipContentType
+        from backend.services.compat_stubs import ClipContentType
     except ImportError:
         ClipContentType = None
 

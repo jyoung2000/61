@@ -532,7 +532,7 @@ def parse_clip_dict(
         # Backfill axes from the legacy score if the LLM ignored the
         # 4-axis schema entirely.
         if (hook_score, flow_score, value_score, trend_score) == (0, 0, 0, 0):
-            from backend.services.clip_scoring import fill_axes_from_legacy
+            from backend.services.compat_stubs import fill_axes_from_legacy
             fill_axes_from_legacy(clip)
 
         return clip, None
@@ -1947,7 +1947,7 @@ class ChunkedClipDetectionMixin:
             and _coverage_reach < video_duration * 0.75
         )
         if not skip_pass2 and (len(all_clips) < num_clips or _needs_coverage_sweep):
-            from backend.services.hot_zone_scorer import get_coverage_gaps
+            from backend.services.compat_stubs import get_coverage_gaps
             # If late regions are starving for coverage, ignore the hot-zone
             # filter so we don't drop a 20-minute late gap simply because it
             # lacks a pre-scored zone. Dialogue-light action / cinematic

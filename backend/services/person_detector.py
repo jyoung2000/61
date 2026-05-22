@@ -176,7 +176,7 @@ def detect_persons_in_frames(
     """
     # Lazy import so test files that don't need cv2 / ultralytics still
     # import this module without pulling in the heavy detector path.
-    from backend.services.object_detector import get_detector
+    from backend.services.compat_stubs import get_detector
     import cv2  # local import — only used inside the detect loop
 
     detector = get_detector()
@@ -235,7 +235,7 @@ def detect_persons_in_frames(
                 # Use the same device-resolution policy as ObjectDetector
                 # so YOLO11n-pose runs on the GPU when available. Honors
                 # the GPU_ACCELERATION_ENABLED kill switch.
-                from backend.services.object_detector import _resolve_yolo_device
+                from backend.services.compat_stubs import _resolve_yolo_device
                 _pose_device = _resolve_yolo_device()
                 yres = pose_model(
                     img, verbose=False, device=_pose_device,

@@ -82,7 +82,7 @@ async def get_render_plan(
         clip_range = (clip_start, clip_end)
 
     try:
-        from backend.services.render_plan_builder import build_render_plan
+        from backend.services.compat_stubs import build_render_plan
 
         plan = build_render_plan(
             segments=segments,
