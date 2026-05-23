@@ -462,90 +462,76 @@ async def _background_post_processing(job_id: str, transcript: list, orchestrato
             })
 
     # ── Subtitle translation ──
-    if job.subtitle_language and transcript:
-        source_lang = job.language or ""
-        target_lang = job.subtitle_language.strip().lower()
-
-        # If source language wasn't detected, try to get it from Whisper
-        if not source_lang:
-            from backend.services.compat_stubs import _last_detected_language
-            source_lang = _last_detected_language.get("lang", "")
-
-        # If Whisper used task="translate", the transcript is already in English.
-        # Store it as translated_transcript and skip LLM translation.
-        whisper_did_translate = (
-            target_lang == "en"
-            and source_lang
-            and source_lang != "en"
+    # An explicit job.subtitle_language always wins; otherwise auto-translate
+    # non-English audio to English so the default UX matches expectations
+    # (upload Japanese → get English subtitles). The reframer's Whisper path
+    # uses task="transcribe" (source-language output), so the LLM translator
+    # is what actually produces English — earlier code shortcut around it
+    # under the wrong assumption that Whisper had already translated, which
+    # left non-English transcripts unchanged and labelled as "translated".
+    target_lang = (job.subtitle_language or "").strip().lower()
+    source_lang = (job.language or "").strip().lower()
+    if not source_lang:
+        from backend.services.compat_stubs import _last_detected_language
+        source_lang = (_last_detected_language.get("lang", "") or "").strip().lower()
+    if not target_lang and source_lang and source_lang not in ("en", "english"):
+        target_lang = "en"
+        logger.info(
+            "[%s] Auto-translating subtitles: %s → en (no explicit subtitle_language set)",
+            job_id, source_lang,
         )
 
-        if whisper_did_translate:
-            logger.info(
-                "[%s] Whisper native translate produced English text — "
-                "storing as translated_transcript (skipping LLM translation)",
-                job_id,
+    if target_lang and target_lang != source_lang and transcript:
+        from backend.services.translator import translate_segments_with_fallback, SUPPORTED_LANGUAGES
+        target_name = SUPPORTED_LANGUAGES.get(target_lang, target_lang)
+        source_name = SUPPORTED_LANGUAGES.get(source_lang, source_lang) if source_lang else "auto-detected"
+        logger.info("[%s] Background subtitle translation: %s → %s (%d segments)",
+                    job_id, source_name, target_name, len(transcript))
+
+        await broadcast_ws(job_id, {
+            "type": "background_task",
+            "task": "subtitle_translation",
+            "status": "running",
+            "message": f"Translating subtitles to {target_name}...",
+        })
+
+        # Scale timeout with segment count — allow extra time for model pull + fallback
+        _trans_timeout = max(600, len(transcript) * 4)
+        try:
+            orchestrator.reset_circuit_breaker()
+            translated = await asyncio.wait_for(
+                translate_segments_with_fallback(
+                    transcript,
+                    source_language=source_lang if source_lang else "auto",
+                    target_language=target_lang,
+                    orchestrator=orchestrator,
+                ),
+                timeout=_trans_timeout,
             )
+
+            changed = sum(1 for t, o in zip(translated, transcript) if t.text != o.text)
             await database.update_job_status(
                 job_id,
-                translated_transcript=list(transcript),
+                translated_transcript=list(translated),
             )
+
             await broadcast_ws(job_id, {
                 "type": "background_task",
                 "task": "subtitle_translation",
                 "status": "complete",
-                "message": "English subtitles ready (Whisper native translation)",
+                "message": f"Subtitles translated to {target_name} ({changed}/{len(translated)} segments)",
             })
-        elif target_lang and target_lang != source_lang:
-            from backend.services.translator import translate_segments_with_fallback, SUPPORTED_LANGUAGES
-            target_name = SUPPORTED_LANGUAGES.get(target_lang, target_lang)
-            source_name = SUPPORTED_LANGUAGES.get(source_lang, source_lang) if source_lang else "auto-detected"
-            logger.info("[%s] Background subtitle translation: %s → %s (%d segments)",
-                        job_id, source_name, target_name, len(transcript))
+            logger.info("[%s] Translated %d/%d segments to %s",
+                        job_id, changed, len(translated), target_lang)
 
+        except Exception as e:
+            logger.error("[%s] Translation failed: %s", job_id, e)
             await broadcast_ws(job_id, {
                 "type": "background_task",
                 "task": "subtitle_translation",
-                "status": "running",
-                "message": f"Translating subtitles to {target_name}...",
+                "status": "failed",
+                "message": f"Translation failed: {str(e)[:80]}",
             })
-
-            # Scale timeout with segment count — allow extra time for model pull + fallback
-            _trans_timeout = max(600, len(transcript) * 4)
-            try:
-                orchestrator.reset_circuit_breaker()
-                translated = await asyncio.wait_for(
-                    translate_segments_with_fallback(
-                        transcript,
-                        source_language=source_lang if source_lang else "auto",
-                        target_language=target_lang,
-                        orchestrator=orchestrator,
-                    ),
-                    timeout=_trans_timeout,
-                )
-
-                changed = sum(1 for t, o in zip(translated, transcript) if t.text != o.text)
-                await database.update_job_status(
-                    job_id,
-                    translated_transcript=list(translated),
-                )
-
-                await broadcast_ws(job_id, {
-                    "type": "background_task",
-                    "task": "subtitle_translation",
-                    "status": "complete",
-                    "message": f"Subtitles translated to {target_name} ({changed}/{len(translated)} segments)",
-                })
-                logger.info("[%s] Translated %d/%d segments to %s",
-                            job_id, changed, len(translated), target_lang)
-
-            except Exception as e:
-                logger.error("[%s] Translation failed: %s", job_id, e)
-                await broadcast_ws(job_id, {
-                    "type": "background_task",
-                    "task": "subtitle_translation",
-                    "status": "failed",
-                    "message": f"Translation failed: {str(e)[:80]}",
-                })
 
 
 async def run_analysis(job_id: str):

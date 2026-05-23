@@ -564,6 +564,12 @@ class AIOrchestrator:
         If tier specifies map_reduce strategy, splits transcript into chunks,
         summarizes each, then merges. This ensures long videos get full coverage.
         """
+        # Callers sometimes pass dicts (e.g., transcript / scenes loaded from
+        # the DB before Pydantic re-parse). Re-hydrate so downstream code can
+        # use attribute access (s.start, s.timestamp, …) without "'dict'
+        # object has no attribute 'start'" crashes.
+        transcript = [TranscriptSegment(**s) if isinstance(s, dict) else s for s in transcript]
+        scenes = [SceneDescription(**s) if isinstance(s, dict) else s for s in scenes]
         if tier and tier.summary_strategy == "map_reduce" and tier.summary_chunk_minutes > 0:
             return await self._map_reduce_summary(transcript, scenes, job_id, tier)
 
