@@ -99,6 +99,34 @@ export default function SceneCard({ scene, sceneIndex, jobId, onClick, onUpdated
         >
           {formatTime(scene.timestamp)}
         </span>
+        {/* Subject count badge — reframer's face_positions per scene */}
+        {((scene.face_count || 0) > 0 || (scene.face_positions?.length || 0) > 0) && (() => {
+          const count = scene.face_count || scene.face_positions?.length || 0;
+          const ids = (scene.face_positions || [])
+            .map((f) => (f.identity_id != null ? f.identity_id : f.slot_id))
+            .filter((v) => v != null);
+          const speaking = (scene.face_positions || []).some((f) => f.is_speaking);
+          const idStr = ids.length ? ` — #${ids.join(', #')}` : '';
+          const tip = `${count} subject${count === 1 ? '' : 's'}${idStr}${speaking ? ' — someone speaking' : ''}`;
+          return (
+            <span
+              style={{
+                position: 'absolute',
+                bottom: 4,
+                right: 4,
+                background: 'var(--badge-overlay-bg)',
+                color: speaking ? 'var(--accent-amber)' : 'var(--accent-cyan)',
+                fontFamily: 'var(--font-mono)',
+                fontSize: 11,
+                padding: '2px 6px',
+                borderRadius: 2,
+              }}
+              title={tip}
+            >
+              {count} subject{count === 1 ? '' : 's'}{speaking ? ' (speaking)' : ''}
+            </span>
+          );
+        })()}
         {/* Edit/Delete buttons */}
         {onUpdated && !editing && (
           <div style={{ position: 'absolute', top: 4, right: 4, display: 'flex', gap: 4 }}>
