@@ -728,6 +728,30 @@ class ReplicateDiscovery:
 
         os.environ["REPLICATE_API_TOKEN"] = self.api_key
 
+        # Resolve a version pin for community models. The Replicate SDK's
+        # "owner/model" form (no ":") hits POST /v1/models/owner/model/predictions,
+        # which only works for Replicate-curated *official* models. Community
+        # models (like lucataco/videollama3-7b) live under /v1/predictions and
+        # require "owner/model:VERSION_ID". Resolve the latest version once
+        # per discovery call so users can keep the friendly "owner/model"
+        # default in Settings.
+        model_ref = self.model_id
+        if ":" not in model_ref:
+            try:
+                model_obj = replicate_sdk.models.get(model_ref)
+                version_obj = getattr(model_obj, "latest_version", None)
+                if version_obj is not None and getattr(version_obj, "id", None):
+                    model_ref = f"{model_ref}:{version_obj.id}"
+                    logger.info(
+                        f"Replicate: resolved {self.model_id} → "
+                        f"{model_ref[:len(self.model_id) + 13]}…"
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"Replicate: could not resolve latest version for "
+                    f"{self.model_id}: {e} — call may 404"
+                )
+
         duration_s = _get_video_duration(video_path)
         n_total_chunks = max(1, math.ceil(duration_s / chunk_duration_s))
 
@@ -777,7 +801,7 @@ class ReplicateDiscovery:
 
                 with open(chunk_path, "rb") as f:
                     output = replicate_sdk.run(
-                        self.model_id,
+                        model_ref,
                         input={
                             "video": f,
                             "prompt": prompt,
