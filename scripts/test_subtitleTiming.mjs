@@ -53,10 +53,10 @@ console.log('spokenWindow — segment with valid words');
   };
   const w = spokenWindow(seg);
   // start = max(segStart - 0.02, ws - WORD_HEAD_S)
-  //       = max(0.98, 1.10 - 0.04) = max(0.98, 1.06) = 1.06
+  //       = max(0.98, 1.10 - 0.00) = max(0.98, 1.10) = 1.10
   check('start uses words[0].start - WORD_HEAD_S', approx(w.start, 1.10 - WORD_HEAD_S), w);
   // end = max(segEnd, we) + WORD_TAIL_S
-  //     = max(2.5, 2.30) + 0.20 = 2.5 + 0.20 = 2.70
+  //     = max(2.5, 2.30) + 0.10 = 2.5 + 0.10 = 2.60
   check('end = max(segEnd, we) + WORD_TAIL_S (segEnd wins)', approx(w.end, 2.5 + WORD_TAIL_S), w);
 }
 
@@ -72,7 +72,7 @@ console.log('spokenWindow — words extend past segEnd (we wins)');
     ],
   };
   const w = spokenWindow(seg);
-  // end = max(2.0, 2.30) + 0.20 = 2.30 + 0.20 = 2.50
+  // end = max(2.0, 2.30) + 0.10 = 2.30 + 0.10 = 2.40
   check('end uses we when we > segEnd', approx(w.end, 2.30 + WORD_TAIL_S), w);
 }
 
@@ -139,10 +139,10 @@ console.log('isSpokenAt — boundary conditions');
     ],
   };
   const w = spokenWindow(seg);
-  // w.start = max(0.98, 1.02 - 0.04) = max(0.98, 0.98) = 0.98
-  // w.end = max(2.0, 1.95) + 0.20 = 2.0 + 0.20 = 2.20
-  check('start = 0.98', approx(w.start, 0.98), w);
-  check('end = 2.20', approx(w.end, 2.20), w);
+  // w.start = max(0.98, 1.02 - 0.00) = max(0.98, 1.02) = 1.02
+  // w.end = max(2.0, 1.95) + 0.10 = 2.0 + 0.10 = 2.10
+  check('start = 1.02', approx(w.start, 1.02), w);
+  check('end = 2.10', approx(w.end, 2.10), w);
   check('inclusive at start', isSpokenAt(seg, w.start) === true, w);
   check('exclusive at end', isSpokenAt(seg, w.end) === false, w);
   check('1 ms inside is active', isSpokenAt(seg, w.start + 0.001) === true, w);
@@ -174,25 +174,26 @@ console.log('Integration — TranscriptViewer gap-hold math');
 
   // Segments with no word timestamps — spokenWindow returns
   // [seg.start, seg.end + WORD_TAIL_S].
-  //   seg0: 0.0–1.0 → window 0.0–1.20
+  //   seg0: 0.0–1.0 → window 0.0–1.10
   //   (short gap: 0.3 s)
-  //   seg1: 1.3–2.0 → window 1.3–2.20
+  //   seg1: 1.3–2.0 → window 1.3–2.10
   //   (long gap: 2.0 s)
-  //   seg2: 4.0–5.0 → window 4.0–5.20
+  //   seg2: 4.0–5.0 → window 4.0–5.10
   const tr = [
     { start: 0.0, end: 1.0 },
     { start: 1.3, end: 2.0 },
     { start: 4.0, end: 5.0 },
   ];
   check('t=0.5 → seg0', activeIdx(tr, 0.5) === 0);
-  // With the tail extension, seg0 still has window [0, 1.20] so the
-  // small 0.3s gap is absorbed by the window, not by gap-hold.
+  // With the tail extension, seg0's window is [0, 1.10]. t=1.1 is past
+  // the window's exclusive end (~1.10) so direct match misses, but
+  // gap-hold keeps seg0 active because the gap is well under 0.75 s.
   check('t=1.1 (inside seg0 window) → seg0', activeIdx(tr, 1.1) === 0);
   check('t=1.5 → seg1', activeIdx(tr, 1.5) === 1);
-  // Right after seg1's window ends (2.20), gap-hold keeps seg1
+  // Right after seg1's window ends (2.10), gap-hold keeps seg1
   // active for up to 0.75 s.
   check('t=2.3 (just past seg1 end, inside 0.75s hold) → seg1', activeIdx(tr, 2.3) === 1);
-  check('t=2.9 (0.70s past seg1 end, still inside hold) → seg1', activeIdx(tr, 2.9) === 1);
+  check('t=2.9 (0.80s past seg1 end, past 0.75s hold) → -1', activeIdx(tr, 2.9) === -1);
   check('t=3.0 (exactly 0.80s past, past hold) → -1', activeIdx(tr, 3.0) === -1);
   check('t=3.5 (far past hold) → -1', activeIdx(tr, 3.5) === -1);
   check('t=4.1 → seg2', activeIdx(tr, 4.1) === 2);
@@ -213,11 +214,12 @@ console.log('Regression — diarization split, back-to-back lines');
   //           audio is still saying A.
   //
   // New code: A's window end = max(seg.end, we) + WORD_TAIL_S
-  //           = max(890, 889.5) + 0.20 = 890.20. A stays active until
-  //           890.20. B's start = max(890 - 0.02, 890.3 - 0.04) = 890.26.
-  //           So at t=890.10 (inside A's tail), direct match on A wins.
-  //           At t=890.25, neither A nor B direct-matches, gap-hold
-  //           keeps A. At t=890.30 B wins via direct match.
+  //           = max(890, 889.5) + 0.10 = 890.10. A stays active until
+  //           890.10 via direct match. B's start = max(890 - 0.02, 890.3
+  //           - 0.00) = 890.30.
+  //           So at t=890.10–890.30, neither A nor B direct-matches and
+  //           gap-hold (≤ 0.75 s) keeps A active. At t=890.30 B's
+  //           direct match begins and wins.
   const activeIdx = (transcript, currentTime, GAP_HOLD_SEC = 0.75) => {
     let lastEndedIdx = -1;
     let lastEndedTime = -Infinity;
