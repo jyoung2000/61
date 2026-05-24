@@ -1913,7 +1913,7 @@ export function keyframesToCropSegments(keyframes, duration, clusters, sceneCuts
       originalCropX: seg.cropX,
       clusterId: cId,
       isManualOverride: false,
-      label: cId >= 0 ? `Speaker ${cId + 1}` : `${Math.round(seg.cropX)}%`,
+      label: `${Math.round(seg.cropX)}%`,
     };
   });
 }
@@ -2008,10 +2008,12 @@ export function keyframesToCropSegmentsWithSlots(keyframes, duration, slotTimeli
 
   console.log(`[CropTrack] segments_from_slots=${filtered.length}`);
 
-  // Label resolution: speakerNames[slot] > "Speaker ${slot+1}" > geometric fallback
+  // Label by crop-window position so the track reads as a horizontal
+  // location instead of an abstract speaker slot — that's what the user
+  // is actually adjusting on the slider.
   return filtered.map((seg, i) => {
     const slot = seg.slot;
-    const label = speakerNames[slot] || (slot >= 0 ? `Speaker ${slot + 1}` : `${Math.round(seg.cropX)}%`);
+    const label = `${Math.round(seg.cropX)}%`;
     return {
       id: `crop-${i}`,
       startTime: seg.startTime,

@@ -705,7 +705,14 @@ export default function PropertiesPanel({ compact = false, settings = null, onSe
               type="range"
               min={0} max={100} step={1}
               value={Number.isFinite(selectedCropSeg.cropX) ? selectedCropSeg.cropX : 50}
-              onChange={e => updateCropSegment({ ...selectedCropSeg, cropX: Number(e.target.value) })}
+              onChange={e => {
+                const newX = Number(e.target.value);
+                updateCropSegment({
+                  ...selectedCropSeg,
+                  cropX: newX,
+                  label: `${Math.round(newX)}%`,
+                });
+              }}
               {...undoCoalesceHandlers()}
               style={{ width: '100%', accentColor: '#06B6D4' }}
             />

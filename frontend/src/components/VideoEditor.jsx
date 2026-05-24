@@ -1060,7 +1060,9 @@ export default function VideoEditor({
         if (hit) {
           seg.cropX = hit.cropX;
           seg.isManualOverride = true;
-          if (hit.label) seg.label = hit.label;
+          // Re-derive the percent label from the (potentially edited)
+          // cropX so the timeline track stays in sync with the slider.
+          seg.label = `${Math.round(hit.cropX)}%`;
         }
       }
     }
