@@ -1814,7 +1814,7 @@ export function computeLayoutAtTime(t, layoutTimeline, srcW, srcH, targetAspect,
  * @param {Array<{center: number, count: number}>|null} clusters - Detected speaker clusters
  * @returns {Array<{id: string, startTime: number, endTime: number, cropX: number, clusterId: number, isManualOverride: boolean, label: string, originalCropX: number}>}
  */
-export function keyframesToCropSegments(keyframes, duration, clusters) {
+export function keyframesToCropSegments(keyframes, duration, clusters, sceneCuts = null) {
   if (!keyframes?.length || !duration) return [];
 
   // Build a lookup: x → closest cluster index
@@ -1833,7 +1833,17 @@ export function keyframesToCropSegments(keyframes, duration, clusters) {
   // This prevents the LP solver's smooth ease curves from creating
   // dozens of micro-segments during transitions.  A segment break
   // occurs only when the keyframe's cluster changes (i.e., the camera
-  // has arrived at a different speaker position).
+  // has arrived at a different speaker position) OR a scene cut lands
+  // inside the running segment — giving the user a natural handle to
+  // tweak the crop separately on each side of a shot boundary.
+  const sortedCuts = Array.isArray(sceneCuts)
+    ? [...sceneCuts]
+        .map((c) => Number(c))
+        .filter((c) => Number.isFinite(c) && c > 0 && c < duration)
+        .sort((a, b) => a - b)
+    : [];
+  let nextCutIdx = 0;
+
   const segments = [];
   let segStart = keyframes[0].t;
   let segX = keyframes[0].x;
@@ -1842,6 +1852,22 @@ export function keyframesToCropSegments(keyframes, duration, clusters) {
   for (let i = 1; i < keyframes.length; i++) {
     const kf = keyframes[i];
     const kfCluster = clusterLookup(kf.x);
+
+    // Drain any scene cuts that fall between segStart and the current
+    // keyframe — each one opens a fresh segment so the user gets a
+    // separately-editable crop window per shot.
+    while (nextCutIdx < sortedCuts.length
+        && sortedCuts[nextCutIdx] <= segStart) {
+      nextCutIdx++;
+    }
+    while (nextCutIdx < sortedCuts.length
+        && sortedCuts[nextCutIdx] > segStart
+        && sortedCuts[nextCutIdx] < kf.t) {
+      const cutT = sortedCuts[nextCutIdx];
+      segments.push({ startTime: segStart, endTime: cutT, cropX: segX });
+      segStart = cutT;
+      nextCutIdx++;
+    }
 
     // Break on cluster change — smooth transitions between clusters
     // are absorbed into the preceding segment (the camera is "in transit")
@@ -1852,30 +1878,32 @@ export function keyframesToCropSegments(keyframes, duration, clusters) {
       segCluster = kfCluster;
     }
   }
+  // Drain remaining scene cuts before the clip ends.
+  while (nextCutIdx < sortedCuts.length && sortedCuts[nextCutIdx] < duration) {
+    const cutT = sortedCuts[nextCutIdx];
+    if (cutT > segStart) {
+      segments.push({ startTime: segStart, endTime: cutT, cropX: segX });
+      segStart = cutT;
+    }
+    nextCutIdx++;
+  }
   // Final segment to end of clip
   segments.push({ startTime: segStart, endTime: duration, cropX: segX });
 
-  // Merge adjacent segments with the same cluster (can happen if the
-  // solver briefly leaves and re-enters the same cluster)
-  const merged = [segments[0]];
-  for (let i = 1; i < segments.length; i++) {
-    const prev = merged[merged.length - 1];
-    const curr = segments[i];
-    if (clusterLookup(prev.cropX) === clusterLookup(curr.cropX)) {
-      // Merge: extend previous segment
-      prev.endTime = curr.endTime;
-    } else {
-      merged.push(curr);
-    }
-  }
+  // Drop degenerate segments (< 80 ms — usually back-to-back scene cuts
+  // produced by the perceiver on transition frames).
+  const filtered = segments.filter((s) => s.endTime - s.startTime >= 0.08);
+  if (!filtered.length) filtered.push(segments[0]);
 
   // Enforce strict contiguity: each segment's endTime === next segment's startTime
-  for (let i = 0; i < merged.length - 1; i++) {
-    merged[i].endTime = merged[i + 1].startTime;
+  for (let i = 0; i < filtered.length - 1; i++) {
+    filtered[i].endTime = filtered[i + 1].startTime;
   }
 
-  // Annotate with IDs, cluster info, and labels
-  return merged.map((seg, i) => {
+  // Annotate with IDs, cluster info, and labels. Each segment gets a
+  // unique id even when two adjacent ones share a cluster so the user
+  // can still select and edit them independently in the timeline.
+  return filtered.map((seg, i) => {
     const cId = clusterLookup(seg.cropX);
     return {
       id: `crop-${i}`,
@@ -1885,7 +1913,7 @@ export function keyframesToCropSegments(keyframes, duration, clusters) {
       originalCropX: seg.cropX,
       clusterId: cId,
       isManualOverride: false,
-      label: cId >= 0 ? `Speaker ${cId + 1}` : `${seg.cropX}%`,
+      label: cId >= 0 ? `Speaker ${cId + 1}` : `${Math.round(seg.cropX)}%`,
     };
   });
 }
@@ -1900,7 +1928,7 @@ export function keyframesToCropSegments(keyframes, duration, clusters) {
  * @param {Object} speakerNames - Map of slot_id → display name (from user renames)
  * @returns {Array<{id: string, startTime: number, endTime: number, cropX: number, clusterId: number, isManualOverride: boolean, label: string, originalCropX: number, speakerSlot: number}>}
  */
-export function keyframesToCropSegmentsWithSlots(keyframes, duration, slotTimeline, speakerNames = {}) {
+export function keyframesToCropSegmentsWithSlots(keyframes, duration, slotTimeline, speakerNames = {}, sceneCuts = null) {
   if (!keyframes?.length || !duration || !slotTimeline?.length) return [];
 
   // Build a function to look up the active slot at a given time
@@ -1913,17 +1941,41 @@ export function keyframesToCropSegmentsWithSlots(keyframes, duration, slotTimeli
     return best?.slot ?? -1;
   };
 
+  const sortedCuts = Array.isArray(sceneCuts)
+    ? [...sceneCuts]
+        .map((c) => Number(c))
+        .filter((c) => Number.isFinite(c) && c > 0 && c < duration)
+        .sort((a, b) => a - b)
+    : [];
+  let nextCutIdx = 0;
+
   // Build segments by slot changes
   const segments = [];
   let segStart = 0;
   let segSlot = slotAtTime(0);
   let segX = keyframes[0]?.x ?? 50;
 
-  // Walk through keyframes and break on slot changes
+  // Walk through keyframes and break on slot changes or scene cuts.
+  // Scene-cut breaks give the user a separately editable crop window
+  // per shot even when the slot stays the same across the boundary.
   for (let i = 1; i < keyframes.length; i++) {
     const kf = keyframes[i];
-    const slot = slotAtTime(kf.t);
 
+    // Drain any scene cuts that fall strictly between segStart and kf.t.
+    while (nextCutIdx < sortedCuts.length
+        && sortedCuts[nextCutIdx] <= segStart) {
+      nextCutIdx++;
+    }
+    while (nextCutIdx < sortedCuts.length
+        && sortedCuts[nextCutIdx] > segStart
+        && sortedCuts[nextCutIdx] < kf.t) {
+      const cutT = sortedCuts[nextCutIdx];
+      segments.push({ startTime: segStart, endTime: cutT, cropX: segX, slot: segSlot });
+      segStart = cutT;
+      nextCutIdx++;
+    }
+
+    const slot = slotAtTime(kf.t);
     if (slot !== segSlot && slot >= 0) {
       segments.push({ startTime: segStart, endTime: kf.t, cropX: segX, slot: segSlot });
       segStart = kf.t;
@@ -1931,31 +1983,35 @@ export function keyframesToCropSegmentsWithSlots(keyframes, duration, slotTimeli
       segSlot = slot;
     }
   }
+  // Drain remaining cuts before clip end
+  while (nextCutIdx < sortedCuts.length && sortedCuts[nextCutIdx] < duration) {
+    const cutT = sortedCuts[nextCutIdx];
+    if (cutT > segStart) {
+      segments.push({ startTime: segStart, endTime: cutT, cropX: segX, slot: segSlot });
+      segStart = cutT;
+    }
+    nextCutIdx++;
+  }
   // Final segment
   segments.push({ startTime: segStart, endTime: duration, cropX: segX, slot: segSlot });
 
-  // Merge adjacent segments with same slot
-  const merged = [segments[0]];
-  for (let i = 1; i < segments.length; i++) {
-    const prev = merged[merged.length - 1];
-    if (prev.slot === segments[i].slot) {
-      prev.endTime = segments[i].endTime;
-    } else {
-      merged.push(segments[i]);
-    }
-  }
+  // Drop degenerate segments (< 80 ms — back-to-back scene cuts on
+  // transition frames). Keep at least one segment so we never return
+  // an empty array.
+  const filtered = segments.filter((s) => s.endTime - s.startTime >= 0.08);
+  if (!filtered.length) filtered.push(segments[0]);
 
   // Enforce contiguity
-  for (let i = 0; i < merged.length - 1; i++) {
-    merged[i].endTime = merged[i + 1].startTime;
+  for (let i = 0; i < filtered.length - 1; i++) {
+    filtered[i].endTime = filtered[i + 1].startTime;
   }
 
-  console.log(`[CropTrack] segments_from_slots=${segments.length}`);
+  console.log(`[CropTrack] segments_from_slots=${filtered.length}`);
 
   // Label resolution: speakerNames[slot] > "Speaker ${slot+1}" > geometric fallback
-  return merged.map((seg, i) => {
+  return filtered.map((seg, i) => {
     const slot = seg.slot;
-    const label = speakerNames[slot] || (slot >= 0 ? `Speaker ${slot + 1}` : `${seg.cropX}%`);
+    const label = speakerNames[slot] || (slot >= 0 ? `Speaker ${slot + 1}` : `${Math.round(seg.cropX)}%`);
     return {
       id: `crop-${i}`,
       startTime: seg.startTime,

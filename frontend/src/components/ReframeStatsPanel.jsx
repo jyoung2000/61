@@ -1,6 +1,6 @@
 import React, { useRef, useEffect, useMemo } from 'react';
-import { interpolateSubjectX } from '../utils/subjectTracking';
-import { findNearestKey } from './ReframePreview';
+import useTimelineStore from '../stores/timelineStore';
+import { findNearestKey, getCropXForTime } from './ReframePreview';
 
 const STATS_UPDATE_HZ = 12;        // ~12 stat refreshes per second
 const SCENE_CUT_WARN_MS = 500;     // flag scene cuts within 500ms
@@ -163,13 +163,11 @@ export default function ReframeStatsPanel({
           refs.strategy.current.textContent = op?.strategy_label || op?.kind || '—';
         }
 
-        // Crop X position.
+        // Crop X position — match the live cropSegments the preview
+        // canvas uses so the "Crop X" stat reflects the user's edits.
         if (refs.cropX.current && cropDims) {
-          let sxPct = 50;
-          try {
-            const v = interpolateSubjectX(subjectKeyframes, relT);
-            if (typeof v === 'number' && !Number.isNaN(v)) sxPct = v;
-          } catch (_) { /* fall through */ }
+          const { cropSegments } = useTimelineStore.getState();
+          const sxPct = getCropXForTime(relT, cropSegments, subjectKeyframes);
           const center = (sxPct / 100) * sourceWidth;
           const cropX = Math.max(0, Math.min(
             cropDims.maxX, Math.round(center - cropDims.cropW / 2),

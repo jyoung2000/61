@@ -1011,16 +1011,16 @@ export default function VideoEditor({
       kfCount: subjectKeyframes?.length || 0,
       dur: clipEnd - clipStart,
     });
-    const setCropSegments = useTimelineStore.getState().setCropSegments;
+    const store = useTimelineStore.getState();
     if (!isCrop) {
-      setCropSegments([]);
+      store.setCropSegments([]);
       return;
     }
     const dur = clipEnd - clipStart;
     if (!subjectKeyframes?.length) {
       // No scene data yet — generate a default center-crop segment so the crop
       // track isn't empty while the user waits for subject tracking to complete.
-      setCropSegments([{
+      store.setCropSegments([{
         id: 'crop-default',
         startTime: 0,
         endTime: dur,
@@ -1035,11 +1035,37 @@ export default function VideoEditor({
     const clusters = detectPositionClusters(subjectKeyframes);
     // Prefer backend slot identity when available from render plan
     const slotTimeline = renderPlan ? extractSlotTimelineFromRenderPlan(renderPlan) : null;
+    // Convert absolute scene-cut timestamps (full-video seconds) into
+    // clip-relative seconds so per-scene segment breaks line up with
+    // the timeline. Filter to the trimmed clip window.
+    const relSceneCuts = Array.isArray(sceneCuts)
+      ? sceneCuts
+          .map((c) => Number(c) - (clipStart || 0))
+          .filter((c) => c > 0.25 && c < dur - 0.25)
+      : null;
     const segments = slotTimeline?.length
-      ? keyframesToCropSegmentsWithSlots(subjectKeyframes, dur, slotTimeline, speakerNames || {})
-      : keyframesToCropSegments(subjectKeyframes, dur, clusters);
-    setCropSegments(segments);
-  }, [subjectKeyframes, isCrop, clipStart, clipEnd, renderPlan, speakerNames]);
+      ? keyframesToCropSegmentsWithSlots(subjectKeyframes, dur, slotTimeline, speakerNames || {}, relSceneCuts)
+      : keyframesToCropSegments(subjectKeyframes, dur, clusters, relSceneCuts);
+
+    // Preserve the user's manual overrides across rebuilds. When a
+    // freshly built segment's time window overlaps a previously
+    // edited one, port its cropX forward so a slider tweak doesn't
+    // get wiped by an unrelated prop change upstream.
+    const prior = store.cropSegments || [];
+    const overrides = prior.filter((s) => s.isManualOverride && Number.isFinite(s.cropX));
+    if (overrides.length) {
+      for (const seg of segments) {
+        const mid = (seg.startTime + seg.endTime) / 2;
+        const hit = overrides.find((o) => mid >= o.startTime && mid < o.endTime);
+        if (hit) {
+          seg.cropX = hit.cropX;
+          seg.isManualOverride = true;
+          if (hit.label) seg.label = hit.label;
+        }
+      }
+    }
+    store.setCropSegments(segments);
+  }, [subjectKeyframes, isCrop, clipStart, clipEnd, renderPlan, speakerNames, sceneCuts]);
 
   const hasDynamicSubject = useMemo(
     () => isCrop && subjectKeyframes && isDynamic(subjectKeyframes),

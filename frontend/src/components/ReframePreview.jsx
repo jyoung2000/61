@@ -1,5 +1,23 @@
 import React, { useRef, useEffect, useMemo } from 'react';
 import { interpolateSubjectX } from '../utils/subjectTracking';
+import useTimelineStore from '../stores/timelineStore';
+
+// Look up the active crop X (0–100%) at a given clip-relative time.
+// Mirrors the legacy ClipPreview / VideoEditor rAF helper so the
+// canvas overlay tracks the same user edits the export uses.
+export function getCropXForTime(relTime, cropSegments, subjectKeyframes) {
+  if (Array.isArray(cropSegments) && cropSegments.length > 0) {
+    const seg = cropSegments.find((s) => relTime >= s.startTime && relTime < s.endTime);
+    if (seg && Number.isFinite(seg.cropX)) return seg.cropX;
+    const last = cropSegments[cropSegments.length - 1];
+    if (last && relTime >= last.endTime && Number.isFinite(last.cropX)) return last.cropX;
+  }
+  try {
+    const v = interpolateSubjectX(subjectKeyframes, relTime);
+    if (typeof v === 'number' && !Number.isNaN(v)) return v;
+  } catch (_) { /* fall through */ }
+  return 50;
+}
 
 // Binary search: index of the first key >= target (lower_bound).
 function lowerBound(sortedKeys, target) {
@@ -127,14 +145,15 @@ export default function ReframePreview({
       const scaleX = displayW / sourceWidth;
       const scaleY = displayH / sourceHeight;
 
-      // Current crop X derived from the same subjectKeyframes the export
-      // path uses, so the preview rectangle matches the rendered output.
+      // Current crop X — read the live cropSegments from the store so
+      // PropertiesPanel slider edits, drag-resizes on the timeline, and
+      // split / merge actions all update the preview rectangle. Falls
+      // back to interpolated subjectKeyframes only when no segments
+      // exist (e.g. immediately after job analysis completes, before
+      // the cropSegments effect has run).
       const relTime = Math.max(0, video.currentTime - clipStart);
-      let sxPct = 50;
-      try {
-        const v = interpolateSubjectX(subjectKeyframes, relTime);
-        if (typeof v === 'number' && !Number.isNaN(v)) sxPct = v;
-      } catch (_) { /* fall through */ }
+      const { cropSegments } = useTimelineStore.getState();
+      const sxPct = getCropXForTime(relTime, cropSegments, subjectKeyframes);
       const cropCenterPx = (sxPct / 100) * sourceWidth;
       const cropX0Src = Math.max(0, Math.min(
         cropDims.maxX,
