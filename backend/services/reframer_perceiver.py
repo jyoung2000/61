@@ -477,6 +477,13 @@ class Perceiver:
         # Merge fragmented tracks that are clearly the same person
         self._consolidate_tracks_across_cuts(r)
 
+        # ── Release perception models before Whisper allocates ──
+        # On small GPUs (e.g. GTX 1650, 3.7 GB total) the YOLO-World
+        # weights + ctranslate2 workspace can't both fit. Detection is
+        # finished by this point, so drop the YOLO/SFace handles and
+        # flush the CUDA allocator before Whisper loads its budget.
+        self._release_perception_models()
+
         # ── Audio intelligence (Whisper transcription) ──
         if self.audio_intel.try_load():
             audio_result = self.audio_intel.transcribe(
@@ -528,6 +535,46 @@ class Perceiver:
                        duration_sec=round(r.duration_ms / 1000, 2))
 
         return r
+
+    def _release_perception_models(self) -> None:
+        """Drop face / YOLO weights from VRAM after detection is finished.
+
+        Called between face-detection and Whisper-load so the
+        transcriber inherits a clean allocator on small GPUs. Idempotent
+        — repeated calls are no-ops because the references are nulled.
+        """
+        log = get_logger()
+        released = []
+        fd = getattr(self, 'face_detector', None)
+        if fd is not None:
+            for attr in ('_yolo_model', '_sface', '_yunet', '_haar_face', '_haar_eye'):
+                if getattr(fd, attr, None) is not None:
+                    released.append(attr)
+                    try:
+                        setattr(fd, attr, None)
+                    except Exception:
+                        pass
+        try:
+            import gc as _gc
+            _gc.collect()
+            _gc.collect()
+            import torch as _torch
+            if _torch.cuda.is_available():
+                before, _ = _torch.cuda.mem_get_info()
+                _torch.cuda.empty_cache()
+                _torch.cuda.synchronize()
+                _torch.cuda.empty_cache()
+                after, _ = _torch.cuda.mem_get_info()
+                freed_mb = max(0, (after - before) // (1024 * 1024))
+                if released:
+                    log.log_stage('PERCEIVE',
+                        f'Released perception models ({", ".join(released)}); '
+                        f'freed {freed_mb} MB VRAM')
+            elif released:
+                log.log_stage('PERCEIVE',
+                    f'Released perception models ({", ".join(released)})')
+        except Exception:
+            pass
 
     def _detect_faces_fast(self, gray, frame_bgr, min_face, max_face,
                        det_w, det_h, scale) -> List[dict]:

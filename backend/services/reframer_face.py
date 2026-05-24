@@ -205,6 +205,23 @@ class FaceDetector:
                     f'Face detector: YOLO + Haar combined ({_yolo_dev_label})')
         except Exception as e:
             log.log_stage('PERCEIVE', f'YOLO unavailable: {str(e)[:100]}')
+            # YOLO may have loaded its weights into VRAM before the test
+            # inference failed. Drop the model and flush the CUDA cache
+            # so we don't leak ~150 MB into the Whisper budget.
+            if self._yolo_model is not None:
+                try:
+                    del self._yolo_model
+                except Exception:
+                    pass
+                self._yolo_model = None
+                try:
+                    import gc as _gc
+                    _gc.collect()
+                    import torch as _torch
+                    if _torch.cuda.is_available():
+                        _torch.cuda.empty_cache()
+                except Exception:
+                    pass
         finally:
             # Restore CUDA_VISIBLE_DEVICES so Whisper can still use GPU
             if _saved_cuda_visible is not None:
@@ -261,9 +278,11 @@ class FaceDetector:
         mismatch), permanently fall back to CPU for the rest of this run so
         analysis degrades gracefully instead of crashing.
         """
+        if self._yolo_model is None:
+            raise RuntimeError("YOLO model not loaded")
         kwargs.pop('device', None)
         try:
-            return self._yolo_predict(*args, device=self._yolo_device, **kwargs)
+            return self._yolo_model.predict(*args, device=self._yolo_device, **kwargs)
         except Exception as e:
             if self._yolo_device != 'cpu':
                 logger.warning(
@@ -271,7 +290,7 @@ class FaceDetector:
                     str(e)[:140],
                 )
                 self._yolo_device = 'cpu'
-                return self._yolo_predict(*args, device='cpu', **kwargs)
+                return self._yolo_model.predict(*args, device='cpu', **kwargs)
             raise
 
     def compute_embedding(self, frame_bgr, face_dict: dict) -> Optional[np.ndarray]:

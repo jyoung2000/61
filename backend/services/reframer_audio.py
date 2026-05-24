@@ -172,6 +172,24 @@ class AudioIntelligence:
 
         log.log_stage('AUDIO', f'CUDA: available={cuda_available}, reason={cuda_reason}')
 
+        # ── VRAM budget for the chosen Whisper model size ──
+        # Used to skip CUDA tiers up front when the GPU is too small for
+        # batched inference (loading + workspace + KV cache). Numbers are
+        # empirical floors — going lower OOMs reliably under batch=16.
+        _vram_needed_gb = {
+            'large': 5.5, 'large-v2': 5.5, 'large-v3': 5.5,
+            'medium': 3.0, 'small': 1.8,
+            'base': 1.0, 'tiny': 0.6,
+        }.get(self.model_name, 3.0)
+        _gpu_free_gb = None
+        try:
+            import torch as _torch
+            if _torch.cuda.is_available():
+                _free_bytes, _ = _torch.cuda.mem_get_info()
+                _gpu_free_gb = _free_bytes / 1_073_741_824
+        except Exception:
+            pass
+
         # ── Try loading (CUDA float16 → CUDA int8 → CPU int8) ──
         for tier, device, compute in [
             ('CUDA fp16', 'cuda', 'float16'),
@@ -180,6 +198,17 @@ class AudioIntelligence:
         ]:
             if device == 'cuda' and not cuda_available:
                 continue
+            # Skip the CUDA tiers before allocation when there isn't enough
+            # headroom — otherwise the load succeeds, takes ~1.5 GB, and the
+            # later batched-inference workspace check forces a CPU fallback
+            # while the GPU copy lingers in VRAM.
+            if device == 'cuda' and _gpu_free_gb is not None:
+                _budget = _vram_needed_gb if compute == 'float16' else _vram_needed_gb * 0.65
+                if _gpu_free_gb < _budget:
+                    log.log_stage('AUDIO',
+                        f'Skipping {tier}: only {_gpu_free_gb:.1f} GB VRAM free '
+                        f'(need ~{_budget:.1f} GB for {self.model_name})')
+                    continue
             try:
                 log.log_stage('AUDIO', f'Loading {self.model_name} on {tier}...')
                 self.engine = WhisperModel(
@@ -194,6 +223,20 @@ class AudioIntelligence:
                 return True
             except Exception as e:
                 log.log_stage('AUDIO', f'{tier} FAILED: {type(e).__name__}: {str(e)[:150]}')
+                # Free anything ctranslate2 mapped before raising — otherwise
+                # the next tier picks up the same fragmented allocator state.
+                try:
+                    if getattr(self, 'engine', None) is not None:
+                        del self.engine
+                        self.engine = None
+                    import gc as _gc
+                    _gc.collect()
+                    if device == 'cuda':
+                        import torch as _torch
+                        if _torch.cuda.is_available():
+                            _torch.cuda.empty_cache()
+                except Exception:
+                    pass
 
         # Last resort: try 'base' model on CPU
         if self.model_name != 'base':
@@ -540,17 +583,38 @@ class AudioIntelligence:
         """Reload Whisper on CPU int8 — used when CUDA runs out of memory.
         Low-VRAM GPUs (the GTX 1650 = 4 GB, for instance) can't fit Whisper
         medium under batched inference; CPU is slower but always completes."""
+        # The previously loaded GPU engine is referenced from BOTH ``self``
+        # and the class-level cache. Dropping only ``self.engine`` leaves
+        # the cache alive, so ``empty_cache()`` finds nothing to free and
+        # the GPU model lingers for the rest of the process. Clear both
+        # before flushing the allocator.
         try:
-            import torch as _torch
+            import gc as _gc
+            AudioIntelligence._cached_engine = None
+            AudioIntelligence._cached_model_name = None
+            AudioIntelligence._cached_device = None
             if hasattr(self, 'engine'):
-                del self.engine
+                try:
+                    del self.engine
+                except Exception:
+                    pass
+                self.engine = None
+            _gc.collect()
+            _gc.collect()
+            import torch as _torch
             if _torch.cuda.is_available():
+                _torch.cuda.empty_cache()
+                _torch.cuda.synchronize()
                 _torch.cuda.empty_cache()
         except Exception:
             pass
         from faster_whisper import WhisperModel
         self.engine = WhisperModel(self.model_name, device='cpu', compute_type='int8')
         self.device_used = 'cpu_int8'
+        # Re-cache the CPU engine so the next Perceiver in this process
+        # doesn't load yet another copy on top of the GPU one we just freed.
+        AudioIntelligence._cached_engine = self.engine
+        AudioIntelligence._cached_model_name = self.model_name
         AudioIntelligence._cached_device = self.device_used
         log.log_stage('AUDIO', f'Whisper reloaded on CPU int8 ({self.model_name})')
 
