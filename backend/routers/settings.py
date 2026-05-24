@@ -81,6 +81,7 @@ _PERSISTABLE_KEYS = [
     "FFMPEG_PRESET", "FFMPEG_CRF", "FFMPEG_THREADS", "FFMPEG_FASTSTART",
     "GPU_ACCELERATION_ENABLED", "GPU_VENDOR_OVERRIDE",
     "GPU_HWDECODE_ENABLED", "GPU_HEVC_FOR_4K", "GPU_DEVICE_INDEX",
+    "GPU_FREE_BEFORE_ANALYSIS", "GPU_FREE_BEFORE_WHISPER",
     "AI_FALLBACK_CHAIN",
     # Cloud storage OAuth credentials — entered via the Settings > Cloud
     # Storage UI and persisted so containers without env vars can still
@@ -2403,6 +2404,83 @@ async def set_gpu_acceleration(req: GpuAccelerationRequest):
             "gpus": gpu_info.get("gpus", []),
             "gpu_issues": gpu_info.get("gpu_issues", []),
         },
+    }
+
+
+# ── GPU Preflight (manual trigger + status) ──────────────────────
+
+
+@router.get("/gpu/preflight-status")
+async def get_gpu_preflight_status():
+    """Return current VRAM state + which Ollama models are loaded.
+
+    Use this from the Settings UI to verify the preflight is doing what
+    you expect, or to diagnose why analysis is slow.
+    """
+    import httpx as _httpx
+    from backend.services.gpu_preflight import (
+        _nvidia_smi_free_mb, _nvidia_smi_compute_procs,
+    )
+
+    free_mb = _nvidia_smi_free_mb()
+    procs = _nvidia_smi_compute_procs()
+    ollama_models: list[dict] = []
+    host = (settings.OLLAMA_HOST or "").rstrip("/")
+    if host:
+        try:
+            async with _httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(f"{host}/api/ps")
+                if resp.status_code == 200:
+                    for m in resp.json().get("models", []) or []:
+                        size_vram = int(m.get("size_vram", 0) or 0)
+                        ollama_models.append({
+                            "name": m.get("name", ""),
+                            "vram_mb": size_vram // (1024 * 1024),
+                            "on_gpu": size_vram > 0,
+                        })
+        except Exception:
+            pass
+
+    return {
+        "free_vram_mb": free_mb,
+        "compute_procs": procs,
+        "ollama_models": ollama_models,
+        "settings": {
+            "gpu_free_before_analysis": bool(settings.GPU_FREE_BEFORE_ANALYSIS),
+            "gpu_free_before_whisper": bool(settings.GPU_FREE_BEFORE_WHISPER),
+        },
+    }
+
+
+@router.post("/gpu/free-now")
+async def free_gpu_now():
+    """Manually trigger the same preflight the pipeline runs.
+
+    Useful for the user to free VRAM on demand from the Settings UI
+    without having to start (and cancel) an analysis. Always runs
+    regardless of the ``GPU_FREE_BEFORE_ANALYSIS`` flag.
+    """
+    from backend.services.gpu_preflight import (
+        _evict_all_ollama_models, _release_local_torch_vram,
+        _nvidia_smi_free_mb,
+    )
+
+    before = _nvidia_smi_free_mb()
+    host = (settings.OLLAMA_HOST or "").rstrip("/")
+    ollama_stats: dict = {}
+    if host:
+        try:
+            ollama_stats = await _evict_all_ollama_models(host, "manual")
+        except Exception as e:
+            ollama_stats = {"error": str(e)}
+    torch_freed = _release_local_torch_vram("manual")
+    after = _nvidia_smi_free_mb()
+    return {
+        "status": "ok",
+        "before_free_mb": before,
+        "after_free_mb": after,
+        "torch_freed_mb": torch_freed,
+        "ollama": ollama_stats,
     }
 
 

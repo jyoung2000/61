@@ -1032,6 +1032,18 @@ async def _run_analysis_inner(job_id: str):
     await _update_progress(job_id, JobStatus.EXTRACTING_FRAMES, 2, "Extracting video metadata...")
     logger.info("[%s] Pipeline started — video: %s", job_id, video_path)
     _log_gpu_memory(job_id, "pipeline start")
+
+    # ── GPU preflight: evict any Ollama models still resident in VRAM ──
+    # On a low-VRAM card (GTX 1650 4 GB and similar) a stray Ollama
+    # model from a previous run starves Whisper of inference workspace
+    # and forces a CPU fallback that's 10-20× slower than realtime.
+    # Ollama itself keeps running — models auto-reload on demand the
+    # next time the editorial AI is invoked, so no restart is needed.
+    try:
+        from backend.services.gpu_preflight import ensure_gpu_free_before_analysis
+        await ensure_gpu_free_before_analysis(job_id)
+    except Exception as _pre_err:
+        logger.warning("[%s] GPU preflight skipped (error: %s)", job_id, _pre_err)
     async with _stage_timer(job_id, "metadata"):
         try:
             metadata = await asyncio.wait_for(
@@ -1399,6 +1411,17 @@ async def _run_analysis_inner(job_id: str):
         job_id, JobStatus.ANALYZING_SCENES, 15,
         "Starting reframer analysis (faces, transcription, motion)...",
     )
+
+    # Second GPU preflight right before reframer/Whisper kicks in. The
+    # analysis-start preflight already evicted Ollama; this catches
+    # anything the frame-extraction stage may have leaked or the
+    # editorial AI may have auto-loaded for a probe call.
+    try:
+        from backend.services.gpu_preflight import ensure_gpu_free_before_whisper
+        await ensure_gpu_free_before_whisper(job_id)
+    except Exception as _pre_err:
+        logger.warning("[%s] pre-Whisper GPU preflight skipped: %s", job_id, _pre_err)
+
     engine = ReframeEngine(video_path, sample_fps=_sample_fps, aspect_ratio="9:16")
     async with _stage_timer(job_id, "reframer_analysis"):
         reframer_plan = await asyncio.to_thread(engine.analyze, _engine_progress)

@@ -149,6 +149,21 @@ class Settings(BaseSettings):
     GPU_HEVC_FOR_4K: bool = True             # Use HEVC encoder for 4K exports when available
     GPU_DEVICE_INDEX: str = ""               # GPU device index for FFmpeg (e.g. "0", "1") — set by client GPU report
 
+    # Pre-analysis GPU memory preflight.
+    # When True, the pipeline unloads any Ollama models still resident in
+    # VRAM (via the Ollama daemon's keep_alive=0 API) before the first
+    # frame extraction starts. Ollama itself keeps running — models
+    # auto-reload on the next editorial AI request. Critical on low-VRAM
+    # systems (GTX 1650 4 GB and similar) where stray Ollama models from
+    # a previous run starve Whisper of the workspace it needs and force a
+    # CPU fallback that's 10-20× slower than realtime.
+    GPU_FREE_BEFORE_ANALYSIS: bool = True
+    # Per-stage GPU preflight: also free VRAM right before the Whisper
+    # transcribe stage, so anything that loaded during perceive (YOLO,
+    # SFace, scene tracker) doesn't compete with Whisper for the
+    # inference workspace. Lighter touch than the analysis-start preflight.
+    GPU_FREE_BEFORE_WHISPER: bool = True
+
     # AI transcript post-correction
     AI_TRANSCRIPT_CORRECTION: bool = True  # Use LLM to fix proper nouns, punctuation, fillers
 
