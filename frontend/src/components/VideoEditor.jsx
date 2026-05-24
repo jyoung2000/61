@@ -3013,23 +3013,6 @@ export default function VideoEditor({
           className={`ve-stage${isFullscreen ? ' ve-stage--fullscreen' : ''}`}
           style={isFullscreen ? { '--ve-target-ratio': targetRatio } : undefined}
         >
-        {/* Subject tracking status indicator */}
-        {trackingStatus && (
-          <div style={{
-            position: 'absolute', top: 8, right: 8, zIndex: 15,
-            display: 'flex', alignItems: 'center', gap: 5,
-            padding: '3px 8px', borderRadius: 6,
-            background: 'rgba(0,0,0,0.6)', backdropFilter: 'blur(4px)',
-            fontSize: 11, color: '#e5e7eb', pointerEvents: 'none',
-          }}>
-            <span style={{
-              width: 6, height: 6, borderRadius: '50%',
-              background: trackingStatus.color,
-              boxShadow: (trackingStatus.mode === 'dynamic' || trackingStatus.mode === 'multi') ? `0 0 4px ${trackingStatus.color}` : 'none',
-            }} />
-            {livePosition !== null ? `Face tracked at ${livePosition}%` : trackingStatus.label}
-          </div>
-        )}
         <video
           ref={videoRef}
           src={src}
