@@ -1484,7 +1484,7 @@ export default function Settings() {
                     </div>
                     <div style={{ fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.4 }}>
                       {active.replicate_available
-                        ? `Using ${(active.replicate_model || 'videollama3-7b').replace(/^.*\//, '')} on Replicate cloud GPU — no local VRAM needed.`
+                        ? `Using ${(active.replicate_model || 'videollama3-7b').replace(/^.*\//, '')} on Replicate cloud GPU — no local VRAM needed. Mode: ${active.videollama3_enhanced ? 'Enhanced (multi-pass)' : 'Classic (single-pass)'}.`
                         : 'Audio-visual AI that watches and listens to your video. Requires ≥10GB VRAM (RTX 4070+); add a Replicate API key above to use cloud GPU instead.'
                       }
                     </div>

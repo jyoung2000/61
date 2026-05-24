@@ -39,9 +39,14 @@ export default function ClipGenerationSettings() {
   const [error, setError] = useState('');
   const [defaults, setDefaults] = useState(null);
   const [defaultPrompt, setDefaultPrompt] = useState('');
+  const [advancedOpen, setAdvancedOpen] = useState(false);
   const [form, setForm] = useState({
     min_duration: 60, max_duration: 300, clip_count: 0,
     preferred_subjects: '', avoid_subjects: '', discovery_prompt: '',
+    videollama3_enhanced: true,
+    videollama3_refinement_pass: true,
+    videollama3_keyframe_analysis: true,
+    videollama3_fps: 2,
   });
 
   useEffect(() => {
@@ -61,6 +66,10 @@ export default function ClipGenerationSettings() {
           // Show the effective prompt — the saved custom one, or the
           // built-in default so the user can see exactly what is sent.
           discovery_prompt: d.discovery_prompt || d.default_discovery_prompt || '',
+          videollama3_enhanced: d.videollama3_enhanced ?? true,
+          videollama3_refinement_pass: d.videollama3_refinement_pass ?? true,
+          videollama3_keyframe_analysis: d.videollama3_keyframe_analysis ?? true,
+          videollama3_fps: d.videollama3_fps ?? 2,
         });
       })
       .catch(() => { if (alive) setError('Could not load clip-generation settings.'); })
@@ -82,6 +91,10 @@ export default function ClipGenerationSettings() {
       preferred_subjects: defaults.preferred_subjects,
       avoid_subjects: defaults.avoid_subjects,
       discovery_prompt: defaultPrompt,
+      videollama3_enhanced: defaults.videollama3_enhanced ?? true,
+      videollama3_refinement_pass: defaults.videollama3_refinement_pass ?? true,
+      videollama3_keyframe_analysis: defaults.videollama3_keyframe_analysis ?? true,
+      videollama3_fps: defaults.videollama3_fps ?? 2,
     });
     setSaved(false);
   };
@@ -103,6 +116,10 @@ export default function ClipGenerationSettings() {
           preferred_subjects: form.preferred_subjects,
           avoid_subjects: form.avoid_subjects,
           discovery_prompt: promptOut,
+          videollama3_enhanced: !!form.videollama3_enhanced,
+          videollama3_refinement_pass: !!form.videollama3_refinement_pass,
+          videollama3_keyframe_analysis: !!form.videollama3_keyframe_analysis,
+          videollama3_fps: Math.max(1, Math.min(4, Number(form.videollama3_fps) || 2)),
         }),
       });
       if (!res.ok) throw new Error('save failed');
@@ -222,6 +239,114 @@ export default function ClipGenerationSettings() {
       <p style={{ fontSize: 10, color: 'var(--text-muted)', margin: '6px 0 0', lineHeight: 1.5 }}>
         {PLACEHOLDER_HINT} Reset it to default any time to restore intended behavior.
       </p>
+
+      {/* Advanced VideoLLaMA3 Settings — collapsed by default */}
+      <div style={{ marginTop: 16, borderTop: '1px solid var(--border)', paddingTop: 12 }}>
+        <button
+          type="button"
+          onClick={() => setAdvancedOpen((v) => !v)}
+          style={{
+            background: 'transparent', border: 'none', padding: 0,
+            color: 'var(--text-secondary)', fontSize: 12, fontWeight: 600,
+            cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6,
+          }}
+        >
+          <span style={{
+            display: 'inline-block',
+            transform: advancedOpen ? 'rotate(90deg)' : 'rotate(0deg)',
+            transition: 'transform 0.15s ease', fontSize: 10,
+          }}>▶</span>
+          Advanced VideoLLaMA3 Settings
+        </button>
+        {advancedOpen && (
+          <div style={{ marginTop: 12, paddingLeft: 16 }}>
+            <p style={{ fontSize: 10, color: 'var(--text-muted)', margin: '0 0 12px', lineHeight: 1.5 }}>
+              Multi-pass discovery upgrades for the Replicate VideoLLaMA3 backend.
+              Each feature degrades independently if the model rejects it.
+            </p>
+
+            <label style={{
+              display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10,
+              fontSize: 12, color: 'var(--text-primary)', cursor: 'pointer',
+            }}>
+              <input
+                type="checkbox"
+                checked={!!form.videollama3_enhanced}
+                onChange={(e) => set('videollama3_enhanced', e.target.checked)}
+              />
+              <span>
+                Enhanced mode
+                <span style={{ display: 'block', fontSize: 10, color: 'var(--text-muted)' }}>
+                  Use V3 system prompt, adaptive chunks, and audio annotations
+                </span>
+              </span>
+            </label>
+
+            <label style={{
+              display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10,
+              fontSize: 12, color: 'var(--text-primary)', cursor: 'pointer',
+              opacity: form.videollama3_enhanced ? 1 : 0.5,
+            }}>
+              <input
+                type="checkbox"
+                checked={!!form.videollama3_refinement_pass}
+                disabled={!form.videollama3_enhanced}
+                onChange={(e) => set('videollama3_refinement_pass', e.target.checked)}
+              />
+              <span>
+                Refinement pass
+                <span style={{ display: 'block', fontSize: 10, color: 'var(--text-muted)' }}>
+                  Re-query top candidates on a tight sub-clip for precise timestamps (~$0.005/clip)
+                </span>
+              </span>
+            </label>
+
+            <label style={{
+              display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10,
+              fontSize: 12, color: 'var(--text-primary)', cursor: 'pointer',
+              opacity: form.videollama3_enhanced ? 1 : 0.5,
+            }}>
+              <input
+                type="checkbox"
+                checked={!!form.videollama3_keyframe_analysis}
+                disabled={!form.videollama3_enhanced}
+                onChange={(e) => set('videollama3_keyframe_analysis', e.target.checked)}
+              />
+              <span>
+                Keyframe analysis
+                <span style={{ display: 'block', fontSize: 10, color: 'var(--text-muted)' }}>
+                  Use V3 image mode to score visual hook strength on top candidates
+                </span>
+              </span>
+            </label>
+
+            <div style={{
+              display: 'flex', alignItems: 'center', gap: 12, marginTop: 6,
+              opacity: form.videollama3_enhanced ? 1 : 0.5,
+            }}>
+              <label style={{ fontSize: 12, color: 'var(--text-primary)', minWidth: 110 }}>
+                Sampling fps
+              </label>
+              <input
+                type="range" min={1} max={4} step={1}
+                disabled={!form.videollama3_enhanced}
+                value={form.videollama3_fps}
+                onChange={(e) => set('videollama3_fps', Number(e.target.value))}
+                style={{ flex: 1 }}
+              />
+              <span style={{
+                fontFamily: 'var(--font-mono)', fontSize: 12,
+                color: 'var(--text-secondary)', minWidth: 24, textAlign: 'right',
+              }}>
+                {form.videollama3_fps}
+              </span>
+            </div>
+            <p style={{ fontSize: 10, color: 'var(--text-muted)', margin: '4px 0 0 122px', lineHeight: 1.5 }}>
+              Temporal sampling density per chunk. Higher = more detail, slower, more cost.
+            </p>
+          </div>
+        )}
+      </div>
 
       {/* actions */}
       <div style={{

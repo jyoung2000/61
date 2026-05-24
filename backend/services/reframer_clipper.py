@@ -872,6 +872,818 @@ class ReplicateDiscovery:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  VIDEOLLAMA3 ENHANCED DISCOVERY (Replicate)
+# ═══════════════════════════════════════════════════════════════════════════
+
+SYSTEM_PROMPT_V3 = """You are an expert viral video editor and content strategist. Your job is to identify the exact moments in video content that will generate maximum engagement on short-form platforms (TikTok, Instagram Reels, YouTube Shorts).
+
+EVALUATION CRITERIA (score each moment mentally):
+- Hook strength: Would this stop a scroller in the first 2 seconds?
+- Emotional intensity: Does this provoke laughter, shock, awe, anger, or tears?
+- Shareability: Would someone tag a friend or repost this?
+- Completeness: Does this moment have a natural beginning, peak, and resolution?
+- Audio-visual sync: Are the strongest visual and audio moments aligned?
+
+OUTPUT FORMAT: Respond ONLY with a JSON array. No preamble, no markdown, no explanation.
+Each element: {"timestamp": "MM:SS", "duration": <int seconds>, "reason": "<one sentence>", "hook": "<opening line>", "confidence": <0.0-1.0>, "category": "<emotional_peak|hot_take|funny|revelation|confrontation|visual_wow>"}
+Timestamps are relative to the START of the provided segment."""
+
+
+REFINEMENT_PROMPT_V3 = """You previously identified a potentially viral moment near {timestamp} in this video segment.
+
+Watch this focused clip carefully. Provide a DETAILED assessment:
+
+1. EXACT optimal start and end timestamps (to the second) for maximum impact
+2. The single strongest "hook" frame or moment that should open the clip
+3. Whether the moment has a satisfying conclusion or needs the clip trimmed
+4. A confidence score (0.0-1.0) now that you've seen it in detail
+5. A viral-optimized title (max 60 chars)
+6. 3 hashtag suggestions
+
+TRANSCRIPT:
+{transcript}
+{audio_annotations}
+
+Respond ONLY with JSON:
+{{"start": "MM:SS", "end": "MM:SS", "hook_timestamp": "MM:SS", "needs_trim": true/false, "trim_suggestion": "MM:SS-MM:SS", "confidence": 0.0-1.0, "title": "...", "hashtags": ["...", "...", "..."], "reason": "..."}}"""
+
+
+class ReplicateDiscoveryV3:
+    """VideoLLaMA3-enhanced cloud GPU discovery.
+
+    Wraps Replicate's ``lucataco/videollama3-7b`` with five upgrades over
+    the base ``ReplicateDiscovery`` class. Every upgrade has independent
+    error handling so a single failed feature never crashes the pipeline:
+
+    1. System + user prompt separation — gives V3's instruction tuning the
+       persona/criteria persistently while per-segment context varies.
+    2. Audio annotations — V3 has no audio branch, so per-window summaries
+       of speech density, RMS energy, face count and motion are injected
+       into each prompt so the model knows about events it can't hear.
+    3. Adaptive chunk sizing — chunk boundaries are placed at signal
+       valleys (natural scene breaks) instead of a rigid 10-minute grid,
+       keeping signal-dense regions together for better cross-boundary
+       reasoning.
+    4. fps / max_frames control — temporal sampling density is scaled by
+       chunk signal density. Falls back to the base 4-param call if the
+       cog wrapper rejects the new fields.
+    5. Two-pass refinement — top candidates by confidence are re-queried
+       on a tight sub-clip for surgical timestamp/title precision (mirrors
+       the editorial-judge pattern but on V3 itself).
+
+    Method signature matches ``ReplicateDiscovery.discover_clips`` exactly
+    so the calling code in ``ClipExtractor.run`` doesn't change.
+    """
+
+    def __init__(
+        self,
+        api_key: str,
+        model_id: str = "lucataco/videollama3-7b",
+        fps: int = 2,
+        max_frames: int = 128,
+        refinement_enabled: bool = True,
+        keyframe_analysis: bool = True,
+        audio_annotation: bool = True,
+        adaptive_chunks: bool = True,
+        chunk_min_s: int = 120,
+        chunk_max_s: int = 900,
+    ):
+        self.api_key = api_key
+        self.model_id = model_id
+        self.fps = max(1, min(4, int(fps)))
+        self.max_frames = max(16, min(180, int(max_frames)))
+        self.refinement_enabled = bool(refinement_enabled)
+        self.keyframe_analysis = bool(keyframe_analysis)
+        self.audio_annotation = bool(audio_annotation)
+        self.adaptive_chunks = bool(adaptive_chunks)
+        self.chunk_min_s = max(30, int(chunk_min_s))
+        self.chunk_max_s = max(self.chunk_min_s, int(chunk_max_s))
+
+    def is_available(self) -> bool:
+        return bool(self.api_key and self.api_key.strip())
+
+    # ── Public entry point — identical signature to ReplicateDiscovery ──
+
+    def discover_clips(
+        self,
+        video_path: str,
+        transcript_segments: list,
+        signal_timeline: 'SignalTimeline',
+        chunk_duration_s: int = 600,
+        max_vlm_chunks: int = 6,
+        preferred_subjects: str = "",
+        avoid_subjects: str = "",
+        platforms: list = None,
+        min_dur_s: int = 60,
+        max_dur_s: int = 300,
+        ideal_dur_s: int = 150,
+        discovery_prompt: str = "",
+        on_progress: Callable = None,
+    ) -> List['ClipCandidate']:
+        import replicate as replicate_sdk
+
+        os.environ["REPLICATE_API_TOKEN"] = self.api_key
+        t_start_total = _time.time()
+
+        model_ref = self._resolve_model_version(replicate_sdk)
+        duration_s = _get_video_duration(video_path)
+
+        # ── Step 1: build chunks (adaptive or rigid) ──
+        chunks = self._build_chunks(signal_timeline, duration_s, chunk_duration_s)
+
+        # ── Step 2: rank chunks by signal density, keep top-N ──
+        ranked = sorted(
+            (
+                (i, s, e, score_chunk_signals(signal_timeline, s, e))
+                for i, (s, e) in enumerate(chunks)
+            ),
+            key=lambda x: x[3],
+            reverse=True,
+        )
+        n_to_process = min(len(ranked), max_vlm_chunks)
+        selected = sorted(ranked[:n_to_process], key=lambda x: x[1])
+
+        logger.info(
+            "VideoLLaMA3-V3: %s chunking produced %d chunks (%s)",
+            "adaptive" if self.adaptive_chunks else "rigid",
+            len(chunks),
+            ", ".join(f"{_fmt_time(s)}-{_fmt_time(e)}" for _, s, e in chunks[:8])
+            + ("…" if len(chunks) > 8 else ""),
+        )
+        logger.info(
+            "VideoLLaMA3-V3: sending top %d/%d chunks to Replicate (%s)",
+            n_to_process, len(chunks), self.model_id,
+        )
+
+        # ── Step 3: coarse pass ──
+        all_candidates: List[ClipCandidate] = []
+        for idx, (chunk_idx, start_s, end_s, sig_score) in enumerate(selected):
+            if on_progress:
+                # Reserve last 25% for refinement / keyframe analysis
+                on_progress((idx / max(1, n_to_process)) * 0.75)
+
+            candidates = self._coarse_pass_chunk(
+                replicate_sdk, model_ref, video_path, signal_timeline,
+                transcript_segments, start_s, end_s, sig_score,
+                preferred_subjects, avoid_subjects, platforms,
+                min_dur_s, max_dur_s, ideal_dur_s, discovery_prompt,
+                chunk_idx=chunk_idx + 1, n_total=n_to_process,
+            )
+            all_candidates.extend(candidates)
+
+        coarse_count = len(all_candidates)
+
+        # ── Step 4: refinement pass on top candidates ──
+        refined_count = 0
+        if self.refinement_enabled and all_candidates:
+            try:
+                refined_count = self._refinement_pass(
+                    replicate_sdk, model_ref, video_path, signal_timeline,
+                    transcript_segments, all_candidates,
+                )
+            except Exception as e:
+                logger.warning("VideoLLaMA3-V3: refinement pass failed (%s) — using coarse results", e)
+
+        # ── Step 5: optional keyframe image analysis on top candidates ──
+        if self.keyframe_analysis and all_candidates:
+            try:
+                self._keyframe_pass(
+                    replicate_sdk, model_ref, video_path, signal_timeline,
+                    transcript_segments, all_candidates,
+                )
+            except Exception as e:
+                logger.warning("VideoLLaMA3-V3: keyframe analysis failed (%s) — skipping", e)
+
+        if on_progress:
+            on_progress(1.0)
+
+        elapsed = _time.time() - t_start_total
+        # Replicate cost ≈ $0.011 per coarse chunk + $0.005 per refine + keyframe
+        est_cost = (
+            n_to_process * 0.011
+            + refined_count * 0.005
+            + (min(3, len(all_candidates)) * 0.003 if self.keyframe_analysis else 0)
+        )
+        logger.info(
+            "VideoLLaMA3-V3: total discovery: %d chunks, %d candidates (%d coarse, %d refined) — %.1fs, ~$%.2f",
+            n_to_process, len(all_candidates), coarse_count, refined_count, elapsed, est_cost,
+        )
+        return all_candidates
+
+    # ── Replicate version pinning (same logic as base class) ──
+
+    def _resolve_model_version(self, replicate_sdk) -> str:
+        model_ref = self.model_id
+        if ":" in model_ref:
+            return model_ref
+        try:
+            model_obj = replicate_sdk.models.get(model_ref)
+            version_obj = getattr(model_obj, "latest_version", None)
+            if version_obj is not None and getattr(version_obj, "id", None):
+                model_ref = f"{model_ref}:{version_obj.id}"
+                logger.info(
+                    "VideoLLaMA3-V3: resolved %s → %s…",
+                    self.model_id, model_ref[:len(self.model_id) + 13],
+                )
+        except Exception as e:
+            logger.warning(
+                "VideoLLaMA3-V3: could not resolve latest version for %s: %s — call may 404",
+                self.model_id, e,
+            )
+        return model_ref
+
+    # ── Chunking: adaptive (signal-valley splits) or rigid fallback ──
+
+    def _build_chunks(self, signal_timeline, duration_s: float, rigid_chunk_s: int):
+        """Return List[(start_s, end_s)] covering the whole video."""
+        if not self.adaptive_chunks:
+            return self._rigid_chunks(duration_s, rigid_chunk_s)
+        try:
+            chunks = self._compute_adaptive_chunks(
+                signal_timeline, duration_s,
+                min_chunk_s=self.chunk_min_s,
+                max_chunk_s=self.chunk_max_s,
+            )
+            if not chunks:
+                raise ValueError("adaptive chunker returned no chunks")
+            return chunks
+        except Exception as e:
+            logger.warning(
+                "VideoLLaMA3-V3: adaptive chunking failed (%s) — falling back to rigid %ds chunks",
+                e, rigid_chunk_s,
+            )
+            return self._rigid_chunks(duration_s, rigid_chunk_s)
+
+    @staticmethod
+    def _rigid_chunks(duration_s: float, chunk_s: int):
+        n = max(1, math.ceil(duration_s / max(1, chunk_s)))
+        return [
+            (int(i * chunk_s), int(min((i + 1) * chunk_s, duration_s)))
+            for i in range(n)
+        ]
+
+    def _compute_adaptive_chunks(self, signal_timeline, duration_s, min_chunk_s=120, max_chunk_s=900):
+        """Create variable-length chunks based on signal density.
+
+        Dense-signal regions get shorter chunks (more VLM attention per
+        second). Sparse-signal regions get longer chunks (less wasted API
+        calls). Signal valleys are preferred as chunk edges so a "scene
+        break" doesn't fall mid-chunk and lose context.
+        """
+        duration_s = int(duration_s)
+        if duration_s <= max_chunk_s:
+            return [(0, duration_s)]
+
+        composite = [
+            score_chunk_signals(signal_timeline, s, s + 1)
+            for s in range(duration_s)
+        ]
+        # Wider smoothing kernel so per-second jitter doesn't manufacture
+        # local minima on every frame.
+        kernel = 30
+        smoothed = []
+        for i in range(len(composite)):
+            window = composite[max(0, i - kernel):i + kernel]
+            smoothed.append(sum(window) / max(1, len(window)))
+
+        # Only flag genuine valleys — points strictly lower than their
+        # immediate neighbors AND meaningfully lower than the surrounding
+        # window. Without the significance gate a plateau or noise floor
+        # becomes a candidate at every position, forcing the chunker into
+        # minimum-sized chunks on flat / sparse-signal content.
+        avg_signal = sum(smoothed) / max(1, len(smoothed)) if smoothed else 0
+        significance_floor = max(1e-3, avg_signal * 0.05)
+        split_candidates = []
+        for i in range(kernel, len(smoothed) - kernel):
+            if smoothed[i] < smoothed[i - 1] and smoothed[i] < smoothed[i + 1]:
+                wide = smoothed[i - kernel:i + kernel + 1]
+                if not wide:
+                    continue
+                wide_avg = sum(wide) / len(wide)
+                # Require a real dip: at least 5% below the local window
+                # average (or below the global noise floor).
+                if smoothed[i] + significance_floor <= wide_avg:
+                    split_candidates.append(i)
+
+        chunks = []
+        prev = 0
+        for sp in split_candidates:
+            chunk_len = sp - prev
+            if chunk_len < min_chunk_s:
+                continue
+            if chunk_len <= max_chunk_s:
+                chunks.append((prev, sp))
+                prev = sp
+            else:
+                while sp - prev > max_chunk_s:
+                    chunks.append((prev, prev + max_chunk_s))
+                    prev = prev + max_chunk_s
+                if sp - prev >= min_chunk_s:
+                    chunks.append((prev, sp))
+                    prev = sp
+
+        remaining = duration_s - prev
+        if remaining > 0:
+            if remaining < min_chunk_s and chunks:
+                last_start, _ = chunks.pop()
+                chunks.append((last_start, duration_s))
+            else:
+                while duration_s - prev > max_chunk_s:
+                    chunks.append((prev, prev + max_chunk_s))
+                    prev = prev + max_chunk_s
+                if duration_s > prev:
+                    chunks.append((prev, duration_s))
+
+        return chunks or [(0, duration_s)]
+
+    # ── Per-chunk fps scaling ──
+
+    def _compute_chunk_fps(self, signal_timeline, start_s, end_s, max_fps=4):
+        score = score_chunk_signals(signal_timeline, start_s, end_s)
+        if score > 0.7:
+            return min(max_fps, self.fps + 1)
+        if score < 0.3:
+            return max(1, self.fps - 1)
+        return self.fps
+
+    # ── Audio annotations (V3 can't hear, so we describe what it can't) ──
+
+    def _build_audio_annotation(self, signal_timeline, start_s, end_s):
+        if not self.audio_annotation or signal_timeline is None:
+            return ""
+        # Signal arrays — handle both attribute names ('audio_rms' is the
+        # spec name but the actual SignalTimeline class stores RMS as
+        # 'rms_energy'). getattr keeps either path working.
+        speech = list(getattr(signal_timeline, "speech_density", []))
+        rms = list(getattr(signal_timeline, "audio_rms", None)
+                   or getattr(signal_timeline, "rms_energy", []))
+        faces = list(getattr(signal_timeline, "face_count", []))
+        motion = list(getattr(signal_timeline, "motion_magnitude", []))
+
+        n = max(len(speech), len(rms), len(faces), len(motion))
+        if n == 0:
+            return ""
+
+        start_s_i = max(0, int(start_s))
+        end_s_i = min(n, int(end_s))
+        if end_s_i <= start_s_i:
+            return ""
+
+        window_s = 15
+        annotations = []
+        for ws in range(start_s_i, end_s_i, window_s):
+            we = min(ws + window_s, end_s_i)
+            sp = speech[ws:we]
+            rm = rms[ws:we]
+            fc = faces[ws:we]
+            mo = motion[ws:we]
+
+            avg_speech = sum(sp) / max(1, len(sp)) if sp else 0
+            avg_rms = sum(rm) / max(1, len(rm)) if rm else 0
+            avg_faces = sum(fc) / max(1, len(fc)) if fc else 0
+            avg_motion = sum(mo) / max(1, len(mo)) if mo else 0
+
+            notable = []
+            if avg_speech > 0.5:
+                notable.append("active speech")
+            elif avg_speech > 0.0:
+                notable.append("sparse speech")
+            if avg_rms > 0.7:
+                notable.append("loud audio (possible laughter/applause/music)")
+            elif avg_rms > 0.4:
+                notable.append("moderate audio")
+            if avg_faces >= 2:
+                notable.append(f"{int(avg_faces)} faces visible")
+            # motion_magnitude in SignalTimeline is normalised by frame count
+            # but not 0-1; >0.6 of the local average is a reasonable spike.
+            if avg_motion > 0.6:
+                notable.append("high motion")
+
+            if notable:
+                rel_start = ws - start_s_i
+                rel_end = we - start_s_i
+                annotations.append(
+                    f"  {_fmt_time(rel_start)}-{_fmt_time(rel_end)}: {', '.join(notable)}"
+                )
+
+        if not annotations:
+            return ""
+
+        return (
+            "\n\nAUDIO/SIGNAL ANNOTATIONS (you cannot hear audio — "
+            "these are machine-detected audio and motion signals):\n"
+            + "\n".join(annotations)
+        )
+
+    # ── Coarse pass: one Replicate call per selected chunk ──
+
+    def _coarse_pass_chunk(
+        self, replicate_sdk, model_ref, video_path, signal_timeline,
+        transcript_segments, start_s, end_s, sig_score,
+        preferred_subjects, avoid_subjects, platforms,
+        min_dur_s, max_dur_s, ideal_dur_s, discovery_prompt,
+        chunk_idx, n_total,
+    ):
+        chunk_path = None
+        chunk_fps = self._compute_chunk_fps(signal_timeline, start_s, end_s)
+        t_start = _time.time()
+        try:
+            chunk_path = _extract_chunk(video_path, start_s, end_s)
+            transcript_slice = _slice_transcript(transcript_segments, start_s, end_s)
+            audio_annotation = self._build_audio_annotation(signal_timeline, start_s, end_s)
+
+            segment_prompt = self._build_segment_prompt(
+                start_s, end_s, transcript_slice, audio_annotation,
+                preferred_subjects, avoid_subjects, platforms,
+                min_dur_s, max_dur_s, ideal_dur_s, discovery_prompt,
+            )
+            full_prompt = f"[SYSTEM]\n{SYSTEM_PROMPT_V3}\n\n[USER]\n{segment_prompt}"
+
+            logger.info(
+                "VideoLLaMA3-V3: coarse pass chunk %d/%d (%s-%s, fps=%d, max_frames=%d)",
+                chunk_idx, n_total, _fmt_time(start_s), _fmt_time(end_s),
+                chunk_fps, self.max_frames,
+            )
+
+            response_text = self._call_replicate_video(
+                replicate_sdk, model_ref, chunk_path, full_prompt,
+                fps=chunk_fps, max_frames=self.max_frames, max_new_tokens=2048,
+            )
+
+            candidates = _parse_vlm_response(response_text, start_s, end_s)
+            if not candidates and "[SYSTEM]" in full_prompt:
+                # JSON parsing failed — retry once with a flat prompt in
+                # case the SYSTEM/USER tags confused the model.
+                logger.info(
+                    "VideoLLaMA3-V3: coarse pass chunk %d/%d returned no candidates — retrying flat prompt",
+                    chunk_idx, n_total,
+                )
+                response_text = self._call_replicate_video(
+                    replicate_sdk, model_ref, chunk_path, segment_prompt,
+                    fps=chunk_fps, max_frames=self.max_frames, max_new_tokens=2048,
+                )
+                candidates = _parse_vlm_response(response_text, start_s, end_s)
+
+            for c in candidates:
+                c.signal_score = sig_score
+                c.source = "vlm_discovery_v3"
+
+            elapsed = _time.time() - t_start
+            logger.info(
+                "VideoLLaMA3-V3: coarse pass chunk %d/%d — %.1fs — %d candidates",
+                chunk_idx, n_total, elapsed, len(candidates),
+            )
+            return candidates
+
+        except Exception as e:
+            logger.warning(
+                "VideoLLaMA3-V3: coarse pass chunk %d/%d failed: %s",
+                chunk_idx, n_total, e,
+            )
+            return []
+        finally:
+            if chunk_path and os.path.exists(chunk_path):
+                try:
+                    os.remove(chunk_path)
+                except OSError:
+                    pass
+
+    def _build_segment_prompt(
+        self, start_s, end_s, transcript_slice, audio_annotation,
+        preferred_subjects, avoid_subjects, platforms,
+        min_dur_s, max_dur_s, ideal_dur_s, discovery_prompt,
+    ):
+        """Per-chunk user message. Mirrors the placeholder substitution of
+        the base ``ReplicateDiscovery`` so a user's custom prompt template
+        keeps working under V3, but appends the audio annotations."""
+        platform_str = _format_platforms(platforms)
+        pref_line = (f"\nPRIORITIZE moments with: {preferred_subjects.strip()}"
+                     if preferred_subjects and preferred_subjects.strip() else "")
+        avoid_line = (f"\nAVOID: {avoid_subjects.strip()}"
+                      if avoid_subjects and avoid_subjects.strip() else "")
+        tpl = discovery_prompt.strip() if (discovery_prompt and discovery_prompt.strip()) else DEFAULT_DISCOVERY_PROMPT
+        for key, val in (
+            ("{start}", _fmt_time(start_s)),
+            ("{end}", _fmt_time(end_s)),
+            ("{platforms}", platform_str),
+            ("{min_duration}", str(min_dur_s)),
+            ("{max_duration}", str(max_dur_s)),
+            ("{ideal_duration}", str(ideal_dur_s)),
+            ("{preferred}", pref_line),
+            ("{avoid}", avoid_line),
+            ("{transcript}", transcript_slice or "(no speech in this segment)"),
+        ):
+            tpl = tpl.replace(key, val)
+        return tpl + (audio_annotation or "")
+
+    # ── Replicate transport — wraps fps/max_frames params with safe fallback ──
+
+    def _call_replicate_video(
+        self, replicate_sdk, model_ref, chunk_path, prompt,
+        fps=None, max_frames=None, max_new_tokens=2048,
+    ):
+        """Run the model with V3-specific extras; on bad-input errors fall
+        back to the legacy 4-param call so an unsupported field never
+        crashes the pipeline."""
+        base_input = {
+            "prompt": prompt,
+            "max_new_tokens": max_new_tokens,
+            "temperature": 0.1,
+        }
+        extras = {}
+        if fps is not None:
+            extras["fps"] = int(fps)
+        if max_frames is not None:
+            extras["max_frames"] = int(max_frames)
+        # top_p is also V3-only; include in extras so the same fallback
+        # rescues us if the cog rejects it.
+        extras["top_p"] = 0.9
+
+        try:
+            with open(chunk_path, "rb") as f:
+                output = replicate_sdk.run(
+                    model_ref,
+                    input={**base_input, "video": f, **extras},
+                    use_file_output=False,
+                )
+            return self._collect_output(output)
+        except Exception as e:
+            msg = str(e).lower()
+            # Replicate raises ReplicateError("Invalid input: ...") for
+            # unknown fields. Retry once without the V3 extras.
+            if "invalid" in msg or "input" in msg or "unknown" in msg or "unexpected" in msg:
+                logger.warning(
+                    "VideoLLaMA3-V3: Replicate rejected V3 params (%s) — retrying with base 4-param call",
+                    e,
+                )
+                with open(chunk_path, "rb") as f:
+                    output = replicate_sdk.run(
+                        model_ref,
+                        input={**base_input, "video": f},
+                        use_file_output=False,
+                    )
+                return self._collect_output(output)
+            raise
+
+    @staticmethod
+    def _collect_output(output) -> str:
+        if hasattr(output, "__iter__") and not isinstance(output, (str, bytes, dict)):
+            return "".join(str(chunk) for chunk in output)
+        return str(output)
+
+    # ── Refinement pass: re-query top candidates with tight sub-clips ──
+
+    def _refinement_pass(
+        self, replicate_sdk, model_ref, video_path, signal_timeline,
+        transcript_segments, candidates,
+    ):
+        # Pick top 3 by confidence (fallback: signal_score) so we don't burn
+        # API calls on every coarse candidate.
+        scored = sorted(
+            candidates,
+            key=lambda c: (
+                _candidate_confidence(c),
+                getattr(c, "signal_score", 0.0),
+            ),
+            reverse=True,
+        )
+        top = scored[:3]
+        if not top:
+            return 0
+
+        t_start = _time.time()
+        refined = 0
+        for c in top:
+            sub_start = max(0.0, c.start_s - 5.0)
+            sub_end = c.end_s + 5.0
+            # Cap sub-clip to a sane 60s upper bound so we don't re-upload
+            # a long segment when the coarse pass over-estimated duration.
+            if sub_end - sub_start > 60:
+                center = (c.start_s + c.end_s) / 2
+                sub_start = max(0.0, center - 30.0)
+                sub_end = sub_start + 60.0
+
+            chunk_path = None
+            try:
+                chunk_path = _extract_chunk(video_path, sub_start, sub_end)
+                transcript_slice = _slice_transcript(transcript_segments, sub_start, sub_end)
+                audio_annotation = self._build_audio_annotation(signal_timeline, sub_start, sub_end)
+
+                user_prompt = REFINEMENT_PROMPT_V3.format(
+                    timestamp=_fmt_time(c.start_s),
+                    transcript=transcript_slice,
+                    audio_annotations=audio_annotation,
+                )
+                full_prompt = f"[SYSTEM]\n{SYSTEM_PROMPT_V3}\n\n[USER]\n{user_prompt}"
+
+                response_text = self._call_replicate_video(
+                    replicate_sdk, model_ref, chunk_path, full_prompt,
+                    fps=self.fps, max_frames=min(self.max_frames, 64),
+                    max_new_tokens=1024,
+                )
+
+                if self._apply_refinement(c, response_text, sub_start, sub_end):
+                    refined += 1
+            except Exception as e:
+                logger.warning(
+                    "VideoLLaMA3-V3: refinement on candidate @%s failed: %s",
+                    _fmt_time(c.start_s), e,
+                )
+            finally:
+                if chunk_path and os.path.exists(chunk_path):
+                    try:
+                        os.remove(chunk_path)
+                    except OSError:
+                        pass
+
+        elapsed = _time.time() - t_start
+        logger.info(
+            "VideoLLaMA3-V3: refinement pass on %d top candidates — %.1fs total (%d refined)",
+            len(top), elapsed, refined,
+        )
+        return refined
+
+    @staticmethod
+    def _apply_refinement(candidate, response_text, sub_start, sub_end):
+        text = response_text.strip()
+        text = re.sub(r"^```json\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            match = re.search(r"\{.*\}", text, re.DOTALL)
+            if not match:
+                return False
+            try:
+                data = json.loads(match.group())
+            except json.JSONDecodeError:
+                return False
+        if not isinstance(data, dict):
+            return False
+
+        changed = False
+        # Refined absolute timestamps (relative to sub_start)
+        try:
+            new_rel_start = _parse_mmss(str(data.get("start", "")))
+            new_rel_end = _parse_mmss(str(data.get("end", "")))
+            if new_rel_end > new_rel_start > 0:
+                abs_start = sub_start + new_rel_start
+                abs_end = sub_start + new_rel_end
+                # Sanity: keep within the sub-clip window
+                abs_start = max(sub_start, min(abs_start, sub_end))
+                abs_end = max(abs_start, min(abs_end, sub_end))
+                if abs_end - abs_start >= 5:
+                    candidate.start_s = float(abs_start)
+                    candidate.end_s = float(abs_end)
+                    candidate.duration_s = float(abs_end - abs_start)
+                    changed = True
+        except Exception:
+            pass
+
+        title = data.get("title")
+        if title and isinstance(title, str):
+            candidate.judge_title = title.strip()[:60]
+            changed = True
+
+        reason = data.get("reason")
+        if reason and isinstance(reason, str):
+            candidate.vlm_reason = reason.strip()
+            changed = True
+
+        # Stash the refined confidence on judge_scores so downstream
+        # ranking can use it without breaking the existing schema.
+        try:
+            conf = float(data.get("confidence", 0))
+            if conf > 0:
+                candidate.judge_scores = candidate.judge_scores or {}
+                candidate.judge_scores["v3_confidence"] = conf
+                changed = True
+        except (TypeError, ValueError):
+            pass
+
+        hashtags = data.get("hashtags")
+        if isinstance(hashtags, list) and hashtags:
+            candidate.judge_scores = candidate.judge_scores or {}
+            candidate.judge_scores["v3_hashtags"] = [
+                str(h).strip() for h in hashtags[:3] if str(h).strip()
+            ]
+            changed = True
+
+        return changed
+
+    # ── Keyframe image-mode analysis (optional) ──
+
+    def _keyframe_pass(
+        self, replicate_sdk, model_ref, video_path, signal_timeline,
+        transcript_segments, candidates,
+    ):
+        # Only run on the top 3 candidates to keep cost predictable.
+        scored = sorted(
+            candidates,
+            key=lambda c: (
+                _candidate_confidence(c),
+                getattr(c, "signal_score", 0.0),
+            ),
+            reverse=True,
+        )
+        for c in scored[:3]:
+            try:
+                # Sample 2 keyframes from the candidate window.
+                frames_b64 = _extract_keyframes_b64(
+                    video_path, c.start_s, c.end_s, n_frames=2,
+                )
+                if not frames_b64:
+                    continue
+                transcript_slice = _slice_transcript(transcript_segments, c.start_s, c.end_s)
+                audio_annotation = self._build_audio_annotation(signal_timeline, c.start_s, c.end_s)
+
+                prompt = (
+                    f"[SYSTEM]\n{SYSTEM_PROMPT_V3}\n\n"
+                    f"[USER]\nThese are keyframes from a potential viral moment at "
+                    f"{_fmt_time(c.start_s)}-{_fmt_time(c.end_s)}.\n\n"
+                    f"TRANSCRIPT: {transcript_slice}\n"
+                    f"{audio_annotation}\n\n"
+                    "Analyze what makes this moment visually compelling. "
+                    "What is the strongest single frame for a thumbnail? "
+                    "Is there visual payoff (reaction, reveal, transformation)?\n\n"
+                    'Respond with JSON: {"visual_score": 0.0-1.0, '
+                    '"best_thumbnail_frame": 1-2, '
+                    '"visual_hook": "what the viewer sees that stops the scroll", '
+                    '"has_visual_payoff": true/false}'
+                )
+
+                # Try image-mode first (V3 supports it natively, but the cog
+                # wrapper may not expose `image` as an input). On rejection,
+                # skip silently.
+                try:
+                    output = replicate_sdk.run(
+                        model_ref,
+                        input={
+                            "image": f"data:image/jpeg;base64,{frames_b64[0]}",
+                            "prompt": prompt,
+                            "max_new_tokens": 512,
+                            "temperature": 0.1,
+                        },
+                        use_file_output=False,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "VideoLLaMA3-V3: image-mode rejected by cog wrapper (%s) — skipping keyframe analysis",
+                        e,
+                    )
+                    return
+
+                text = self._collect_output(output).strip()
+                text = re.sub(r"^```json\s*", "", text)
+                text = re.sub(r"\s*```$", "", text)
+                try:
+                    data = json.loads(text)
+                except json.JSONDecodeError:
+                    match = re.search(r"\{.*\}", text, re.DOTALL)
+                    if not match:
+                        continue
+                    try:
+                        data = json.loads(match.group())
+                    except json.JSONDecodeError:
+                        continue
+                if not isinstance(data, dict):
+                    continue
+
+                try:
+                    visual_score = float(data.get("visual_score", 0))
+                except (TypeError, ValueError):
+                    visual_score = 0
+                visual_hook = str(data.get("visual_hook", "")).strip()
+                has_payoff = bool(data.get("has_visual_payoff", False))
+
+                c.judge_scores = c.judge_scores or {}
+                c.judge_scores["v3_visual_score"] = visual_score
+                c.judge_scores["v3_has_visual_payoff"] = has_payoff
+                if visual_hook and not c.vlm_hook:
+                    c.vlm_hook = visual_hook
+                logger.info(
+                    "VideoLLaMA3-V3: keyframe analysis on candidate @%s — visual_score=%.2f",
+                    _fmt_time(c.start_s), visual_score,
+                )
+            except Exception as e:
+                logger.warning(
+                    "VideoLLaMA3-V3: keyframe analysis on candidate @%s failed: %s",
+                    _fmt_time(getattr(c, "start_s", 0)), e,
+                )
+
+
+def _candidate_confidence(c) -> float:
+    """Best available confidence signal for ranking V3 candidates."""
+    js = getattr(c, "judge_scores", None) or {}
+    if "v3_confidence" in js:
+        try:
+            return float(js["v3_confidence"])
+        except (TypeError, ValueError):
+            pass
+    return float(getattr(c, "composite_score", 0) or getattr(c, "signal_score", 0) or 0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  OLLAMA FALLBACK DISCOVERY
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -1824,9 +2636,32 @@ class ClipExtractor:
 
         # Priority 1: Replicate cloud GPU (no local VRAM needed)
         if self.config.replicate_enabled and self.config.replicate_api_key:
-            rep = ReplicateDiscovery(
-                api_key=self.config.replicate_api_key,
-                model_id=self.config.replicate_model)
+            # When VIDEOLLAMA3_ENHANCED is set, use the multi-pass V3
+            # discovery (system prompt + adaptive chunks + audio
+            # annotations + refinement + image keyframe analysis).
+            # Otherwise preserve the classic single-pass behavior.
+            try:
+                from backend.config import settings as _app_settings
+            except Exception:
+                _app_settings = None
+            use_v3_enhanced = bool(getattr(_app_settings, "VIDEOLLAMA3_ENHANCED", False))
+            if use_v3_enhanced:
+                rep = ReplicateDiscoveryV3(
+                    api_key=self.config.replicate_api_key,
+                    model_id=self.config.replicate_model,
+                    fps=getattr(_app_settings, "VIDEOLLAMA3_FPS", 2),
+                    max_frames=getattr(_app_settings, "VIDEOLLAMA3_MAX_FRAMES", 128),
+                    refinement_enabled=getattr(_app_settings, "VIDEOLLAMA3_REFINEMENT_PASS", True),
+                    keyframe_analysis=getattr(_app_settings, "VIDEOLLAMA3_KEYFRAME_ANALYSIS", True),
+                    audio_annotation=getattr(_app_settings, "VIDEOLLAMA3_AUDIO_ANNOTATION", True),
+                    adaptive_chunks=getattr(_app_settings, "VIDEOLLAMA3_ADAPTIVE_CHUNKS", True),
+                    chunk_min_s=getattr(_app_settings, "VIDEOLLAMA3_CHUNK_MIN_S", 120),
+                    chunk_max_s=getattr(_app_settings, "VIDEOLLAMA3_CHUNK_MAX_S", 900),
+                )
+            else:
+                rep = ReplicateDiscovery(
+                    api_key=self.config.replicate_api_key,
+                    model_id=self.config.replicate_model)
             if rep.is_available():
                 try:
                     logger.info("Pass 2: Replicate cloud VideoLLaMA discovery...")

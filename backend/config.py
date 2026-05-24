@@ -54,6 +54,23 @@ class Settings(BaseSettings):
     REPLICATE_MODEL: str = "lucataco/videollama3-7b"
     REPLICATE_ENABLED: bool = True   # user toggle — disable to skip Replicate even if key is set
 
+    # VideoLLaMA3 Enhanced Discovery — multi-pass, image-mode, system prompt.
+    # When True, the clipper uses ``ReplicateDiscoveryV3`` (system prompt +
+    # adaptive chunking + audio annotations + optional refinement pass +
+    # optional keyframe image analysis) instead of the flat single-pass
+    # ``ReplicateDiscovery``. Every enhancement degrades independently if
+    # the Replicate cog wrapper rejects a parameter or the call fails, so
+    # the pipeline never crashes from the new code path.
+    VIDEOLLAMA3_ENHANCED: bool = True
+    VIDEOLLAMA3_FPS: int = 2                # frames/sec for V3 temporal sampling (1-4)
+    VIDEOLLAMA3_MAX_FRAMES: int = 128       # max frames per chunk (V3 supports up to 180)
+    VIDEOLLAMA3_REFINEMENT_PASS: bool = True  # enable coarse→refined two-pass discovery
+    VIDEOLLAMA3_KEYFRAME_ANALYSIS: bool = True  # use V3 image mode for peak-signal keyframes
+    VIDEOLLAMA3_AUDIO_ANNOTATION: bool = True   # annotate prompts with signal timeline audio data
+    VIDEOLLAMA3_ADAPTIVE_CHUNKS: bool = True    # use signal-aware chunk sizing instead of rigid 10min
+    VIDEOLLAMA3_CHUNK_MIN_S: int = 120          # minimum adaptive chunk (seconds)
+    VIDEOLLAMA3_CHUNK_MAX_S: int = 900          # maximum adaptive chunk (seconds)
+
     # Fallback chain (ollama excluded by default — user can enable it in Settings)
     AI_FALLBACK_CHAIN: str = "openrouter,gemini,groq"
 

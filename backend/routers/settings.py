@@ -55,6 +55,12 @@ _PERSISTABLE_KEYS = [
     "WHISPER_VAD_FILTER", "FRAME_SAMPLE_RATE",
     "CLIP_MIN_DURATION", "CLIP_MAX_DURATION", "CLIP_COUNT",
     "CLIP_PREFERRED_SUBJECTS", "CLIP_AVOID_SUBJECTS", "CLIP_DISCOVERY_PROMPT",
+    # VideoLLaMA3 Enhanced Discovery toggles — non-secret, persisted so
+    # operator-tuned defaults survive container restarts.
+    "VIDEOLLAMA3_ENHANCED", "VIDEOLLAMA3_FPS", "VIDEOLLAMA3_MAX_FRAMES",
+    "VIDEOLLAMA3_REFINEMENT_PASS", "VIDEOLLAMA3_KEYFRAME_ANALYSIS",
+    "VIDEOLLAMA3_AUDIO_ANNOTATION", "VIDEOLLAMA3_ADAPTIVE_CHUNKS",
+    "VIDEOLLAMA3_CHUNK_MIN_S", "VIDEOLLAMA3_CHUNK_MAX_S",
     "SELF_HOSTED_MODE", "CLIP_ENGINE_SOURCE", "EDITORIAL_AI_SOURCE",
     "FFMPEG_PRESET", "FFMPEG_CRF", "FFMPEG_THREADS", "FFMPEG_FASTSTART",
     "GPU_ACCELERATION_ENABLED", "GPU_VENDOR_OVERRIDE",
@@ -571,6 +577,7 @@ async def provider_status():
         statuses["replicate"] = {
             "status": "configured",
             "model": settings.REPLICATE_MODEL,
+            "videollama3_enhanced": bool(getattr(settings, "VIDEOLLAMA3_ENHANCED", False)),
         }
     else:
         statuses["replicate"] = {"status": "not_configured"}
@@ -627,6 +634,7 @@ async def provider_status():
         "videollama2_available": _videollama2_ok,
         "replicate_available": _key_is_set(settings.REPLICATE_API_KEY) and settings.REPLICATE_ENABLED,
         "replicate_model": settings.REPLICATE_MODEL if _key_is_set(settings.REPLICATE_API_KEY) else "",
+        "videollama3_enhanced": bool(getattr(settings, "VIDEOLLAMA3_ENHANCED", False)),
         "primary_type": (
             "replicate" if (_key_is_set(settings.REPLICATE_API_KEY) and settings.REPLICATE_ENABLED)
             else "videollama2" if _videollama2_ok
@@ -2104,6 +2112,11 @@ class SaveClipGenerationRequest(BaseModel):
     preferred_subjects: Optional[str] = None
     avoid_subjects: Optional[str] = None
     discovery_prompt: Optional[str] = None  # "" = revert to the built-in default
+    # VideoLLaMA3 Enhanced Discovery toggles (exposed in the Settings UI).
+    videollama3_enhanced: Optional[bool] = None
+    videollama3_refinement_pass: Optional[bool] = None
+    videollama3_keyframe_analysis: Optional[bool] = None
+    videollama3_fps: Optional[int] = None
 
 
 def _clip_generation_state() -> dict:
@@ -2118,12 +2131,27 @@ def _clip_generation_state() -> dict:
         "avoid_subjects": settings.CLIP_AVOID_SUBJECTS,
         "discovery_prompt": settings.CLIP_DISCOVERY_PROMPT,
         "default_discovery_prompt": DEFAULT_DISCOVERY_PROMPT,
+        # VideoLLaMA3 Enhanced Discovery — surfaced to the UI so toggles
+        # render the current backend state on first paint.
+        "videollama3_enhanced": bool(getattr(settings, "VIDEOLLAMA3_ENHANCED", False)),
+        "videollama3_refinement_pass": bool(getattr(settings, "VIDEOLLAMA3_REFINEMENT_PASS", True)),
+        "videollama3_keyframe_analysis": bool(getattr(settings, "VIDEOLLAMA3_KEYFRAME_ANALYSIS", True)),
+        "videollama3_audio_annotation": bool(getattr(settings, "VIDEOLLAMA3_AUDIO_ANNOTATION", True)),
+        "videollama3_adaptive_chunks": bool(getattr(settings, "VIDEOLLAMA3_ADAPTIVE_CHUNKS", True)),
+        "videollama3_fps": int(getattr(settings, "VIDEOLLAMA3_FPS", 2)),
+        "videollama3_max_frames": int(getattr(settings, "VIDEOLLAMA3_MAX_FRAMES", 128)),
+        "videollama3_chunk_min_s": int(getattr(settings, "VIDEOLLAMA3_CHUNK_MIN_S", 120)),
+        "videollama3_chunk_max_s": int(getattr(settings, "VIDEOLLAMA3_CHUNK_MAX_S", 900)),
         "defaults": {
             "min_duration": 60,
             "max_duration": 300,
             "clip_count": 0,
             "preferred_subjects": "",
             "avoid_subjects": "",
+            "videollama3_enhanced": True,
+            "videollama3_refinement_pass": True,
+            "videollama3_keyframe_analysis": True,
+            "videollama3_fps": 2,
         },
     }
 
@@ -2154,6 +2182,14 @@ async def save_clip_generation_settings(req: SaveClipGenerationRequest):
         settings.CLIP_AVOID_SUBJECTS = req.avoid_subjects.strip()
     if req.discovery_prompt is not None:
         settings.CLIP_DISCOVERY_PROMPT = req.discovery_prompt.strip()
+    if req.videollama3_enhanced is not None:
+        settings.VIDEOLLAMA3_ENHANCED = bool(req.videollama3_enhanced)
+    if req.videollama3_refinement_pass is not None:
+        settings.VIDEOLLAMA3_REFINEMENT_PASS = bool(req.videollama3_refinement_pass)
+    if req.videollama3_keyframe_analysis is not None:
+        settings.VIDEOLLAMA3_KEYFRAME_ANALYSIS = bool(req.videollama3_keyframe_analysis)
+    if req.videollama3_fps is not None:
+        settings.VIDEOLLAMA3_FPS = max(1, min(4, int(req.videollama3_fps)))
     _invalidate_status_cache()
     _persist_user_settings()
     return {"status": "saved", **_clip_generation_state()}

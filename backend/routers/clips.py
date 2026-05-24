@@ -768,7 +768,7 @@ async def _discover_clips_videollama3(job_id, job, transcript, duration, req):
     ``(clips, provider)`` to match AIOrchestrator.detect_viral_clips.
     """
     from backend.services.reframer_clipper import (
-        ClipperConfig, ReplicateDiscovery, SignalTimeline,
+        ClipperConfig, ReplicateDiscovery, ReplicateDiscoveryV3, SignalTimeline,
     )
     from backend.services.reframer_bridge import to_fez_clips
     from backend.models import ClipCandidate
@@ -798,8 +798,22 @@ async def _discover_clips_videollama3(job_id, job, transcript, duration, req):
     if req.clip_focus and req.clip_focus.strip():
         cfg.preferred_subjects = req.clip_focus.strip()
 
-    rep = ReplicateDiscovery(
-        api_key=settings.REPLICATE_API_KEY, model_id=settings.REPLICATE_MODEL)
+    if getattr(settings, "VIDEOLLAMA3_ENHANCED", False):
+        rep = ReplicateDiscoveryV3(
+            api_key=settings.REPLICATE_API_KEY,
+            model_id=settings.REPLICATE_MODEL,
+            fps=getattr(settings, "VIDEOLLAMA3_FPS", 2),
+            max_frames=getattr(settings, "VIDEOLLAMA3_MAX_FRAMES", 128),
+            refinement_enabled=getattr(settings, "VIDEOLLAMA3_REFINEMENT_PASS", True),
+            keyframe_analysis=getattr(settings, "VIDEOLLAMA3_KEYFRAME_ANALYSIS", True),
+            audio_annotation=getattr(settings, "VIDEOLLAMA3_AUDIO_ANNOTATION", True),
+            adaptive_chunks=getattr(settings, "VIDEOLLAMA3_ADAPTIVE_CHUNKS", True),
+            chunk_min_s=getattr(settings, "VIDEOLLAMA3_CHUNK_MIN_S", 120),
+            chunk_max_s=getattr(settings, "VIDEOLLAMA3_CHUNK_MAX_S", 900),
+        )
+    else:
+        rep = ReplicateDiscovery(
+            api_key=settings.REPLICATE_API_KEY, model_id=settings.REPLICATE_MODEL)
     signals = SignalTimeline(max(1, int(duration or 1)))
 
     def _run():

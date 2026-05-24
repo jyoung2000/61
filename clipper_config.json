@@ -15,5 +15,9 @@
   "max_duration_s": 300,
   "ideal_duration_s": 150,
   "preferred_subjects": "",
-  "avoid_subjects": ""
+  "avoid_subjects": "",
+  "videollama3_enhanced": true,
+  "videollama3_refinement_pass": true,
+  "videollama3_keyframe_analysis": true,
+  "videollama3_fps": 2
 }
