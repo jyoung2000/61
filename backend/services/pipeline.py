@@ -389,6 +389,30 @@ async def _update_progress(job_id: str, status: str, progress: int, message: str
         hb.touch(stage_label)
 
 
+def _load_job_glossary(job_id: str) -> dict | None:
+    """Load the per-job translation glossary if it exists.
+
+    The glossary file is a JSON object mapping source terms to target
+    terms, persisted at ``/data/uploads/{job_id}/glossary.json``.
+    Returns None if no glossary is set or the file is malformed —
+    translation continues without it.
+    """
+    path = f"/data/uploads/{job_id}/glossary.json"
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        # Accept both ``{"terms": {...}}`` and ``{...}`` directly.
+        if isinstance(data, dict) and "terms" in data and isinstance(data["terms"], dict):
+            return {str(k): str(v) for k, v in data["terms"].items() if str(k).strip()}
+        if isinstance(data, dict):
+            return {str(k): str(v) for k, v in data.items() if str(k).strip() and not isinstance(v, (list, dict))}
+    except Exception as e:
+        logger.warning("[%s] glossary.json parse failed: %s", job_id, e)
+    return None
+
+
 async def _background_post_processing(job_id: str, transcript: list, orchestrator, job):
     """Run transcript polishing and subtitle translation in background after analysis.
 
@@ -398,7 +422,14 @@ async def _background_post_processing(job_id: str, transcript: list, orchestrato
     # ── Transcript polishing ──
     if settings.AI_TRANSCRIPT_CORRECTION and transcript:
         try:
-            from backend.services.compat_stubs import correct_transcript, _adaptive_batch_size
+            # Pick the real polisher when the flag is on; otherwise keep
+            # the inert compat_stubs.correct_transcript pass-through so
+            # behavior is byte-for-byte identical to the legacy path.
+            if getattr(settings, "TRANSCRIPT_POLISHING_ENABLED", True):
+                from backend.services.transcript_polisher import correct_transcript
+            else:
+                from backend.services.compat_stubs import correct_transcript
+            from backend.services.compat_stubs import _adaptive_batch_size
             logger.info("[%s] Background transcript polishing started (%d segments)", job_id, len(transcript))
 
             await broadcast_ws(job_id, {
@@ -442,6 +473,27 @@ async def _background_post_processing(job_id: str, transcript: list, orchestrato
                 correct_transcript(transcript, orchestrator, job_id=job_id, language=correction_lang),
                 timeout=_correction_timeout,
             )
+
+            # ── Subtitle readability enforcement (CPS / line breaks) ──
+            # Run after polishing so the readability formatter sees the
+            # cleaned-up text. Apply only when the flag is on — when off,
+            # we keep byte-for-byte legacy behavior.
+            if getattr(settings, "SUBTITLE_CPS_ENFORCEMENT", False):
+                try:
+                    from backend.services.subtitle_formatter import enforce_readability
+                    polished = enforce_readability(
+                        list(polished),
+                        max_cps=float(getattr(settings, "SUBTITLE_MAX_CPS", 20.0)),
+                        max_chars_per_line=int(getattr(settings, "SUBTITLE_MAX_CHARS_PER_LINE", 42)),
+                        min_duration_ms=int(getattr(settings, "SUBTITLE_MIN_DURATION_MS", 833)),
+                        max_duration_ms=int(getattr(settings, "SUBTITLE_MAX_DURATION_MS", 7000)),
+                        smart_line_breaks=bool(getattr(settings, "SUBTITLE_SMART_LINE_BREAKS", True)),
+                    )
+                    logger.info("[%s] Subtitle readability enforced on polished transcript", job_id)
+                except Exception as _rd_err:
+                    logger.warning("[%s] Readability enforcement failed (%s) — using unmodified polish",
+                                   job_id, _rd_err)
+
             await database.update_job_status(job_id, transcript=list(polished))
             transcript = polished  # Use polished version for translation below
 
@@ -488,6 +540,22 @@ async def _background_post_processing(job_id: str, transcript: list, orchestrato
         logger.info("[%s] Background subtitle translation: %s → %s (%d segments)",
                     job_id, source_name, target_name, len(transcript))
 
+        # Per-video glossary (Key Name and Phrases) — loaded from disk so
+        # the user can drop a JSON file in via the Settings UI without
+        # restarting the pipeline.
+        glossary = None
+        if getattr(settings, "TRANSLATION_GLOSSARY_ENABLED", True):
+            try:
+                glossary = _load_job_glossary(job_id)
+                if glossary:
+                    logger.info(
+                        "[%s] Loaded glossary with %d terms for translation",
+                        job_id, len(glossary),
+                    )
+            except Exception as _g_err:
+                logger.warning("[%s] Glossary load failed (%s) — translating without glossary",
+                               job_id, _g_err)
+
         await broadcast_ws(job_id, {
             "type": "background_task",
             "task": "subtitle_translation",
@@ -505,9 +573,29 @@ async def _background_post_processing(job_id: str, transcript: list, orchestrato
                     source_language=source_lang if source_lang else "auto",
                     target_language=target_lang,
                     orchestrator=orchestrator,
+                    glossary=glossary,
                 ),
                 timeout=_trans_timeout,
             )
+
+            # ── Re-enforce readability after translation ──
+            # Translation changes character length dramatically — a CJK
+            # → English pass typically doubles the line count. Run the
+            # readability pass again so the translated subs stay readable.
+            if getattr(settings, "SUBTITLE_CPS_ENFORCEMENT", False):
+                try:
+                    from backend.services.subtitle_formatter import enforce_readability
+                    translated = enforce_readability(
+                        list(translated),
+                        max_cps=float(getattr(settings, "SUBTITLE_MAX_CPS", 20.0)),
+                        max_chars_per_line=int(getattr(settings, "SUBTITLE_MAX_CHARS_PER_LINE", 42)),
+                        min_duration_ms=int(getattr(settings, "SUBTITLE_MIN_DURATION_MS", 833)),
+                        max_duration_ms=int(getattr(settings, "SUBTITLE_MAX_DURATION_MS", 7000)),
+                        smart_line_breaks=bool(getattr(settings, "SUBTITLE_SMART_LINE_BREAKS", True)),
+                    )
+                except Exception as _rd_err:
+                    logger.warning("[%s] Post-translation readability enforcement failed (%s)",
+                                   job_id, _rd_err)
 
             changed = sum(1 for t, o in zip(translated, transcript) if t.text != o.text)
             await database.update_job_status(

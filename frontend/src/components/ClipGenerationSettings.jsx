@@ -47,13 +47,19 @@ export default function ClipGenerationSettings() {
     videollama3_refinement_pass: true,
     videollama3_keyframe_analysis: true,
     videollama3_fps: 2,
+    subtitle_platform_profile: '',
   });
 
   useEffect(() => {
     let alive = true;
-    fetch('/api/clip-generation/settings')
-      .then((r) => r.json())
-      .then((d) => {
+    // Load both clip-generation defaults AND the subtitle platform
+    // profile in parallel so the dropdown reflects the current backend
+    // setting on first paint.
+    Promise.all([
+      fetch('/api/clip-generation/settings').then((r) => r.json()),
+      fetch('/api/subtitle-quality/settings').then((r) => r.json()).catch(() => ({})),
+    ])
+      .then(([d, sub]) => {
         if (!alive) return;
         setDefaults(d.defaults || null);
         setDefaultPrompt(d.default_discovery_prompt || '');
@@ -70,6 +76,7 @@ export default function ClipGenerationSettings() {
           videollama3_refinement_pass: d.videollama3_refinement_pass ?? true,
           videollama3_keyframe_analysis: d.videollama3_keyframe_analysis ?? true,
           videollama3_fps: d.videollama3_fps ?? 2,
+          subtitle_platform_profile: sub.subtitle_platform_profile || '',
         });
       })
       .catch(() => { if (alive) setError('Could not load clip-generation settings.'); })
@@ -106,22 +113,33 @@ export default function ClipGenerationSettings() {
       // If the prompt still matches the built-in default, persist "" so a
       // future default change propagates instead of pinning the old text.
       const promptOut = promptIsDefault ? '' : form.discovery_prompt;
-      const res = await fetch('/api/clip-generation/settings', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          min_duration: Number(form.min_duration) || 0,
-          max_duration: Number(form.max_duration) || 0,
-          clip_count: Number(form.clip_count) || 0,
-          preferred_subjects: form.preferred_subjects,
-          avoid_subjects: form.avoid_subjects,
-          discovery_prompt: promptOut,
-          videollama3_enhanced: !!form.videollama3_enhanced,
-          videollama3_refinement_pass: !!form.videollama3_refinement_pass,
-          videollama3_keyframe_analysis: !!form.videollama3_keyframe_analysis,
-          videollama3_fps: Math.max(1, Math.min(4, Number(form.videollama3_fps) || 2)),
+      const [res] = await Promise.all([
+        fetch('/api/clip-generation/settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            min_duration: Number(form.min_duration) || 0,
+            max_duration: Number(form.max_duration) || 0,
+            clip_count: Number(form.clip_count) || 0,
+            preferred_subjects: form.preferred_subjects,
+            avoid_subjects: form.avoid_subjects,
+            discovery_prompt: promptOut,
+            videollama3_enhanced: !!form.videollama3_enhanced,
+            videollama3_refinement_pass: !!form.videollama3_refinement_pass,
+            videollama3_keyframe_analysis: !!form.videollama3_keyframe_analysis,
+            videollama3_fps: Math.max(1, Math.min(4, Number(form.videollama3_fps) || 2)),
+          }),
         }),
-      });
+        // Save the platform profile separately so it lives next to the
+        // other subtitle-quality settings in the backend.
+        fetch('/api/subtitle-quality/settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            subtitle_platform_profile: form.subtitle_platform_profile || '',
+          }),
+        }).catch(() => null),
+      ]);
       if (!res.ok) throw new Error('save failed');
       const d = await res.json();
       setForm((f) => ({
@@ -206,6 +224,29 @@ export default function ClipGenerationSettings() {
             onChange={(e) => set('avoid_subjects', e.target.value)}
           />
         </div>
+      </div>
+
+      {/* subtitle safe-zone platform */}
+      <div style={{ marginBottom: 14 }}>
+        <label style={labelStyle}>Subtitle platform safe-zone (for exports)</label>
+        <select
+          value={form.subtitle_platform_profile || ''}
+          onChange={(e) => set('subtitle_platform_profile', e.target.value)}
+          style={{
+            ...inputStyle, padding: '6px 10px', fontSize: 12,
+          }}
+        >
+          <option value="">Inherit from Settings</option>
+          <option value="tiktok">TikTok (1080×1920)</option>
+          <option value="reels">Instagram Reels (1080×1920)</option>
+          <option value="shorts">YouTube Shorts (1080×1920)</option>
+          <option value="horizontal">Horizontal (16:9)</option>
+          <option value="square">Square (1:1)</option>
+        </select>
+        <p style={{ fontSize: 10, color: 'var(--text-muted)', margin: '4px 0 0', lineHeight: 1.5 }}>
+          Controls subtitle margins so they avoid the platform's UI overlays
+          (creator badges, captions, subscribe buttons).
+        </p>
       </div>
 
       {/* editable discovery prompt */}

@@ -3,11 +3,19 @@
 Extracts loudness contour from audio using FFmpeg's ebur128 filter,
 identifies volume spikes (laughter, applause, excitement), and generates
 an energy map for the clip detection prompt.
+
+Also provides ``classify_audio_events()`` — a spectral classifier built
+on FFmpeg + scipy (no ML model) that tags each window of audio as
+``speech``, ``music``, ``laughter``, ``applause``, ``silence``, or
+``noise``. The output integrates with the subtitle pipeline (the
+[applause] / [music] / [laughter] annotations) and the SignalTimeline.
 """
 
 import asyncio
 import logging
+import os
 import re
+import tempfile
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -185,3 +193,259 @@ def format_audio_energy_map(moments: list[dict]) -> str:
         "not transcript guesses. Clips containing these moments tend to be more engaging):\n"
         + "\n".join(lines)
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Spectral Audio Event Classification (no ML model required)
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Reference frequency bands (Hz) used for the rule-based classifier.
+_FUNDAMENTAL_BAND = (60, 250)        # voiced speech fundamental, bass notes
+_FORMANT_BAND    = (250, 3500)       # vowel formants — speech intelligibility
+_PRESENCE_BAND   = (3500, 8000)      # consonants, applause / cymbal energy
+_AIR_BAND        = (8000, 16000)     # very high frequencies — applause hash
+
+
+def _extract_pcm_mono(
+    audio_path: str,
+    sample_rate: int = 16000,
+) -> tuple[bytes, int]:
+    """Decode the input to 16 kHz mono PCM via FFmpeg. Returns (raw_bytes,
+    sample_rate). On failure returns ``(b'', 0)``."""
+    import subprocess
+    try:
+        proc = subprocess.run(
+            [
+                "ffmpeg", "-v", "error", "-i", audio_path,
+                "-vn", "-acodec", "pcm_s16le",
+                "-ar", str(sample_rate), "-ac", "1",
+                "-f", "s16le", "-",
+            ],
+            capture_output=True, timeout=600,
+        )
+        if proc.returncode != 0:
+            logger.warning("FFmpeg PCM extract failed: %s", proc.stderr[:200].decode(errors="replace"))
+            return b"", 0
+        return proc.stdout, sample_rate
+    except Exception as e:
+        logger.warning("FFmpeg PCM extract crashed: %s", e)
+        return b"", 0
+
+
+def _classify_window(
+    samples,
+    sample_rate: int,
+    rms_threshold_silence: float,
+) -> tuple[str, float]:
+    """Classify a single 1-second window. Returns (label, confidence).
+
+    Pure-Python rule-based classifier — no ML model. Uses RMS + a few
+    spectral descriptors (centroid, flatness, band-energy ratios).
+    """
+    try:
+        import numpy as np
+    except Exception:
+        return ("noise", 0.0)
+    if len(samples) == 0:
+        return ("silence", 1.0)
+
+    arr = samples.astype("float32") / 32768.0
+    rms = float((arr * arr).mean() ** 0.5)
+    if rms < rms_threshold_silence:
+        return ("silence", min(1.0, (rms_threshold_silence - rms) * 20))
+
+    # Spectrum via real FFT.
+    n = len(arr)
+    # Hann window to suppress spectral leakage.
+    win = arr * np.hanning(n)
+    spec = np.abs(np.fft.rfft(win))
+    freqs = np.fft.rfftfreq(n, 1.0 / sample_rate)
+    spec2 = spec * spec
+    total_power = float(spec2.sum()) or 1e-9
+
+    def _band_power(lo, hi):
+        mask = (freqs >= lo) & (freqs < hi)
+        return float(spec2[mask].sum())
+
+    fund = _band_power(*_FUNDAMENTAL_BAND) / total_power
+    formant = _band_power(*_FORMANT_BAND) / total_power
+    presence = _band_power(*_PRESENCE_BAND) / total_power
+    air = _band_power(*_AIR_BAND) / total_power
+
+    # Spectral centroid (Hz) — speech ≈ 1-3 kHz, music varies, applause is high.
+    centroid = float((freqs * spec).sum() / max(1e-9, spec.sum()))
+    # Spectral flatness (geometric mean / arithmetic mean) — noise/applause is high (~0.3+),
+    # tonal music/speech is low (~0.05).
+    nonzero = spec[spec > 1e-9]
+    if len(nonzero) > 1:
+        log_mean = float(np.log(nonzero).mean())
+        arith_mean = float(nonzero.mean())
+        flatness = float(np.exp(log_mean) / arith_mean) if arith_mean > 0 else 0.0
+    else:
+        flatness = 0.0
+
+    # ── Rule-based decisions ──
+    # Applause / crowd noise: very flat spectrum, high presence/air energy.
+    if flatness > 0.35 and (presence + air) > 0.30 and centroid > 2500:
+        return ("applause", min(1.0, flatness * 2))
+
+    # Music: tonal (low flatness), strong formant + fundamental energy,
+    # centroid moderate.
+    if flatness < 0.15 and (fund + formant) > 0.55 and 500 < centroid < 4000:
+        return ("music", min(1.0, 1.0 - flatness * 3))
+
+    # Speech: balanced formant energy, centroid ≈ 1-2.5 kHz, moderate flatness.
+    if 0.05 < flatness < 0.25 and formant > 0.35 and 800 < centroid < 3000:
+        return ("speech", 0.7)
+
+    # Laughter: high-energy spike, very broad spectrum, centroid >2 kHz,
+    # presence > formant. Tends to be loud.
+    if rms > 0.15 and presence > formant * 0.8 and centroid > 1500 and flatness > 0.20:
+        return ("laughter", 0.6)
+
+    return ("noise", 0.4)
+
+
+async def classify_audio_events(
+    audio_path: str,
+    window_seconds: float = 1.0,
+) -> list[dict]:
+    """Classify audio events using spectral analysis (no ML model).
+
+    Returns a list of ``{"timestamp": float, "duration": float, "type":
+    str, "confidence": float}`` dicts spanning the entire audio. Adjacent
+    same-type windows are merged into a single event.
+
+    Types: ``speech``, ``music``, ``laughter``, ``applause``,
+    ``silence``, ``noise``.
+    """
+    try:
+        import numpy as np
+    except Exception as e:
+        logger.warning("classify_audio_events: numpy unavailable (%s) — returning empty", e)
+        return []
+
+    raw, sr = await asyncio.to_thread(_extract_pcm_mono, audio_path, 16000)
+    if not raw or sr <= 0:
+        return []
+
+    samples = np.frombuffer(raw, dtype="<i2")
+    if samples.size == 0:
+        return []
+
+    # Estimate a per-clip silence threshold: the 10th-percentile RMS.
+    win_samples = max(1, int(window_seconds * sr))
+    if samples.size < win_samples:
+        return []
+
+    # Pre-compute per-window RMS to derive silence floor.
+    n_windows = samples.size // win_samples
+    rms_arr = np.empty(n_windows, dtype="float32")
+    for i in range(n_windows):
+        chunk = samples[i * win_samples:(i + 1) * win_samples].astype("float32") / 32768.0
+        rms_arr[i] = float((chunk * chunk).mean() ** 0.5)
+    if rms_arr.size == 0:
+        return []
+    silence_floor = float(max(0.005, np.percentile(rms_arr, 10) * 1.5))
+
+    raw_events: list[dict] = []
+    for i in range(n_windows):
+        chunk = samples[i * win_samples:(i + 1) * win_samples]
+        label, conf = _classify_window(chunk, sr, silence_floor)
+        raw_events.append({
+            "timestamp": round(i * window_seconds, 3),
+            "duration": window_seconds,
+            "type": label,
+            "confidence": round(conf, 3),
+        })
+
+    # Merge adjacent same-type events.
+    merged: list[dict] = []
+    for ev in raw_events:
+        if merged and merged[-1]["type"] == ev["type"]:
+            merged[-1]["duration"] = round(
+                merged[-1]["duration"] + ev["duration"], 3
+            )
+            # Keep the higher of the two confidences.
+            merged[-1]["confidence"] = round(
+                max(merged[-1]["confidence"], ev["confidence"]), 3
+            )
+        else:
+            merged.append(dict(ev))
+
+    # Drop micro-events shorter than 0.5s of non-speech (e.g. a single
+    # noisy frame inside a long speech block).
+    cleaned: list[dict] = []
+    for ev in merged:
+        if ev["type"] != "speech" and ev["duration"] < 0.5:
+            # Re-tag as the surrounding speech if possible.
+            if cleaned and cleaned[-1]["type"] == "speech":
+                cleaned[-1]["duration"] = round(cleaned[-1]["duration"] + ev["duration"], 3)
+                continue
+        cleaned.append(ev)
+
+    logger.info(
+        "classify_audio_events: %d events across %.1fs",
+        len(cleaned), n_windows * window_seconds,
+    )
+    return cleaned
+
+
+def build_non_speech_subtitle_events(
+    audio_events: list[dict],
+    transcript_segments: list,
+    min_gap_s: float = 0.6,
+    min_event_s: float = 0.8,
+) -> list[dict]:
+    """Translate non-speech audio events into bracketed subtitle events.
+
+    Produces ``[{"start": s, "end": s, "text": "[applause]"}]`` dicts
+    that the export pipeline can merge with the speech transcript when
+    ``AUDIO_EVENTS_IN_SUBTITLES`` is enabled. Only emits events that fall
+    entirely inside gaps in the speech transcript, to avoid overlapping
+    actual dialogue.
+    """
+    if not audio_events:
+        return []
+
+    # Build a list of speech windows for quick gap testing.
+    speech_windows = []
+    for seg in transcript_segments or []:
+        start = getattr(seg, "start", getattr(seg, "start_sec", None))
+        end = getattr(seg, "end", getattr(seg, "end_sec", None))
+        if isinstance(seg, dict):
+            start = seg.get("start", seg.get("start_sec"))
+            end = seg.get("end", seg.get("end_sec"))
+        if start is None or end is None:
+            continue
+        speech_windows.append((float(start), float(end)))
+    speech_windows.sort()
+
+    def _overlaps_speech(s: float, e: float) -> bool:
+        for ws, we in speech_windows:
+            if we + min_gap_s < s:
+                continue
+            if ws - min_gap_s > e:
+                break
+            if min(we, e) > max(ws, s):
+                return True
+        return False
+
+    label_map = {
+        "applause": "[applause]",
+        "laughter": "[laughter]",
+        "music": "[music]",
+    }
+    out: list[dict] = []
+    for ev in audio_events:
+        label = label_map.get(ev.get("type"))
+        if not label:
+            continue
+        if ev.get("duration", 0) < min_event_s:
+            continue
+        start = float(ev.get("timestamp", 0))
+        end = start + float(ev.get("duration", 0))
+        if _overlaps_speech(start, end):
+            continue
+        out.append({"start": start, "end": end, "text": label})
+    return out

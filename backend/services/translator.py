@@ -209,6 +209,29 @@ def _apply_batch_translations(
     return result
 
 
+def _format_glossary_block(glossary: dict | None) -> str:
+    """Format a per-video glossary as a prompt block."""
+    if not glossary or not isinstance(glossary, dict):
+        return ""
+    pairs = [(str(k), str(v)) for k, v in glossary.items() if str(k).strip() and str(v).strip()]
+    if not pairs:
+        return ""
+    lines = ["GLOSSARY (always use these exact translations for these terms):"]
+    for src, tgt in pairs:
+        lines.append(f"  {src} → {tgt}")
+    return "\n".join(lines) + "\n\n"
+
+
+def _format_context_block(label: str, items: list[TranscriptSegment]) -> str:
+    """Format a context window as a prompt block."""
+    if not items:
+        return ""
+    lines = [f"{label} (do NOT translate — context only):"]
+    for s in items:
+        lines.append(f"  [{s.start:.0f}s] {s.text}")
+    return "\n".join(lines) + "\n"
+
+
 async def translate_segments(
     segments: list[TranscriptSegment],
     source_language: str,
@@ -216,11 +239,19 @@ async def translate_segments(
     orchestrator: AIOrchestrator,
     batch_size: int = 25,
     progress_callback=None,
+    context_window: int | None = None,
+    glossary: dict | None = None,
 ) -> list[TranscriptSegment]:
     """Translate transcript segments to the target language.
 
     Returns new TranscriptSegment[] with translated text and
     proportional word timestamps. Original timing is preserved.
+
+    ``context_window`` controls the number of surrounding segments included
+    as reference-only context (default: TRANSLATION_CONTEXT_WINDOW setting).
+    ``glossary`` is a {source_term: target_term} dict whose entries are
+    pinned in the prompt so proper nouns and recurring terms get
+    translated consistently across batches.
     """
     if source_language == target_language:
         return segments
@@ -238,6 +269,11 @@ async def translate_segments(
         logger.info("Using smaller batch size (%d) for CJK translation", batch_size)
 
     extra_rules = _get_pair_rules(source_language, target_language)
+    if context_window is None:
+        context_window = int(getattr(settings, "TRANSLATION_CONTEXT_WINDOW", 5))
+    context_window = max(0, min(20, int(context_window)))
+    use_glossary = bool(getattr(settings, "TRANSLATION_GLOSSARY_ENABLED", True))
+    glossary_block = _format_glossary_block(glossary) if use_glossary else ""
 
     translated = []
     total_batches = (len(segments) + batch_size - 1) // batch_size
@@ -248,24 +284,19 @@ async def translate_segments(
         batch = segments[batch_start : batch_start + batch_size]
 
         # Include surrounding segments as context (not to be translated)
-        context_before = segments[max(0, batch_start - 2) : batch_start]
-        context_after = segments[batch_start + len(batch) : batch_start + len(batch) + 2]
+        context_before = segments[max(0, batch_start - context_window): batch_start]
+        ctx_after_start = batch_start + len(batch)
+        context_after = segments[ctx_after_start: ctx_after_start + context_window]
 
-        context_section = ""
-        if context_before or context_after:
-            ctx_parts = []
-            if context_before:
-                ctx_parts.append("Previous context (do NOT translate, for reference only):")
-                for s in context_before:
-                    ctx_parts.append(f"  [{s.start:.0f}s] {s.text}")
-            if context_after:
-                ctx_parts.append("Following context (do NOT translate, for reference only):")
-                for s in context_after:
-                    ctx_parts.append(f"  [{s.start:.0f}s] {s.text}")
-            context_section = "\n".join(ctx_parts) + "\n\n"
+        context_section = (
+            _format_context_block("PREVIOUS CONTEXT", context_before)
+            + _format_context_block("FOLLOWING CONTEXT", context_after)
+        )
+        if context_section:
+            context_section += "\n"
 
         seg_texts = [{"index": i, "text": seg.text} for i, seg in enumerate(batch)]
-        prompt = TRANSLATION_PROMPT.format(
+        prompt = glossary_block + TRANSLATION_PROMPT.format(
             source_lang=source_name,
             target_lang=target_name,
             count=len(batch),
@@ -331,6 +362,99 @@ async def translate_segments(
     return translated
 
 
+async def _translate_via_nmt(
+    segments: list[TranscriptSegment],
+    source_language: str,
+    target_language: str,
+    glossary: dict | None,
+    progress_callback=None,
+) -> list[TranscriptSegment] | None:
+    """Try NMT (Opus-MT preferred, NLLB fallback). Returns None if no
+    local NMT engine is available for this pair."""
+    try:
+        from backend.services.nmt_translator import (
+            pick_local_engine, NMTTranslator, OpusMTTranslator,
+        )
+    except Exception as e:
+        logger.warning("NMT module unavailable: %s", e)
+        return None
+    engine = pick_local_engine(source_language, target_language)
+    if engine is None:
+        return None
+    logger.info(
+        "NMT: using %s for %s→%s (%d segments)",
+        type(engine).__name__, source_language, target_language, len(segments),
+    )
+    context_window = max(0, min(20, int(getattr(settings, "TRANSLATION_CONTEXT_WINDOW", 5))))
+    out: list[TranscriptSegment] = []
+    try:
+        # Batch in groups of 16 to keep memory + decode time bounded.
+        BATCH = 16
+        for start in range(0, len(segments), BATCH):
+            batch = segments[start: start + BATCH]
+            ctx_before = [
+                s.text for s in segments[max(0, start - context_window): start]
+            ]
+            ctx_after = [
+                s.text for s in segments[start + len(batch): start + len(batch) + context_window]
+            ]
+            texts = [s.text for s in batch]
+            if isinstance(engine, NMTTranslator):
+                translations = engine.translate_with_context(
+                    texts, ctx_before, ctx_after,
+                    source_language, target_language, glossary=glossary,
+                )
+            else:
+                translations = engine.translate_batch(texts, glossary=glossary)
+            out.extend(_apply_batch_translations(batch, translations))
+            if progress_callback:
+                pct = int(((start + len(batch)) / max(1, len(segments))) * 100)
+                try:
+                    res = progress_callback(pct)
+                    if hasattr(res, "__await__"):
+                        await res
+                except Exception:
+                    pass
+    finally:
+        try:
+            engine.unload()
+        except Exception:
+            pass
+    changed = sum(1 for t, o in zip(out, segments) if t.text != o.text)
+    if changed == 0:
+        logger.warning("NMT: 0 segments changed — returning None so caller can fall back")
+        return None
+    logger.info("NMT: translated %d/%d segments via local engine", changed, len(out))
+    return out
+
+
+def _resolve_translation_engine(source: str, target: str) -> str:
+    """Pick the translation engine to use based on settings + availability.
+
+    Returns one of: ``"deepl"``, ``"google"``, ``"nllb"``, ``"opus-mt"``,
+    ``"llm"``. The router in ``translate_segments_with_fallback`` consults
+    this when ``TRANSLATION_ENGINE=auto``.
+    """
+    requested = (getattr(settings, "TRANSLATION_ENGINE", "auto") or "auto").lower()
+    if requested not in ("auto", "", "llm", "whisper"):
+        return requested
+    if requested in ("llm", "whisper"):
+        return "llm"
+    # AUTO selection.
+    if (getattr(settings, "DEEPL_API_KEY", "") or "").strip():
+        return "deepl"
+    if (getattr(settings, "GOOGLE_TRANSLATE_API_KEY", "") or "").strip():
+        return "google"
+    try:
+        from backend.services.nmt_translator import pick_local_engine
+        engine = pick_local_engine(source, target)
+        if engine is not None:
+            return "opus-mt" if engine.__class__.__name__ == "OpusMTTranslator" else "nllb"
+    except Exception:
+        pass
+    return "llm"
+
+
 async def translate_segments_with_fallback(
     segments: list[TranscriptSegment],
     source_language: str,
@@ -338,17 +462,55 @@ async def translate_segments_with_fallback(
     orchestrator: AIOrchestrator,
     batch_size: int = 25,
     progress_callback=None,
+    glossary: dict | None = None,
 ) -> list[TranscriptSegment]:
-    """Translate segments, falling back to a dedicated Ollama model if the
-    primary provider can't translate (e.g. vision-only model).
+    """Translate segments, falling back across engines.
 
-    This is the main entry point called by the pipeline. It:
-    1. Tries the orchestrator's provider chain first
-    2. Checks if translation actually changed the text
-    3. If not, retries with OLLAMA_TRANSLATION_MODEL directly
+    Decision tree (driven by TRANSLATION_ENGINE):
+      - ``auto``    → DeepL → Google → Opus-MT → NLLB → LLM → Ollama
+      - ``deepl``   → DeepL API (if key set) else LLM
+      - ``google``  → Google Cloud Translation v3 (if key set) else LLM
+      - ``opus-mt`` → Opus-MT local (if downloaded) else LLM
+      - ``nllb``    → NLLB-200 local (if downloaded) else LLM
+      - ``llm``     → orchestrator chain (current behavior)
+      - ``whisper`` → caller is expected to have used Whisper's native
+                      translate task; this entry point still falls back
+                      to LLM as a safety net.
     """
     if source_language == target_language:
         return segments
+
+    engine = _resolve_translation_engine(source_language, target_language)
+    logger.info("Translation engine resolved: %s (requested=%s)",
+                engine, getattr(settings, "TRANSLATION_ENGINE", "auto"))
+
+    # ── Cloud NMT engines (DeepL, Google) ──
+    if engine == "deepl":
+        try:
+            out = await _translate_via_deepl(segments, source_language, target_language, glossary)
+            if out is not None:
+                return out
+        except Exception as e:
+            logger.warning("DeepL translation failed: %s — falling back", e)
+    if engine == "google":
+        try:
+            out = await _translate_via_google(segments, source_language, target_language, glossary)
+            if out is not None:
+                return out
+        except Exception as e:
+            logger.warning("Google Translate failed: %s — falling back", e)
+
+    # ── Local NMT engines (Opus-MT, NLLB) ──
+    if engine in ("opus-mt", "nllb"):
+        try:
+            out = await _translate_via_nmt(
+                segments, source_language, target_language,
+                glossary=glossary, progress_callback=progress_callback,
+            )
+            if out is not None:
+                return out
+        except Exception as e:
+            logger.warning("NMT translation failed: %s — falling back to LLM", e)
 
     # --- Attempt 1: Quick probe with orchestrator (small sample first) ---
     # Don't waste time translating all 1441 segments if the model can't translate.
@@ -357,7 +519,7 @@ async def translate_segments_with_fallback(
     probe_sample = segments[:probe_size]
     probe_result = await translate_segments(
         probe_sample, source_language, target_language,
-        orchestrator, batch_size=probe_size,
+        orchestrator, batch_size=probe_size, glossary=glossary,
     )
     probe_changed = sum(1 for t, o in zip(probe_result, probe_sample) if t.text != o.text)
 
@@ -367,6 +529,7 @@ async def translate_segments_with_fallback(
         result = await translate_segments(
             segments, source_language, target_language,
             orchestrator, batch_size, progress_callback,
+            glossary=glossary,
         )
         changed = sum(1 for t, o in zip(result, segments) if t.text != o.text)
         if changed > 0:
@@ -406,29 +569,29 @@ async def translate_segments_with_fallback(
     MAX_CONSECUTIVE_BATCH_FAILURES = 5  # more tolerance — don't abort early
 
     extra_rules = _get_pair_rules(source_language, target_language)
+    fallback_context_window = max(0, min(20, int(getattr(settings, "TRANSLATION_CONTEXT_WINDOW", 5))))
+    fallback_use_glossary = bool(getattr(settings, "TRANSLATION_GLOSSARY_ENABLED", True))
+    fallback_glossary_block = (
+        _format_glossary_block(glossary) if fallback_use_glossary else ""
+    )
 
     for batch_idx, batch_start in enumerate(range(0, len(segments), fallback_batch_size)):
         batch = segments[batch_start : batch_start + fallback_batch_size]
 
         # Include surrounding segments as context
-        context_before = segments[max(0, batch_start - 2) : batch_start]
-        context_after = segments[batch_start + len(batch) : batch_start + len(batch) + 2]
+        context_before = segments[max(0, batch_start - fallback_context_window): batch_start]
+        ctx_after_start = batch_start + len(batch)
+        context_after = segments[ctx_after_start: ctx_after_start + fallback_context_window]
 
-        context_section = ""
-        if context_before or context_after:
-            ctx_parts = []
-            if context_before:
-                ctx_parts.append("Previous context (do NOT translate, for reference only):")
-                for s in context_before:
-                    ctx_parts.append(f"  [{s.start:.0f}s] {s.text}")
-            if context_after:
-                ctx_parts.append("Following context (do NOT translate, for reference only):")
-                for s in context_after:
-                    ctx_parts.append(f"  [{s.start:.0f}s] {s.text}")
-            context_section = "\n".join(ctx_parts) + "\n\n"
+        context_section = (
+            _format_context_block("PREVIOUS CONTEXT", context_before)
+            + _format_context_block("FOLLOWING CONTEXT", context_after)
+        )
+        if context_section:
+            context_section += "\n"
 
         seg_texts = [{"index": i, "text": seg.text} for i, seg in enumerate(batch)]
-        prompt = TRANSLATION_PROMPT.format(
+        prompt = fallback_glossary_block + TRANSLATION_PROMPT.format(
             source_lang=source_name,
             target_lang=target_name,
             count=len(batch),
@@ -500,3 +663,154 @@ async def translate_segments_with_fallback(
         changed, len(translated), translation_model,
     )
     return translated
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Cloud NMT engines — DeepL + Google Cloud Translation v3
+# ═══════════════════════════════════════════════════════════════════════════
+
+# DeepL's supported source/target codes (a subset of ISO 639-1 with a few
+# regional variants). Used to short-circuit ``auto`` selection so we don't
+# attempt a pair DeepL can't handle.
+_DEEPL_LANGS = {
+    "ar", "bg", "cs", "da", "de", "el", "en", "es", "et", "fi", "fr",
+    "hu", "id", "it", "ja", "ko", "lt", "lv", "nb", "nl", "pl", "pt",
+    "ro", "ru", "sk", "sl", "sv", "tr", "uk", "zh",
+}
+
+
+def _iso_to_deepl_lang(code: str, *, is_target: bool) -> str | None:
+    if not code:
+        return None
+    c = code.lower().split("-")[0]
+    if c not in _DEEPL_LANGS:
+        return None
+    if c == "en" and is_target:
+        return "EN-US"
+    if c == "pt" and is_target:
+        return "PT-BR"
+    if c == "zh" and is_target:
+        return "ZH-HANS"
+    return c.upper()
+
+
+async def _translate_via_deepl(
+    segments: list[TranscriptSegment],
+    source_language: str,
+    target_language: str,
+    glossary: dict | None,
+) -> list[TranscriptSegment] | None:
+    """Translate via DeepL's REST API. Returns None when the key is missing
+    or the pair is unsupported."""
+    key = (getattr(settings, "DEEPL_API_KEY", "") or "").strip()
+    if not key:
+        return None
+    src = _iso_to_deepl_lang(source_language, is_target=False)
+    tgt = _iso_to_deepl_lang(target_language, is_target=True)
+    if not src or not tgt:
+        logger.info("DeepL: %s→%s is not in DeepL's supported pairs",
+                    source_language, target_language)
+        return None
+    endpoints = [
+        "https://api.deepl.com/v2/translate",
+        "https://api-free.deepl.com/v2/translate",
+    ]
+    headers = {"Authorization": f"DeepL-Auth-Key {key}"}
+
+    out: list[TranscriptSegment] = []
+    CHUNK = 50
+    async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
+        for start in range(0, len(segments), CHUNK):
+            batch = segments[start: start + CHUNK]
+            texts = [s.text for s in batch]
+            payload = {
+                "text": texts,
+                "source_lang": src,
+                "target_lang": tgt,
+                "preserve_formatting": "1",
+            }
+            translations: list[str] | None = None
+            last_err: str | None = None
+            for url in endpoints:
+                try:
+                    resp = await client.post(url, data=payload, headers=headers)
+                    if resp.status_code == 403:
+                        last_err = f"HTTP 403 at {url}"
+                        continue
+                    resp.raise_for_status()
+                    data = resp.json()
+                    translations = [t.get("text", "") for t in data.get("translations", [])]
+                    if len(translations) != len(texts):
+                        translations = None
+                        last_err = f"DeepL returned wrong count"
+                        continue
+                    break
+                except Exception as e:
+                    last_err = str(e)
+                    continue
+            if translations is None:
+                logger.warning("DeepL chunk failed: %s", last_err or "unknown")
+                return None
+            if glossary:
+                for i, src_text in enumerate(texts):
+                    new = translations[i]
+                    for k, v in glossary.items():
+                        ks, vs = (k or "").strip(), (v or "").strip()
+                        if ks and vs and ks in src_text and ks in new:
+                            new = new.replace(ks, vs)
+                    translations[i] = new
+            out.extend(_apply_batch_translations(batch, translations))
+    logger.info("DeepL: translated %d segments %s→%s", len(out), src, tgt)
+    return out
+
+
+async def _translate_via_google(
+    segments: list[TranscriptSegment],
+    source_language: str,
+    target_language: str,
+    glossary: dict | None,
+) -> list[TranscriptSegment] | None:
+    """Translate via Google Cloud Translation v2 REST API. Returns None
+    when the key is missing."""
+    key = (getattr(settings, "GOOGLE_TRANSLATE_API_KEY", "") or "").strip()
+    if not key:
+        return None
+    url = f"https://translation.googleapis.com/language/translate/v2?key={key}"
+    out: list[TranscriptSegment] = []
+    CHUNK = 100
+    async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
+        for start in range(0, len(segments), CHUNK):
+            batch = segments[start: start + CHUNK]
+            texts = [s.text for s in batch]
+            payload = {
+                "q": texts,
+                "target": target_language.split("-")[0],
+                "format": "text",
+            }
+            if source_language and source_language not in ("auto", ""):
+                payload["source"] = source_language.split("-")[0]
+            try:
+                resp = await client.post(url, json=payload)
+                resp.raise_for_status()
+                data = resp.json()
+                items = data.get("data", {}).get("translations", [])
+                translations = [it.get("translatedText", "") for it in items]
+                if len(translations) != len(texts):
+                    logger.warning("Google Translate returned %d for %d inputs",
+                                   len(translations), len(texts))
+                    return None
+            except Exception as e:
+                logger.warning("Google Translate chunk failed: %s", e)
+                return None
+            if glossary:
+                for i, src_text in enumerate(texts):
+                    new = translations[i]
+                    for k, v in glossary.items():
+                        ks, vs = (k or "").strip(), (v or "").strip()
+                        if ks and vs and ks in src_text and ks in new:
+                            new = new.replace(ks, vs)
+                    translations[i] = new
+            out.extend(_apply_batch_translations(batch, translations))
+    logger.info("Google Translate: translated %d segments to %s", len(out), target_language)
+    return out
+

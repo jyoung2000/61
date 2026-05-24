@@ -28,6 +28,55 @@ from backend.services.reframer_models import (
 logger = logging.getLogger("clipai.reframer_audio")
 
 
+def _cross_validate_segments(segments: list) -> list:
+    """Remove cross-segment artefacts the per-segment TACT filter misses.
+
+    Drops:
+      - Exact text duplicates of the immediately preceding segment.
+      - Segments that start before the previous segment ended (temporal
+        overlap by more than 100 ms).
+      - Segments with >80% word overlap with the previous segment (a
+        common Whisper hallucination pattern on noisy audio).
+
+    Lightweight pure-Python pass — no feature flag, only removes clearly
+    invalid output.
+    """
+    if not segments:
+        return segments
+    cleaned: list = []
+    prev_text = ""
+    prev_end = 0.0
+    for seg in segments:
+        text = (seg.get("text", "") or "").strip()
+        start = seg.get("start_sec", seg.get("start", 0)) or 0
+        end = seg.get("end_sec", seg.get("end", 0)) or 0
+
+        if text and text == prev_text:
+            continue
+        if cleaned and start < prev_end - 0.1:
+            continue
+        if prev_text and text:
+            # Strip punctuation so "fine," and "fine" compare equal.
+            import string as _str
+            _tbl = str.maketrans("", "", _str.punctuation)
+            prev_words = set(prev_text.lower().translate(_tbl).split())
+            curr_words = set(text.lower().translate(_tbl).split())
+            if prev_words and len(prev_words & curr_words) / len(prev_words) > 0.8:
+                continue
+
+        cleaned.append(seg)
+        prev_text = text
+        prev_end = float(end) or prev_end
+
+    dropped = len(segments) - len(cleaned)
+    if dropped > 0:
+        logger.info(
+            "cross-segment validation removed %d duplicate/overlapping segments",
+            dropped,
+        )
+    return cleaned
+
+
 class AudioIntelligence:
     """
     Whisper-based audio analysis for reframing intelligence.
@@ -459,6 +508,11 @@ class AudioIntelligence:
             # Filter hallucinations from the segment list for downstream consumers
             clean_segments = [s for s in segments if not s.get('is_hallucination')]
 
+            # ── Cross-segment hallucination validation ──
+            # Remove exact duplicates, temporal overlaps, and >80% word-overlap
+            # repeats that slip past the per-segment TACT filter above.
+            clean_segments = _cross_validate_segments(clean_segments)
+
             log.log_stage('AUDIO',
                 f'Transcription complete: {len(clean_segments)} segments '
                 f'({hallucinated_count} hallucinations quarantined, '
@@ -502,20 +556,32 @@ class AudioIntelligence:
 
     def whisper_translate(self, video_path: str, source_lang: str = None,
                           on_progress=None) -> List[dict]:
-        """Direct audio→English translation using Whisper's native translate task.
+        """DEPRECATED: prefer ASR transcribe → NMT/LLM translate pipeline.
 
-        This bypasses the two-step error amplification problem:
-          BAD:  ja audio → Whisper(ja text) → Google(en text)  [errors × errors]
-          GOOD: ja audio → Whisper(en text directly)           [single step]
+        Whisper's built-in translate task produces lower quality than a
+        dedicated NMT pass on most benchmarks. This method is retained
+        for backward compatibility and as a fallback when no NMT engine
+        is available.
 
-        Whisper's translate task is trained on multilingual audio→English pairs.
-        It handles proper nouns better because it hears the audio directly
-        rather than trying to transcribe Japanese text first (where names
-        like ゼクス become "Z/X" and then Google translates that literally).
-
-        Returns: [{start_sec, end_sec, text, words}] in English
+        When ``TRANSLATION_ENGINE`` is set to anything other than
+        ``"whisper"`` / ``""``, this method returns an empty list so the
+        caller falls through to the ASR + NMT path defined in
+        ``backend/services/translator.py``.
         """
         log = get_logger()
+
+        try:
+            from backend.config import settings as _app_settings
+            _engine = (getattr(_app_settings, "TRANSLATION_ENGINE", "") or "").lower()
+        except Exception:
+            _engine = ""
+        if _engine and _engine not in ("whisper", ""):
+            log.log_stage(
+                'TRANSLATE',
+                f'Whisper native translate skipped (TRANSLATION_ENGINE={_engine}) '
+                f'— use ASR→NMT pipeline instead',
+            )
+            return []
 
         if not self.engine:
             log.log_stage('TRANSLATE',

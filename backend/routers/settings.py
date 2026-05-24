@@ -49,6 +49,8 @@ _PLACEHOLDER_KEYS = {"sk-or-...", "sk-ant-...", "AIza...", "gsk_...", "r8_...", 
 _PERSISTABLE_KEYS = [
     "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "GROQ_API_KEY",
     "HF_AUTH_TOKEN", "REPLICATE_API_KEY",
+    # Translation cloud NMT secrets.
+    "GOOGLE_TRANSLATE_API_KEY", "DEEPL_API_KEY",
     "OPENROUTER_PRESET", "OPENROUTER_PRIMARY_MODEL", "OPENROUTER_EDITORIAL_MODEL",
     "OPENROUTER_SUMMARY_MODEL", "OLLAMA_PRIMARY_MODEL", "OLLAMA_EDITORIAL_MODEL", "OLLAMA_TRANSLATION_MODEL",
     "WHISPER_MODEL", "WHISPER_MODEL_USER_SET", "WHISPER_BEAM_SIZE",
@@ -61,6 +63,20 @@ _PERSISTABLE_KEYS = [
     "VIDEOLLAMA3_REFINEMENT_PASS", "VIDEOLLAMA3_KEYFRAME_ANALYSIS",
     "VIDEOLLAMA3_AUDIO_ANNOTATION", "VIDEOLLAMA3_ADAPTIVE_CHUNKS",
     "VIDEOLLAMA3_CHUNK_MIN_S", "VIDEOLLAMA3_CHUNK_MAX_S",
+    # Transcript polishing toggles.
+    "TRANSCRIPT_POLISHING_ENABLED", "TRANSCRIPT_POLISHING_BATCH_SIZE",
+    "TRANSCRIPT_FILLER_REMOVAL", "TRANSCRIPT_SENTENCE_REPAIR",
+    # Subtitle readability + safe-zone toggles.
+    "SUBTITLE_CPS_ENFORCEMENT", "SUBTITLE_MAX_CPS", "SUBTITLE_MAX_CHARS_PER_LINE",
+    "SUBTITLE_MIN_DURATION_MS", "SUBTITLE_MAX_DURATION_MS",
+    "SUBTITLE_SMART_LINE_BREAKS", "SUBTITLE_PLATFORM_SAFE_ZONES",
+    "SUBTITLE_PLATFORM_PROFILE",
+    # Translation engine + glossary toggles.
+    "TRANSLATION_ENGINE", "TRANSLATION_CONTEXT_WINDOW",
+    "TRANSLATION_GLOSSARY_ENABLED",
+    # Audio event detection toggles.
+    "AUDIO_EVENT_DETECTION", "AUDIO_EVENTS_IN_SUBTITLES",
+    "AUDIO_MUSIC_DETECTION",
     "SELF_HOSTED_MODE", "CLIP_ENGINE_SOURCE", "EDITORIAL_AI_SOURCE",
     "FFMPEG_PRESET", "FFMPEG_CRF", "FFMPEG_THREADS", "FFMPEG_FASTSTART",
     "GPU_ACCELERATION_ENABLED", "GPU_VENDOR_OVERRIDE",
@@ -78,6 +94,8 @@ _PERSISTABLE_KEYS = [
 _API_KEY_FIELDS = {
     "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "GROQ_API_KEY",
     "HF_AUTH_TOKEN", "REPLICATE_API_KEY",
+    # Translation cloud NMT secrets.
+    "GOOGLE_TRANSLATE_API_KEY", "DEEPL_API_KEY",
     # Cloud client secrets — same "never overwrite with blank" rule.
     "GOOGLE_DRIVE_CLIENT_SECRET", "BOX_CLIENT_SECRET",
 }
@@ -2983,3 +3001,216 @@ async def put_ui_state(request: Request):
             state[key] = value
     _save_ui_state(state)
     return {"status": "saved", "keys": len(state)}
+
+
+# ─── Subtitle Quality + Translation Engine settings ───────────────────────
+
+
+def _subtitle_quality_state() -> dict:
+    """Return the current subtitle / translation / audio-event settings."""
+    return {
+        "subtitle_cps_enforcement": bool(getattr(settings, "SUBTITLE_CPS_ENFORCEMENT", True)),
+        "subtitle_max_cps": float(getattr(settings, "SUBTITLE_MAX_CPS", 20.0)),
+        "subtitle_max_chars_per_line": int(getattr(settings, "SUBTITLE_MAX_CHARS_PER_LINE", 42)),
+        "subtitle_min_duration_ms": int(getattr(settings, "SUBTITLE_MIN_DURATION_MS", 833)),
+        "subtitle_max_duration_ms": int(getattr(settings, "SUBTITLE_MAX_DURATION_MS", 7000)),
+        "subtitle_smart_line_breaks": bool(getattr(settings, "SUBTITLE_SMART_LINE_BREAKS", True)),
+        "subtitle_platform_safe_zones": bool(getattr(settings, "SUBTITLE_PLATFORM_SAFE_ZONES", True)),
+        "subtitle_platform_profile": str(getattr(settings, "SUBTITLE_PLATFORM_PROFILE", "") or ""),
+        "transcript_polishing_enabled": bool(getattr(settings, "TRANSCRIPT_POLISHING_ENABLED", True)),
+        "transcript_filler_removal": bool(getattr(settings, "TRANSCRIPT_FILLER_REMOVAL", True)),
+        "transcript_sentence_repair": bool(getattr(settings, "TRANSCRIPT_SENTENCE_REPAIR", True)),
+        "translation_engine": str(getattr(settings, "TRANSLATION_ENGINE", "auto")),
+        "translation_context_window": int(getattr(settings, "TRANSLATION_CONTEXT_WINDOW", 5)),
+        "translation_glossary_enabled": bool(getattr(settings, "TRANSLATION_GLOSSARY_ENABLED", True)),
+        "audio_event_detection": bool(getattr(settings, "AUDIO_EVENT_DETECTION", True)),
+        "audio_events_in_subtitles": bool(getattr(settings, "AUDIO_EVENTS_IN_SUBTITLES", False)),
+        "audio_music_detection": bool(getattr(settings, "AUDIO_MUSIC_DETECTION", True)),
+        "google_translate_configured": bool(
+            (getattr(settings, "GOOGLE_TRANSLATE_API_KEY", "") or "").strip()
+        ),
+        "deepl_configured": bool(
+            (getattr(settings, "DEEPL_API_KEY", "") or "").strip()
+        ),
+    }
+
+
+class SaveSubtitleQualityRequest(BaseModel):
+    subtitle_cps_enforcement: Optional[bool] = None
+    subtitle_max_cps: Optional[float] = None
+    subtitle_max_chars_per_line: Optional[int] = None
+    subtitle_min_duration_ms: Optional[int] = None
+    subtitle_max_duration_ms: Optional[int] = None
+    subtitle_smart_line_breaks: Optional[bool] = None
+    subtitle_platform_safe_zones: Optional[bool] = None
+    subtitle_platform_profile: Optional[str] = None
+    transcript_polishing_enabled: Optional[bool] = None
+    transcript_filler_removal: Optional[bool] = None
+    transcript_sentence_repair: Optional[bool] = None
+    translation_engine: Optional[str] = None
+    translation_context_window: Optional[int] = None
+    translation_glossary_enabled: Optional[bool] = None
+    audio_event_detection: Optional[bool] = None
+    audio_events_in_subtitles: Optional[bool] = None
+    audio_music_detection: Optional[bool] = None
+    google_translate_api_key: Optional[str] = None
+    deepl_api_key: Optional[str] = None
+
+
+_VALID_TRANSLATION_ENGINES = {"auto", "llm", "nllb", "opus-mt", "google", "deepl", "whisper"}
+_VALID_PLATFORM_PROFILES = {"", "tiktok", "reels", "shorts", "horizontal", "square"}
+
+
+@router.get("/subtitle-quality/settings")
+async def get_subtitle_quality():
+    """Return the subtitle / translation / audio-event settings."""
+    return _subtitle_quality_state()
+
+
+@router.post("/subtitle-quality/settings")
+async def save_subtitle_quality(req: SaveSubtitleQualityRequest):
+    """Save subtitle / translation / audio-event settings."""
+    if req.subtitle_cps_enforcement is not None:
+        settings.SUBTITLE_CPS_ENFORCEMENT = bool(req.subtitle_cps_enforcement)
+    if req.subtitle_max_cps is not None:
+        settings.SUBTITLE_MAX_CPS = max(5.0, min(30.0, float(req.subtitle_max_cps)))
+    if req.subtitle_max_chars_per_line is not None:
+        settings.SUBTITLE_MAX_CHARS_PER_LINE = max(20, min(80, int(req.subtitle_max_chars_per_line)))
+    if req.subtitle_min_duration_ms is not None:
+        settings.SUBTITLE_MIN_DURATION_MS = max(100, min(5000, int(req.subtitle_min_duration_ms)))
+    if req.subtitle_max_duration_ms is not None:
+        settings.SUBTITLE_MAX_DURATION_MS = max(1000, min(15000, int(req.subtitle_max_duration_ms)))
+    if settings.SUBTITLE_MIN_DURATION_MS > settings.SUBTITLE_MAX_DURATION_MS:
+        settings.SUBTITLE_MIN_DURATION_MS, settings.SUBTITLE_MAX_DURATION_MS = (
+            settings.SUBTITLE_MAX_DURATION_MS, settings.SUBTITLE_MIN_DURATION_MS,
+        )
+    if req.subtitle_smart_line_breaks is not None:
+        settings.SUBTITLE_SMART_LINE_BREAKS = bool(req.subtitle_smart_line_breaks)
+    if req.subtitle_platform_safe_zones is not None:
+        settings.SUBTITLE_PLATFORM_SAFE_ZONES = bool(req.subtitle_platform_safe_zones)
+    if req.subtitle_platform_profile is not None:
+        profile = (req.subtitle_platform_profile or "").strip().lower()
+        if profile in _VALID_PLATFORM_PROFILES:
+            settings.SUBTITLE_PLATFORM_PROFILE = profile
+    if req.transcript_polishing_enabled is not None:
+        settings.TRANSCRIPT_POLISHING_ENABLED = bool(req.transcript_polishing_enabled)
+    if req.transcript_filler_removal is not None:
+        settings.TRANSCRIPT_FILLER_REMOVAL = bool(req.transcript_filler_removal)
+    if req.transcript_sentence_repair is not None:
+        settings.TRANSCRIPT_SENTENCE_REPAIR = bool(req.transcript_sentence_repair)
+    if req.translation_engine is not None:
+        engine = (req.translation_engine or "").strip().lower()
+        if engine in _VALID_TRANSLATION_ENGINES:
+            settings.TRANSLATION_ENGINE = engine
+    if req.translation_context_window is not None:
+        settings.TRANSLATION_CONTEXT_WINDOW = max(0, min(20, int(req.translation_context_window)))
+    if req.translation_glossary_enabled is not None:
+        settings.TRANSLATION_GLOSSARY_ENABLED = bool(req.translation_glossary_enabled)
+    if req.audio_event_detection is not None:
+        settings.AUDIO_EVENT_DETECTION = bool(req.audio_event_detection)
+    if req.audio_events_in_subtitles is not None:
+        settings.AUDIO_EVENTS_IN_SUBTITLES = bool(req.audio_events_in_subtitles)
+    if req.audio_music_detection is not None:
+        settings.AUDIO_MUSIC_DETECTION = bool(req.audio_music_detection)
+    # API keys — never persist blanks (mirrors the other API-key handlers).
+    if req.google_translate_api_key is not None and req.google_translate_api_key.strip():
+        settings.GOOGLE_TRANSLATE_API_KEY = req.google_translate_api_key.strip()
+    if req.deepl_api_key is not None and req.deepl_api_key.strip():
+        settings.DEEPL_API_KEY = req.deepl_api_key.strip()
+    _invalidate_status_cache()
+    _persist_user_settings()
+    return {"status": "saved", **_subtitle_quality_state()}
+
+
+# ─── Per-job glossary (KNP) endpoint ──────────────────────────────────────
+
+
+class SaveGlossaryRequest(BaseModel):
+    terms: dict = {}
+
+
+@router.post("/jobs/{job_id}/glossary")
+async def save_job_glossary(job_id: str, req: SaveGlossaryRequest):
+    """Persist a per-job Key Name and Phrases (KNP) glossary.
+
+    The translator looks for ``/data/uploads/{job_id}/glossary.json``
+    at translation time and pins these terms in the prompt so they get
+    translated consistently across all batches.
+    """
+    if not isinstance(req.terms, dict):
+        return {"status": "error", "message": "terms must be an object"}
+    safe_terms: dict[str, str] = {}
+    for k, v in req.terms.items():
+        ks = str(k or "").strip()
+        vs = str(v or "").strip()
+        if ks and vs and len(ks) <= 200 and len(vs) <= 200:
+            safe_terms[ks] = vs
+    job_dir = f"/data/uploads/{job_id}"
+    if not os.path.isdir(job_dir):
+        # Fall back to local repo path for tests / non-Docker dev.
+        job_dir = os.path.join(_DATA_DIR, "uploads", job_id)
+        os.makedirs(job_dir, exist_ok=True)
+    path = os.path.join(job_dir, "glossary.json")
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"terms": safe_terms}, fh, ensure_ascii=False, indent=2)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+    return {"status": "saved", "term_count": len(safe_terms), "path": path}
+
+
+@router.get("/jobs/{job_id}/glossary")
+async def get_job_glossary(job_id: str):
+    """Return the per-job glossary if it exists."""
+    candidates = [
+        f"/data/uploads/{job_id}/glossary.json",
+        os.path.join(_DATA_DIR, "uploads", job_id, "glossary.json"),
+    ]
+    for path in candidates:
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            terms = data.get("terms", data) if isinstance(data, dict) else {}
+            if not isinstance(terms, dict):
+                terms = {}
+            return {"terms": terms, "term_count": len(terms)}
+        except Exception:
+            continue
+    return {"terms": {}, "term_count": 0}
+
+
+# ─── NMT model download endpoint (on-demand) ──────────────────────────────
+
+
+class DownloadNMTRequest(BaseModel):
+    engine: str = "nllb"   # "nllb" | "opus-mt"
+    source: Optional[str] = None
+    target: Optional[str] = None
+
+
+@router.post("/translation/download-model")
+async def download_nmt_model(req: DownloadNMTRequest):
+    """Download + convert an NMT model on demand. NEVER triggered at
+    startup — only when the user explicitly clicks the download button
+    in the Settings UI. The conversion can take several minutes and
+    requires several hundred MB to a few GB of disk."""
+    engine = (req.engine or "nllb").lower()
+    if engine == "nllb":
+        try:
+            from backend.services.nmt_translator import ensure_nllb_downloaded
+            path = await asyncio.to_thread(ensure_nllb_downloaded)
+            return {"status": "ok", "engine": "nllb", "path": path}
+        except Exception as e:
+            return {"status": "error", "engine": "nllb", "message": str(e)}
+    if engine == "opus-mt":
+        if not req.source or not req.target:
+            return {"status": "error", "message": "source + target language codes required for opus-mt"}
+        try:
+            from backend.services.nmt_translator import ensure_opus_mt_downloaded
+            path = await asyncio.to_thread(ensure_opus_mt_downloaded, req.source, req.target)
+            return {"status": "ok", "engine": "opus-mt", "path": path}
+        except Exception as e:
+            return {"status": "error", "engine": "opus-mt", "message": str(e)}
+    return {"status": "error", "message": f"unknown engine: {engine}"}

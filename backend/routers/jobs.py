@@ -368,6 +368,43 @@ async def download_srt(job_id: str, speakers: bool = True):
     )
 
 
+@router.get("/jobs/{job_id}/transcript.vtt")
+async def download_vtt(
+    job_id: str,
+    speakers: bool = True,
+    include_position: bool = False,
+    platform: str = "horizontal",
+):
+    """Download the transcript as a WebVTT subtitle file.
+
+    Pass ``include_position=true`` and ``platform=tiktok|reels|shorts``
+    to embed safe-zone position cues for short-form platforms.
+    """
+    job = await database.load_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if not job.transcript:
+        raise HTTPException(status_code=404, detail="No transcript available")
+
+    from backend.services.vtt_generator import generate_vtt
+    segments = [TranscriptSegment(**s) if isinstance(s, dict) else s for s in job.transcript]
+    vtt_content = generate_vtt(
+        segments,
+        include_speakers=speakers,
+        include_position=include_position,
+        platform=platform,
+    )
+
+    base = job.filename.rsplit(".", 1)[0] if "." in job.filename else job.filename
+    filename = f"{base}.vtt"
+
+    return Response(
+        content=vtt_content,
+        media_type="text/vtt; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @router.delete("/jobs/{job_id}/speakers/{speaker}")
 async def delete_speaker(
     job_id: str,

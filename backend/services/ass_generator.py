@@ -361,6 +361,8 @@ def generate_ass(
     active_word_bg_opacity: int = 0,
     active_word_bg_radius: int = 4,
     hook_text: str = "",
+    platform: str = "",
+    enforce_readability_rules: bool | None = None,
 ) -> str:
     """Generate an ASS subtitle string from transcript segments within a time range.
 
@@ -374,8 +376,67 @@ def generate_ass(
     content_inset_h: extra horizontal margin (px) to keep subtitles within the
     actual video content area when blur-background pillarboxing is present.
     Applied for all positions including center.
+
+    platform: optional safe-zone profile name ("tiktok" | "reels" | "shorts" |
+    "horizontal" | "square"). When set and ``SUBTITLE_PLATFORM_SAFE_ZONES``
+    is True, additional content-inset margins are added so subtitles avoid
+    the platform's UI overlays (subscribe button, creator badge, etc.).
+
+    enforce_readability_rules: when None (the default), follows the
+    ``SUBTITLE_CPS_ENFORCEMENT`` setting. When set explicitly, overrides it
+    for this call. Pass False to skip the readability preprocessor entirely
+    (preserves byte-for-byte legacy behavior).
     """
     speaker_colors = speaker_colors or {}
+
+    # ── Readability preprocessing (CPS / line-length / duration) ──
+    try:
+        from backend.config import settings as _app_settings
+    except Exception:
+        _app_settings = None
+    _enforce = enforce_readability_rules
+    if _enforce is None:
+        _enforce = bool(getattr(_app_settings, "SUBTITLE_CPS_ENFORCEMENT", False))
+    if _enforce and segments:
+        try:
+            from backend.services.subtitle_formatter import enforce_readability
+            segments = enforce_readability(
+                segments,
+                max_cps=float(getattr(_app_settings, "SUBTITLE_MAX_CPS", 20.0)),
+                max_chars_per_line=int(getattr(_app_settings, "SUBTITLE_MAX_CHARS_PER_LINE", 42)),
+                min_duration_ms=int(getattr(_app_settings, "SUBTITLE_MIN_DURATION_MS", 833)),
+                max_duration_ms=int(getattr(_app_settings, "SUBTITLE_MAX_DURATION_MS", 7000)),
+                smart_line_breaks=bool(getattr(_app_settings, "SUBTITLE_SMART_LINE_BREAKS", True)),
+            )
+        except Exception:
+            # Never let readability formatting break ASS generation.
+            pass
+
+    # ── Platform safe-zone margins (added on top of any caller inset) ──
+    _platform_name = (platform or "").strip().lower()
+    if (
+        _platform_name
+        and bool(getattr(_app_settings, "SUBTITLE_PLATFORM_SAFE_ZONES", False))
+    ):
+        try:
+            from backend.services.subtitle_formatter import get_safe_zone_margins
+            zone = get_safe_zone_margins(_platform_name, video_width, video_height)
+            # Translate the per-side margin into an additional content
+            # inset. For top alignment use the top margin; for bottom use
+            # the bottom margin; for middle/center take half the larger.
+            pos_lc = (position or "bottom").strip().lower()
+            if pos_lc == "top":
+                extra_v = zone["top_px"]
+            elif pos_lc == "center":
+                extra_v = max(zone["top_px"], zone["bottom_px"]) // 2
+            else:
+                extra_v = zone["bottom_px"]
+            extra_h = max(zone["left_px"], zone["right_px"])
+            content_inset_v = int(content_inset_v) + int(extra_v)
+            content_inset_h = int(content_inset_h) + int(extra_h)
+        except Exception:
+            pass
+
     if isinstance(font_size, (int, float)):
         size_px = int(font_size)
     else:

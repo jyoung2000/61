@@ -152,6 +152,47 @@ class Settings(BaseSettings):
     # AI transcript post-correction
     AI_TRANSCRIPT_CORRECTION: bool = True  # Use LLM to fix proper nouns, punctuation, fillers
 
+    # ── Transcript Polishing (real implementation) ──
+    # When True, the post-analysis pipeline routes the transcript through
+    # backend/services/transcript_polisher.py — a batched LLM corrector
+    # that fixes proper nouns, punctuation, fillers, and sentence
+    # boundaries. When False, the inert compat_stubs.correct_transcript
+    # pass-through is used (the legacy behavior).
+    TRANSCRIPT_POLISHING_ENABLED: bool = True
+    TRANSCRIPT_POLISHING_BATCH_SIZE: int = 15   # segments per LLM call
+    TRANSCRIPT_FILLER_REMOVAL: bool = True      # remove um, uh, like, you know
+    TRANSCRIPT_SENTENCE_REPAIR: bool = True     # fix run-on/fragmented sentences
+
+    # ── Subtitle Readability + Safe Zones ──
+    # Enforces Netflix-style CPS / line-length / duration limits and
+    # platform-specific safe-zone margins for TikTok / Reels / Shorts.
+    # Wired into srt_generator + ass_generator as a preprocessing step.
+    SUBTITLE_CPS_ENFORCEMENT: bool = True       # enforce reading speed limits
+    SUBTITLE_MAX_CPS: float = 20.0              # chars/sec (Netflix adult standard)
+    SUBTITLE_MAX_CHARS_PER_LINE: int = 42       # Netflix Latin standard
+    SUBTITLE_MIN_DURATION_MS: int = 833         # 5/6 second (Netflix minimum)
+    SUBTITLE_MAX_DURATION_MS: int = 7000        # 7 seconds (Netflix maximum)
+    SUBTITLE_SMART_LINE_BREAKS: bool = True     # linguistic boundary breaks
+    SUBTITLE_PLATFORM_SAFE_ZONES: bool = True   # per-platform margin profiles
+    SUBTITLE_PLATFORM_PROFILE: str = ""         # "" | tiktok | reels | shorts | horizontal | square
+
+    # ── Translation Engine ──
+    # ``auto`` picks the best available engine: DeepL > Google > Opus-MT > NLLB > LLM.
+    # Force a specific engine to bypass auto-selection.
+    TRANSLATION_ENGINE: str = "auto"            # auto | llm | nllb | opus-mt | google | deepl | whisper
+    TRANSLATION_CONTEXT_WINDOW: int = 5         # segments before/after for context
+    TRANSLATION_GLOSSARY_ENABLED: bool = True   # per-video KNP glossary support
+    GOOGLE_TRANSLATE_API_KEY: str = ""          # for Google Cloud Translation v3
+    DEEPL_API_KEY: str = ""                     # for DeepL API
+    # NMT model identifiers — downloaded on demand (NOT at startup).
+    NMT_NLLB_MODEL: str = "facebook/nllb-200-distilled-600M"
+    NMT_OPUS_MT_TEMPLATE: str = "Helsinki-NLP/opus-mt-{src}-{tgt}"
+
+    # ── Audio Analysis ──
+    AUDIO_EVENT_DETECTION: bool = True          # spectral audio event classification
+    AUDIO_EVENTS_IN_SUBTITLES: bool = False     # inject [applause], [music] into subtitle track
+    AUDIO_MUSIC_DETECTION: bool = True          # detect sustained harmonic content
+
     # Speaker diarization (pyannote)
     DIARIZATION_ENABLED: bool = True  # Use pyannote for real speaker diarization
     DIARIZATION_MIN_SPEAKERS: int = 1

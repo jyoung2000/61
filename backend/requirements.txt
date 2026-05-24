@@ -37,3 +37,8 @@ torch>=2.0.0
 # Enabled via CLIPAI_FACE_EMBEDDING=arcface (default: sface).
 insightface==0.7.3
 onnxruntime>=1.17.0
+# SentencePiece tokenizer for NLLB-200 / Opus-MT NMT translation.
+# ctranslate2 is already installed by faster-whisper; the actual NLLB and
+# Opus-MT model weights are downloaded on demand via the Settings UI
+# (see backend/services/nmt_translator.py).
+sentencepiece>=0.1.99
