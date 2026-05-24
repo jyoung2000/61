@@ -347,24 +347,59 @@ async def trigger_analysis(job_id: str, background_tasks: BackgroundTasks):
 
 
 @router.get("/jobs/{job_id}/transcript.srt")
-async def download_srt(job_id: str, speakers: bool = True):
-    """Download the transcript as a speaker-separated SRT subtitle file."""
+async def download_srt(
+    job_id: str,
+    speakers: bool = True,
+    translated: bool = True,
+):
+    """Download the transcript as a speaker-separated SRT subtitle file.
+
+    When ``translated=true`` (default) and the job has a non-empty
+    ``translated_transcript``, the translated version is served and the
+    filename gets a ``_translated`` suffix. Pass ``translated=false`` to
+    force the original-language transcript.
+    """
     job = await database.load_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    if not job.transcript:
+
+    source = job.transcript
+    lang_suffix = ""
+    if translated and job.translated_transcript and len(job.translated_transcript) > 0:
+        source = job.translated_transcript
+        lang_suffix = "_translated"
+
+    if not source:
         raise HTTPException(status_code=404, detail="No transcript available")
 
-    segments = [TranscriptSegment(**s) if isinstance(s, dict) else s for s in job.transcript]
+    segments = [TranscriptSegment(**s) if isinstance(s, dict) else s for s in source]
     srt_content = generate_srt(segments, include_speakers=speakers)
 
     base = job.filename.rsplit(".", 1)[0] if "." in job.filename else job.filename
-    filename = f"{base}.srt"
+    filename = f"{base}{lang_suffix}.srt"
 
     return Response(
         content=srt_content,
         media_type="text/srt; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/jobs/{job_id}/transcript_original.srt")
+async def download_original_srt(job_id: str, speakers: bool = True):
+    """Download the original-language transcript (never the translation)."""
+    job = await database.load_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if not job.transcript:
+        raise HTTPException(status_code=404, detail="No transcript available")
+    segments = [TranscriptSegment(**s) if isinstance(s, dict) else s for s in job.transcript]
+    srt_content = generate_srt(segments, include_speakers=speakers)
+    base = job.filename.rsplit(".", 1)[0] if "." in job.filename else job.filename
+    return Response(
+        content=srt_content,
+        media_type="text/srt; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{base}_original.srt"'},
     )
 
 
@@ -374,20 +409,31 @@ async def download_vtt(
     speakers: bool = True,
     include_position: bool = False,
     platform: str = "horizontal",
+    translated: bool = True,
 ):
     """Download the transcript as a WebVTT subtitle file.
 
     Pass ``include_position=true`` and ``platform=tiktok|reels|shorts``
-    to embed safe-zone position cues for short-form platforms.
+    to embed safe-zone position cues for short-form platforms. When
+    ``translated=true`` (default) and a translated transcript exists,
+    the translated version is served and the filename gets a
+    ``_translated`` suffix.
     """
     job = await database.load_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    if not job.transcript:
+
+    source = job.transcript
+    lang_suffix = ""
+    if translated and job.translated_transcript and len(job.translated_transcript) > 0:
+        source = job.translated_transcript
+        lang_suffix = "_translated"
+
+    if not source:
         raise HTTPException(status_code=404, detail="No transcript available")
 
     from backend.services.vtt_generator import generate_vtt
-    segments = [TranscriptSegment(**s) if isinstance(s, dict) else s for s in job.transcript]
+    segments = [TranscriptSegment(**s) if isinstance(s, dict) else s for s in source]
     vtt_content = generate_vtt(
         segments,
         include_speakers=speakers,
@@ -396,7 +442,7 @@ async def download_vtt(
     )
 
     base = job.filename.rsplit(".", 1)[0] if "." in job.filename else job.filename
-    filename = f"{base}.vtt"
+    filename = f"{base}{lang_suffix}.vtt"
 
     return Response(
         content=vtt_content,

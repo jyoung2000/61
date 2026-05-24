@@ -6200,6 +6200,7 @@ async def export_clip(
                 active_word_bg_opacity=settings.get("active_word_bg_opacity", 0),
                 active_word_bg_radius=settings.get("active_word_bg_radius", 4),
                 hook_text=hook_text,
+                platform=settings.get("platform", ""),
             )
 
             if ass_content:

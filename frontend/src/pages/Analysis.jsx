@@ -444,6 +444,25 @@ export default function Analysis() {
   const [fullVideoRange, setFullVideoRange] = useState(null); // { start, end } for full video editor
   const [showInlineSubSettings, setShowInlineSubSettings] = useState(false);
 
+  // When both an original and a translated transcript exist, this lets the
+  // user flip the entire UI (transcript viewer + subtitle overlay preview)
+  // between the two. Default false = show translated. The toggle pill in
+  // TranscriptViewer's header drives this.
+  const [showOriginalTranscript, setShowOriginalTranscript] = useState(false);
+
+  // Single source of truth for which transcript to render across the
+  // SubtitleOverlay previews, VideoEditor, and TranscriptViewer. When a
+  // translation exists we prefer it by default; the toggle flips back to
+  // the original. When no translation exists, always falls back to the
+  // original transcript.
+  const hasTranslation = (job?.translated_transcript?.length || 0) > 0;
+  const activeTranscript = useMemo(() => {
+    const original = job?.transcript || [];
+    const translated = job?.translated_transcript || [];
+    if (!hasTranslation) return original;
+    return showOriginalTranscript ? original : translated;
+  }, [job?.transcript, job?.translated_transcript, hasTranslation, showOriginalTranscript]);
+
   // ── Mark Key Scene inline state ──
   const [showMarkScene, setShowMarkScene] = useState(false);
   const [markSceneDesc, setMarkSceneDesc] = useState('');
@@ -2363,7 +2382,7 @@ export default function Analysis() {
               onSettingsChange={setClipSettings}
               jobId={jobId}
               clipId={clipPreview.id}
-              transcript={job.translated_transcript?.length ? job.translated_transcript : (job.transcript || [])}
+              transcript={activeTranscript}
               onTranscriptUpdated={fetchJob}
               isProcessing={isProcessing}
               onSubjectKeyframes={setEditorSubjectKeyframes}
@@ -2389,7 +2408,7 @@ export default function Analysis() {
               subtitleOverlay={
                 <SubtitleOverlay
                   currentTime={videoCurrentTime}
-                  transcript={job.translated_transcript?.length ? job.translated_transcript : (job.transcript || [])}
+                  transcript={activeTranscript}
                   clipStart={clipPreview.start_time}
                   clipEnd={clipPreview.end_time}
                   settings={clipSettings}
@@ -2468,14 +2487,14 @@ export default function Analysis() {
               speakerNames={job.speaker_names}
               onSettingsChange={setClipSettings}
               jobId={jobId}
-              transcript={job.translated_transcript?.length ? job.translated_transcript : (job.transcript || [])}
+              transcript={activeTranscript}
               onTranscriptUpdated={fetchJob}
               isProcessing={isProcessing}
               onSubjectKeyframes={setEditorSubjectKeyframes}
               subtitleOverlay={
                 <SubtitleOverlay
                   currentTime={videoCurrentTime}
-                  transcript={job.translated_transcript?.length ? job.translated_transcript : (job.transcript || [])}
+                  transcript={activeTranscript}
                   clipStart={fullVideoRange ? fullVideoRange.start : 0}
                   clipEnd={fullVideoRange ? fullVideoRange.end : (job.duration || 0)}
                   settings={clipSettings}
@@ -3042,39 +3061,135 @@ export default function Analysis() {
                   >
                     Update Subtitles
                   </button>
-                  <a
-                    href={`/api/jobs/${jobId}/transcript.srt`}
-                    download
-                    style={{
-                      padding: '6px 14px',
-                      background: 'var(--bg-elevated)',
-                      color: 'var(--accent-cyan)',
-                      border: '1px solid var(--border)',
-                      borderRadius: 'var(--radius-sm)',
-                      fontSize: 12,
-                      fontWeight: 600,
-                      textDecoration: 'none',
-                      fontFamily: 'var(--font-mono)',
-                    }}
-                  >
-                    &#x2B07; Download SRT (with speakers)
-                  </a>
-                  <a
-                    href={`/api/jobs/${jobId}/transcript.srt?speakers=false`}
-                    download
-                    style={{
-                      padding: '6px 14px',
-                      background: 'var(--bg-elevated)',
-                      color: 'var(--text-secondary)',
-                      border: '1px solid var(--border)',
-                      borderRadius: 'var(--radius-sm)',
-                      fontSize: 12,
-                      textDecoration: 'none',
-                      fontFamily: 'var(--font-mono)',
-                    }}
-                  >
-                    &#x2B07; SRT (no speakers)
-                  </a>
+                  {/* Download buttons — when a translated transcript exists,
+                      offer both the translated default and the original
+                      explicitly. Falls back to a single download row when
+                      there's no translation. */}
+                  {(job?.translated_transcript?.length || 0) > 0 ? (
+                    <>
+                      <a
+                        href={`/api/jobs/${jobId}/transcript.srt`}
+                        download
+                        title="Download translated SRT (with speakers)"
+                        style={{
+                          padding: '6px 14px',
+                          background: 'var(--bg-elevated)',
+                          color: 'var(--accent-cyan)',
+                          border: '1px solid var(--border)',
+                          borderRadius: 'var(--radius-sm)',
+                          fontSize: 12,
+                          fontWeight: 600,
+                          textDecoration: 'none',
+                          fontFamily: 'var(--font-mono)',
+                        }}
+                      >
+                        &#x2B07; SRT (Translated)
+                      </a>
+                      <a
+                        href={`/api/jobs/${jobId}/transcript.srt?translated=false`}
+                        download
+                        title="Download the original-language SRT"
+                        style={{
+                          padding: '6px 14px',
+                          background: 'var(--bg-elevated)',
+                          color: 'var(--text-secondary)',
+                          border: '1px solid var(--border)',
+                          borderRadius: 'var(--radius-sm)',
+                          fontSize: 12,
+                          textDecoration: 'none',
+                          fontFamily: 'var(--font-mono)',
+                        }}
+                      >
+                        &#x2B07; SRT (Original)
+                      </a>
+                      <a
+                        href={`/api/jobs/${jobId}/transcript.vtt`}
+                        download
+                        title="Download translated WebVTT"
+                        style={{
+                          padding: '6px 14px',
+                          background: 'var(--bg-elevated)',
+                          color: 'var(--text-secondary)',
+                          border: '1px solid var(--border)',
+                          borderRadius: 'var(--radius-sm)',
+                          fontSize: 12,
+                          textDecoration: 'none',
+                          fontFamily: 'var(--font-mono)',
+                        }}
+                      >
+                        &#x2B07; VTT
+                      </a>
+                      <a
+                        href={`/api/jobs/${jobId}/transcript.srt?speakers=false`}
+                        download
+                        title="Download translated SRT without speaker labels"
+                        style={{
+                          padding: '6px 14px',
+                          background: 'var(--bg-elevated)',
+                          color: 'var(--text-secondary)',
+                          border: '1px solid var(--border)',
+                          borderRadius: 'var(--radius-sm)',
+                          fontSize: 12,
+                          textDecoration: 'none',
+                          fontFamily: 'var(--font-mono)',
+                        }}
+                      >
+                        &#x2B07; SRT (no speakers)
+                      </a>
+                    </>
+                  ) : (
+                    <>
+                      <a
+                        href={`/api/jobs/${jobId}/transcript.srt`}
+                        download
+                        style={{
+                          padding: '6px 14px',
+                          background: 'var(--bg-elevated)',
+                          color: 'var(--accent-cyan)',
+                          border: '1px solid var(--border)',
+                          borderRadius: 'var(--radius-sm)',
+                          fontSize: 12,
+                          fontWeight: 600,
+                          textDecoration: 'none',
+                          fontFamily: 'var(--font-mono)',
+                        }}
+                      >
+                        &#x2B07; Download SRT (with speakers)
+                      </a>
+                      <a
+                        href={`/api/jobs/${jobId}/transcript.srt?speakers=false`}
+                        download
+                        style={{
+                          padding: '6px 14px',
+                          background: 'var(--bg-elevated)',
+                          color: 'var(--text-secondary)',
+                          border: '1px solid var(--border)',
+                          borderRadius: 'var(--radius-sm)',
+                          fontSize: 12,
+                          textDecoration: 'none',
+                          fontFamily: 'var(--font-mono)',
+                        }}
+                      >
+                        &#x2B07; SRT (no speakers)
+                      </a>
+                      <a
+                        href={`/api/jobs/${jobId}/transcript.vtt`}
+                        download
+                        style={{
+                          padding: '6px 14px',
+                          background: 'var(--bg-elevated)',
+                          color: 'var(--text-secondary)',
+                          border: '1px solid var(--border)',
+                          borderRadius: 'var(--radius-sm)',
+                          fontSize: 12,
+                          textDecoration: 'none',
+                          fontFamily: 'var(--font-mono)',
+                        }}
+                      >
+                        &#x2B07; VTT
+                      </a>
+                    </>
+                  )}
                   <button
                     onClick={handleRetranscribe}
                     disabled={retranscribing || job?.status === 'transcribing' || job?.status === 'processing'}
@@ -3150,7 +3265,7 @@ export default function Analysis() {
                 </div>
 
                 <TranscriptViewer
-                  transcript={job.translated_transcript?.length ? job.translated_transcript : (job.transcript || [])}
+                  transcript={activeTranscript}
                   currentTime={videoCurrentTime}
                   speakerColors={clipSettings?.speakerColors}
                   onSpeakerColorChanged={handleSpeakerColorChanged}
@@ -3159,6 +3274,9 @@ export default function Analysis() {
                   jobId={jobId}
                   onSpeakerRenamed={fetchJob}
                   onTranscriptUpdated={fetchJob}
+                  hasTranslation={hasTranslation}
+                  showingOriginal={showOriginalTranscript}
+                  onToggleOriginal={() => setShowOriginalTranscript((prev) => !prev)}
                 />
               </div>
             </div>

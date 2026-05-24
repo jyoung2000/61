@@ -49,7 +49,7 @@ function toTXT(segments) {
 // the quiet window resumes it.
 const MANUAL_OVERRIDE_MS = 2500;
 
-export default function TranscriptViewer({ transcript, onSeek, jobId, onSpeakerRenamed, onTranscriptUpdated, onSpeakerColorChanged, onSpeakerAdded, speakerColors, timeRange, currentTime, maxHeight }) {
+export default function TranscriptViewer({ transcript, onSeek, jobId, onSpeakerRenamed, onTranscriptUpdated, onSpeakerColorChanged, onSpeakerAdded, speakerColors, timeRange, currentTime, maxHeight, hasTranslation = false, showingOriginal = false, onToggleOriginal = null }) {
   const { isMobile } = useResponsive();
   const scrollContainerRef = useRef(null);
   const activeSegRef = useRef(null);
@@ -876,7 +876,29 @@ export default function TranscriptViewer({ transcript, onSeek, jobId, onSpeakerR
       </div>
 
       {/* Search + actions */}
-      <div style={{ display: 'flex', gap: 8, marginBottom: 16, flexWrap: 'wrap' }}>
+      <div style={{ display: 'flex', gap: 8, marginBottom: 16, flexWrap: 'wrap', alignItems: 'center' }}>
+        {hasTranslation && onToggleOriginal && (
+          <button
+            onClick={onToggleOriginal}
+            title={showingOriginal
+              ? 'Currently showing original-language transcript — click to view translation'
+              : 'Currently showing translated transcript — click to view original'}
+            style={{
+              padding: '3px 10px',
+              fontSize: 10,
+              fontWeight: 600,
+              background: showingOriginal ? 'var(--bg-elevated)' : 'var(--accent-cyan)',
+              color: showingOriginal ? 'var(--text-muted)' : 'var(--bg-base)',
+              border: '1px solid var(--border)',
+              borderRadius: 'var(--radius-sm)',
+              cursor: 'pointer',
+              whiteSpace: 'nowrap',
+              fontFamily: 'var(--font-mono)',
+            }}
+          >
+            {showingOriginal ? 'Original' : 'Translated'}
+          </button>
+        )}
         <input
           type="text"
           placeholder="Search transcript..."
