@@ -29,6 +29,7 @@ from backend.routers import chunked_upload
 from backend.routers import cloud as cloud_router
 from backend.routers import diagnostics as diagnostics_router
 from backend.routers import render_plan as render_plan_router
+from backend.routers import detection_overlay as detection_overlay_router
 from backend.routers import thumbnails as thumbnails_router
 from backend.routers import share as share_router
 from backend.routers import auth as auth_router
@@ -530,6 +531,7 @@ app.include_router(agent_router.router)
 app.include_router(media_router.router)
 app.include_router(diagnostics_router.router)
 app.include_router(render_plan_router.router)
+app.include_router(detection_overlay_router.router)
 app.include_router(thumbnails_router.router)
 app.include_router(share_router.router)
 app.include_router(api_v1_router)

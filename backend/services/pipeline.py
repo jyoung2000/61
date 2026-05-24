@@ -1348,7 +1348,7 @@ async def _run_analysis_inner(job_id: str):
     from backend.services.reframer_engine import ReframeEngine
     from backend.services.reframer_bridge import (
         to_fez_render_plan, to_fez_scenes, to_fez_transcript, to_fez_clips,
-        to_fez_subject_track,
+        to_fez_subject_track, serialize_detection_overlay,
     )
 
     _log_gpu_memory(job_id, "pre-reframer")
@@ -1473,6 +1473,23 @@ async def _run_analysis_inner(job_id: str):
         logger.info("[%s] render_plan.json written (%d ops)", job_id, len(render_plan.ops))
     except Exception as _rpe:
         logger.warning("[%s] render_plan.json write failed: %s", job_id, _rpe)
+
+    # ── Detection overlay sidecar for the reframer preview ──
+    # Captures the face / subject / motion / speech timelines so the
+    # VideoEditor canvas overlay can draw spatial boxes that match the
+    # render plan. Served by /api/jobs/{id}/detection_overlay.
+    try:
+        overlay_data = serialize_detection_overlay(perception, reframer_plan)
+        with open(os.path.join(job_dir, "detection_overlay.json"), "w") as _odf:
+            json.dump(overlay_data, _odf)
+        logger.info(
+            "[%s] detection_overlay.json written (%d face samples, %d person samples)",
+            job_id,
+            len(overlay_data.get("face_timeline", {})),
+            len(overlay_data.get("person_timeline", {})),
+        )
+    except Exception as _ovre:
+        logger.warning("[%s] detection_overlay.json write failed: %s", job_id, _ovre)
 
     # ── Reframe quality grade (A-F, 0-100 score, per-axis sub-scores) ──
     reframe_report = None

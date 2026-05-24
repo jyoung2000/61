@@ -517,3 +517,103 @@ def to_fez_clips(clipper_candidates: list, editorial_results: list = None) -> li
             "trend_reason": str(judge.get("trend_reason", "") or "Fits short-form formats."),
         })
     return out
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Function 5 — perception timelines → frontend detection-overlay sidecar
+# ═══════════════════════════════════════════════════════════════════════════
+
+def serialize_detection_overlay(perception, reframer_plan=None) -> dict:
+    """Pack the perception timelines into JSON the React preview overlay
+    consumes via /api/jobs/{job_id}/detection_overlay.
+
+    All timestamps stay in milliseconds (matching the reframer's native
+    units). Bounding boxes stay in *source-pixel* space so the canvas
+    overlay can map them to its own display rect using scale factors.
+    """
+    face_tl = {}
+    for t_ms, faces in (getattr(perception, "face_timeline", None) or {}).items():
+        face_tl[str(int(t_ms))] = [
+            {
+                "x": _to_int(f.get("x", 0)),
+                "y": _to_int(f.get("y", 0)),
+                "w": _to_int(f.get("w", 0)),
+                "h": _to_int(f.get("h", 0)),
+                "cx": _to_int(f.get("cx", 0)),
+                "cy": _to_int(f.get("cy", 0)),
+                "confidence": round(float(f.get("confidence", 0.0) or 0.0), 3),
+                "track_id": _to_int(f.get("track_id", -1), default=-1),
+                "mouth_motion": round(float(f.get("mouth_motion", 0.0) or 0.0), 3),
+                "source": str(f.get("source", "") or "unknown"),
+            }
+            for f in (faces or [])
+        ]
+
+    person_tl = {}
+    for t_ms, persons in (getattr(perception, "person_timeline", None) or {}).items():
+        person_tl[str(int(t_ms))] = [
+            {
+                "x": _to_int(p.get("x", 0)),
+                "y": _to_int(p.get("y", 0)),
+                "w": _to_int(p.get("w", 0)),
+                "h": _to_int(p.get("h", 0)),
+                "cx": _to_int(p.get("cx", 0)),
+                "cy": _to_int(p.get("cy", 0)),
+                "class_name": str(p.get("class_name", "") or "person"),
+            }
+            for p in (persons or [])
+        ]
+
+    motion_tl = {}
+    for t_ms, v in (getattr(perception, "motion_timeline", None) or {}).items():
+        try:
+            motion_tl[str(int(t_ms))] = round(float(v), 3)
+        except (TypeError, ValueError):
+            pass
+
+    speech_tl = {}
+    for t_ms, v in (getattr(perception, "speech_active", None) or {}).items():
+        speech_tl[str(int(t_ms))] = bool(v)
+
+    saliency_tl = {}
+    for t_ms, v in (getattr(perception, "saliency_hotspot", None) or {}).items():
+        if isinstance(v, dict):
+            saliency_tl[str(int(t_ms))] = {
+                "cx": _to_int(v.get("cx", 0)),
+                "cy": _to_int(v.get("cy", 0)),
+                "intensity": round(float(v.get("intensity", 0.0) or 0.0), 3),
+            }
+
+    scene_cuts = [int(c) for c in (getattr(perception, "scene_cuts", None) or [])]
+
+    track_ids = set()
+    for faces in (getattr(perception, "face_timeline", None) or {}).values():
+        for f in (faces or []):
+            tid = _to_int(f.get("track_id", -1), default=-1)
+            if tid >= 0:
+                track_ids.add(tid)
+
+    samples_with_faces = sum(
+        1 for v in (getattr(perception, "face_timeline", None) or {}).values() if v
+    )
+
+    metadata = {
+        "src_w": _to_int(getattr(perception, "src_w", 0)),
+        "src_h": _to_int(getattr(perception, "src_h", 0)),
+        "fps": round(float(getattr(perception, "fps", 0.0) or 0.0), 3),
+        "duration_ms": _to_int(getattr(perception, "duration_ms", 0)),
+        "is_live_action": bool(getattr(perception, "is_live_action", False)),
+        "total_face_samples": samples_with_faces,
+        "total_tracks": len(track_ids),
+        "language": str(getattr(perception, "detected_language", "") or ""),
+    }
+
+    return {
+        "face_timeline": face_tl,
+        "person_timeline": person_tl,
+        "motion_timeline": motion_tl,
+        "speech_active": speech_tl,
+        "scene_cuts": scene_cuts,
+        "saliency_hotspot": saliency_tl,
+        "metadata": metadata,
+    }

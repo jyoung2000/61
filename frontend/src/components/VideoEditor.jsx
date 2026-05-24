@@ -9,6 +9,8 @@ import { usePlayer } from '../contexts/PlayerContext';
 import EditorErrorBoundary from './EditorErrorBoundary';
 import Timeline from './Timeline';
 import TimelineOverlay from './TimelineOverlay';
+import ReframePreview from './ReframePreview';
+import ReframeStatsPanel from './ReframeStatsPanel';
 import MediaUploader from './MediaUploader';
 import PropertiesPanel from './PropertiesPanel';
 import ToolBar from './ToolBar';
@@ -980,6 +982,27 @@ export default function VideoEditor({
     if (onSubjectKeyframes) onSubjectKeyframes(subjectKeyframes);
   }, [subjectKeyframes]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // ── Detection overlay (faces + subjects) for the reframer preview ──
+  // Served by /api/jobs/{id}/detection_overlay once the pipeline has
+  // run; while it's pending or absent the preview still renders the
+  // crop window but skips the detection boxes.
+  const [detectionData, setDetectionData] = useState(null);
+  useEffect(() => {
+    if (!jobId || !isCrop) { setDetectionData(null); return; }
+    let cancelled = false;
+    fetch(`/api/jobs/${jobId}/detection_overlay`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => { if (!cancelled && data) setDetectionData(data); })
+      .catch(() => { /* graceful fallback */ });
+    return () => { cancelled = true; };
+  }, [jobId, isCrop]);
+
+  // Reframer preview is active whenever the user has picked an aspect
+  // ratio that requires cropping. Detection boxes appear on top once
+  // ``detectionData`` arrives, but the source-view + crop overlay
+  // layout itself doesn't wait on the network round-trip.
+  const reframePreviewActive = isCrop;
+
   // Populate crop segments on timeline when keyframes change
   useEffect(() => {
     console.log('[CropTrack]', {
@@ -1737,6 +1760,10 @@ export default function VideoEditor({
   const lastAppliedPctRef = useRef(null);
   useEffect(() => {
     if (!hasDynamicSubject) return;
+    // Reframer preview shows the full source frame with a crop overlay
+    // — letting this loop continue writing objectPosition would fight
+    // the canvas overlay and re-introduce the old cropped-only view.
+    if (reframePreviewActive) return;
     const video = videoRef.current;
     if (!video) return;
 
@@ -1843,11 +1870,12 @@ export default function VideoEditor({
       // static objectPosition that React just applied. This matches
       // ClipPreview.jsx behavior.
     };
-  }, [hasDynamicSubject, subjectKeyframes, clipStart, srcRatio, targetRatio, segments, subjectX]);
+  }, [hasDynamicSubject, subjectKeyframes, clipStart, srcRatio, targetRatio, segments, subjectX, reframePreviewActive]);
 
   // Static subject tracking fallback
   useEffect(() => {
     if (hasDynamicSubject || !isCrop) return;
+    if (reframePreviewActive) return;
     const video = videoRef.current;
     if (!video) return;
     // Use processed keyframe value if available — it interpolates from nearby
@@ -1858,7 +1886,18 @@ export default function VideoEditor({
     const sx = safeSubjectX ? safeSubjectX(effectiveSx, srcRatio, targetRatio) : effectiveSx;
     const centerPct = subjectXToCenterPct(Math.max(0, Math.min(100, sx)), srcRatio, targetRatio);
     video.style.objectPosition = `${centerPct}% 50%`;
-  }, [hasDynamicSubject, isCrop, subjectX, subjectKeyframes, srcRatio, targetRatio]);
+  }, [hasDynamicSubject, isCrop, subjectX, subjectKeyframes, srcRatio, targetRatio, reframePreviewActive]);
+
+  // Clear any stale objectPosition the rAF loop left on the <video>
+  // when we hand the frame over to the canvas overlay (otherwise the
+  // last cropped offset stays applied and the source isn't centered).
+  useEffect(() => {
+    if (!reframePreviewActive) return;
+    const video = videoRef.current;
+    if (!video) return;
+    video.style.objectPosition = '';
+    lastAppliedPctRef.current = null;
+  }, [reframePreviewActive]);
 
   // ── Web Audio API for volume > 100% ────────────────
   useEffect(() => {
@@ -2851,7 +2890,7 @@ export default function VideoEditor({
     compact && 've-container--compact',
   ].filter(Boolean).join(' ');
 
-  const initialObjectPosition = isCrop
+  const initialObjectPosition = (isCrop && !reframePreviewActive)
     ? `${subjectXToCenterPct(
         (subjectKeyframes?.length >= 1)
           ? subjectKeyframes[0].x
@@ -2860,6 +2899,12 @@ export default function VideoEditor({
         targetRatio,
       )}% 50%`
     : undefined;
+
+  // When the reframer preview is active the viewport shows the full
+  // source frame (so the user can see the crop window in context).
+  // Otherwise it sticks to the target aspect ratio so the legacy
+  // crop-via-objectFit path keeps producing identical pixels.
+  const previewRatio = reframePreviewActive ? srcRatio : targetRatio;
 
   return (
     <div
@@ -2880,14 +2925,19 @@ export default function VideoEditor({
 
       {/* ── Viewport ── */}
       <div
+        className={reframePreviewActive && !isFullscreen
+          ? 've-viewport-container ve-viewport-container--reframe'
+          : 've-viewport-container'}
+      >
+      <div
         ref={viewportRef}
         className={`ve-viewport${isFullscreen ? ' ve-viewport--fullscreen' : ''}`}
         style={isFullscreen ? {} : {
-          aspectRatio: `${targetRatio}`,
+          aspectRatio: `${previewRatio}`,
           maxHeight: compact ? '55vh' : '50vh',
-          maxWidth: compact ? undefined : `calc(50vh * ${targetRatio})`,
+          maxWidth: compact ? undefined : `calc(50vh * ${previewRatio})`,
           width: '100%',
-          margin: '0 auto',
+          margin: reframePreviewActive ? 0 : '0 auto',
         }}
         onPointerDown={() => { viewportClickRef.current = { downTime: Date.now(), moved: false }; }}
         onPointerMove={() => { if (viewportClickRef.current.downTime) viewportClickRef.current.moved = true; }}
@@ -2966,6 +3016,9 @@ export default function VideoEditor({
               videoItemSize.w !== 100 || videoItemSize.h !== 100 ||
               videoItemRotation !== 0
             );
+            // In reframer preview mode we want the full source visible
+            // so the canvas overlay can draw the crop window in context.
+            const videoFit = (isCrop && !reframePreviewActive) ? 'cover' : 'contain';
             if (hasCustomTransform) {
               // When user has adjusted position/size/rotation, render video as
               // a positioned element within the viewport (like other overlay items)
@@ -2975,7 +3028,7 @@ export default function VideoEditor({
                 top: `${videoItemPosition.y}%`,
                 width: `${videoItemSize.w}%`,
                 height: `${videoItemSize.h}%`,
-                objectFit: isCrop ? 'cover' : 'contain',
+                objectFit: videoFit,
                 objectPosition: initialObjectPosition,
                 transform: `translate(-50%, -50%)${videoItemRotation ? ` rotate(${videoItemRotation}deg)` : ''}`,
                 opacity: videoItemOpacity,
@@ -2987,7 +3040,7 @@ export default function VideoEditor({
             }
             // Default: fill viewport
             return {
-              objectFit: isCrop ? 'cover' : 'contain',
+              objectFit: videoFit,
               objectPosition: initialObjectPosition,
               opacity: videoItemOpacity,
               filter: videoItemFilter || undefined,
@@ -2996,6 +3049,21 @@ export default function VideoEditor({
             };
           })()}
         />
+
+        {/* Reframer canvas overlay — paints the crop window, face boxes,
+            and subject boxes on top of the source <video>. Pointer events
+            pass through so click-to-play still works on the video. */}
+        {reframePreviewActive && !isFullscreen && (
+          <ReframePreview
+            videoRef={videoRef}
+            detectionData={detectionData}
+            subjectKeyframes={subjectKeyframes}
+            sourceWidth={sourceWidth}
+            sourceHeight={sourceHeight}
+            targetRatio={targetRatio}
+            clipStart={clipStart}
+          />
+        )}
 
         {/* Multi-track timeline overlay: text, shapes, images — always rendered
             so edits remain visible even when the multi-track editor panel is closed */}
@@ -3065,7 +3133,23 @@ export default function VideoEditor({
           </div>
         )}
         </div> {/* /ve-stage */}
-      </div>
+      </div> {/* /ve-viewport */}
+
+      {/* Reframer stats sidebar — only when the reframe preview layout
+          is active. Hidden on mobile by CSS (see VideoEditor.css). */}
+      {reframePreviewActive && !isFullscreen && (
+        <ReframeStatsPanel
+          videoRef={videoRef}
+          detectionData={detectionData}
+          subjectKeyframes={subjectKeyframes}
+          renderPlan={renderPlan}
+          sourceWidth={sourceWidth}
+          sourceHeight={sourceHeight}
+          targetRatio={targetRatio}
+          clipStart={clipStart}
+        />
+      )}
+      </div> {/* /ve-viewport-container */}
 
       {/* ── Aspect Ratio Picker ── */}
       {onAspectRatioChange && (
