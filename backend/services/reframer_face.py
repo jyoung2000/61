@@ -37,8 +37,15 @@ def _pick_yolo_device():
     single biggest analysis-speed win on a capable GPU.
 
     Override with the ``CLIPAI_REFRAMER_YOLO_DEVICE`` env var
-    (``cpu`` | ``cuda`` | ``auto``). The 6.5GB free-VRAM gate keeps small
-    cards (e.g. a 4GB GTX 1650) on CPU so YOLO never starves the VLM stage.
+    (``cpu`` | ``cuda`` | ``auto``).
+
+    The VRAM gate is intentionally small (~1 GB) — YOLO-World v2-small is
+    ~150 MB of weights plus a few hundred MB of inference workspace. The
+    perceiver explicitly releases the YOLO weights via
+    ``_release_perception_models()`` before Whisper loads, so YOLO no
+    longer competes with the transcriber even on 4 GB cards. Cloud-VLM
+    pipelines (OpenRouter / Gemini / Replicate) don't touch local VRAM
+    at all, so YOLO can use the GPU freely during face detection.
     """
     forced = os.environ.get("CLIPAI_REFRAMER_YOLO_DEVICE", "auto").strip().lower()
     if forced == "cpu":
@@ -47,7 +54,7 @@ def _pick_yolo_device():
         import torch
         if torch.cuda.is_available():
             free_mb = torch.cuda.mem_get_info()[0] / 1024 / 1024
-            if forced in ("cuda", "gpu", "0") or free_mb >= 6500:
+            if forced in ("cuda", "gpu", "0") or free_mb >= 1100:
                 return 0
     except Exception:
         pass

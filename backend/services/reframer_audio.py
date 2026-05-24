@@ -102,6 +102,10 @@ class AudioIntelligence:
         self.engine = None
         self.model_name = model_name
         self.device_used = 'unknown'
+        # try_load() picks an appropriate batched-inference batch size
+        # based on the GPU's total VRAM (4 → batch=4, larger → batch=16).
+        # Surfaced as ``self._batch_size`` so ``transcribe()`` uses it.
+        self._batch_size = 16
 
     def try_load(self) -> bool:
         """Load faster-whisper with GPU → CPU fallback.
@@ -122,8 +126,22 @@ class AudioIntelligence:
             self.engine = AudioIntelligence._cached_engine
             self.device_used = AudioIntelligence._cached_device
             self.available = True
+            # Re-derive batch size from the cached device tier so a reused
+            # GPU engine doesn't suddenly run with the wrong workspace.
+            if self.device_used and self.device_used.startswith('cuda'):
+                try:
+                    import torch as _torch
+                    if _torch.cuda.is_available():
+                        _total_gb = (_torch.cuda.mem_get_info()[1]
+                                     / 1_073_741_824)
+                        self._batch_size = 4 if _total_gb < 5.5 else 16
+                except Exception:
+                    self._batch_size = 16
+            else:
+                self._batch_size = 16
             log.log_stage('AUDIO',
-                f'Whisper {self.model_name} already loaded ({self.device_used}) — using cached')
+                f'Whisper {self.model_name} already loaded ({self.device_used}, '
+                f'batch={self._batch_size}) — using cached')
             return True
 
         # ── Diagnose CUDA ──
@@ -172,45 +190,86 @@ class AudioIntelligence:
 
         log.log_stage('AUDIO', f'CUDA: available={cuda_available}, reason={cuda_reason}')
 
-        # ── VRAM budget for the chosen Whisper model size ──
-        # Used to skip CUDA tiers up front when the GPU is too small for
-        # batched inference (loading + workspace + KV cache). Numbers are
-        # empirical floors — going lower OOMs reliably under batch=16.
-        _vram_needed_gb = {
-            'large': 5.5, 'large-v2': 5.5, 'large-v3': 5.5,
-            'medium': 3.0, 'small': 1.8,
-            'base': 1.0, 'tiny': 0.6,
-        }.get(self.model_name, 3.0)
+        # ── VRAM budgets per (model, compute_type) ──
+        # First number = load footprint, second = peak workspace under
+        # the chosen batched-inference settings. ``int8_float16`` keeps
+        # weights in int8 (half the fp16 footprint) but does matmul in
+        # fp16 — same speed as float16 on modern GPUs, half the VRAM.
+        # Empirical floors from real GTX 1650 / RTX 4060 / RTX 4090 runs.
+        _vram_load_gb = {
+            ('large',         'float16'):       3.0,
+            ('large',         'int8_float16'):  1.6,
+            ('large-v2',      'float16'):       3.0,
+            ('large-v2',      'int8_float16'):  1.6,
+            ('large-v3',      'float16'):       3.0,
+            ('large-v3',      'int8_float16'):  1.6,
+            ('medium',        'float16'):       1.6,
+            ('medium',        'int8_float16'):  0.85,
+            ('small',         'float16'):       1.0,
+            ('small',         'int8_float16'):  0.55,
+            ('base',          'float16'):       0.4,
+            ('base',          'int8_float16'):  0.25,
+            ('tiny',          'float16'):       0.2,
+            ('tiny',          'int8_float16'):  0.15,
+        }
         _gpu_free_gb = None
+        _gpu_total_gb = None
         try:
             import torch as _torch
             if _torch.cuda.is_available():
-                _free_bytes, _ = _torch.cuda.mem_get_info()
+                _free_bytes, _total_bytes = _torch.cuda.mem_get_info()
                 _gpu_free_gb = _free_bytes / 1_073_741_824
+                _gpu_total_gb = _total_bytes / 1_073_741_824
         except Exception:
             pass
 
-        # ── Try loading (CUDA float16 → CUDA int8 → CPU int8) ──
-        for tier, device, compute in [
-            ('CUDA fp16', 'cuda', 'float16'),
-            ('CUDA int8', 'cuda', 'int8'),
-            ('CPU int8', 'cpu', 'int8'),
-        ]:
+        # On small GPUs (≤4 GB cards like the GTX 1650) prefer
+        # ``int8_float16`` over plain ``float16`` so models from medium
+        # upward actually fit. Larger cards stick with fp16 for maximum
+        # decoder throughput — the int8 path is a touch slower per token.
+        _small_gpu = (_gpu_total_gb is not None and _gpu_total_gb < 5.5)
+        if _small_gpu:
+            self._batch_size = 4   # smaller workspace footprint
+            _tiers = [
+                ('CUDA int8_float16', 'cuda', 'int8_float16'),
+                ('CUDA float16',      'cuda', 'float16'),
+                ('CUDA int8',         'cuda', 'int8'),
+                ('CPU int8',          'cpu',  'int8'),
+            ]
+        else:
+            self._batch_size = 16
+            _tiers = [
+                ('CUDA fp16',         'cuda', 'float16'),
+                ('CUDA int8_float16', 'cuda', 'int8_float16'),
+                ('CUDA int8',         'cuda', 'int8'),
+                ('CPU int8',          'cpu',  'int8'),
+            ]
+
+        # ── Try the chosen ordered list of (device, compute_type) tiers ──
+        for tier, device, compute in _tiers:
             if device == 'cuda' and not cuda_available:
                 continue
-            # Skip the CUDA tiers before allocation when there isn't enough
-            # headroom — otherwise the load succeeds, takes ~1.5 GB, and the
-            # later batched-inference workspace check forces a CPU fallback
-            # while the GPU copy lingers in VRAM.
+            # Skip the CUDA tier up front when there's no headroom —
+            # otherwise the load succeeds, sits in VRAM, and the later
+            # batched-inference workspace check forces a CPU fallback
+            # while the GPU copy lingers.
             if device == 'cuda' and _gpu_free_gb is not None:
-                _budget = _vram_needed_gb if compute == 'float16' else _vram_needed_gb * 0.65
+                load_gb = _vram_load_gb.get(
+                    (self.model_name, compute), 1.5 if compute != 'int8' else 0.8)
+                # Workspace is roughly 1.0× model size under batch=16,
+                # 0.4× under batch=4. Add a small constant for ctranslate2
+                # scratch buffers so we don't squeak through and OOM mid-run.
+                _ws_mult = 0.45 if self._batch_size <= 4 else 1.0
+                _budget = load_gb + load_gb * _ws_mult + 0.25
                 if _gpu_free_gb < _budget:
                     log.log_stage('AUDIO',
-                        f'Skipping {tier}: only {_gpu_free_gb:.1f} GB VRAM free '
-                        f'(need ~{_budget:.1f} GB for {self.model_name})')
+                        f'Skipping {tier}: only {_gpu_free_gb:.2f} GB VRAM free '
+                        f'(need ~{_budget:.2f} GB for {self.model_name} '
+                        f'@ batch={self._batch_size})')
                     continue
             try:
-                log.log_stage('AUDIO', f'Loading {self.model_name} on {tier}...')
+                log.log_stage('AUDIO',
+                    f'Loading {self.model_name} on {tier} (batch={self._batch_size})...')
                 self.engine = WhisperModel(
                     self.model_name, device=device, compute_type=compute)
                 self.available = True
@@ -287,34 +346,55 @@ class AudioIntelligence:
             audio_size = os.path.getsize(audio_path)
             log.log_stage('AUDIO', f'Audio extracted: {audio_size/1048576:.1f} MB')
 
-            # Pre-flight: low-VRAM GPUs (the GTX 1650 = 4 GB, etc.) can't fit
-            # Whisper medium under batched inference. Reload on CPU before
-            # transcribing so we don't burn an attempt on a doomed CUDA call.
+            # Pre-flight: the GPU model is already loaded — only the
+            # batched-inference workspace is left to allocate. Reload on
+            # CPU only when the remaining headroom is below that workspace
+            # footprint (load_gb × ws_mult + scratch). Keeps us on GPU on
+            # tight cards like the GTX 1650 while still aborting cleanly
+            # when the budget really is too small.
             if self.device_used.startswith('cuda'):
                 try:
                     import torch as _torch
                     if _torch.cuda.is_available():
                         _free_bytes, _ = _torch.cuda.mem_get_info()
                         _free_gb = _free_bytes / 1_073_741_824
-                        _needed = {'large': 5.5, 'large-v2': 5.5, 'large-v3': 5.5,
-                                   'medium': 3.0, 'small': 1.8,
-                                   'base': 1.0, 'tiny': 0.6,
-                                   }.get(self.model_name, 3.0)
+                        _compute = self.device_used.split('_', 1)[1] if '_' in self.device_used else 'float16'
+                        # Rough workspace budgets — match the load-time
+                        # numbers in try_load() so the two checks agree.
+                        _ws_load = {
+                            ('large',    'float16'):      3.0,
+                            ('large',    'int8_float16'): 1.6,
+                            ('large-v2', 'float16'):      3.0,
+                            ('large-v2', 'int8_float16'): 1.6,
+                            ('large-v3', 'float16'):      3.0,
+                            ('large-v3', 'int8_float16'): 1.6,
+                            ('medium',   'float16'):      1.6,
+                            ('medium',   'int8_float16'): 0.85,
+                            ('small',    'float16'):      1.0,
+                            ('small',    'int8_float16'): 0.55,
+                            ('base',     'float16'):      0.4,
+                            ('base',     'int8_float16'): 0.25,
+                            ('tiny',     'float16'):      0.2,
+                            ('tiny',     'int8_float16'): 0.15,
+                        }.get((self.model_name, _compute), 1.5)
+                        _ws_mult = 0.45 if self._batch_size <= 4 else 1.0
+                        _needed = _ws_load * _ws_mult + 0.15
                         if _free_gb < _needed:
                             log.log_stage('AUDIO',
-                                f'Only {_free_gb:.1f} GB VRAM free '
-                                f'(need ~{_needed:.1f} GB for {self.model_name}) '
+                                f'Only {_free_gb:.2f} GB VRAM free '
+                                f'(need ~{_needed:.2f} GB workspace for '
+                                f'{self.model_name} {_compute} @ batch={self._batch_size}) '
                                 '— using CPU to avoid OOM')
                             self._reload_on_cpu()
                 except Exception:
                     pass
 
             log.log_stage('AUDIO', f'Transcribing with {self.model_name} ({self.device_used})...'
-                           f' language={whisper_lang or "auto"}')
+                           f' language={whisper_lang or "auto"} batch={self._batch_size}')
 
             # Transcription parameters:
             #   beam_size=5 (better accuracy — captures ~5-8% more words than greedy)
-            #   batch_size=16 (reduced from 24 to compensate for beam memory)
+            #   batch_size=self._batch_size (4 on ≤4GB GPUs, 16 elsewhere)
             #   vad min_silence=300ms (catches brief pauses within sentences)
             #   no_speech_threshold=0.5 (lower = less likely to skip quiet speech)
             #   condition_on_previous_text=True (improves coherence across segments)
@@ -323,7 +403,7 @@ class AudioIntelligence:
                 from faster_whisper import BatchedInferencePipeline
                 batched = BatchedInferencePipeline(model=self.engine)
                 segments_iter, info = batched.transcribe(
-                    audio_path, batch_size=16,
+                    audio_path, batch_size=self._batch_size,
                     language=whisper_lang,
                     beam_size=5, vad_filter=True,
                     vad_parameters={
@@ -693,7 +773,7 @@ class AudioIntelligence:
                 from faster_whisper import BatchedInferencePipeline
                 batched = BatchedInferencePipeline(model=self.engine)
                 segments_iter, info = batched.transcribe(
-                    audio_path, batch_size=16,
+                    audio_path, batch_size=self._batch_size,
                     language=whisper_lang,
                     task='translate',  # ← the key difference
                     beam_size=5, vad_filter=True,
