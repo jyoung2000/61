@@ -175,8 +175,19 @@ class Settings(BaseSettings):
     # pass-through is used (the legacy behavior).
     TRANSCRIPT_POLISHING_ENABLED: bool = True
     TRANSCRIPT_POLISHING_BATCH_SIZE: int = 15   # segments per LLM call
-    TRANSCRIPT_FILLER_REMOVAL: bool = True      # remove um, uh, like, you know
+    TRANSCRIPT_FILLER_REMOVAL: bool = False     # remove um, uh, like, you know
     TRANSCRIPT_SENTENCE_REPAIR: bool = True     # fix run-on/fragmented sentences
+    # Default ON: tells the polisher to keep every spoken word and only
+    # add punctuation / sentence breaks for readability. Matches the
+    # "the transcript should match the spoken audio" guideline — flip
+    # off if you want the polisher to actually delete fillers /
+    # restructure.
+    TRANSCRIPT_PRESERVE_WORDS: bool = True
+    # Re-polish loop: keep iterating until the readability report scores
+    # the transcript ≥ this target (0-100). Capped at 3 passes so a
+    # poorly-segmented source can't loop forever.
+    TRANSCRIPT_READABILITY_TARGET: float = 90.0
+    TRANSCRIPT_READABILITY_MAX_PASSES: int = 3
 
     # ── Subtitle Readability + Safe Zones ──
     # Enforces Netflix-style CPS / line-length / duration limits and

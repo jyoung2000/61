@@ -268,9 +268,64 @@ export default function SceneCard({ scene, sceneIndex, jobId, onClick, onUpdated
             </div>
           </div>
         ) : (
-          <p style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.4 }}>
-            {String(scene.description || '')}
-          </p>
+          <>
+            <p style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.5 }}>
+              {String(scene.description || '')}
+            </p>
+            {/* Detail strip — pulls every non-empty signal the
+                reframer/perceiver dropped on the scene so the user can
+                read it at a glance instead of digging into JSON. */}
+            <div style={{
+              marginTop: 8, display: 'flex', flexWrap: 'wrap',
+              gap: 4, fontSize: 10, color: 'var(--text-muted)',
+              fontFamily: 'var(--font-mono)',
+            }}>
+              {(() => {
+                const chips = [];
+                if (scene.layout_mode && scene.layout_mode !== 'single') {
+                  chips.push({ label: scene.layout_mode.replace(/_/g, ' '), color: 'var(--accent-cyan)' });
+                }
+                const fcount = scene.face_count || scene.face_positions?.length || 0;
+                if (fcount > 0) {
+                  chips.push({ label: `${fcount} face${fcount === 1 ? '' : 's'}`, color: 'var(--text-secondary)' });
+                }
+                const speaking = (scene.face_positions || []).some((f) => f.is_speaking);
+                if (speaking) chips.push({ label: 'speaker active', color: 'var(--accent-amber)' });
+                if (scene.has_screen_content) chips.push({ label: 'screen / slides', color: 'var(--accent-cyan)' });
+                if (scene.primary_object_type) {
+                  chips.push({ label: `obj: ${scene.primary_object_type}`, color: 'var(--text-secondary)' });
+                }
+                if (scene.fusion_source) {
+                  chips.push({ label: scene.fusion_source.replace(/_/g, ' '), color: 'var(--text-muted)' });
+                }
+                if (typeof scene.subject_x === 'number') {
+                  chips.push({ label: `crop ${Math.round(scene.subject_x)}%`, color: 'var(--text-muted)' });
+                }
+                if (typeof scene.subject_confidence === 'number' && scene.subject_confidence > 0) {
+                  chips.push({
+                    label: `conf ${Math.round(scene.subject_confidence * 100)}%`,
+                    color: scene.subject_confidence >= 0.7
+                      ? 'var(--success)'
+                      : scene.subject_confidence >= 0.4
+                        ? 'var(--accent-amber)'
+                        : 'var(--danger)',
+                  });
+                }
+                if (scene.no_subject_reason) {
+                  chips.push({ label: scene.no_subject_reason.replace(/_/g, ' '), color: 'var(--accent-amber)' });
+                }
+                return chips.map((c, i) => (
+                  <span key={i} style={{
+                    padding: '1px 6px',
+                    borderRadius: 3,
+                    background: 'var(--badge-overlay-bg, rgba(127,127,127,0.12))',
+                    color: c.color,
+                    border: '1px solid var(--border)',
+                  }}>{c.label}</span>
+                ));
+              })()}
+            </div>
+          </>
         )}
       </div>
     </div>

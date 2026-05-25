@@ -295,23 +295,51 @@ def get_genre_prompt(content_type) -> str:
 
 
 DEFAULT_SUMMARY_PROMPT = (
-    "You are summarizing a video for a human audience. Write like a real person — "
-    "not a robot, not a press release. The summary should feel like something a "
-    "friend would say if you asked 'what was that video about?'\n\n"
-    "IMPORTANT: Do not reference or speculate about speakers unless speaker names are "
-    "explicitly present in the transcript. Focus on WHAT is discussed and shown, "
-    "not who is saying it.\n\n"
-    "Based on the transcript and scene descriptions below, return ONLY valid JSON:\n"
-    '{"overview": "<2-4 sentence paragraph>", "key_topics": ["topic1", "topic2", "topic3"], '
-    '"tone": "<1-2 words>", "estimated_audience": "<who would watch>", "content_category": "<category>"}\n\n'
+    "You are writing a substantive video summary for a human audience. "
+    "Write like a real person walking a friend through what they just "
+    "watched — but be GENEROUS with detail. We want the reader to walk "
+    "away feeling like they have a real sense of how the video unfolds, "
+    "who appears, what happens in each section, and what makes it worth "
+    "watching. Not a press release, not a one-liner.\n\n"
+    "IMPORTANT: Do not reference or speculate about speakers by name "
+    "unless the speaker names are explicitly present in the transcript. "
+    "Focus on WHAT is discussed and shown — the speakers, the actions, "
+    "the visuals, the topics, the emotional beats.\n\n"
+    "Based on the transcript and scene descriptions below, return ONLY "
+    "valid JSON:\n"
+    '{"overview": "<6-10 sentence paragraph or 2-3 short paragraphs>", '
+    '"narrative_arc": "<3-5 sentences describing how the video unfolds '
+    'from opening to close — the beats, the turns, the payoff>", '
+    '"key_topics": ["topic1", "topic2", ...], '
+    '"highlight_moments": ["timestamp + 1-sentence description", ...], '
+    '"tone": "<1-3 words>", "estimated_audience": "<who would watch>", '
+    '"content_category": "<category>"}\n\n'
     "Field guidelines:\n"
-    "- overview: Natural, conversational. Describe what happens in the video.\n"
-    '   Good: "Two friends taste-test fast food burgers and debate whether In-N-Out is overrated."\n'
-    '   Bad: "This video features content creators engaging in comparative analysis."\n'
-    "- key_topics: 3-6 specific topics. Use natural phrases, not SEO keywords.\n"
-    '   Good: ["fast food taste test", "In-N-Out vs Five Guys", "sauce disaster"]\n'
-    '   Bad: ["food", "review", "content"]\n'
-    '- tone: The vibe (e.g. "funny and casual", "serious", "educational")\n'
+    "- overview: 6-10 sentences (or 2-3 short paragraphs). Cover the "
+    "  setup, the main thread, any meaningful turn / climax, and how it "
+    "  ends. Use natural conversational language. Describe both the "
+    "  audio (what is said) and the visuals (what is shown).\n"
+    '   Good: "Two friends sit down at a beat-up picnic table to taste-'
+    "  test five fast-food burgers. The bit opens with them ranking "
+    "  the chains beforehand — Five Guys is favoured, In-N-Out is "
+    "  doubted — then the food shows up and the rankings start to "
+    "  fall apart. There's a sauce-spill disaster midway through, an "
+    "  unexpected love for Wendy's, and a final scorecard where the "
+    "  bottom-ranked chain ends up winning. Light, off-the-cuff, "
+    "  obviously not staged.\"\n"
+    "- narrative_arc: 3-5 sentences specifically on the *structure* — "
+    "  hook → development → twist → resolution. This is the part "
+    "  someone reads to decide if the pacing fits what they want.\n"
+    "- key_topics: 5-10 specific topics. Use natural phrases, not "
+    "  generic SEO keywords.\n"
+    '   Good: ["fast food taste test", "In-N-Out vs Five Guys", '
+    '   "sauce disaster", "Wendy\'s surprise winner"]\n'
+    "- highlight_moments: 4-8 concrete beats with their approximate "
+    '  timestamp (use mm:ss). Each line: "01:23 — sauce explodes on '
+    '  shirt, both laugh", "04:10 — first In-N-Out bite, surprised '
+    '  reaction".\n'
+    '- tone: The vibe (e.g. "funny and casual", "tense and '
+    '  thoughtful", "high-energy chaotic")\n'
     '- estimated_audience: Be specific (e.g. "foodies and fast food fans")\n'
     '- content_category: Specific (e.g. "food review", "tech unboxing", "comedy sketch")\n'
 )

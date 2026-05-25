@@ -474,32 +474,73 @@ async def _background_post_processing(job_id: str, transcript: list, orchestrato
             )
             correction_lang = "en" if _whisper_translated else whisper_lang
 
-            polished = await asyncio.wait_for(
-                correct_transcript(transcript, orchestrator, job_id=job_id, language=correction_lang),
-                timeout=_correction_timeout,
+            # ── Polish + readability loop ──
+            # Re-polish (up to N passes) until the readability score
+            # clears TRANSCRIPT_READABILITY_TARGET, or we run out of
+            # passes. Each pass: LLM polish → CJK-aware segmentation
+            # → score. With TRANSCRIPT_PRESERVE_WORDS the polisher is
+            # forbidden from deleting words, so what improves between
+            # passes is punctuation density and segment boundaries.
+            from backend.services.subtitle_formatter import (
+                enforce_readability, compute_readability_report,
             )
+            target_score = float(getattr(settings, "TRANSCRIPT_READABILITY_TARGET", 90.0))
+            max_passes = int(getattr(settings, "TRANSCRIPT_READABILITY_MAX_PASSES", 3))
 
-            # ── Subtitle readability enforcement (CPS / line breaks) ──
-            # Run after polishing so the readability formatter sees the
-            # cleaned-up text. Apply only when the flag is on — when off,
-            # we keep byte-for-byte legacy behavior.
-            if getattr(settings, "SUBTITLE_CPS_ENFORCEMENT", False):
+            polished = transcript
+            best_polished = transcript
+            best_report = None
+            for _pass in range(1, max_passes + 1):
+                polished = await asyncio.wait_for(
+                    correct_transcript(polished, orchestrator, job_id=job_id, language=correction_lang),
+                    timeout=_correction_timeout,
+                )
+                if getattr(settings, "SUBTITLE_CPS_ENFORCEMENT", False):
+                    try:
+                        polished = enforce_readability(
+                            list(polished),
+                            max_cps=float(getattr(settings, "SUBTITLE_MAX_CPS", 20.0)),
+                            max_chars_per_line=int(getattr(settings, "SUBTITLE_MAX_CHARS_PER_LINE", 42)),
+                            min_duration_ms=int(getattr(settings, "SUBTITLE_MIN_DURATION_MS", 833)),
+                            max_duration_ms=int(getattr(settings, "SUBTITLE_MAX_DURATION_MS", 7000)),
+                            smart_line_breaks=bool(getattr(settings, "SUBTITLE_SMART_LINE_BREAKS", True)),
+                        )
+                    except Exception as _rd_err:
+                        logger.warning("[%s] Readability enforcement failed (%s) — using unmodified polish",
+                                       job_id, _rd_err)
                 try:
-                    from backend.services.subtitle_formatter import enforce_readability
-                    polished = enforce_readability(
-                        list(polished),
-                        max_cps=float(getattr(settings, "SUBTITLE_MAX_CPS", 20.0)),
-                        max_chars_per_line=int(getattr(settings, "SUBTITLE_MAX_CHARS_PER_LINE", 42)),
-                        min_duration_ms=int(getattr(settings, "SUBTITLE_MIN_DURATION_MS", 833)),
-                        max_duration_ms=int(getattr(settings, "SUBTITLE_MAX_DURATION_MS", 7000)),
-                        smart_line_breaks=bool(getattr(settings, "SUBTITLE_SMART_LINE_BREAKS", True)),
-                    )
-                    logger.info("[%s] Subtitle readability enforced on polished transcript", job_id)
-                except Exception as _rd_err:
-                    logger.warning("[%s] Readability enforcement failed (%s) — using unmodified polish",
-                                   job_id, _rd_err)
+                    pass_report = compute_readability_report(list(polished))
+                except Exception:
+                    pass_report = None
 
-            await database.update_job_status(job_id, transcript=list(polished))
+                # Track the best run so a regression doesn't lose progress.
+                if pass_report and (
+                    best_report is None or pass_report.get("score", 0) > best_report.get("score", 0)
+                ):
+                    best_report = pass_report
+                    best_polished = polished
+
+                _score = pass_report.get("score") if pass_report else None
+                logger.info(
+                    "[%s] Polish pass %d/%d → readability %s%s",
+                    job_id, _pass, max_passes,
+                    f"{_score:.1f}/100" if _score is not None else "(no score)",
+                    " ✓ target met" if _score is not None and _score >= target_score else "",
+                )
+                if _score is not None and _score >= target_score:
+                    break
+
+            polished = best_polished
+            if best_report is not None:
+                # Persist the readability score against the polished
+                # transcript so the UI can read it immediately.
+                await database.update_job_status(
+                    job_id,
+                    transcript=list(polished),
+                    transcript_readability=best_report,
+                )
+            else:
+                await database.update_job_status(job_id, transcript=list(polished))
             transcript = polished  # Use polished version for translation below
 
             await broadcast_ws(job_id, {
@@ -1690,6 +1731,32 @@ async def _run_analysis_inner(job_id: str):
     # ── Final save ──
     cancel_check()
     _analysis_seconds = round(_time.monotonic() - _pipeline_start, 1)
+
+    # ── Aggregate the analysis spend ──
+    # Orchestrator tracks per-provider token usage (OpenRouter,
+    # Anthropic, Gemini, Groq) and translates that to USD via its
+    # _COST_PER_1K_TOKENS table; the clipper carries the Replicate
+    # estimate from the VideoLLaMA3 chunks. Both are best-effort
+    # estimates — Replicate's real billing lines up within a few
+    # cents of the per-chunk multiplier we use.
+    _total_cost_usd = 0.0
+    _cost_breakdown = {}
+    try:
+        _orch_cost = float(orchestrator.estimate_cost() or 0.0)
+        _total_cost_usd += _orch_cost
+        if _orch_cost > 0:
+            _cost_breakdown["llm"] = round(_orch_cost, 4)
+    except Exception:
+        pass
+    try:
+        _rep_cost = float(getattr(clip_extractor, "total_cost_usd", 0.0) or 0.0)
+        _total_cost_usd += _rep_cost
+        if _rep_cost > 0:
+            _cost_breakdown["replicate"] = round(_rep_cost, 4)
+    except Exception:
+        pass
+    _total_cost_usd = round(_total_cost_usd, 4)
+
     await _update_progress(job_id, JobStatus.DETECTING_CLIPS, 98, "Saving results...")
     await database.update_job_status(
         job_id,
@@ -1701,6 +1768,8 @@ async def _run_analysis_inner(job_id: str):
         transcript=transcript,
         clips=clips,
         analysis_duration_seconds=_analysis_seconds,
+        estimated_cost_usd=_total_cost_usd,
+        cost_breakdown=_cost_breakdown,
         default_layout_mode="single",
     )
     await broadcast_ws(job_id, {

@@ -696,11 +696,16 @@ class ReplicateDiscovery:
     Sends video chunks to Replicate's hosted VideoLLaMA3-7B model.
     No local GPU required — ideal for GTX 1650 and other low-VRAM systems.
     Costs ~$0.02 per chunk (~23s processing time per chunk).
+
+    Per-instance ``total_cost_usd`` accumulates an estimate of every
+    call routed through this object so the pipeline can surface the
+    real Replicate spend on the analysis summary card.
     """
 
     def __init__(self, api_key: str, model_id: str = "lucataco/videollama3-7b"):
         self.api_key = api_key
         self.model_id = model_id
+        self.total_cost_usd: float = 0.0
 
     def is_available(self) -> bool:
         """True when a Replicate API key is configured."""
@@ -950,6 +955,7 @@ class ReplicateDiscoveryV3:
     ):
         self.api_key = api_key
         self.model_id = model_id
+        self.total_cost_usd: float = 0.0
         self.fps = max(1, min(4, int(fps)))
         self.max_frames = max(16, min(180, int(max_frames)))
         self.refinement_enabled = bool(refinement_enabled)
@@ -1064,6 +1070,12 @@ class ReplicateDiscoveryV3:
             + refined_count * 0.005
             + (min(3, len(all_candidates)) * 0.003 if self.keyframe_analysis else 0)
         )
+        # Persist the running spend so the pipeline can sum it with the
+        # OpenRouter / Anthropic / Gemini totals for the analysis card.
+        try:
+            self.total_cost_usd = float(self.total_cost_usd or 0.0) + float(est_cost)
+        except Exception:
+            pass
         logger.info(
             "VideoLLaMA3-V3: total discovery: %d chunks, %d candidates (%d coarse, %d refined) — %.1fs, ~$%.2f",
             n_to_process, len(all_candidates), coarse_count, refined_count, elapsed, est_cost,
@@ -2599,6 +2611,10 @@ class ClipExtractor:
         self.transcript = transcript_segments or (
             perception.transcript_segments if perception else [])
         self.clips: List[ClipCandidate] = []
+        # Running estimate of the Replicate / cloud spend incurred by
+        # this extraction. Read by the pipeline after run() completes
+        # to populate the job's analysis-cost card.
+        self.total_cost_usd: float = 0.0
 
     def run(self, on_progress: Callable = None) -> List[ClipCandidate]:
         """Execute the full clip extraction pipeline."""
@@ -2684,6 +2700,12 @@ class ClipExtractor:
                     logger.info(f"Replicate discovered {len(vlm_candidates)} candidates")
                 except Exception as e:
                     logger.warning(f"Replicate VLM failed: {e} — falling back to local")
+                # Surface the running cost estimate (V3 + V2 both
+                # populate ``total_cost_usd`` after a run, V2 stays at
+                # 0.0 since it doesn't compute it).
+                self.total_cost_usd = float(
+                    getattr(rep, "total_cost_usd", 0.0) or 0.0
+                )
 
         # Priority 2: Local VideoLLaMA2 (needs ≥10GB VRAM)
         if not vlm_candidates and self.config.videollama2_enabled:

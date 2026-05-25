@@ -821,24 +821,42 @@ class ReframeEngine:
             if st is None:
                 continue
 
+            # Same subject-priority chain as the centering nudge below:
+            # face → YOLO subject → saliency hotspot. Animated /
+            # gameplay / wide-landscape moments without a face still
+            # get their crop corrected when the main subject drifts
+            # off-frame.
+            face_cx = None
             faces = self.perception.face_timeline.get(st, [])
             real_faces = [f for f in faces
                           if f.get('track_id', -1) >= 0
                           and (not real_tracks
                                or f.get('track_id', -1) in real_tracks)]
-            if not real_faces:
+            if real_faces:
+                best_face = max(real_faces, key=lambda f: (
+                    f.get('saliency', 0) + f.get('mouth_motion', 0)
+                ) * max(0.15, f.get('confidence', 0.5)))
+                face_cx = best_face['cx']
+            else:
+                persons = (self.perception.person_timeline.get(st, [])
+                           if hasattr(self.perception, 'person_timeline')
+                           else [])
+                if persons:
+                    face_cx = max(persons, key=lambda p: p.get('area', 0)).get('cx')
+            if face_cx is None:
+                sal = (self.perception.saliency_hotspot.get(st)
+                       if hasattr(self.perception, 'saliency_hotspot')
+                       else None)
+                if isinstance(sal, dict):
+                    face_cx = sal.get('cx')
+            if face_cx is None:
                 continue
-
-            best_face = max(real_faces, key=lambda f: (
-                f.get('saliency', 0) + f.get('mouth_motion', 0)
-            ) * max(0.15, f.get('confidence', 0.5)))
-            face_cx = best_face['cx']
 
             crop_x = interpolate_x(anchored, check_ms)
             crop_left = crop_x
             crop_right = crop_x + crop_w
 
-            # Only fix if face center is FULLY outside crop (not just at edge)
+            # Only fix if subject center is FULLY outside crop (not just at edge)
             if face_cx < crop_left or face_cx > crop_right:
                 corrected_x = clamp_x(face_cx - crop_w // 2, max_x)
 
@@ -889,19 +907,47 @@ class ReframeEngine:
                 if st is None:
                     continue
 
+                # Centering subject priority: face → YOLO subject →
+                # saliency hotspot. This matters for animated /
+                # gameplay / anime content where face-detection
+                # coverage drops below 30% — without a fallback the
+                # centering pass simply skips most of the timeline.
+                cx = None
                 faces = self.perception.face_timeline.get(st, [])
                 real_faces = [f for f in faces
                               if f.get('track_id', -1) >= 0
                               and (not real_tracks
                                    or f.get('track_id', -1) in real_tracks)]
-                if not real_faces:
+                if real_faces:
+                    # Pick the most salient face (matches evaluator logic).
+                    best_face = max(real_faces, key=lambda f: (
+                        f.get('saliency', 0) + f.get('mouth_motion', 0)
+                    ) * max(0.2, f.get('confidence', 0.5)))
+                    cx = best_face['cx']
+                else:
+                    # No face → YOLO person / head / character / mecha
+                    # box. Bigger area wins (closest to camera tends to
+                    # be the intended subject).
+                    persons = (self.perception.person_timeline.get(st, [])
+                               if hasattr(self.perception, 'person_timeline')
+                               else [])
+                    if persons:
+                        best_p = max(persons, key=lambda p: p.get('area', 0))
+                        cx = best_p.get('cx')
+                if cx is None:
+                    # Final fallback — spectral-saliency hotspot. Built by
+                    # the perceiver for frames with no face AND no YOLO
+                    # box (abstract / wide / landscape shots).
+                    sal = (self.perception.saliency_hotspot.get(st)
+                           if hasattr(self.perception, 'saliency_hotspot')
+                           else None)
+                    if isinstance(sal, dict):
+                        cx = sal.get('cx')
+                if cx is None:
                     continue
-
-                # Pick the most salient face (matches evaluator logic).
-                best_face = max(real_faces, key=lambda f: (
-                    f.get('saliency', 0) + f.get('mouth_motion', 0)
-                ) * max(0.2, f.get('confidence', 0.5)))
-                cx = best_face['cx']
+                # Faux "best_face" shim so the rest of this block keeps
+                # reading from cx the same way regardless of source.
+                best_face = {'cx': cx}
                 crop_left = kf['x']
                 center_left = crop_left + third
                 center_right = crop_left + 2 * third

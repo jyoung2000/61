@@ -144,21 +144,50 @@ def _build_user_prompt(
         else ""
     )
 
-    rules = []
-    if settings.TRANSCRIPT_FILLER_REMOVAL and language.lower() not in _CJK_LANGS:
-        rules.append("Delete filler words: um, uh, like, you know, basically, literally, kinda, sorta.")
-    if settings.TRANSCRIPT_SENTENCE_REPAIR:
+    preserve = getattr(settings, "TRANSCRIPT_PRESERVE_WORDS", True)
+    rules: list[str] = []
+    if preserve:
+        # Conservative profile: every spoken word stays. Only allowed
+        # edits are punctuation, capitalisation, and homophone fixes —
+        # nothing that would make the on-screen caption diverge from
+        # the audio.
         rules.append(
-            "Repair fragmented sentences: if the segment is a fragment that "
-            "obviously continues from the previous one in CONTEXT, keep it as "
-            "a fragment but match casing/punctuation appropriately."
+            "CRITICAL: Preserve EVERY spoken word — do NOT delete, "
+            "rephrase, summarise, or substitute words. The polished "
+            "text must read the SAME sequence of words as the input."
         )
-    if language.lower() in _CJK_LANGS:
-        rules.append("Japanese/Korean/Chinese: do NOT add Western punctuation. Leave particles untouched. Do NOT change sentence-final particles.")
+        rules.append(
+            "You MAY add or correct punctuation, capitalisation, and "
+            "sentence boundaries to make the text readable."
+        )
+        rules.append(
+            "You MAY split a long run-on into multiple sentences by "
+            "inserting punctuation, but every word must remain."
+        )
+        if language.lower() in _CJK_LANGS:
+            rules.append(
+                "Japanese/Korean/Chinese: insert 。 at obvious sentence "
+                "ends and 、 at clause breaks where appropriate. Leave "
+                "particles untouched. Do NOT remove or substitute kana."
+            )
+        else:
+            rules.append("Fix homophones: their/there/they're, your/you're, its/it's.")
+            rules.append("Standardise spellings of proper nouns across all segments in this batch.")
     else:
-        rules.append("Add proper punctuation: periods, commas, question marks, capitalisation.")
-        rules.append("Fix homophones: their/there/they're, your/you're, its/it's.")
-        rules.append("Standardise spellings of proper nouns across all segments in this batch.")
+        if settings.TRANSCRIPT_FILLER_REMOVAL and language.lower() not in _CJK_LANGS:
+            rules.append("Delete filler words: um, uh, like, you know, basically, literally, kinda, sorta.")
+        if settings.TRANSCRIPT_SENTENCE_REPAIR:
+            rules.append(
+                "Repair fragmented sentences: if the segment is a fragment that "
+                "obviously continues from the previous one in CONTEXT, keep it as "
+                "a fragment but match casing/punctuation appropriately."
+            )
+        if language.lower() in _CJK_LANGS:
+            rules.append("Japanese/Korean/Chinese: do NOT add Western punctuation. Leave particles untouched. Do NOT change sentence-final particles.")
+        else:
+            rules.append("Add proper punctuation: periods, commas, question marks, capitalisation.")
+            rules.append("Fix homophones: their/there/they're, your/you're, its/it's.")
+            rules.append("Standardise spellings of proper nouns across all segments in this batch.")
 
     rules_block = "\n".join(f"  - {r}" for r in rules)
 

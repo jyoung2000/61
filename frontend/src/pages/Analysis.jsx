@@ -2840,6 +2840,31 @@ export default function Analysis() {
               : `${Math.floor(job.analysis_duration_seconds / 60)}m ${Math.round(job.analysis_duration_seconds % 60)}s`}
           </span>
         )}
+        {typeof job.estimated_cost_usd === 'number' && (
+          <span
+            style={{
+              fontFamily: 'var(--font-mono)',
+              color: job.estimated_cost_usd > 0
+                ? 'var(--accent-amber, #f59e0b)'
+                : 'var(--text-muted)',
+              cursor: job.cost_breakdown ? 'help' : 'default',
+            }}
+            title={
+              job.cost_breakdown && Object.keys(job.cost_breakdown).length
+                ? `Cost breakdown:\n${Object
+                    .entries(job.cost_breakdown)
+                    .map(([k, v]) => `  ${k}: $${Number(v).toFixed(4)}`)
+                    .join('\n')}`
+                : 'Estimated analysis spend (LLM tokens + Replicate cloud GPU)'
+            }
+          >
+            {job.estimated_cost_usd > 0
+              ? `Cost ~$${job.estimated_cost_usd < 0.01
+                  ? job.estimated_cost_usd.toFixed(4)
+                  : job.estimated_cost_usd.toFixed(2)}`
+              : 'Cost $0.00 (local only)'}
+          </span>
+        )}
         {/* The Share button lives in the page header (top-right);
             duplicating it inside the metadata bar generated invalid
             ``/share/analysis/<jobId>`` URLs (the public share routes
@@ -2927,8 +2952,53 @@ export default function Analysis() {
             <div className="slide-in">
               <div style={{ background: 'var(--bg-panel)', border: '1px solid var(--border)', borderRadius: 'var(--radius-md)', padding: 20, marginBottom: 16, boxShadow: 'var(--shadow-sm)' }}>
                 <h3 style={{ fontSize: 14, marginBottom: 12, color: 'var(--accent-cyan)' }}>Overview</h3>
-                <p style={{ fontSize: 14, lineHeight: 1.6, color: 'var(--text-primary)' }}>{String(job.summary.overview || '')}</p>
+                <p style={{ fontSize: 14, lineHeight: 1.6, color: 'var(--text-primary)', whiteSpace: 'pre-wrap' }}>{String(job.summary.overview || '')}</p>
               </div>
+
+              {job.summary.narrative_arc && (
+                <div style={{ background: 'var(--bg-panel)', border: '1px solid var(--border)', borderRadius: 'var(--radius-md)', padding: 20, marginBottom: 16, boxShadow: 'var(--shadow-sm)' }}>
+                  <h3 style={{ fontSize: 14, marginBottom: 12, color: 'var(--accent-amber)' }}>Narrative Arc</h3>
+                  <p style={{ fontSize: 14, lineHeight: 1.6, color: 'var(--text-primary)', whiteSpace: 'pre-wrap' }}>{String(job.summary.narrative_arc)}</p>
+                </div>
+              )}
+
+              {Array.isArray(job.summary.highlight_moments) && job.summary.highlight_moments.length > 0 && (
+                <div style={{ background: 'var(--bg-panel)', border: '1px solid var(--border)', borderRadius: 'var(--radius-md)', padding: 20, marginBottom: 16, boxShadow: 'var(--shadow-sm)' }}>
+                  <h3 style={{ fontSize: 14, marginBottom: 12, color: 'var(--accent-cyan)' }}>Highlight Moments</h3>
+                  <ul style={{ paddingLeft: 18, margin: 0 }}>
+                    {job.summary.highlight_moments.map((moment, i) => {
+                      const text = typeof moment === 'string' ? moment : String(moment);
+                      // Try to parse "MM:SS — text" or "MM:SS - text" and make
+                      // the timestamp clickable.
+                      const m = text.match(/^\s*(\d{1,2}:\d{2}(?:\.\d+)?)\s*[—–-]\s*(.*)$/);
+                      if (m) {
+                        const tsStr = m[1];
+                        const parts = tsStr.split(':');
+                        const seconds = parts.length === 2
+                          ? parseInt(parts[0], 10) * 60 + parseFloat(parts[1])
+                          : 0;
+                        return (
+                          <li key={i} style={{ fontSize: 13, lineHeight: 1.7, color: 'var(--text-primary)' }}>
+                            <button
+                              onClick={() => handleSeek(seconds)}
+                              style={{
+                                background: 'transparent', border: 'none', padding: '0 4px',
+                                color: 'var(--accent-cyan)', cursor: 'pointer',
+                                fontFamily: 'var(--font-mono)', fontWeight: 600,
+                              }}
+                              title="Jump to this moment"
+                            >
+                              {tsStr}
+                            </button>
+                            <span>— {m[2]}</span>
+                          </li>
+                        );
+                      }
+                      return <li key={i} style={{ fontSize: 13, lineHeight: 1.7, color: 'var(--text-primary)' }}>{text}</li>;
+                    })}
+                  </ul>
+                </div>
+              )}
 
               <div style={{ display: 'flex', flexDirection: isMobile ? 'column' : 'row', gap: 16, flexWrap: 'wrap', marginBottom: 16 }}>
                 <div style={{ background: 'var(--bg-panel)', border: '1px solid var(--border)', borderRadius: 'var(--radius-md)', padding: 16, flex: 1, minWidth: 200, boxShadow: 'var(--shadow-sm)' }}>
@@ -2947,6 +3017,29 @@ export default function Analysis() {
                     <div>Category: <span className="badge badge-amber">{String(job.summary.content_category || '')}</span></div>
                   </div>
                 </div>
+                {job.transcript_readability && (
+                  <div style={{ background: 'var(--bg-panel)', border: '1px solid var(--border)', borderRadius: 'var(--radius-md)', padding: 16, flex: 1, minWidth: 200, boxShadow: 'var(--shadow-sm)' }}>
+                    <h4 style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 8, textTransform: 'uppercase', letterSpacing: '0.06em' }}>Transcript Readability</h4>
+                    <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 6 }}>
+                      <span style={{
+                        fontSize: 24, fontWeight: 700,
+                        color: job.transcript_readability.score >= 92 ? 'var(--success)' :
+                               job.transcript_readability.score >= 75 ? 'var(--accent-cyan)' :
+                               job.transcript_readability.score >= 65 ? 'var(--accent-amber)' : 'var(--danger)',
+                        fontFamily: 'var(--font-mono)',
+                      }}>{job.transcript_readability.grade}</span>
+                      <span style={{ fontSize: 13, color: 'var(--text-secondary)', fontFamily: 'var(--font-mono)' }}>
+                        {Number(job.transcript_readability.score || 0).toFixed(0)}/100
+                      </span>
+                    </div>
+                    <div style={{ fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.6 }}>
+                      <div>CPS compliance: {Number(job.transcript_readability.cps_compliance_pct || 0).toFixed(0)}%</div>
+                      <div>Line length: {Number(job.transcript_readability.line_compliance_pct || 0).toFixed(0)}%</div>
+                      <div>Duration: {Number(job.transcript_readability.duration_compliance_pct || 0).toFixed(0)}%</div>
+                      <div>Avg CPS: <span style={{ fontFamily: 'var(--font-mono)' }}>{Number(job.transcript_readability.avg_cps || 0).toFixed(1)}</span>{job.transcript_readability.is_cjk ? ' (CJK-weighted)' : ''}</div>
+                    </div>
+                  </div>
+                )}
               </div>
             </div>
           ) : (

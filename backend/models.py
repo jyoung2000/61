@@ -161,6 +161,11 @@ class VideoSummary(BaseModel):
     tone: str
     estimated_audience: str
     content_category: str
+    # New fields populated by the richer summary prompt. Optional so
+    # legacy / fallback summaries that only emit the four-line shape
+    # still validate cleanly.
+    narrative_arc: Optional[str] = None
+    highlight_moments: list[str] = []
 
 
 class JobResult(BaseModel):
@@ -217,6 +222,11 @@ class JobResult(BaseModel):
     subtitle_settings: Optional[dict] = None  # Canonical subtitle settings — server is source of truth
     error: Optional[str] = None
     estimated_cost_usd: Optional[float] = None
+    # Per-provider breakdown of the analysis spend (best-effort).
+    # Keys are provider buckets ("llm" for OpenRouter / Anthropic /
+    # Gemini / Groq, "replicate" for the VideoLLaMA cloud chunks).
+    # Sum equals estimated_cost_usd.
+    cost_breakdown: Optional[dict] = None
     face_registry_data: Optional[dict] = None   # Serialized FaceRegistry with embeddings
     layout_timeline: list[dict] = []            # [{start, end, layout_mode, face_positions}]
     default_layout_mode: str = "single"         # Overall recommended layout for the video
