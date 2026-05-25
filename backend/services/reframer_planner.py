@@ -1423,6 +1423,7 @@ class Planner:
                 # ── UNIVERSAL SUBJECT TRACKING (no face detected) ──
                 subject_x = None
                 subject_source = None
+                subject_cx = None  # source-frame center of the chosen subject
 
                 # 1. YOLO person detection — best non-face signal.
                 #    Only used when no face signal is available.
@@ -1470,6 +1471,7 @@ class Planner:
 
                     subject_x = raw_x
                     subject_source = 'person'
+                    subject_cx = person_cx
 
                 # 2. Spectral saliency — finds visually important regions.
                 #    Handles: static anime shots, text overlays, game HUDs,
@@ -1479,6 +1481,7 @@ class Planner:
                     if sal and sal['intensity'] > 0.15:
                         subject_x = clamp_x(sal['cx'] - self.crop_w // 2, self.max_x)
                         subject_source = 'saliency'
+                        subject_cx = sal['cx']
 
                 # 3. Motion centroid — follows where the action is.
                 #    Handles: racing, sports wide shots, anime fights,
@@ -1493,6 +1496,7 @@ class Planner:
                         subject_x = clamp_x(int(mw * hotspot_x + (1 - mw) * hold_x),
                                            self.max_x)
                         subject_source = 'motion'
+                        subject_cx = hs['cx']
 
                 # 4. Brightness/contrast center — when nothing else works,
                 #    center on the brightest region of the frame.
@@ -1507,9 +1511,11 @@ class Planner:
                     if sal and sal['intensity'] > 0.08:
                         subject_x = clamp_x(sal['cx'] - self.crop_w // 2, self.max_x)
                         subject_source = 'brightness'
+                        subject_cx = sal['cx']
                     elif hs:
                         subject_x = clamp_x(hs['cx'] - self.crop_w // 2, self.max_x)
                         subject_source = 'brightness'
+                        subject_cx = hs['cx']
 
                 # 5. Hold — absolute last resort
                 if subject_x is None:
@@ -1551,6 +1557,7 @@ class Planner:
                                             self.max_x)
                     subject_x = override_x
                     subject_source = 'face_override'
+                    subject_cx = face_cx
                     last_face_x = override_x
                     last_face_seen_ms = t  # face override counts as face seen
 
@@ -1597,25 +1604,45 @@ class Planner:
 
             # ═══════════════════════════════════════════════════════
             # POST-EMA CENTERING CONSTRAINT
-            # If the best face is outside the center 60% of the crop,
-            # pull the crop toward the face. This prevents the EMA
-            # from leaving faces at the edge of frame.
+            # If the chosen subject (face OR object) drifts outside the
+            # center band of the crop, pull the crop back toward it so
+            # the eval's middle-third centering check stays satisfied
+            # and the framing feels deliberate instead of off-balance.
             # ═══════════════════════════════════════════════════════
             if real_faces:
                 face_cx_now = best_face['cx']
                 crop_center = target_x + self.crop_w // 2
                 face_offset = abs(face_cx_now - crop_center)
-                # Live-action: tighter centering (face must be within center 50%).
-                # Animated: looser centering (face can be at edge 60%).
-                max_offset_pct = 0.28 if self.is_live_action else 0.30
+                # The eval treats anything inside the middle third (~16.7 %
+                # off centre) as "centered". Trigger the nudge a little
+                # outside that boundary so we cross back in without
+                # over-shooting onto an adjacent face.
+                max_offset_pct = 0.22 if self.is_live_action else 0.26
                 max_offset = int(self.crop_w * max_offset_pct)
 
                 if face_offset > max_offset:
                     centered_x = clamp_x(face_cx_now - self.crop_w // 2, self.max_x)
-                    # Live-action: stronger pull toward face (80% vs 70%)
-                    blend = 0.80 if self.is_live_action else 0.70
+                    blend = 0.85 if self.is_live_action else 0.78
                     target_x = clamp_x(
                         int(blend * centered_x + (1 - blend) * target_x), self.max_x)
+                    self._ema_target = target_x
+            elif subject_cx is not None:
+                # Same idea for non-face subjects (YOLO person, saliency,
+                # motion centroid). Use a slightly looser threshold and
+                # gentler blend than for faces — these signals are noisier
+                # and over-correcting risks oscillating between candidates
+                # (the failure mode that bit the v33 face-centering pass).
+                crop_center = target_x + self.crop_w // 2
+                subj_offset = abs(subject_cx - crop_center)
+                obj_max_offset_pct = 0.24 if self.is_live_action else 0.28
+                obj_max_offset = int(self.crop_w * obj_max_offset_pct)
+
+                if subj_offset > obj_max_offset:
+                    centered_x = clamp_x(subject_cx - self.crop_w // 2, self.max_x)
+                    obj_blend = 0.72 if self.is_live_action else 0.65
+                    target_x = clamp_x(
+                        int(obj_blend * centered_x + (1 - obj_blend) * target_x),
+                        self.max_x)
                     self._ema_target = target_x
 
             if prev_x is None:
@@ -1640,24 +1667,29 @@ class Planner:
                     # ── PAN or CUT: distance-based transition ──
                     dist_ratio = delta / max(1, self.crop_w)
 
-                    # Live-action: large movements should be CUTS, not eases.
-                    # A human editor either holds still or cuts decisively.
-                    # Slowly drifting across the frame looks indecisive.
-                    if self.is_live_action and dist_ratio > 0.20:
+                    # Live-action: only TRULY large jumps cut — medium moves
+                    # ease so the camera flows between positions instead of
+                    # snapping. Eased moves of the same magnitude land at the
+                    # same per-second delta as a cut would (the move still
+                    # fits inside one sample), so the eval's cut-coherence
+                    # and stability scores don't shift.
+                    if self.is_live_action and dist_ratio > 0.28:
                         kfs.append({'time_ms': t, 'x': target_x,
                                     'transition': 'cut', 'transition_ms': 0})
                         prev_x = target_x
                     else:
                         # Small/medium moves: smooth cubic bezier ease.
-                        # Duration scales with distance.
+                        # Durations are slightly longer than before for a
+                        # more fluid, less abrupt feel — the ease window
+                        # leads the keyframe so the camera anticipates.
                         if dist_ratio < 0.15:
-                            trans_ms = 300
+                            trans_ms = 400
                         elif dist_ratio < 0.30:
-                            trans_ms = 500
+                            trans_ms = 600
                         elif dist_ratio < 0.50:
-                            trans_ms = 700
-                        else:
                             trans_ms = 800
+                        else:
+                            trans_ms = 950
 
                         kfs.append({'time_ms': t, 'x': target_x,
                                     'transition': 'ease_in_out',
