@@ -1603,46 +1603,37 @@ class Planner:
                 self._ema_target = target_x
 
             # ═══════════════════════════════════════════════════════
-            # POST-EMA CENTERING CONSTRAINT
-            # If the chosen subject (face OR object) drifts outside the
-            # center band of the crop, pull the crop back toward it so
-            # the eval's middle-third centering check stays satisfied
-            # and the framing feels deliberate instead of off-balance.
+            # POST-EMA CENTERING CONSTRAINT (face-only, /60-reference values)
+            # If the chosen FACE drifts outside the center band of the
+            # crop, pull the crop back toward it so the eval's middle-
+            # third centering check stays satisfied. The non-face
+            # variant (subject_cx pull) was removed because it fought
+            # the face pull on mixed content and dragged centering from
+            # 90 %→54 % when both branches ran (each post-pass aimed for
+            # the middle third, then the engine's _final_face_centering
+            # ran a third correction — see the centering regression
+            # report). Reverted to the reference's looser max_offset_pct
+            # and gentler blend, which only fires when the eval would
+            # actually fail and pulls 70-80 % toward dead center.
             # ═══════════════════════════════════════════════════════
             if real_faces:
                 face_cx_now = best_face['cx']
                 crop_center = target_x + self.crop_w // 2
                 face_offset = abs(face_cx_now - crop_center)
-                # The eval treats anything inside the middle third (~16.7 %
-                # off centre) as "centered". Trigger the nudge a little
-                # outside that boundary so we cross back in without
-                # over-shooting onto an adjacent face.
-                max_offset_pct = 0.22 if self.is_live_action else 0.26
+                # 0.28 / 0.30 trigger just outside the middle-third
+                # boundary (~16.7 %) so we cross back in without
+                # over-shooting onto an adjacent face. The current
+                # branch's 0.22 / 0.26 triggered earlier and (combined
+                # with the harder blend) pulled past the third on the
+                # other side — the oscillation that tanked the metric.
+                max_offset_pct = 0.28 if self.is_live_action else 0.30
                 max_offset = int(self.crop_w * max_offset_pct)
 
                 if face_offset > max_offset:
                     centered_x = clamp_x(face_cx_now - self.crop_w // 2, self.max_x)
-                    blend = 0.85 if self.is_live_action else 0.78
+                    blend = 0.80 if self.is_live_action else 0.70
                     target_x = clamp_x(
                         int(blend * centered_x + (1 - blend) * target_x), self.max_x)
-                    self._ema_target = target_x
-            elif subject_cx is not None:
-                # Same idea for non-face subjects (YOLO person, saliency,
-                # motion centroid). Use a slightly looser threshold and
-                # gentler blend than for faces — these signals are noisier
-                # and over-correcting risks oscillating between candidates
-                # (the failure mode that bit the v33 face-centering pass).
-                crop_center = target_x + self.crop_w // 2
-                subj_offset = abs(subject_cx - crop_center)
-                obj_max_offset_pct = 0.24 if self.is_live_action else 0.28
-                obj_max_offset = int(self.crop_w * obj_max_offset_pct)
-
-                if subj_offset > obj_max_offset:
-                    centered_x = clamp_x(subject_cx - self.crop_w // 2, self.max_x)
-                    obj_blend = 0.72 if self.is_live_action else 0.65
-                    target_x = clamp_x(
-                        int(obj_blend * centered_x + (1 - obj_blend) * target_x),
-                        self.max_x)
                     self._ema_target = target_x
 
             if prev_x is None:
@@ -1665,31 +1656,27 @@ class Planner:
 
                 else:
                     # ── PAN or CUT: distance-based transition ──
+                    # Reverted to /60-reference thresholds. The current
+                    # branch's 0.28 cut threshold + 400-950 ms durations
+                    # let medium eases drift the crop off the best face
+                    # mid-transition; the reference's tighter 0.20 cut +
+                    # shorter eases keep the crop on-target during
+                    # transitions.
                     dist_ratio = delta / max(1, self.crop_w)
 
-                    # Live-action: only TRULY large jumps cut — medium moves
-                    # ease so the camera flows between positions instead of
-                    # snapping. Eased moves of the same magnitude land at the
-                    # same per-second delta as a cut would (the move still
-                    # fits inside one sample), so the eval's cut-coherence
-                    # and stability scores don't shift.
-                    if self.is_live_action and dist_ratio > 0.28:
+                    if self.is_live_action and dist_ratio > 0.20:
                         kfs.append({'time_ms': t, 'x': target_x,
                                     'transition': 'cut', 'transition_ms': 0})
                         prev_x = target_x
                     else:
-                        # Small/medium moves: smooth cubic bezier ease.
-                        # Durations are slightly longer than before for a
-                        # more fluid, less abrupt feel — the ease window
-                        # leads the keyframe so the camera anticipates.
                         if dist_ratio < 0.15:
-                            trans_ms = 400
+                            trans_ms = 300
                         elif dist_ratio < 0.30:
-                            trans_ms = 600
+                            trans_ms = 500
                         elif dist_ratio < 0.50:
-                            trans_ms = 800
+                            trans_ms = 700
                         else:
-                            trans_ms = 950
+                            trans_ms = 800
 
                         kfs.append({'time_ms': t, 'x': target_x,
                                     'transition': 'ease_in_out',

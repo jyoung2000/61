@@ -174,6 +174,21 @@ export function sanitizeClip(c) {
   if (Array.isArray(sc.seo_tags)) {
     sc.seo_tags = sc.seo_tags.map((t) => (typeof t === 'string' ? t : String(t)));
   }
+  // Per-platform SEO map — each entry is a ClipSEO record with the same
+  // primitive-coercion rules as the legacy single-platform fields.
+  if (sc.seo_by_platform && typeof sc.seo_by_platform === 'object') {
+    const cleaned = {};
+    for (const [slug, value] of Object.entries(sc.seo_by_platform)) {
+      if (!value || typeof value !== 'object') continue;
+      cleaned[String(slug)] = {
+        title: typeof value.title === 'string' ? value.title : String(value.title ?? ''),
+        description: typeof value.description === 'string' ? value.description : String(value.description ?? ''),
+        tags: Array.isArray(value.tags) ? value.tags.map((t) => (typeof t === 'string' ? t : String(t))) : [],
+        platform_tips: typeof value.platform_tips === 'string' ? value.platform_tips : String(value.platform_tips ?? ''),
+      };
+    }
+    sc.seo_by_platform = cleaned;
+  }
   // Numeric fields — coerce objects to number
   const numFields = ['viral_score', 'start_time', 'end_time', 'id'];
   for (const f of numFields) {

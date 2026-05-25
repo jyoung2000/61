@@ -111,6 +111,34 @@ function getCurrentWordIndex(segment, relativeTime) {
   return words.length - 1;
 }
 
+// ── Platform metadata (display labels + colors). Slugs match the
+//    PLATFORM_PROFILES keys in backend/services/prompts.py so a user
+//    selecting a platform here sends the slug the backend understands.
+const PLATFORM_OPTIONS = [
+  { slug: 'tiktok',         label: 'TikTok',         color: '#22d3ee', titleMax: 150,  tagMin: 5,  tagMax: 8 },
+  { slug: 'youtube_shorts', label: 'YT Shorts',      color: '#ef4444', titleMax: 100,  tagMin: 3,  tagMax: 6 },
+  { slug: 'reels',          label: 'IG Reels',       color: '#ec4899', titleMax: 125,  tagMin: 15, tagMax: 20 },
+  { slug: 'instagram',      label: 'IG Feed',        color: '#a855f7', titleMax: 125,  tagMin: 10, tagMax: 15 },
+  { slug: 'youtube',        label: 'YouTube',        color: '#dc2626', titleMax: 70,   tagMin: 8,  tagMax: 15 },
+  { slug: 'x',              label: 'X / Twitter',    color: '#0ea5e9', titleMax: 280,  tagMin: 0,  tagMax: 3 },
+  { slug: 'facebook',       label: 'Facebook',       color: '#3b82f6', titleMax: 100,  tagMin: 2,  tagMax: 6 },
+  { slug: 'linkedin',       label: 'LinkedIn',       color: '#0a66c2', titleMax: 150,  tagMin: 3,  tagMax: 6 },
+];
+const PLATFORM_BY_SLUG = Object.fromEntries(PLATFORM_OPTIONS.map((p) => [p.slug, p]));
+
+function resolvePlatformSlug(raw) {
+  if (!raw) return 'tiktok';
+  const c = String(raw).toLowerCase().replace(/-/g, '_');
+  const aliases = {
+    youtube_short: 'youtube_shorts', shorts: 'youtube_shorts', yt_shorts: 'youtube_shorts',
+    yt: 'youtube', youtube_long: 'youtube', youtube_longform: 'youtube',
+    ig: 'instagram', instagram_reels: 'reels', ig_reels: 'reels',
+    fb: 'facebook', twitter: 'x', li: 'linkedin', both: 'tiktok',
+  };
+  const resolved = aliases[c] || c;
+  return PLATFORM_BY_SLUG[resolved] ? resolved : 'tiktok';
+}
+
 export default function ClipSEO() {
   const { jobId, clipId } = useParams();
   // Multi-track editor timeline state (global zustand store)
@@ -119,6 +147,12 @@ export default function ClipSEO() {
   const [job, setJob] = useState(null);
   const [clip, setClip] = useState(null);
   const [seo, setSeo] = useState(null);
+  // Per-platform SEO map ({ tiktok: {title,desc,tags,platform_tips}, ... }).
+  // Hydrated from clip.seo_by_platform on load, updated as each platform
+  // is generated. Drives the platform tabs and the active tab's display.
+  const [seoByPlatform, setSeoByPlatform] = useState({});
+  const [selectedPlatform, setSelectedPlatform] = useState('tiktok');
+  const [generatingPlatforms, setGeneratingPlatforms] = useState({}); // {tiktok: true}
   const [loading, setLoading] = useState(true);
   const [generating, setGenerating] = useState(false);
   const [genStatus, setGenStatus] = useState('');
@@ -451,6 +485,36 @@ export default function ClipSEO() {
                 platform_tips: typeof found.seo_platform_tips === 'string' ? found.seo_platform_tips : String(found.seo_platform_tips ?? ''),
               });
             }
+            // Hydrate the per-platform SEO map so the tab UI can show which
+            // platforms already have generated copy without a separate fetch.
+            const byPlat = {};
+            const serverMap = found.seo_by_platform || {};
+            Object.entries(serverMap).forEach(([rawSlug, value]) => {
+              if (!value) return;
+              const slug = resolvePlatformSlug(rawSlug);
+              byPlat[slug] = {
+                title: String(value.title ?? ''),
+                description: String(value.description ?? ''),
+                tags: Array.isArray(value.tags) ? value.tags.map((t) => String(t)) : [],
+                platform_tips: String(value.platform_tips ?? ''),
+              };
+            });
+            // Fall back to the legacy single-platform SEO under the clip's
+            // primary platform tab so users with old data don't see an empty
+            // panel after upgrading.
+            const legacySlug = resolvePlatformSlug(found.platform);
+            if (!byPlat[legacySlug] && found.seo_title) {
+              byPlat[legacySlug] = {
+                title: String(found.seo_title ?? ''),
+                description: String(found.seo_description ?? ''),
+                tags: Array.isArray(found.seo_tags) ? found.seo_tags.map((t) => String(t)) : [],
+                platform_tips: String(found.seo_platform_tips ?? ''),
+              };
+            }
+            setSeoByPlatform(byPlat);
+            // Open the tab the clip is primarily targeting so the most
+            // relevant generated copy is visible by default.
+            setSelectedPlatform(legacySlug);
             if (found.shorts_description) setShortsDesc(found.shorts_description);
             if (found.longform_description) setLongFormDesc(found.longform_description);
           }
@@ -742,10 +806,15 @@ export default function ClipSEO() {
     setEditingSpeaker(null);
   };
 
-  const generateSEO = useCallback(async () => {
+  const generateSEO = useCallback(async (platformArg) => {
+    // Default to the active tab; callers can override per-platform.
+    const platform = resolvePlatformSlug(platformArg || selectedPlatform);
+    const platformLabel = PLATFORM_BY_SLUG[platform]?.label || platform;
+
     setGenerating(true);
+    setGeneratingPlatforms((prev) => ({ ...prev, [platform]: true }));
     setGenElapsed(0);
-    setGenStatus('Connecting to AI provider...');
+    setGenStatus(`Generating ${platformLabel} SEO...`);
 
     const startMs = Date.now();
     const timerInterval = setInterval(() => {
@@ -755,12 +824,11 @@ export default function ClipSEO() {
     const statusInterval = setInterval(() => {
       setGenStatus((prev) => {
         const msgs = [
-          'Connecting to AI provider...',
-          'Analyzing clip transcript...',
-          'Generating SEO metadata...',
-          'Crafting title and caption...',
-          'Picking tags...',
-          'Almost done...',
+          `Generating ${platformLabel} SEO...`,
+          `Analyzing clip transcript...`,
+          `Crafting ${platformLabel} title...`,
+          `Picking ${platformLabel} hashtags...`,
+          `Almost done...`,
         ];
         const idx = msgs.indexOf(prev);
         return msgs[Math.min(idx + 1, msgs.length - 1)];
@@ -768,30 +836,118 @@ export default function ClipSEO() {
     }, 4000);
 
     try {
-      const res = await fetch(`/api/jobs/${jobId}/seo/${clipId}`, { method: 'POST' });
+      const res = await fetch(`/api/jobs/${jobId}/seo/${clipId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ platform }),
+      });
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
         throw new Error(err.detail || 'SEO generation failed');
       }
       const data = await res.json();
       const rawSeo = data.seo || {};
-      setSeo({
+      const normalized = {
         title: typeof rawSeo.title === 'string' ? rawSeo.title : String(rawSeo.title ?? ''),
         description: typeof rawSeo.description === 'string' ? rawSeo.description : String(rawSeo.description ?? ''),
         tags: Array.isArray(rawSeo.tags) ? rawSeo.tags.map((t) => typeof t === 'string' ? t : String(t)) : [],
         platform_tips: typeof rawSeo.platform_tips === 'string' ? rawSeo.platform_tips : String(rawSeo.platform_tips ?? ''),
-      });
-      showToast(`SEO generated via ${data.provider}`, 'success');
+      };
+      setSeoByPlatform((prev) => ({ ...prev, [platform]: normalized }));
+      // Keep the legacy single-platform display in sync with whichever
+      // platform the user is currently viewing so the "Caption / Hook"
+      // overlays elsewhere in the editor pick up the new copy.
+      if (platform === resolvePlatformSlug(selectedPlatform)) {
+        setSeo(normalized);
+      }
+      showToast(`${platformLabel} SEO generated via ${data.provider}`, 'success');
     } catch (err) {
       showToast(err.message, 'error');
     } finally {
       clearInterval(statusInterval);
       clearInterval(timerInterval);
       setGenerating(false);
+      setGeneratingPlatforms((prev) => {
+        const next = { ...prev };
+        delete next[platform];
+        return next;
+      });
       setGenStatus('');
       setGenElapsed(0);
     }
-  }, [jobId, clipId]);
+  }, [jobId, clipId, selectedPlatform]);
+
+  // Generate every standard short-form platform in one click. Sequential
+  // on the server side (LLM fallback chains assume serial); the UI shows
+  // a per-platform spinner so the user can see progress.
+  const generateAllPlatforms = useCallback(async (platforms) => {
+    const list = (platforms && platforms.length > 0)
+      ? platforms
+      : ['tiktok', 'youtube_shorts', 'reels', 'youtube'];
+    const startMarkers = {};
+    list.forEach((p) => { startMarkers[p] = true; });
+    setGeneratingPlatforms((prev) => ({ ...prev, ...startMarkers }));
+
+    try {
+      const res = await fetch(`/api/jobs/${jobId}/seo/${clipId}/multi`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ platforms: list }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || 'Multi-platform SEO generation failed');
+      }
+      const data = await res.json();
+      const updates = {};
+      Object.entries(data.results || {}).forEach(([slug, payload]) => {
+        const raw = payload?.seo || {};
+        updates[slug] = {
+          title: typeof raw.title === 'string' ? raw.title : String(raw.title ?? ''),
+          description: typeof raw.description === 'string' ? raw.description : String(raw.description ?? ''),
+          tags: Array.isArray(raw.tags) ? raw.tags.map((t) => String(t)) : [],
+          platform_tips: typeof raw.platform_tips === 'string' ? raw.platform_tips : String(raw.platform_tips ?? ''),
+        };
+      });
+      setSeoByPlatform((prev) => ({ ...prev, ...updates }));
+      // Mirror the active tab's freshly generated SEO into the legacy
+      // single-platform state used by other panels.
+      const activeSlug = resolvePlatformSlug(selectedPlatform);
+      if (updates[activeSlug]) {
+        setSeo(updates[activeSlug]);
+      }
+      const successCount = Object.keys(data.results || {}).length;
+      const failCount = Object.keys(data.failures || {}).length;
+      if (failCount > 0) {
+        showToast(`Generated ${successCount}, ${failCount} failed`, 'warning');
+      } else {
+        showToast(`SEO generated for ${successCount} platforms`, 'success');
+      }
+    } catch (err) {
+      showToast(err.message, 'error');
+    } finally {
+      const clearMarkers = {};
+      list.forEach((p) => { clearMarkers[p] = false; });
+      setGeneratingPlatforms((prev) => {
+        const next = { ...prev };
+        list.forEach((p) => delete next[p]);
+        return next;
+      });
+    }
+  }, [jobId, clipId, selectedPlatform]);
+
+  // When the user switches tabs, mirror the visible platform's SEO into
+  // the legacy single-platform state so the other panels (Caption preview,
+  // Copy All button) reflect the active platform's copy.
+  useEffect(() => {
+    const slug = resolvePlatformSlug(selectedPlatform);
+    const existing = seoByPlatform[slug];
+    if (existing) {
+      setSeo(existing);
+    } else {
+      setSeo(null);
+    }
+  }, [selectedPlatform, seoByPlatform]);
 
   const generateDescription = useCallback(async (descType) => {
     const isShorts = descType === 'shorts';
@@ -1639,6 +1795,89 @@ export default function ClipSEO() {
               ``/share/clip/<jobId>/<clipId>`` route which the public
               SharedView never knew how to load — duplicating that
               button confused users into copying broken URLs. */}
+
+          {/* ── Platform tabs ── */}
+          <div style={{
+            ...sectionStyle, padding: '12px 12px 8px',
+            background: 'var(--bg-base)', borderColor: 'var(--border)',
+          }}>
+            <div style={{
+              display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+              marginBottom: 10,
+            }}>
+              <div style={{
+                fontSize: 10, fontFamily: 'var(--font-mono)',
+                color: 'var(--text-muted)', textTransform: 'uppercase',
+                letterSpacing: '0.1em',
+              }}>
+                SEO per platform
+              </div>
+              <button
+                onClick={() => generateAllPlatforms(['tiktok', 'youtube_shorts', 'reels', 'youtube'])}
+                disabled={Object.values(generatingPlatforms).some(Boolean)}
+                title="Generate SEO for the four most common short-form + long-form platforms in one call"
+                style={{
+                  padding: '4px 10px', fontSize: 10, fontWeight: 600,
+                  background: 'var(--bg-panel)',
+                  color: 'var(--accent-cyan)',
+                  border: '1px solid var(--accent-cyan)',
+                  borderRadius: 'var(--radius-sm)',
+                  cursor: Object.values(generatingPlatforms).some(Boolean) ? 'wait' : 'pointer',
+                  opacity: Object.values(generatingPlatforms).some(Boolean) ? 0.5 : 1,
+                }}
+              >
+                Generate all (4)
+              </button>
+            </div>
+            <div style={{
+              display: 'flex', flexWrap: 'wrap', gap: 6,
+            }}>
+              {PLATFORM_OPTIONS.map((p) => {
+                const isActive = p.slug === selectedPlatform;
+                const hasData = !!seoByPlatform[p.slug];
+                const isGenerating = !!generatingPlatforms[p.slug];
+                return (
+                  <button
+                    key={p.slug}
+                    onClick={() => setSelectedPlatform(p.slug)}
+                    title={`${p.label} — title ≤${p.titleMax}, ${p.tagMin}-${p.tagMax} hashtags${hasData ? ' — generated' : ''}`}
+                    style={{
+                      padding: '6px 12px', fontSize: 11, fontWeight: 600,
+                      background: isActive ? p.color : 'var(--bg-panel)',
+                      color: isActive ? 'var(--bg-base)' : 'var(--text-secondary)',
+                      border: `1px solid ${isActive ? p.color : 'var(--border)'}`,
+                      borderRadius: 'var(--radius-sm)',
+                      cursor: 'pointer',
+                      display: 'flex', alignItems: 'center', gap: 6,
+                      position: 'relative',
+                    }}
+                  >
+                    {p.label}
+                    {hasData && !isGenerating && (
+                      <span
+                        style={{
+                          width: 6, height: 6, borderRadius: '50%',
+                          background: isActive ? 'var(--bg-base)' : p.color,
+                          opacity: isActive ? 0.7 : 1,
+                        }}
+                        title="SEO generated"
+                      />
+                    )}
+                    {isGenerating && (
+                      <span style={{
+                        width: 10, height: 10,
+                        border: `2px solid ${isActive ? 'var(--bg-base)' : p.color}`,
+                        borderTopColor: 'transparent',
+                        borderRadius: '50%',
+                        animation: 'seo-spin 0.8s linear infinite',
+                      }} />
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
           {!seo ? (
             <div style={{ ...sectionStyle, textAlign: 'center', padding: '48px 24px' }}>
               {generating ? (
@@ -1668,21 +1907,24 @@ export default function ClipSEO() {
                 <>
                   <div style={{ fontSize: 36, marginBottom: 16, opacity: 0.3 }}>&#128269;</div>
                   <h3 style={{ fontSize: 16, marginBottom: 8, color: 'var(--text-secondary)' }}>
-                    Generate SEO Metadata
+                    Generate {PLATFORM_BY_SLUG[selectedPlatform]?.label || 'SEO'} Metadata
                   </h3>
                   <p style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 20, maxWidth: 360, margin: '0 auto 20px' }}>
-                    Use AI to generate a title, caption, and tags for this clip — written like a real person would post it
+                    Generate a {PLATFORM_BY_SLUG[selectedPlatform]?.label || 'platform'}-tuned title,
+                    caption, and hashtags — character limits and tag count match what that
+                    platform's algorithm actually rewards.
                   </p>
                   <button
-                    onClick={generateSEO}
+                    onClick={() => generateSEO(selectedPlatform)}
                     style={{
                       padding: '10px 24px',
-                      background: 'var(--accent-cyan)', color: 'var(--bg-base)',
+                      background: PLATFORM_BY_SLUG[selectedPlatform]?.color || 'var(--accent-cyan)',
+                      color: 'var(--bg-base)',
                       border: 'none', borderRadius: 'var(--radius-sm)',
                       fontSize: 13, fontWeight: 600, cursor: 'pointer',
                     }}
                   >
-                    Generate SEO
+                    Generate {PLATFORM_BY_SLUG[selectedPlatform]?.label || 'SEO'}
                   </button>
                 </>
               )}
@@ -1811,7 +2053,7 @@ export default function ClipSEO() {
                 </div>
               ) : (
                 <button
-                  onClick={generateSEO}
+                  onClick={() => generateSEO(selectedPlatform)}
                   style={{
                     padding: '8px 16px',
                     background: 'var(--bg-elevated)', color: 'var(--text-secondary)',
@@ -1819,7 +2061,7 @@ export default function ClipSEO() {
                     fontSize: 12, cursor: 'pointer',
                   }}
                 >
-                  Regenerate
+                  Regenerate {PLATFORM_BY_SLUG[selectedPlatform]?.label || 'SEO'}
                 </button>
               )}
             </>

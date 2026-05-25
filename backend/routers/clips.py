@@ -1425,16 +1425,54 @@ async def get_retention_predictions(job_id: str):
     return {"predictions": predictions}
 
 
-@router.post("/jobs/{job_id}/seo/{clip_id}")
-async def generate_seo_endpoint(job_id: str, clip_id: int):
-    """Generate SEO-optimized title, description, and tags for a clip."""
-    job = await database.load_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+def _resolve_seo_platform(raw: str | None, clip_platform: str | None) -> str:
+    """Normalise a platform slug to a value our PLATFORM_PROFILES table knows.
 
-    clip = next((c for c in job.clips if c.id == clip_id), None)
-    if not clip:
-        raise HTTPException(status_code=404, detail="Clip not found")
+    Accepts both the user-typed slug (``"tiktok"``) and the legacy
+    bridge values (``"both"`` → falls through to a TikTok-style profile).
+    Returns the lowercase canonical slug.
+    """
+    from backend.services.prompts import PLATFORM_PROFILES
+
+    candidate = (raw or clip_platform or "").strip().lower().replace("-", "_")
+    aliases = {
+        "youtube_short": "youtube_shorts",
+        "shorts": "youtube_shorts",
+        "yt_shorts": "youtube_shorts",
+        "yt": "youtube",
+        "youtube_long": "youtube",
+        "youtube_longform": "youtube",
+        "ig": "instagram",
+        "ig_reels": "reels",
+        "instagram_reels": "reels",
+        "fb": "facebook",
+        "twitter": "x",
+        "li": "linkedin",
+    }
+    candidate = aliases.get(candidate, candidate)
+    return candidate if candidate in PLATFORM_PROFILES else "default"
+
+
+async def _generate_seo_for_platform(
+    job, clip, platform: str, *, ws_broadcast=None, progress_label: str = "",
+):
+    """Run the SEO generator for a single platform and write it back to clip.seo_by_platform.
+
+    Returns (seo_dict, provider_name). The legacy ``seo_title``/etc. fields
+    are kept in sync with whichever platform matches ``clip.platform`` so
+    older readers (export pipeline, downloads) keep working.
+    """
+    from backend.services.ai_orchestrator import AIOrchestrator
+    from backend.services.prompts import (
+        load_prompts,
+        build_platform_seo_prompt,
+        enforce_platform_caps,
+        PLATFORM_PROFILES,
+    )
+    from backend.models import ClipSEO
+
+    canonical = _resolve_seo_platform(platform, clip.platform)
+    profile = PLATFORM_PROFILES[canonical]
 
     # Build clip transcript from segments within the clip time range
     clip_transcript = "\n".join(
@@ -1449,7 +1487,80 @@ async def generate_seo_endpoint(job_id: str, clip_id: int):
     if job.summary:
         video_summary = job.summary.overview
 
-    # Check that at least one AI provider has an API key configured
+    custom_prompts = load_prompts()
+    # Swap the platform-agnostic default with the per-platform prompt for
+    # this call only — leaves the user's custom_prompts.json untouched.
+    platform_prompt = build_platform_seo_prompt(canonical)
+    custom_prompts = custom_prompts.model_copy(update={"seo": platform_prompt})
+
+    orchestrator = AIOrchestrator(ws_broadcast=ws_broadcast, custom_prompts=custom_prompts)
+
+    if ws_broadcast:
+        await ws_broadcast(job.job_id, {
+            "type": "status",
+            "status": "generating_seo",
+            "progress": 10,
+            "message": (
+                progress_label
+                or f"Generating {profile['label']} SEO for clip {clip.id}..."
+            ),
+        })
+
+    seo, provider = await orchestrator.generate_seo(
+        clip_title=clip.title,
+        clip_transcript=clip_transcript,
+        video_summary=video_summary,
+        platform=canonical,
+        job_id=job.job_id,
+    )
+
+    # Enforce platform caps as a final guardrail — the LLM will sometimes
+    # blow the title length even with the constraint spelled out, and the
+    # validator owns the hard cut so the persisted copy always fits.
+    capped = enforce_platform_caps(seo.model_dump(), canonical)
+    seo_record = ClipSEO(**capped)
+
+    # Mutate clip in place — caller is responsible for the surrounding save.
+    if clip.seo_by_platform is None:
+        clip.seo_by_platform = {}
+    clip.seo_by_platform[canonical] = seo_record
+
+    # Keep the legacy single-platform fields in lockstep with the entry
+    # that matches the clip's declared default platform so the existing
+    # downloads/export code paths keep returning meaningful data.
+    legacy_target = _resolve_seo_platform(clip.platform, clip.platform)
+    if canonical == legacy_target or not clip.seo_title:
+        clip.seo_title = capped.get("title", "")
+        clip.seo_description = capped.get("description", "")
+        clip.seo_tags = capped.get("tags", [])
+        clip.seo_platform_tips = capped.get("platform_tips", "")
+
+    return capped, provider, canonical, profile["label"]
+
+
+class GenerateSEORequest(BaseModel):
+    platform: Optional[str] = None  # None → uses clip.platform
+
+
+@router.post("/jobs/{job_id}/seo/{clip_id}")
+async def generate_seo_endpoint(
+    job_id: str, clip_id: int, req: GenerateSEORequest | None = None,
+):
+    """Generate SEO-optimized title, description, and tags for a clip.
+
+    When a ``platform`` is supplied in the body, the platform-specific
+    prompt is used and the result is stored in ``clip.seo_by_platform[platform]``
+    alongside (and keeping in sync with) the legacy ``seo_title``/etc. fields.
+    Omitting the body falls back to ``clip.platform``.
+    """
+    job = await database.load_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    clip = next((c for c in job.clips if c.id == clip_id), None)
+    if not clip:
+        raise HTTPException(status_code=404, detail="Clip not found")
+
     has_any_key = any([
         settings.OPENROUTER_API_KEY,
         settings.ANTHROPIC_API_KEY,
@@ -1462,50 +1573,101 @@ async def generate_seo_endpoint(job_id: str, clip_id: int):
             detail="No OpenRouter API key configured. Please add your key in Settings.",
         )
 
-    await broadcast_ws(job_id, {
-        "type": "status",
-        "status": "generating_seo",
-        "progress": 10,
-        "message": f"Generating SEO metadata for clip {clip_id}...",
-    })
+    platform_arg = (req.platform if req else None) or clip.platform
 
     try:
-        from backend.services.ai_orchestrator import AIOrchestrator
-        from backend.services.prompts import load_prompts
-
-        orchestrator = AIOrchestrator(ws_broadcast=broadcast_ws, custom_prompts=load_prompts())
-
-        seo, provider = await orchestrator.generate_seo(
-            clip_title=clip.title,
-            clip_transcript=clip_transcript,
-            video_summary=video_summary,
-            platform=clip.platform,
-            job_id=job_id,
+        seo_data, provider, canonical, label = await _generate_seo_for_platform(
+            job, clip, platform_arg, ws_broadcast=broadcast_ws,
         )
 
         await broadcast_ws(job_id, {
             "type": "status",
             "status": "generating_seo",
             "progress": 100,
-            "message": f"SEO generated via {provider}",
+            "message": f"{label} SEO generated via {provider}",
         })
 
-        # Persist SEO data on the clip
-        seo_data = seo.model_dump()
-        clip.seo_title = seo_data.get("title", "")
-        clip.seo_description = seo_data.get("description", "")
-        clip.seo_tags = seo_data.get("tags", [])
-        clip.seo_platform_tips = seo_data.get("platform_tips", "")
         await database.save_job(job)
 
         return {
             "clip_id": clip_id,
+            "platform": canonical,
+            "platform_label": label,
             "provider": provider,
             "seo": seo_data,
         }
     except Exception as e:
         logger.exception(f"SEO generation failed for {job_id}/{clip_id}")
         raise HTTPException(status_code=500, detail=f"SEO generation failed: {str(e)}")
+
+
+class GenerateMultiSEORequest(BaseModel):
+    platforms: list[str]  # e.g. ["tiktok", "youtube_shorts", "reels"]
+
+
+@router.post("/jobs/{job_id}/seo/{clip_id}/multi")
+async def generate_seo_multi_endpoint(
+    job_id: str, clip_id: int, req: GenerateMultiSEORequest,
+):
+    """Generate SEO for several platforms in one call.
+
+    The platforms run sequentially (LLM rate limits + provider fallback
+    chains assume serial). Partial success is OK — platforms that fail
+    are reported in the response so the UI can show which ones need
+    a retry without losing the ones that succeeded.
+    """
+    job = await database.load_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    clip = next((c for c in job.clips if c.id == clip_id), None)
+    if not clip:
+        raise HTTPException(status_code=404, detail="Clip not found")
+
+    has_any_key = any([
+        settings.OPENROUTER_API_KEY,
+        settings.ANTHROPIC_API_KEY,
+        settings.GEMINI_API_KEY,
+        settings.GROQ_API_KEY,
+    ])
+    if not has_any_key:
+        raise HTTPException(
+            status_code=400,
+            detail="No OpenRouter API key configured. Please add your key in Settings.",
+        )
+
+    if not req.platforms:
+        raise HTTPException(status_code=400, detail="platforms list is required")
+
+    results = {}
+    failures = {}
+    for raw_platform in req.platforms:
+        try:
+            seo_data, provider, canonical, label = await _generate_seo_for_platform(
+                job, clip, raw_platform, ws_broadcast=broadcast_ws,
+                progress_label=f"Generating {raw_platform} SEO for clip {clip.id}...",
+            )
+            results[canonical] = {
+                "seo": seo_data,
+                "provider": provider,
+                "platform_label": label,
+            }
+        except Exception as e:
+            logger.exception(
+                "SEO generation failed for %s/%s on platform %s",
+                job_id, clip_id, raw_platform,
+            )
+            failures[raw_platform] = str(e)
+
+    # Single save at the end — each generation already mutated the clip.
+    if results:
+        await database.save_job(job)
+
+    return {
+        "clip_id": clip_id,
+        "results": results,
+        "failures": failures,
+    }
 
 
 # ── YouTube Description Generators ─────────────────────────────────────
@@ -1689,6 +1851,13 @@ async def generate_description_endpoint(
 
 # ── Persist SEO edits ──────────────────────────────────────────────────
 
+class PerPlatformSEOEdit(BaseModel):
+    title: Optional[str] = None
+    description: Optional[str] = None
+    tags: Optional[list[str]] = None
+    platform_tips: Optional[str] = None
+
+
 class UpdateClipSEORequest(BaseModel):
     seo_title: Optional[str] = None
     seo_description: Optional[str] = None
@@ -1696,11 +1865,24 @@ class UpdateClipSEORequest(BaseModel):
     seo_platform_tips: Optional[str] = None
     shorts_description: Optional[str] = None
     longform_description: Optional[str] = None
+    # Per-platform edits: ``{ "tiktok": {title, description, tags, ...}, ... }``.
+    # Each entry is partial — only the fields the user actually changed get
+    # written, the rest stay as whatever the generator produced. Caps are
+    # re-enforced via ``enforce_platform_caps`` so a long manual edit can't
+    # break the contract the platform-specific export logic relies on.
+    seo_by_platform: Optional[dict[str, PerPlatformSEOEdit]] = None
+    # Platform this clip is primarily targeting (drives which per-platform
+    # SEO is mirrored into the legacy ``seo_*`` fields and which is picked
+    # at export time when the request doesn't specify one).
+    platform: Optional[str] = None
 
 
 @router.put("/jobs/{job_id}/clips/{clip_id}/seo")
 async def update_clip_seo(job_id: str, clip_id: int, req: UpdateClipSEORequest):
     """Persist user-edited SEO data on a clip."""
+    from backend.services.prompts import enforce_platform_caps
+    from backend.models import ClipSEO
+
     job = await database.load_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -1721,6 +1903,33 @@ async def update_clip_seo(job_id: str, clip_id: int, req: UpdateClipSEORequest):
         clip.shorts_description = req.shorts_description
     if req.longform_description is not None:
         clip.longform_description = req.longform_description
+    if req.platform is not None:
+        clip.platform = req.platform
+
+    if req.seo_by_platform:
+        if clip.seo_by_platform is None:
+            clip.seo_by_platform = {}
+        for raw_plat, edit in req.seo_by_platform.items():
+            canonical = _resolve_seo_platform(raw_plat, clip.platform)
+            existing = clip.seo_by_platform.get(canonical)
+            merged = {
+                "title": (edit.title if edit.title is not None
+                          else (existing.title if existing else "")),
+                "description": (edit.description if edit.description is not None
+                                else (existing.description if existing else "")),
+                "tags": (edit.tags if edit.tags is not None
+                         else (list(existing.tags) if existing else [])),
+                "platform_tips": (edit.platform_tips if edit.platform_tips is not None
+                                  else (existing.platform_tips if existing else "")),
+            }
+            capped = enforce_platform_caps(merged, canonical)
+            clip.seo_by_platform[canonical] = ClipSEO(**capped)
+            # Mirror into legacy fields when this is the clip's primary platform.
+            if canonical == _resolve_seo_platform(clip.platform, clip.platform):
+                clip.seo_title = capped.get("title", "")
+                clip.seo_description = capped.get("description", "")
+                clip.seo_tags = capped.get("tags", [])
+                clip.seo_platform_tips = capped.get("platform_tips", "")
 
     await database.save_job(job)
 

@@ -113,14 +113,18 @@ class ReframeEngine:
         self.plan = smoother.smooth(self.plan)
         self.log.stop_timer('smooth')
 
-        # Stage 4.4: Final face centering — animated AND live-action.
-        # The smoother can drift keyframes off the best face after
-        # post-cut hold suppression and micro-drift collapse; this pass
-        # snaps any keyframe whose best-face is outside the crop or
-        # >25% off-center back onto the face without inserting new
-        # keyframes (preserves stability). Matches the /60 reference
-        # ``_final_face_centering`` post-pass.
-        self._final_face_centering()
+        # NOTE: ``_final_face_centering`` is intentionally NOT called here.
+        # It was added in commit 09d991a (this branch) as a third
+        # centering pass after the planner's post-EMA pull and
+        # ``_stabilize_keyframes`` nudge. In practice the three passes
+        # fought each other — the planner pulled toward face A, the
+        # stabilizer nudged toward face B (broader subject hierarchy),
+        # and the final pass re-snapped back, producing keyframes that
+        # ping-ponged between adjacent subjects and tanked centering
+        # from 90 %→54 %. The /60 reference (which scored ≥90 %)
+        # defines this method but never calls it. Keeping the method
+        # available so a future ``_enforce_live_action_faces``-style
+        # opt-in can wire it back in selectively.
 
         # Stage 4.5: Live-action face enforcement
         # In live-action content, EVERY keyframe must have a face in crop.
@@ -945,18 +949,24 @@ class ReframeEngine:
         #   v22: per-frame face → 78→61%
         #   v28: forward-looking → 69→64%
         #   v30: scene-level median → 68→56%
-        #   v33: aggressive 2× nudge + 2 passes → REGRESSED to 70% +
-        #        face-coverage dropped 98→91% because consecutive big
-        #        nudges oscillated the crop between two faces, leaving
-        #        it parked between them with NEITHER visible.
-        #   v34: nudge-to-middle-third with a tight cap (≤80 px),
-        #        single pass. Plus the YOLO / saliency fallback chain
-        #        for animated content. This keeps the live-action A
-        #        grade AND gives anime content a centering signal.
+        #   v33: aggressive 2× nudge + 2 passes → REGRESSED to 70%
+        #   v34: 80 px cap + YOLO/saliency fallback + no upper-bound
+        #        gate → REGRESSED to 54 % (the current branch). The
+        #        wider 80 px cap let the nudge cross a third boundary
+        #        in a single step, and feeding it saliency hotspots
+        #        on non-face frames yanked the crop between adjacent
+        #        subjects on cut-heavy content.
+        #   v35 (current): reverted to the /60 reference settings —
+        #        FACE-ONLY subject (no YOLO/saliency fallback in this
+        #        pass; the inclusion-fix Pass 3 already covers
+        #        face-less frames), 60 px cap (proportional to crop
+        #        width), and an upper-bound gate so we skip nudges
+        #        when the best face is so far away it's almost
+        #        certainly a different shot or a misclassified frame.
         # ══════════════════════════════════════════════════════════════
-        third = max(1, crop_w // 3)
-        NUDGE_MAX = 80          # tight: ~13% of a 600px crop
+        NUDGE_MAX = 60          # tight cap — < 10 % of a 600 px crop
         NUDGE_MIN_DELTA = 5     # below this we're indistinguishable from jitter
+        NUDGE_DELTA_CEILING = 150  # above this it's probably a different shot
 
         def _nudge_pass(label):
             count = 0
@@ -968,60 +978,53 @@ class ReframeEngine:
                 if st is None:
                     continue
 
-                # Centering subject priority: face → YOLO subject →
-                # saliency hotspot. This matters for animated /
-                # gameplay / anime content where face-detection
-                # coverage drops below 30% — without a fallback the
-                # centering pass simply skips most of the timeline.
-                cx = None
+                # FACE-ONLY: dropping the YOLO/saliency fallback here
+                # is deliberate. The inclusion-fix pass above already
+                # corrects keyframes that have no face by snapping to
+                # YOLO persons; running a second pass that nudges
+                # toward saliency hotspots on top of that pulled the
+                # crop the wrong direction on cut-heavy content and
+                # was the largest contributor to the 90 %→54 %
+                # centering regression.
                 faces = self.perception.face_timeline.get(st, [])
                 real_faces = [f for f in faces
                               if f.get('track_id', -1) >= 0
                               and (not real_tracks
                                    or f.get('track_id', -1) in real_tracks)]
-                if real_faces:
-                    # Pick the most salient face (matches evaluator logic).
-                    best_face = max(real_faces, key=lambda f: (
-                        f.get('saliency', 0) + f.get('mouth_motion', 0)
-                    ) * max(0.2, f.get('confidence', 0.5)))
-                    cx = best_face['cx']
-                else:
-                    # No face → YOLO person / head / character / mecha
-                    # box. Bigger area wins (closest to camera tends to
-                    # be the intended subject).
-                    persons = (self.perception.person_timeline.get(st, [])
-                               if hasattr(self.perception, 'person_timeline')
-                               else [])
-                    if persons:
-                        best_p = max(persons, key=lambda p: p.get('area', 0))
-                        cx = best_p.get('cx')
-                if cx is None:
-                    # Final fallback — spectral-saliency hotspot. Built by
-                    # the perceiver for frames with no face AND no YOLO
-                    # box (abstract / wide / landscape shots).
-                    sal = (self.perception.saliency_hotspot.get(st)
-                           if hasattr(self.perception, 'saliency_hotspot')
-                           else None)
-                    if isinstance(sal, dict):
-                        cx = sal.get('cx')
-                if cx is None:
+                if not real_faces:
                     continue
+                # Pick the most salient face (matches evaluator logic).
+                best_face = max(real_faces, key=lambda f: (
+                    f.get('saliency', 0) + f.get('mouth_motion', 0)
+                ) * max(0.2, f.get('confidence', 0.5)))
+                cx = best_face['cx']
 
                 # The evaluator wants cx in [crop_left + third,
                 # crop_left + 2*third]. Use dead-centre as the IDEAL
-                # but cap the nudge at NUDGE_MAX so we never jump far
-                # enough in one step to lose another face in the same
-                # shot. Big offsets converge over multiple keyframes.
+                # but cap the nudge at NUDGE_MAX so we never jump
+                # far enough in one step to lose another face in the
+                # same shot, AND skip nudges when the delta is so
+                # large it's almost certainly a different shot (the
+                # reference's upper-bound gate the current branch
+                # removed).
                 ideal_x = clamp_x(cx - crop_w // 2, max_x)
                 delta = ideal_x - kf['x']
-                if abs(delta) < NUDGE_MIN_DELTA:
+                abs_delta = abs(delta)
+                if abs_delta < NUDGE_MIN_DELTA:
                     continue
-                nudge = max(-NUDGE_MAX, min(NUDGE_MAX, delta))
-                # Aim a touch past the third boundary so smoothing
-                # Single-pass with a tight cap. The old "10% overshoot
-                # + second pass" combo amplified the nudge into the
-                # next keyframe's territory which is exactly what the
-                # v33 regression showed.
+                if abs_delta > NUDGE_DELTA_CEILING:
+                    # Best face is far away — likely a different shot
+                    # or a misclassified frame. Trusting it would pull
+                    # the crop the wrong direction. Leave the keyframe
+                    # for the cut-aware planner to handle.
+                    continue
+                # min(cap, magnitude) with original sign — matches the
+                # reference's single-step clamp, NOT the current
+                # branch's symmetric max(-NUDGE_MAX, min(NUDGE_MAX, ...))
+                # which never short-circuits when the delta is exactly
+                # at the cap and let consecutive nudges accumulate.
+                sign = 1 if delta > 0 else -1
+                nudge = min(NUDGE_MAX, abs_delta) * sign
                 kf['x'] = clamp_x(kf['x'] + nudge, max_x)
                 count += 1
             return count

@@ -395,6 +395,274 @@ DEFAULT_SEO_PROMPT = (
 )
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  Per-platform SEO — each platform has its own ranking signals, char caps,
+#  and hashtag culture; using the same prompt for all of them produces
+#  generic copy that wins on none of them. The slugs match clip.platform
+#  values the bridge / clipper emit.
+# ═══════════════════════════════════════════════════════════════════════════
+
+PLATFORM_PROFILES: dict[str, dict] = {
+    "tiktok": {
+        "label": "TikTok",
+        "title_max": 150,
+        "description_max": 2200,
+        "tag_min": 5,
+        "tag_max": 8,
+        "guidance": (
+            "TIKTOK profile — short-form, algorithm-driven, FYP-first.\n"
+            "TITLE: a 1-line hook that lands in the first 3 seconds (≤150 chars). "
+            "Lowercase, conversational, no marketing-speak. Reference a specific "
+            "moment, line, or visual from the clip so curious viewers tap.\n"
+            "DESCRIPTION: 1-2 short sentences then a line break then hashtags. "
+            "Keep the readable text ≤150 chars (TikTok truncates the rest behind 'see more'). "
+            "Hashtags belong INSIDE the description after a line break — TikTok ranks them. "
+            "Total under 2200 chars including hashtags.\n"
+            "TAGS: 5-8 hashtags. Mix one big-discovery tag (#fyp / #foryou / "
+            "#foryoupage) with niche tags tied to the actual subject. Avoid "
+            "tag stuffing — TikTok's algorithm penalises >8 unrelated tags. "
+            "All lowercase.\n"
+            "PLATFORM_TIPS: 1 line on which sound, trend, or duet/stitch "
+            "angle would amplify this clip."
+        ),
+    },
+    "youtube_shorts": {
+        "label": "YouTube Shorts",
+        "title_max": 100,
+        "description_max": 5000,
+        "tag_min": 3,
+        "tag_max": 6,
+        "guidance": (
+            "YOUTUBE SHORTS profile — keyword-front-loaded, search-discoverable.\n"
+            "TITLE: under 100 chars, front-load the primary keyword/topic, end with "
+            "#Shorts. Avoid lowercase-only — title case helps Shorts search. Example: "
+            "\"How I Hit a 12-Foot Wave for the First Time #Shorts\".\n"
+            "DESCRIPTION: 3-5 sentences. First sentence reuses the title keyword and "
+            "describes what the viewer sees in the first 3 seconds (this is what shows "
+            "before 'show more'). Body sentences reference specific things SAID in the "
+            "transcript so the algorithm has keyword density. End with 3-5 hashtags on "
+            "their own line. Include a soft CTA (\"subscribe for more\"). Total 400-800 chars.\n"
+            "TAGS: 3-6 hashtags, MUST include #Shorts as the first tag. Add 2-4 topic "
+            "tags. Mixed case allowed (#Shorts not #shorts).\n"
+            "PLATFORM_TIPS: 1 line on the suggested thumbnail moment + the keyword "
+            "this should rank for in Shorts search."
+        ),
+    },
+    "reels": {
+        "label": "Instagram Reels",
+        "title_max": 125,
+        "description_max": 2200,
+        "tag_min": 15,
+        "tag_max": 20,
+        "guidance": (
+            "INSTAGRAM REELS profile — caption-driven, emoji-friendly, hashtag-heavy.\n"
+            "TITLE: short hook line (≤125 chars), can use 1-2 emojis. This becomes the "
+            "first line of the caption (the part visible before 'more'), so put the most "
+            "interesting thing first.\n"
+            "DESCRIPTION: 2-4 sentences in a conversational, on-brand voice. Emojis "
+            "welcome but not stuffed. End with a question or CTA that invites comments "
+            "(Reels reward comment velocity). Then a line break, then hashtags. Total "
+            "under 2200 chars.\n"
+            "TAGS: 15-20 hashtags. Mix three reach tiers: 3-4 huge (#reels, #explorepage, "
+            "#viral), 6-8 mid-reach niche, 4-6 specific micro-niche. All lowercase. "
+            "Hashtags inside the caption rank, but a separate line break before them "
+            "keeps the caption readable.\n"
+            "PLATFORM_TIPS: 1 line on the on-screen text overlay that would lift this "
+            "Reel + any trending audio the clip could be paired with."
+        ),
+    },
+    "instagram": {
+        "label": "Instagram Feed",
+        "title_max": 125,
+        "description_max": 2200,
+        "tag_min": 10,
+        "tag_max": 15,
+        "guidance": (
+            "INSTAGRAM FEED profile — community-tone, hashtag-balanced.\n"
+            "TITLE: opening hook (≤125 chars), the first line before 'more'. "
+            "Conversational, can carry one emoji.\n"
+            "DESCRIPTION: 2-5 sentences, slightly longer than Reels. Build a story or "
+            "context. End with an explicit CTA (\"save this if you...\", \"comment your "
+            "favorite...\"). Line break, then 10-15 hashtags. Total under 2200 chars.\n"
+            "TAGS: 10-15 hashtags. Heavier on niche than reach — Feed posts don't get "
+            "the same FYP-style virality, so micro-targeted tags matter more. Lowercase.\n"
+            "PLATFORM_TIPS: 1 line on best posting window for this audience + whether "
+            "to push as a carousel or single."
+        ),
+    },
+    "youtube": {
+        "label": "YouTube (Long-form)",
+        "title_max": 70,
+        "description_max": 5000,
+        "tag_min": 8,
+        "tag_max": 15,
+        "guidance": (
+            "YOUTUBE LONG-FORM profile — SEO-optimized for search ranking + watch time.\n"
+            "TITLE: ≤70 chars (mobile cutoff). Front-load the primary search keyword. "
+            "Title case. Numbers and brackets perform — e.g. \"How I Built X in 24 Hours "
+            "[Day 1]\". Avoid clickbait; YouTube punishes mismatch.\n"
+            "DESCRIPTION: 1000-3000 chars. Structure:\n"
+            "  • Opening paragraph (2-3 sentences) — first 100 chars MUST contain the "
+            "    primary keyword; they appear in search results.\n"
+            "  • Body — 2-3 paragraphs of what the video covers, with the secondary "
+            "    keywords woven in naturally. Reference actual transcript content.\n"
+            "  • Timestamps section (\"0:00 Intro / 1:30 ...\") when scenes are available.\n"
+            "  • CTA paragraph (subscribe, related videos, mailing list).\n"
+            "  • Hashtags section at the bottom.\n"
+            "TAGS: 8-15 hashtags. The first 3 appear above the title — pick the highest-"
+            "value ranking keywords for those. Mixed case OK.\n"
+            "PLATFORM_TIPS: 1 line on the thumbnail keyword to feature + the suggested "
+            "chapter where retention is highest."
+        ),
+    },
+    "x": {
+        "label": "X (Twitter)",
+        "title_max": 280,
+        "description_max": 280,
+        "tag_min": 0,
+        "tag_max": 3,
+        "guidance": (
+            "X / TWITTER profile — terse, no hashtag stuffing.\n"
+            "TITLE: same as the post body, ≤280 chars total INCLUDING any hashtags. The "
+            "hook IS the post — one punchy line, optionally with a second line for context. "
+            "Lowercase OK. Avoid hashtag stuffing — X demotes posts with >3 hashtags.\n"
+            "DESCRIPTION: an alternate longer version (up to 280 chars) for users who turn "
+            "on the longer reply-thread experience. Optional — return empty string if the "
+            "title already says everything.\n"
+            "TAGS: 0-3 hashtags MAX. Often the best post has zero hashtags and just a "
+            "@-mention or topical phrase.\n"
+            "PLATFORM_TIPS: 1 line on whether the clip should be a standalone post, a "
+            "reply to a trending topic, or the first of a thread."
+        ),
+    },
+    "facebook": {
+        "label": "Facebook",
+        "title_max": 100,
+        "description_max": 63206,
+        "tag_min": 2,
+        "tag_max": 6,
+        "guidance": (
+            "FACEBOOK profile — conversational, story-driven, low-hashtag.\n"
+            "TITLE: short attention-getter ≤100 chars. The first 80 chars are what shows "
+            "before 'See more' on mobile so put the hook there.\n"
+            "DESCRIPTION: 2-5 sentences in a personal voice. Facebook rewards comments and "
+            "shares, so end with a question or invitation. 200-500 chars is the sweet spot.\n"
+            "TAGS: 2-6 hashtags. Facebook's algorithm doesn't surface hashtags the way "
+            "Instagram/TikTok do — 3 well-chosen tags beats 15. Lowercase.\n"
+            "PLATFORM_TIPS: 1 line on whether this is best posted as a Reel, a feed video, "
+            "or boosted to a specific page audience."
+        ),
+    },
+    "linkedin": {
+        "label": "LinkedIn",
+        "title_max": 150,
+        "description_max": 3000,
+        "tag_min": 3,
+        "tag_max": 6,
+        "guidance": (
+            "LINKEDIN profile — professional voice, insight-led, hashtag-light.\n"
+            "TITLE: thought-leader hook ≤150 chars. Lead with the takeaway / insight, NOT "
+            "the format. Avoid emojis. Examples: \"Three things I learned from shipping X.\"\n"
+            "DESCRIPTION: 3-7 sentences, single-line paragraphs (LinkedIn rewards "
+            "white-space). Lead with the insight, prove it with one specific example from "
+            "the clip's transcript, close with a question that invites professional comments. "
+            "500-1500 chars.\n"
+            "TAGS: 3-6 hashtags. LinkedIn's algorithm uses them for topic clustering — pick "
+            "industry-specific tags (#productdesign, #growthmarketing) over generic ones. "
+            "Camel case (#ProductDesign).\n"
+            "PLATFORM_TIPS: 1 line on the target reader role + whether to post from a "
+            "personal page or company page."
+        ),
+    },
+}
+
+# Default for unknown / "both" / legacy values — falls back to a balanced
+# short-form profile so the generation doesn't silently degrade.
+PLATFORM_PROFILES["both"] = PLATFORM_PROFILES["tiktok"]
+PLATFORM_PROFILES["default"] = PLATFORM_PROFILES["tiktok"]
+
+
+def build_platform_seo_prompt(platform: str) -> str:
+    """Return the platform-specific SEO prompt for the given platform slug.
+
+    Falls back to ``PLATFORM_PROFILES['default']`` (TikTok-style) when the
+    platform is unknown so a new clip type still gets reasonable output
+    instead of crashing.
+    """
+    profile = PLATFORM_PROFILES.get(platform) or PLATFORM_PROFILES["default"]
+    return (
+        "You write social media captions and tags like a real creator on the "
+        "specific platform you're targeting — not a marketer, not a robot. "
+        "The text should feel native to that platform's culture.\n\n"
+        f"{profile['guidance']}\n\n"
+        "HARD CONSTRAINTS (the validator WILL truncate / reject if you miss):\n"
+        f"  • title_max_chars: {profile['title_max']}\n"
+        f"  • description_max_chars: {profile['description_max']}\n"
+        f"  • tag_count: {profile['tag_min']}-{profile['tag_max']} hashtags\n\n"
+        "Use the clip's transcript, video summary, and title to ground the copy in "
+        "specific things that actually happen in this clip. No generic filler — "
+        "every sentence should reference a concrete moment, quote, or visual.\n\n"
+        "Return ONLY valid JSON:\n"
+        '{"title": "...", "description": "...", "tags": ["#tag1", "#tag2", ...], '
+        '"platform_tips": "..."}'
+    )
+
+
+def enforce_platform_caps(seo_data: dict, platform: str) -> dict:
+    """Trim / pad SEO output so it fits the platform's hard caps.
+
+    The LLM occasionally blows the title/description length even with the
+    constraint spelled out in the prompt. This is the last line of defense
+    before the SEO is persisted: title and description get trimmed to the
+    platform cap (preserving the leading words), and the tag list is
+    truncated / padded to the platform's min/max range. Returns a NEW
+    dict — does not mutate the input.
+    """
+    profile = PLATFORM_PROFILES.get(platform) or PLATFORM_PROFILES["default"]
+    out = dict(seo_data or {})
+
+    def _trim(text: str, cap: int) -> str:
+        if not isinstance(text, str):
+            return ""
+        if len(text) <= cap:
+            return text
+        # Trim at the last word boundary before the cap so we don't slice
+        # mid-word; fall back to a hard cut if no whitespace fits.
+        trimmed = text[: cap - 1]
+        last_space = trimmed.rfind(" ")
+        if last_space > cap * 0.6:
+            trimmed = trimmed[:last_space]
+        return trimmed.rstrip() + "…"
+
+    out["title"] = _trim(out.get("title") or "", profile["title_max"])
+    out["description"] = _trim(out.get("description") or "", profile["description_max"])
+
+    tags = out.get("tags") or []
+    if not isinstance(tags, list):
+        tags = []
+    # Normalise: every tag starts with '#', no spaces, no empty strings.
+    cleaned = []
+    for t in tags:
+        if not isinstance(t, str):
+            t = str(t)
+        t = t.strip()
+        if not t:
+            continue
+        t = t.replace(" ", "")
+        if not t.startswith("#"):
+            t = "#" + t.lstrip("#")
+        if t == "#":
+            continue
+        if t not in cleaned:
+            cleaned.append(t)
+    if len(cleaned) > profile["tag_max"]:
+        cleaned = cleaned[: profile["tag_max"]]
+    out["tags"] = cleaned
+
+    out["platform_tips"] = (out.get("platform_tips") or "").strip()
+    return out
+
+
 class PromptSet(BaseModel):
     frame_analysis: str = Field(default=DEFAULT_FRAME_ANALYSIS_PROMPT)
     viral_clip_detection: str = Field(default=DEFAULT_VIRAL_CLIP_PROMPT)

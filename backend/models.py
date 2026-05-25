@@ -153,6 +153,17 @@ class ClipCandidate(BaseModel):
     seo_platform_tips: Optional[str] = None
     shorts_description: Optional[str] = None
     longform_description: Optional[str] = None
+    # ── Per-platform SEO ──
+    # Each entry is a full ClipSEO record keyed by platform slug
+    # ("tiktok", "youtube_shorts", "reels", "youtube", "x", "facebook").
+    # Lets a single clip ship to multiple platforms with copy tuned to
+    # that surface's ranking signals and character limits. The legacy
+    # ``seo_title`` / ``seo_description`` / ``seo_tags`` /
+    # ``seo_platform_tips`` fields above mirror the entry for
+    # ``clip.platform`` so any reader that hasn't been updated to the
+    # per-platform dict (older exporters, downloads, etc.) keeps
+    # working. Default ``{}`` so legacy persisted clips load cleanly.
+    seo_by_platform: dict[str, "ClipSEO"] = {}
     # ── Language-source provenance ──
     # The background translator re-derives caption/hook_text/title from
     # the translated transcript after analysis completes, so non-English
