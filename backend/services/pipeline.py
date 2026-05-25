@@ -603,10 +603,27 @@ async def _background_post_processing(job_id: str, transcript: list, orchestrato
                                    job_id, _rd_err)
 
             changed = sum(1 for t, o in zip(translated, transcript) if t.text != o.text)
-            await database.update_job_status(
-                job_id,
-                translated_transcript=list(translated),
-            )
+
+            # Re-score readability against the translated transcript so
+            # the UI shows the score of what viewers will actually read
+            # (e.g. an English render of a Japanese source).
+            _tr_readability = None
+            try:
+                from backend.services.subtitle_formatter import compute_readability_report
+                _tr_readability = compute_readability_report(list(translated))
+                logger.info(
+                    "[%s] Translated transcript readability: grade %s (%.1f/100)",
+                    job_id,
+                    _tr_readability.get("grade"),
+                    _tr_readability.get("score", 0),
+                )
+            except Exception as _trd_err:
+                logger.debug("[%s] Translated readability skipped: %s", job_id, _trd_err)
+
+            _update_kwargs = {"translated_transcript": list(translated)}
+            if _tr_readability is not None:
+                _update_kwargs["transcript_readability"] = _tr_readability
+            await database.update_job_status(job_id, **_update_kwargs)
 
             await broadcast_ws(job_id, {
                 "type": "background_task",
@@ -1470,6 +1487,70 @@ async def _run_analysis_inner(job_id: str):
         )
         subject_track = to_fez_subject_track(perception, reframer_plan)
 
+    # ── Apply readability rules to the raw transcript ──
+    # Whisper emits one segment per VAD-detected speech window, which on
+    # dialogue-dense content (Japanese narration, podcasts) ends up as
+    # 30 s blocks of un-broken text — unreadable as subtitles. Run the
+    # Netflix-style enforcer here so the on-screen captions and the
+    # transcript panel are both segmented to readable chunks BEFORE
+    # translation runs. Translation later applies the enforcer again on
+    # its own output to handle character-density changes (CJK → English
+    # typically doubles segment length).
+    if getattr(settings, "SUBTITLE_CPS_ENFORCEMENT", True) and transcript:
+        try:
+            from backend.services.subtitle_formatter import enforce_readability
+            from backend.models import TranscriptSegment
+            _ts_models = [
+                t if isinstance(t, TranscriptSegment) else TranscriptSegment(**t)
+                for t in transcript
+            ]
+            _readable = enforce_readability(_ts_models)
+            transcript = [
+                t.model_dump() if hasattr(t, "model_dump") else dict(t)
+                for t in _readable
+            ]
+            logger.info(
+                "[%s] Raw transcript reflowed for readability: %d → %d segments",
+                job_id, len(_ts_models), len(transcript),
+            )
+        except Exception as _re_err:
+            logger.warning(
+                "[%s] Raw transcript readability pass failed (%s) — keeping Whisper output as-is",
+                job_id, _re_err,
+            )
+
+    # ── Transcript readability score ──
+    # Returns a Netflix-style A-F grade + per-axis sub-scores (CPS,
+    # line length, duration, gap). Persisted on the job so the Analysis
+    # page can display a readability card next to the reframe report.
+    transcript_readability = None
+    if transcript:
+        try:
+            from backend.services.subtitle_formatter import compute_readability_report
+            from backend.models import TranscriptSegment
+            _r_models = [
+                t if isinstance(t, TranscriptSegment) else TranscriptSegment(**t)
+                for t in transcript
+            ]
+            transcript_readability = compute_readability_report(_r_models)
+            logger.info(
+                "[%s] Transcript readability: grade %s (%.1f/100) — CPS %.1f compliance, "
+                "avg %.1f cps / peak %.1f cps over %d segments%s",
+                job_id,
+                transcript_readability.get("grade"),
+                transcript_readability.get("score", 0),
+                transcript_readability.get("cps_compliance_pct", 0),
+                transcript_readability.get("avg_cps", 0),
+                transcript_readability.get("max_cps_observed", 0),
+                transcript_readability.get("total_segments", 0),
+                " (CJK profile)" if transcript_readability.get("is_cjk") else "",
+            )
+        except Exception as _rd_err:
+            logger.warning(
+                "[%s] Readability scoring failed: %s",
+                job_id, _rd_err,
+            )
+
     # JobResult has no render_plan field, so persist the plan as a sidecar
     # JSON the /api/jobs/{id}/render_plan endpoint can serve to the NLE editor.
     try:
@@ -1522,6 +1603,7 @@ async def _run_analysis_inner(job_id: str):
         transcript=transcript,
         subject_track=subject_track,
         reframe_report=reframe_report,
+        transcript_readability=transcript_readability,
         speaker_names=speaker_names,
         language=getattr(perception, "detected_language", "") or "",
         default_layout_mode="single",

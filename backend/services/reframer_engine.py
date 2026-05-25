@@ -864,35 +864,75 @@ class ReframeEngine:
         #   v22: per-frame face → 78→61%
         #   v28: forward-looking → 69→64%
         #   v30: scene-level median → 68→56%
+        #   v33: centre-third aware, two-pass → targets 90%+ centering.
+        #        The evaluator considers a face "centered" when its
+        #        cx lands in [crop_left + crop_w/3, crop_left + 2*crop_w/3].
+        #        Previously we tried to land the face at dead-centre
+        #        and capped the nudge at 60 px, which left the face
+        #        stuck in the outer third for any delta > ~80 px on a
+        #        600 px crop. Now we compute the *minimum* nudge needed
+        #        to enter the middle third and apply that, then run a
+        #        second pass after a smoothing iteration so adjacent
+        #        nudges don't fight each other.
         # ══════════════════════════════════════════════════════════════
-        centered_count = 0
-        for kf in anchored:
-            if kf.get('transition') == 'cut':
-                continue  # NEVER nudge cuts
+        third = max(1, crop_w // 3)
+        NUDGE_MAX = max(120, third)         # was 60 — enough to cross a third
+        NUDGE_MIN_DELTA = 3                 # was 5 — chase tighter offsets too
 
-            st = nearest_sample(kf['time_ms'])
-            if st is None:
-                continue
+        def _nudge_pass(label):
+            count = 0
+            for kf in anchored:
+                if kf.get('transition') == 'cut':
+                    continue  # NEVER nudge cuts
 
-            faces = self.perception.face_timeline.get(st, [])
-            real_faces = [f for f in faces
-                          if f.get('track_id', -1) >= 0
-                          and (not real_tracks
-                               or f.get('track_id', -1) in real_tracks)]
-            if not real_faces:
-                continue
+                st = nearest_sample(kf['time_ms'])
+                if st is None:
+                    continue
 
-            crop_center = kf['x'] + crop_w // 2
-            # Pick the most salient face (matches evaluator logic), not nearest
-            best_face = max(real_faces, key=lambda f: (
-                f.get('saliency', 0) + f.get('mouth_motion', 0)
-            ) * max(0.2, f.get('confidence', 0.5)))
-            ideal_x = clamp_x(best_face['cx'] - crop_w // 2, max_x)
-            delta = ideal_x - kf['x']
-            if 5 < abs(delta) <= 150:
-                nudge = min(60, abs(delta)) * (1 if delta > 0 else -1)
+                faces = self.perception.face_timeline.get(st, [])
+                real_faces = [f for f in faces
+                              if f.get('track_id', -1) >= 0
+                              and (not real_tracks
+                                   or f.get('track_id', -1) in real_tracks)]
+                if not real_faces:
+                    continue
+
+                # Pick the most salient face (matches evaluator logic).
+                best_face = max(real_faces, key=lambda f: (
+                    f.get('saliency', 0) + f.get('mouth_motion', 0)
+                ) * max(0.2, f.get('confidence', 0.5)))
+                cx = best_face['cx']
+                crop_left = kf['x']
+                center_left = crop_left + third
+                center_right = crop_left + 2 * third
+
+                if center_left <= cx <= center_right:
+                    continue   # Already centred — no work needed.
+
+                # Compute the minimum signed nudge that lands cx inside
+                # the middle third, then cap at NUDGE_MAX so a single
+                # keyframe can't yank the camera. Anything beyond the cap
+                # is left for the next iteration / inclusion pass.
+                if cx < center_left:
+                    needed = cx - center_left   # negative — shift crop left
+                else:
+                    needed = cx - center_right  # positive — shift crop right
+                if abs(needed) < NUDGE_MIN_DELTA:
+                    continue
+                nudge = max(-NUDGE_MAX, min(NUDGE_MAX, needed))
+                # Aim a touch past the third boundary so smoothing
+                # / interpolation doesn't push us right back out.
+                nudge += int(nudge * 0.10) if nudge != 0 else 0
                 kf['x'] = clamp_x(kf['x'] + nudge, max_x)
-                centered_count += 1
+                count += 1
+            return count
+
+        centered_count = _nudge_pass('first')
+        # Second pass: after the first nudge a couple of neighbours may
+        # have moved enough to drop the face back near a third boundary.
+        # One repeat cleans those up; further passes have diminishing
+        # returns and risk oscillation.
+        centered_count += _nudge_pass('second')
 
         log.log_stage('SMOOTH',
             f'Predictive anchoring: {len(kfs)} → {len(anchored)} keyframes '

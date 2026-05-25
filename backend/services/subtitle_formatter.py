@@ -109,6 +109,46 @@ def _smart_split(text: str, max_chars: int, max_lines: int = 2) -> str:
     if len(text) <= max_chars:
         return text
 
+    # ── CJK path: no whitespace to split on, so walk the string and
+    # break at the best punctuation / particle boundary. We respect
+    # max_chars per line and emit up to max_lines lines.
+    if _is_cjk(text):
+        lines: list[str] = []
+        remaining = text
+        while remaining and len(lines) < max_lines:
+            if len(remaining) <= max_chars:
+                lines.append(remaining)
+                break
+            # Search for the rightmost break point inside the max_chars
+            # window so each line is as full as possible without going over.
+            window = remaining[:max_chars]
+            cut = -1
+            # Prefer sentence terminators in window
+            for i in range(len(window) - 1, -1, -1):
+                if window[i] in _CJK_SENTENCE_PUNCT:
+                    cut = i + 1
+                    break
+            # Then clause separators
+            if cut < 0:
+                for i in range(len(window) - 1, -1, -1):
+                    if window[i] in _CJK_CLAUSE_PUNCT:
+                        cut = i + 1
+                        break
+            # Then particle boundaries inside the window
+            if cut < 0:
+                for m in _CJK_PARTICLE_BREAK_RE.finditer(window):
+                    cut = m.end()
+            # Last resort: hard split at max_chars
+            if cut <= 0:
+                cut = max_chars
+            lines.append(remaining[:cut])
+            remaining = remaining[cut:]
+        if remaining and len(lines) >= max_lines:
+            # Append leftover to the last line — over-long is caught by
+            # the duration / CPS splitter upstream.
+            lines[-1] = lines[-1] + remaining
+        return "\n".join(lines)
+
     words = text.split()
     if len(words) < 2:
         # Can't break a single word; return as-is.
@@ -188,20 +228,81 @@ def _greedy_wrap(words: list[str], max_chars: int, max_lines: int) -> str:
 
 _BOUNDARY_RE = re.compile(r"([.!?])\s+|([,;:])\s+| (and|but|or|so|because|when|if|that|which) ", re.IGNORECASE)
 
+# CJK punctuation used as sentence / clause breaks in Japanese, Chinese,
+# and Korean subtitles. The matching is space-optional because CJK text
+# is typically written without inter-word whitespace.
+_CJK_SENTENCE_PUNCT = "。！？．…"
+_CJK_CLAUSE_PUNCT = "、，；：・"
+_CJK_PARTICLE_BREAK_RE = re.compile(
+    r"([はがをにへとでもからまでよりねよ])(?=[぀-ヿ一-鿿])"
+)
+
+
+def _is_cjk(text: str) -> bool:
+    """Heuristic: ≥ 30% of non-space chars are CJK ideographs / kana / hangul.
+
+    Catches Japanese, Simplified / Traditional Chinese, and Korean which
+    all need different CPS limits and split rules than Latin scripts.
+    """
+    if not text:
+        return False
+    cjk = 0
+    total = 0
+    for ch in text:
+        if ch.isspace():
+            continue
+        total += 1
+        o = ord(ch)
+        # CJK Unified Ideographs + Hiragana + Katakana + Hangul Syllables
+        if (
+            0x3040 <= o <= 0x30FF   # hiragana / katakana
+            or 0x4E00 <= o <= 0x9FFF   # CJK unified ideographs
+            or 0x3400 <= o <= 0x4DBF   # CJK ext A
+            or 0xAC00 <= o <= 0xD7A3   # hangul syllables
+        ):
+            cjk += 1
+    return total > 0 and (cjk / total) >= 0.30
+
 
 def _find_split_point(text: str) -> Optional[int]:
     """Return the character index just past the best break point in
-    ``text`` (sentence end → clause end → conjunction → word midpoint)."""
+    ``text`` (sentence end → clause end → conjunction → word midpoint).
+    CJK-aware: also looks for 。、！？・ and Japanese particle boundaries
+    so a long Japanese subtitle has somewhere to break."""
+    mid = len(text) // 2
+
+    if _is_cjk(text):
+        # 1) CJK sentence terminators.
+        sent = [i + 1 for i, ch in enumerate(text) if ch in _CJK_SENTENCE_PUNCT]
+        if sent:
+            return min(sent, key=lambda i: abs(i - mid))
+        # 2) CJK clause separators.
+        clause = [i + 1 for i, ch in enumerate(text) if ch in _CJK_CLAUSE_PUNCT]
+        if clause:
+            return min(clause, key=lambda i: abs(i - mid))
+        # 3) Japanese particle boundaries — break AFTER common particles
+        #    (は が を に へ と で も から まで より ね よ) which usually
+        #    end a phrase. Skips runs of kana / kanji so the index lands
+        #    between morphemes.
+        particle = [m.end() for m in _CJK_PARTICLE_BREAK_RE.finditer(text)]
+        if particle:
+            return min(particle, key=lambda i: abs(i - mid))
+        # 4) Latin punctuation fallback (mixed scripts).
+        ascii_breaks = [i + 1 for i, ch in enumerate(text) if ch in ".,!?;:"]
+        if ascii_breaks:
+            return min(ascii_breaks, key=lambda i: abs(i - mid))
+        # 5) Last resort: split at midpoint character.
+        return mid if mid > 0 and mid < len(text) else None
+
+    # Latin script path
     # Try sentence end first.
     sentence_breaks = [m.end() for m in re.finditer(r"[.!?]\s+", text)]
     if sentence_breaks:
         # Pick the one nearest the centre.
-        mid = len(text) // 2
         return min(sentence_breaks, key=lambda i: abs(i - mid))
     # Clause break.
     clause_breaks = [m.end() for m in re.finditer(r"[,;:]\s+", text)]
     if clause_breaks:
-        mid = len(text) // 2
         return min(clause_breaks, key=lambda i: abs(i - mid))
     # Conjunction.
     conj_breaks = [m.start() for m in re.finditer(
@@ -209,7 +310,6 @@ def _find_split_point(text: str) -> Optional[int]:
         text, re.IGNORECASE,
     )]
     if conj_breaks:
-        mid = len(text) // 2
         return min(conj_breaks, key=lambda i: abs(i - mid))
     # Fall back: word boundary nearest centre.
     words = text.split()
@@ -221,8 +321,27 @@ def _find_split_point(text: str) -> Optional[int]:
 # ── CPS / duration / gap enforcement ─────────────────────────────────────
 
 def _cps(text: str, duration_s: float) -> float:
+    """Characters per second. For CJK scripts each character carries ~2×
+    the information density of a Latin character, so we weight CJK chars
+    accordingly — matching Netflix's separate CJK CPS limits (13 CJK CPS
+    ≈ 21 Latin CPS in reading-effort)."""
     if duration_s <= 0:
         return float("inf")
+    if _is_cjk(text):
+        # Weighted: each CJK char = 1.6 reading units, latin = 1.0
+        weight = 0.0
+        for ch in text:
+            o = ord(ch)
+            if (
+                0x3040 <= o <= 0x30FF
+                or 0x4E00 <= o <= 0x9FFF
+                or 0x3400 <= o <= 0x4DBF
+                or 0xAC00 <= o <= 0xD7A3
+            ):
+                weight += 1.6
+            elif not ch.isspace():
+                weight += 1.0
+        return weight / duration_s
     return len(text) / duration_s
 
 
@@ -298,6 +417,7 @@ def enforce_readability(
     max_duration_ms: int = 7000,
     min_gap_ms: int = 80,
     smart_line_breaks: bool = True,
+    auto_cjk: bool = True,
 ) -> list[TranscriptSegment]:
     """Apply Netflix-style readability rules to a list of subtitle events.
 
@@ -316,6 +436,24 @@ def enforce_readability(
     """
     if not segments:
         return []
+
+    # Auto-detect CJK content and tighten the readability budget.
+    # Netflix Japan / Korea spec: CJK characters are read ~60% faster
+    # per glyph than Latin words, but each glyph occupies ~2× the
+    # screen width, so we cap per-line CJK chars tighter and use a
+    # lower CPS limit (weighted to match the Latin-equivalent reading
+    # effort). Numbers cribbed from Netflix's published CJK style guide.
+    if auto_cjk:
+        cjk_chars = sum(1 for s in segments if _is_cjk(s.text or ""))
+        if cjk_chars >= len(segments) * 0.4:
+            # Bump CPS lower (CJK reads denser → less time per char)
+            max_cps = min(max_cps, 13.0)
+            max_chars_per_line = min(max_chars_per_line, 16)
+            logger.info(
+                "enforce_readability: CJK content detected — using max_cps=%.1f, "
+                "max_chars_per_line=%d (Netflix CJK profile)",
+                max_cps, max_chars_per_line,
+            )
 
     out: list[TranscriptSegment] = []
     max_dur_s = max_duration_ms / 1000.0
@@ -429,3 +567,179 @@ def enforce_readability(
         out3.append(seg)
 
     return out3
+
+
+# ── Standalone readability scoring ───────────────────────────────────────
+
+def compute_readability_report(
+    segments: list[TranscriptSegment],
+    max_cps: Optional[float] = None,
+    ideal_cps: Optional[float] = None,
+    max_chars_per_line: Optional[int] = None,
+    max_duration_ms: int = 7000,
+    min_duration_ms: int = 833,
+) -> dict:
+    """Score a subtitle transcript for human readability.
+
+    Modeled on the rubric Netflix's TPN, YouTube auto-caption QC, and
+    TikTok's accessibility audit use:
+
+      * CPS distribution      — % of segments inside the ideal reading-
+                                speed window. Anything above ``max_cps``
+                                is flagged "too fast"; way below the
+                                ideal floor flags "padded".
+      * Line-length compliance — % of segments whose longest line fits
+                                inside ``max_chars_per_line``.
+      * Duration compliance   — % of segments inside the
+                                ``min_duration_ms`` / ``max_duration_ms``
+                                window (Netflix: 833 ms – 7 s).
+      * Overlap / gap         — % of segments that don't overlap and
+                                leave at least 80 ms of gap.
+
+    The overall ``score`` is a weighted blend of those four sub-scores;
+    a letter grade (A–F) gives a quick eyeball reading. The function
+    also returns per-segment ``violations`` so the UI can highlight
+    specific subtitles needing attention.
+    """
+    if not segments:
+        return {
+            "score": 100.0,
+            "grade": "A",
+            "cps_compliance_pct": 100.0,
+            "line_compliance_pct": 100.0,
+            "duration_compliance_pct": 100.0,
+            "gap_compliance_pct": 100.0,
+            "total_segments": 0,
+            "avg_cps": 0.0,
+            "max_cps_observed": 0.0,
+            "is_cjk": False,
+            "violations": [],
+            "platform_targets": {},
+        }
+
+    cjk_share = sum(1 for s in segments if _is_cjk(s.text or "")) / len(segments)
+    is_cjk = cjk_share >= 0.4
+    if max_cps is None:
+        max_cps = 13.0 if is_cjk else 21.0   # Netflix: 21 CPS adult Latin, 13 CJK
+    if ideal_cps is None:
+        ideal_cps = 10.0 if is_cjk else 17.0  # Netflix: 17 CPS comfortable reading
+    if max_chars_per_line is None:
+        max_chars_per_line = 16 if is_cjk else 42
+
+    cps_ok = 0
+    line_ok = 0
+    dur_ok = 0
+    gap_ok = 0
+    cps_values: list[float] = []
+    violations: list[dict] = []
+    min_dur_s = min_duration_ms / 1000.0
+    max_dur_s = max_duration_ms / 1000.0
+
+    for i, seg in enumerate(segments):
+        text = (seg.text or "").strip()
+        if not text:
+            continue
+        dur = max(0.001, seg.end - seg.start)
+        cps = _cps(text, dur)
+        cps_values.append(cps)
+        seg_problems: list[str] = []
+        if cps <= max_cps:
+            cps_ok += 1
+        else:
+            seg_problems.append(f"cps={cps:.1f}>{max_cps:.0f}")
+
+        # Longest line vs max_chars_per_line
+        longest_line = max((len(line) for line in text.splitlines()), default=len(text))
+        if longest_line <= max_chars_per_line:
+            line_ok += 1
+        else:
+            seg_problems.append(f"line={longest_line}>{max_chars_per_line}")
+
+        if min_dur_s <= dur <= max_dur_s:
+            dur_ok += 1
+        else:
+            seg_problems.append(
+                f"dur={dur:.2f}s<{min_dur_s:.2f}s" if dur < min_dur_s
+                else f"dur={dur:.2f}s>{max_dur_s:.1f}s"
+            )
+
+        # Gap to the next segment
+        if i + 1 < len(segments):
+            nxt = segments[i + 1]
+            gap = nxt.start - seg.end
+            if gap >= 0.080:
+                gap_ok += 1
+            else:
+                seg_problems.append(
+                    f"overlap={-gap*1000:.0f}ms" if gap < 0
+                    else f"gap={gap*1000:.0f}ms<80ms"
+                )
+        else:
+            gap_ok += 1
+
+        if seg_problems:
+            violations.append({
+                "index": i,
+                "time_sec": round(seg.start, 2),
+                "issues": seg_problems,
+            })
+
+    n = max(1, len(cps_values))
+    cps_pct = cps_ok / n * 100
+    line_pct = line_ok / n * 100
+    dur_pct = dur_ok / n * 100
+    gap_pct = gap_ok / n * 100
+
+    # Weighted blend: CPS is the dominant signal (a too-fast subtitle
+    # is unreadable no matter how short its lines are), line length and
+    # duration share the next tier, gap is the least disruptive.
+    score = (
+        cps_pct * 0.45 +
+        line_pct * 0.25 +
+        dur_pct * 0.20 +
+        gap_pct * 0.10
+    )
+    if score >= 92:
+        grade = "A"
+    elif score >= 84:
+        grade = "B"
+    elif score >= 75:
+        grade = "C"
+    elif score >= 65:
+        grade = "D"
+    else:
+        grade = "F"
+
+    avg_cps = sum(cps_values) / max(1, len(cps_values))
+    max_cps_obs = max(cps_values) if cps_values else 0.0
+
+    return {
+        "score": round(score, 1),
+        "grade": grade,
+        "cps_compliance_pct": round(cps_pct, 1),
+        "line_compliance_pct": round(line_pct, 1),
+        "duration_compliance_pct": round(dur_pct, 1),
+        "gap_compliance_pct": round(gap_pct, 1),
+        "total_segments": len(cps_values),
+        "avg_cps": round(avg_cps, 2),
+        "max_cps_observed": round(max_cps_obs, 2),
+        "is_cjk": is_cjk,
+        "violations": violations[:200],   # cap so payload stays small
+        "platform_targets": {
+            "netflix": {"max_cps": max_cps, "ideal_cps": ideal_cps,
+                        "max_chars_per_line": max_chars_per_line,
+                        "max_lines": 2,
+                        "min_duration_ms": min_duration_ms,
+                        "max_duration_ms": max_duration_ms,
+                        "min_gap_ms": 80},
+            "youtube": {"max_cps": 21.0, "ideal_cps": 15.0,
+                        "max_chars_per_line": 32, "max_lines": 2,
+                        "min_duration_ms": 750, "max_duration_ms": 6000,
+                        "min_gap_ms": 80},
+            "tiktok":  {"max_cps": 17.0, "ideal_cps": 12.0,
+                        "max_chars_per_line": 30, "max_lines": 1,
+                        "min_duration_ms": 1000, "max_duration_ms": 4000,
+                        "min_gap_ms": 100},
+        },
+    }
+

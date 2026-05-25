@@ -236,6 +236,10 @@ class JobResult(BaseModel):
     # Reframe quality grade — A-F grade, 0-100 overall score and per-axis
     # sub-scores produced by reframe_evaluator after the reframer plan is built.
     reframe_report: Optional[dict] = None
+    # Transcript readability score (CPS / line length / duration / gap
+    # compliance against a Netflix-style rubric). Populated by
+    # subtitle_formatter.compute_readability_report after analysis.
+    transcript_readability: Optional[dict] = None
     # Phase 1 + 2 — content-type override pipeline.
     # ``content_type_override`` accepts every UI dropdown value: the
     # legacy ones (gameplay / podcast / movie) PLUS the Phase 2
