@@ -282,6 +282,11 @@ class _PipelineHeartbeat:
 # Active heartbeats per job
 _heartbeats: dict[str, _PipelineHeartbeat] = {}
 
+# Strong references to in-flight background tasks so the asyncio loop
+# doesn't garbage-collect them mid-flight (transcript polish + subtitle
+# translation, scheduled after analysis completes).
+_background_tasks: set[asyncio.Task] = set()
+
 # Semaphore to limit concurrent analyses
 _analysis_semaphore: asyncio.Semaphore | None = None
 
@@ -1625,3 +1630,25 @@ async def _run_analysis_inner(job_id: str):
         "[%s] Pipeline complete in %.1fs — %d clips, %d scenes, %d transcript segments",
         job_id, _analysis_seconds, len(clips), len(scenes), len(transcript),
     )
+
+    # ── Background post-processing (polish + translation) ──
+    # Kick this off AFTER COMPLETE has been broadcast so the user can
+    # already start editing while polishing + translation finish. The
+    # call to ``_background_post_processing`` was lost in the legacy →
+    # reframer pipeline rewrite, which is why non-English jobs were
+    # shipping with their source-language transcripts and no translated
+    # subtitle track. Reload the job snapshot first so the function
+    # sees the freshly-stored transcript + clip metadata.
+    try:
+        post_job = await database.load_job(job_id)
+        _bg = asyncio.create_task(
+            _background_post_processing(job_id, list(transcript), orchestrator, post_job),
+            name=f"post-processing:{job_id}",
+        )
+        _background_tasks.add(_bg)
+        _bg.add_done_callback(_background_tasks.discard)
+    except Exception as _bg_err:
+        logger.warning(
+            "[%s] Failed to launch background post-processing: %s",
+            job_id, _bg_err,
+        )

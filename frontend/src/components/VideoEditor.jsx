@@ -364,7 +364,46 @@ export default function VideoEditor({
         (Math.abs((videoItem.trimStart || 0) - clipStart) > 0.5 ||
          Math.abs((videoItem.trimEnd || 0) - effectiveEnd) > 0.5);
 
-    if (!needsInit && !storeClipMismatch) return;
+    // ── Late-arriving transcript backfill ──
+    // The first mount may run with ``transcript`` still empty
+    // (translation runs in the background after analysis completes
+    // and the frontend WS push lands a few seconds later). Without
+    // this branch the effect short-circuits and the subtitle track
+    // stays empty forever even once the transcript arrives.
+    if (!needsInit && !storeClipMismatch) {
+      if (Array.isArray(transcript) && transcript.length > 0) {
+        const hasSubtitles = timelineStoreItems.some((it) => it.type === 'subtitle');
+        if (!hasSubtitles) {
+          transcript.forEach((seg) => {
+            if (seg.end > clipStart && seg.start < effectiveEnd) {
+              const s = Math.max(seg.start, clipStart);
+              const e = Math.min(seg.end, effectiveEnd);
+              addItem({
+                trackId: 't1',
+                type: 'subtitle',
+                mediaRef: null,
+                start: s - clipStart,
+                end: e - clipStart,
+                trimStart: 0,
+                trimEnd: null,
+                volume: 1.0,
+                speed: 1.0,
+                opacity: 1.0,
+                position: { x: 50, y: 90 },
+                size: { w: 100, h: 100 },
+                effects: {},
+                fadeIn: 0,
+                fadeOut: 0,
+                subtitleText: seg.text,
+                subtitleStyle: null,
+                speaker: seg.speaker || null,
+              });
+            }
+          });
+        }
+      }
+      return;
+    }
 
     if (!recovered || timelineStoreItems.length === 0 || lastInitClipEnd.current === 0 || storeClipMismatch) {
       // Fresh init — populate with transcript subtitles
@@ -1003,16 +1042,23 @@ export default function VideoEditor({
   // layout itself doesn't wait on the network round-trip.
   const reframePreviewActive = isCrop;
 
-  // Populate crop segments on timeline when keyframes change
+  // Populate crop segments on timeline when keyframes change. We
+  // build the segments whenever subject-track data is available —
+  // even when the user hasn't selected a crop aspect ratio yet — so
+  // they can preview the reframer's per-shot decisions on the Crop
+  // track and tweak them before committing to a ratio. When the
+  // backend never produced a subject_track AND no crop ratio is
+  // selected we leave the track empty (no data to show).
   useEffect(() => {
     console.log('[CropTrack]', {
       isCrop, aspectRatio, srcRatio, targetRatio,
       hasKeyframes: !!subjectKeyframes?.length,
       kfCount: subjectKeyframes?.length || 0,
+      hasSubjectTrack: Array.isArray(subjectTrack) && subjectTrack.length > 0,
       dur: clipEnd - clipStart,
     });
     const store = useTimelineStore.getState();
-    if (!isCrop) {
+    if (!isCrop && !(Array.isArray(subjectTrack) && subjectTrack.length > 0)) {
       store.setCropSegments([]);
       return;
     }
@@ -1067,7 +1113,7 @@ export default function VideoEditor({
       }
     }
     store.setCropSegments(segments);
-  }, [subjectKeyframes, isCrop, clipStart, clipEnd, renderPlan, speakerNames, sceneCuts]);
+  }, [subjectKeyframes, isCrop, clipStart, clipEnd, renderPlan, speakerNames, sceneCuts, subjectTrack]);
 
   const hasDynamicSubject = useMemo(
     () => isCrop && subjectKeyframes && isDynamic(subjectKeyframes),
