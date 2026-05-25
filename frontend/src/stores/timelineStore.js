@@ -875,6 +875,35 @@ const useTimelineStore = create(
         state.duration = computeTimelineDuration(state.items);
       }),
 
+      // Apply explicit new positions to many items in one transaction.
+      // Used by the preview's multi-select drag so every selected element
+      // moves in lockstep (same shared {dx, dy} captured at drag start).
+      // ``positions`` = { [itemId]: { x, y, w?, h? } } in viewport %.
+      setItemPositions: (positions) => set((state) => {
+        if (!positions) return;
+        for (const [id, p] of Object.entries(positions)) {
+          if (!p) continue;
+          const item = state.items.find(i => i.id === id);
+          if (!item) continue;
+          const track = state.tracks.find(t => t.id === item.trackId);
+          if (track?.locked) continue;
+          if (p.x !== undefined || p.y !== undefined) {
+            const cur = item.position || { x: 50, y: 50 };
+            item.position = {
+              x: p.x !== undefined ? Math.max(0, Math.min(100, Math.round(p.x * 10) / 10)) : cur.x,
+              y: p.y !== undefined ? Math.max(0, Math.min(100, Math.round(p.y * 10) / 10)) : cur.y,
+            };
+          }
+          if (p.w !== undefined || p.h !== undefined) {
+            const curSize = item.size || { w: 30, h: 30 };
+            item.size = {
+              w: p.w !== undefined ? Math.round(Math.max(2, p.w) * 10) / 10 : curSize.w,
+              h: p.h !== undefined ? Math.round(Math.max(2, p.h) * 10) / 10 : curSize.h,
+            };
+          }
+        }
+      }),
+
       // Group operations
       groupItems: (itemIds) => set((state) => {
         if (!itemIds || itemIds.length < 2) return;

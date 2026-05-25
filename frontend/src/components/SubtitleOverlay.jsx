@@ -254,8 +254,18 @@ export default function SubtitleOverlay({
   const timelineItems = useTimelineStore((s) => s.items);
   const tracks = useTimelineStore((s) => s.tracks);
   const selectedItemId = useTimelineStore((s) => s.selectedItemId);
+  const selectedItemIds = useTimelineStore((s) => s.selectedItemIds);
   const setSelectedItemId = useTimelineStore((s) => s.setSelectedItemId);
+  const toggleSelectedItem = useTimelineStore((s) => s.toggleSelectedItem);
   const updateItem = useTimelineStore((s) => s.updateItem);
+  const setItemPositions = useTimelineStore((s) => s.setItemPositions);
+
+  // Drag state for repositioning the subtitle in the preview. Mirrors the
+  // pattern in InteractiveOverlay — start positions for every selected
+  // item are captured on pointerdown so a multi-item drag translates the
+  // whole selection as a rigid block.
+  const [isDraggingSub, setIsDraggingSub] = useState(false);
+  const dragRef = useRef(null);
 
   // Check if subtitle track is hidden via the eye icon toggle
   // This IS the single source of truth — settings.subtitlesEnabled syncs TO this
@@ -448,13 +458,115 @@ export default function SubtitleOverlay({
   const handleSubtitleClick = useCallback((e) => {
     e.stopPropagation();
     if (!currentTimelineItem) return;
-    // Don't steal selection from overlay items
-    if (selectedItemId) {
-      const sel = timelineItems.find((it) => it.id === selectedItemId);
-      if (sel && sel.type !== 'subtitle') return;
+    // Shift / Cmd / Ctrl click extends the current selection so the
+    // subtitle can join the marquee group.
+    if (e.shiftKey || e.metaKey || e.ctrlKey) {
+      toggleSelectedItem(currentTimelineItem.id);
+      return;
     }
-    setSelectedItemId(currentTimelineItem.id);
-  }, [currentTimelineItem, setSelectedItemId, selectedItemId, timelineItems]);
+    // Plain click on an unselected element selects only the subtitle.
+    if (!selectedItemIds.includes(currentTimelineItem.id)) {
+      setSelectedItemId(currentTimelineItem.id);
+    }
+  }, [currentTimelineItem, setSelectedItemId, toggleSelectedItem, selectedItemIds]);
+
+  // ── DRAG: reposition the subtitle (and any other selected items) ──
+  const handleSubtitlePointerDown = useCallback((e) => {
+    if (!currentTimelineItem) return;
+    // Ignore secondary buttons and event from the inline editor textarea.
+    if (e.button !== 0 && e.button !== undefined) return;
+    e.stopPropagation();
+
+    // Promote the subtitle to (part of) the selection. Shift/Cmd/Ctrl adds
+    // to the existing selection; plain pointerdown either selects it alone
+    // or keeps the existing group if the subtitle is already in it.
+    if (e.shiftKey || e.metaKey || e.ctrlKey) {
+      if (!selectedItemIds.includes(currentTimelineItem.id)) {
+        toggleSelectedItem(currentTimelineItem.id);
+      }
+    } else if (!selectedItemIds.includes(currentTimelineItem.id)) {
+      setSelectedItemId(currentTimelineItem.id);
+    }
+
+    // Container rect = the actual video-content area inside the viewport
+    // (handles letterboxing). Drag deltas are normalised against this so
+    // dragging tracks the cursor 1:1 regardless of letterbox bars.
+    const containerEl = containerRef.current;
+    const rect = (containerEl && typeof containerEl.getBoundingClientRect === 'function')
+      ? containerEl.getBoundingClientRect()
+      : null;
+    if (!rect || rect.width <= 0 || rect.height <= 0) return;
+
+    // Latest selection at the moment of pointerdown (including the
+    // subtitle we just toggled in).
+    const liveSel = useTimelineStore.getState().selectedItemIds;
+    const dragIds = (liveSel && liveSel.length > 0 && liveSel.includes(currentTimelineItem.id))
+      ? liveSel
+      : [currentTimelineItem.id];
+    const liveItems = useTimelineStore.getState().items;
+    const startPositions = {};
+    for (const id of dragIds) {
+      const it = liveItems.find((x) => x.id === id);
+      if (!it) continue;
+      const p = it.position || (it.type === 'subtitle' ? { x: 50, y: 90 } : { x: 50, y: 50 });
+      startPositions[id] = { x: p.x, y: p.y };
+    }
+
+    useTimelineStore.temporal.getState().pause();
+    dragRef.current = {
+      startMouseX: e.clientX,
+      startMouseY: e.clientY,
+      containerW: rect.width,
+      containerH: rect.height,
+      startPositions,
+      dragIds,
+      moved: false,
+    };
+    setIsDraggingSub(true);
+  }, [currentTimelineItem, selectedItemIds, setSelectedItemId,
+      toggleSelectedItem, containerRef]);
+
+  // Global pointermove/up while a subtitle drag is active.
+  useEffect(() => {
+    if (!isDraggingSub) return;
+
+    const handleMove = (e) => {
+      const ds = dragRef.current;
+      if (!ds) return;
+      const dx = e.clientX - ds.startMouseX;
+      const dy = e.clientY - ds.startMouseY;
+      if (!ds.moved && Math.abs(dx) + Math.abs(dy) > 2) {
+        ds.moved = true;
+      }
+      const dxPct = (dx / ds.containerW) * 100;
+      const dyPct = (dy / ds.containerH) * 100;
+      const updates = {};
+      for (const id of ds.dragIds) {
+        const sp = ds.startPositions[id];
+        if (!sp) continue;
+        updates[id] = { x: sp.x + dxPct, y: sp.y + dyPct };
+      }
+      setItemPositions(updates);
+    };
+
+    const handleUp = () => {
+      useTimelineStore.temporal.getState().resume();
+      dragRef.current = null;
+      setIsDraggingSub(false);
+    };
+
+    window.addEventListener('pointermove', handleMove);
+    window.addEventListener('pointerup', handleUp);
+    window.addEventListener('pointercancel', handleUp);
+    return () => {
+      window.removeEventListener('pointermove', handleMove);
+      window.removeEventListener('pointerup', handleUp);
+      window.removeEventListener('pointercancel', handleUp);
+      if (isDraggingSub) {
+        useTimelineStore.temporal.getState().resume();
+      }
+    };
+  }, [isDraggingSub, setItemPositions]);
 
   const handleSubtitleDoubleClick = useCallback((e) => {
     e.stopPropagation();
@@ -543,11 +655,18 @@ export default function SubtitleOverlay({
     }
   }, [containerSize, outputDims]);
 
-  // Check if the current subtitle's timeline item is selected
-  const isSubtitleSelected = useMemo(() => {
+  // Check if the current subtitle's timeline item is selected — primary
+  // selection draws a solid outline, group members draw a dashed one so
+  // the user can tell which item handles act on.
+  const isSubtitlePrimary = useMemo(() => {
     if (!currentTimelineItem || !selectedItemId) return false;
     return currentTimelineItem.id === selectedItemId;
   }, [currentTimelineItem, selectedItemId]);
+  const isSubtitleInSelection = useMemo(() => {
+    if (!currentTimelineItem) return false;
+    return selectedItemIds.includes(currentTimelineItem.id);
+  }, [currentTimelineItem, selectedItemIds]);
+  const isSubtitleSelected = isSubtitleInSelection;
 
   // The resolved text comes directly from the timeline item (single source)
   const resolvedSubtitleText = currentSubtitle?.subtitleText || currentSubtitle?.text || '';
@@ -722,6 +841,8 @@ export default function SubtitleOverlay({
         }}>
           {/* Clickable subtitle text */}
           <span
+            data-item-id={currentTimelineItem?.id}
+            data-item-type="subtitle"
             style={{
               display: 'inline-block',
               fontFamily,
@@ -732,8 +853,9 @@ export default function SubtitleOverlay({
               wordWrap: 'break-word',
               overflowWrap: 'break-word',
               whiteSpace: 'pre-wrap',
-              cursor: 'pointer',
+              cursor: isDraggingSub ? 'grabbing' : 'grab',
               pointerEvents: 'auto',
+              touchAction: 'none',
               ...outlineStyle,
               ...(bgEnabled ? {
                 background: hexToRgba(bgColor, bgOpacity / 100),
@@ -741,14 +863,17 @@ export default function SubtitleOverlay({
                 borderRadius: `${(settings.subtitleBgRadius || 0) * subtitleScale}px`,
               } : {}),
               ...(isSubtitleSelected ? {
-                outline: '2px solid #0A84FF',
+                outline: isSubtitlePrimary
+                  ? '2px solid #0A84FF'
+                  : '2px dashed rgba(10, 132, 255, 0.85)',
                 outlineOffset: 4,
                 borderRadius: 4,
               } : {}),
             }}
+            onPointerDown={isEditing ? undefined : handleSubtitlePointerDown}
             onClick={handleSubtitleClick}
             onDoubleClick={handleSubtitleDoubleClick}
-            title="Click to select, double-click to edit"
+            title="Click to select, drag to reposition, double-click to edit"
           >
             {textContent}
           </span>

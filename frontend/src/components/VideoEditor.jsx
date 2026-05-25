@@ -18,6 +18,7 @@ import EffectsPanel from './EffectsPanel';
 import TransitionPicker from './TransitionPicker';
 import ExportDialog from './ExportDialog';
 import InteractiveOverlay from './InteractiveOverlay';
+import MarqueeSelection from './MarqueeSelection';
 import { hexToRgbString } from '../utils/colorUtils';
 import { runEditorQA, autoFixTrackCompatibility } from '../utils/editorQA';
 import './VideoEditor.css';
@@ -3141,6 +3142,17 @@ export default function VideoEditor({
           <InteractiveOverlay
             currentTime={currentTime - clipStart}
             clipStart={clipStart}
+            containerRef={stageRef}
+            onInteraction={setOverlayInteracting}
+          />
+        )}
+
+        {/* Marquee selection: drag from an empty area of the stage to draw
+            a selection box. All overlay items (including the current
+            subtitle) whose on-screen bbox intersects the box get added to
+            the selection — once grouped they move/scale/rotate together. */}
+        {showMultiTrack && !isFullscreen && (
+          <MarqueeSelection
             containerRef={stageRef}
             onInteraction={setOverlayInteracting}
           />

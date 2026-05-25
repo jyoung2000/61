@@ -15,8 +15,11 @@ export default function InteractiveOverlay({ currentTime = 0, clipStart = 0, con
   const items = useTimelineStore((s) => s.items);
   const tracks = useTimelineStore((s) => s.tracks);
   const selectedItemId = useTimelineStore((s) => s.selectedItemId);
+  const selectedItemIds = useTimelineStore((s) => s.selectedItemIds);
   const setSelectedItemId = useTimelineStore((s) => s.setSelectedItemId);
+  const toggleSelectedItem = useTimelineStore((s) => s.toggleSelectedItem);
   const updateItem = useTimelineStore((s) => s.updateItem);
+  const setItemPositions = useTimelineStore((s) => s.setItemPositions);
 
   // currentTime is already relative to clipStart (passed as currentTime - clipStart)
   const absTime = currentTime;
@@ -65,11 +68,25 @@ export default function InteractiveOverlay({ currentTime = 0, clipStart = 0, con
         <InteractiveElement
           key={item.id}
           item={item}
-          isSelected={item.id === selectedItemId}
+          isSelected={selectedItemIds.includes(item.id)}
+          isPrimarySelection={item.id === selectedItemId}
+          selectedItemIds={selectedItemIds}
+          allItems={items}
           isLocked={lockedItemIds.has(item.id)}
           containerRef={containerRef}
-          onSelect={() => setSelectedItemId(item.id)}
+          onSelect={(e) => {
+            // Shift / Cmd / Ctrl click extends the selection instead of replacing it.
+            if (e && (e.shiftKey || e.metaKey || e.ctrlKey)) {
+              toggleSelectedItem(item.id);
+            } else if (!selectedItemIds.includes(item.id)) {
+              // Plain click on an unselected element resets the selection.
+              // Plain click on an already-selected element keeps the group
+              // intact so the user can start a multi-item drag.
+              setSelectedItemId(item.id);
+            }
+          }}
           onUpdate={(updates) => updateItem(item.id, updates)}
+          setItemPositions={setItemPositions}
           onInteraction={onInteraction}
         />
       ))}
@@ -91,7 +108,19 @@ const HANDLES = [
 ];
 
 
-function InteractiveElement({ item, isSelected, isLocked, containerRef, onSelect, onUpdate, onInteraction }) {
+function InteractiveElement({
+  item,
+  isSelected,
+  isPrimarySelection = isSelected,
+  selectedItemIds = [],
+  allItems = [],
+  isLocked,
+  containerRef,
+  onSelect,
+  onUpdate,
+  setItemPositions,
+  onInteraction,
+}) {
   const [isHovered, setIsHovered] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
   const [isResizing, setIsResizing] = useState(false);
@@ -106,9 +135,11 @@ function InteractiveElement({ item, isSelected, isLocked, containerRef, onSelect
   // can drop mouse events mid-drag.
   const onUpdateRef = useRef(onUpdate);
   const onInteractionRef = useRef(onInteraction);
+  const setItemPositionsRef = useRef(setItemPositions);
   const itemRef = useRef(item);
   onUpdateRef.current = onUpdate;
   onInteractionRef.current = onInteraction;
+  setItemPositionsRef.current = setItemPositions;
   itemRef.current = item;
 
   const isVideo = item.type === 'video';
@@ -169,13 +200,30 @@ function InteractiveElement({ item, isSelected, isLocked, containerRef, onSelect
   const handleDragStart = useCallback((e) => {
     e.stopPropagation();
     e.preventDefault();
-    onSelect();
+    onSelect(e);
     if (isLocked) return; // Locked items can be selected but not moved
     onInteraction?.(true);
 
     const rect = getContainerRect();
     // Pause undo history during drag so intermediate frames don't flood it
     useTimelineStore.temporal.getState().pause();
+
+    // Capture the starting position of EVERY selected item (including this
+    // one). On move we apply the same dx/dy in viewport % to all of them so
+    // the marquee-grouped selection translates as a rigid block.
+    const dragIds = (selectedItemIds && selectedItemIds.length > 0
+      && selectedItemIds.includes(item.id))
+      ? selectedItemIds
+      : [item.id];
+    const startPositions = {};
+    for (const id of dragIds) {
+      const it = allItems.find((x) => x.id === id);
+      if (!it) continue;
+      const p = it.position || { x: 50, y: 50 };
+      const ep = (p.x === 0 && p.y === 0) ? { x: 50, y: 50 } : p;
+      startPositions[id] = { x: ep.x, y: ep.y };
+    }
+
     dragState.current = {
       type: 'drag',
       startMouseX: e.clientX,
@@ -184,9 +232,12 @@ function InteractiveElement({ item, isSelected, isLocked, containerRef, onSelect
       startPosY: effectivePos.y,
       containerW: rect.width,
       containerH: rect.height,
+      startPositions,
+      dragIds,
     };
     setIsDragging(true);
-  }, [effectivePos, getContainerRect, onSelect, onInteraction, isLocked]);
+  }, [effectivePos, getContainerRect, onSelect, onInteraction, isLocked,
+      selectedItemIds, allItems, item.id]);
 
   // ── RESIZE ────────────────────────────────────────────
   const handleResizeStart = useCallback((e, handleId) => {
@@ -198,6 +249,42 @@ function InteractiveElement({ item, isSelected, isLocked, containerRef, onSelect
     const rect = getContainerRect();
     // Pause undo history during resize so intermediate frames don't flood it
     useTimelineStore.temporal.getState().pause();
+
+    // Capture every selected item's geometry. When a group is selected
+    // we resize them all relative to the GROUP'S bounding box, so each
+    // item scales proportionally instead of every item snapping to the
+    // exact same size — that preserves their layout relative to each
+    // other (the "...and relative to each other" requirement).
+    const groupIds = (selectedItemIds && selectedItemIds.length > 1
+      && selectedItemIds.includes(item.id))
+      ? selectedItemIds
+      : null;
+    let groupBounds = null;
+    let startGeoms = null;
+    if (groupIds) {
+      startGeoms = {};
+      let gLeft = Infinity, gRight = -Infinity, gTop = Infinity, gBottom = -Infinity;
+      for (const id of groupIds) {
+        const it = allItems.find((x) => x.id === id);
+        if (!it) continue;
+        const p = it.position || { x: 50, y: 50 };
+        const ep = (p.x === 0 && p.y === 0) ? { x: 50, y: 50 } : p;
+        const sz = it.size || { w: 30, h: 30 };
+        startGeoms[id] = {
+          x: ep.x, y: ep.y, w: sz.w, h: sz.h,
+          fontSize: it.textStyle?.fontSize,
+          isText: it.type === 'text' || it.type === 'subtitle',
+        };
+        gLeft = Math.min(gLeft, ep.x - sz.w / 2);
+        gRight = Math.max(gRight, ep.x + sz.w / 2);
+        gTop = Math.min(gTop, ep.y - sz.h / 2);
+        gBottom = Math.max(gBottom, ep.y + sz.h / 2);
+      }
+      if (Number.isFinite(gLeft)) {
+        groupBounds = { left: gLeft, right: gRight, top: gTop, bottom: gBottom };
+      }
+    }
+
     dragState.current = {
       type: 'resize',
       handle: handleId,
@@ -211,9 +298,13 @@ function InteractiveElement({ item, isSelected, isLocked, containerRef, onSelect
       containerH: rect.height,
       startFontSize: item.textStyle?.fontSize || 48,
       isTextItem: item.type === 'text',
+      groupIds,
+      groupBounds,
+      startGeoms,
     };
     setIsResizing(true);
-  }, [effectivePos, size, item, getContainerRect, onInteraction, isLocked]);
+  }, [effectivePos, size, item, getContainerRect, onInteraction, isLocked,
+      selectedItemIds, allItems]);
 
   // ── ROTATE ────────────────────────────────────────────
   const handleRotateStart = useCallback((e) => {
@@ -223,9 +314,42 @@ function InteractiveElement({ item, isSelected, isLocked, containerRef, onSelect
     onInteraction?.(true);
 
     const rect = getContainerRect();
-    // Center of the element in viewport coordinates
-    const centerX = rect.left + (effectivePos.x / 100) * rect.width;
-    const centerY = rect.top + (effectivePos.y / 100) * rect.height;
+    // Group rotation pivots around the centre of the GROUP'S bounding box
+    // (and orbits each item's position around that pivot) so the selection
+    // rotates as one rigid block. Single-item rotation pivots around the
+    // item itself, same as before.
+    const groupIds = (selectedItemIds && selectedItemIds.length > 1
+      && selectedItemIds.includes(item.id))
+      ? selectedItemIds
+      : null;
+    let pivotX = effectivePos.x;
+    let pivotY = effectivePos.y;
+    let startGeoms = null;
+    if (groupIds) {
+      startGeoms = {};
+      let gLeft = Infinity, gRight = -Infinity, gTop = Infinity, gBottom = -Infinity;
+      for (const id of groupIds) {
+        const it = allItems.find((x) => x.id === id);
+        if (!it) continue;
+        const p = it.position || { x: 50, y: 50 };
+        const ep = (p.x === 0 && p.y === 0) ? { x: 50, y: 50 } : p;
+        const sz = it.size || { w: 30, h: 30 };
+        startGeoms[id] = {
+          x: ep.x, y: ep.y,
+          rotation: it.transform?.rotation || 0,
+        };
+        gLeft = Math.min(gLeft, ep.x - sz.w / 2);
+        gRight = Math.max(gRight, ep.x + sz.w / 2);
+        gTop = Math.min(gTop, ep.y - sz.h / 2);
+        gBottom = Math.max(gBottom, ep.y + sz.h / 2);
+      }
+      if (Number.isFinite(gLeft)) {
+        pivotX = (gLeft + gRight) / 2;
+        pivotY = (gTop + gBottom) / 2;
+      }
+    }
+    const centerX = rect.left + (pivotX / 100) * rect.width;
+    const centerY = rect.top + (pivotY / 100) * rect.height;
 
     // Pause undo history during rotation so intermediate frames don't flood it
     useTimelineStore.temporal.getState().pause();
@@ -235,9 +359,16 @@ function InteractiveElement({ item, isSelected, isLocked, containerRef, onSelect
       centerY,
       startAngle: Math.atan2(e.clientY - centerY, e.clientX - centerX) * (180 / Math.PI),
       startRotation: rotation,
+      groupIds,
+      pivotX,
+      pivotY,
+      containerW: rect.width,
+      containerH: rect.height,
+      startGeoms,
     };
     setIsRotating(true);
-  }, [effectivePos, rotation, getContainerRect, onInteraction, isLocked]);
+  }, [effectivePos, rotation, getContainerRect, onInteraction, isLocked,
+      selectedItemIds, allItems, item.id]);
 
   // ── Pointer move / up handlers ────────────────────────
   // Pointer events unify mouse + touch + pen so the same drag, resize
@@ -255,14 +386,30 @@ function InteractiveElement({ item, isSelected, isLocked, containerRef, onSelect
       if (ds.type === 'drag') {
         const dx = e.clientX - ds.startMouseX;
         const dy = e.clientY - ds.startMouseY;
-        const newX = ds.startPosX + (dx / ds.containerW) * 100;
-        const newY = ds.startPosY + (dy / ds.containerH) * 100;
-        onUpdateRef.current({
-          position: {
-            x: Math.max(0, Math.min(100, Math.round(newX * 10) / 10)),
-            y: Math.max(0, Math.min(100, Math.round(newY * 10) / 10)),
-          },
-        });
+        const dxPct = (dx / ds.containerW) * 100;
+        const dyPct = (dy / ds.containerH) * 100;
+
+        // Multi-item drag: shift every selected item's start position by
+        // the same dx/dy so they translate as a rigid block.
+        if (ds.startPositions && ds.dragIds && ds.dragIds.length > 1
+            && setItemPositionsRef.current) {
+          const updates = {};
+          for (const id of ds.dragIds) {
+            const sp = ds.startPositions[id];
+            if (!sp) continue;
+            updates[id] = { x: sp.x + dxPct, y: sp.y + dyPct };
+          }
+          setItemPositionsRef.current(updates);
+        } else {
+          const newX = ds.startPosX + dxPct;
+          const newY = ds.startPosY + dyPct;
+          onUpdateRef.current({
+            position: {
+              x: Math.max(0, Math.min(100, Math.round(newX * 10) / 10)),
+              y: Math.max(0, Math.min(100, Math.round(newY * 10) / 10)),
+            },
+          });
+        }
       }
 
       if (ds.type === 'resize') {
@@ -330,11 +477,90 @@ function InteractiveElement({ item, isSelected, isLocked, containerRef, onSelect
         }
 
         onUpdateRef.current(updates);
+
+        // Group resize: scale every selected item's position + size around
+        // the group's starting bounds. The handle being dragged controls
+        // the active item; the GROUP'S bounds get the same proportional
+        // change, and each other item is repositioned/resized to stay in
+        // the same relative spot inside those bounds.
+        if (ds.groupBounds && ds.groupIds && ds.groupIds.length > 1
+            && ds.startGeoms && setItemPositionsRef.current) {
+          const gb = ds.groupBounds;
+          const startW = Math.max(0.001, gb.right - gb.left);
+          const startH = Math.max(0.001, gb.bottom - gb.top);
+
+          let gLeft = gb.left, gRight = gb.right, gTop = gb.top, gBottom = gb.bottom;
+          if (h.includes('e')) gRight = gb.right + dx;
+          if (h.includes('w')) gLeft = gb.left + dx;
+          if (h.includes('s')) gBottom = gb.bottom + dy;
+          if (h.includes('n')) gTop = gb.top + dy;
+          // Aspect lock for the group (Shift)
+          if (e.shiftKey) {
+            const newGW = gRight - gLeft;
+            const newGH = gBottom - gTop;
+            const aspect = startW / startH;
+            if (h === 'e' || h === 'w') {
+              const targetH = newGW / aspect;
+              const cy = (gTop + gBottom) / 2;
+              gTop = cy - targetH / 2;
+              gBottom = cy + targetH / 2;
+            } else if (h === 'n' || h === 's') {
+              const targetW = newGH * aspect;
+              const cx = (gLeft + gRight) / 2;
+              gLeft = cx - targetW / 2;
+              gRight = cx + targetW / 2;
+            } else {
+              const dw = Math.abs(newGW - startW);
+              const dh = Math.abs(newGH - startH);
+              if (dw > dh) {
+                const targetH = newGW / aspect;
+                if (h.includes('s')) gBottom = gTop + targetH;
+                else gTop = gBottom - targetH;
+              } else {
+                const targetW = newGH * aspect;
+                if (h.includes('e')) gRight = gLeft + targetW;
+                else gLeft = gRight - targetW;
+              }
+            }
+          }
+          const scaleX = (gRight - gLeft) / startW;
+          const scaleY = (gBottom - gTop) / startH;
+          const updatesAll = {};
+          for (const id of ds.groupIds) {
+            if (id === item.id) continue; // already updated above
+            const sg = ds.startGeoms[id];
+            if (!sg) continue;
+            const relX = (sg.x - gb.left) / startW;
+            const relY = (sg.y - gb.top) / startH;
+            const nx = gLeft + relX * (gRight - gLeft);
+            const ny = gTop + relY * (gBottom - gTop);
+            const nw = sg.w * scaleX;
+            const nh = sg.h * scaleY;
+            const u = { x: nx, y: ny, w: nw, h: nh };
+            updatesAll[id] = u;
+            // Text items also scale their font size with the group so
+            // the rendered text grows/shrinks with the bounding box.
+            if (sg.isText && sg.fontSize) {
+              const fontScale = Math.min(scaleX, scaleY);
+              const newFontSize = Math.max(
+                8, Math.min(400, Math.round(sg.fontSize * fontScale)),
+              );
+              const it = allItems.find((x) => x.id === id);
+              if (it) {
+                useTimelineStore.getState().updateItem(id, {
+                  textStyle: { ...(it.textStyle || {}), fontSize: newFontSize },
+                });
+              }
+            }
+          }
+          setItemPositionsRef.current(updatesAll);
+        }
       }
 
       if (ds.type === 'rotate') {
         const angle = Math.atan2(e.clientY - ds.centerY, e.clientX - ds.centerX) * (180 / Math.PI);
-        let newRotation = ds.startRotation + (angle - ds.startAngle);
+        const delta = angle - ds.startAngle;
+        let newRotation = ds.startRotation + delta;
 
         if (e.shiftKey) {
           newRotation = Math.round(newRotation / 15) * 15;
@@ -346,6 +572,48 @@ function InteractiveElement({ item, isSelected, isLocked, containerRef, onSelect
         onUpdateRef.current({
           transform: { ...(currentItem.transform || {}), rotation: Math.round(newRotation) },
         });
+
+        // Group rotation: orbit every other selected item's position
+        // around the group pivot, and rotate each item by the same delta
+        // so the whole selection rotates rigidly.
+        if (ds.groupIds && ds.groupIds.length > 1 && ds.startGeoms
+            && setItemPositionsRef.current) {
+          let dRad = (delta * Math.PI) / 180;
+          if (e.shiftKey) {
+            // Snap the delta to 15° so positions and rotations stay aligned.
+            const snapped = Math.round(delta / 15) * 15;
+            dRad = (snapped * Math.PI) / 180;
+          }
+          const cosD = Math.cos(dRad);
+          const sinD = Math.sin(dRad);
+          // Convert % to a uniform px-like space using container aspect so
+          // orbits stay circular regardless of viewport shape.
+          const ar = (ds.containerW || 1) / (ds.containerH || 1);
+          const updatesAll = {};
+          for (const id of ds.groupIds) {
+            if (id === item.id) continue;
+            const sg = ds.startGeoms[id];
+            if (!sg) continue;
+            const rx = (sg.x - ds.pivotX) * ar;
+            const ry = sg.y - ds.pivotY;
+            const nx = ds.pivotX + (rx * cosD - ry * sinD) / ar;
+            const ny = ds.pivotY + (rx * sinD + ry * cosD);
+            updatesAll[id] = { x: nx, y: ny };
+            // Also rotate each item individually
+            const it = allItems.find((x) => x.id === id);
+            if (it) {
+              let r = sg.rotation + (e.shiftKey
+                ? Math.round(delta / 15) * 15
+                : delta);
+              r = ((r % 360) + 360) % 360;
+              if (r > 180) r -= 360;
+              useTimelineStore.getState().updateItem(id, {
+                transform: { ...(it.transform || {}), rotation: Math.round(r) },
+              });
+            }
+          }
+          setItemPositionsRef.current(updatesAll);
+        }
       }
     };
 
@@ -379,7 +647,7 @@ function InteractiveElement({ item, isSelected, isLocked, containerRef, onSelect
   // ── Click to select ───────────────────────────────────
   const handleClick = useCallback((e) => {
     e.stopPropagation();
-    onSelect();
+    onSelect(e);
   }, [onSelect]);
 
   // ── Double-click to edit text/subtitle ────────────────
@@ -445,6 +713,8 @@ function InteractiveElement({ item, isSelected, isLocked, containerRef, onSelect
 
   return (
     <div
+      data-item-id={item.id}
+      data-item-type={item.type}
       style={{
         ...boxStyle,
         // ``touch-action: none`` lets us own the touch sequence so the
@@ -504,25 +774,42 @@ function InteractiveElement({ item, isSelected, isLocked, containerRef, onSelect
         }} />
       )}
 
-      {/* Selection outline */}
+      {/* Selection outline — drawn on every selected member of the group.
+          Cyan = primary (carries the handles), dashed cyan = secondary
+          members (selected but no handles, drag still moves them). */}
       {isSelected && (
         <>
-          {/* Selection border — interactive: enables drag-from-border for video items */}
+          {/* Selection border — interactive: enables drag-from-border for
+              every selected item, including secondary group members, so
+              the whole group can be moved from any of its outlines. */}
           <div
             style={{
               position: 'absolute',
               inset: -2,
-              border: '2px solid #0A84FF',
+              border: isPrimarySelection
+                ? '2px solid #0A84FF'
+                : '2px dashed rgba(10, 132, 255, 0.85)',
               borderRadius: 2,
               pointerEvents: 'auto',
-              boxShadow: '0 0 0 1px rgba(10, 132, 255, 0.3)',
+              boxShadow: isPrimarySelection
+                ? '0 0 0 1px rgba(10, 132, 255, 0.3)'
+                : undefined,
               cursor: isLocked ? 'not-allowed' : (isDragging ? 'grabbing' : 'grab'),
               background: 'transparent',
               touchAction: 'none',
             }}
             onPointerDown={isEditing ? undefined : handleDragStart}
           />
+        </>
+      )}
 
+      {/* Resize / rotate handles only on the PRIMARY selection. For a
+          group selection the handles operate on the primary item; resize
+          scales every other selected item proportionally around the
+          group's bounding box, and rotation orbits them around its
+          centre — that's the "relative to each other" behaviour. */}
+      {isPrimarySelection && (
+        <>
           {/* Resize handles */}
           {HANDLES.map((h) => (
             <div
@@ -612,8 +899,12 @@ function InteractiveElement({ item, isSelected, isLocked, containerRef, onSelect
               zIndex: 40,
               backdropFilter: 'blur(4px)',
             }}>
-              {isDragging && `${effectivePos.x.toFixed(1)}%, ${effectivePos.y.toFixed(1)}%`}
-              {isResizing && `${size.w.toFixed(1)}% x ${size.h.toFixed(1)}%`}
+              {isDragging && (selectedItemIds.length > 1
+                ? `${selectedItemIds.length} items`
+                : `${effectivePos.x.toFixed(1)}%, ${effectivePos.y.toFixed(1)}%`)}
+              {isResizing && (selectedItemIds.length > 1
+                ? `${selectedItemIds.length} items`
+                : `${size.w.toFixed(1)}% x ${size.h.toFixed(1)}%`)}
               {isRotating && `${rotation}°`}
             </div>
           )}
