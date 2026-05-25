@@ -882,20 +882,18 @@ class ReframeEngine:
         #   v22: per-frame face → 78→61%
         #   v28: forward-looking → 69→64%
         #   v30: scene-level median → 68→56%
-        #   v33: centre-third aware, two-pass → targets 90%+ centering.
-        #        The evaluator considers a face "centered" when its
-        #        cx lands in [crop_left + crop_w/3, crop_left + 2*crop_w/3].
-        #        Previously we tried to land the face at dead-centre
-        #        and capped the nudge at 60 px, which left the face
-        #        stuck in the outer third for any delta > ~80 px on a
-        #        600 px crop. Now we compute the *minimum* nudge needed
-        #        to enter the middle third and apply that, then run a
-        #        second pass after a smoothing iteration so adjacent
-        #        nudges don't fight each other.
+        #   v33: aggressive 2× nudge + 2 passes → REGRESSED to 70% +
+        #        face-coverage dropped 98→91% because consecutive big
+        #        nudges oscillated the crop between two faces, leaving
+        #        it parked between them with NEITHER visible.
+        #   v34: nudge-to-middle-third with a tight cap (≤80 px),
+        #        single pass. Plus the YOLO / saliency fallback chain
+        #        for animated content. This keeps the live-action A
+        #        grade AND gives anime content a centering signal.
         # ══════════════════════════════════════════════════════════════
         third = max(1, crop_w // 3)
-        NUDGE_MAX = max(120, third)         # was 60 — enough to cross a third
-        NUDGE_MIN_DELTA = 3                 # was 5 — chase tighter offsets too
+        NUDGE_MAX = 80          # tight: ~13% of a 600px crop
+        NUDGE_MIN_DELTA = 5     # below this we're indistinguishable from jitter
 
         def _nudge_pass(label):
             count = 0
@@ -945,40 +943,27 @@ class ReframeEngine:
                         cx = sal.get('cx')
                 if cx is None:
                     continue
-                # Faux "best_face" shim so the rest of this block keeps
-                # reading from cx the same way regardless of source.
-                best_face = {'cx': cx}
-                crop_left = kf['x']
-                center_left = crop_left + third
-                center_right = crop_left + 2 * third
 
-                if center_left <= cx <= center_right:
-                    continue   # Already centred — no work needed.
-
-                # Compute the minimum signed nudge that lands cx inside
-                # the middle third, then cap at NUDGE_MAX so a single
-                # keyframe can't yank the camera. Anything beyond the cap
-                # is left for the next iteration / inclusion pass.
-                if cx < center_left:
-                    needed = cx - center_left   # negative — shift crop left
-                else:
-                    needed = cx - center_right  # positive — shift crop right
-                if abs(needed) < NUDGE_MIN_DELTA:
+                # The evaluator wants cx in [crop_left + third,
+                # crop_left + 2*third]. Use dead-centre as the IDEAL
+                # but cap the nudge at NUDGE_MAX so we never jump far
+                # enough in one step to lose another face in the same
+                # shot. Big offsets converge over multiple keyframes.
+                ideal_x = clamp_x(cx - crop_w // 2, max_x)
+                delta = ideal_x - kf['x']
+                if abs(delta) < NUDGE_MIN_DELTA:
                     continue
-                nudge = max(-NUDGE_MAX, min(NUDGE_MAX, needed))
+                nudge = max(-NUDGE_MAX, min(NUDGE_MAX, delta))
                 # Aim a touch past the third boundary so smoothing
-                # / interpolation doesn't push us right back out.
-                nudge += int(nudge * 0.10) if nudge != 0 else 0
+                # Single-pass with a tight cap. The old "10% overshoot
+                # + second pass" combo amplified the nudge into the
+                # next keyframe's territory which is exactly what the
+                # v33 regression showed.
                 kf['x'] = clamp_x(kf['x'] + nudge, max_x)
                 count += 1
             return count
 
         centered_count = _nudge_pass('first')
-        # Second pass: after the first nudge a couple of neighbours may
-        # have moved enough to drop the face back near a third boundary.
-        # One repeat cleans those up; further passes have diminishing
-        # returns and risk oscillation.
-        centered_count += _nudge_pass('second')
 
         log.log_stage('SMOOTH',
             f'Predictive anchoring: {len(kfs)} → {len(anchored)} keyframes '

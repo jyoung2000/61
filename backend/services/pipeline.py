@@ -477,28 +477,62 @@ async def _background_post_processing(job_id: str, transcript: list, orchestrato
             # ── Polish + readability loop ──
             # Re-polish (up to N passes) until the readability score
             # clears TRANSCRIPT_READABILITY_TARGET, or we run out of
-            # passes. Each pass: LLM polish → CJK-aware segmentation
-            # → score. With TRANSCRIPT_PRESERVE_WORDS the polisher is
-            # forbidden from deleting words, so what improves between
-            # passes is punctuation density and segment boundaries.
+            # passes. Type discipline: the polish loop operates on
+            # TranscriptSegment models so enforce_readability /
+            # compute_readability_report (which read seg.text / .start
+            # / .end attributes) work on every iteration. We convert
+            # back to dicts only when writing to the DB or handing
+            # off to the translator (which also expects models — see
+            # the explicit cast at the translation call site below).
             from backend.services.subtitle_formatter import (
                 enforce_readability, compute_readability_report,
             )
+            from backend.models import TranscriptSegment as _TS
             target_score = float(getattr(settings, "TRANSCRIPT_READABILITY_TARGET", 90.0))
             max_passes = int(getattr(settings, "TRANSCRIPT_READABILITY_MAX_PASSES", 3))
 
-            polished = transcript
-            best_polished = transcript
+            def _to_models(items):
+                out = []
+                for t in (items or []):
+                    if isinstance(t, _TS):
+                        out.append(t)
+                    elif isinstance(t, dict):
+                        try:
+                            out.append(_TS(**t))
+                        except Exception:
+                            # Drop irreparable rows rather than crash —
+                            # the polisher tolerates length changes.
+                            continue
+                return out
+
+            polished_models = _to_models(transcript)
+            best_models = list(polished_models)
             best_report = None
             for _pass in range(1, max_passes + 1):
-                polished = await asyncio.wait_for(
-                    correct_transcript(polished, orchestrator, job_id=job_id, language=correction_lang),
-                    timeout=_correction_timeout,
-                )
-                if getattr(settings, "SUBTITLE_CPS_ENFORCEMENT", False):
+                # correct_transcript round-trips its input shape, so
+                # passing models in → models out keeps the type stable.
+                try:
+                    polished_models = await asyncio.wait_for(
+                        correct_transcript(
+                            polished_models,
+                            orchestrator,
+                            job_id=job_id,
+                            language=correction_lang,
+                        ),
+                        timeout=_correction_timeout,
+                    )
+                    # Defensive: if polisher hand-cracked the type, re-coerce.
+                    polished_models = _to_models(polished_models)
+                except Exception as _pe:
+                    logger.warning(
+                        "[%s] Polish pass %d failed (%s) — keeping previous text",
+                        job_id, _pass, _pe,
+                    )
+
+                if getattr(settings, "SUBTITLE_CPS_ENFORCEMENT", False) and polished_models:
                     try:
-                        polished = enforce_readability(
-                            list(polished),
+                        polished_models = enforce_readability(
+                            list(polished_models),
                             max_cps=float(getattr(settings, "SUBTITLE_MAX_CPS", 20.0)),
                             max_chars_per_line=int(getattr(settings, "SUBTITLE_MAX_CHARS_PER_LINE", 42)),
                             min_duration_ms=int(getattr(settings, "SUBTITLE_MIN_DURATION_MS", 833)),
@@ -508,8 +542,9 @@ async def _background_post_processing(job_id: str, transcript: list, orchestrato
                     except Exception as _rd_err:
                         logger.warning("[%s] Readability enforcement failed (%s) — using unmodified polish",
                                        job_id, _rd_err)
+
                 try:
-                    pass_report = compute_readability_report(list(polished))
+                    pass_report = compute_readability_report(list(polished_models))
                 except Exception:
                     pass_report = None
 
@@ -518,7 +553,7 @@ async def _background_post_processing(job_id: str, transcript: list, orchestrato
                     best_report is None or pass_report.get("score", 0) > best_report.get("score", 0)
                 ):
                     best_report = pass_report
-                    best_polished = polished
+                    best_models = list(polished_models)
 
                 _score = pass_report.get("score") if pass_report else None
                 logger.info(
@@ -530,18 +565,26 @@ async def _background_post_processing(job_id: str, transcript: list, orchestrato
                 if _score is not None and _score >= target_score:
                     break
 
-            polished = best_polished
+            polished_models = best_models
+            # Write the polished transcript back as dicts so any reader
+            # that still expects the dict shape (the bridge, the
+            # frontend client, etc.) stays happy.
+            polished_dicts = [
+                p.model_dump() if hasattr(p, "model_dump") else dict(p)
+                for p in polished_models
+            ]
             if best_report is not None:
-                # Persist the readability score against the polished
-                # transcript so the UI can read it immediately.
                 await database.update_job_status(
                     job_id,
-                    transcript=list(polished),
+                    transcript=polished_dicts,
                     transcript_readability=best_report,
                 )
             else:
-                await database.update_job_status(job_id, transcript=list(polished))
-            transcript = polished  # Use polished version for translation below
+                await database.update_job_status(job_id, transcript=polished_dicts)
+            # Hand the MODEL list to the translation block — it calls
+            # ``seg.text`` directly, so passing dicts there is what
+            # threw "'dict' object has no attribute 'text'" last run.
+            transcript = polished_models
 
             await broadcast_ws(job_id, {
                 "type": "background_task",
@@ -611,11 +654,23 @@ async def _background_post_processing(job_id: str, transcript: list, orchestrato
 
         # Scale timeout with segment count — allow extra time for model pull + fallback
         _trans_timeout = max(600, len(transcript) * 4)
+        # Translator calls ``seg.text`` directly, so make sure every
+        # row is a TranscriptSegment regardless of upstream shape.
+        from backend.models import TranscriptSegment as _TS_for_translate
+        _trans_input = []
+        for t in (transcript or []):
+            if isinstance(t, _TS_for_translate):
+                _trans_input.append(t)
+            elif isinstance(t, dict):
+                try:
+                    _trans_input.append(_TS_for_translate(**t))
+                except Exception:
+                    pass
         try:
             orchestrator.reset_circuit_breaker()
             translated = await asyncio.wait_for(
                 translate_segments_with_fallback(
-                    transcript,
+                    _trans_input,
                     source_language=source_lang if source_lang else "auto",
                     target_language=target_lang,
                     orchestrator=orchestrator,
@@ -643,7 +698,14 @@ async def _background_post_processing(job_id: str, transcript: list, orchestrato
                     logger.warning("[%s] Post-translation readability enforcement failed (%s)",
                                    job_id, _rd_err)
 
-            changed = sum(1 for t, o in zip(translated, transcript) if t.text != o.text)
+            # Compare against the coerced model list (``_trans_input``)
+            # so the loop works whether the caller handed us dicts or
+            # models — the older zip(translated, transcript) crashed
+            # the moment ``transcript`` was a list of dicts.
+            changed = sum(
+                1 for t, o in zip(translated, _trans_input)
+                if (getattr(t, "text", "") or "") != (getattr(o, "text", "") or "")
+            )
 
             # Re-score readability against the translated transcript so
             # the UI shows the score of what viewers will actually read
