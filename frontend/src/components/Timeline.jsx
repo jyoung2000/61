@@ -109,6 +109,271 @@ function findSnapTarget(candidateTime, items, excludeItemId, playhead, duration,
   return null;
 }
 
+// ── Overview minimap ─────────────────────────────────────────────────────────
+// Premiere / Resolve / Final Cut all surface a condensed projection of
+// the entire timeline as a "navigator" so the user can jump anywhere
+// without zooming out. Click anywhere to seek; drag the highlighted
+// viewport rectangle to pan; drag its edges to zoom.
+function TimelineMinimap({
+  tracks, items, cropSegments, duration, playhead,
+  scrollX, pps, labelWidth, canvasWidthRef, onScrollTo, onSeek,
+}) {
+  const miniRef = useRef(null);
+  const containerRef = useRef(null);
+  const setZoom = useTimelineStore((s) => s.setZoom);
+  const basePPS = 50; // must match the basePPS used in Timeline
+  const [hoverPx, setHoverPx] = useState(null);
+  const draggingRef = useRef(null);
+  const HEIGHT = 38;
+
+  // Total content extent in seconds — same heuristic as the ruler.
+  const maxItemEnd = items.length > 0 ? Math.max(...items.map((it) => it.end || 0)) : 0;
+  const totalDuration = Math.max(duration || 0, maxItemEnd, 30) * 1.05;
+
+  useEffect(() => {
+    const canvas = miniRef.current;
+    if (!canvas) return;
+    const dpr = window.devicePixelRatio || 1;
+    const rect = canvas.getBoundingClientRect();
+    if (rect.width === 0) return;
+    canvas.width = rect.width * dpr;
+    canvas.height = HEIGHT * dpr;
+    const ctx = canvas.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const W = rect.width;
+    const isDark = document.documentElement.dataset?.theme === 'dark';
+
+    // Background
+    ctx.clearRect(0, 0, W, HEIGHT);
+    ctx.fillStyle = isDark ? 'rgba(255,255,255,0.04)' : 'rgba(0,0,0,0.04)';
+    ctx.fillRect(0, 0, W, HEIGHT);
+
+    // Convert: seconds → minimap px
+    const sPerPx = totalDuration / W;
+    const pxPerSec = W / totalDuration;
+
+    // Each track gets a horizontal lane in the minimap.
+    const visTracks = tracks.filter((t) => t.visible !== false);
+    const laneH = Math.max(2, (HEIGHT - 8) / Math.max(1, visTracks.length));
+    visTracks.forEach((track, idx) => {
+      const ly = 4 + idx * laneH;
+      // Lane background
+      ctx.fillStyle = isDark ? 'rgba(255,255,255,0.02)' : 'rgba(0,0,0,0.02)';
+      ctx.fillRect(0, ly, W, Math.max(1, laneH - 1));
+
+      // Paint each item as a colored slim bar
+      const trackItems = items.filter((it) => it.trackId === track.id);
+      for (const it of trackItems) {
+        const ix = it.start * pxPerSec;
+        const iw = Math.max(1, (it.end - it.start) * pxPerSec);
+        const color = TRACK_COLORS[it.type] || TRACK_COLORS.video;
+        ctx.fillStyle = color + 'B0';
+        ctx.fillRect(ix, ly, iw, Math.max(1, laneH - 1));
+      }
+
+      // Crop track gets crop segments instead
+      if (track.type === 'crop' && cropSegments?.length) {
+        for (const seg of cropSegments) {
+          const cx = seg.startTime * pxPerSec;
+          const cw = Math.max(1, (seg.endTime - seg.startTime) * pxPerSec);
+          const clrIdx = seg.isManualOverride ? 4 : Math.max(0, seg.clusterId);
+          const color = CROP_CLUSTER_COLORS[clrIdx % CROP_CLUSTER_COLORS.length];
+          ctx.fillStyle = color + 'C0';
+          ctx.fillRect(cx, ly, cw, Math.max(1, laneH - 1));
+        }
+      }
+    });
+
+    // Viewport rectangle — what's currently visible in the main canvas.
+    const mainCanvas = canvasWidthRef?.current;
+    if (mainCanvas) {
+      const mainWidth = mainCanvas.getBoundingClientRect().width - labelWidth;
+      const viewStartSec = scrollX / pps;
+      const viewEndSec = (scrollX + mainWidth) / pps;
+      const vx = viewStartSec * pxPerSec;
+      const vw = Math.max(8, (viewEndSec - viewStartSec) * pxPerSec);
+      // Frosted glass viewport
+      ctx.fillStyle = isDark ? 'rgba(255,255,255,0.10)' : 'rgba(0,0,0,0.07)';
+      ctx.fillRect(vx, 0, vw, HEIGHT);
+      ctx.strokeStyle = 'var(--accent, #0A84FF)';
+      ctx.fillStyle = 'rgba(10,132,255,0.18)';
+      ctx.fillRect(vx, 0, vw, HEIGHT);
+      ctx.strokeStyle = '#0A84FF';
+      ctx.lineWidth = 1.5;
+      ctx.strokeRect(vx + 0.5, 0.5, vw - 1, HEIGHT - 1);
+      // Edge grippers for zoom-drag
+      ctx.fillStyle = '#0A84FF';
+      ctx.fillRect(vx - 1, 8, 2, HEIGHT - 16);
+      ctx.fillRect(vx + vw - 1, 8, 2, HEIGHT - 16);
+    }
+
+    // Playhead
+    const phx = playhead * pxPerSec;
+    if (phx >= 0 && phx <= W) {
+      ctx.strokeStyle = '#FF3B30';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(phx, 0);
+      ctx.lineTo(phx, HEIGHT);
+      ctx.stroke();
+    }
+
+    // Hover tooltip line
+    if (hoverPx != null) {
+      ctx.strokeStyle = isDark ? 'rgba(255,255,255,0.4)' : 'rgba(0,0,0,0.4)';
+      ctx.setLineDash([3, 3]);
+      ctx.beginPath();
+      ctx.moveTo(hoverPx, 0);
+      ctx.lineTo(hoverPx, HEIGHT);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+  }, [tracks, items, cropSegments, duration, playhead, scrollX, pps,
+      hoverPx, totalDuration, canvasWidthRef, labelWidth]);
+
+  const pxToTime = useCallback((px) => {
+    const canvas = miniRef.current;
+    if (!canvas) return 0;
+    const W = canvas.getBoundingClientRect().width;
+    return Math.max(0, (px / W) * totalDuration);
+  }, [totalDuration]);
+
+  const onMiniPointerDown = (e) => {
+    const canvas = miniRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const px = e.clientX - rect.left;
+    const time = pxToTime(px);
+
+    const mainCanvas = canvasWidthRef?.current;
+    if (!mainCanvas) {
+      onSeek(time);
+      return;
+    }
+    const mainWidth = mainCanvas.getBoundingClientRect().width - labelWidth;
+    const W = rect.width;
+    const pxPerSec = W / totalDuration;
+    const viewStartSec = scrollX / pps;
+    const viewEndSec = (scrollX + mainWidth) / pps;
+    const vx = viewStartSec * pxPerSec;
+    const vw = (viewEndSec - viewStartSec) * pxPerSec;
+    const edgeGrab = 6;
+    let mode = 'seek';
+    if (px >= vx - edgeGrab && px <= vx + edgeGrab) mode = 'zoom-left';
+    else if (px >= vx + vw - edgeGrab && px <= vx + vw + edgeGrab) mode = 'zoom-right';
+    else if (px >= vx && px <= vx + vw) mode = 'pan';
+    draggingRef.current = {
+      mode,
+      startPx: px,
+      startScrollX: scrollX,
+      startTime: time,
+      origVStart: viewStartSec,
+      origVEnd: viewEndSec,
+    };
+
+    const onMove = (ev) => {
+      const drag = draggingRef.current;
+      if (!drag) return;
+      const cRect = canvas.getBoundingClientRect();
+      const curPx = ev.clientX - cRect.left;
+      const dx = curPx - drag.startPx;
+      const dSec = dx / pxPerSec;
+      if (drag.mode === 'pan' || drag.mode === 'seek') {
+        // Pan the main view so the same minimap-px point stays under
+        // the cursor. For 'seek' mode we also move the playhead.
+        const newScrollX = Math.max(0, drag.startScrollX + dSec * pps);
+        onScrollTo(newScrollX);
+        if (drag.mode === 'seek') {
+          onSeek(pxToTime(curPx));
+        }
+      } else if (drag.mode === 'zoom-left') {
+        const newVStart = Math.max(0, drag.origVStart + dSec);
+        const newWindow = drag.origVEnd - newVStart;
+        if (newWindow > 0.5) {
+          const mainW = canvasWidthRef.current.getBoundingClientRect().width - labelWidth;
+          const newZoom = Math.max(0.01, mainW / (newWindow * basePPS));
+          setZoom(newZoom);
+          onScrollTo(newVStart * newZoom * basePPS);
+        }
+      } else if (drag.mode === 'zoom-right') {
+        const newVEnd = Math.max(drag.origVStart + 0.5, drag.origVEnd + dSec);
+        const newWindow = newVEnd - drag.origVStart;
+        if (newWindow > 0.5) {
+          const mainW = canvasWidthRef.current.getBoundingClientRect().width - labelWidth;
+          const newZoom = Math.max(0.01, mainW / (newWindow * basePPS));
+          setZoom(newZoom);
+          onScrollTo(drag.origVStart * newZoom * basePPS);
+        }
+      }
+    };
+    const onUp = () => {
+      draggingRef.current = null;
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+    };
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+
+    // Single click outside the viewport jumps the view to center on
+    // the click + seeks the playhead.
+    if (mode === 'seek') {
+      onSeek(time);
+      const mainW = mainWidth;
+      const newScrollX = Math.max(0, time * pps - mainW / 2);
+      onScrollTo(newScrollX);
+    }
+  };
+
+  return (
+    <div
+      ref={containerRef}
+      className="ve-multi-timeline__minimap"
+      style={{
+        height: HEIGHT,
+        marginTop: 4,
+        marginBottom: 4,
+        marginLeft: 8,
+        marginRight: 8,
+        position: 'relative',
+        borderRadius: 6,
+        overflow: 'hidden',
+        border: '1px solid var(--ve-chrome-border, rgba(127,127,127,0.15))',
+        cursor: 'pointer',
+      }}
+      onPointerMove={(e) => {
+        const rect = miniRef.current?.getBoundingClientRect();
+        if (rect) setHoverPx(e.clientX - rect.left);
+      }}
+      onPointerLeave={() => setHoverPx(null)}
+    >
+      <canvas
+        ref={miniRef}
+        style={{ width: '100%', height: HEIGHT, display: 'block', touchAction: 'none' }}
+        onPointerDown={onMiniPointerDown}
+      />
+      {hoverPx != null && (
+        <div
+          style={{
+            position: 'absolute',
+            left: hoverPx + 6,
+            top: 4,
+            fontSize: 10,
+            color: '#fff',
+            background: 'rgba(0,0,0,0.7)',
+            padding: '1px 5px',
+            borderRadius: 3,
+            pointerEvents: 'none',
+            fontFamily: 'var(--font-mono, monospace)',
+            whiteSpace: 'nowrap',
+          }}
+        >
+          {formatTime(pxToTime(hoverPx))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function Timeline({ compact = false, onSeek, onItemSelect, onSubtitleVisibilityChange }) {
   const canvasRef = useRef(null);
   const containerRef = useRef(null);
@@ -122,6 +387,16 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
   // every pixel of mouse movement; we just schedule a redraw via
   // ``requestRedrawRef`` when the hovered item / handle changes.
   const hoverRef = useRef({ itemId: null, cropId: null, edge: null });
+
+  // Auto-scroll during drag: rAF loop that pans the timeline while the
+  // user holds a clip / trim handle near a viewport edge. The
+  // ``vx`` ref carries the current pan speed (px / frame), and
+  // ``lastMoveEvent`` lets the rAF step re-run the drag onMove handler
+  // so the dragged target tracks the new scroll position even when
+  // the mouse itself is parked.
+  const _autoScrollVxRef = useRef(0);
+  const _autoScrollRafRef = useRef(0);
+  const _lastMoveEventRef = useRef(null);
 
   // Subscribe per-slice for STATE that needs to trigger re-renders.
   // ACTIONS are pulled via ``_store.getState()`` below — they are
@@ -797,23 +1072,49 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
       ctx.restore();
       ctx.lineWidth = 1;
 
-      // Playhead handle — large inverted triangle for easy grabbing
+      // Playhead handle — wide flat-top "needle" with a grippy notch,
+      // matching the Premiere / Resolve / Final Cut playhead idiom.
+      // Wider top reads as a clear drag target; the tip points to the
+      // exact frame.
       ctx.fillStyle = '#FF3B30';
       ctx.beginPath();
-      ctx.moveTo(phX - 12, 0);
-      ctx.lineTo(phX + 12, 0);
-      ctx.lineTo(phX, 18);
+      ctx.moveTo(phX - 11, 0);
+      ctx.lineTo(phX + 11, 0);
+      ctx.lineTo(phX + 11, RULER_HEIGHT - 14);
+      ctx.lineTo(phX, RULER_HEIGHT - 2);
+      ctx.lineTo(phX - 11, RULER_HEIGHT - 14);
       ctx.closePath();
       ctx.fill();
 
-      // White inner triangle for visibility
-      ctx.fillStyle = 'rgba(255, 255, 255, 0.5)';
+      // Glossy notch on the handle top
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.55)';
+      ctx.fillRect(phX - 6, 2, 12, 2);
+
+      // Live time tooltip — readable bubble that follows the playhead
+      // during scrub / playback. Sits just under the handle so it never
+      // collides with the segment chips. Always painted so the user
+      // doesn't lose track of the current frame.
+      const tipText = formatTimeMs(playheadRef.current);
+      ctx.font = '600 11px "SF Mono", "Cascadia Code", "Menlo", monospace';
+      const tipPad = 6;
+      const tipW = Math.ceil(ctx.measureText(tipText).width) + tipPad * 2;
+      const tipH = 18;
+      const tipY = RULER_HEIGHT - 1;
+      let tipX = phX - tipW / 2;
+      // Clamp so the bubble never escapes the visible canvas / track headers
+      tipX = Math.max(contentLeft + 2, Math.min(canvasW - tipW - 2, tipX));
+      ctx.save();
+      ctx.shadowColor = 'rgba(0,0,0,0.45)';
+      ctx.shadowBlur = 6;
+      ctx.shadowOffsetY = 2;
+      ctx.fillStyle = '#FF3B30';
       ctx.beginPath();
-      ctx.moveTo(phX - 6, 1);
-      ctx.lineTo(phX + 6, 1);
-      ctx.lineTo(phX, 10);
-      ctx.closePath();
+      ctx.roundRect(tipX, tipY, tipW, tipH, 4);
       ctx.fill();
+      ctx.restore();
+      ctx.fillStyle = '#fff';
+      ctx.textAlign = 'center';
+      ctx.fillText(tipText, tipX + tipW / 2, tipY + 13);
     }
 
     // ── Snap guide line ──
@@ -1304,6 +1605,57 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
         return;
       }
 
+      // Auto-scroll the timeline while dragging near either viewport
+      // edge — the single most important affordance for "let me move
+      // this clip 30 seconds to the right without zooming out first".
+      // Every state-of-the-art NLE (Premiere, DaVinci, Final Cut, VEED)
+      // does this. The further into the edge zone the cursor sits,
+      // the faster the scroll, matching Premiere's behavior.
+      const _affectsScroll = (
+        dragInfo.type === 'trim' ||
+        dragInfo.type === 'move' ||
+        dragInfo.type === 'trim-crop' ||
+        dragInfo.type === 'move-crop' ||
+        dragInfo.type === 'scrub'
+      );
+      if (_affectsScroll) {
+        try {
+          const _canvas = canvasRef.current;
+          if (_canvas) {
+            const _rect = _canvas.getBoundingClientRect();
+            const _edgeZone = 50; // px from edge that triggers scroll
+            const _maxSpeed = 22;  // px per frame at the very edge
+            const _contentLeft = _rect.left + LABEL_WIDTH;
+            const _distLeft = e.clientX - _contentLeft;
+            const _distRight = _rect.right - e.clientX;
+            let _vx = 0;
+            if (_distLeft < _edgeZone && _distLeft > -200) {
+              _vx = -_maxSpeed * Math.min(1, Math.max(0, 1 - _distLeft / _edgeZone));
+            } else if (_distRight < _edgeZone && _distRight > -200) {
+              _vx = _maxSpeed * Math.min(1, Math.max(0, 1 - _distRight / _edgeZone));
+            }
+            _autoScrollVxRef.current = _vx;
+            if (_vx !== 0 && !_autoScrollRafRef.current) {
+              const _step = () => {
+                const v = _autoScrollVxRef.current;
+                if (!v) { _autoScrollRafRef.current = 0; return; }
+                const cur = useTimelineStore.getState().scrollX;
+                useTimelineStore.getState().setScrollX(Math.max(0, cur + v));
+                // Re-run onMove with the last known clientX so the
+                // drag target tracks the new scroll position even
+                // when the mouse is parked.
+                if (_lastMoveEventRef.current) {
+                  onMove(_lastMoveEventRef.current);
+                }
+                _autoScrollRafRef.current = requestAnimationFrame(_step);
+              };
+              _autoScrollRafRef.current = requestAnimationFrame(_step);
+            }
+            _lastMoveEventRef.current = e;
+          }
+        } catch (_) { /* never break the drag because of auto-scroll */ }
+      }
+
       const time = getTimeFromX(e.clientX);
 
       if (dragInfo.type === 'scrub') {
@@ -1452,6 +1804,13 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
     };
 
     const onUp = () => {
+      // Stop the drag auto-scroll loop.
+      _autoScrollVxRef.current = 0;
+      if (_autoScrollRafRef.current) {
+        cancelAnimationFrame(_autoScrollRafRef.current);
+        _autoScrollRafRef.current = 0;
+      }
+      _lastMoveEventRef.current = null;
       // Resume undo history so the final drag state is recorded as one snapshot
       if (dragInfo.type === 'move' || dragInfo.type === 'trim' ||
           dragInfo.type === 'trim-crop' || dragInfo.type === 'move-crop') {
@@ -1499,6 +1858,13 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
         cancelAnimationFrame(_scrubRafRef.current);
         _scrubRafRef.current = 0;
       }
+      // Stop any in-flight auto-scroll rAF loop on unmount.
+      _autoScrollVxRef.current = 0;
+      if (_autoScrollRafRef.current) {
+        cancelAnimationFrame(_autoScrollRafRef.current);
+        _autoScrollRafRef.current = 0;
+      }
+      _lastMoveEventRef.current = null;
       // Safety: if component unmounts during a drag of any kind, resume
       // undo history. The previous version only handled ``move`` /
       // ``trim`` and would leave the temporal store paused after a
@@ -2013,6 +2379,28 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
         onContextMenu={onContextMenu}
         />
       </div>
+
+      {/* Overview ribbon — Premiere/Resolve-style mini-map.  Renders a
+          condensed projection of every track plus the current viewport
+          rectangle so the user can pan to any point on the timeline in
+          one click, even when the working zoom only shows a few
+          seconds at a time. */}
+      <TimelineMinimap
+        tracks={tracks}
+        items={items}
+        cropSegments={cropSegments}
+        duration={duration}
+        playhead={playhead}
+        scrollX={scrollX}
+        pps={pps}
+        labelWidth={LABEL_WIDTH}
+        canvasWidthRef={canvasRef}
+        onScrollTo={(newScrollX) => setScrollX(Math.max(0, newScrollX))}
+        onSeek={(t) => {
+          setPlayhead(t);
+          try { onSeek?.(t); } catch { /* noop */ }
+        }}
+      />
 
       {/* Context menu */}
       {contextMenu && (
