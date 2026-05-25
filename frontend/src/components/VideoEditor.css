@@ -1733,6 +1733,78 @@ input.ve-timecode--input {
   color: var(--ve-accent);
 }
 
+.ve-btn--active-ripple {
+  background: rgba(245, 158, 11, 0.14);
+  color: #f59e0b;
+  border-color: rgba(245, 158, 11, 0.45);
+  box-shadow: inset 0 0 0 1px rgba(245, 158, 11, 0.35);
+}
+
+.ve-multi-timeline__tc:hover {
+  background: rgba(127, 127, 127, 0.18) !important;
+  color: var(--ve-accent, #0A84FF) !important;
+}
+
+/* Scroll wrapper for the main timeline canvas — kicks in when the
+   user has stacked enough tracks to overflow the visible area. A
+   tinted custom scrollbar gives it the same chip aesthetic as the
+   rest of the chrome. */
+.ve-multi-timeline__canvas-wrap {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(127, 127, 127, 0.45) transparent;
+}
+.ve-multi-timeline__canvas-wrap::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+.ve-multi-timeline__canvas-wrap::-webkit-scrollbar-track {
+  background: transparent;
+}
+.ve-multi-timeline__canvas-wrap::-webkit-scrollbar-thumb {
+  background: rgba(127, 127, 127, 0.32);
+  border-radius: 5px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+  transition: background 0.15s ease;
+}
+.ve-multi-timeline__canvas-wrap::-webkit-scrollbar-thumb:hover {
+  background: rgba(127, 127, 127, 0.55);
+  background-clip: padding-box;
+}
+
+/* Track rail — sticky column on the right edge of the scroll wrapper
+   showing a colored swatch + label per track. Clicking a swatch
+   scrolls that track into view. Mirrors how Premiere's Track Panel
+   gives a quick "jump-to" rail when the timeline is taller than the
+   viewport. */
+.ve-multi-timeline__rail {
+  position: absolute;
+  right: 4px;
+  top: 0;
+  width: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  pointer-events: auto;
+  z-index: 6;
+}
+.ve-multi-timeline__rail-dot {
+  display: block;
+  width: 8px;
+  height: 100%;
+  margin-left: 3px;
+  border-radius: 2px;
+  opacity: 0.55;
+  transition: opacity 0.12s ease, transform 0.12s ease;
+  cursor: pointer;
+  border: none;
+  padding: 0;
+}
+.ve-multi-timeline__rail-dot:hover {
+  opacity: 1;
+  transform: scaleX(1.4);
+}
+
 .ve-multi-timeline__context-menu {
   position: absolute;
   background: var(--ve-dropdown-bg);

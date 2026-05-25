@@ -116,7 +116,7 @@ function findSnapTarget(candidateTime, items, excludeItemId, playhead, duration,
 // viewport rectangle to pan; drag its edges to zoom.
 function TimelineMinimap({
   tracks, items, cropSegments, duration, playhead,
-  scrollX, pps, labelWidth, canvasWidthRef, onScrollTo, onSeek,
+  scrollX, pps, labelWidth, canvasWidthRef, onScrollTo, onSeek, sceneCuts,
 }) {
   const miniRef = useRef(null);
   const containerRef = useRef(null);
@@ -207,6 +207,18 @@ function TimelineMinimap({
       ctx.fillRect(vx + vw - 1, 8, 2, HEIGHT - 16);
     }
 
+    // Scene-cut markers — small notches on the top edge so the user
+    // can navigate cut-to-cut in one click without zooming in.
+    if (Array.isArray(sceneCuts) && sceneCuts.length) {
+      ctx.fillStyle = isDark ? 'rgba(251, 191, 36, 0.85)' : 'rgba(217, 119, 6, 0.85)';
+      for (const c of sceneCuts) {
+        const cx = c * pxPerSec;
+        if (cx < 0 || cx > W) continue;
+        // 3 × 6 notch hanging from the top
+        ctx.fillRect(Math.round(cx) - 1, 0, 2, 5);
+      }
+    }
+
     // Playhead
     const phx = playhead * pxPerSec;
     if (phx >= 0 && phx <= W) {
@@ -229,7 +241,7 @@ function TimelineMinimap({
       ctx.setLineDash([]);
     }
   }, [tracks, items, cropSegments, duration, playhead, scrollX, pps,
-      hoverPx, totalDuration, canvasWidthRef, labelWidth]);
+      hoverPx, totalDuration, canvasWidthRef, labelWidth, sceneCuts]);
 
   const pxToTime = useCallback((px) => {
     const canvas = miniRef.current;
@@ -243,7 +255,22 @@ function TimelineMinimap({
     if (!canvas) return;
     const rect = canvas.getBoundingClientRect();
     const px = e.clientX - rect.left;
-    const time = pxToTime(px);
+    let time = pxToTime(px);
+
+    // Click-to-cut snapping: if the click lands within 6 minimap pixels
+    // of a scene cut, snap to the cut so cut-to-cut navigation is
+    // pixel-accurate even at very compressed scales.
+    if (Array.isArray(sceneCuts) && sceneCuts.length) {
+      const W = rect.width;
+      const pxPerSecSnap = W / totalDuration;
+      let best = null;
+      let bestDist = Infinity;
+      for (const c of sceneCuts) {
+        const d = Math.abs(c * pxPerSecSnap - px);
+        if (d < bestDist) { bestDist = d; best = c; }
+      }
+      if (best !== null && bestDist <= 6) time = best;
+    }
 
     const mainCanvas = canvasWidthRef?.current;
     if (!mainCanvas) {
@@ -374,6 +401,96 @@ function TimelineMinimap({
   );
 }
 
+// ── Timecode input ───────────────────────────────────────────────────────────
+// Click → type → Enter to seek the playhead to a specific frame.
+// Accepts: ``H:MM:SS.mmm``, ``M:SS.mmm``, ``SS.mmm``, raw seconds.
+function parseTimecodeInput(raw) {
+  if (raw == null) return null;
+  const s = String(raw).trim();
+  if (!s) return null;
+  const parts = s.split(':');
+  let total = 0;
+  try {
+    if (parts.length === 1) {
+      total = parseFloat(parts[0]);
+    } else if (parts.length === 2) {
+      total = parseInt(parts[0], 10) * 60 + parseFloat(parts[1]);
+    } else if (parts.length === 3) {
+      total = parseInt(parts[0], 10) * 3600 + parseInt(parts[1], 10) * 60 + parseFloat(parts[2]);
+    } else {
+      return null;
+    }
+  } catch (_) { return null; }
+  if (!Number.isFinite(total) || total < 0) return null;
+  return total;
+}
+
+function TimecodeInput({ playhead, onSeek }) {
+  const [editing, setEditing] = useState(false);
+  const [value, setValue] = useState('');
+  const display = formatTimeMs(playhead || 0);
+  if (!editing) {
+    return (
+      <button
+        className="ve-multi-timeline__tc"
+        title="Current timecode — click to jump to a specific time (H:MM:SS.mmm)"
+        onClick={() => {
+          setValue(formatTimeMs(playhead || 0));
+          setEditing(true);
+        }}
+        style={{
+          fontFamily: 'var(--font-mono, "SF Mono", monospace)',
+          fontSize: 11,
+          padding: '3px 8px',
+          minHeight: 24,
+          background: 'rgba(127,127,127,0.10)',
+          color: 'var(--ve-text, #ddd)',
+          border: '1px solid rgba(127,127,127,0.18)',
+          borderRadius: 4,
+          cursor: 'pointer',
+          letterSpacing: '0.02em',
+        }}
+      >
+        {display}
+      </button>
+    );
+  }
+  return (
+    <input
+      autoFocus
+      value={value}
+      onChange={(e) => setValue(e.target.value)}
+      onBlur={() => {
+        const t = parseTimecodeInput(value);
+        if (t != null) onSeek(t);
+        setEditing(false);
+      }}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') {
+          const t = parseTimecodeInput(value);
+          if (t != null) onSeek(t);
+          setEditing(false);
+        } else if (e.key === 'Escape') {
+          setEditing(false);
+        }
+        e.stopPropagation();
+      }}
+      style={{
+        fontFamily: 'var(--font-mono, "SF Mono", monospace)',
+        fontSize: 11,
+        padding: '3px 8px',
+        minHeight: 24,
+        width: 110,
+        background: 'var(--ve-surface, #1a1a1a)',
+        color: 'var(--ve-text, #ddd)',
+        border: '1px solid var(--accent, #0A84FF)',
+        borderRadius: 4,
+        outline: 'none',
+      }}
+    />
+  );
+}
+
 export default function Timeline({ compact = false, onSeek, onItemSelect, onSubtitleVisibilityChange }) {
   const canvasRef = useRef(null);
   const containerRef = useRef(null);
@@ -412,6 +529,7 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
   const zoom = useTimelineStore((s) => s.zoom);
   const scrollX = useTimelineStore((s) => s.scrollX);
   const snapEnabled = useTimelineStore((s) => s.snapEnabled);
+  const rippleEnabled = useTimelineStore((s) => s.rippleEnabled);
   // Subscribed so a snap-guide change triggers a redraw via the
   // ``[draw]`` effect; ``draw`` reads the live value below.
   const snapLine = useTimelineStore((s) => s.snapLine);
@@ -441,6 +559,7 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
   const splitItem = _store.getState().splitItem;
   const removeItem = _store.getState().removeItem;
   const toggleSnap = _store.getState().toggleSnap;
+  const toggleRipple = _store.getState().toggleRipple;
   const addTrack = _store.getState().addTrack;
   const toggleTrackVisibility = _store.getState().toggleTrackVisibility;
   const toggleTrackMute = _store.getState().toggleTrackMute;
@@ -1144,6 +1263,25 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
         ctx.closePath();
         ctx.fill();
 
+        // Snap-target time bubble — readable timestamp + tiny "snap"
+        // label so the user knows what they're locking onto. Sits just
+        // below the diamond, clamped to the canvas so it can't escape.
+        const snapText = formatTimeMs(snapLine.time);
+        ctx.globalAlpha = 1;
+        ctx.font = '600 10px "SF Mono", "Cascadia Code", "Menlo", monospace';
+        const snapTipW = Math.ceil(ctx.measureText(snapText).width) + 12;
+        const snapTipH = 16;
+        const snapTipY = RULER_HEIGHT + 14;
+        let snapTipX = snapX - snapTipW / 2;
+        snapTipX = Math.max(contentLeft + 2, Math.min(canvasW - snapTipW - 2, snapTipX));
+        ctx.fillStyle = 'rgba(0, 212, 255, 0.95)';
+        ctx.beginPath();
+        ctx.roundRect(snapTipX, snapTipY, snapTipW, snapTipH, 3);
+        ctx.fill();
+        ctx.fillStyle = '#001A26';
+        ctx.textAlign = 'center';
+        ctx.fillText(snapText, snapTipX + snapTipW / 2, snapTipY + 11);
+
         ctx.restore();
       }
     }
@@ -1672,6 +1810,8 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
         const mediaLib = useTimelineStore.getState().mediaLibrary;
         const maxDur = getMaxItemDuration(item, mediaLib);
         const setSnapLine = useTimelineStore.getState().setSnapLine;
+        const ripple = useTimelineStore.getState().rippleEnabled;
+        const rippleShiftAfter = useTimelineStore.getState().rippleShiftAfter;
 
         if (dragInfo.edge === 'left') {
           let newStart = Math.max(0, Math.min(dragInfo.origEnd - 0.1, time));
@@ -1689,6 +1829,15 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
             }
           }
           updateItem(dragInfo.itemId, { start: newStart });
+          // Ripple: trimming the LEFT edge inward (later) means
+          // downstream items should pull in by the same delta so the
+          // gap doesn't grow. ``delta = newStart - origStart``.
+          if (ripple) {
+            const delta = newStart - dragInfo.origStart;
+            if (delta !== 0) {
+              rippleShiftAfter(dragInfo.origEnd, delta, [dragInfo.itemId]);
+            }
+          }
         } else {
           let newEnd = Math.max(dragInfo.origStart + 0.1, time);
           if (maxDur < Infinity) {
@@ -1706,6 +1855,14 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
             }
           }
           updateItem(dragInfo.itemId, { end: newEnd });
+          // Ripple: trimming the RIGHT edge shifts everything that
+          // started at or after the old end by ``newEnd - origEnd``.
+          if (ripple) {
+            const delta = newEnd - dragInfo.origEnd;
+            if (delta !== 0) {
+              rippleShiftAfter(dragInfo.origEnd, delta, [dragInfo.itemId]);
+            }
+          }
         }
       } else if (dragInfo.type === 'move') {
         const dx = (e.clientX - dragInfo.startX) / pps;
@@ -2114,6 +2271,24 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
         >
           Snap {snapEnabled ? 'ON' : 'OFF'}
         </button>
+        <button
+          className={`ve-btn${rippleEnabled ? ' ve-btn--active-ripple' : ''}`}
+          onClick={toggleRipple}
+          title={`Ripple edit: ${rippleEnabled ? 'ON' : 'OFF'} (\\)  —  trimming pulls or pushes downstream clips so cuts stay aligned`}
+          style={{ fontSize: 10, padding: '2px 6px', minWidth: 'auto', minHeight: 24 }}
+        >
+          Ripple {rippleEnabled ? 'ON' : 'OFF'}
+        </button>
+        {/* Numeric timecode entry — click the display, type a time,
+            press Enter to seek. Accepts H:MM:SS.mmm, M:SS.mmm, SS.mmm,
+            and SSSS (raw seconds). */}
+        <TimecodeInput
+          playhead={playhead}
+          onSeek={(t) => {
+            setPlayhead(t);
+            try { onSeek?.(t); } catch { /* noop */ }
+          }}
+        />
         <div style={{ flex: 1 }} />
         <div style={{ position: 'relative' }}>
           <button
@@ -2139,8 +2314,21 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
         </div>
       </div>
 
-      {/* Canvas area with track header overlay */}
-      <div style={{ position: 'relative' }}>
+      {/* Canvas area with track header overlay.  When the stack of
+          tracks grows past the visible window (8+ tracks), the wrapping
+          container scrolls vertically. A thin styled scrollbar plus a
+          right-edge "track rail" with a color swatch per track gives
+          the user a Premiere-style overview + quick jump-to-track
+          affordance. */}
+      <div
+        className="ve-multi-timeline__canvas-wrap"
+        style={{
+          position: 'relative',
+          maxHeight: 'calc(72vh - 96px)',
+          overflowY: 'auto',
+          overflowX: 'hidden',
+        }}
+      >
         {/* Track header controls — overlays the canvas label area */}
         {/* Styled like DaVinci Resolve / Premiere Pro: eye (visibility), mute, lock per track */}
         <div
@@ -2378,6 +2566,46 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
         onDragOver={onDragOver}
         onContextMenu={onContextMenu}
         />
+
+        {/* Track rail — colored swatches on the right edge for quick
+            "jump to track" navigation. Only shows when the stack is
+            tall enough to overflow the visible area (8+ tracks at
+            current sizing); for typical 6-track jobs it's hidden. */}
+        {tracks.length >= 8 && (
+          <div
+            className="ve-multi-timeline__rail"
+            style={{ height: canvasHeight }}
+            aria-label="Track rail — click a swatch to scroll its track into view"
+          >
+            {tracks.map((track, trackIdx) => {
+              const trackY = RULER_HEIGHT + trackIdx * (TRACK_HEIGHT + TRACK_GAP);
+              const swatchColor = TRACK_COLORS[track.type] || TRACK_COLORS.video;
+              return (
+                <button
+                  key={track.id}
+                  className="ve-multi-timeline__rail-dot"
+                  style={{
+                    height: TRACK_HEIGHT - 6,
+                    background: swatchColor,
+                    marginTop: trackIdx === 0 ? RULER_HEIGHT + 3 : TRACK_GAP - 1,
+                  }}
+                  title={`${track.name} — jump to track`}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    const wrap = e.currentTarget.closest('.ve-multi-timeline__canvas-wrap');
+                    if (wrap) {
+                      wrap.scrollTo({
+                        top: Math.max(0, trackY - RULER_HEIGHT - 8),
+                        behavior: 'smooth',
+                      });
+                    }
+                    setSelectedItemId(null);
+                  }}
+                />
+              );
+            })}
+          </div>
+        )}
       </div>
 
       {/* Overview ribbon — Premiere/Resolve-style mini-map.  Renders a
@@ -2395,6 +2623,7 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
         pps={pps}
         labelWidth={LABEL_WIDTH}
         canvasWidthRef={canvasRef}
+        sceneCuts={sceneCuts}
         onScrollTo={(newScrollX) => setScrollX(Math.max(0, newScrollX))}
         onSeek={(t) => {
           setPlayhead(t);

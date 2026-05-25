@@ -200,6 +200,12 @@ export default function useKeyboardShortcuts({
         useTimelineStore.getState().toggleSnap();
         break;
 
+      // Ripple-edit toggle (Premiere uses `\` for this)
+      case 'Backslash':
+        e.preventDefault();
+        useTimelineStore.getState().toggleRipple();
+        break;
+
       // Delete selected (supports multi-select) — single undo snapshot
       case 'Delete':
       case 'Backspace':

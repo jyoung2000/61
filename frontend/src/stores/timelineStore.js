@@ -355,6 +355,11 @@ const useTimelineStore = create(
       zoom: 1.0,
       scrollX: 0,
       snapEnabled: true,
+      // Ripple-edit mode (Premiere ``\``). When true, trimming or
+      // moving an item shifts every item that starts at-or-after the
+      // dragged item's old end-time by the same delta, so cuts later
+      // in the timeline don't get stranded with gaps after a trim.
+      rippleEnabled: false,
       snapLine: null, // { time: number } | null — active snap guide position
       // Scene-cut timestamps (seconds, timeline-absolute) populated by
       // VideoEditor from the analysis job. Used by Timeline.findSnapTarget
@@ -423,6 +428,34 @@ const useTimelineStore = create(
       setZoom: (z) => set({ zoom: Math.max(0.01, Math.min(10, z)) }),
       setScrollX: (x) => set({ scrollX: Math.max(0, x) }),
       toggleSnap: () => set((state) => { state.snapEnabled = !state.snapEnabled; }),
+      toggleRipple: () => set((state) => { state.rippleEnabled = !state.rippleEnabled; }),
+      setRippleEnabled: (v) => set((state) => { state.rippleEnabled = !!v; }),
+      // Shift every item whose start ≥ ``pivot`` by ``deltaSec``. Used
+      // by ripple trim / move to keep downstream cuts contiguous after
+      // an edit. ``excludeIds`` is a Set of item ids that should not
+      // move (typically the dragged item itself, which the caller has
+      // already updated).
+      rippleShiftAfter: (pivot, deltaSec, excludeIds) => set((state) => {
+        if (!Number.isFinite(deltaSec) || deltaSec === 0) return;
+        const skip = excludeIds instanceof Set ? excludeIds : new Set(excludeIds || []);
+        // First pass: collect the items we want to move and the new
+        // start/end so we can sort + apply without invalidating the
+        // pivot mid-iteration when ``deltaSec`` is negative.
+        const pending = [];
+        for (const it of state.items) {
+          if (skip.has(it.id)) continue;
+          if ((it.start ?? 0) + 0.0005 < pivot) continue;
+          const dur = (it.end ?? 0) - (it.start ?? 0);
+          const newStart = Math.max(0, (it.start ?? 0) + deltaSec);
+          pending.push({ id: it.id, newStart, newEnd: newStart + dur });
+        }
+        for (const p of pending) {
+          const it = state.items.find((x) => x.id === p.id);
+          if (!it) continue;
+          it.start = p.newStart;
+          it.end = p.newEnd;
+        }
+      }),
       setSnapLine: (line) => set({ snapLine: line }),
       // Replace the scene-cut snap targets. Pass [] (or undefined) to
       // clear. Coerces numbers and drops invalid entries defensively.
