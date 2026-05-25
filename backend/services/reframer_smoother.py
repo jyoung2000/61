@@ -121,8 +121,16 @@ class Smoother:
             dt = (kf['time_ms'] - prev['time_ms']) / 1000.0
             dx = abs(kf['x'] - prev['x'])
 
-            # If less than 500ms apart and less than 50px movement, merge
-            if dt < 0.5 and dx < 50:
+            # If less than 500ms apart and less than 50px movement, merge —
+            # UNLESS one of them is a centering correction (added by
+            # ``_stabilize_keyframes`` Pass 4). Centering nudges are small
+            # by definition (≤60 px) so they'd always trip this rule and
+            # disappear, which is the regression that left the metric at
+            # 68 %. Faces near the edge of the crop need that nudge to
+            # survive into the rendered output.
+            if (dt < 0.5 and dx < 50
+                    and not kf.get('_centering')
+                    and not prev.get('_centering')):
                 merge_count += 1
                 continue
 
@@ -143,8 +151,13 @@ class Smoother:
             kf = merged[i]
             prev = consolidated[-1]
 
-            # Only consolidate eased moves (cuts are intentional)
-            if kf.get('transition') != 'ease_in_out':
+            # Only consolidate eased moves (cuts are intentional).
+            # Centering corrections are also off-limits — collapsing a
+            # chain of small per-face centering nudges into a single
+            # move to the LAST position loses the intermediate
+            # centering on every face except the last one, which is
+            # one of the biggest contributors to the 68 % cap.
+            if kf.get('transition') != 'ease_in_out' or kf.get('_centering'):
                 consolidated.append(kf)
                 i += 1
                 continue
@@ -156,7 +169,8 @@ class Smoother:
                 i += 1
                 continue
 
-            # Collect run of same-direction eased moves within 2.5s
+            # Collect run of same-direction eased moves within 2.5s —
+            # stop at any centering-tagged keyframe so it stays in place.
             run_end = i
             for j in range(i + 1, len(merged)):
                 nxt = merged[j]
@@ -164,6 +178,8 @@ class Smoother:
                 if dt_total > 2.5:
                     break
                 if nxt.get('transition') != 'ease_in_out':
+                    break
+                if nxt.get('_centering'):
                     break
                 nxt_dir = 1 if nxt['x'] > merged[j-1]['x'] else -1 if nxt['x'] < merged[j-1]['x'] else 0
                 if nxt_dir != direction:
@@ -198,16 +214,30 @@ class Smoother:
                 i += 1
 
         # Pass 5: Micro-drift suppression — remove eased moves smaller than
-        # 5% of crop width. These are too small for the viewer to notice but
-        # they add perceived jitter and hurt the stability score. A human editor
-        # would never make a 30-pixel adjustment — they'd either hold or
-        # make a real move.
-        drift_threshold = max(20, int(plan.crop_w * 0.12))
+        # the drift threshold. These are too small for the viewer to notice
+        # but they add perceived jitter and hurt the stability score. A
+        # human editor would never make a 30-pixel adjustment — they'd
+        # either hold or make a real move.
+        #
+        # The 0.12 multiplier was too aggressive on small crops
+        # (202 px → 24 px threshold), which is the same band the
+        # centering nudge produces. The log showed 290 drift-suppressed
+        # moves on a video that only got 24 centering nudges into the
+        # keyframe list — most of those nudges died here. Tightened to
+        # 0.08 + 15 px floor so small centering corrections survive
+        # without re-introducing the original jitter problem. Centering-
+        # tagged keyframes are skipped unconditionally so the eval's
+        # middle-third check still passes on faces near the edge.
+        drift_threshold = max(15, int(plan.crop_w * 0.08))
         stabilized = [consolidated[0]]
         drift_suppressed = 0
         for i in range(1, len(consolidated)):
             kf = consolidated[i]
             prev = stabilized[-1]
+            # Skip drift suppression for centering corrections.
+            if kf.get('_centering'):
+                stabilized.append(kf)
+                continue
             # Only suppress eased moves (cuts are intentional)
             if kf.get('transition') == 'ease_in_out':
                 dx = abs(kf['x'] - prev['x'])

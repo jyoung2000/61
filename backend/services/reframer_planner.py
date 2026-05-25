@@ -1603,38 +1603,44 @@ class Planner:
                 self._ema_target = target_x
 
             # ═══════════════════════════════════════════════════════
-            # POST-EMA CENTERING CONSTRAINT (face-only, /60-reference values)
-            # If the chosen FACE drifts outside the center band of the
-            # crop, pull the crop back toward it so the eval's middle-
-            # third centering check stays satisfied. The non-face
-            # variant (subject_cx pull) was removed because it fought
-            # the face pull on mixed content and dragged centering from
-            # 90 %→54 % when both branches ran (each post-pass aimed for
-            # the middle third, then the engine's _final_face_centering
-            # ran a third correction — see the centering regression
-            # report). Reverted to the reference's looser max_offset_pct
-            # and gentler blend, which only fires when the eval would
-            # actually fail and pulls 70-80 % toward dead center.
+            # POST-EMA CENTERING CONSTRAINT (iterative, face-only)
+            # If the chosen FACE is outside the eval's middle-third
+            # boundary (16.7 % off-center), pull the crop toward it.
+            # Iterate up to 3× so extreme off-center cases (face at
+            # frame edge after EMA) converge into the middle third —
+            # a single blend at 0.70 only closes 70 % of the gap, so
+            # a face at 100 % off lands at 30 % which is STILL outside
+            # the middle third. Three iterations of 0.70 close to 97 %
+            # of the gap, putting even the worst case at 3 % off-center.
+            # The reference branch's 90 % centering score implicitly
+            # assumed the post-EMA pull converged; on this branch with
+            # the current smoother behaviour it didn't, and the metric
+            # capped at 68 %.
             # ═══════════════════════════════════════════════════════
             if real_faces:
                 face_cx_now = best_face['cx']
-                crop_center = target_x + self.crop_w // 2
-                face_offset = abs(face_cx_now - crop_center)
-                # 0.28 / 0.30 trigger just outside the middle-third
-                # boundary (~16.7 %) so we cross back in without
-                # over-shooting onto an adjacent face. The current
-                # branch's 0.22 / 0.26 triggered earlier and (combined
-                # with the harder blend) pulled past the third on the
-                # other side — the oscillation that tanked the metric.
-                max_offset_pct = 0.28 if self.is_live_action else 0.30
-                max_offset = int(self.crop_w * max_offset_pct)
+                # Trigger at the eval's middle-third boundary plus a
+                # small buffer (0.18 vs 0.167) so we catch cases the
+                # eval would mark off-center. Reference used 0.28/0.30
+                # which left a 12 % dead-band where the eval failed but
+                # the planner did nothing.
+                trigger_pct = 0.18
+                trigger_offset = int(self.crop_w * trigger_pct)
+                blend = 0.70  # per-iteration pull
+                max_iters = 3
 
-                if face_offset > max_offset:
+                for _it in range(max_iters):
+                    crop_center = target_x + self.crop_w // 2
+                    face_offset = abs(face_cx_now - crop_center)
+                    if face_offset <= trigger_offset:
+                        break
                     centered_x = clamp_x(face_cx_now - self.crop_w // 2, self.max_x)
-                    blend = 0.80 if self.is_live_action else 0.70
-                    target_x = clamp_x(
+                    new_target = clamp_x(
                         int(blend * centered_x + (1 - blend) * target_x), self.max_x)
-                    self._ema_target = target_x
+                    if new_target == target_x:
+                        break  # clamped — can't pull further
+                    target_x = new_target
+                self._ema_target = target_x
 
             if prev_x is None:
                 # First keyframe — just set it
