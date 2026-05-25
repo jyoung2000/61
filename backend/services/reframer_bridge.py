@@ -515,6 +515,14 @@ def to_fez_clips(clipper_candidates: list, editorial_results: list = None) -> li
             "flow_reason": str(judge.get("flow_reason", "") or "Clean narrative arc."),
             "value_reason": str(judge.get("value_reason", "") or "Delivers a clear payoff."),
             "trend_reason": str(judge.get("trend_reason", "") or "Fits short-form formats."),
+            # Preserve the three model-emitted strings the bridge used as
+            # fallback sources so the post-translation refresh in
+            # ``pipeline._refresh_clips_with_translation`` can rebuild
+            # caption / hook_text / title against the translated transcript
+            # without losing VLM-derived text.
+            "vlm_hook": vlm_hook or None,
+            "vlm_reason": vlm_reason or None,
+            "judge_title": judge_title or None,
         })
     return out
 

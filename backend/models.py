@@ -153,6 +153,17 @@ class ClipCandidate(BaseModel):
     seo_platform_tips: Optional[str] = None
     shorts_description: Optional[str] = None
     longform_description: Optional[str] = None
+    # ── Language-source provenance ──
+    # The background translator re-derives caption/hook_text/title from
+    # the translated transcript after analysis completes, so non-English
+    # uploads end up with English clip text. These three fields preserve
+    # the model-emitted strings the bridge originally chose so the
+    # re-derivation can rebuild caption/hook_text/title with the exact
+    # same fallback order against the translated slice. Leaving them
+    # blank disables the post-translation refresh.
+    vlm_hook: Optional[str] = None
+    vlm_reason: Optional[str] = None
+    judge_title: Optional[str] = None
 
 
 class VideoSummary(BaseModel):

@@ -418,6 +418,95 @@ def _load_job_glossary(job_id: str) -> dict | None:
     return None
 
 
+def _slice_transcript_for_clip(segments: list, start_s: float, end_s: float) -> str:
+    """Extract transcript text spoken during a clip's time window.
+
+    Mirrors ``reframer_clipper._slice_transcript`` so the post-translation
+    refresh produces the same shape (per-line ``[m:ss] text``) the bridge
+    originally fed into caption / hook_text / title. Accepts both dicts
+    and Pydantic models because the persisted ``translated_transcript``
+    can be either depending on the call site that produced it.
+    """
+    lines = []
+    for seg in segments or []:
+        if hasattr(seg, "model_dump"):
+            seg = seg.model_dump()
+        seg_start = seg.get("start_sec", seg.get("start", 0)) or 0
+        seg_end = seg.get("end_sec", seg.get("end", 0)) or 0
+        if seg_end > start_s and seg_start < end_s:
+            rel_start = max(0, seg_start - start_s)
+            m, s = divmod(int(rel_start), 60)
+            text = (seg.get("text") or "").strip()
+            if text:
+                lines.append(f"[{m}:{s:02d}] {text}")
+    return "\n".join(lines) if lines else "(no speech in this segment)"
+
+
+async def _refresh_clips_with_translation(job_id: str, translated: list) -> int:
+    """Rebuild clip caption / hook_text / title from the translated transcript.
+
+    Returns the number of clips updated. Mirrors the bridge's original
+    fallback ladder (judge_title → vlm_hook → transcript) so clips end
+    up in the same shape they would have had if translation had run
+    BEFORE clip extraction. Only clips with usable VLM provenance are
+    re-derived; legacy clips missing ``vlm_hook`` / ``judge_title`` are
+    treated as pure-transcript and refreshed unconditionally so the
+    Japanese caption gets replaced with the English one either way.
+    """
+    job = await database.load_job(job_id)
+    if not job or not job.clips:
+        return 0
+
+    updated_clips = []
+    changed = 0
+    for clip in job.clips:
+        clip_dict = clip.model_dump() if hasattr(clip, "model_dump") else dict(clip)
+        start_s = float(clip_dict.get("start_time", 0.0) or 0.0)
+        end_s = float(clip_dict.get("end_time", start_s) or start_s)
+        if end_s <= start_s:
+            updated_clips.append(clip_dict)
+            continue
+
+        new_slice = _slice_transcript_for_clip(translated, start_s, end_s)
+        if new_slice == "(no speech in this segment)":
+            # No transcript covers this clip — leave it alone.
+            updated_clips.append(clip_dict)
+            continue
+
+        vlm_hook = (clip_dict.get("vlm_hook") or "").strip()
+        vlm_reason = (clip_dict.get("vlm_reason") or "").strip()
+        judge_title = (clip_dict.get("judge_title") or "").strip()
+        idx = clip_dict.get("id", 0)
+
+        new_title = judge_title or vlm_hook[:80] or (
+            " ".join(new_slice.split()[:8]) or f"Clip {idx}")
+        new_hook = vlm_hook or (new_slice[:120] if new_slice else new_title)
+        new_caption = new_slice[:150] if new_slice else new_title
+        new_why = vlm_reason or (
+            "Strong audio/visual engagement signals across this window.")
+        new_reasoning = vlm_reason or clip_dict.get("viral_score_reasoning", "")
+
+        if (clip_dict.get("title") != new_title
+                or clip_dict.get("hook_text") != new_hook
+                or clip_dict.get("suggested_caption") != new_caption):
+            changed += 1
+            clip_dict["title"] = new_title
+            clip_dict["hook_text"] = new_hook
+            clip_dict["suggested_caption"] = new_caption
+            clip_dict["why_this_works"] = new_why
+            if new_reasoning:
+                clip_dict["viral_score_reasoning"] = new_reasoning
+        updated_clips.append(clip_dict)
+
+    if changed > 0:
+        await database.update_job_status(job_id, clips=updated_clips)
+        logger.info(
+            "[%s] Refreshed %d/%d clip captions/hooks/titles from translated transcript",
+            job_id, changed, len(updated_clips),
+        )
+    return changed
+
+
 async def _background_post_processing(job_id: str, transcript: list, orchestrator, job):
     """Run transcript polishing and subtitle translation in background after analysis.
 
@@ -727,6 +816,25 @@ async def _background_post_processing(job_id: str, transcript: list, orchestrato
             if _tr_readability is not None:
                 _update_kwargs["transcript_readability"] = _tr_readability
             await database.update_job_status(job_id, **_update_kwargs)
+
+            # Re-derive clip caption / hook_text / title from the translated
+            # transcript. Clip extraction had to run BEFORE translation so
+            # the user could start editing immediately; without this refresh
+            # the clip cards on the Viral Clips page keep showing the source
+            # language (Japanese on a JA→EN job, etc.).
+            try:
+                _refreshed = await _refresh_clips_with_translation(
+                    job_id, list(translated))
+                if _refreshed > 0:
+                    await broadcast_ws(job_id, {
+                        "type": "clips_refreshed",
+                        "message": f"Refreshed {_refreshed} clip captions in {target_name}",
+                    })
+            except Exception as _cr_err:
+                logger.warning(
+                    "[%s] Post-translation clip refresh failed: %s",
+                    job_id, _cr_err,
+                )
 
             await broadcast_ws(job_id, {
                 "type": "background_task",

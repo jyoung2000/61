@@ -113,6 +113,15 @@ class ReframeEngine:
         self.plan = smoother.smooth(self.plan)
         self.log.stop_timer('smooth')
 
+        # Stage 4.4: Final face centering — animated AND live-action.
+        # The smoother can drift keyframes off the best face after
+        # post-cut hold suppression and micro-drift collapse; this pass
+        # snaps any keyframe whose best-face is outside the crop or
+        # >25% off-center back onto the face without inserting new
+        # keyframes (preserves stability). Matches the /60 reference
+        # ``_final_face_centering`` post-pass.
+        self._final_face_centering()
+
         # Stage 4.5: Live-action face enforcement
         # In live-action content, EVERY keyframe must have a face in crop.
         # This is the hard constraint that distinguishes live-action behavior.
@@ -143,6 +152,14 @@ class ReframeEngine:
         It only adjusts x positions — no new keyframes are added, so stability
         is preserved. This catches issues where the predictive anchoring or
         smoother removed safety corrections that were keeping faces in frame.
+
+        Two-check ladder per keyframe:
+          1. Face center OUTSIDE crop → snap full correction onto face center.
+          2. Face IN crop but >25% off-center → blend 75% toward centered.
+
+        Both checks ALSO enforce full-bbox containment: if the face bbox
+        (cx ± w/2) plus an edge margin would clip on either side after the
+        x correction, the crop is nudged inward so the whole face fits.
         """
         if not self.perception or not self.plan:
             return
@@ -151,7 +168,12 @@ class ReframeEngine:
         crop_w = self.plan.crop_w
         max_x = self.plan.max_x
 
-        # Build real-track set (tracks with ≥25 samples = ≥5s screen time)
+        # Build real-track set (tracks with ≥25 samples = ≥5s screen time).
+        # Animated content with rapid scene changes can yield short-lived
+        # tracks where none clear the 25-sample bar — in that case fall
+        # back to ALL tracks (>0 samples) so the final pass still has
+        # face evidence to act on. Without this fallback, animated shows
+        # silently skip the final-centering safety net.
         track_counts = {}
         for faces in self.perception.face_timeline.values():
             for f in faces:
@@ -159,18 +181,31 @@ class ReframeEngine:
                 if tid >= 0:
                     track_counts[tid] = track_counts.get(tid, 0) + 1
         real_tracks = {tid for tid, cnt in track_counts.items() if cnt >= 25}
+        if not real_tracks and track_counts:
+            # Animated fallback: every tracked face is "real" because the
+            # tracker only ever emits IDs for face-shaped detections.
+            real_tracks = set(track_counts.keys())
 
         corrected = 0
         for kf in self.plan.keyframes:
             t = kf['time_ms']
             x = kf['x']
 
-            # Find best face at this time (±200ms window)
+            # Find best face at this time (±200ms window).
             best_face = None
             best_score = 0
             for dt in [0, -200, 200, -400, 400]:
                 faces = self.perception.face_timeline.get(t + dt, [])
-                for f in faces:
+                # Filter non-human faces (figurines, posters) when YOLO
+                # found persons at this moment — mirrors the planner gate
+                # so the final pass doesn't snap onto background art.
+                persons_at_t = self.perception.person_timeline.get(t + dt, [])
+                cand_faces = faces
+                if persons_at_t:
+                    human = [f for f in faces if _face_overlaps_person(f, persons_at_t)]
+                    if human:
+                        cand_faces = human
+                for f in cand_faces:
                     if f.get('track_id', -1) not in real_tracks:
                         continue
                     # Match evaluator: saliency + mouth_motion, weighted by confidence
@@ -184,10 +219,28 @@ class ReframeEngine:
                 continue
 
             face_cx = best_face['cx']
+            face_w = best_face.get('w', 0)
+            # Edge margin = half the face width + 15% padding so the
+            # whole bbox stays inside the crop, not just the center.
+            edge_m = max(20, int(face_w * 0.65)) if face_w > 0 else 20
+
+            def _apply_containment(target_x: int) -> int:
+                """Shift target_x so face_cx ± face_w/2 + edge_m sits inside crop."""
+                if face_w <= 0:
+                    return max(0, min(max_x, target_x))
+                face_left = face_cx - face_w // 2
+                face_right = face_cx + face_w // 2
+                crop_left = target_x
+                crop_right = target_x + crop_w
+                if face_left < crop_left + edge_m:
+                    target_x = face_left - edge_m
+                elif face_right > crop_right - edge_m:
+                    target_x = face_right + edge_m - crop_w
+                return max(0, min(max_x, target_x))
 
             # Check 1: face completely outside crop → hard correction
             if face_cx < x or face_cx > x + crop_w:
-                kf['x'] = max(0, min(max_x, face_cx - crop_w // 2))
+                kf['x'] = _apply_containment(face_cx - crop_w // 2)
                 corrected += 1
                 continue
 
@@ -196,9 +249,19 @@ class ReframeEngine:
             offset = abs(face_cx - crop_center)
             if offset > crop_w * 0.25:
                 # Blend 75% toward centered — aggressive correction
-                centered_x = max(0, min(max_x, face_cx - crop_w // 2))
-                kf['x'] = max(0, min(max_x, int(0.75 * centered_x + 0.25 * x)))
+                centered_x = face_cx - crop_w // 2
+                blended = int(0.75 * centered_x + 0.25 * x)
+                kf['x'] = _apply_containment(blended)
                 corrected += 1
+            else:
+                # Check 3: even when within the center band, make sure
+                # the face bbox isn't clipping at the edge (a >25%-off
+                # center face also fails containment, but a 24%-off face
+                # with a wide bbox can still poke out — fix it).
+                contained = _apply_containment(x)
+                if contained != x:
+                    kf['x'] = contained
+                    corrected += 1
 
         if corrected > 0:
             log.log_stage('SMOOTH',
