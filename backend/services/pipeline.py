@@ -507,6 +507,150 @@ async def _refresh_clips_with_translation(job_id: str, translated: list) -> int:
     return changed
 
 
+async def _auto_generate_clip_seo(
+    job_id: str, transcript: list, orchestrator
+) -> tuple[int, int]:
+    """Generate SEO (title / description / tags / platform_tips) for every
+    clip in the background after analysis completes.
+
+    Without this, every clip card on the Viral Clips page shows raw
+    transcript snippets ("[0:29] We've been waiting...") instead of a
+    real SEO-ready title and caption. The manual "Generate SEO" button
+    on the ClipSEO page still works for regenerating or targeting
+    additional platforms — this helper just seeds the primary-platform
+    SEO automatically so the first-load experience matches what a user
+    would expect from a clip-generator product.
+
+    Runs the per-platform prompt + the platform-cap validator from
+    ``prompts.py`` so the generated copy stays inside the platform's
+    actual character limits. Per-clip failures are logged but never
+    abort the loop — partial success is better than nothing.
+
+    Returns (generated_count, failed_count).
+    """
+    from backend.models import ClipSEO
+    from backend.services.prompts import (
+        load_prompts,
+        build_platform_seo_prompt,
+        enforce_platform_caps,
+        PLATFORM_PROFILES,
+    )
+
+    def _resolve(raw: str | None) -> str:
+        candidate = (raw or "").strip().lower().replace("-", "_")
+        aliases = {
+            "youtube_short": "youtube_shorts", "shorts": "youtube_shorts",
+            "yt_shorts": "youtube_shorts", "yt": "youtube",
+            "youtube_long": "youtube", "youtube_longform": "youtube",
+            "ig": "instagram", "instagram_reels": "reels", "ig_reels": "reels",
+            "fb": "facebook", "twitter": "x", "li": "linkedin", "both": "tiktok",
+        }
+        candidate = aliases.get(candidate, candidate)
+        return candidate if candidate in PLATFORM_PROFILES else "tiktok"
+
+    def _slice(start_s: float, end_s: float) -> str:
+        lines = []
+        for s in (transcript or []):
+            ss = s.model_dump() if hasattr(s, "model_dump") else s
+            seg_start = ss.get("start_sec", ss.get("start", 0)) or 0
+            seg_end = ss.get("end_sec", ss.get("end", 0)) or 0
+            if seg_end > start_s and seg_start < end_s:
+                text = (ss.get("text") or "").strip()
+                speaker = (ss.get("speaker") or "").strip()
+                if text:
+                    lines.append(f"{speaker}: {text}" if speaker else text)
+        return "\n".join(lines)
+
+    job = await database.load_job(job_id)
+    if not job or not job.clips:
+        return (0, 0)
+
+    video_summary = ""
+    if job.summary:
+        video_summary = job.summary.overview
+        if job.summary.key_topics:
+            video_summary += "\nTopics: " + ", ".join(job.summary.key_topics)
+
+    # Cache the per-platform prompt strings so we don't rebuild the
+    # ~2 kB template for every clip.
+    prompt_cache: dict[str, str] = {}
+    base_prompts = load_prompts()
+
+    generated = 0
+    failed = 0
+    updated_clips = []
+    for clip in job.clips:
+        clip_dict = clip.model_dump() if hasattr(clip, "model_dump") else dict(clip)
+        platform = _resolve(clip_dict.get("platform"))
+
+        # Skip clips that already carry SEO for this platform — the
+        # ClipSEO page might have generated it before this background
+        # job ran, and we shouldn't overwrite user edits.
+        existing = (clip_dict.get("seo_by_platform") or {}).get(platform)
+        if existing and (existing.get("title") if isinstance(existing, dict)
+                         else getattr(existing, "title", "")):
+            updated_clips.append(clip_dict)
+            continue
+        if clip_dict.get("seo_title") and platform == _resolve(clip_dict.get("platform")):
+            # Legacy SEO already populated for this platform.
+            updated_clips.append(clip_dict)
+            continue
+
+        start_s = float(clip_dict.get("start_time", 0.0) or 0.0)
+        end_s = float(clip_dict.get("end_time", start_s) or start_s)
+        clip_transcript = _slice(start_s, end_s)
+        if not clip_transcript:
+            clip_transcript = clip_dict.get("suggested_caption") or clip_dict.get("title", "")
+
+        if platform not in prompt_cache:
+            prompt_cache[platform] = build_platform_seo_prompt(platform)
+        custom_prompts = base_prompts.model_copy(
+            update={"seo": prompt_cache[platform]})
+
+        # Re-bind the orchestrator with the per-platform prompt for
+        # this single call. The constructor is cheap (no I/O) so the
+        # per-clip allocation cost is negligible.
+        from backend.services.ai_orchestrator import AIOrchestrator
+        platform_orch = AIOrchestrator(
+            ws_broadcast=broadcast_ws, custom_prompts=custom_prompts,
+        )
+        try:
+            seo, provider = await platform_orch.generate_seo(
+                clip_title=clip_dict.get("title", ""),
+                clip_transcript=clip_transcript,
+                video_summary=video_summary,
+                platform=platform,
+                job_id=job_id,
+            )
+            capped = enforce_platform_caps(seo.model_dump(), platform)
+            seo_record = ClipSEO(**capped)
+            seo_by_plat = dict(clip_dict.get("seo_by_platform") or {})
+            seo_by_plat[platform] = seo_record.model_dump()
+            clip_dict["seo_by_platform"] = seo_by_plat
+            # Mirror into legacy single-platform fields so any reader
+            # that still expects ``clip.seo_title`` keeps working.
+            clip_dict["seo_title"] = capped.get("title", "")
+            clip_dict["seo_description"] = capped.get("description", "")
+            clip_dict["seo_tags"] = capped.get("tags", [])
+            clip_dict["seo_platform_tips"] = capped.get("platform_tips", "")
+            generated += 1
+        except Exception as e:
+            logger.warning(
+                "[%s] Auto-SEO generation failed for clip %s (%s/%s)",
+                job_id, clip_dict.get("id"), platform, e,
+            )
+            failed += 1
+        updated_clips.append(clip_dict)
+
+    if generated > 0 or failed > 0:
+        await database.update_job_status(job_id, clips=updated_clips)
+        logger.info(
+            "[%s] Auto-SEO complete: %d generated, %d failed (%d clips total)",
+            job_id, generated, failed, len(updated_clips),
+        )
+    return (generated, failed)
+
+
 async def _background_post_processing(job_id: str, transcript: list, orchestrator, job):
     """Run transcript polishing and subtitle translation in background after analysis.
 
@@ -853,6 +997,39 @@ async def _background_post_processing(job_id: str, transcript: list, orchestrato
             logger.info("[%s] Translated %d/%d segments to %s",
                         job_id, changed, len(translated), target_lang)
 
+            # Seed SEO (title / description / tags / platform_tips) for
+            # every clip using the translated transcript. The Viral Clips
+            # cards otherwise just show raw transcript snippets until the
+            # user manually clicks "Generate SEO" on each one.
+            try:
+                await broadcast_ws(job_id, {
+                    "type": "background_task",
+                    "task": "auto_seo",
+                    "status": "running",
+                    "message": "Generating SEO titles, captions, and tags for clips...",
+                })
+                _seo_gen, _seo_fail = await _auto_generate_clip_seo(
+                    job_id, list(translated), orchestrator,
+                )
+                await broadcast_ws(job_id, {
+                    "type": "background_task",
+                    "task": "auto_seo",
+                    "status": "complete",
+                    "message": (
+                        f"SEO generated for {_seo_gen} clips"
+                        + (f" ({_seo_fail} failed)" if _seo_fail else "")
+                    ),
+                })
+            except Exception as _seo_err:
+                logger.warning("[%s] Auto-SEO seeding failed: %s",
+                               job_id, _seo_err, exc_info=True)
+                await broadcast_ws(job_id, {
+                    "type": "background_task",
+                    "task": "auto_seo",
+                    "status": "failed",
+                    "message": f"Auto-SEO skipped: {str(_seo_err)[:80]}",
+                })
+
         except Exception as e:
             logger.error("[%s] Translation failed: %s", job_id, e)
             await broadcast_ws(job_id, {
@@ -860,6 +1037,41 @@ async def _background_post_processing(job_id: str, transcript: list, orchestrato
                 "task": "subtitle_translation",
                 "status": "failed",
                 "message": f"Translation failed: {str(e)[:80]}",
+            })
+
+    else:
+        # No translation needed (source already in target language, or no
+        # subtitle_language requested) — still seed SEO so the cards on the
+        # Viral Clips page don't ship as bare transcript snippets. Uses the
+        # source-language transcript directly since that's what the user
+        # will publish with.
+        try:
+            await broadcast_ws(job_id, {
+                "type": "background_task",
+                "task": "auto_seo",
+                "status": "running",
+                "message": "Generating SEO titles, captions, and tags for clips...",
+            })
+            _seo_gen, _seo_fail = await _auto_generate_clip_seo(
+                job_id, list(transcript), orchestrator,
+            )
+            await broadcast_ws(job_id, {
+                "type": "background_task",
+                "task": "auto_seo",
+                "status": "complete",
+                "message": (
+                    f"SEO generated for {_seo_gen} clips"
+                    + (f" ({_seo_fail} failed)" if _seo_fail else "")
+                ),
+            })
+        except Exception as _seo_err:
+            logger.warning("[%s] Auto-SEO seeding failed: %s",
+                           job_id, _seo_err, exc_info=True)
+            await broadcast_ws(job_id, {
+                "type": "background_task",
+                "task": "auto_seo",
+                "status": "failed",
+                "message": f"Auto-SEO skipped: {str(_seo_err)[:80]}",
             })
 
 

@@ -609,6 +609,25 @@ export default function ViralClips() {
 
   useEffect(() => { fetchJobs(); }, [fetchJobs]);
 
+  // Poll for clip updates while the background auto-SEO task is
+  // probably still running. The pipeline kicks off SEO generation
+  // for every clip in the background after analysis completes, and
+  // populates ``clip.seo_title`` / ``clip.seo_description`` /
+  // ``clip.seo_tags`` as each one returns. Without this poll the
+  // user lands on the Viral Clips page, sees raw transcript snippets,
+  // and has to manually refresh once SEO finishes. The poll stops
+  // running as soon as every visible clip already has an SEO title
+  // so we don't keep hitting /api/jobs forever.
+  useEffect(() => {
+    if (!jobs || jobs.length === 0) return;
+    const allHaveSeo = jobs.every(
+      (j) => (j.clips || []).every((c) => c.seo_title)
+    );
+    if (allHaveSeo) return;
+    const id = setInterval(fetchJobs, 8000);
+    return () => clearInterval(id);
+  }, [jobs, fetchJobs]);
+
   // ── Server-first subtitle settings persistence ──
   // Load settings from the most recently updated job that has subtitle_settings
   const settingsLoadedFromServer = useRef(false);
@@ -1081,7 +1100,10 @@ export default function ViralClips() {
     const q = searchQuery.trim().toLowerCase();
     filtered = filtered.filter((c) =>
       (c.title || '').toLowerCase().includes(q) ||
+      (c.seo_title || '').toLowerCase().includes(q) ||
       (c.suggested_caption || '').toLowerCase().includes(q) ||
+      (c.seo_description || '').toLowerCase().includes(q) ||
+      (Array.isArray(c.seo_tags) ? c.seo_tags.join(' ') : '').toLowerCase().includes(q) ||
       (c.hook_text || '').toLowerCase().includes(q) ||
       (c.why_this_works || '').toLowerCase().includes(q) ||
       (c.clip_type || '').toLowerCase().includes(q) ||
@@ -1590,8 +1612,8 @@ export default function ViralClips() {
                   </div>
                 ) : (
                   <h4
-                    onClick={() => { setEditingTitle(clipKey); setEditTitleValue(clip.title || ''); }}
-                    title={String(clip.title || '')}
+                    onClick={() => { setEditingTitle(clipKey); setEditTitleValue(clip.seo_title || clip.title || ''); }}
+                    title={String(clip.seo_title || clip.title || '')}
                     style={{
                       fontSize: 14, marginBottom: 8, lineHeight: 1.3, cursor: 'pointer',
                       borderBottom: '1px dashed transparent',
@@ -1602,7 +1624,11 @@ export default function ViralClips() {
                     onMouseEnter={(e) => e.target.style.borderBottomColor = 'var(--accent-cyan)'}
                     onMouseLeave={(e) => e.target.style.borderBottomColor = 'transparent'}
                   >
-                    {String(clip.title || '')}
+                    {/* Prefer SEO title when the background auto-SEO has
+                        seeded one; fall back to the legacy transcript-
+                        derived title for clips generated before the
+                        auto-SEO step shipped. */}
+                    {String(clip.seo_title || clip.title || '')}
                     <span style={{ fontSize: 10, color: 'var(--text-muted)', marginLeft: 6, opacity: 0.6 }}>&#x270E;</span>
                   </h4>
                 )}
@@ -1662,28 +1688,79 @@ export default function ViralClips() {
                   );
                 })()}
 
-                <div
-                  style={{
-                    fontSize: 12, color: 'var(--text-secondary)', marginBottom: 8,
-                    overflowWrap: 'anywhere', wordBreak: 'break-word',
-                  }}
-                >
-                  {clip.suggested_caption && (
-                    <div style={{ marginBottom: 4 }}>
-                      <strong style={{ color: 'var(--text-primary)' }}>Caption:</strong> {String(clip.suggested_caption || '')}
+                {(() => {
+                  // Prefer the auto-generated SEO fields over the raw
+                  // transcript-derived ones. The background ``_auto_generate_clip_seo``
+                  // job writes platform-tuned title / description / tags
+                  // into clip.seo_* after analysis completes; until that
+                  // runs the cards fall back to suggested_caption /
+                  // hook_text so older jobs still render meaningfully.
+                  const hasSeo = !!(clip.seo_title || clip.seo_description
+                    || (clip.seo_tags && clip.seo_tags.length > 0));
+                  const seoDescription = clip.seo_description || clip.suggested_caption || '';
+                  const seoTags = Array.isArray(clip.seo_tags) ? clip.seo_tags : [];
+                  const seoTip = clip.seo_platform_tips || '';
+                  return (
+                    <div
+                      style={{
+                        fontSize: 12, color: 'var(--text-secondary)', marginBottom: 8,
+                        overflowWrap: 'anywhere', wordBreak: 'break-word',
+                      }}
+                    >
+                      {hasSeo && (
+                        <div style={{
+                          fontSize: 9, fontFamily: 'var(--font-mono)',
+                          color: 'var(--accent-cyan)', textTransform: 'uppercase',
+                          letterSpacing: '0.1em', marginBottom: 4,
+                        }}>
+                          AI-generated SEO
+                        </div>
+                      )}
+                      {seoDescription && (
+                        <div style={{ marginBottom: 4 }}>
+                          <strong style={{ color: 'var(--text-primary)' }}>
+                            {hasSeo && clip.seo_description ? 'Description:' : 'Caption:'}
+                          </strong> {String(seoDescription)}
+                        </div>
+                      )}
+                      {seoTags.length > 0 && (
+                        <div style={{
+                          marginBottom: 4, display: 'flex',
+                          flexWrap: 'wrap', gap: 4,
+                        }}>
+                          <strong style={{ color: 'var(--text-primary)' }}>Tags:</strong>
+                          {seoTags.map((t, ti) => (
+                            <span key={ti} style={{
+                              padding: '2px 6px',
+                              background: 'rgba(0,217,255,0.08)',
+                              color: 'var(--accent-cyan)',
+                              border: '1px solid rgba(0,217,255,0.25)',
+                              borderRadius: 3, fontSize: 10,
+                              fontFamily: 'var(--font-mono)',
+                            }}>
+                              {String(t)}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                      {clip.hook_text && (
+                        <div style={{ marginBottom: 4 }}>
+                          <strong style={{ color: 'var(--text-primary)' }}>Hook:</strong> {String(clip.hook_text || '')}
+                        </div>
+                      )}
+                      {seoTip && (
+                        <div style={{ marginBottom: 4, fontStyle: 'italic' }}>
+                          <strong style={{ color: 'var(--text-primary)', fontStyle: 'normal' }}>Tip:</strong> {String(seoTip)}
+                        </div>
+                      )}
+                      {clip.why_this_works && (
+                        <div>
+                          <strong style={{ color: 'var(--text-primary)' }}>Why it works:</strong> {String(clip.why_this_works || '')}
+                        </div>
+                      )}
                     </div>
-                  )}
-                  {clip.hook_text && (
-                    <div style={{ marginBottom: 4 }}>
-                      <strong style={{ color: 'var(--text-primary)' }}>Hook:</strong> {String(clip.hook_text || '')}
-                    </div>
-                  )}
-                  {clip.why_this_works && (
-                    <div>
-                      <strong style={{ color: 'var(--text-primary)' }}>Why it works:</strong> {String(clip.why_this_works || '')}
-                    </div>
-                  )}
-                </div>
+                  );
+                })()}
 
                 {/* Per-clip settings toggle */}
                 <button
