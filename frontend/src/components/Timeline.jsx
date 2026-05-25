@@ -7,12 +7,16 @@ import {
 } from '../utils/filmstrip';
 
 // ── Constants ────────────────────────────────────────────────────────────────
-const TRACK_HEIGHT = 64;
-const TRACK_GAP = 0;
-const LABEL_WIDTH = 120;
-const HANDLE_WIDTH = 6;
-const HANDLE_HIT_AREA = 12;
-const RULER_HEIGHT = 28;
+// Track sizing modeled after Premiere Pro / DaVinci Resolve / VEED — a clear
+// gap between lanes reads as "stacked cards" instead of "one giant grid",
+// which makes drag targets and selection states much easier to parse.
+const TRACK_HEIGHT = 56;
+const TRACK_GAP = 6;
+const LABEL_WIDTH = 140;
+const HANDLE_WIDTH = 4;          // slim resting state
+const HANDLE_WIDTH_HOVER = 8;    // fattened on hover for an easy grab
+const HANDLE_HIT_AREA = 14;
+const RULER_HEIGHT = 32;
 const PLAYHEAD_GRAB_WIDTH = 16; // px on each side of playhead for grab detection
 
 const TRACK_COLORS = {
@@ -112,6 +116,12 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
   // Stable ref so async filmstrip generations can request a repaint
   // through the latest ``draw`` callback identity.
   const requestRedrawRef = useRef(null);
+
+  // Imperative hover tracking — written from the mousemove handler and
+  // read by ``draw``. Using a ref avoids forcing a React re-render on
+  // every pixel of mouse movement; we just schedule a redraw via
+  // ``requestRedrawRef`` when the hovered item / handle changes.
+  const hoverRef = useRef({ itemId: null, cropId: null, edge: null });
 
   // Subscribe per-slice for STATE that needs to trigger re-renders.
   // ACTIONS are pulled via ``_store.getState()`` below — they are
@@ -275,8 +285,8 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
     ctx.fillStyle = isDark ? 'rgba(255,255,255,0.04)' : 'rgba(0,0,0,0.03)';
     ctx.fillRect(0, 0, canvasW, RULER_HEIGHT);
 
-    ctx.fillStyle = isDark ? 'rgba(255,255,255,0.5)' : 'rgba(0,0,0,0.5)';
-    ctx.font = '10px "SF Mono", "Menlo", monospace';
+    ctx.fillStyle = isDark ? 'rgba(255,255,255,0.62)' : 'rgba(0,0,0,0.58)';
+    ctx.font = '500 11px "SF Mono", "Menlo", "Cascadia Code", monospace';
     ctx.textAlign = 'center';
 
     let interval = 1;
@@ -290,7 +300,7 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
     for (let t = 0; t <= maxTime; t += interval) {
       const x = contentLeft + t * pps - sx;
       if (x < contentLeft - 10 || x > canvasW + 10) continue;
-      ctx.fillText(formatTime(t), x, 16);
+      ctx.fillText(formatTime(t), x, 18);
 
       // Tick marks
       ctx.strokeStyle = isDark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.06)';
@@ -312,21 +322,30 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
       const y = RULER_HEIGHT + idx * (TRACK_HEIGHT + TRACK_GAP);
       const isHidden = track.visible === false;
 
-      // Track label background
-      ctx.fillStyle = isDark ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.03)';
-      ctx.fillRect(0, y, LABEL_WIDTH - 1, TRACK_HEIGHT);
-
-      // Track lane background
-      ctx.fillStyle = isDark ? 'rgba(255,255,255,0.02)' : 'rgba(0,0,0,0.015)';
+      // Card-style track lane with subtle alternating tint — Premiere
+      // and VEED both use this trick to make adjacent rows easier to
+      // scan even at a glance.
+      const laneAlt = idx % 2 === 0;
+      ctx.fillStyle = isDark
+        ? (laneAlt ? 'rgba(255,255,255,0.035)' : 'rgba(255,255,255,0.02)')
+        : (laneAlt ? 'rgba(0,0,0,0.03)' : 'rgba(0,0,0,0.015)');
       ctx.fillRect(contentLeft, y, contentWidth, TRACK_HEIGHT);
 
-      // Track border
-      ctx.strokeStyle = isDark ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.05)';
-      ctx.strokeRect(contentLeft, y, contentWidth, TRACK_HEIGHT);
+      // Track label background — solid darker strip so headers read as
+      // "side rail" instead of part of the timeline grid.
+      ctx.fillStyle = isDark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.04)';
+      ctx.fillRect(0, y, LABEL_WIDTH - 1, TRACK_HEIGHT);
+
+      // Soft inner border — same accent on both axes so the lane reads
+      // as a single rounded "card" even though we don't actually round
+      // the rect (would force a save/restore per track).
+      ctx.strokeStyle = isDark ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.07)';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(contentLeft + 0.5, y + 0.5, contentWidth - 1, TRACK_HEIGHT - 1);
 
       // Muted overlay
       if (track.muted) {
-        ctx.fillStyle = isDark ? 'rgba(255,59,48,0.06)' : 'rgba(255,59,48,0.04)';
+        ctx.fillStyle = isDark ? 'rgba(255,59,48,0.07)' : 'rgba(255,59,48,0.05)';
         ctx.fillRect(contentLeft, y, contentWidth, TRACK_HEIGHT);
       }
 
@@ -387,12 +406,12 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
       const color = TRACK_COLORS[item.type] || TRACK_COLORS.video;
       const isSelected = item.id === selectedItemId;
       const isMultiSelected = selectedItemIds.includes(item.id);
+      const isHovered = hoverRef.current.itemId === item.id;
 
       // Clip body — enforce minimum visual width of 4px for visibility, but
       // cap against the next sibling's start position so short adjacent
       // items never visually overlap each other.
-      ctx.fillStyle = (isSelected || isMultiSelected) ? color + 'DD' : color + '77';
-      const rr = 4;
+      const rr = 5;
       const clipX = Math.max(x1, contentLeft);
       const nextSiblingStart = nextSiblingStartByItemId[item.id];
       const maxRightX = nextSiblingStart !== undefined && nextSiblingStart !== Infinity
@@ -401,9 +420,35 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
       const availableW = Math.max(0, maxRightX - clipX);
       const actualW = Math.min(w, canvasW - clipX);
       const clipW = Math.min(Math.max(actualW, 4), availableW || actualW);
+
+      // Subtle vertical gradient — top is lighter, bottom darker. Reads
+      // as depth without competing with the track-color identity.
+      const bodyY = y + 3;
+      const bodyH = TRACK_HEIGHT - 6;
+      const grad = ctx.createLinearGradient(0, bodyY, 0, bodyY + bodyH);
+      const alphaTop = (isSelected || isMultiSelected) ? 'F0' : (isHovered ? 'C0' : '99');
+      const alphaBot = (isSelected || isMultiSelected) ? 'C0' : (isHovered ? '95' : '6A');
+      grad.addColorStop(0, color + alphaTop);
+      grad.addColorStop(1, color + alphaBot);
+      ctx.fillStyle = grad;
+
+      // Soft drop shadow when selected — only the selected item gets
+      // the shadow so it visibly "lifts" off the lane.
+      if (isSelected) {
+        ctx.save();
+        ctx.shadowColor = 'rgba(0,0,0,0.45)';
+        ctx.shadowBlur = 8;
+        ctx.shadowOffsetY = 2;
+      }
       ctx.beginPath();
-      ctx.roundRect(clipX, y + 2, clipW, TRACK_HEIGHT - 4, rr);
+      ctx.roundRect(clipX, bodyY, clipW, bodyH, rr);
       ctx.fill();
+      if (isSelected) ctx.restore();
+
+      // Glossy top highlight — 1px line at ~30% opacity gives the chip a
+      // very Premiere-like specular sheen on dark themes.
+      ctx.fillStyle = 'rgba(255,255,255,0.18)';
+      ctx.fillRect(clipX + 1, bodyY + 1, Math.max(0, clipW - 2), 1);
 
       // ── Filmstrip thumbnails (long-zoom only) ──
       // Skip when:
@@ -447,12 +492,15 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
         }
       }
 
-      // Selected border (solid white for primary, dashed cyan for multi-select)
+      // Selected border (solid white for primary, dashed cyan for
+      // multi-select, soft white for hover). The hover state only
+      // paints when nothing is selected so it doesn't fight the
+      // selection border.
       if (isSelected) {
         ctx.strokeStyle = '#FFFFFF';
         ctx.lineWidth = 2;
         ctx.beginPath();
-        ctx.roundRect(clipX, y + 2, clipW, TRACK_HEIGHT - 4, rr);
+        ctx.roundRect(clipX, bodyY, clipW, bodyH, rr);
         ctx.stroke();
         ctx.lineWidth = 1;
       } else if (isMultiSelected) {
@@ -460,10 +508,16 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
         ctx.lineWidth = 2;
         ctx.setLineDash([4, 3]);
         ctx.beginPath();
-        ctx.roundRect(clipX, y + 2, clipW, TRACK_HEIGHT - 4, rr);
+        ctx.roundRect(clipX, bodyY, clipW, bodyH, rr);
         ctx.stroke();
         ctx.setLineDash([]);
         ctx.lineWidth = 1;
+      } else if (isHovered) {
+        ctx.strokeStyle = 'rgba(255,255,255,0.55)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.roundRect(clipX + 0.5, bodyY + 0.5, clipW - 1, bodyH - 1, rr);
+        ctx.stroke();
       }
 
       // Group indicator: colored bottom bar
@@ -489,22 +543,55 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
       // Clip label
       if (w > 35) {
         ctx.fillStyle = '#fff';
-        ctx.font = '10px -apple-system, BlinkMacSystemFont, sans-serif';
+        ctx.font = '600 11px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
         ctx.textAlign = 'left';
         const label = item.textContent
           ? item.textContent.slice(0, 25)
           : item.subtitleText
             ? item.subtitleText.slice(0, 25)
             : item.type;
-        ctx.fillText(label, Math.max(x1 + 8, contentLeft + 4), y + TRACK_HEIGHT / 2 + 4, w - 16);
+        // Subtle text shadow so labels stay readable on any track color.
+        ctx.shadowColor = 'rgba(0,0,0,0.45)';
+        ctx.shadowBlur = 2;
+        ctx.fillText(label, Math.max(x1 + 10, contentLeft + 6), y + TRACK_HEIGHT / 2 + 4, w - 18);
+        ctx.shadowColor = 'transparent';
+        ctx.shadowBlur = 0;
       }
 
-      // Trim handles (visual, for selected items)
-      if (isSelected && w > 20) {
+      // Trim handles. Two states:
+      //   * Selected → bright fixed handles with a grip notch
+      //   * Hovered  → translucent handles so the user knows where to
+      //                grab without committing to a click.
+      if (clipW > 24 && (isSelected || isHovered)) {
+        const handleW = isSelected ? HANDLE_WIDTH_HOVER : HANDLE_WIDTH;
+        const handleY = bodyY + 3;
+        const handleH = bodyH - 6;
+        const handleAlpha = isSelected ? 0.92 : 0.45;
+        const handleRR = 2;
         ctx.fillStyle = '#FFFFFF';
-        ctx.globalAlpha = 0.8;
-        ctx.fillRect(x1, y + 4, HANDLE_WIDTH, TRACK_HEIGHT - 8);
-        ctx.fillRect(x2 - HANDLE_WIDTH, y + 4, HANDLE_WIDTH, TRACK_HEIGHT - 8);
+        ctx.globalAlpha = handleAlpha;
+        // Left handle
+        ctx.beginPath();
+        ctx.roundRect(clipX, handleY, handleW, handleH, handleRR);
+        ctx.fill();
+        // Right handle — anchored to the right edge of the visible clip,
+        // not the off-screen x2, so it stays grabbable when the clip is
+        // partially scrolled out.
+        const rightHandleX = Math.min(clipX + clipW - handleW, x2 - handleW);
+        ctx.beginPath();
+        ctx.roundRect(rightHandleX, handleY, handleW, handleH, handleRR);
+        ctx.fill();
+        // Grip notch — two short vertical lines on each handle so the
+        // user reads them as "drag here" the same way a Mac window
+        // resize corner reads.
+        if (isSelected) {
+          ctx.globalAlpha = 0.5;
+          ctx.fillStyle = '#000';
+          const notchH = Math.min(10, handleH - 4);
+          const notchY = handleY + (handleH - notchH) / 2;
+          ctx.fillRect(clipX + handleW / 2 - 1, notchY, 1, notchH);
+          ctx.fillRect(rightHandleX + handleW / 2 - 1, notchY, 1, notchH);
+        }
         ctx.globalAlpha = 1;
       }
 
@@ -564,28 +651,97 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
             const clrIdx = seg.isManualOverride ? 4 : Math.max(0, seg.clusterId);
             const baseColor = CROP_CLUSTER_COLORS[clrIdx % CROP_CLUSTER_COLORS.length];
             const isSelCrop = seg.id === selectedCropSegmentId;
-            ctx.fillStyle = isSelCrop ? baseColor + 'DD' : baseColor + '88';
-            ctx.beginPath();
-            ctx.roundRect(clipCX, cy + 3, clipCW, TRACK_HEIGHT - 6, 3);
-            ctx.fill();
+            const isHoverCrop = hoverRef.current.cropId === seg.id;
 
-            // Selection border
+            const sBodyY = cy + 4;
+            const sBodyH = TRACK_HEIGHT - 8;
+            const sRr = 4;
+
+            // Vertical gradient — same depth treatment as the main
+            // segments so the crop track reads as part of the same
+            // visual system rather than a flat tag strip.
+            const sGrad = ctx.createLinearGradient(0, sBodyY, 0, sBodyY + sBodyH);
+            const aTop = isSelCrop ? 'F0' : (isHoverCrop ? 'C0' : '99');
+            const aBot = isSelCrop ? 'C0' : (isHoverCrop ? '85' : '5A');
+            sGrad.addColorStop(0, baseColor + aTop);
+            sGrad.addColorStop(1, baseColor + aBot);
+            ctx.fillStyle = sGrad;
+
+            if (isSelCrop) {
+              ctx.save();
+              ctx.shadowColor = 'rgba(0,0,0,0.45)';
+              ctx.shadowBlur = 8;
+              ctx.shadowOffsetY = 2;
+            }
+            ctx.beginPath();
+            ctx.roundRect(clipCX, sBodyY, clipCW, sBodyH, sRr);
+            ctx.fill();
+            if (isSelCrop) ctx.restore();
+
+            // Specular sheen
+            ctx.fillStyle = 'rgba(255,255,255,0.18)';
+            ctx.fillRect(clipCX + 1, sBodyY + 1, Math.max(0, clipCW - 2), 1);
+
+            // Manual-override stripe — a vertical accent on the left so
+            // a glance tells the user "this one is user-edited".
+            if (seg.isManualOverride) {
+              ctx.fillStyle = 'rgba(255,255,255,0.85)';
+              ctx.fillRect(clipCX, sBodyY, 3, sBodyH);
+            }
+
+            // Borders for select / hover
             if (isSelCrop) {
               ctx.strokeStyle = '#FFFFFF';
               ctx.lineWidth = 2;
               ctx.beginPath();
-              ctx.roundRect(clipCX, cy + 3, clipCW, TRACK_HEIGHT - 6, 3);
+              ctx.roundRect(clipCX, sBodyY, clipCW, sBodyH, sRr);
               ctx.stroke();
               ctx.lineWidth = 1;
+            } else if (isHoverCrop) {
+              ctx.strokeStyle = 'rgba(255,255,255,0.55)';
+              ctx.lineWidth = 1;
+              ctx.beginPath();
+              ctx.roundRect(clipCX + 0.5, sBodyY + 0.5, clipCW - 1, sBodyH - 1, sRr);
+              ctx.stroke();
+            }
+
+            // Trim handles — match the main segment treatment so the
+            // crop track resizes the same way an audio clip does.
+            if (clipCW > 22 && (isSelCrop || isHoverCrop)) {
+              const handleW = isSelCrop ? HANDLE_WIDTH_HOVER : HANDLE_WIDTH;
+              const handleH = sBodyH - 6;
+              const handleY = sBodyY + 3;
+              ctx.fillStyle = '#FFFFFF';
+              ctx.globalAlpha = isSelCrop ? 0.92 : 0.45;
+              ctx.beginPath();
+              ctx.roundRect(clipCX, handleY, handleW, handleH, 2);
+              ctx.fill();
+              const rightHX = Math.min(clipCX + clipCW - handleW, cx2 - handleW);
+              ctx.beginPath();
+              ctx.roundRect(rightHX, handleY, handleW, handleH, 2);
+              ctx.fill();
+              if (isSelCrop) {
+                ctx.globalAlpha = 0.5;
+                ctx.fillStyle = '#000';
+                const notchH = Math.min(10, handleH - 4);
+                const notchY = handleY + (handleH - notchH) / 2;
+                ctx.fillRect(clipCX + handleW / 2 - 1, notchY, 1, notchH);
+                ctx.fillRect(rightHX + handleW / 2 - 1, notchY, 1, notchH);
+              }
+              ctx.globalAlpha = 1;
             }
 
             // Label
             if (cw > 30) {
               ctx.fillStyle = '#fff';
-              ctx.font = '10px -apple-system, BlinkMacSystemFont, sans-serif';
+              ctx.font = '600 11px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
               ctx.textAlign = 'left';
-              const lbl = seg.label || `${seg.cropX}%`;
-              ctx.fillText(lbl, Math.max(cx1 + 6, contentLeft + 4), cy + TRACK_HEIGHT / 2 + 3, cw - 12);
+              ctx.shadowColor = 'rgba(0,0,0,0.45)';
+              ctx.shadowBlur = 2;
+              const lbl = seg.label || `${Math.round(seg.cropX)}%`;
+              ctx.fillText(lbl, Math.max(cx1 + 8, contentLeft + 6), cy + TRACK_HEIGHT / 2 + 4, cw - 16);
+              ctx.shadowColor = 'transparent';
+              ctx.shadowBlur = 0;
             }
           });
           ctx.restore(); // End crop track clip
@@ -1406,12 +1562,27 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
       return;
     }
 
+    // Update imperative hover state — the draw fn uses these refs to
+    // paint a soft outline and resize handles even before the user
+    // commits to a click. Trigger a redraw only when the hovered id
+    // actually changes so we don't burn CPU on every mouse pixel.
     const hit = hitTestItem(e.clientX, e.clientY);
+    const cropHit = hitTestCropSegment(e.clientX, e.clientY);
+    const prevHover = hoverRef.current;
+    const newItemId = hit ? hit.item.id : null;
+    const newCropId = cropHit ? cropHit.seg.id : null;
+    const newEdge = (hit?.edge) || (cropHit?.edge) || null;
+    if (prevHover.itemId !== newItemId
+        || prevHover.cropId !== newCropId
+        || prevHover.edge !== newEdge) {
+      hoverRef.current = { itemId: newItemId, cropId: newCropId, edge: newEdge };
+      requestRedrawRef.current?.();
+    }
+
     if (hit) {
       canvas.style.cursor = hit.edge === 'left' || hit.edge === 'right' ? 'col-resize' : 'grab';
       return;
     }
-    const cropHit = hitTestCropSegment(e.clientX, e.clientY);
     if (cropHit) {
       canvas.style.cursor = cropHit.edge === 'left' || cropHit.edge === 'right' ? 'col-resize' : 'grab';
       return;
@@ -1424,7 +1595,13 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
     }
   }, [isDragging, getTimeFromX, hitTestItem, hitTestCropSegment, activeTool, spaceHeld, playhead, pps, scrollX]);
 
-  const onPointerLeave = useCallback(() => setHoverTime(null), []);
+  const onPointerLeave = useCallback(() => {
+    setHoverTime(null);
+    if (hoverRef.current.itemId || hoverRef.current.cropId || hoverRef.current.edge) {
+      hoverRef.current = { itemId: null, cropId: null, edge: null };
+      requestRedrawRef.current?.();
+    }
+  }, []);
 
   // ── Zoom via Ctrl+Wheel ────────────────────────────────────────────────────
   const onWheel = useCallback((e) => {

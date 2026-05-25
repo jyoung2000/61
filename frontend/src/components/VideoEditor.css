@@ -1658,51 +1658,74 @@ input.ve-timecode--input {
 
 .ve-multi-timeline {
   height: 100%;
-  min-height: 280px;
+  min-height: 320px;
   display: flex;
   flex-direction: column;
+  background:
+    linear-gradient(to bottom, rgba(0,0,0,0.04) 0, transparent 12px),
+    var(--ve-track-bg, rgba(0,0,0,0.02));
 }
 
 .ve-multi-timeline__toolbar {
   display: flex;
   align-items: center;
-  gap: 4px;
-  padding: 4px 8px;
-  background: var(--ve-track-bg);
+  gap: 6px;
+  padding: 6px 10px;
+  background: var(--ve-chrome-bg);
   border-bottom: 1px solid var(--ve-chrome-border);
+  backdrop-filter: blur(20px) saturate(1.6);
+  -webkit-backdrop-filter: blur(20px) saturate(1.6);
   flex-shrink: 0;
 }
 
 .ve-multi-timeline__zoom-slider {
   -webkit-appearance: none;
   appearance: none;
-  width: 80px;
-  height: 3px;
+  width: 110px;
+  height: 4px;
   background: var(--ve-slider-track);
-  border-radius: 2px;
+  border-radius: 3px;
   outline: none;
   border: none;
   cursor: pointer;
   margin: 0;
   padding: 0;
+  transition: background 0.15s ease;
+}
+.ve-multi-timeline__zoom-slider:hover {
+  background: rgba(127, 127, 127, 0.25);
 }
 .ve-multi-timeline__zoom-slider::-webkit-slider-thumb {
   -webkit-appearance: none;
   appearance: none;
-  width: 10px;
-  height: 10px;
+  width: 14px;
+  height: 14px;
   border-radius: 50%;
-  background: var(--ve-text);
-  cursor: pointer;
-  border: none;
-  margin-top: -3.5px;
+  background: var(--ve-accent, #0A84FF);
+  cursor: grab;
+  border: 2px solid var(--ve-chrome-bg, #fff);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+  margin-top: -5px;
+  transition: transform 0.12s ease;
+}
+.ve-multi-timeline__zoom-slider::-webkit-slider-thumb:hover {
+  transform: scale(1.15);
+}
+.ve-multi-timeline__zoom-slider::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--ve-accent, #0A84FF);
+  cursor: grab;
+  border: 2px solid var(--ve-chrome-bg, #fff);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
 }
 
 .ve-multi-timeline__canvas {
   flex: 1;
   display: block;
   touch-action: none;
-  min-height: 100px;
+  min-height: 120px;
 }
 
 .ve-btn--active-snap {
@@ -2760,20 +2783,35 @@ input.ve-timecode--input {
 /* ── Track Header Controls (visibility/mute/lock toggles) ─── */
 .ve-multi-timeline__track-header {
   box-sizing: border-box;
+  position: relative;
+  border-radius: 5px;
+  transition: background-color 0.12s ease, transform 0.12s ease;
+}
+.ve-multi-timeline__track-header:hover {
+  background: linear-gradient(
+    to right,
+    rgba(127, 127, 127, 0.06),
+    rgba(127, 127, 127, 0.0)
+  );
 }
 .ve-multi-timeline__track-ctrl {
-  transition: opacity 0.15s ease;
+  transition: opacity 0.15s ease, background-color 0.12s ease, transform 0.12s ease;
   flex-shrink: 0;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 18px;
-  height: 18px;
-  border-radius: 3px;
+  width: 22px;
+  height: 22px;
+  border-radius: 5px;
+  margin: 0 1px;
 }
 .ve-multi-timeline__track-ctrl:hover {
   opacity: 1 !important;
-  background: rgba(255,255,255,0.08);
+  background: rgba(127, 127, 127, 0.18);
+  transform: scale(1.08);
+}
+.ve-multi-timeline__track-ctrl:active {
+  transform: scale(0.94);
 }
 
 /* ── Editor Layout (NLE-style) ───────────────────────── */
