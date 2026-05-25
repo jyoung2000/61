@@ -923,18 +923,42 @@ async def _background_post_processing(job_id: str, transcript: list, orchestrato
             # ── Re-enforce readability after translation ──
             # Translation changes character length dramatically — a CJK
             # → English pass typically doubles the line count. Run the
-            # readability pass again so the translated subs stay readable.
+            # readability pass repeatedly until the score plateaus, so
+            # cascading fixes (split → merge short → re-cap gap) settle
+            # in one shot instead of leaving residual violations that
+            # drag the grade down to C even after the first pass closed
+            # the obvious problems.
             if getattr(settings, "SUBTITLE_CPS_ENFORCEMENT", False):
                 try:
-                    from backend.services.subtitle_formatter import enforce_readability
-                    translated = enforce_readability(
-                        list(translated),
+                    from backend.services.subtitle_formatter import (
+                        enforce_readability, compute_readability_report,
+                    )
+                    _enforce_kwargs = dict(
                         max_cps=float(getattr(settings, "SUBTITLE_MAX_CPS", 20.0)),
                         max_chars_per_line=int(getattr(settings, "SUBTITLE_MAX_CHARS_PER_LINE", 42)),
                         min_duration_ms=int(getattr(settings, "SUBTITLE_MIN_DURATION_MS", 833)),
                         max_duration_ms=int(getattr(settings, "SUBTITLE_MAX_DURATION_MS", 7000)),
                         smart_line_breaks=bool(getattr(settings, "SUBTITLE_SMART_LINE_BREAKS", True)),
                     )
+                    best_translated = list(translated)
+                    best_score = -1.0
+                    for _rd_iter in range(4):
+                        translated = enforce_readability(
+                            list(translated), **_enforce_kwargs,
+                        )
+                        try:
+                            _rep = compute_readability_report(list(translated))
+                            _sc = float(_rep.get("score", 0) or 0)
+                        except Exception:
+                            _sc = 0.0
+                        if _sc > best_score + 0.5:
+                            best_score = _sc
+                            best_translated = list(translated)
+                        else:
+                            # Plateau reached — additional passes would
+                            # only shuffle the same violations around.
+                            break
+                    translated = best_translated
                 except Exception as _rd_err:
                     logger.warning("[%s] Post-translation readability enforcement failed (%s)",
                                    job_id, _rd_err)
@@ -1929,13 +1953,32 @@ async def _run_analysis_inner(job_id: str):
     # typically doubles segment length).
     if getattr(settings, "SUBTITLE_CPS_ENFORCEMENT", True) and transcript:
         try:
-            from backend.services.subtitle_formatter import enforce_readability
+            from backend.services.subtitle_formatter import (
+                enforce_readability, compute_readability_report,
+            )
             from backend.models import TranscriptSegment
             _ts_models = [
                 t if isinstance(t, TranscriptSegment) else TranscriptSegment(**t)
                 for t in transcript
             ]
-            _readable = enforce_readability(_ts_models)
+            # Iterate the readability enforcer until the score plateaus.
+            # Single-pass leaves cascade artifacts (Pass 2 extends a short
+            # segment, Pass 4 caps it back below min_dur, score stays low).
+            _readable = _ts_models
+            _best_readable = list(_ts_models)
+            _best_score = -1.0
+            for _ in range(4):
+                _readable = enforce_readability(list(_readable))
+                try:
+                    _sc = float(compute_readability_report(list(_readable)).get("score", 0) or 0)
+                except Exception:
+                    _sc = 0.0
+                if _sc > _best_score + 0.5:
+                    _best_score = _sc
+                    _best_readable = list(_readable)
+                else:
+                    break
+            _readable = _best_readable
             transcript = [
                 t.model_dump() if hasattr(t, "model_dump") else dict(t)
                 for t in _readable
