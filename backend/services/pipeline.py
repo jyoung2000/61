@@ -683,7 +683,15 @@ async def _background_post_processing(job_id: str, transcript: list, orchestrato
             })
             logger.info("[%s] Background transcript polishing complete", job_id)
         except Exception as e:
-            logger.warning("[%s] Background transcript polishing failed: %s", job_id, e)
+            # Log a full traceback so the next failure surfaces the
+            # exact call site of the crash. The previous one-line
+            # warning ("'str' object has no attribute 'get'") gave
+            # us no way to find the line that converted a model into
+            # a string somewhere mid-loop.
+            logger.warning(
+                "[%s] Background transcript polishing failed: %s",
+                job_id, e, exc_info=True,
+            )
             await broadcast_ws(job_id, {
                 "type": "background_task",
                 "task": "transcript_polishing",
@@ -1891,7 +1899,58 @@ async def _run_analysis_inner(job_id: str):
                 config=clipper_config,
                 transcript_segments=perception.transcript_segments,
             )
-            raw_clips = await asyncio.to_thread(clip_extractor.run)
+
+            # ── Live progress for clip extraction (80 → 97 %) ──
+            # Without this callback the pipeline sits at 80 %
+            # "Detecting viral clip candidates..." for 2-5 minutes while
+            # the clipper runs its CPU signal scan, the VLM discovery
+            # passes, the judge loop, and the export step. The UI
+            # reports that as "stuck at 80 %" (or, when the manual
+            # generate-clips heartbeat at clips.py:1047 is also running,
+            # "stuck at 89 %"). The clipper already reports
+            # internal progress as a 0-1 fraction via its run()
+            # ``on_progress`` callback — we just have to relay it
+            # back to the main pipeline.
+            _loop = asyncio.get_running_loop()
+            _last_clipper_pct = [80]  # mutable cell for the closure
+
+            def _clipper_progress(frac):
+                try:
+                    f = float(frac or 0)
+                except (TypeError, ValueError):
+                    f = 0.0
+                f = max(0.0, min(1.0, f))
+                # Map 0-1 to 80-97 %; leave the final 1 % for the
+                # "Saving results..." broadcast at the end of the
+                # pipeline so the bar always moves forward.
+                pct = 80 + int(f * 17)
+                if pct <= _last_clipper_pct[0]:
+                    return  # ProgressBar is monotonic — skip backward ticks
+                _last_clipper_pct[0] = pct
+                # Phase-aware message — derive a label from the
+                # fraction so the user sees what's happening rather
+                # than a static "Detecting viral clip candidates...".
+                if f < 0.10:
+                    label = "Scoring clip candidates from signal density..."
+                elif f < 0.55:
+                    label = "Asking the VLM to discover viral moments..."
+                elif f < 0.75:
+                    label = "Judging clip candidates for hook + flow..."
+                elif f < 0.95:
+                    label = "Exporting top clips..."
+                else:
+                    label = "Finalizing clip detection..."
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        _update_progress(
+                            job_id, JobStatus.DETECTING_CLIPS, pct, label,
+                        ),
+                        _loop,
+                    )
+                except Exception:
+                    pass  # best-effort — never break clip extraction
+
+            raw_clips = await asyncio.to_thread(clip_extractor.run, _clipper_progress)
             clips = to_fez_clips(raw_clips)
             logger.info("[%s] Clip extraction produced %d clips", job_id, len(clips))
         except Exception as _ce:

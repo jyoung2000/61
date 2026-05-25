@@ -70,9 +70,25 @@ def _coerce_segment(seg) -> dict:
     """Return a dict view of a TranscriptSegment or dict. The polisher
     accepts either shape so it can drop into both the reframer pipeline
     (which passes dicts) and the model-based pipeline (which passes
-    Pydantic objects)."""
+    Pydantic objects).
+
+    Bare strings are coerced to a stub segment with the string as text
+    so a polish pass that returned raw strings instead of segments
+    doesn't crash the readability scoring downstream. The compat path
+    that previously crashed with ``'str' object has no attribute
+    'get'`` (background polishing background task on the 12:48:49 run)
+    came from exactly this case.
+    """
     if isinstance(seg, dict):
         return seg
+    if isinstance(seg, str):
+        return {
+            "start": 0.0,
+            "end": 0.0,
+            "text": seg,
+            "speaker": "",
+            "_obj": seg,
+        }
     # Pydantic / dataclass
     return {
         "start": getattr(seg, "start", getattr(seg, "start_sec", 0.0)),
