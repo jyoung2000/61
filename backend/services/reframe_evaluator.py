@@ -127,6 +127,23 @@ class ReframeEvaluator:
                     center_left = crop_left + crop_w // 3
                     center_right = crop_left + (2 * crop_w) // 3
                     face_centered = center_left <= best_face["cx"] <= center_right
+                    # Edge-clamp credit: when the crop is pressed against
+                    # the source frame's edge it physically cannot move
+                    # further to center the face, so don't penalise the
+                    # reframer for that. Mirrors the exporter's existing
+                    # exemption (clip_exporter.py:1823-1825: "Only check
+                    # centering when the crop isn't edge-clamped. At the
+                    # frame edges, perfect centering is impossible.").
+                    # Credit is only given when the face is on the same
+                    # side that pulled the crop to the edge — a face on
+                    # the opposite side means the planner could have moved
+                    # the crop and chose not to, which is a real miss.
+                    if not face_centered:
+                        crop_center = crop_left + crop_w / 2
+                        if crop_x == 0 and best_face["cx"] < crop_center:
+                            face_centered = True
+                        elif crop_x == max_x and best_face["cx"] > crop_center:
+                            face_centered = True
                     if face_centered:
                         report.seconds_face_centered += 1
 
