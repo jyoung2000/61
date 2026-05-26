@@ -85,6 +85,43 @@ class ReframeLogger:
         ch.setFormatter(logging.Formatter('[%(levelname)-5s] %(message)s'))
         self.logger.addHandler(ch)
 
+        # Propagate to root so the rotating /data/logs/app.log handler
+        # (set up by the FastAPI app's logging config) picks these up,
+        # which is what the /api/logs/export endpoint streams. Without
+        # this, every line written through ``log.log_stage(...)`` lives
+        # ONLY in the per-session reframe_YYYY.log under
+        # backend/services/logs/ and never makes it into the export
+        # bundle the user downloads.
+        self.logger.propagate = True
+
+        # Belt-and-braces: if /data/logs/app.log exists and is writable
+        # but the root logger isn't writing there (e.g. CLI runs that
+        # never call setup_logging), attach our own handler. Concurrent
+        # writes from two file handlers to the same file are safe at
+        # the line level on POSIX (each .emit() is a single write()
+        # below PIPE_BUF for any realistic log line).
+        app_log_path = "/data/logs/app.log"
+        try:
+            if os.path.isdir(os.path.dirname(app_log_path)) and os.access(
+                    os.path.dirname(app_log_path), os.W_OK):
+                root = logging.getLogger()
+                already_attached = any(
+                    isinstance(h, logging.FileHandler)
+                    and os.path.abspath(getattr(h, 'baseFilename', '')) ==
+                        os.path.abspath(app_log_path)
+                    for h in root.handlers)
+                if not already_attached:
+                    app_fh = logging.FileHandler(app_log_path, encoding='utf-8')
+                    app_fh.setLevel(logging.INFO)
+                    app_fh.setFormatter(logging.Formatter(
+                        '%(asctime)s [%(levelname)-5s] [reframer] %(message)s',
+                        datefmt='%Y-%m-%d %H:%M:%S'))
+                    self.logger.addHandler(app_fh)
+        except Exception:
+            # Permission denied, disk full, weird filesystem — silently
+            # skip; the dedicated per-session file still works.
+            pass
+
         self.logger.info(f"Session started: {self.session_id}")
         self.logger.info(f"Log file: {self.log_path}")
 
@@ -136,6 +173,132 @@ class ReframeLogger:
             json.dump(self.get_summary(), f, indent=2, default=str)
         self.logger.info(f"Summary saved: {path}")
         return path
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  REFRAME TRACER — Append-only JSONL of every per-keyframe decision
+# ═══════════════════════════════════════════════════════════════════════════
+#
+#  The structured logger above captures stage transitions and aggregates —
+#  "scene 7 → adaptive_face (8 keyframes)", "smoothed 45 → 42 keyframes".
+#  That's enough to know WHAT happened but not WHY: which keyframe got
+#  dropped, which face was chosen at t=12.3s, why crop_x = 480 vs 520.
+#
+#  The tracer fills that gap with one JSON line per decision. Schema is
+#  intentionally flat — each event carries an ``event`` field naming the
+#  decision, a ``t_ms`` (when relevant), and arbitrary kwargs describing
+#  the inputs and outcome. Consumers grep / jq the file:
+#
+#    jq 'select(.event=="centering_nudge")' reframe_trace.jsonl
+#    jq 'select(.event=="smoother_drop" and .reason=="drift_suppressed")' …
+#
+#  The tracer is a no-op when ``path`` is empty so callsites don't need
+#  to None-check it. One file per job; the pipeline writes it next to
+#  ``render_plan.json`` so the artifacts move together.
+
+class ReframeTracer:
+    """Append-only JSONL writer for per-decision reframe telemetry.
+
+    Tracer events follow a flat schema: every line is a JSON object with
+    at minimum ``{"event": "<name>", "t_ms": <int>}`` plus arbitrary
+    decision-specific kwargs. The tracer never raises — write errors
+    are swallowed so a full disk can't take down the pipeline.
+
+    When ``path`` is empty / None, the tracer becomes a no-op:
+    ``.event(...)`` returns immediately. Callsites pass the engine's
+    tracer everywhere without having to guard each call.
+    """
+
+    SCHEMA_VERSION = 1
+
+    def __init__(self, path: Optional[str] = None):
+        self.path = path or ""
+        self._fh = None
+        self._counts: Dict[str, int] = {}
+        if not self.path:
+            return
+        try:
+            parent = os.path.dirname(self.path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            # Open in append mode so reruns in the same job dir (e.g.
+            # regenerate) don't blow away the previous trace.
+            self._fh = open(self.path, 'a', encoding='utf-8')
+            self._raw_write({
+                'event': 'session_start',
+                'schema_version': self.SCHEMA_VERSION,
+                'started_at': datetime.now().isoformat(timespec='seconds'),
+            })
+        except Exception:
+            # Could be /data/logs/jobs/.../reframe_trace.jsonl with the
+            # parent dir not yet created, or a read-only filesystem —
+            # either way, fall back to disabled-tracer behaviour.
+            self._fh = None
+
+    def _raw_write(self, obj: dict):
+        if self._fh is None:
+            return
+        try:
+            self._fh.write(json.dumps(
+                obj, default=str, separators=(',', ':')) + '\n')
+            self._fh.flush()
+        except Exception:
+            # Best-effort — a failed write must not abort the pipeline.
+            pass
+
+    def event(self, name: str, **kwargs):
+        """Emit one trace line.
+
+        ``name`` becomes the ``event`` field. Any keyword arguments are
+        included verbatim (after JSON-default coercion via ``default=str``,
+        so dataclasses / numpy scalars / etc. serialise without error).
+        """
+        if self._fh is None:
+            return
+        self._counts[name] = self._counts.get(name, 0) + 1
+        kwargs['event'] = name
+        self._raw_write(kwargs)
+
+    @property
+    def enabled(self) -> bool:
+        return self._fh is not None
+
+    @property
+    def counts(self) -> Dict[str, int]:
+        """Per-event call counts. Useful for asserting in tests / smoke runs."""
+        return dict(self._counts)
+
+    def close(self, summary: Optional[dict] = None):
+        """Flush + close the underlying file handle.
+
+        Optional ``summary`` is emitted as a final ``session_end`` event
+        so consumers can find the total counts without scanning the file.
+        """
+        if self._fh is None:
+            return
+        try:
+            self._raw_write({
+                'event': 'session_end',
+                'ended_at': datetime.now().isoformat(timespec='seconds'),
+                'counts': dict(self._counts),
+                'summary': summary or {},
+            })
+            self._fh.close()
+        except Exception:
+            pass
+        finally:
+            self._fh = None
+
+
+# A singleton no-op tracer for code paths that haven't been threaded with
+# an explicit one yet. Tests / CLI invocations that don't care about
+# tracing can use this without checking for None.
+_NULL_TRACER = ReframeTracer(path=None)
+
+
+def null_tracer() -> ReframeTracer:
+    """Return a shared no-op tracer for callers that don't want telemetry."""
+    return _NULL_TRACER
 
 
 # Global logger instance — set per session

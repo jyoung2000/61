@@ -79,6 +79,37 @@ class ReframeEvaluator:
         keyframes = getattr(self.plan, "keyframes", None) or []
         face_timeline = getattr(self.perc, "face_timeline", None) or {}
 
+        # Pre-sort keyframe times so each per-second problem can resolve
+        # its bracket (prev + next) keyframe in O(log n) instead of O(n).
+        # The bracket lets an offline reviewer jump from "centering miss
+        # at t=12s" straight to the two keyframes that produced the bad
+        # interpolated crop position. Stored on every problem entry so
+        # the reframe_report.problems list joins cleanly against
+        # reframe_trace.jsonl events.
+        kf_times = [kf.get("time_ms", 0) for kf in keyframes]
+
+        def _bracket_keyframes(time_ms: int) -> dict:
+            """Return {keyframe_idx_before, keyframe_idx_after, …}
+            describing the kf bracket around ``time_ms``."""
+            if not kf_times:
+                return {"keyframe_idx_before": -1, "keyframe_idx_after": -1}
+            # Binary-search for the insertion point of time_ms.
+            from bisect import bisect_right
+            j = bisect_right(kf_times, time_ms)
+            before = j - 1 if j > 0 else -1
+            after = j if j < len(kf_times) else -1
+            out = {
+                "keyframe_idx_before": before,
+                "keyframe_idx_after": after,
+            }
+            if before >= 0:
+                out["keyframe_t_ms_before"] = kf_times[before]
+                out["keyframe_x_before"] = keyframes[before].get("x", 0)
+            if after >= 0:
+                out["keyframe_t_ms_after"] = kf_times[after]
+                out["keyframe_x_after"] = keyframes[after].get("x", 0)
+            return out
+
         prev_x = None
         x_deltas: List[float] = []
         cut_intervals: List[int] = []
@@ -165,26 +196,42 @@ class ReframeEvaluator:
                 "edge_violation": edge_violation,
             })
 
-            # Flag problems
+            # Flag problems. Every entry carries the bracket of
+            # keyframes that produced the interpolated crop at this
+            # second so an offline reviewer (or reframe_trace.jsonl
+            # consumer) can join straight to the responsible
+            # keyframes instead of bisecting the plan by hand.
+            bracket = _bracket_keyframes(time_ms)
             if has_faces and not face_in_crop:
                 report.problems.append({
                     "time_sec": sec, "severity": "HIGH", "type": "face_missing",
                     "message": "Face detected but not in the crop window",
+                    "crop_x": crop_x,
+                    "best_face_cx": best_face["cx"] if best_face else None,
+                    **bracket,
                 })
             elif has_faces and face_in_crop and not best_face_in_crop:
                 report.problems.append({
                     "time_sec": sec, "severity": "MED", "type": "wrong_face",
                     "message": "A less salient face is in the crop; the best face is elsewhere",
+                    "crop_x": crop_x,
+                    "best_face_cx": best_face["cx"] if best_face else None,
+                    **bracket,
                 })
             if edge_violation:
                 report.problems.append({
                     "time_sec": sec, "severity": "LOW", "type": "edge_cut",
                     "message": "Face partially cut off at the crop edge",
+                    "crop_x": crop_x,
+                    **bracket,
                 })
             if has_faces and best_face_in_crop and not face_centered:
                 report.problems.append({
                     "time_sec": sec, "severity": "MED", "type": "off_center",
                     "message": "Best face is off-center within the crop",
+                    "crop_x": crop_x,
+                    "best_face_cx": best_face["cx"] if best_face else None,
+                    **bracket,
                 })
 
             if on_progress and sec % 10 == 0:

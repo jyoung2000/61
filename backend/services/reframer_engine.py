@@ -23,6 +23,7 @@ from backend.services.reframer_models import (
     ReframeLogger, get_logger, reset_logger, RenderPlan,
     interpolate_x, clamp_x, _face_overlaps_person,
     LedgerBin, CoverageLedger, PerceptionResult, SceneSignals, AdaptiveParams,
+    ReframeTracer, null_tracer,
 )
 from backend.services.reframer_perceiver import Perceiver
 from backend.services.reframer_planner import Planner
@@ -56,7 +57,8 @@ class ReframeEngine:
 
     def __init__(self, video_path: str, sample_fps: float = 5.0,
                  log_dir: str = None, aspect_ratio: str = '9:16',
-                 source_language: str = 'auto'):
+                 source_language: str = 'auto',
+                 trace_path: str = None):
         self.video_path = video_path
         self.sample_fps = sample_fps
         self.aspect_ratio = aspect_ratio
@@ -64,6 +66,10 @@ class ReframeEngine:
         self.perception: Optional[PerceptionResult] = None
         self.plan: Optional[RenderPlan] = None
         self.log = reset_logger(log_dir)
+        # JSONL per-decision trace. When trace_path is empty the tracer
+        # becomes a no-op so every callsite below stays the same.
+        self.tracer: ReframeTracer = (
+            ReframeTracer(trace_path) if trace_path else null_tracer())
 
         # Parse aspect ratio
         if aspect_ratio in self.ASPECT_RATIOS:
@@ -83,6 +89,13 @@ class ReframeEngine:
                            sample_fps=self.sample_fps,
                            source_language=self.source_language)
         self.log.start_timer('total_pipeline')
+        # Tracer: high-level session metadata. Every downstream event
+        # joins on this implicitly (one trace file = one session).
+        self.tracer.event('analyze_start',
+                          video=os.path.basename(self.video_path),
+                          aspect_ratio=f'{self.ar_w}:{self.ar_h}',
+                          sample_fps=self.sample_fps,
+                          source_language=self.source_language)
 
         # Stage 1: Perception (faces + audio + motion)
         self.log.log_stage('ENGINE', '═══ STAGE 1: PERCEIVE (faces, audio, motion) ═══')
@@ -95,9 +108,21 @@ class ReframeEngine:
             self._perceiver_audio_device = getattr(
                 perceiver.audio_intel, 'device_used', 'unknown')
 
+        self.tracer.event('perceive_complete',
+                          src_w=self.perception.src_w,
+                          src_h=self.perception.src_h,
+                          duration_ms=self.perception.duration_ms,
+                          fps=self.perception.fps,
+                          face_samples=len(self.perception.face_timeline),
+                          scene_cuts=len(self.perception.scene_cuts),
+                          transcript_segments=len(self.perception.transcript_segments),
+                          is_live_action=self.perception.is_live_action,
+                          detected_language=self.perception.detected_language)
+
         # Stage 2+3: Classify + Decide
         self.log.log_stage('ENGINE', '═══ STAGE 2+3: CLASSIFY + DECIDE ═══')
-        planner = Planner(self.perception, self.ar_w, self.ar_h)
+        planner = Planner(self.perception, self.ar_w, self.ar_h,
+                          tracer=self.tracer)
         self.plan = planner.generate()
 
         # Stage 3.5: Gradient centering for stuck title-card scenes
@@ -109,7 +134,7 @@ class ReframeEngine:
         # Stage 4: Smooth
         self.log.log_stage('ENGINE', '═══ STAGE 4: SMOOTH ═══')
         self.log.start_timer('smooth')
-        smoother = Smoother()
+        smoother = Smoother(tracer=self.tracer)
         self.plan = smoother.smooth(self.plan)
         self.log.stop_timer('smooth')
 
@@ -149,6 +174,15 @@ class ReframeEngine:
             f'  Scenes: {len(self.plan.scenes)}\n'
             f'  Keyframes: {len(self.plan.keyframes)}\n'
             f'  Strategies: {[s["strategy"] for s in self.plan.strategy_log]}')
+
+        # Final tracer summary + close. Done in a try/finally so even a
+        # raise on the way out flushes the trace to disk for diagnosis.
+        self.tracer.close(summary={
+            'total_elapsed_s': round(total_elapsed, 2),
+            'scenes': len(self.plan.scenes),
+            'keyframes': len(self.plan.keyframes),
+            'strategies': [s['strategy'] for s in self.plan.strategy_log],
+        })
 
         return self.plan
 
@@ -398,6 +432,14 @@ class ReframeEngine:
             new_x = clamp_x(x + nudge, max_x)
             if new_x == x:
                 continue
+            self.tracer.event('post_smoother_nudge',
+                              t_ms=t,
+                              old_x=x, new_x=new_x,
+                              face_cx=face_cx,
+                              face_offset_px=face_offset,
+                              ideal_x=ideal_x,
+                              delta=delta, nudge=nudge,
+                              nudge_cap=NUDGE_CAP)
             kf['x'] = new_x
             kf['_centering'] = True
             corrected += 1
@@ -450,13 +492,22 @@ class ReframeEngine:
                 continue  # an existing keyframe already covers this sample
             # Snap to face — use a short ease so the new keyframe
             # blends with its neighbours instead of cutting.
+            new_x = clamp_x(face_cx - crop_w // 2, max_x)
             anchor_kfs.append({
                 'time_ms': time_ms,
-                'x': clamp_x(face_cx - crop_w // 2, max_x),
+                'x': new_x,
                 'transition': 'ease_in_out',
                 'transition_ms': 200,
                 '_centering': True,
             })
+            self.tracer.event('post_smoother_anchor_inserted',
+                              t_ms=time_ms,
+                              interp_x_before=interp_x,
+                              new_x=new_x,
+                              face_cx=face_cx,
+                              face_offset_px=abs(face_cx - crop_center),
+                              eval_boundary=eval_boundary,
+                              reason='mid_transition_off_center')
             anchored += 1
 
         if anchor_kfs:
@@ -560,6 +611,18 @@ class ReframeEngine:
                     'transition': trans_type,
                     'transition_ms': trans_ms,
                 })
+                self.tracer.event('live_action_correction',
+                                  t_ms=st,
+                                  old_interp_x=crop_x,
+                                  new_x=new_x,
+                                  face_cx=best['cx'],
+                                  face_w=best.get('w', 0),
+                                  face_track_id=best.get('track_id', -1),
+                                  mouth_motion=best.get('mouth_motion', 0),
+                                  transition=trans_type,
+                                  transition_ms=trans_ms,
+                                  delta_px=dx,
+                                  reason='no_face_in_crop')
                 last_correction_t = st
 
         if corrections:
@@ -725,6 +788,14 @@ class ReframeEngine:
                     'gradient_centroid': centroid_x,
                     'new_crop_x': gradient_crop_x,
                 })
+                self.tracer.event('gradient_recenter',
+                                  scene_start_ms=s_start,
+                                  scene_end_ms=s_end,
+                                  strategy=strategy,
+                                  old_max_x=kf_max_x,
+                                  centroid_x=centroid_x,
+                                  new_crop_x=gradient_crop_x,
+                                  keyframes_affected=len(scene_kf_indices))
 
         finally:
             if cap is not None:
@@ -995,6 +1066,16 @@ class ReframeEngine:
 
                 anchored.extend(face_anchors)
                 anchor_count += len(face_anchors)
+                self.tracer.event('stabilize_scene_anchor',
+                                  scene_start_ms=s_start, scene_end_ms=s_end,
+                                  strategy=strategy,
+                                  mode='face_track_deadband',
+                                  input_kfs=len(scene_kfs),
+                                  output_kfs=len(face_anchors),
+                                  face_positions=len(face_positions),
+                                  deadband_px=face_deadband,
+                                  bimodal=is_bimodal,
+                                  anchor_xs=[a['x'] for a in face_anchors])
 
             else:
                 # ── NON-FACE SCENE: scene-level median (proven stable) ──
@@ -1039,6 +1120,16 @@ class ReframeEngine:
                             deduped.append(kf)
                     anchored.extend(deduped)
                     anchor_count += 2
+                    self.tracer.event('stabilize_scene_anchor',
+                                      scene_start_ms=s_start, scene_end_ms=s_end,
+                                      strategy=strategy,
+                                      mode='non_face_bimodal',
+                                      input_kfs=len(scene_kfs),
+                                      output_kfs=len(deduped),
+                                      left_anchor=left_anchor,
+                                      right_anchor=right_anchor,
+                                      cluster_gap_px=max_gap,
+                                      split_value=split_value)
                 else:
                     # UNIMODAL: single anchor
                     anchor_x = int(np.median(xs))
@@ -1046,6 +1137,14 @@ class ReframeEngine:
                     first_kf['x'] = anchor_x
                     anchored.append(first_kf)
                     anchor_count += 1
+                    self.tracer.event('stabilize_scene_anchor',
+                                      scene_start_ms=s_start, scene_end_ms=s_end,
+                                      strategy=strategy,
+                                      mode='non_face_unimodal',
+                                      input_kfs=len(scene_kfs),
+                                      output_kfs=1,
+                                      anchor_x=anchor_x,
+                                      x_range=[min(xs), max(xs)])
 
         # ══════════════════════════════════════════════════════════════
         # Pass 2: Blip removal — A→B→A patterns within 2 seconds are noise
@@ -1069,6 +1168,13 @@ class ReframeEngine:
 
                 if hold_dur < 2.5 and returns_close:
                     # This is a blip — remove it
+                    self.tracer.event('stabilize_blip_removed',
+                                      t_ms=curr['time_ms'],
+                                      x=curr['x'],
+                                      hold_dur_s=round(hold_dur, 3),
+                                      prev_x=prev['x'],
+                                      next_x=nxt['x'],
+                                      pattern='A_to_B_to_A')
                     anchored.pop(i)
                     blip_count += 1
                 else:
@@ -1141,6 +1247,13 @@ class ReframeEngine:
                         # — that loses the first face's centering.
                         '_centering': True,
                     })
+                    self.tracer.event('stabilize_inclusion_fix',
+                                      t_ms=check_ms,
+                                      crop_x=crop_x,
+                                      new_x=corrected_x,
+                                      face_cx=face_cx,
+                                      crop_w=crop_w,
+                                      reason='subject_outside_crop')
                     inclusion_fixes += 1
 
         if correction_kfs:
@@ -1229,7 +1342,17 @@ class ReframeEngine:
                 # at the cap and let consecutive nudges accumulate.
                 sign = 1 if delta > 0 else -1
                 nudge = min(NUDGE_MAX, abs_delta) * sign
+                old_x = kf['x']
                 kf['x'] = clamp_x(kf['x'] + nudge, max_x)
+                self.tracer.event('stabilize_centering_nudge',
+                                  t_ms=kf['time_ms'],
+                                  old_x=old_x, new_x=kf['x'],
+                                  face_cx=cx,
+                                  ideal_x=ideal_x,
+                                  delta=delta,
+                                  nudge=nudge,
+                                  nudge_cap=NUDGE_MAX,
+                                  pass_label=label)
                 # Tag the keyframe as a centering correction so the
                 # smoother's drift-suppression doesn't collapse it
                 # back into a hold. Without this flag, a 24 px

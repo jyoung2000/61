@@ -23,6 +23,7 @@ from backend.services.reframer_models import (
     ReframeLogger, get_logger, reset_logger, RenderPlan,
     interpolate_x, clamp_x, _face_overlaps_person,
     LedgerBin, CoverageLedger, PerceptionResult, SceneSignals, AdaptiveParams,
+    ReframeTracer, null_tracer,
 )
 
 logger = logging.getLogger("clipai.reframer_planner")
@@ -31,10 +32,12 @@ logger = logging.getLogger("clipai.reframer_planner")
 class Planner:
     """Route scenes to strategies, emit keyframed RenderPlan."""
 
-    def __init__(self, perc: PerceptionResult, ar_w: int = 9, ar_h: int = 16):
+    def __init__(self, perc: PerceptionResult, ar_w: int = 9, ar_h: int = 16,
+                 tracer: Optional[ReframeTracer] = None):
         self.p = perc
         self.ar_w = ar_w
         self.ar_h = ar_h
+        self.tracer: ReframeTracer = tracer if tracer is not None else null_tracer()
 
         # Compute crop dimensions from aspect ratio
         # Key insight: we're cropping FROM a 16:9 source.
@@ -173,15 +176,35 @@ class Planner:
         for i, (s_start, s_end) in enumerate(scenes):
             signals = self._measure_scene_signals(s_start, s_end, global_signals)
             params = self._derive_params(signals)
-            kfs = self._decide_adaptive(s_start, s_end, params)
+            kfs = self._decide_adaptive(s_start, s_end, params, scene_idx=i)
             all_kf.extend(kfs)
             plan.strategy_log.append({
                 'time_range': [s_start, s_end],
                 'strategy': params.strategy_label,
             })
+            # Embed measured signals + derived params on every scene
+            # entry so the artifact captures WHY the planner picked the
+            # strategy it did. Without this the only output of
+            # _measure_scene_signals / _derive_params was the strategy
+            # label — leaving the per-scene math invisible to anyone
+            # reviewing a bad reframe. asdict() is safe here because
+            # both SceneSignals and AdaptiveParams are plain dataclasses.
             plan.scenes.append({
-                'start_ms': s_start, 'end_ms': s_end, 'strategy': params.strategy_label
+                'scene_idx': i,
+                'start_ms': s_start,
+                'end_ms': s_end,
+                'strategy': params.strategy_label,
+                'keyframe_count': len(kfs),
+                'signals': asdict(signals),
+                'params': asdict(params),
             })
+            self.tracer.event('scene_signals',
+                              scene_idx=i,
+                              start_ms=s_start, end_ms=s_end,
+                              strategy=params.strategy_label,
+                              keyframe_count=len(kfs),
+                              signals=asdict(signals),
+                              params=asdict(params))
             dur_sec = (s_end - s_start) / 1000
             log.log_stage('DECIDE',
                 f'Scene {i+1}/{len(scenes)}: '
@@ -226,6 +249,14 @@ class Planner:
                     # Keep its time and transition style so we don't mess up
                     # transition timing across non-locked → locked boundaries.
                     if kf['x'] != lock['anchor_x']:
+                        self.tracer.event('speaker_lock_override',
+                                          t_ms=t,
+                                          old_x=kf['x'],
+                                          new_x=lock['anchor_x'],
+                                          lock_start_ms=lock['start_ms'],
+                                          lock_end_ms=lock['end_ms'],
+                                          track_id=lock['track_id'],
+                                          mouth_score=lock.get('mouth_score', 0))
                         kf = {**kf, 'x': lock['anchor_x']}
                         locked_count += 1
                 new_kfs.append(kf)
@@ -245,6 +276,12 @@ class Planner:
                     'transition': 'cut',
                     'transition_ms': 0,
                 })
+                self.tracer.event('speaker_lock_anchor_inserted',
+                                  t_ms=anchor_t,
+                                  x=lock['anchor_x'],
+                                  lock_end_ms=lock['end_ms'],
+                                  track_id=lock['track_id'],
+                                  word_count=lock.get('word_count', 0))
                 existing_times.add(anchor_t)
                 inserted_anchors += 1
 
@@ -312,6 +349,13 @@ class Planner:
             if not (x <= face_cx <= x + self.crop_w):
                 # Face completely outside crop — always correct, even speaker-locked
                 new_x = clamp_x(face_cx - self.crop_w // 2, self.max_x)
+                self.tracer.event('safety_correction',
+                                  t_ms=t, old_x=x, new_x=new_x,
+                                  face_cx=face_cx,
+                                  face_track_id=best_face.get('track_id', -1),
+                                  best_score=round(best_score, 4),
+                                  speaker_locked=is_speaker_locked,
+                                  reason='face_outside_crop')
                 kf['x'] = new_x
                 corrected += 1
             elif not is_speaker_locked:
@@ -319,7 +363,15 @@ class Planner:
                 center_left = x + self.crop_w // 4
                 center_right = x + (3 * self.crop_w) // 4
                 if not (center_left <= face_cx <= center_right):
-                    kf['x'] = clamp_x(face_cx - self.crop_w // 2, self.max_x)
+                    new_x = clamp_x(face_cx - self.crop_w // 2, self.max_x)
+                    self.tracer.event('safety_correction',
+                                      t_ms=t, old_x=x, new_x=new_x,
+                                      face_cx=face_cx,
+                                      face_track_id=best_face.get('track_id', -1),
+                                      best_score=round(best_score, 4),
+                                      speaker_locked=False,
+                                      reason='off_center_in_crop')
+                    kf['x'] = new_x
                     corrected += 1
 
         # Pass 2: Check interpolated positions at every sample time
@@ -363,6 +415,13 @@ class Planner:
                     'time_ms': t, 'x': new_x,
                     'transition': 'cut', 'transition_ms': 0
                 })
+                self.tracer.event('safety_insertion',
+                                  t_ms=t, x=new_x,
+                                  interp_x_before=interp_x,
+                                  face_cx=face_cx,
+                                  face_track_id=best_face.get('track_id', -1),
+                                  speech_active=speech_at_t,
+                                  reason='interp_crop_missed_face')
                 inserted += 1
 
         if new_kfs:
@@ -1138,7 +1197,8 @@ class Planner:
     #  UNIVERSAL DECIDE — One function for all content types
     # ═══════════════════════════════════════════════════════════════════════
 
-    def _decide_adaptive(self, start: int, end: int, params: AdaptiveParams) -> List[dict]:
+    def _decide_adaptive(self, start: int, end: int, params: AdaptiveParams,
+                         scene_idx: int = -1) -> List[dict]:
         """Universal keyframe generator — snappy, locked on the active subject.
 
         Core behavior:
@@ -1699,6 +1759,19 @@ class Planner:
                         'transition': 'cut', 'transition_ms': 0})
 
         kfs = self._validate_face_in_crop(kfs, start, end)
+        # Emit one trace line per keyframe so consumers can join later
+        # smoother / centering events on the same time_ms. We do this
+        # in one batch at function exit rather than per-append to keep
+        # the inner loop clean.
+        if self.tracer.enabled:
+            for kf in kfs:
+                self.tracer.event('keyframe_decided',
+                                  scene_idx=scene_idx,
+                                  t_ms=kf['time_ms'],
+                                  x=kf['x'],
+                                  transition=kf.get('transition', 'cut'),
+                                  transition_ms=kf.get('transition_ms', 0),
+                                  strategy=params.strategy_label)
         return kfs
 
 

@@ -1899,7 +1899,14 @@ async def _run_analysis_inner(job_id: str):
     except Exception as _pre_err:
         logger.warning("[%s] pre-Whisper GPU preflight skipped: %s", job_id, _pre_err)
 
-    engine = ReframeEngine(video_path, sample_fps=_sample_fps, aspect_ratio="9:16")
+    # Per-job JSONL trace of every reframe decision. Lands next to
+    # render_plan.json / detection_overlay.json so all the reframer
+    # artifacts live together. The engine handles an empty path as
+    # "tracing disabled" so callers that don't pass one continue to
+    # work unchanged.
+    _trace_path = os.path.join(job_dir, "reframe_trace.jsonl")
+    engine = ReframeEngine(video_path, sample_fps=_sample_fps,
+                           aspect_ratio="9:16", trace_path=_trace_path)
     async with _stage_timer(job_id, "reframer_analysis"):
         reframer_plan = await asyncio.to_thread(engine.analyze, _engine_progress)
     perception = engine.perception
@@ -2033,6 +2040,22 @@ async def _run_analysis_inner(job_id: str):
         logger.info("[%s] render_plan.json written (%d ops)", job_id, len(render_plan.ops))
     except Exception as _rpe:
         logger.warning("[%s] render_plan.json write failed: %s", job_id, _rpe)
+
+    # Confirm the reframer-internal RenderPlan (with per-scene signals)
+    # also persisted, plus the per-decision JSONL trace. Surfaces in
+    # /api/logs/export so the Claude reviewer has the full picture
+    # without needing shell access to the job directory.
+    try:
+        _scene_signals_count = sum(
+            1 for sc in (reframer_plan.scenes or []) if sc.get("signals"))
+        _trace_size = (os.path.getsize(_trace_path)
+                       if os.path.exists(_trace_path) else 0)
+        logger.info(
+            "[%s] reframer artifacts: scenes_with_signals=%d "
+            "reframe_trace.jsonl=%d bytes",
+            job_id, _scene_signals_count, _trace_size)
+    except Exception:
+        pass
 
     # ── Detection overlay sidecar for the reframer preview ──
     # Captures the face / subject / motion / speech timelines so the

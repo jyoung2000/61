@@ -23,6 +23,7 @@ from backend.services.reframer_models import (
     ReframeLogger, get_logger, reset_logger, RenderPlan,
     interpolate_x, clamp_x, _face_overlaps_person,
     LedgerBin, CoverageLedger, PerceptionResult, SceneSignals, AdaptiveParams,
+    ReframeTracer, null_tracer,
 )
 
 logger = logging.getLogger("clipai.reframer_smoother")
@@ -31,15 +32,24 @@ logger = logging.getLogger("clipai.reframer_smoother")
 class Smoother:
     """Post-process keyframes for smooth, natural-feeling output."""
 
-    def __init__(self, max_vel_px_per_sec: float = 2000):
+    def __init__(self, max_vel_px_per_sec: float = 2000,
+                 tracer: Optional[ReframeTracer] = None):
         self.max_vel = max_vel_px_per_sec
+        self.tracer: ReframeTracer = tracer if tracer is not None else null_tracer()
 
     def smooth(self, plan: RenderPlan) -> RenderPlan:
         log = get_logger()
         kfs = plan.keyframes
         if len(kfs) < 2:
             log.log_stage('SMOOTH', f'Skipped (only {len(kfs)} keyframe)')
+            self.tracer.event('smoother_skipped',
+                              keyframes=len(kfs),
+                              reason='not_enough_keyframes')
             return plan
+        self.tracer.event('smoother_start',
+                          input_keyframes=len(kfs),
+                          crop_w=plan.crop_w,
+                          max_velocity_px_per_s=self.max_vel)
 
         # Pass 1: Remove temporal duplicates and clamp velocity
         smoothed = [kfs[0]]
@@ -50,6 +60,11 @@ class Smoother:
             prev = smoothed[-1]
             dt = (kf['time_ms'] - prev['time_ms']) / 1000.0
             if dt <= 0.001:
+                self.tracer.event('smoother_drop',
+                                  pass_name='dedup',
+                                  t_ms=kf['time_ms'], x=kf['x'],
+                                  prev_t_ms=prev['time_ms'],
+                                  reason='temporal_duplicate')
                 removed_count += 1
                 continue
 
@@ -59,7 +74,16 @@ class Smoother:
                 if vel > self.max_vel:
                     max_dx = int(self.max_vel * dt)
                     sign = 1 if kf['x'] > prev['x'] else -1
-                    kf['x'] = clamp_x(prev['x'] + sign * max_dx, plan.max_x)
+                    new_x = clamp_x(prev['x'] + sign * max_dx, plan.max_x)
+                    self.tracer.event('smoother_clamp',
+                                      pass_name='velocity',
+                                      t_ms=kf['time_ms'],
+                                      original_x=kf['x'], clamped_x=new_x,
+                                      prev_x=prev['x'],
+                                      velocity_px_per_s=round(vel, 1),
+                                      max_velocity_px_per_s=self.max_vel,
+                                      reason='velocity_exceeds_max')
+                    kf['x'] = new_x
                     clamped_count += 1
 
             smoothed.append(kf)
@@ -84,6 +108,16 @@ class Smoother:
                     if (dt_total < 2.0 and dx_back < plan.crop_w * 0.15
                             and dx_out > plan.crop_w * 0.05):
                         # Remove the middle keyframe (the bounce)
+                        popped = dejittered[-1]
+                        self.tracer.event('smoother_drop',
+                                          pass_name='dejitter',
+                                          t_ms=popped['time_ms'],
+                                          x=popped['x'],
+                                          prev_x=prev2['x'],
+                                          next_x=curr['x'],
+                                          dt_total_s=round(dt_total, 3),
+                                          dx_back=dx_back, dx_out=dx_out,
+                                          reason='A_B_A_oscillation')
                         dejittered.pop()
                         jitter_count += 1
 
@@ -106,6 +140,12 @@ class Smoother:
                     and kf.get('transition') != 'cut'
                     and kf['time_ms'] - last_cut_t < 800):
                 # Within hold period after cut — suppress this movement
+                self.tracer.event('smoother_drop',
+                                  pass_name='hold_enforce',
+                                  t_ms=kf['time_ms'], x=kf['x'],
+                                  last_cut_t_ms=last_cut_t,
+                                  delta_from_cut_ms=kf['time_ms'] - last_cut_t,
+                                  reason='within_800ms_post_cut')
                 hold_enforced += 1
                 continue
 
@@ -131,6 +171,12 @@ class Smoother:
             if (dt < 0.5 and dx < 50
                     and not kf.get('_centering')
                     and not prev.get('_centering')):
+                self.tracer.event('smoother_drop',
+                                  pass_name='merge',
+                                  t_ms=kf['time_ms'], x=kf['x'],
+                                  prev_t_ms=prev['time_ms'], prev_x=prev['x'],
+                                  dt_s=round(dt, 3), dx=dx,
+                                  reason='close_in_time_and_position')
                 merge_count += 1
                 continue
 
@@ -207,7 +253,20 @@ class Smoother:
                     'transition': 'ease_in_out',
                     'transition_ms': trans_ms,
                 })
-                consol_count += (run_end - i)
+                # Emit one drop event per intermediate keyframe absorbed
+                # into the consolidated pan. Distinct events so the trace
+                # can be filtered exactly like the other passes.
+                dropped_count = run_end - i
+                for j in range(i, run_end):
+                    dk = merged[j]
+                    self.tracer.event('smoother_drop',
+                                      pass_name='consolidate',
+                                      t_ms=dk['time_ms'], x=dk['x'],
+                                      consolidated_into_t_ms=final['time_ms'],
+                                      consolidated_x=final['x'],
+                                      run_length=dropped_count,
+                                      reason='intermediate_pan_step')
+                consol_count += dropped_count
                 i = run_end + 1
             else:
                 consolidated.append(kf)
@@ -242,6 +301,12 @@ class Smoother:
             if kf.get('transition') == 'ease_in_out':
                 dx = abs(kf['x'] - prev['x'])
                 if dx < drift_threshold:
+                    self.tracer.event('smoother_drop',
+                                      pass_name='drift_suppress',
+                                      t_ms=kf['time_ms'], x=kf['x'],
+                                      prev_x=prev['x'], dx=dx,
+                                      drift_threshold_px=drift_threshold,
+                                      reason='movement_below_drift_threshold')
                     drift_suppressed += 1
                     continue
             stabilized.append(kf)
@@ -253,6 +318,16 @@ class Smoother:
             f'dejittered {jitter_count}, merged {merge_count}, '
             f'consolidated {consol_count} pans, hold-enforced {hold_enforced}, '
             f'drift-suppressed {drift_suppressed})')
+        self.tracer.event('smoother_complete',
+                          input_keyframes=len(kfs),
+                          output_keyframes=len(stabilized),
+                          velocity_clamped=clamped_count,
+                          temporal_dupes_removed=removed_count,
+                          dejittered=jitter_count,
+                          merged=merge_count,
+                          consolidated=consol_count,
+                          hold_enforced=hold_enforced,
+                          drift_suppressed=drift_suppressed)
         return plan
 
 
