@@ -43,12 +43,12 @@ MODEL_CACHE_TTL = 86400  # 24 hours
 # Persistent user settings — saved so they survive container/process restarts.
 USER_SETTINGS_PATH = os.path.join(_DATA_DIR, "user_settings.json")
 
-_PLACEHOLDER_KEYS = {"sk-or-...", "sk-ant-...", "AIza...", "gsk_...", ""}
+_PLACEHOLDER_KEYS = {"sk-or-...", "sk-ant-...", "AIza...", "gsk_...", "r8_...", ""}
 
 # Keys that are persisted to user_settings.json
 _PERSISTABLE_KEYS = [
     "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "GROQ_API_KEY",
-    "HF_AUTH_TOKEN",
+    "HF_AUTH_TOKEN", "REPLICATE_API_KEY",
     "OPENROUTER_PRESET", "OPENROUTER_PRIMARY_MODEL", "OPENROUTER_EDITORIAL_MODEL",
     "OPENROUTER_SUMMARY_MODEL", "OLLAMA_PRIMARY_MODEL", "OLLAMA_EDITORIAL_MODEL", "OLLAMA_TRANSLATION_MODEL",
     "WHISPER_MODEL", "WHISPER_MODEL_USER_SET", "WHISPER_BEAM_SIZE",
@@ -68,7 +68,7 @@ _PERSISTABLE_KEYS = [
 # API key fields specifically (used to filter out placeholder values)
 _API_KEY_FIELDS = {
     "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "GROQ_API_KEY",
-    "HF_AUTH_TOKEN",
+    "HF_AUTH_TOKEN", "REPLICATE_API_KEY",
     # Cloud client secrets — same "never overwrite with blank" rule.
     "GOOGLE_DRIVE_CLIENT_SECRET", "BOX_CLIENT_SECRET",
 }

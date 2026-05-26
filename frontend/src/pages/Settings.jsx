@@ -877,6 +877,9 @@ export default function Settings() {
           if (s.OPENROUTER_API_KEY === '<set>') next.openrouter = next.openrouter || '';
           if (s.ANTHROPIC_API_KEY === '<set>')  next.anthropic  = next.anthropic  || '';
           if (s.GEMINI_API_KEY === '<set>')     next.gemini     = next.gemini     || '';
+          if (s.GROQ_API_KEY === '<set>')       next.groq       = next.groq       || '';
+          if (s.HF_AUTH_TOKEN === '<set>')      next.huggingface = next.huggingface || '';
+          if (s.REPLICATE_API_KEY === '<set>')  next.replicate  = next.replicate  || '';
           return next;
         });
 
