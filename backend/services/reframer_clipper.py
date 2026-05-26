@@ -69,12 +69,26 @@ class ClipperConfig:
     chunk_duration_s: int = 600          # 10 min chunks
     max_vlm_chunks: int = 6             # caps GPU time for long videos
 
-    # ── Cloud Editorial Judge ──
+    # ── Cloud Editorial Judge (legacy: clipper-private keys) ──
+    # Retained so existing clipper_config.json files continue to work
+    # untouched. New code path uses ``judge_primary`` / ``judge_fallback``
+    # below, which pulls keys from the app-wide settings (managed by the
+    # Settings page) instead of duplicating them here.
     cloud_backend: str = "none"          # "none", "google_ai", "openrouter"
     google_ai_key: str = ""
     google_ai_model: str = "gemini-2.0-flash"
     openrouter_key: str = ""
     openrouter_model: str = "google/gemini-2.0-flash"
+
+    # ── Editorial Judge (new spec format) ──
+    # Spec format: "<backend>:<model>" where backend is one of
+    # gemini | openrouter | anthropic | groq | ollama. Empty string =
+    # no judge (or, for ``judge_fallback``, no backup). When set,
+    # these win over the legacy ``cloud_backend`` fields and the API
+    # key for the named provider is read from settings (the app-wide
+    # provider key managed in the Settings page).
+    judge_primary: str = ""
+    judge_fallback: str = ""
 
     # ── Clip Preferences ──
     platforms: list = field(default_factory=lambda: ["tiktok", "reels", "shorts"])
@@ -1968,6 +1982,338 @@ class OpenRouterJudge:
             return {"error": str(e)}
 
 
+class AnthropicJudge:
+    """Anthropic Claude editorial judge (Messages API, vision-capable)."""
+
+    ENDPOINT = "https://api.anthropic.com/v1/messages"
+    VERSION = "2023-06-01"
+
+    def __init__(self, api_key: str, model: str = "claude-sonnet-4-5"):
+        self.api_key = api_key
+        self.model = model
+
+    def judge(self, candidate: ClipCandidate, transcript_slice: str,
+              keyframes_b64: List[str], signal_summary: str,
+              preferred_subjects: str = "",
+              avoid_subjects: str = "") -> dict:
+        import urllib.request
+
+        prompt = _build_judge_prompt(
+            candidate, transcript_slice, signal_summary,
+            preferred_subjects, avoid_subjects)
+
+        content = []
+        for img_b64 in keyframes_b64[:6]:
+            content.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/jpeg",
+                    "data": img_b64,
+                },
+            })
+        content.append({"type": "text", "text": prompt})
+
+        payload = json.dumps({
+            "model": self.model,
+            "max_tokens": 1024,
+            "temperature": 0.3,
+            "messages": [{"role": "user", "content": content}],
+        }).encode()
+
+        req = urllib.request.Request(
+            self.ENDPOINT, data=payload,
+            headers={
+                "x-api-key": self.api_key,
+                "anthropic-version": self.VERSION,
+                "Content-Type": "application/json",
+            },
+            method='POST',
+        )
+
+        try:
+            resp = urllib.request.urlopen(req, timeout=45)
+            data = json.loads(resp.read().decode())
+            blocks = data.get("content") or []
+            text = next(
+                (b.get("text", "") for b in blocks if b.get("type") == "text"),
+                "")
+            return _parse_judge_response(text)
+        except Exception as e:
+            logger.warning(f"Anthropic judge error: {e}")
+            return {"error": str(e)}
+
+
+class GroqJudge:
+    """Groq editorial judge (OpenAI-compatible Chat Completions)."""
+
+    ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
+
+    def __init__(self, api_key: str, model: str = "llama-3.2-90b-vision-preview"):
+        self.api_key = api_key
+        self.model = model
+
+    def judge(self, candidate: ClipCandidate, transcript_slice: str,
+              keyframes_b64: List[str], signal_summary: str,
+              preferred_subjects: str = "",
+              avoid_subjects: str = "") -> dict:
+        import urllib.request
+
+        prompt = _build_judge_prompt(
+            candidate, transcript_slice, signal_summary,
+            preferred_subjects, avoid_subjects)
+
+        # Groq vision quirk: their llama-3.2 vision endpoint accepts at
+        # most ONE image per request. We send the middle keyframe (it
+        # tends to be the most representative); text-only models drop
+        # all images automatically below.
+        content = [{"type": "text", "text": prompt}]
+        if keyframes_b64:
+            mid = keyframes_b64[len(keyframes_b64) // 2]
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{mid}"},
+            })
+
+        payload = json.dumps({
+            "model": self.model,
+            "messages": [{"role": "user", "content": content}],
+            "temperature": 0.3,
+            "max_tokens": 1024,
+        }).encode()
+
+        req = urllib.request.Request(
+            self.ENDPOINT, data=payload,
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            method='POST',
+        )
+
+        try:
+            resp = urllib.request.urlopen(req, timeout=45)
+            data = json.loads(resp.read().decode())
+            text = data["choices"][0]["message"]["content"]
+            return _parse_judge_response(text)
+        except urllib.error.HTTPError as e:
+            if e.code in (400, 422):
+                logger.info(
+                    f"Groq model {self.model} rejected images, "
+                    f"retrying text-only")
+                return self._judge_text_only(prompt)
+            logger.warning(f"Groq judge error: {e}")
+            return {"error": str(e)}
+        except Exception as e:
+            logger.warning(f"Groq judge error: {e}")
+            return {"error": str(e)}
+
+    def _judge_text_only(self, prompt: str) -> dict:
+        import urllib.request
+        payload = json.dumps({
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.3,
+            "max_tokens": 1024,
+        }).encode()
+        req = urllib.request.Request(
+            self.ENDPOINT, data=payload,
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            method='POST',
+        )
+        try:
+            resp = urllib.request.urlopen(req, timeout=45)
+            data = json.loads(resp.read().decode())
+            text = data["choices"][0]["message"]["content"]
+            return _parse_judge_response(text)
+        except Exception as e:
+            logger.warning(f"Groq text-only judge error: {e}")
+            return {"error": str(e)}
+
+
+class OllamaJudge:
+    """Ollama editorial judge — local models via /api/chat.
+
+    Vision is supported for multimodal models (llava, llama3.2-vision,
+    moondream, qwen2.5vl, etc.) by passing the ``images`` field on the
+    user message. Non-vision models simply ignore it.
+    """
+
+    def __init__(self, host: str, model: str = "llama3.2-vision:11b"):
+        self.host = host.rstrip("/")
+        self.model = model
+
+    def judge(self, candidate: ClipCandidate, transcript_slice: str,
+              keyframes_b64: List[str], signal_summary: str,
+              preferred_subjects: str = "",
+              avoid_subjects: str = "") -> dict:
+        import urllib.request
+
+        prompt = _build_judge_prompt(
+            candidate, transcript_slice, signal_summary,
+            preferred_subjects, avoid_subjects)
+
+        msg = {"role": "user", "content": prompt}
+        if keyframes_b64:
+            msg["images"] = keyframes_b64[:4]
+
+        payload = json.dumps({
+            "model": self.model,
+            "messages": [msg],
+            "stream": False,
+            "options": {"temperature": 0.3, "num_predict": 1024},
+        }).encode()
+
+        url = f"{self.host}/api/chat"
+        req = urllib.request.Request(
+            url, data=payload,
+            headers={"Content-Type": "application/json"},
+            method='POST',
+        )
+
+        try:
+            # Local inference can be slow; Ollama needs the longer ceiling.
+            resp = urllib.request.urlopen(req, timeout=120)
+            data = json.loads(resp.read().decode())
+            text = (data.get("message") or {}).get("content", "")
+            return _parse_judge_response(text)
+        except Exception as e:
+            logger.warning(f"Ollama judge error: {e}")
+            return {"error": str(e)}
+
+
+def _build_judge_from_spec(spec: str):
+    """Construct a judge from a "<backend>:<model>" spec string.
+
+    Reads the API key for the named provider from the app-wide
+    settings (the same place the Settings page writes to). Returns
+    ``None`` if the spec is empty, malformed, or names a provider
+    whose key isn't configured.
+    """
+    if not spec or ':' not in spec:
+        return None
+    backend, model = spec.split(':', 1)
+    backend = backend.strip().lower()
+    model = model.strip()
+    if not backend or not model:
+        return None
+
+    # Lazy import to avoid pulling pydantic_settings at module import
+    # time (this module is imported in places where the app settings
+    # aren't yet initialised, e.g. tests).
+    try:
+        from backend.config import settings
+    except Exception as e:
+        logger.warning(f"Editorial judge: cannot import settings ({e})")
+        return None
+
+    if backend == "gemini" or backend == "google_ai":
+        key = settings.GEMINI_API_KEY
+        if not key:
+            logger.warning(f"Judge spec '{spec}' needs GEMINI_API_KEY, not set")
+            return None
+        return GeminiJudge(key, model)
+    if backend == "openrouter":
+        key = settings.OPENROUTER_API_KEY
+        if not key:
+            logger.warning(f"Judge spec '{spec}' needs OPENROUTER_API_KEY, not set")
+            return None
+        return OpenRouterJudge(key, model)
+    if backend == "anthropic":
+        key = settings.ANTHROPIC_API_KEY
+        if not key:
+            logger.warning(f"Judge spec '{spec}' needs ANTHROPIC_API_KEY, not set")
+            return None
+        return AnthropicJudge(key, model)
+    if backend == "groq":
+        key = settings.GROQ_API_KEY
+        if not key:
+            logger.warning(f"Judge spec '{spec}' needs GROQ_API_KEY, not set")
+            return None
+        return GroqJudge(key, model)
+    if backend == "ollama":
+        host = settings.OLLAMA_HOST
+        if not host:
+            logger.warning(f"Judge spec '{spec}' needs OLLAMA_HOST, not set")
+            return None
+        return OllamaJudge(host, model)
+
+    logger.warning(f"Unknown editorial judge backend: {backend}")
+    return None
+
+
+class FallbackJudge:
+    """Wraps a primary judge with a backup judge.
+
+    Behaviour:
+    * Calls primary first; on success, returns its result and resets
+      the failure counter.
+    * On a *transient* primary failure (timeout, 429, 5xx, network),
+      falls through to the fallback and returns whatever it produces.
+    * On a *permanent* primary failure (auth, 4xx other than 429,
+      JSON parse), returns the primary error unchanged — there is no
+      point burning fallback budget on a misconfiguration.
+    * If the primary has failed transiently ``STICKY_AFTER`` times in
+      a row, subsequent candidates skip the primary entirely and call
+      the fallback directly for the rest of the batch. This keeps
+      total wall-clock bounded when the primary is fully down — we
+      pay the primary's timeout once per (STICKY_AFTER) candidates,
+      not once per candidate. The counter resets on the next primary
+      success.
+    """
+
+    STICKY_AFTER = 3
+    TRANSIENT_MARKERS = (
+        "429", "500", "502", "503", "504",
+        "timeout", "timed out",
+        "connection", "remote disconnected",
+        "rate limit", "overloaded", "unavailable",
+    )
+
+    def __init__(self, primary, fallback):
+        self.primary = primary
+        self.fallback = fallback
+        self._primary_consecutive_failures = 0
+
+    @classmethod
+    def _is_transient(cls, err: str) -> bool:
+        e = (err or "").lower()
+        return any(m in e for m in cls.TRANSIENT_MARKERS)
+
+    def judge(self, *args, **kwargs) -> dict:
+        skip_primary = (
+            self._primary_consecutive_failures >= self.STICKY_AFTER
+        )
+
+        if not skip_primary:
+            result = self.primary.judge(*args, **kwargs)
+            if 'error' not in result:
+                self._primary_consecutive_failures = 0
+                return result
+
+            err = str(result.get('error', ''))
+            if not self._is_transient(err):
+                # Permanent — auth, model-not-found, etc. Don't fall
+                # back; the user should fix the primary config.
+                return result
+
+            self._primary_consecutive_failures += 1
+            logger.info(
+                "Primary judge transient failure (%s) — trying fallback",
+                err[:120])
+        else:
+            logger.debug(
+                "Primary judge sticky-skipped (%d consecutive failures), "
+                "using fallback directly",
+                self._primary_consecutive_failures)
+
+        fb = self.fallback.judge(*args, **kwargs)
+        return fb
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  API KEY TESTING
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2798,13 +3144,22 @@ class ClipExtractor:
             on_progress(0.60)
 
         # ── CLOUD EDITORIAL JUDGE (if configured) ─────────────
-        if self.config.cloud_backend != "none" and judge_candidates:
-            logger.info(f"Running cloud editorial judge "
-                         f"({self.config.cloud_backend}) on "
-                         f"{len(judge_candidates)} candidates...")
-
+        judge_configured = (
+            self.config.cloud_backend != "none"
+            or bool(self.config.judge_primary)
+        )
+        if judge_configured and judge_candidates:
             judge = self._create_judge()
             if judge:
+                judge_label = (
+                    self.config.judge_primary
+                    or f"legacy:{self.config.cloud_backend}"
+                )
+                if self.config.judge_fallback:
+                    judge_label += f" → {self.config.judge_fallback}"
+                logger.info(
+                    f"Running cloud editorial judge ({judge_label}) on "
+                    f"{len(judge_candidates)} candidates...")
                 self._run_editorial_judge(
                     judge, judge_candidates,
                     lambda p: on_progress(0.60 + p * 0.25) if on_progress else None
@@ -2830,7 +3185,38 @@ class ClipExtractor:
         return self.clips
 
     def _create_judge(self):
-        """Create the appropriate cloud judge based on config."""
+        """Build the editorial judge from config.
+
+        Priority order:
+        1. New spec format (``judge_primary`` / ``judge_fallback``)
+           using app-wide settings keys. If both are set, returns a
+           ``FallbackJudge`` wrapper. If only primary is set, returns
+           that judge directly.
+        2. Legacy ``cloud_backend`` + clipper-private keys (the old
+           pre-fallback config). Preserved so existing on-disk
+           configs keep working without a migration.
+        3. ``None`` — pipeline falls back to signal-only scoring.
+        """
+        primary = _build_judge_from_spec(self.config.judge_primary)
+
+        if primary is None and self.config.cloud_backend != "none":
+            primary = self._create_legacy_judge()
+
+        if primary is None:
+            return None
+
+        fallback = _build_judge_from_spec(self.config.judge_fallback)
+        if fallback is not None:
+            logger.info(
+                "Editorial judge using fallback chain: primary=%s fallback=%s",
+                self.config.judge_primary or f"legacy:{self.config.cloud_backend}",
+                self.config.judge_fallback)
+            return FallbackJudge(primary, fallback)
+
+        return primary
+
+    def _create_legacy_judge(self):
+        """Build a judge from the pre-fallback config fields."""
         if self.config.cloud_backend == "google_ai":
             if not self.config.google_ai_key:
                 logger.warning("Google AI key not set, skipping judge")
