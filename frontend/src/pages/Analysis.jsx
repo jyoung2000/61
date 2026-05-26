@@ -10,6 +10,7 @@ import SceneCard from '../components/SceneCard';
 import TranscriptViewer from '../components/TranscriptViewer';
 import ClipCard from '../components/ClipCard';
 import ReframeGrade from '../components/ReframeGrade';
+import ComputeCard from '../components/ComputeCard';
 import sanitizeJob, { sanitizeSubtitleSettings } from '../utils/sanitizeJob';
 import { sendNotification, requestNotificationPermission } from '../utils/notifications';
 import ClipSettingsPanel from '../components/ClipSettingsPanel';
@@ -3049,6 +3050,9 @@ export default function Analysis() {
           )}
           {job.reframe_report && (
             <ReframeGrade report={job.reframe_report} isMobile={isMobile} />
+          )}
+          {job.compute_summary && (
+            <ComputeCard summary={job.compute_summary} />
           )}
         </div>
       )}

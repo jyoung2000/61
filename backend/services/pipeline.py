@@ -33,6 +33,76 @@ _PROJECT_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
+def _build_compute_summary(engine, perception) -> dict:
+    """Snapshot which device each pipeline stage actually used.
+
+    Read by the frontend's Analysis-page Compute card. Three stages
+    covered because each picks GPU vs CPU independently and can
+    silently fall to CPU for different reasons:
+
+      * ``frame_extract`` — FFmpeg ``-hwaccel cuda`` for video decode.
+        Pulled from ``frame_extractor.LAST_EXTRACTION_LABEL`` which is
+        the strategy label of the successful extraction
+        (``GPU+scene`` / ``CPU+interval`` / …).
+      * ``yolo_world`` — the reframer's scene-aware subject detector.
+        Reads ``perception.face_detector._yolo_device`` (set at
+        FaceDetector __init__ time via the picker we just instrumented).
+      * ``whisper`` — speech transcription via CTranslate2. Reads
+        the engine's stashed ``_perceiver_audio_device`` (already
+        captured by the engine for GUI display).
+
+    Missing stages are simply omitted — the frontend hides any row
+    it doesn't get.
+
+    Shape: ``{stage: {"device": "cuda:0"|"cpu"|..., "detail": str}}``.
+    """
+    summary: dict = {}
+
+    # Frame extraction
+    try:
+        from backend.services import frame_extractor
+        label = getattr(frame_extractor, "LAST_EXTRACTION_LABEL", None)
+        if label:
+            on_gpu = label.startswith("GPU")
+            summary["frame_extract"] = {
+                "device": "cuda:0" if on_gpu else "cpu",
+                "detail": f"ffmpeg strategy: {label}",
+            }
+    except Exception:
+        pass
+
+    # YOLO-World subject detector (reframer perceiver)
+    try:
+        fd = getattr(perception, "face_detector", None)
+        yolo_dev = getattr(fd, "_yolo_device", None) if fd is not None else None
+        if yolo_dev is not None:
+            on_gpu = yolo_dev != "cpu"
+            summary["yolo_world"] = {
+                "device": "cuda:0" if on_gpu else "cpu",
+                "detail": "YOLO-World v2 scene-aware subject detector",
+            }
+    except Exception:
+        pass
+
+    # Whisper
+    try:
+        whisper_dev = getattr(engine, "_perceiver_audio_device", None)
+        if whisper_dev:
+            # device_used strings look like "cuda_float16" / "cpu_int8" /
+            # "cpu_int8_base" / etc. Split on the first underscore.
+            on_gpu = whisper_dev.startswith("cuda")
+            compute_type = whisper_dev.split("_", 1)[1] if "_" in whisper_dev else ""
+            summary["whisper"] = {
+                "device": "cuda:0" if on_gpu else "cpu",
+                "detail": f"CTranslate2 {compute_type}".strip()
+                          if compute_type else "CTranslate2",
+            }
+    except Exception:
+        pass
+
+    return summary
+
+
 def _log_gpu_memory(job_id: str, label: str):
     """Log current GPU memory state for VRAM debugging."""
     try:
@@ -2094,12 +2164,26 @@ async def _run_analysis_inner(job_id: str):
     _speakers = sorted({t.get("speaker", "Speaker 1") for t in transcript})
     speaker_names = {s: s for s in _speakers}
 
+    # ── Compute summary: what ran on GPU vs CPU ──────────────────
+    # Three-stage snapshot so the Analysis page can show "did the GPU
+    # actually get used?" without making the user export and grep
+    # logs. Each stage decides independently and can silently fall to
+    # CPU (different code paths, different reasons), so each gets
+    # its own row in the Compute card.
+    compute_summary = _build_compute_summary(engine, perception)
+    logger.info(
+        "[%s] compute summary: %s",
+        job_id,
+        ", ".join(f"{k}={v.get('device')}" for k, v in compute_summary.items()),
+    )
+
     await database.update_job_status(
         job_id,
         scenes=scenes,
         transcript=transcript,
         subject_track=subject_track,
         reframe_report=reframe_report,
+        compute_summary=compute_summary,
         transcript_readability=transcript_readability,
         speaker_names=speaker_names,
         language=getattr(perception, "detected_language", "") or "",

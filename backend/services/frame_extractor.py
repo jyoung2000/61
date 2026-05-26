@@ -13,6 +13,14 @@ from backend.models import FrameData
 
 logger = logging.getLogger(__name__)
 
+# Module-level snapshot of the strategy label that produced the last
+# successful frame extraction (e.g. "GPU+scene" / "CPU+interval").
+# Read by pipeline.py to populate JobResult.compute_summary so the
+# Analysis page can tell the user whether frame extraction used GPU
+# decode or fell back to CPU. ``None`` until the first extraction
+# completes. Sequential-jobs-only.
+LAST_EXTRACTION_LABEL: Optional[str] = None
+
 MAX_DIMENSION = 1568
 
 
@@ -589,6 +597,13 @@ async def extract_frames(
                 "Frame extraction succeeded (%s): %d frames",
                 label, frame_count,
             )
+            # Surface which strategy actually worked so the pipeline
+            # can stamp it on the job's compute_summary for the
+            # Analysis-page Compute card. Sequential-jobs-only — fine
+            # for the current single-worker pipeline. The label is
+            # "GPU+scene" / "GPU+interval" / "CPU+scene" / etc.
+            global LAST_EXTRACTION_LABEL
+            LAST_EXTRACTION_LABEL = label
             break
 
         # Log the failure and try next strategy

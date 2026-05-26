@@ -268,6 +268,13 @@ class JobResult(BaseModel):
     # Reframe quality grade — A-F grade, 0-100 overall score and per-axis
     # sub-scores produced by reframe_evaluator after the reframer plan is built.
     reframe_report: Optional[dict] = None
+    # Per-stage compute device. Populated as each pipeline stage runs so
+    # the Analysis page can show whether the GPU was actually used.
+    # Shape: {"<stage>": {"device": "cuda:0" | "cpu" | "gpu" | ...,
+    #                     "detail": "free VRAM 3660 MB" | "torch.cuda.is_available()=False"}}
+    # Known stages: frame_extract, yolo_world, person_pose, whisper,
+    # face_detect. Missing entries mean that stage never ran on this job.
+    compute_summary: Optional[dict] = None
     # Transcript readability score (CPS / line length / duration / gap
     # compliance against a Netflix-style rubric). Populated by
     # subtitle_formatter.compute_readability_report after analysis.
