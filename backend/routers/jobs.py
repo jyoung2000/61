@@ -1275,12 +1275,166 @@ async def rescore_clips(
     }
 
 
+# Per-job diagnostic artifacts the reframer writes alongside the
+# upload. Inlined into the log export so a remote reviewer (Claude
+# Code or otherwise) sees the per-decision data without having to
+# SSH in and grep /data/uploads/<job_id>/. Kept as raw text bodies
+# so each section stays grep-able with the same tools the user
+# already runs on the log itself (jq for the JSONL, less for the rest).
+_JOB_DIAGNOSTIC_FILES = [
+    "render_plan.json",       # per-scene signals + params + keyframe list
+    "reframe_trace.jsonl",    # per-decision events (one per line)
+]
+
+# Cap how many job dirs we walk to keep the export under reasonable
+# size on long-lived installs. Recent-first by mtime — the user's
+# last few analyses are almost always what they want to inspect.
+_DIAGNOSTIC_JOB_LIMIT = 20
+
+# Per-file size guard so one runaway artifact can't blow the
+# response up to hundreds of MB. ~2 MB is plenty for the trace
+# on a 24-min video and well below the export's overall budget.
+_DIAGNOSTIC_FILE_MAX_BYTES = 2 * 1024 * 1024
+
+
+def _recent_job_dirs(uploads_root: str, limit: int) -> list[tuple[str, str, float]]:
+    """Return ``(job_id, job_dir, mtime)`` for the ``limit`` most-recent
+    job dirs in ``uploads_root`` that look like they ran the reframer.
+
+    "Looks like the reframer ran" = has at least one of the diagnostic
+    files we'd want to inline. Jobs that are still uploading or that
+    never finished analysis are skipped to keep the export focused on
+    actionable data.
+    """
+    if not os.path.isdir(uploads_root):
+        return []
+    candidates: list[tuple[str, str, float]] = []
+    for entry in os.listdir(uploads_root):
+        job_dir = os.path.join(uploads_root, entry)
+        if not os.path.isdir(job_dir):
+            continue
+        has_any = any(
+            os.path.isfile(os.path.join(job_dir, name))
+            for name in _JOB_DIAGNOSTIC_FILES
+        )
+        if not has_any:
+            continue
+        try:
+            # Use the newest diagnostic file as the "analyzed at" mtime
+            # so re-running an old job pulls it back to the top.
+            mtime = max(
+                os.path.getmtime(os.path.join(job_dir, name))
+                for name in _JOB_DIAGNOSTIC_FILES
+                if os.path.isfile(os.path.join(job_dir, name))
+            )
+        except OSError:
+            continue
+        candidates.append((entry, job_dir, mtime))
+    candidates.sort(key=lambda x: x[2], reverse=True)
+    return candidates[:limit]
+
+
+def _read_diagnostic(path: str) -> tuple[str, int]:
+    """Read a diagnostic file with size cap. Returns ``(body, bytes_read)``."""
+    try:
+        size = os.path.getsize(path)
+    except OSError as e:
+        return (f"[clipai: cannot stat {path}: {e}]\n", 0)
+    if size > _DIAGNOSTIC_FILE_MAX_BYTES:
+        try:
+            with open(path, "rb") as f:
+                head = f.read(_DIAGNOSTIC_FILE_MAX_BYTES).decode(
+                    "utf-8", errors="replace")
+            return (
+                head + (
+                    f"\n[clipai: file truncated at "
+                    f"{_DIAGNOSTIC_FILE_MAX_BYTES} bytes "
+                    f"(actual size {size}); SSH in for the full artifact]\n"
+                ),
+                _DIAGNOSTIC_FILE_MAX_BYTES,
+            )
+        except OSError as e:
+            return (f"[clipai: cannot read {path}: {e}]\n", 0)
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return (f.read(), size)
+    except OSError as e:
+        return (f"[clipai: cannot read {path}: {e}]\n", 0)
+
+
+async def _collect_job_diagnostics() -> str:
+    """Build the ``=== JOB DIAGNOSTICS ===`` tail section of the export.
+
+    For each of the most-recent reframer jobs, dumps render_plan.json
+    and reframe_trace.jsonl inline (so a single text file gives the
+    full per-decision picture) plus the reframe_report from the job
+    record (only persisted in the DB, not as a file).
+    """
+    uploads_root = "/data/uploads"
+    jobs = _recent_job_dirs(uploads_root, _DIAGNOSTIC_JOB_LIMIT)
+    if not jobs:
+        return ""
+
+    out: list[str] = [
+        "\n",
+        "=" * 78 + "\n",
+        f"== JOB DIAGNOSTICS — {len(jobs)} most-recent reframer job(s)\n",
+        "==   render_plan.json     per-scene signals + params + keyframes\n",
+        "==   reframe_trace.jsonl  per-decision events\n",
+        "==   reframe_report       A-F grade + problems with keyframe brackets\n",
+        "=" * 78 + "\n",
+    ]
+    for job_id, job_dir, mtime in jobs:
+        ts = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat(
+            timespec="seconds")
+        out.append("\n")
+        out.append("-" * 78 + "\n")
+        out.append(f"-- JOB {job_id} (artifact mtime: {ts})\n")
+        out.append("-" * 78 + "\n")
+
+        # The DB-persisted reframe_report. Loaded best-effort so a
+        # database failure can't block the rest of the export.
+        try:
+            job = await database.load_job(job_id)
+            report = getattr(job, "reframe_report", None) if job else None
+            if report:
+                out.append("\n--- reframe_report ---\n")
+                import json as _json
+                out.append(_json.dumps(report, indent=2, default=str))
+                out.append("\n")
+        except Exception as e:
+            out.append(f"\n[clipai: failed to load reframe_report from db: {e}]\n")
+
+        # The on-disk artifacts.
+        for fname in _JOB_DIAGNOSTIC_FILES:
+            path = os.path.join(job_dir, fname)
+            if not os.path.isfile(path):
+                continue
+            body, _bytes = _read_diagnostic(path)
+            out.append(f"\n--- {fname} ---\n")
+            out.append(body)
+            if not body.endswith("\n"):
+                out.append("\n")
+
+    return "".join(out)
+
+
 @router.get("/logs/export")
 async def export_logs():
-    """Export all application logs since container start as a downloadable text file.
+    """Export the full diagnostic bundle as a single text file.
 
-    Reads from the rotating log file written by the root logger.
-    Includes current log and up to 3 rotated backups (oldest first).
+    Includes:
+      * The rotating ``/data/logs/app.log`` plus up to 3 rotated
+        backups (chronological order: oldest backup first, current
+        log last).
+      * Per-job diagnostic artifacts for the most-recent reframer
+        jobs (``render_plan.json``, ``reframe_trace.jsonl``, and
+        the persisted ``reframe_report``). Inlined with clear
+        ``=== JOB <id> ===`` section markers so a reviewer can grep
+        the same single file for both server-level events and
+        per-decision reframer events. Capped at
+        ``_DIAGNOSTIC_JOB_LIMIT`` jobs and ``_DIAGNOSTIC_FILE_MAX_BYTES``
+        per file to keep the response under control on busy installs.
     """
     log_file = "/data/logs/app.log"
     parts = []
@@ -1302,6 +1456,17 @@ async def export_logs():
                 parts.append(f.read())
         except OSError:
             pass
+
+    # Append per-job diagnostic artifacts. Failures here must not
+    # abort the export — the rotating log is the priority, the
+    # diagnostics are a bonus.
+    try:
+        diagnostics = await _collect_job_diagnostics()
+        if diagnostics:
+            parts.append(diagnostics)
+    except Exception as e:
+        logger.warning("Failed to collect job diagnostics for export: %s", e)
+        parts.append(f"\n[clipai: job diagnostics collection failed: {e}]\n")
 
     if not parts:
         raise HTTPException(status_code=404, detail="No log files found")
