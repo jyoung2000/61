@@ -336,25 +336,51 @@ class FaceDetector:
         """Set YOLO-World classes and re-sync the model to the active device.
 
         YOLO-World's ``set_classes()`` rebuilds the per-class text
-        embeddings via its CLIP text encoder. The new embedding tensors
-        land on whatever device the text encoder lives on (often CPU
-        even when the rest of the model is on CUDA), which then triggers
-        "Expected all tensors to be on the same device" inside
-        ``predict()``. Moving the whole model back to ``self._yolo_device``
-        after set_classes restores device parity.
+        embeddings via its CLIP text encoder. Those embeddings are stored
+        as plain ``Tensor`` attributes on the underlying ``WorldModel``
+        (``txt_feats``) and on the ``WorldDetect`` head — not as registered
+        buffers — so ``nn.Module.to(device)`` does NOT move them. They
+        stay on whichever device CLIP encoded them on (usually CPU), and
+        the next ``predict()`` then trips "Expected all tensors to be on
+        the same device, but got index is on cpu, different from other
+        tensors on cuda:0" inside ``WorldDetect``'s ``index_select``.
+
+        We migrate the whole module via ``.to()`` and then explicitly walk
+        the known text-feature attributes and move them too.
         """
         if self._yolo_model is None:
             raise RuntimeError("YOLO model not loaded")
         self._yolo_model.set_classes(classes)
-        if self._yolo_device != 'cpu':
+        if self._yolo_device == 'cpu':
+            return
+        try:
+            import torch
+            target = (torch.device(f'cuda:{self._yolo_device}')
+                      if isinstance(self._yolo_device, int)
+                      else torch.device(self._yolo_device))
+            self._yolo_model.to(target)
+            inner = getattr(self._yolo_model, 'model', None)
+            head = None
             try:
-                self._yolo_model.to(self._yolo_device)
-            except Exception as e:
-                logger.warning(
-                    "YOLO-World to(%s) after set_classes failed (%s) — "
-                    "falling back to CPU for the rest of this run",
-                    self._yolo_device, str(e)[:140])
-                self._yolo_device = 'cpu'
+                head = inner.model[-1] if inner is not None else None
+            except (TypeError, IndexError, AttributeError):
+                head = None
+            for obj in (inner, head):
+                if obj is None:
+                    continue
+                for attr in ('txt_feats', 'text_features'):
+                    val = getattr(obj, attr, None)
+                    if isinstance(val, torch.Tensor) and val.device != target:
+                        try:
+                            setattr(obj, attr, val.to(target))
+                        except Exception:
+                            pass
+        except Exception as e:
+            logger.warning(
+                "YOLO-World to(%s) after set_classes failed (%s) — "
+                "falling back to CPU for the rest of this run",
+                self._yolo_device, str(e)[:140])
+            self._yolo_device = 'cpu'
 
     def compute_embedding(self, frame_bgr, face_dict: dict) -> Optional[np.ndarray]:
         """Compute a 128-dim face embedding for identity matching.

@@ -1047,7 +1047,15 @@ class ReplicateDiscoveryV3:
                 transcript_segments, start_s, end_s, sig_score,
                 preferred_subjects, avoid_subjects, platforms,
                 min_dur_s, max_dur_s, ideal_dur_s, discovery_prompt,
-                chunk_idx=chunk_idx + 1, n_total=n_to_process,
+                # ``idx`` is the position inside the selected batch
+                # (1..n_to_process). The previous version passed
+                # ``chunk_idx`` (the chunk's position in the full timeline,
+                # e.g. 1..11) which produced nonsensical log lines like
+                # "coarse pass chunk 9/6" once the top-N selection skipped
+                # earlier chunks. Pass the timeline position separately so
+                # both numbers stay visible without breaking the ratio.
+                chunk_idx=idx + 1, n_total=n_to_process,
+                timeline_idx=chunk_idx + 1, n_timeline=len(chunks),
             )
             all_candidates.extend(candidates)
 
@@ -1309,10 +1317,15 @@ class ReplicateDiscoveryV3:
         preferred_subjects, avoid_subjects, platforms,
         min_dur_s, max_dur_s, ideal_dur_s, discovery_prompt,
         chunk_idx, n_total,
+        timeline_idx=None, n_timeline=None,
     ):
         chunk_path = None
         chunk_fps = self._compute_chunk_fps(signal_timeline, start_s, end_s)
         t_start = _time.time()
+        timeline_suffix = (
+            f" [timeline {timeline_idx}/{n_timeline}]"
+            if timeline_idx is not None and n_timeline is not None else ""
+        )
         try:
             chunk_path = _extract_chunk(video_path, start_s, end_s)
             transcript_slice = _slice_transcript(transcript_segments, start_s, end_s)
@@ -1326,8 +1339,9 @@ class ReplicateDiscoveryV3:
             full_prompt = f"[SYSTEM]\n{SYSTEM_PROMPT_V3}\n\n[USER]\n{segment_prompt}"
 
             logger.info(
-                "VideoLLaMA3-V3: coarse pass chunk %d/%d (%s-%s, fps=%d, max_frames=%d)",
-                chunk_idx, n_total, _fmt_time(start_s), _fmt_time(end_s),
+                "VideoLLaMA3-V3: coarse pass chunk %d/%d%s (%s-%s, fps=%d, max_frames=%d)",
+                chunk_idx, n_total, timeline_suffix,
+                _fmt_time(start_s), _fmt_time(end_s),
                 chunk_fps, self.max_frames,
             )
 
@@ -1341,8 +1355,8 @@ class ReplicateDiscoveryV3:
                 # JSON parsing failed — retry once with a flat prompt in
                 # case the SYSTEM/USER tags confused the model.
                 logger.info(
-                    "VideoLLaMA3-V3: coarse pass chunk %d/%d returned no candidates — retrying flat prompt",
-                    chunk_idx, n_total,
+                    "VideoLLaMA3-V3: coarse pass chunk %d/%d%s returned no candidates — retrying flat prompt",
+                    chunk_idx, n_total, timeline_suffix,
                 )
                 response_text = self._call_replicate_video(
                     replicate_sdk, model_ref, chunk_path, segment_prompt,
@@ -1356,15 +1370,15 @@ class ReplicateDiscoveryV3:
 
             elapsed = _time.time() - t_start
             logger.info(
-                "VideoLLaMA3-V3: coarse pass chunk %d/%d — %.1fs — %d candidates",
-                chunk_idx, n_total, elapsed, len(candidates),
+                "VideoLLaMA3-V3: coarse pass chunk %d/%d%s — %.1fs — %d candidates",
+                chunk_idx, n_total, timeline_suffix, elapsed, len(candidates),
             )
             return candidates
 
         except Exception as e:
             logger.warning(
-                "VideoLLaMA3-V3: coarse pass chunk %d/%d failed: %s",
-                chunk_idx, n_total, e,
+                "VideoLLaMA3-V3: coarse pass chunk %d/%d%s failed: %s",
+                chunk_idx, n_total, timeline_suffix, e,
             )
             return []
         finally:
