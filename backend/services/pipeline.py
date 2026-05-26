@@ -1375,6 +1375,22 @@ async def _run_analysis_inner(job_id: str):
     except Exception as _rpe:
         logger.warning("[%s] render_plan.json write failed: %s", job_id, _rpe)
 
+    # ── Reframe quality grade (A-F, 0-100 score, per-axis sub-scores) ──
+    reframe_report = None
+    try:
+        from backend.services.reframe_evaluator import ReframeEvaluator
+        _grade = await asyncio.to_thread(
+            ReframeEvaluator(reframer_plan, perception).run
+        )
+        reframe_report = _grade.to_dict()
+        reframe_report.pop("second_scores", None)
+        logger.info(
+            "[%s] reframe grade: %s (%.0f/100)", job_id,
+            reframe_report.get("grade"), reframe_report.get("overall_score", 0),
+        )
+    except Exception as _ge:
+        logger.warning("[%s] reframe grade failed: %s", job_id, _ge)
+
     # Seed the speaker-name map so the transcript UI has stable colour keys.
     _speakers = sorted({t.get("speaker", "Speaker 1") for t in transcript})
     speaker_names = {s: s for s in _speakers}
@@ -1383,6 +1399,7 @@ async def _run_analysis_inner(job_id: str):
         job_id,
         scenes=scenes,
         transcript=transcript,
+        reframe_report=reframe_report,
         speaker_names=speaker_names,
         language=getattr(perception, "detected_language", "") or "",
         default_layout_mode="single",

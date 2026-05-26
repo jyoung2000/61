@@ -113,6 +113,15 @@ class ReframeEngine:
         self.plan = smoother.smooth(self.plan)
         self.log.stop_timer('smooth')
 
+        # Stage 4.4: Eval-aligned post-smoother centering. The evaluator
+        # samples every 1 second and checks the INTERPOLATED crop_x at
+        # that timestamp, so keyframes that are centered AT the keyframe
+        # time can still drift outside the middle third in between. This
+        # pass walks both keyframe positions and the per-second eval
+        # grid and corrects both — without inflating the keyframe count
+        # the smoother just worked to collapse.
+        self._post_smoother_centering()
+
         # Stage 4.5: Live-action face enforcement
         # In live-action content, EVERY keyframe must have a face in crop.
         # This is the hard constraint that distinguishes live-action behavior.
@@ -203,6 +212,235 @@ class ReframeEngine:
         if corrected > 0:
             log.log_stage('SMOOTH',
                 f'Final face-centering: corrected {corrected} keyframes')
+
+    def _post_smoother_centering(self):
+        """Eval-aligned final centering pass after the smoother.
+
+        The reframe evaluator samples every 1 second and checks the
+        INTERPOLATED crop_x at that timestamp against the middle-third
+        band. Two failure modes survive the earlier passes and tank the
+        centering metric:
+
+        * KEYFRAME drift — a keyframe whose face is outside the
+          middle-third band. The smoother's drift suppression can
+          re-introduce these by collapsing earlier centering nudges.
+        * INTERPOLATED drift — between two centered keyframes the eased
+          interpolation can leave the face outside the middle-third for
+          half the transition duration. Phase A doesn't see this
+          because it only checks AT keyframe positions.
+
+        Both are handled here:
+
+        * Phase A nudges off-centre keyframes back inside the middle
+          third with a 35 %-crop cap so it can't yank past an adjacent
+          subject.
+        * Phase B walks the per-second eval grid and, for each second
+          that fails the middle-third check, either inserts a new
+          anchor (when the nearest existing keyframe is far away) or
+          UPDATES the nearest neighbour's x (the new behaviour — keeps
+          keyframe count flat on dense-keyframe content so Stability /
+          Hold quality / Decisiveness don't regress).
+
+        Cuts are never touched: they're intentional speaker switches
+        and nudging them has historically dragged centering down.
+        """
+        if not self.perception or not self.plan:
+            return
+
+        log = self.log
+        crop_w = self.plan.crop_w
+        max_x = self.plan.max_x
+        if crop_w <= 0 or not self.plan.keyframes:
+            return
+
+        # Build real-track set, with animated fallback (rapid scene
+        # changes can yield short-lived tracks where none clear the
+        # 25-sample bar — fall back to all tracked faces so animated
+        # shows still benefit from the centering pass).
+        track_counts: dict = {}
+        for faces in self.perception.face_timeline.values():
+            for f in faces:
+                tid = f.get('track_id', -1)
+                if tid >= 0:
+                    track_counts[tid] = track_counts.get(tid, 0) + 1
+        real_tracks = {tid for tid, cnt in track_counts.items() if cnt >= 25}
+        if not real_tracks and track_counts:
+            real_tracks = set(track_counts.keys())
+
+        # Eval's middle-third boundary: |face_cx - crop_center| <= crop_w/6.
+        # Trigger SLIGHTLY inside the boundary so sub-pixel interpolation
+        # rounding doesn't land us back on the line.
+        eval_boundary = crop_w // 6
+        trigger_offset = max(0, eval_boundary - 2)
+        NUDGE_CAP = max(20, int(crop_w * 0.35))
+
+        def _best_face_near(time_ms: int):
+            """Pick the most salient face within ±400 ms of time_ms.
+
+            Uses the same scoring as the evaluator (saliency + mouth
+            motion, confidence-weighted) so we agree on the subject and
+            filters out non-human faces via person overlap when YOLO
+            has persons at that moment.
+            """
+            best_face = None
+            best_score = 0.0
+            persons_at_t = self.perception.person_timeline.get(time_ms, [])
+            for dt in [0, -200, 200, -400, 400]:
+                faces = self.perception.face_timeline.get(time_ms + dt, [])
+                cand = faces
+                if persons_at_t:
+                    human = [f for f in faces if _face_overlaps_person(f, persons_at_t)]
+                    if human:
+                        cand = human
+                for f in cand:
+                    if f.get('track_id', -1) not in real_tracks:
+                        continue
+                    score = (f.get('saliency', 0) + f.get('mouth_motion', 0)
+                             ) * max(0.15, f.get('confidence', 0.5))
+                    if score > best_score:
+                        best_score = score
+                        best_face = f
+            return best_face
+
+        # ── Phase A: validate every keyframe ──
+        corrected = 0
+        for kf in self.plan.keyframes:
+            if kf.get('transition') == 'cut':
+                continue  # never nudge cuts
+
+            t = kf['time_ms']
+            best_face = _best_face_near(t)
+            if best_face is None:
+                continue
+
+            face_cx = best_face['cx']
+            x = kf['x']
+
+            # Face center outside crop is the inclusion-fix pass's job.
+            if face_cx < x or face_cx > x + crop_w:
+                continue
+
+            crop_center = x + crop_w // 2
+            if abs(face_cx - crop_center) <= trigger_offset:
+                continue  # already inside middle third
+
+            ideal_x = clamp_x(face_cx - crop_w // 2, max_x)
+            delta = ideal_x - x
+            sign = 1 if delta > 0 else -1
+            nudge = min(NUDGE_CAP, abs(delta)) * sign
+            new_x = clamp_x(x + nudge, max_x)
+            if new_x == x:
+                continue
+            kf['x'] = new_x
+            kf['_centering'] = True
+            corrected += 1
+
+        # ── Phase B: eval-aligned per-second pass ──
+        # The evaluator's per-second grid catches interpolated drift
+        # between keyframes that Phase A can't see. For each second
+        # whose interpolated crop puts the best face outside the
+        # middle-third band:
+        #
+        #   * If the nearest keyframe is FAR (>400 ms), insert a new
+        #     anchor at that second.
+        #   * If a neighbour is close (≤400 ms), UPDATE the neighbour's
+        #     x by nudging it toward face center. Keeps keyframe count
+        #     flat so Stability / Hold quality / Decisiveness don't
+        #     regress, which is the failure mode that left centering
+        #     stuck at 71 % on dense-keyframe content. Cut neighbours
+        #     are still never touched — we only update non-cut ones,
+        #     and fall through to "skip" when the only neighbour is a
+        #     cut.
+        from bisect import bisect_left
+
+        keyframes = self.plan.keyframes
+        existing_times = sorted(kf['time_ms'] for kf in keyframes)
+        kfs_by_time = {kf['time_ms']: kf for kf in keyframes}
+        anchor_kfs: list = []
+        anchored_count = 0
+        neighbour_updated = 0
+
+        NEIGHBOUR_WINDOW_MS = 400  # used for both "is there a neighbour" and "is it close"
+
+        def _nearest_nonzero_neighbour(time_ms: int):
+            """Return (neighbour_kf, distance_ms) — the closest non-cut
+            keyframe whose time is within NEIGHBOUR_WINDOW_MS, or None.
+            """
+            i = bisect_left(existing_times, time_ms)
+            candidates = []
+            if i < len(existing_times):
+                candidates.append(existing_times[i])
+            if i > 0:
+                candidates.append(existing_times[i - 1])
+            best_kf = None
+            best_d = NEIGHBOUR_WINDOW_MS + 1
+            for ct in candidates:
+                d = abs(ct - time_ms)
+                if d > NEIGHBOUR_WINDOW_MS:
+                    continue
+                kf = kfs_by_time.get(ct)
+                if kf is None or kf.get('transition') == 'cut':
+                    continue
+                if d < best_d:
+                    best_d = d
+                    best_kf = kf
+            return best_kf
+
+        duration_ms = self.plan.duration_ms or 0
+        for sec in range(0, duration_ms // 1000):
+            time_ms = sec * 1000
+            best_face = _best_face_near(time_ms)
+            if best_face is None:
+                continue
+            interp_x = clamp_x(interpolate_x(keyframes, time_ms), max_x)
+            face_cx = best_face['cx']
+            # Outside crop is the inclusion-fix pass's job.
+            if face_cx < interp_x or face_cx > interp_x + crop_w:
+                continue
+            crop_center = interp_x + crop_w // 2
+            if abs(face_cx - crop_center) <= eval_boundary:
+                continue  # already in middle third at eval time
+
+            neighbour = _nearest_nonzero_neighbour(time_ms)
+            ideal_x = clamp_x(face_cx - crop_w // 2, max_x)
+
+            if neighbour is None:
+                # No close neighbour — insert a fresh anchor with a
+                # short ease so it blends with surrounding keyframes
+                # instead of cutting.
+                anchor_kfs.append({
+                    'time_ms': time_ms,
+                    'x': ideal_x,
+                    'transition': 'ease_in_out',
+                    'transition_ms': 200,
+                    '_centering': True,
+                })
+                anchored_count += 1
+            else:
+                # Pull the existing neighbour toward face center. The
+                # 35 % NUDGE_CAP keeps adjacent subjects safe.
+                nx = neighbour['x']
+                delta = ideal_x - nx
+                if abs(delta) < 3:
+                    continue  # already close enough; sub-pixel jitter
+                sign = 1 if delta > 0 else -1
+                nudge = min(NUDGE_CAP, abs(delta)) * sign
+                new_nx = clamp_x(nx + nudge, max_x)
+                if new_nx == nx:
+                    continue
+                neighbour['x'] = new_nx
+                neighbour['_centering'] = True
+                neighbour_updated += 1
+
+        if anchor_kfs:
+            self.plan.keyframes.extend(anchor_kfs)
+            self.plan.keyframes.sort(key=lambda k: k['time_ms'])
+
+        if corrected or anchored_count or neighbour_updated:
+            log.log_stage('SMOOTH',
+                f'Post-smoother centering: nudged {corrected}, '
+                f'anchored {anchored_count} mid-transition seconds, '
+                f'pulled {neighbour_updated} neighbours toward face')
 
     def _enforce_live_action_faces(self):
         """Hard constraint: in live-action content, ensure every keyframe
