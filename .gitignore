@@ -19,3 +19,8 @@ tests/real_content/ground_truth/
 
 # Vendored VideoLLaMA2 source (cloned at Docker build with ENABLE_VIDEOLLAMA2=1)
 backend/services/VideoLLaMA2/
+
+# Per-session reframer log files written by ReframeLogger when code
+# runs outside Docker (tests, local CLI). In Docker the logger
+# propagates to /data/logs/app.log instead so these don't accumulate.
+backend/services/logs/
