@@ -3292,3 +3292,231 @@ async def download_nmt_model(req: DownloadNMTRequest):
         except Exception as e:
             return {"status": "error", "engine": "opus-mt", "message": str(e)}
     return {"status": "error", "message": f"unknown engine: {engine}"}
+
+
+# ── Editorial Judge config + model picker ─────────────────────────────
+# The clipper's editorial judge can use any provider the user has
+# already connected in Settings → Providers. The endpoints below let
+# the UI render a dropdown of valid (vision-capable) editorial models
+# and persist the user's pick to clipper_config.json.
+
+# Known vision-capable Ollama tags. Ollama doesn't expose a clean
+# "supports_vision" flag in /api/tags, so we recognise families by
+# name. Pull requests welcome to extend this when new vision models
+# ship.
+_OLLAMA_VISION_TAGS = (
+    "llava", "moondream", "bakllava", "minicpm-v",
+    "llama3.2-vision", "llama4", "llama-4",
+    "qwen2.5vl", "qwen-vl", "qwen2-vl", "qwen2.5-vl",
+    "gemma3", "gemma-3", "internvl", "pixtral",
+    "phi3.5-vision", "phi-3-vision",
+)
+
+
+def _clipper_config_path() -> str:
+    """Locate clipper_config.json the same way pipeline.py does."""
+    project_root = os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    return os.path.join(project_root, "clipper_config.json")
+
+
+def _read_clipper_config() -> dict:
+    path = _clipper_config_path()
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r") as f:
+            return json.load(f) or {}
+    except Exception as e:
+        logger.warning(f"Could not read clipper_config.json: {e}")
+        return {}
+
+
+def _write_clipper_config_fields(updates: dict) -> dict:
+    """Merge ``updates`` into clipper_config.json on disk.
+
+    Loads the existing JSON, applies the updates, writes atomically
+    via a temp file + rename so a crash mid-write can't corrupt the
+    config. Returns the merged dict.
+    """
+    path = _clipper_config_path()
+    cfg = _read_clipper_config()
+    cfg.update(updates)
+    tmp = path + ".tmp"
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(tmp, "w") as f:
+        json.dump(cfg, f, indent=2)
+    os.replace(tmp, path)
+    return cfg
+
+
+async def _editorial_models_openrouter() -> list:
+    """Return vision-capable OpenRouter models for the judge dropdown."""
+    raw = await _fetch_openrouter_models()
+    if not raw:
+        return []
+    out = []
+    for m in raw:
+        mid = m.get("id", "")
+        if not mid:
+            continue
+        arch = m.get("architecture", {}) or {}
+        modality = str(arch.get("modality", "")).lower()
+        input_mods = [str(x).lower() for x in arch.get("input_modalities", []) or []]
+        has_vision = "image" in modality or "image" in input_mods
+        if not has_vision:
+            continue
+        out.append({
+            "id": mid,
+            "label": m.get("name") or mid,
+            "spec": f"openrouter:{mid}",
+        })
+    out.sort(key=lambda x: x["label"].lower())
+    return out
+
+
+def _editorial_models_gemini() -> list:
+    """Hardcoded list of vision-capable Gemini models."""
+    ids = [
+        "gemini-2.5-pro",
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "gemini-2.0-flash-lite",
+        "gemini-1.5-pro",
+        "gemini-1.5-flash",
+    ]
+    return [{"id": i, "label": i, "spec": f"gemini:{i}"} for i in ids]
+
+
+def _editorial_models_anthropic() -> list:
+    """All current Claude models are vision-capable."""
+    ids = [
+        "claude-opus-4-5",
+        "claude-sonnet-4-6",
+        "claude-sonnet-4-5",
+        "claude-haiku-4-5",
+        "claude-3-5-sonnet-latest",
+        "claude-3-5-haiku-latest",
+    ]
+    return [{"id": i, "label": i, "spec": f"anthropic:{i}"} for i in ids]
+
+
+def _editorial_models_groq() -> list:
+    """Groq vision-capable models (the llama-3.2-vision family)."""
+    ids = [
+        "llama-3.2-90b-vision-preview",
+        "llama-3.2-11b-vision-preview",
+    ]
+    return [{"id": i, "label": i, "spec": f"groq:{i}"} for i in ids]
+
+
+async def _editorial_models_ollama() -> list:
+    """Query Ollama for installed models, filter to known vision tags."""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(f"{settings.OLLAMA_HOST}/api/tags")
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as e:
+        logger.debug(f"Ollama tag list unavailable: {e}")
+        return []
+    out = []
+    for m in data.get("models", []) or []:
+        name = m.get("name", "")
+        if not name:
+            continue
+        lower = name.lower()
+        if not any(tag in lower for tag in _OLLAMA_VISION_TAGS):
+            continue
+        out.append({"id": name, "label": name, "spec": f"ollama:{name}"})
+    out.sort(key=lambda x: x["label"].lower())
+    return out
+
+
+@router.get("/clipper/editorial-models")
+async def list_editorial_models():
+    """Return the dropdown data for the Editorial Judge picker.
+
+    For each backend, reports whether the user has it connected
+    (an API key set, or Ollama reachable) and lists the
+    vision-capable models they can pick from. UI uses this to
+    populate the primary + fallback selectors.
+    """
+    providers = []
+
+    providers.append({
+        "backend": "gemini",
+        "label": "Google Gemini",
+        "configured": _key_is_set(settings.GEMINI_API_KEY),
+        "models": _editorial_models_gemini()
+            if _key_is_set(settings.GEMINI_API_KEY) else [],
+    })
+
+    or_configured = _key_is_set(settings.OPENROUTER_API_KEY)
+    providers.append({
+        "backend": "openrouter",
+        "label": "OpenRouter",
+        "configured": or_configured,
+        "models": (await _editorial_models_openrouter()) if or_configured else [],
+    })
+
+    providers.append({
+        "backend": "anthropic",
+        "label": "Anthropic",
+        "configured": _key_is_set(settings.ANTHROPIC_API_KEY),
+        "models": _editorial_models_anthropic()
+            if _key_is_set(settings.ANTHROPIC_API_KEY) else [],
+    })
+
+    providers.append({
+        "backend": "groq",
+        "label": "Groq",
+        "configured": _key_is_set(settings.GROQ_API_KEY),
+        "models": _editorial_models_groq()
+            if _key_is_set(settings.GROQ_API_KEY) else [],
+    })
+
+    ollama_models = await _editorial_models_ollama()
+    providers.append({
+        "backend": "ollama",
+        "label": "Ollama (local)",
+        "configured": bool(ollama_models),
+        "models": ollama_models,
+    })
+
+    return {"providers": providers}
+
+
+class JudgeConfigRequest(BaseModel):
+    primary: Optional[str] = None    # spec "<backend>:<model>" or ""
+    fallback: Optional[str] = None   # spec "<backend>:<model>" or ""
+
+
+@router.get("/clipper/judge-config")
+async def get_judge_config():
+    """Return the currently saved editorial judge specs."""
+    cfg = _read_clipper_config()
+    return {
+        "primary": cfg.get("judge_primary", "") or "",
+        "fallback": cfg.get("judge_fallback", "") or "",
+    }
+
+
+@router.put("/clipper/judge-config")
+async def put_judge_config(req: JudgeConfigRequest):
+    """Save the editorial judge spec choices to clipper_config.json.
+
+    Accepts ``primary`` and ``fallback`` as "<backend>:<model>" specs
+    or empty strings. Empty primary disables the judge entirely; empty
+    fallback disables the safety net but keeps the primary.
+    """
+    updates = {}
+    if req.primary is not None:
+        updates["judge_primary"] = req.primary.strip()
+    if req.fallback is not None:
+        updates["judge_fallback"] = req.fallback.strip()
+    cfg = _write_clipper_config_fields(updates)
+    return {
+        "primary": cfg.get("judge_primary", "") or "",
+        "fallback": cfg.get("judge_fallback", "") or "",
+    }
