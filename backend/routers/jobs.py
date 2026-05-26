@@ -1284,6 +1284,64 @@ async def rescore_clips(
 _JOB_DIAGNOSTIC_FILES = [
     "render_plan.json",       # per-scene signals + params + keyframe list
     "reframe_trace.jsonl",    # per-decision events (one per line)
+    "detection_overlay.json", # face / person / motion / saliency timelines
+                              # in source-pixel coords — the raw inputs
+                              # the planner reasoned over. Without this
+                              # the trace tells you the decision but not
+                              # what alternatives were available.
+]
+
+# Keys whose values are secrets — printed as ``<set>`` / ``<unset>``
+# placeholders in the ACTIVE CONFIG block rather than leaking into the
+# exported log. The user mails this file around for debugging, so
+# anything containing an API key, OAuth secret, encryption key, or
+# token must be redacted here.
+_REDACTED_CONFIG_KEYS = {
+    # backend/config.py
+    "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY",
+    "GROQ_API_KEY", "REPLICATE_API_KEY", "GOOGLE_TRANSLATE_API_KEY",
+    "DEEPL_API_KEY", "HF_AUTH_TOKEN", "CLIPAI_TOKEN_ENC_KEY",
+    "GOOGLE_DRIVE_CLIENT_SECRET", "BOX_CLIENT_SECRET",
+    # clipper_config.json
+    "google_ai_key", "openrouter_key", "replicate_api_key",
+}
+
+# Subset of ``settings`` fields actually useful for reframer debugging.
+# A full dump would include cloud-storage paths, FastAPI internals, and
+# 60+ feature flags unrelated to the analysis pipeline — too much noise.
+_CONFIG_KEYS_OF_INTEREST = [
+    "AI_PROVIDER", "AI_FALLBACK_CHAIN", "SELF_HOSTED_MODE",
+    "CLIP_ENGINE_SOURCE", "EDITORIAL_AI_SOURCE",
+    "OPENROUTER_PRESET", "OPENROUTER_PRIMARY_MODEL",
+    "OPENROUTER_EDITORIAL_MODEL", "OPENROUTER_SUMMARY_MODEL",
+    "ANTHROPIC_MODEL", "GEMINI_EDITORIAL_MODEL", "GEMINI_VIDEO_MODEL",
+    "GEMINI_USE_NATIVE_VIDEO", "GROQ_EDITORIAL_MODEL",
+    "OLLAMA_HOST", "OLLAMA_PRIMARY_MODEL", "OLLAMA_EDITORIAL_MODEL",
+    "VIDEOLLAMA2_ENABLED", "VIDEOLLAMA2_MODEL", "VIDEOLLAMA2_QUANTIZE",
+    "VIDEOLLAMA3_ENHANCED", "VIDEOLLAMA3_FPS", "VIDEOLLAMA3_MAX_FRAMES",
+    "VIDEOLLAMA3_REFINEMENT_PASS", "VIDEOLLAMA3_KEYFRAME_ANALYSIS",
+    "VIDEOLLAMA3_AUDIO_ANNOTATION", "VIDEOLLAMA3_ADAPTIVE_CHUNKS",
+    "REPLICATE_MODEL", "REPLICATE_ENABLED",
+    "WHISPER_MODEL", "WHISPER_BEAM_SIZE", "WHISPER_VAD_FILTER",
+    "WHISPER_VAD_ONSET", "WHISPER_NO_SPEECH_THRESHOLD",
+    "WHISPER_AUDIO_PRECONDITION", "WHISPER_AUTO_UPGRADE",
+    "FRAME_SAMPLE_RATE", "MIN_FRAMES", "FRAMES_PER_MINUTE",
+    "MAX_CLIP_CANDIDATES", "CLIP_MIN_DURATION", "CLIP_MAX_DURATION",
+    "CLIP_COUNT", "CLIP_PREFERRED_SUBJECTS", "CLIP_AVOID_SUBJECTS",
+    "AI_TRANSCRIPT_CORRECTION", "TRANSCRIPT_POLISHING_ENABLED",
+    "TRANSCRIPT_FILLER_REMOVAL", "TRANSCRIPT_SENTENCE_REPAIR",
+    "TRANSCRIPT_PRESERVE_WORDS", "TRANSCRIPT_READABILITY_TARGET",
+    "TRANSCRIPT_READABILITY_MAX_PASSES",
+    "SUBTITLE_CPS_ENFORCEMENT", "SUBTITLE_MAX_CPS",
+    "SUBTITLE_MAX_CHARS_PER_LINE", "SUBTITLE_PLATFORM_PROFILE",
+    "TRANSLATION_ENGINE", "TRANSLATION_CONTEXT_WINDOW",
+    "GPU_ACCELERATION_ENABLED", "GPU_VENDOR_OVERRIDE",
+    "GPU_HWDECODE_ENABLED", "GPU_HEVC_FOR_4K", "GPU_DEVICE_INDEX",
+    "GPU_FREE_BEFORE_ANALYSIS", "GPU_FREE_BEFORE_WHISPER",
+    "FFMPEG_PRESET", "FFMPEG_CRF", "FFMPEG_THREADS", "FFMPEG_FASTSTART",
+    "DIARIZATION_ENABLED", "AUDIO_EVENT_DETECTION",
+    "SUBJECT_TRACKING_ENABLED", "CLIPAI_CAMERA_SOLVER",
+    "CLIPAI_CONTENT_ROUTING",
 ]
 
 # Cap how many job dirs we walk to keep the export under reasonable
@@ -1362,6 +1420,156 @@ def _read_diagnostic(path: str) -> tuple[str, int]:
         return (f"[clipai: cannot read {path}: {e}]\n", 0)
 
 
+def _build_active_config_block() -> str:
+    """Snapshot the reframer-relevant config knobs once for the export.
+
+    Two sources merged:
+
+      * ``backend.config.settings`` — process-wide env-driven settings
+        (Whisper tier, AI provider chain, GPU flags, FFmpeg knobs, …).
+        Filtered to ``_CONFIG_KEYS_OF_INTEREST`` to keep the noise
+        floor low. Secret keys redacted to ``<set>`` / ``<unset>``.
+
+      * ``/app/clipper_config.json`` — the clipper's per-install
+        dataclass (judge selection, VLM toggle, platform list, max
+        clips, etc.). Secret keys redacted the same way.
+
+    Snapshot reflects current values at export time, not necessarily
+    what was in effect when each job ran — but in practice the user
+    rarely changes these between runs, and the most-recent jobs at
+    the top of the diagnostics list are the ones a reviewer is
+    actually looking at.
+    """
+    lines: list[str] = ["\n", "=" * 78 + "\n",
+                        "== ACTIVE CONFIG (current values at export time)\n",
+                        "=" * 78 + "\n"]
+
+    # ── backend.config.settings ──
+    try:
+        from backend.config import settings
+        lines.append("\n--- settings (backend/config.py) ---\n")
+        for key in _CONFIG_KEYS_OF_INTEREST:
+            value = getattr(settings, key, None)
+            if value is None:
+                continue
+            lines.append(f"{key} = {value!r}\n")
+        # Secret-bearing keys: render as <set>/<unset> only.
+        lines.append("\n--- settings (secrets, redacted) ---\n")
+        for key in sorted(_REDACTED_CONFIG_KEYS):
+            if not hasattr(settings, key):
+                continue
+            value = getattr(settings, key, None)
+            present = bool(value) and str(value) not in ("<set>", "")
+            lines.append(f"{key} = {'<set>' if present else '<unset>'}\n")
+    except Exception as e:
+        lines.append(f"\n[clipai: failed to read settings: {e}]\n")
+
+    # ── clipper_config.json ──
+    try:
+        clipper_path = "/app/clipper_config.json"
+        if not os.path.isfile(clipper_path):
+            # Fall back to the location pipeline.py uses (project root
+            # discovered from this file's parents). Mirrors the loader
+            # at backend/services/pipeline.py:_PROJECT_ROOT.
+            clipper_path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.dirname(
+                    os.path.abspath(__file__)))),
+                "clipper_config.json")
+        if os.path.isfile(clipper_path):
+            import json as _json
+            with open(clipper_path, "r", encoding="utf-8") as f:
+                cfg = _json.load(f)
+            for k in list(cfg.keys()):
+                if k in _REDACTED_CONFIG_KEYS:
+                    cfg[k] = "<set>" if cfg[k] else "<unset>"
+            lines.append("\n--- clipper_config.json ---\n")
+            lines.append(_json.dumps(cfg, indent=2, default=str))
+            lines.append("\n")
+        else:
+            lines.append("\n[clipai: clipper_config.json not found]\n")
+    except Exception as e:
+        lines.append(f"\n[clipai: failed to read clipper_config.json: {e}]\n")
+
+    return "".join(lines)
+
+
+def _build_job_context_block(job, job_dir: str) -> str:
+    """One-block summary so a reviewer doesn't have to scroll the app
+    log to figure out what this job actually was.
+
+    Pulls source dims / fps / crop geometry from ``render_plan.json``
+    when present (most reliable — it's what the reframer actually
+    saw), and the rest from the job DB record (file name, language,
+    duration, content type, cost, compute summary).
+    """
+    fields: list[tuple[str, object]] = []
+    if job is not None:
+        for attr, label in [
+            ("status", "status"),
+            ("language", "detected_language"),
+            ("subtitle_language", "subtitle_language"),
+            ("analysis_duration_seconds", "analysis_duration_seconds"),
+            ("estimated_cost_usd", "estimated_cost_usd"),
+            ("content_type_override", "content_type_override"),
+            ("game_type", "game_type"),
+            ("anime_subtype", "anime_subtype"),
+            ("created_at", "created_at"),
+            ("updated_at", "updated_at"),
+        ]:
+            value = getattr(job, attr, None)
+            if value not in (None, "", 0, 0.0):
+                fields.append((label, value))
+        # compute_summary is itself a dict — render compactly inline so
+        # the reviewer can read it at a glance.
+        cs = getattr(job, "compute_summary", None)
+        if isinstance(cs, dict) and cs:
+            badges = ", ".join(
+                f"{stage}={(info or {}).get('device', '?')}"
+                for stage, info in cs.items())
+            fields.append(("compute_summary", badges))
+        clips = getattr(job, "clips", None) or []
+        fields.append(("clip_count", len(clips)))
+
+    # Pull the source geometry + duration out of render_plan.json (the
+    # planner's own record of what it saw). More reliable than the DB
+    # record which can drift if the user kicks off a regenerate.
+    plan_path = os.path.join(job_dir, "render_plan.json")
+    if os.path.isfile(plan_path):
+        try:
+            import json as _json
+            with open(plan_path, "r", encoding="utf-8") as f:
+                plan = _json.load(f)
+            for k in ("source_width", "source_height", "target_width",
+                      "target_height", "fps", "duration_ms", "crop_w",
+                      "crop_h", "crop_y", "version"):
+                if k in plan:
+                    fields.append((f"plan.{k}", plan[k]))
+            scenes = plan.get("scenes") or []
+            if scenes:
+                strategies = {}
+                for sc in scenes:
+                    s = sc.get("strategy", "?")
+                    strategies[s] = strategies.get(s, 0) + 1
+                fields.append(("plan.scenes", len(scenes)))
+                fields.append((
+                    "plan.strategy_breakdown",
+                    ", ".join(f"{s}={n}" for s, n in
+                              sorted(strategies.items(), key=lambda x: -x[1])),
+                ))
+            fields.append(("plan.keyframes", len(plan.get("keyframes") or [])))
+        except Exception as e:
+            fields.append(("plan_read_error", str(e)))
+
+    if not fields:
+        return ""
+
+    width = max(len(label) for label, _ in fields)
+    out = ["\n--- job context ---\n"]
+    for label, value in fields:
+        out.append(f"{label:<{width}} : {value}\n")
+    return "".join(out)
+
+
 async def _collect_job_diagnostics() -> str:
     """Build the ``=== JOB DIAGNOSTICS ===`` tail section of the export.
 
@@ -1379,11 +1587,17 @@ async def _collect_job_diagnostics() -> str:
         "\n",
         "=" * 78 + "\n",
         f"== JOB DIAGNOSTICS — {len(jobs)} most-recent reframer job(s)\n",
-        "==   render_plan.json     per-scene signals + params + keyframes\n",
-        "==   reframe_trace.jsonl  per-decision events\n",
-        "==   reframe_report       A-F grade + problems with keyframe brackets\n",
+        "==   job context           source dims / fps / strategies / clips\n",
+        "==   reframe_report        A-F grade + problems with keyframe brackets\n",
+        "==   render_plan.json      per-scene signals + params + keyframes\n",
+        "==   reframe_trace.jsonl   per-decision events\n",
+        "==   detection_overlay.json face / person / motion / saliency timelines\n",
         "=" * 78 + "\n",
     ]
+    # ACTIVE CONFIG goes once at the top — it's the same for every
+    # job in the export. Cheaper to read once and cleaner to read.
+    out.append(_build_active_config_block())
+
     for job_id, job_dir, mtime in jobs:
         ts = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat(
             timespec="seconds")
@@ -1392,18 +1606,24 @@ async def _collect_job_diagnostics() -> str:
         out.append(f"-- JOB {job_id} (artifact mtime: {ts})\n")
         out.append("-" * 78 + "\n")
 
-        # The DB-persisted reframe_report. Loaded best-effort so a
-        # database failure can't block the rest of the export.
+        # The DB-persisted reframe_report + the per-job context block.
+        # Loaded best-effort so a database failure can't block the rest
+        # of the export — even if the DB read fails, we still emit the
+        # on-disk artifacts below.
+        job = None
         try:
             job = await database.load_job(job_id)
-            report = getattr(job, "reframe_report", None) if job else None
-            if report:
-                out.append("\n--- reframe_report ---\n")
-                import json as _json
-                out.append(_json.dumps(report, indent=2, default=str))
-                out.append("\n")
         except Exception as e:
-            out.append(f"\n[clipai: failed to load reframe_report from db: {e}]\n")
+            out.append(f"\n[clipai: failed to load job from db: {e}]\n")
+
+        out.append(_build_job_context_block(job, job_dir))
+
+        report = getattr(job, "reframe_report", None) if job else None
+        if report:
+            out.append("\n--- reframe_report ---\n")
+            import json as _json
+            out.append(_json.dumps(report, indent=2, default=str))
+            out.append("\n")
 
         # The on-disk artifacts.
         for fname in _JOB_DIAGNOSTIC_FILES:
