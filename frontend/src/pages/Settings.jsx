@@ -76,6 +76,17 @@ export default function Settings() {
   const [transSaved, setTransSaved] = useState({ beam_size: 1, vad_filter: true, frame_sample_rate: 10 });
   const [transSaving, setTransSaving] = useState(false);
 
+  // Editorial Judge (clip scoring) — separate from app-wide Editorial AI.
+  // Picks per-clip scoring model + an optional fallback from any
+  // already-connected provider.
+  const [judgeProviders, setJudgeProviders] = useState(null); // /api/clipper/editorial-models payload
+  const [judgePrimary, setJudgePrimary] = useState('');
+  const [judgeFallback, setJudgeFallback] = useState('');
+  const [judgePrimarySaved, setJudgePrimarySaved] = useState('');
+  const [judgeFallbackSaved, setJudgeFallbackSaved] = useState('');
+  const [judgeSaving, setJudgeSaving] = useState(false);
+  const [judgeLoading, setJudgeLoading] = useState(false);
+
   // NOTE: Whisper testing is now in PipelineDiagnostics component
 
   // FFmpeg encoding settings
@@ -386,6 +397,64 @@ export default function Settings() {
       || statuses._active?.ollama_enabled;
     if (hasProvider) loadAvailableModels();
   }, [statuses.openrouter?.status, statuses.anthropic?.status, statuses.gemini?.status, statuses._active?.ollama_enabled]);
+
+  // Editorial Judge — load the available-models manifest + saved picks.
+  const loadJudgeData = async () => {
+    setJudgeLoading(true);
+    try {
+      const [mres, cres] = await Promise.all([
+        fetch('/api/clipper/editorial-models'),
+        fetch('/api/clipper/judge-config'),
+      ]);
+      const mdata = mres.ok ? await mres.json() : { providers: [] };
+      const cdata = cres.ok ? await cres.json() : { primary: '', fallback: '' };
+      setJudgeProviders(mdata);
+      setJudgePrimary(cdata.primary || '');
+      setJudgeFallback(cdata.fallback || '');
+      setJudgePrimarySaved(cdata.primary || '');
+      setJudgeFallbackSaved(cdata.fallback || '');
+    } catch (e) {
+      console.error('Could not load editorial judge data:', e);
+    } finally {
+      setJudgeLoading(false);
+    }
+  };
+
+  useEffect(() => { loadJudgeData(); }, []);
+
+  // Refresh after any provider status change — keeps the dropdown
+  // honest when the user adds / removes an API key.
+  useEffect(() => {
+    if (statuses && Object.keys(statuses).length > 0) loadJudgeData();
+  }, [
+    statuses.openrouter?.status,
+    statuses.anthropic?.status,
+    statuses.gemini?.status,
+    statuses.groq?.status,
+    statuses._active?.ollama_enabled,
+  ]);
+
+  const judgeHasChanges =
+    judgePrimary !== judgePrimarySaved || judgeFallback !== judgeFallbackSaved;
+
+  const handleSaveJudgeConfig = async () => {
+    setJudgeSaving(true);
+    try {
+      const res = await fetch('/api/clipper/judge-config', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ primary: judgePrimary, fallback: judgeFallback }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      setJudgePrimarySaved(data.primary || '');
+      setJudgeFallbackSaved(data.fallback || '');
+    } catch (e) {
+      console.error('Could not save editorial judge config:', e);
+    } finally {
+      setJudgeSaving(false);
+    }
+  };
 
   // Map our short provider name (the dropdown id) to the backend
   // env-var name expected by the per-user settings overlay.
@@ -1002,6 +1071,65 @@ export default function Settings() {
     );
   };
 
+  // Dropdown for the Editorial Judge (clip scoring) primary / fallback
+  // picker. Renders each connected provider as an <optgroup> with its
+  // available models. Disabled providers (no API key set) appear as a
+  // dimmed group with a hint instead of being hidden, so users can see
+  // which keys they're missing.
+  const JudgeModelSelect = ({
+    label, value, onChange, providers,
+    allowNone = true, noneLabel = 'None',
+    disabled = false, disabledHint = '',
+  }) => {
+    const hasAny = (providers || []).some((p) => p.configured && (p.models || []).length > 0);
+    return (
+      <div style={{ marginBottom: 14 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 4 }}>
+          <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>{label}</span>
+          {value && (
+            <span style={{ fontSize: 10, fontFamily: 'var(--font-mono)', color: 'var(--accent-cyan)' }}>
+              {value}
+            </span>
+          )}
+        </div>
+        <select
+          value={value || ''}
+          onChange={(e) => onChange(e.target.value)}
+          disabled={disabled || !hasAny}
+          style={{
+            ...dropdownStyle,
+            opacity: (disabled || !hasAny) ? 0.5 : 1,
+            cursor: (disabled || !hasAny) ? 'not-allowed' : 'pointer',
+          }}
+        >
+          {allowNone && <option value="">{noneLabel}</option>}
+          {(providers || []).map((p) => {
+            if (!p.configured) {
+              return (
+                <option key={p.backend} value="" disabled>
+                  {p.label} — not connected
+                </option>
+              );
+            }
+            if (!p.models || p.models.length === 0) return null;
+            return (
+              <optgroup key={p.backend} label={p.label}>
+                {p.models.map((m) => (
+                  <option key={m.spec} value={m.spec}>{m.label}</option>
+                ))}
+              </optgroup>
+            );
+          })}
+        </select>
+        {disabled && disabledHint && (
+          <span style={{ fontSize: 10, color: 'var(--text-muted)', display: 'block', marginTop: 4 }}>
+            {disabledHint}
+          </span>
+        )}
+      </div>
+    );
+  };
+
   return (
     <div>
       <h2 style={{ fontSize: isMobile ? 18 : 20, marginBottom: isMobile ? 20 : 24 }}>Settings</h2>
@@ -1555,6 +1683,88 @@ export default function Settings() {
                   <span style={{ fontSize: 11, color: 'var(--success)' }}>
                     All models saved
                   </span>
+                )}
+              </div>
+
+              {/* ── Editorial Judge (clip scoring) ─────────────── */}
+              {/* Separate from the "Editorial AI" dropdown above —
+                  this one only runs inside the clipper's per-candidate
+                  scoring loop. Lets the user pick a primary model and
+                  an optional fallback to handle rate limits / outages. */}
+              <div style={{
+                marginTop: 24, padding: '16px 18px',
+                background: 'var(--bg-panel)', border: '1px solid var(--border)',
+                borderRadius: 'var(--radius-md)',
+              }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 6 }}>
+                  <h4 style={{ fontSize: 13, margin: 0, color: 'var(--text-primary)' }}>
+                    Editorial Judge (Clip Scoring)
+                    {judgeHasChanges && (
+                      <span style={{ fontSize: 10, fontWeight: 400, color: 'var(--accent-amber)', marginLeft: 8 }}>
+                        unsaved
+                      </span>
+                    )}
+                  </h4>
+                </div>
+                <p style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 14, lineHeight: 1.5 }}>
+                  The clipper sends each candidate clip (with keyframes + transcript)
+                  to this model to score hook / payoff / retention. If the primary is
+                  rate-limited or unreachable, the fallback takes over automatically.
+                  Only vision-capable models from your connected providers are shown.
+                </p>
+
+                {judgeLoading && (
+                  <div style={{ padding: 12, color: 'var(--text-muted)', fontSize: 12 }}>
+                    Loading available models...
+                  </div>
+                )}
+
+                {!judgeLoading && judgeProviders && (
+                  <>
+                    <JudgeModelSelect
+                      label="Primary"
+                      value={judgePrimary}
+                      onChange={setJudgePrimary}
+                      providers={judgeProviders.providers}
+                      allowNone={true}
+                      noneLabel="No editorial judge (signal-only scoring)"
+                    />
+                    <JudgeModelSelect
+                      label="Fallback"
+                      value={judgeFallback}
+                      onChange={setJudgeFallback}
+                      providers={judgeProviders.providers}
+                      allowNone={true}
+                      noneLabel="No fallback"
+                      disabled={!judgePrimary}
+                      disabledHint="Pick a primary first"
+                    />
+
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 12 }}>
+                      <button
+                        onClick={handleSaveJudgeConfig}
+                        disabled={!judgeHasChanges || judgeSaving}
+                        style={{
+                          padding: '8px 22px',
+                          background: judgeHasChanges ? 'var(--accent-cyan)' : 'var(--bg-elevated)',
+                          color: judgeHasChanges ? 'var(--bg-base)' : 'var(--text-muted)',
+                          border: judgeHasChanges ? 'none' : '1px solid var(--border)',
+                          borderRadius: 'var(--radius-sm)', fontSize: 12, fontWeight: 600,
+                          opacity: (!judgeHasChanges || judgeSaving) ? 0.5 : 1,
+                        }}
+                      >
+                        {judgeSaving ? 'Saving...' : 'Save Editorial Judge'}
+                      </button>
+                      {!judgeHasChanges && !judgeSaving && judgePrimarySaved && (
+                        <span style={{ fontSize: 11, color: 'var(--success)' }}>Saved</span>
+                      )}
+                      {judgeProviders.providers.every((p) => !p.configured) && (
+                        <span style={{ fontSize: 11, color: 'var(--accent-amber)' }}>
+                          Connect a provider above to pick a judge model
+                        </span>
+                      )}
+                    </div>
+                  </>
                 )}
               </div>
             </>
