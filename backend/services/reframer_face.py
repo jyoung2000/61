@@ -215,7 +215,7 @@ class FaceDetector:
                     "painting", "poster", "picture", "screen",
                 ]
                 try:
-                    self._yolo_model.set_classes(self._yolo_classes)
+                    self._yolo_set_classes(self._yolo_classes)
                     log.log_stage('PERCEIVE',
                         f'YOLO-World loaded with {len(self._yolo_classes)} classes: '
                         f'{", ".join(self._yolo_classes[:6])}...')
@@ -331,6 +331,30 @@ class FaceDetector:
                 self._yolo_device = 'cpu'
                 return self._yolo_model.predict(*args, device='cpu', **kwargs)
             raise
+
+    def _yolo_set_classes(self, classes):
+        """Set YOLO-World classes and re-sync the model to the active device.
+
+        YOLO-World's ``set_classes()`` rebuilds the per-class text
+        embeddings via its CLIP text encoder. The new embedding tensors
+        land on whatever device the text encoder lives on (often CPU
+        even when the rest of the model is on CUDA), which then triggers
+        "Expected all tensors to be on the same device" inside
+        ``predict()``. Moving the whole model back to ``self._yolo_device``
+        after set_classes restores device parity.
+        """
+        if self._yolo_model is None:
+            raise RuntimeError("YOLO model not loaded")
+        self._yolo_model.set_classes(classes)
+        if self._yolo_device != 'cpu':
+            try:
+                self._yolo_model.to(self._yolo_device)
+            except Exception as e:
+                logger.warning(
+                    "YOLO-World to(%s) after set_classes failed (%s) — "
+                    "falling back to CPU for the rest of this run",
+                    self._yolo_device, str(e)[:140])
+                self._yolo_device = 'cpu'
 
     def compute_embedding(self, frame_bgr, face_dict: dict) -> Optional[np.ndarray]:
         """Compute a 128-dim face embedding for identity matching.

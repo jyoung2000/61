@@ -1027,7 +1027,7 @@ class ReplicateDiscoveryV3:
             "VideoLLaMA3-V3: %s chunking produced %d chunks (%s)",
             "adaptive" if self.adaptive_chunks else "rigid",
             len(chunks),
-            ", ".join(f"{_fmt_time(s)}-{_fmt_time(e)}" for _, s, e in chunks[:8])
+            ", ".join(f"{_fmt_time(s)}-{_fmt_time(e)}" for s, e in chunks[:8])
             + ("…" if len(chunks) > 8 else ""),
         )
         logger.info(

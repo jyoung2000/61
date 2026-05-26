@@ -172,8 +172,11 @@ class Perceiver:
                     dt = int(r.duration_ms * (di + 1) / 9)
                     discovery_times.append(dt)
 
-                # Set broad vocab for discovery
-                self.face_detector._yolo_model.set_classes(_DISCOVERY_VOCAB)
+                # Set broad vocab for discovery. The helper re-syncs the
+                # model to the GPU after set_classes — without it the new
+                # class-embedding tensors land on CPU and predict() trips
+                # "Expected all tensors to be on the same device".
+                self.face_detector._yolo_set_classes(_DISCOVERY_VOCAB)
 
                 class_counts = {}
                 class_confs = {}
@@ -219,8 +222,10 @@ class Perceiver:
                     if len(final_classes) >= 15:
                         break
 
-                # Set the narrowed vocab for the full analysis
-                self.face_detector._yolo_model.set_classes(final_classes)
+                # Set the narrowed vocab for the full analysis (helper
+                # re-syncs the model to GPU to avoid the mixed-device crash
+                # this used to produce on CUDA runs).
+                self.face_detector._yolo_set_classes(final_classes)
                 self.face_detector._yolo_classes = final_classes
 
                 discovered = [f"{c}({class_counts.get(c, 0)})"

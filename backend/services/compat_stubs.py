@@ -166,7 +166,10 @@ def deduplicate_overlapping_clips(clips, overlap_threshold: float = 0.5):
 
 _model = None
 _model_lock = threading.Lock()
-_last_detected_language = ""
+# Dict shape: callers do ``_last_detected_language.get("lang", "")`` so this
+# must be a mapping, not a string. The empty-string default tripped the
+# transcript polisher with ``'str' object has no attribute 'get'``.
+_last_detected_language: dict = {}
 _last_diarization_method = ""
 
 

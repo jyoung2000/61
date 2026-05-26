@@ -633,7 +633,18 @@ async def _auto_generate_clip_seo(
 
     job = await database.load_job(job_id)
     if not job or not job.clips:
+        # Surface the explicit reason — without this log, "SEO generated
+        # for 0 clips" gives no clue whether the clips never made it to
+        # the DB (timing) or whether the loop ran and skipped them all.
+        logger.info(
+            "[%s] Auto-SEO skipped early: job_loaded=%s, clip_count=%d",
+            job_id, bool(job), len(getattr(job, "clips", []) or []) if job else 0,
+        )
         return (0, 0)
+    logger.info(
+        "[%s] Auto-SEO starting on %d clips, %d transcript segments",
+        job_id, len(job.clips), len(transcript or []),
+    )
 
     video_summary = ""
     if job.summary:
@@ -717,6 +728,13 @@ async def _auto_generate_clip_seo(
         logger.info(
             "[%s] Auto-SEO complete: %d generated, %d failed (%d clips total)",
             job_id, generated, failed, len(updated_clips),
+        )
+    else:
+        # Loop ran but every clip was skipped (already had SEO). Log it
+        # so "SEO generated for 0 clips" isn't a black box.
+        logger.info(
+            "[%s] Auto-SEO: all %d clips already had SEO, nothing to generate",
+            job_id, len(updated_clips),
         )
     return (generated, failed)
 
