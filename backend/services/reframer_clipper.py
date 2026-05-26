@@ -2845,9 +2845,35 @@ class ClipExtractor:
 
     def _run_editorial_judge(self, judge, candidates: List[ClipCandidate],
                              on_progress: Callable = None):
-        """Send each candidate to the cloud judge for scoring."""
+        """Send each candidate to the cloud judge for scoring.
+
+        Two safety nets guard against a slow / down LLM endpoint silently
+        stalling the pipeline for 20 + minutes (the previous failure mode:
+        45 s urlopen timeout × ~30 candidates):
+
+        * Per-candidate exception wrap so one bad call can't kill the loop.
+        * Circuit breaker: after ``MAX_CONSECUTIVE_FAILURES`` judge errors
+          in a row, give up — the remaining candidates fall back to their
+          signal-only composite score, which is exactly what happens when
+          the judge isn't configured at all, so downstream code is fine.
+        * Total time budget: cap at ``BUDGET_S`` seconds regardless of
+          progress. Stops the worst-case stall at a few minutes instead of
+          ``45 s × n_candidates``.
+        """
         total = len(candidates)
+        MAX_CONSECUTIVE_FAILURES = 3
+        BUDGET_S = 240  # 4 minutes — generous for a healthy LLM, hard cap for a sick one
+        consecutive_failures = 0
+        loop_start = _time.monotonic()
         for idx, c in enumerate(candidates):
+            elapsed = _time.monotonic() - loop_start
+            if elapsed > BUDGET_S:
+                logger.warning(
+                    "Editorial judge time budget exceeded (%ds) after "
+                    "%d/%d candidates — remaining clips will use "
+                    "signal-only scores", int(elapsed), idx, total)
+                break
+
             if on_progress:
                 on_progress(idx / max(1, total))
 
@@ -2861,11 +2887,16 @@ class ClipExtractor:
                 f"duration={c.duration_s:.0f}s"
             )
 
-            result = judge.judge(
-                c, c.transcript_slice, keyframes, signal_summary,
-                self.config.preferred_subjects, self.config.avoid_subjects)
+            try:
+                result = judge.judge(
+                    c, c.transcript_slice, keyframes, signal_summary,
+                    self.config.preferred_subjects, self.config.avoid_subjects)
+            except Exception as e:
+                logger.warning(f"Editorial judge raised on candidate {idx}: {e}")
+                result = {"error": str(e)}
 
             if 'error' not in result:
+                consecutive_failures = 0
                 c.judge_scores = {
                     k: result.get(k, 0)
                     for k in ['hook', 'payoff', 'retention',
@@ -2899,6 +2930,16 @@ class ClipExtractor:
                                 c.duration_s = new_end - new_start
                     except Exception:
                         pass
+            else:
+                consecutive_failures += 1
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                    logger.warning(
+                        "Editorial judge failed %d consecutive times "
+                        "(last error: %s) — aborting remaining %d "
+                        "candidates, falling back to signal-only scores",
+                        consecutive_failures, result.get('error', '?'),
+                        max(0, total - idx - 1))
+                    break
 
             _time.sleep(0.5)  # rate limiting
 

@@ -5,7 +5,7 @@ import os
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 
 from backend import database
@@ -1281,37 +1281,49 @@ async def export_logs():
 
     Reads from the rotating log file written by the root logger.
     Includes current log and up to 3 rotated backups (oldest first).
+
+    Uses StreamingResponse so the full 4 × 10 MB rotated log set (max
+    40 MB) is sent chunk-by-chunk rather than buffered in process
+    memory and shipped as one giant response. The previous Response()
+    path could hit reverse-proxy timeouts on slow links and would peak
+    memory at the full file size — both fixed here.
     """
     log_file = "/data/logs/app.log"
-    parts = []
 
-    # Read rotated backups oldest-first (app.log.3, app.log.2, app.log.1)
+    # Sources in chronological order: oldest rotated backup first
+    # (app.log.3), then app.log.2, app.log.1, then the current
+    # app.log being written.
+    sources = []
     for i in range(3, 0, -1):
         rotated = f"{log_file}.{i}"
         if os.path.isfile(rotated):
-            try:
-                with open(rotated, "r", encoding="utf-8", errors="replace") as f:
-                    parts.append(f.read())
-            except OSError:
-                pass
-
-    # Read current log file
+            sources.append(rotated)
     if os.path.isfile(log_file):
-        try:
-            with open(log_file, "r", encoding="utf-8", errors="replace") as f:
-                parts.append(f.read())
-        except OSError:
-            pass
+        sources.append(log_file)
 
-    if not parts:
+    if not sources:
         raise HTTPException(status_code=404, detail="No log files found")
 
-    content = "".join(parts)
+    def _iter_logs():
+        # 64 KB chunks — balance between syscall overhead and memory.
+        for path in sources:
+            try:
+                with open(path, "rb") as f:
+                    while True:
+                        chunk = f.read(65536)
+                        if not chunk:
+                            break
+                        yield chunk
+            except OSError as e:
+                # Don't abort the whole download if one rotated file
+                # disappears between os.path.isfile() and open() — just
+                # emit an inline marker so the user knows.
+                yield (f"\n[clipai: failed to read {path}: {e}]\n").encode()
+
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     filename = f"clipai_logs_{ts}.log"
-
-    return Response(
-        content=content,
+    return StreamingResponse(
+        _iter_logs(),
         media_type="text/plain; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
