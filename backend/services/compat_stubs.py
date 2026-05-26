@@ -564,7 +564,80 @@ def get_detector(*args, **kwargs):
 
 
 def _resolve_yolo_device(*args, **kwargs) -> str:
-    return "cpu"
+    """Resolve the device for analysis-pipeline YOLO models.
+
+    Single source of truth for "should YOLO run on GPU?" — used by
+    person_detector.py's pose model and the pipeline diagnostics line.
+    Mirrors the reframer's ``_pick_yolo_device`` logic but returns a
+    string ("cuda:0" / "cpu") for consistency with ultralytics device
+    args and the diagnostics display.
+
+    Decision order:
+      1. ``CLIPAI_REFRAMER_YOLO_DEVICE`` env var. ``cpu`` forces CPU.
+         ``cuda`` / ``gpu`` / ``0`` forces GPU when CUDA is available
+         (skipping the VRAM gate entirely — the user has asserted they
+         want the GPU even on a near-full card).
+      2. ``torch.cuda.is_available()`` — if False, CPU.
+      3. Free-VRAM gate: ≥ ``THRESHOLD_MB`` (600 MB) → GPU, else CPU.
+         600 MB is YOLO-World v2-small's actual peak footprint
+         (~150 MB weights + ~250 MB activations + ~150 MB safety
+         margin); the previous 1100 MB gate was a stale value that
+         turned a 4 GB GTX 1650 into a "GPU? no thanks" device the
+         moment anything else briefly held VRAM.
+
+    Every decision branch logs WHY CPU was chosen at INFO so the
+    operator doesn't need to audit 700 log lines to learn that the
+    analysis pipeline silently fell to CPU again. This was the single
+    biggest forensic blind spot from the previous reframe-perf
+    investigation.
+    """
+    import os
+    forced = os.environ.get(
+        "CLIPAI_REFRAMER_YOLO_DEVICE", "auto").strip().lower()
+    if forced == "cpu":
+        logger.info(
+            "YOLO device: CPU "
+            "(forced via CLIPAI_REFRAMER_YOLO_DEVICE=cpu)")
+        return "cpu"
+    THRESHOLD_MB = 600
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            logger.info(
+                "YOLO device: CPU "
+                "(torch.cuda.is_available() = False — check the "
+                "container has --gpus all / nvidia-container-toolkit)")
+            return "cpu"
+        free_mb = torch.cuda.mem_get_info()[0] / 1024 / 1024
+        if forced in ("cuda", "gpu", "0"):
+            logger.info(
+                "YOLO device: cuda:0 "
+                "(forced via CLIPAI_REFRAMER_YOLO_DEVICE=%s, "
+                "free VRAM %.0f MB)", forced, free_mb)
+            return "cuda:0"
+        if free_mb >= THRESHOLD_MB:
+            logger.info(
+                "YOLO device: cuda:0 "
+                "(free VRAM %.0f MB ≥ %d MB threshold)",
+                free_mb, THRESHOLD_MB)
+            return "cuda:0"
+        logger.info(
+            "YOLO device: CPU "
+            "(free VRAM %.0f MB < %d MB threshold — set "
+            "CLIPAI_REFRAMER_YOLO_DEVICE=cuda to override)",
+            free_mb, THRESHOLD_MB)
+        return "cpu"
+    except Exception as e:
+        # CUDA driver init can raise on the very first query in a
+        # process (e.g. transient PID namespace issues with the
+        # nvidia-container-runtime). Log loudly and fall back so the
+        # next run can use a fresh context — silent fallback is what
+        # cost the user a 40-minute analysis last time.
+        logger.warning(
+            "YOLO device: CPU (CUDA query raised: %s: %s — set "
+            "CLIPAI_REFRAMER_YOLO_DEVICE=cuda if you know the GPU "
+            "is healthy)", type(e).__name__, e)
+        return "cpu"
 
 
 def track_saliency_in_frames(*args, **kwargs) -> list:

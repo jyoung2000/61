@@ -39,26 +39,58 @@ def _pick_yolo_device():
     Override with the ``CLIPAI_REFRAMER_YOLO_DEVICE`` env var
     (``cpu`` | ``cuda`` | ``auto``).
 
-    The VRAM gate is intentionally small (~1 GB) — YOLO-World v2-small is
+    The VRAM gate is intentionally small (600 MB) — YOLO-World v2-small is
     ~150 MB of weights plus a few hundred MB of inference workspace. The
     perceiver explicitly releases the YOLO weights via
     ``_release_perception_models()`` before Whisper loads, so YOLO no
     longer competes with the transcriber even on 4 GB cards. Cloud-VLM
     pipelines (OpenRouter / Gemini / Replicate) don't touch local VRAM
     at all, so YOLO can use the GPU freely during face detection.
+
+    Every decision branch logs WHY at INFO. The previous version had a
+    bare ``except Exception: pass`` that masked the real reason for
+    CPU fallback — auditing it required reading 700 log lines. Now
+    the reason is one grep away (``grep "YOLO-World device" app.log``).
     """
-    forced = os.environ.get("CLIPAI_REFRAMER_YOLO_DEVICE", "auto").strip().lower()
+    forced = os.environ.get(
+        "CLIPAI_REFRAMER_YOLO_DEVICE", "auto").strip().lower()
     if forced == "cpu":
+        logger.info(
+            "YOLO-World device: CPU "
+            "(forced via CLIPAI_REFRAMER_YOLO_DEVICE=cpu)")
         return "cpu"
+    THRESHOLD_MB = 600
     try:
         import torch
-        if torch.cuda.is_available():
-            free_mb = torch.cuda.mem_get_info()[0] / 1024 / 1024
-            if forced in ("cuda", "gpu", "0") or free_mb >= 1100:
-                return 0
-    except Exception:
-        pass
-    return "cpu"
+        if not torch.cuda.is_available():
+            logger.info(
+                "YOLO-World device: CPU "
+                "(torch.cuda.is_available() = False — check the "
+                "container has --gpus all / nvidia-container-toolkit)")
+            return "cpu"
+        free_mb = torch.cuda.mem_get_info()[0] / 1024 / 1024
+        if forced in ("cuda", "gpu", "0"):
+            logger.info(
+                "YOLO-World device: 0 (forced via "
+                "CLIPAI_REFRAMER_YOLO_DEVICE=%s, free VRAM %.0f MB)",
+                forced, free_mb)
+            return 0
+        if free_mb >= THRESHOLD_MB:
+            logger.info(
+                "YOLO-World device: 0 (free VRAM %.0f MB ≥ "
+                "%d MB threshold)", free_mb, THRESHOLD_MB)
+            return 0
+        logger.info(
+            "YOLO-World device: CPU (free VRAM %.0f MB < %d MB "
+            "threshold — set CLIPAI_REFRAMER_YOLO_DEVICE=cuda to "
+            "override)", free_mb, THRESHOLD_MB)
+        return "cpu"
+    except Exception as e:
+        logger.warning(
+            "YOLO-World device: CPU (CUDA query raised: %s: %s — "
+            "set CLIPAI_REFRAMER_YOLO_DEVICE=cuda if you know the "
+            "GPU is healthy)", type(e).__name__, e)
+        return "cpu"
 
 
 class FaceDetector:
