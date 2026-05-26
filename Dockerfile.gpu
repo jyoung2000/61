@@ -52,7 +52,15 @@ RUN cd /tmp && \
     make install && \
     cd / && rm -rf /tmp/nv-codec-headers
 
-# Build FFmpeg with full hardware acceleration
+# Build FFmpeg with full hardware acceleration.
+#
+# nvenc / nvdec are enabled via --enable-ffnvcodec, which only needs the
+# nv-codec-headers installed above. --enable-cuda / --enable-cuvid were
+# the older path and pull in nvcc, which is NOT in the cudnn9-runtime
+# base image — only the cudnn9-devel image ships it. Dropping them lets
+# the build complete on the runtime image (~2GB smaller) without losing
+# the encode / decode acceleration ClipAI actually uses. CUDA-accelerated
+# filters (scale_cuda, yadif_cuda, ...) are not used by the pipeline.
 RUN cd /tmp && \
     wget -q https://ffmpeg.org/releases/ffmpeg-7.1.tar.xz && \
     tar xf ffmpeg-7.1.tar.xz && \
@@ -72,8 +80,7 @@ RUN cd /tmp && \
         --enable-libx264 \
         --enable-libx265 \
         --enable-libfdk-aac \
-        --enable-cuda \
-        --enable-cuvid \
+        --enable-ffnvcodec \
         --enable-nvenc \
         --enable-nvdec \
         --enable-vaapi \
