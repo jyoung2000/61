@@ -329,35 +329,38 @@ class FaceDetector:
                     str(e)[:140],
                 )
                 self._yolo_device = 'cpu'
+                # Migrate the WHOLE model (including plain-attribute tensors
+                # like txt_feats) to CPU so the fallback predict doesn't trip
+                # the same mixed-device error in reverse.
+                self._yolo_sync_to_device('cpu')
                 return self._yolo_model.predict(*args, device='cpu', **kwargs)
             raise
 
-    def _yolo_set_classes(self, classes):
-        """Set YOLO-World classes and re-sync the model to the active device.
+    def _yolo_sync_to_device(self, device):
+        """Move the YOLO(-World) model and its text-feature tensors to ``device``.
 
-        YOLO-World's ``set_classes()`` rebuilds the per-class text
-        embeddings via its CLIP text encoder. Those embeddings are stored
-        as plain ``Tensor`` attributes on the underlying ``WorldModel``
-        (``txt_feats``) and on the ``WorldDetect`` head — not as registered
-        buffers — so ``nn.Module.to(device)`` does NOT move them. They
-        stay on whichever device CLIP encoded them on (usually CPU), and
-        the next ``predict()`` then trips "Expected all tensors to be on
-        the same device, but got index is on cpu, different from other
+        ``nn.Module.to()`` only migrates registered modules / parameters /
+        buffers — it does NOT touch plain Python ``Tensor`` attributes.
+        YOLO-World stores its CLIP text embeddings (``txt_feats``) as a
+        plain attribute on the underlying ``WorldModel`` (and on the
+        ``WorldDetect`` head), so a vanilla ``.to(device)`` leaves them
+        on whichever device CLIP encoded them on — typically CPU. The
+        next ``predict()`` then trips "Expected all tensors to be on the
+        same device, but got index is on cpu, different from other
         tensors on cuda:0" inside ``WorldDetect``'s ``index_select``.
 
-        We migrate the whole module via ``.to()`` and then explicitly walk
-        the known text-feature attributes and move them too.
+        This helper migrates the module the normal way and then walks the
+        known text-feature attributes and moves them explicitly. Used by
+        both ``_yolo_set_classes`` (after a CLIP re-encode) and
+        ``_yolo_predict`` (when falling back to CPU mid-run).
         """
         if self._yolo_model is None:
-            raise RuntimeError("YOLO model not loaded")
-        self._yolo_model.set_classes(classes)
-        if self._yolo_device == 'cpu':
             return
         try:
             import torch
-            target = (torch.device(f'cuda:{self._yolo_device}')
-                      if isinstance(self._yolo_device, int)
-                      else torch.device(self._yolo_device))
+            target = (torch.device(f'cuda:{device}')
+                      if isinstance(device, int)
+                      else torch.device(device))
             self._yolo_model.to(target)
             inner = getattr(self._yolo_model, 'model', None)
             head = None
@@ -377,10 +380,43 @@ class FaceDetector:
                             pass
         except Exception as e:
             logger.warning(
+                "YOLO sync to %s failed (%s) — continuing without migration",
+                device, str(e)[:140])
+
+    def _yolo_set_classes(self, classes):
+        """Set YOLO-World classes and re-sync the model to the active device.
+
+        YOLO-World's ``set_classes()`` rebuilds the per-class text
+        embeddings via its CLIP text encoder. Those embeddings are stored
+        as plain ``Tensor`` attributes on the underlying ``WorldModel``
+        (``txt_feats``) and on the ``WorldDetect`` head — not as registered
+        buffers — so ``nn.Module.to(device)`` does NOT move them. They
+        stay on whichever device CLIP encoded them on (usually CPU), and
+        the next ``predict()`` then trips "Expected all tensors to be on
+        the same device, but got index is on cpu, different from other
+        tensors on cuda:0" inside ``WorldDetect``'s ``index_select``.
+
+        We delegate to ``_yolo_sync_to_device`` which migrates the whole
+        module via ``.to()`` and then explicitly walks the known
+        text-feature attributes and moves them too.
+        """
+        if self._yolo_model is None:
+            raise RuntimeError("YOLO model not loaded")
+        self._yolo_model.set_classes(classes)
+        if self._yolo_device == 'cpu':
+            return
+        try:
+            self._yolo_sync_to_device(self._yolo_device)
+        except Exception as e:
+            logger.warning(
                 "YOLO-World to(%s) after set_classes failed (%s) — "
                 "falling back to CPU for the rest of this run",
                 self._yolo_device, str(e)[:140])
             self._yolo_device = 'cpu'
+            try:
+                self._yolo_sync_to_device('cpu')
+            except Exception:
+                pass
 
     def compute_embedding(self, frame_bgr, face_dict: dict) -> Optional[np.ndarray]:
         """Compute a 128-dim face embedding for identity matching.
@@ -633,7 +669,9 @@ class FaceDetector:
             return [], []
         try:
             has_world_classes = hasattr(self, '_yolo_classes') and self._yolo_classes
-            kwargs = dict(verbose=False, conf=0.3, max_det=15, device='cpu')
+            # _yolo_predict() routes to self._yolo_device (GPU when picked),
+            # ignoring any caller-supplied device kwarg, so we don't pass one.
+            kwargs = dict(verbose=False, conf=0.3, max_det=15)
             if not has_world_classes:
                 kwargs['classes'] = [0]  # person only for standard YOLO
             results = self._yolo_predict(frame_bgr, **kwargs)
@@ -683,7 +721,9 @@ class FaceDetector:
             # YOLO-World: detect all set classes (no class filter)
             # yolov8n: detect person only (class 0)
             has_world_classes = hasattr(self, '_yolo_classes') and self._yolo_classes
-            kwargs = dict(verbose=False, conf=0.3, max_det=15, device='cpu')
+            # _yolo_predict() routes to self._yolo_device (GPU when picked),
+            # ignoring any caller-supplied device kwarg, so we don't pass one.
+            kwargs = dict(verbose=False, conf=0.3, max_det=15)
             if not has_world_classes:
                 kwargs['classes'] = [0]  # person only for standard YOLO
             results = self._yolo_predict(frame_bgr, **kwargs)
@@ -1242,9 +1282,9 @@ class FaceDetector:
         """Use YOLO to find people, then run DNN face detector on each person region.
         Catches faces that DNN misses at full-frame scale (angled, small, occluded)."""
         h, w = frame_bgr.shape[:2]
+        # _yolo_predict() routes to self._yolo_device — no caller device override.
         results = self._yolo_predict(
-            frame_bgr, verbose=False, conf=0.4, classes=[0], max_det=10,
-            device='cpu')
+            frame_bgr, verbose=False, conf=0.4, classes=[0], max_det=10)
 
         faces = []
         for r in results:
@@ -1298,9 +1338,9 @@ class FaceDetector:
     def _detect_yolo_assisted_haar(self, frame_bgr, conf) -> List[dict]:
         """Use YOLO to find people, then run relaxed Haar inside each person's head region."""
         h, w = frame_bgr.shape[:2]
+        # _yolo_predict() routes to self._yolo_device — no caller device override.
         results = self._yolo_predict(
-            frame_bgr, verbose=False, conf=0.3, classes=[0], max_det=10,
-            device='cpu')
+            frame_bgr, verbose=False, conf=0.3, classes=[0], max_det=10)
 
         all_faces = []
         for r in results:

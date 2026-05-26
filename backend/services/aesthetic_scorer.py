@@ -36,6 +36,23 @@ _EMBED_DIM = 512
 
 _CACHED_MODEL = None
 _CACHED_CLIP = None
+_CACHED_DEVICE = None
+
+
+def _resolve_device():
+    """Pick CUDA when available so CLIP encode + the MLP head don't run on CPU."""
+    global _CACHED_DEVICE
+    if _CACHED_DEVICE is not None:
+        return _CACHED_DEVICE
+    try:
+        import torch
+        if torch.cuda.is_available():
+            _CACHED_DEVICE = torch.device("cuda")
+        else:
+            _CACHED_DEVICE = torch.device("cpu")
+    except Exception:
+        _CACHED_DEVICE = "cpu"
+    return _CACHED_DEVICE
 
 
 def _load_model():
@@ -64,10 +81,12 @@ def _load_model():
             def forward(self, emb, crop):
                 return self.net(torch.cat([emb, crop], dim=-1))
 
+        device = _resolve_device()
         model = AestheticHead()
-        state = torch.load(_MODEL_PATH, map_location="cpu")
+        state = torch.load(_MODEL_PATH, map_location=device)
         model.load_state_dict(state)
         model.eval()
+        model.to(device)
         _CACHED_MODEL = model
         return model
     except Exception as e:
@@ -86,6 +105,10 @@ def _load_clip():
             "ViT-B-32", pretrained="laion2b_s34b_b79k",
         )
         model.eval()
+        try:
+            model.to(_resolve_device())
+        except Exception:
+            pass
         _CACHED_CLIP = (model, preprocess)
         return _CACHED_CLIP
     except Exception:
@@ -163,13 +186,14 @@ def score_frame(frame_path: Optional[str], crop_rect: Optional[dict] = None) -> 
         import torch
         from PIL import Image
         clip_model, preprocess = clip
-        img = preprocess(Image.open(frame_path).convert("RGB")).unsqueeze(0)
+        device = _resolve_device()
+        img = preprocess(Image.open(frame_path).convert("RGB")).unsqueeze(0).to(device)
         with torch.no_grad():
             emb = clip_model.encode_image(img)
             emb = emb / emb.norm(dim=-1, keepdim=True)
             rect = crop_rect or {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}
             crop_t = torch.tensor([[rect["x"], rect["y"], rect["w"], rect["h"]]],
-                                  dtype=emb.dtype)
+                                  dtype=emb.dtype, device=emb.device)
             score = model(emb, crop_t).item()
         return float(max(0.0, min(1.0, score)))
     except Exception as e:
