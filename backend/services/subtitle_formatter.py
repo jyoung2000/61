@@ -615,15 +615,29 @@ def enforce_readability(
             if split_idx and 5 < split_idx < len(seg.text) - 5:
                 left_text = seg.text[:split_idx].strip()
                 right_text = seg.text[split_idx:].strip()
-                ratio = len(left_text) / max(1, len(seg.text))
-                mid = seg.start + dur * ratio
+                # Prefer Whisper's word-level timing for the split
+                # midpoint when available; the character-proportional
+                # fallback assumes uniform speech rate and drifts on
+                # CJK / non-uniform delivery. Same logic as
+                # ``_split_segment`` (and same fallback for segments
+                # without a usable ``words`` array).
+                word_timed = _word_timed_midpoint(seg, split_idx)
+                if word_timed is not None:
+                    mid, left_words, right_words = word_timed
+                    mid = max(seg.start + 0.05, min(seg.end - 0.05, mid))
+                else:
+                    ratio = len(left_text) / max(1, len(seg.text))
+                    mid = seg.start + dur * ratio
+                    left_words, right_words = [], []
                 out2.append(TranscriptSegment(
                     start=seg.start, end=mid, text=left_text,
-                    speaker=seg.speaker, words=[], confidence=seg.confidence,
+                    speaker=seg.speaker, words=left_words,
+                    confidence=seg.confidence,
                 ))
                 out2.append(TranscriptSegment(
                     start=mid, end=seg.end, text=right_text,
-                    speaker=seg.speaker, words=[], confidence=seg.confidence,
+                    speaker=seg.speaker, words=right_words,
+                    confidence=seg.confidence,
                 ))
                 continue
         if dur < min_dur_s:

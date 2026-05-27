@@ -1275,21 +1275,44 @@ class ReframeEngine:
                 continue
 
             # When the only signal we have is the saliency hotspot (the
-            # 3rd-tier fallback) AND there's already a centering-
-            # corrected keyframe nearby, leave it alone. The earlier
-            # pass that set _centering used a stronger signal (Sobel
-            # gradient centroid, dedicated face-centering, or YOLO
-            # person), and the saliency hotspot disagreeing by a small
-            # margin is exactly the noise this tolerance was added to
-            # absorb. Same effect as a per-source ranking — face beats
-            # person beats saliency.
+            # 3rd-tier fallback) AND the keyframes bracketing this
+            # check_ms in the anchored list are already centering-
+            # corrected, leave the interpolated position alone. The
+            # earlier pass that set _centering used a stronger signal
+            # (Sobel gradient centroid, dedicated face-centering, or
+            # YOLO person), and the saliency hotspot disagreeing by
+            # a small margin is exactly the noise the tolerance was
+            # added to absorb. Same effect as a per-source ranking —
+            # face beats person beats saliency.
+            #
+            # Was: ``abs(kf.time_ms - check_ms) < 1500`` — a flat
+            # 1.5-second window. That missed the scene-0 case where
+            # the only keyframe sits at t=0 and inclusion_fix fires
+            # at t=1600+ (>1500 ms away), so the weak-signal override
+            # silently bulldozed the gradient-corrected crop on every
+            # title card. Bracketing check is structural — it doesn't
+            # care how long the scene is.
             if face_source == 'saliency':
-                nearby_centering = any(
-                    abs(kf['time_ms'] - check_ms) < 1500
-                    and kf.get('_centering')
-                    for kf in anchored
+                # Find the keyframes immediately before and after
+                # check_ms in the anchored list (the same pair
+                # ``interpolate_x`` used to compute crop_x). If
+                # EITHER is centering-corrected, the interpolated
+                # crop_x is also gradient-aware — skip the override.
+                kf_before = None
+                kf_after = None
+                for kf in anchored:
+                    t_kf = kf['time_ms']
+                    if t_kf <= check_ms and (kf_before is None
+                                              or t_kf > kf_before['time_ms']):
+                        kf_before = kf
+                    if t_kf >= check_ms and (kf_after is None
+                                             or t_kf < kf_after['time_ms']):
+                        kf_after = kf
+                bracketed_by_centering = (
+                    (kf_before is not None and kf_before.get('_centering'))
+                    or (kf_after is not None and kf_after.get('_centering'))
                 )
-                if nearby_centering:
+                if bracketed_by_centering:
                     continue
 
             corrected_x = clamp_x(face_cx - crop_w // 2, max_x)
