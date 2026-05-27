@@ -56,6 +56,14 @@ class SpeakerRenameRequest(BaseModel):
 router = APIRouter(prefix="/api", tags=["jobs"])
 
 
+@router.get("/jobs/pipeline-stages")
+async def get_pipeline_stages(_user: User = Depends(get_current_user)):
+    """Return the static PIPELINE_STAGES list so the frontend can render
+    the multi-segment stage tracker without hard-coding stage definitions."""
+    from backend.services.pipeline import PIPELINE_STAGES
+    return {"stages": PIPELINE_STAGES}
+
+
 @router.get("/jobs")
 async def list_jobs(user: User = Depends(get_current_user)):
     # Admin sees all jobs (including legacy unowned ones).

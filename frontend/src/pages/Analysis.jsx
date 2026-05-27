@@ -6,6 +6,8 @@ import ClipPreview from '../components/ClipPreview';
 import VideoEditor from '../components/VideoEditor';
 import SubtitleOverlay from '../components/SubtitleOverlay';
 import ProgressBar from '../components/ProgressBar';
+import PipelineTracker from '../components/PipelineTracker';
+import ProcessingLog from '../components/ProcessingLog';
 import SceneCard from '../components/SceneCard';
 import TranscriptViewer from '../components/TranscriptViewer';
 import ClipCard from '../components/ClipCard';
@@ -302,8 +304,13 @@ export default function Analysis() {
   const [filters, setFilters] = useState({ minScore: 0, platform: 'all', type: 'all', sort: 'viral_score' });
   const wsRef = useRef(null);
   const [activityLog, setActivityLog] = useState([]);
-  const [logExpanded, setLogExpanded] = useState(true);
-  const logEndRef = useRef(null);
+  const [currentStageId, setCurrentStageId] = useState('');
+  const currentStageIdRef = useRef(''); // stable ref for WS closures
+  const [pipelineStartTime, setPipelineStartTime] = useState(null);
+  const [stageTimes, setStageTimes] = useState({});
+  const [pipelineElapsed, setPipelineElapsed] = useState(0);
+  const stageStartRef = useRef({}); // { stageId: Date.now() }
+  const pipelineElapsedRef = useRef(null); // interval id
   // Subtitle/clip settings — server is the source of truth.
   // On mount we start with defaults; once the job loads, server-stored
   // settings replace them (see the effect below).
@@ -742,14 +749,20 @@ export default function Analysis() {
         safeExtra[k] = (v != null && typeof v === 'object') ? JSON.stringify(v) : v;
       }
     }
-    setActivityLog((prev) => [...prev, { ...safeExtra, ts, type, message: safeMsg }]);
+    setActivityLog((prev) => [...prev, { ...safeExtra, ts, type, message: safeMsg, _absTime: Date.now() }]);
   }, []);
 
-  // Auto-scroll log to bottom (within its own scroll container, not the page)
+  // Pipeline elapsed timer — increments every second while processing
   useEffect(() => {
-    const el = logEndRef.current?.parentElement;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [activityLog.length]);
+    if (!pipelineStartTime) return;
+    if (pipelineElapsedRef.current) clearInterval(pipelineElapsedRef.current);
+    pipelineElapsedRef.current = setInterval(() => {
+      setPipelineElapsed(Math.floor((Date.now() - pipelineStartTime) / 1000));
+    }, 1000);
+    return () => {
+      if (pipelineElapsedRef.current) clearInterval(pipelineElapsedRef.current);
+    };
+  }, [pipelineStartTime]);
 
   // Persist generation settings
   useEffect(() => {
@@ -827,12 +840,45 @@ export default function Analysis() {
             } else if (msg.type === 'complete') {
               setIsGeneratingClips((prev) => prev ? false : prev);
             }
+            // Track pipeline stage transitions for PipelineTracker + ProcessingLog
+            const incomingStage = typeof msg.stage_id === 'string' ? msg.stage_id : '';
+            if (incomingStage) {
+              setCurrentStageId((prev) => {
+                if (incomingStage !== prev) {
+                  // Record elapsed time for the stage that just finished
+                  if (prev && stageStartRef.current[prev] != null) {
+                    const elapsed = Math.floor((Date.now() - stageStartRef.current[prev]) / 1000);
+                    setStageTimes((st) => ({ ...st, [prev]: elapsed }));
+                  }
+                  stageStartRef.current[incomingStage] = Date.now();
+                }
+                currentStageIdRef.current = incomingStage;
+                return incomingStage;
+              });
+              setPipelineStartTime((pt) => pt || Date.now());
+            }
             pushLog(
               msg.type === 'complete' ? 'success' : 'status',
               msg.message || `Status: ${msg.status}`,
-              { progress: msg.progress },
+              { progress: msg.progress, stage_id: incomingStage },
             );
             if (msg.type === 'complete') {
+              // Freeze elapsed and record the final stage
+              if (pipelineElapsedRef.current) {
+                clearInterval(pipelineElapsedRef.current);
+                pipelineElapsedRef.current = null;
+              }
+              setPipelineElapsed((e) => {
+                // record last stage time
+                setCurrentStageId((prev) => {
+                  if (prev && stageStartRef.current[prev] != null) {
+                    const elapsed = Math.floor((Date.now() - stageStartRef.current[prev]) / 1000);
+                    setStageTimes((st) => ({ ...st, [prev]: elapsed }));
+                  }
+                  return prev;
+                });
+                return e;
+              });
               sendNotification('Analysis Complete', {
                 body: msg.message || 'Your video analysis has finished.',
                 tag: `analysis-${jobId}`,
@@ -891,13 +937,20 @@ export default function Analysis() {
             setIsGeneratingClips((prev) => prev ? false : prev);
             fetchJob();
           } else if (msg.type === 'background_task') {
-            // Background post-processing (transcript polishing, translation)
+            // Background post-processing (transcript polishing, translation, SEO)
             const taskName = String(msg.task || 'background');
             const taskStatus = String(msg.status || 'running');
             const taskMsg = String(msg.message || `${taskName}: ${taskStatus}`);
+            const TASK_STAGE_MAP = {
+              transcript_polishing: 'polishing',
+              subtitle_translation: 'translation',
+              auto_seo: 'seo',
+            };
+            const bgStageId = TASK_STAGE_MAP[taskName] || taskName;
             pushLog(
               taskStatus === 'complete' ? 'success' : taskStatus === 'failed' ? 'warning' : 'info',
               taskMsg,
+              { stage_id: bgStageId },
             );
             // Refresh job data when background task completes (e.g., polished transcript)
             if (taskStatus === 'complete') {
@@ -906,7 +959,8 @@ export default function Analysis() {
           } else if (msg.type === 'heartbeat') {
             // Pipeline heartbeat — shows the pipeline is still alive during
             // long-running stages.  Log it and reset the stuck timer.
-            pushLog('info', String(msg.message || 'Still processing...'));
+            pushLog('info', String(msg.message || 'Still processing...'),
+              { stage_id: currentStageIdRef.current || '' });
           } else {
             // Unknown message type — log but don't crash.  Coerce all fields.
             const safeType = String(msg.type || 'unknown');
@@ -2747,60 +2801,24 @@ export default function Analysis() {
         </div>
       )}
 
-      {/* Activity Log */}
+      {/* Pipeline stage tracker + processing log */}
       {activityLog.length > 0 && (isProcessing || job.status === 'complete' || job.status === 'failed' || job.status === 'cancelled') && (
-        <div style={{
-          background: 'var(--bg-panel)', border: '1px solid var(--border)',
-          borderRadius: 'var(--radius-sm)', marginBottom: 16, overflow: 'hidden',
-        }}>
-          <button
-            onClick={() => setLogExpanded((p) => !p)}
-            style={{
-              width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-              padding: '8px 12px', background: 'none', border: 'none', cursor: 'pointer',
-              color: 'var(--text-secondary)', fontSize: 11, fontFamily: 'var(--font-mono)',
-              textTransform: 'uppercase', letterSpacing: '0.05em',
-            }}
-          >
-            <span>
-              Processing Log
-              <span style={{ color: 'var(--text-muted)', marginLeft: 8, textTransform: 'none', letterSpacing: 0 }}>
-                ({activityLog.length} events)
-              </span>
-            </span>
-            <span style={{ fontSize: 14 }}>{logExpanded ? '\u25B4' : '\u25BE'}</span>
-          </button>
-          {logExpanded && (
-            <div style={{
-              maxHeight: 200, overflowY: 'auto', padding: isMobile ? '8px 12px' : '12px 16px',
-              fontFamily: 'var(--font-mono)', fontSize: 11, lineHeight: 1.7,
-            }}>
-              {activityLog.map((entry, i) => {
-                const colors = {
-                  status: 'var(--text-secondary)',
-                  success: 'var(--success)',
-                  warning: 'var(--accent-amber)',
-                  error: 'var(--danger)',
-                  info: 'var(--text-muted)',
-                };
-                return (
-                  <div key={i} style={{ display: 'flex', gap: 8 }}>
-                    <span style={{ color: 'var(--text-muted)', flexShrink: 0 }}>{String(entry.ts || '')}</span>
-                    {entry.progress !== undefined && (
-                      <span style={{ color: 'var(--accent-cyan)', flexShrink: 0, minWidth: 30, textAlign: 'right' }}>
-                        {typeof entry.progress === 'number' ? entry.progress : String(entry.progress ?? '')}%
-                      </span>
-                    )}
-                    <span style={{ color: colors[entry.type] || colors.status }}>
-                      {typeof entry.message === 'string' ? entry.message : String(entry.message ?? '')}
-                    </span>
-                  </div>
-                );
-              })}
-              <div ref={logEndRef} />
-            </div>
+        <>
+          {(isProcessing || (job.status === 'complete' && pipelineStartTime)) && (
+            <PipelineTracker
+              currentStageId={currentStageId}
+              stageTimes={stageTimes}
+              pipelineElapsed={pipelineElapsed}
+              isComplete={job.status === 'complete'}
+              isFailed={job.status === 'failed'}
+            />
           )}
-        </div>
+          <ProcessingLog
+            entries={activityLog}
+            pipelineStartTime={pipelineStartTime}
+            isLive={isProcessing}
+          />
+        </>
       )}
 
       {/* Cancelled banner */}

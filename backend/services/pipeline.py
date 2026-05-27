@@ -488,6 +488,35 @@ async def broadcast_ws(job_id: str, message: dict):
         unregister_ws_subscriber(job_id, ws)
 
 
+PIPELINE_STAGES = [
+    {"id": "queue",          "label": "Queue",               "status": "queued",             "start_pct": 0,   "end_pct": 1},
+    {"id": "metadata",       "label": "Video Metadata",       "status": "extracting_frames",  "start_pct": 2,   "end_pct": 5},
+    {"id": "extraction",     "label": "Frame & Audio",        "status": "extracting_frames",  "start_pct": 5,   "end_pct": 14},
+    {"id": "face_detection", "label": "Face Detection",       "status": "analyzing_scenes",   "start_pct": 15,  "end_pct": 42},
+    {"id": "transcription",  "label": "Audio Transcription",  "status": "analyzing_scenes",   "start_pct": 42,  "end_pct": 56},
+    {"id": "diarization",    "label": "Speaker Detection",    "status": "analyzing_scenes",   "start_pct": 56,  "end_pct": 58},
+    {"id": "conversion",     "label": "Scene Conversion",     "status": "analyzing_scenes",   "start_pct": 60,  "end_pct": 62},
+    {"id": "summary",        "label": "Video Summary",        "status": "generating_summary", "start_pct": 62,  "end_pct": 80},
+    {"id": "clips",          "label": "Clip Detection",       "status": "detecting_clips",    "start_pct": 80,  "end_pct": 98},
+    {"id": "saving",         "label": "Saving Results",       "status": "detecting_clips",    "start_pct": 98,  "end_pct": 100},
+]
+
+
+def _resolve_pipeline_stage(status: str, progress: int) -> dict:
+    """Return the best-matching PIPELINE_STAGES entry for the given status+progress."""
+    best = None
+    for stage in PIPELINE_STAGES:
+        if stage["status"] == status and stage["start_pct"] <= progress <= stage["end_pct"]:
+            best = stage
+    if best is None:
+        # Fallback: match on status alone, pick the stage whose range includes progress
+        # or the closest one
+        candidates = [s for s in PIPELINE_STAGES if s["status"] == status]
+        if candidates:
+            best = min(candidates, key=lambda s: abs((s["start_pct"] + s["end_pct"]) / 2 - progress))
+    return best or {}
+
+
 async def _update_progress(job_id: str, status: str, progress: int, message: str):
     """Update job progress in DB and broadcast via WebSocket.
     If a cancel has been requested, raises CancelledError instead of
@@ -500,11 +529,22 @@ async def _update_progress(job_id: str, status: str, progress: int, message: str
         progress=progress,
         progress_message=message,
     )
+    status_str = status.value if hasattr(status, 'value') else str(status)
+    _stage = _resolve_pipeline_stage(status_str, progress)
+    _stage_start = _stage.get("start_pct", 0)
+    _stage_end = _stage.get("end_pct", 100)
+    _stage_range = max(1, _stage_end - _stage_start)
+    _stage_pct = int(min(100, max(0, (progress - _stage_start) / _stage_range * 100)))
     await broadcast_ws(job_id, {
         "type": "status",
         "status": status,
         "progress": progress,
         "message": message,
+        "stage_id": _stage.get("id", ""),
+        "stage_label": _stage.get("label", ""),
+        "stage_pct": _stage_pct,
+        "stage_start": _stage_start,
+        "stage_end": _stage_end,
     })
     # Touch heartbeat so it knows we just emitted a real update.
     # Use human-friendly stage names for heartbeat messages.
@@ -517,7 +557,7 @@ async def _update_progress(job_id: str, status: str, progress: int, message: str
             "generating_summary": "summary generation",
             "detecting_clips": "clip detection",
         }
-        stage_label = _stage_labels.get(status, status) if isinstance(status, str) else str(status)
+        stage_label = _stage_labels.get(status_str, status_str)
         hb.touch(stage_label)
 
 
@@ -1929,6 +1969,11 @@ async def _run_analysis_inner(job_id: str):
             "status": "processing",
             "progress": 5,
             "message": f"Hardware — {' | '.join(_gpu_parts)}",
+            "stage_id": "metadata",
+            "stage_label": "Video Metadata",
+            "stage_pct": 100,
+            "stage_start": 2,
+            "stage_end": 5,
         })
     except Exception:
         pass  # Non-critical — don't break pipeline if GPU detection fails
@@ -1982,6 +2027,10 @@ async def _run_analysis_inner(job_id: str):
                 "[%s] Re-using cached extraction: %d frames, %s audio (SHA matched)",
                 job_id, len(frames),
                 "with" if os.path.isfile(audio_path) else "missing",
+            )
+            await _update_progress(
+                job_id, JobStatus.EXTRACTING_FRAMES, 14,
+                f"Re-using cached extraction — {len(frames)} frames (SHA matched)",
             )
             _record_pipeline_warning(
                 job_id,
@@ -2072,6 +2121,9 @@ async def _run_analysis_inner(job_id: str):
             return f"{secs // 60}m {secs % 60}s"
         return f"{secs}s"
 
+    _engine_phase = ['faces']  # mutable cell: 'faces' | 'whisper_pending' | 'whisper'
+    _whisper_t0 = [0.0]
+
     def _engine_progress(*pargs):
         """Thread-safe progress relay from the (blocking) reframer engine.
 
@@ -2088,17 +2140,42 @@ async def _run_analysis_inner(job_id: str):
         if frac > 1.5:          # tolerate a 0-100 percentage just in case
             frac /= 100.0
         frac = max(0.0, min(1.0, frac))
-        msg = f"Analyzing video — faces, audio, motion ({int(frac * 100)}%)"
+
+        # Phase detection: face detection reports 0→1, then Whisper
+        # restarts from 0. Detect the restart by watching for frac≥1
+        # then a new call with frac<0.5.
+        if _engine_phase[0] == 'faces' and frac >= 0.999:
+            _engine_phase[0] = 'whisper_pending'
+        elif _engine_phase[0] == 'whisper_pending' and frac < 0.5:
+            _engine_phase[0] = 'whisper'
+            _whisper_t0[0] = _time.monotonic()
+
+        phase = _engine_phase[0]
         elapsed = _time.monotonic() - _perceive_t0
-        # Once there's a real sample of progress, project a remaining time.
-        if frac >= 0.02 and elapsed > 15:
-            eta = elapsed * (1.0 - frac) / frac
-            msg += f" — about {_fmt_eta(eta)} left"
+
+        if phase == 'faces':
+            pct_int = int(15 + frac * 27)  # 15% → 42%
+            pct_int = max(15, min(42, pct_int))
+            msg = f"Detecting faces + motion analysis ({int(frac * 100)}%)"
+            if frac >= 0.02 and elapsed > 15:
+                eta = elapsed * (1.0 - frac) / max(frac, 0.01)
+                msg += f" — {_fmt_eta(eta)} left"
+        elif phase == 'whisper_pending':
+            pct_int = 42
+            msg = "Releasing face detection models — freeing GPU for Whisper..."
+        else:  # whisper
+            pct_int = int(42 + frac * 14)  # 42% → 56%
+            pct_int = max(42, min(56, pct_int))
+            w_elapsed = _time.monotonic() - _whisper_t0[0]
+            msg = f"Transcribing audio with Whisper ({int(frac * 100)}%)"
+            if frac >= 0.02 and w_elapsed > 5:
+                eta = w_elapsed * (1.0 - frac) / max(frac, 0.01)
+                msg += f" — {_fmt_eta(eta)} left"
+
         try:
             asyncio.run_coroutine_threadsafe(
                 _update_progress(
-                    job_id, JobStatus.ANALYZING_SCENES,
-                    int(15 + frac * 43), msg,
+                    job_id, JobStatus.ANALYZING_SCENES, pct_int, msg,
                 ),
                 _loop,
             )
@@ -2144,6 +2221,10 @@ async def _run_analysis_inner(job_id: str):
     perception = engine.perception
     _log_gpu_memory(job_id, "post-reframer")
 
+    await _update_progress(
+        job_id, JobStatus.ANALYZING_SCENES, 57,
+        "Running speaker diarization + audio correlation...",
+    )
     # Whisper ran inside the Perceiver — free its VRAM before the VLM stage.
     await _release_whisper_vram(job_id)
     _log_gpu_memory(job_id, "post-whisper-release")
@@ -2369,9 +2450,13 @@ async def _run_analysis_inner(job_id: str):
         default_layout_mode="single",
         scene_cut_timestamps=[round(c / 1000.0, 3) for c in (perception.scene_cuts or [])],
     )
+    _n_segs = len(transcript)
+    _n_scenes_val = len(scenes)
+    _detected_lang = getattr(perception, "detected_language", "") or ""
+    _lang_note = f" [{_detected_lang}]" if _detected_lang else ""
     await _update_progress(
         job_id, JobStatus.ANALYZING_SCENES, 62,
-        f"Analysis complete — {len(scenes)} scenes, {len(transcript)} transcript segments",
+        f"Analysis complete — {_n_scenes_val} scenes, {_n_segs} transcript segments{_lang_note}",
     )
 
     # ── VLM summary (kept ai_orchestrator) ──
