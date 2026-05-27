@@ -396,6 +396,17 @@ class FaceDetector:
         # WorldModel and every submodule, moving anything that isn't
         # already on ``target``. ``modules()`` includes the root module
         # so this also covers ``self._yolo_model.model`` and the head.
+        #
+        # We also migrate plain ``torch.device`` attributes (e.g.
+        # ultralytics's ``CLIP.device`` / ``MobileCLIP.device``, set as
+        # a Python attribute in ``__init__`` and never updated when
+        # ``.to()`` runs). Without this the CLIP wrapper inside
+        # ``WorldModel.get_text_pe`` will keep doing
+        # ``tokens.to(self.device)`` to the original load-time device,
+        # producing CPU tokens that the GPU-resident text encoder
+        # then trips on with ``wrapper_CUDA__index_select`` — exactly
+        # the auto-discovery failure clipai_logs_20260527_094523 line
+        # 138 keeps surfacing on every run.
         moved = 0
         try:
             roots = [self._yolo_model]
@@ -432,45 +443,68 @@ class FaceDetector:
                             moved += 1
                         except Exception:
                             pass
+                    elif isinstance(val, torch.device) and val != target:
+                        try:
+                            setattr(obj, name, target)
+                            moved += 1
+                        except Exception:
+                            pass
         except Exception as e:
             logger.warning(
                 "YOLO tensor attr walk failed (%s) — module.to() already ran",
                 str(e)[:140])
         if moved:
             logger.info(
-                "YOLO sync to %s migrated %d plain tensor attribute(s)",
+                "YOLO sync to %s migrated %d plain attribute(s)",
                 target, moved)
         return True
 
     def _yolo_set_classes(self, classes):
         """Set YOLO-World classes and re-sync the model to the active device.
 
-        YOLO-World's ``set_classes()`` rebuilds the per-class text
-        embeddings via its CLIP text encoder. Those embeddings are stored
-        as plain ``Tensor`` attributes on the underlying ``WorldModel``
-        and on the ``WorldDetect`` head — not as registered buffers —
-        so ``nn.Module.to(device)`` does NOT move them. They stay on
-        whichever device CLIP encoded them on (usually CPU), and the
-        next ``predict()`` then trips "Expected all tensors to be on
-        the same device" inside ``WorldDetect``'s ``index_select``.
+        ``ultralytics.WorldModel.get_text_pe`` (the helper ``set_classes``
+        calls) derives CLIP's device from
+        ``next(self.model.parameters()).device`` AND caches the CLIP
+        wrapper at ``self.clip_model``. The CLIP wrapper then stores
+        the device as a Python attribute ``self.device`` set in its
+        ``__init__`` — which ``nn.Module.to()`` never updates. So if
+        ``set_classes`` runs BEFORE the model has been moved to GPU,
+        CLIP gets built on CPU, cached on CPU, and every subsequent
+        ``set_classes`` call ALSO encodes on CPU because the cached
+        wrapper ``tokenize()`` does ``.to(self.device)`` against the
+        stale CPU device — producing CPU tokens that the (later
+        GPU-resident) text encoder trips on with
+        ``wrapper_CUDA__index_select``.
 
-        We delegate to ``_yolo_sync_to_device`` which migrates the whole
-        module via ``.to()`` and then walks every plain-tensor attribute
-        on the module tree. When that sync reports failure (returns
-        False), pin the detector to CPU for the rest of this run.
+        Fix: sync to the active device BEFORE ``set_classes`` so the
+        very first CLIP build lands on GPU, then sync AGAIN after so
+        the new ``txt_feats`` (which sits as a plain Tensor attribute
+        on the WorldModel, untouched by ``nn.Module.to()``) ends up
+        on the right device too.
         """
         if self._yolo_model is None:
             raise RuntimeError("YOLO model not loaded")
+        # ── Pre-sync ──
+        # Move the model + any cached CLIP wrapper to the active device
+        # so the (possibly first-ever) ``set_classes`` builds / re-uses
+        # CLIP on the right device.
+        if self._yolo_device != 'cpu':
+            if not self._yolo_sync_to_device(self._yolo_device):
+                logger.warning(
+                    "YOLO-World pre-sync to %s failed — pinning detector to CPU",
+                    self._yolo_device)
+                self._yolo_device = 'cpu'
+                self._yolo_sync_to_device('cpu')
         self._yolo_model.set_classes(classes)
         if self._yolo_device == 'cpu':
             return
-        # ``_yolo_sync_to_device`` swallows its own internal errors and
-        # returns True/False — relying on it to raise (which the previous
-        # outer try/except did) was dead code. Check the return value.
+        # ── Post-sync ──
+        # ``set_classes`` may have created a new ``txt_feats`` Tensor on
+        # whatever device CLIP was on. Re-sync to cover that, plus any
+        # ``torch.device`` attributes whose value the rebuild changed.
         if not self._yolo_sync_to_device(self._yolo_device):
             logger.warning(
-                "YOLO-World sync to %s after set_classes failed — "
-                "falling back to CPU for the rest of this run",
+                "YOLO-World post-sync to %s failed — pinning detector to CPU",
                 self._yolo_device)
             self._yolo_device = 'cpu'
             self._yolo_sync_to_device('cpu')

@@ -410,25 +410,36 @@ class ReframeEngine:
             face_cx = best_face['cx']
             x = kf['x']
 
-            # Skip if the face center is OUTSIDE the crop entirely —
-            # that's the inclusion-fix pass's job, not ours.
-            if face_cx < x or face_cx > x + crop_w:
-                continue
-
+            # Used to skip when the face was fully outside the crop
+            # ("that's the inclusion-fix pass's job"), but reframe_report
+            # in clipai_logs_20260527_094523.log shows HIGH-severity
+            # face_missing problems surviving past inclusion-fix and into
+            # the final plan — usually because the smoother dropped the
+            # inserted anchor or the 500ms-neighbour guard prevented an
+            # anchor. So when the face is outside, lift NUDGE_CAP to the
+            # full delta (a content-driven pan is preferable to a face
+            # not in frame) and apply the move from here as a defence-
+            # in-depth pass. Same protection flag the stabilizer uses,
+            # so the smoother won't re-collapse it.
+            face_outside = face_cx < x or face_cx > x + crop_w
             crop_center = x + crop_w // 2
             face_offset = abs(face_cx - crop_center)
-            if face_offset <= trigger_offset:
+            if not face_outside and face_offset <= trigger_offset:
                 if kf.get('_centering'):
                     revalidated_centering += 1
                 continue  # already in middle third
 
             # Aim for dead-center, but cap the move so we never yank
             # past an adjacent face. Sub-pixel rounding is fine because
-            # the renderer integer-clamps anyway.
+            # the renderer integer-clamps anyway. When the face is
+            # outside the crop, allow the full delta — we'd rather
+            # produce a visible pan than leave a face_missing problem
+            # in the plan.
             ideal_x = clamp_x(face_cx - crop_w // 2, max_x)
             delta = ideal_x - x
             sign = 1 if delta > 0 else -1
-            nudge = min(NUDGE_CAP, abs(delta)) * sign
+            step_cap = abs(delta) if face_outside else NUDGE_CAP
+            nudge = min(step_cap, abs(delta)) * sign
             new_x = clamp_x(x + nudge, max_x)
             if new_x == x:
                 continue
@@ -482,11 +493,13 @@ class ReframeEngine:
                 continue
             interp_x = clamp_x(interpolate_x(self.plan.keyframes, time_ms), max_x)
             face_cx = best_face['cx']
-            # Same "outside crop is the inclusion-fix pass's job" guard.
-            if face_cx < interp_x or face_cx > interp_x + crop_w:
-                continue
+            face_outside = face_cx < interp_x or face_cx > interp_x + crop_w
             crop_center = interp_x + crop_w // 2
-            if abs(face_cx - crop_center) <= eval_boundary:
+            # When the face is outside the crop entirely we always want
+            # to anchor — bypass the 'already centered' check. The
+            # off-centre check below only applies when the face is
+            # inside the crop.
+            if not face_outside and abs(face_cx - crop_center) <= eval_boundary:
                 continue  # already centered at eval time
             if _has_neighbour(time_ms):
                 continue  # an existing keyframe already covers this sample
@@ -1281,8 +1294,25 @@ class ReframeEngine:
         #        when the best face is so far away it's almost
         #        certainly a different shot or a misclassified frame.
         # ══════════════════════════════════════════════════════════════
-        NUDGE_MAX = 60          # tight cap — < 10 % of a 600 px crop
-        NUDGE_MIN_DELTA = 5     # below this we're indistinguishable from jitter
+        NUDGE_MAX = 60          # tight cap when face is INSIDE the crop —
+                                # avoids visible jumps between adjacent
+                                # same-shot faces. Stays at 60 even now;
+                                # the face_outside path below uses a
+                                # larger cap so a single nudge actually
+                                # brings the face into the crop instead
+                                # of leaving it stuck at the edge.
+        NUDGE_MIN_DELTA = 1     # Was 5. Lowered to 1 so the eval's
+                                # sub-pixel face_missing problems (face
+                                # at crop edge by 1-2 px) don't get
+                                # skipped as 'indistinguishable from
+                                # jitter'. The keyframe-level deltas
+                                # produced by ``ideal_x - kf['x']`` are
+                                # face-to-crop-center distances, which
+                                # are O(100 px) even when the face is
+                                # only 1-2 px outside the crop — so 5
+                                # never actually filtered jitter, it
+                                # just filtered nothing while leaving
+                                # edge cases on the table.
         # Was 150. Bumped to 250 after a B-grade run flagged 18 face_missing
         # HIGH-severity problems whose best-face deltas fell in the 150-250
         # band — the old ceiling threw away those genuine same-shot
@@ -1350,7 +1380,25 @@ class ReframeEngine:
                 # which never short-circuits when the delta is exactly
                 # at the cap and let consecutive nudges accumulate.
                 sign = 1 if delta > 0 else -1
-                nudge = min(NUDGE_MAX, abs_delta) * sign
+                # When the best face is FULLY OUTSIDE the crop, the
+                # NUDGE_MAX=60 cap physically cannot bring the face in
+                # on a typical ~200 px 9:16 crop — a 60 px nudge moves
+                # crop_left from 414 to 354 while face_cx stays at 312,
+                # which is STILL face_missing (the exact pattern showing
+                # up at 25s / 33s / 34s in
+                # clipai_logs_20260527_094523 line 2576+). face_missing
+                # is the worst eval category — it costs both
+                # face_coverage and centering — and a content-driven
+                # pan is visually preferable to a face that's not
+                # in frame. So lift the per-step cap to ``abs_delta``
+                # (i.e. go straight to the ideal centered position)
+                # when the face is outside the crop; keep the tight
+                # NUDGE_MAX cap when it's inside-but-off-centre.
+                crop_left = kf['x']
+                crop_right = crop_left + crop_w
+                face_outside = cx < crop_left or cx > crop_right
+                step_cap = abs_delta if face_outside else NUDGE_MAX
+                nudge = min(step_cap, abs_delta) * sign
                 old_x = kf['x']
                 kf['x'] = clamp_x(kf['x'] + nudge, max_x)
                 self.tracer.event('stabilize_centering_nudge',
@@ -1360,7 +1408,8 @@ class ReframeEngine:
                                   ideal_x=ideal_x,
                                   delta=delta,
                                   nudge=nudge,
-                                  nudge_cap=NUDGE_MAX,
+                                  nudge_cap=step_cap,
+                                  face_outside=face_outside,
                                   pass_label=label)
                 # Tag the keyframe as a centering correction so the
                 # smoother's drift-suppression doesn't collapse it
