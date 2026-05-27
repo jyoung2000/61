@@ -29,9 +29,38 @@ from backend.services.audio_analyzer import analyze_audio_energy, format_audio_e
 
 logger = logging.getLogger(__name__)
 
-# Project root — the directory that holds clipper_config.json (``/app`` in Docker).
+# Project root — the directory that holds the legacy
+# ``/app/clipper_config.json`` location. Kept for the migration read
+# inside :func:`clipper_config_path`; live writes go to ``/data/``.
 _PROJECT_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def clipper_config_path() -> str:
+    """Return the on-disk path for ``clipper_config.json``.
+
+    Writes always go to ``/data/clipper_config.json`` (a mount-backed
+    location that survives ``docker compose down`` and ``--no-cache``
+    rebuilds). Reads prefer the new location; if it's missing AND a
+    legacy ``/app/clipper_config.json`` exists from before this fix,
+    the legacy one is returned so the next write migrates it
+    automatically. Centralised here so every caller agrees on the
+    path — previously settings.py, pipeline.py, clips.py and
+    jobs.py each re-derived ``project_root + "clipper_config.json"``
+    and pointed at the ephemeral ``/app/`` copy, which silently lost
+    the user's saved judge primary + fallback on every container
+    rebuild.
+    """
+    data_path = "/data/clipper_config.json"
+    legacy_path = os.path.join(_PROJECT_ROOT, "clipper_config.json")
+    # Pure-read callers want a path that exists. Prefer the new
+    # location; fall back to the legacy one ONLY when the new file
+    # hasn't been written yet (so the migration is a one-shot).
+    if os.path.exists(data_path):
+        return data_path
+    if os.path.exists(legacy_path):
+        return legacy_path
+    return data_path
 
 
 def _build_compute_summary(engine, perception) -> dict:
@@ -2336,8 +2365,7 @@ async def _run_analysis_inner(job_id: str):
     async with _stage_timer(job_id, "clip_extraction"):
         try:
             from backend.services.reframer_clipper import ClipExtractor, ClipperConfig
-            clipper_config = ClipperConfig.load(
-                os.path.join(_PROJECT_ROOT, "clipper_config.json"))
+            clipper_config = ClipperConfig.load(clipper_config_path())
             # Replicate cloud GPU is configured via app settings, not the
             # clipper_config.json file — overlay it so the clipper sees it.
             clipper_config.replicate_api_key = settings.REPLICATE_API_KEY

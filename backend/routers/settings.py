@@ -3314,10 +3314,11 @@ _OLLAMA_VISION_TAGS = (
 
 
 def _clipper_config_path() -> str:
-    """Locate clipper_config.json the same way pipeline.py does."""
-    project_root = os.path.dirname(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    return os.path.join(project_root, "clipper_config.json")
+    """Locate clipper_config.json — delegates to the shared helper that
+    prefers the mount-backed ``/data/clipper_config.json`` over the
+    legacy ``/app/`` copy that doesn't survive container rebuilds."""
+    from backend.services.pipeline import clipper_config_path
+    return clipper_config_path()
 
 
 def _read_clipper_config() -> dict:
@@ -3335,18 +3336,25 @@ def _read_clipper_config() -> dict:
 def _write_clipper_config_fields(updates: dict) -> dict:
     """Merge ``updates`` into clipper_config.json on disk.
 
-    Loads the existing JSON, applies the updates, writes atomically
-    via a temp file + rename so a crash mid-write can't corrupt the
-    config. Returns the merged dict.
+    Loads the existing JSON (transparently migrates from the legacy
+    ``/app/clipper_config.json`` if that's where the read lands),
+    applies the updates, and ALWAYS writes to the mount-backed
+    ``/data/clipper_config.json`` so the next ``docker compose down``
+    + ``rm -rf clipai`` + rebuild doesn't lose the user's saved
+    judge primary / fallback. Atomic via temp file + rename.
     """
-    path = _clipper_config_path()
-    cfg = _read_clipper_config()
+    cfg = _read_clipper_config()  # reads from wherever it lives today
     cfg.update(updates)
-    tmp = path + ".tmp"
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    # Always write to the mount-backed location, regardless of where
+    # the read came from. /data is mounted from the host (see
+    # docker-compose.yml volumes), so the file survives container
+    # rebuilds; /app does not.
+    write_path = "/data/clipper_config.json"
+    tmp = write_path + ".tmp"
+    os.makedirs(os.path.dirname(write_path) or ".", exist_ok=True)
     with open(tmp, "w") as f:
         json.dump(cfg, f, indent=2)
-    os.replace(tmp, path)
+    os.replace(tmp, write_path)
     return cfg
 
 

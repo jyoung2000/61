@@ -773,8 +773,8 @@ async def _discover_clips_videollama3(job_id, job, transcript, duration, req):
     from backend.services.reframer_bridge import to_fez_clips
     from backend.models import ClipCandidate
 
-    cfg = ClipperConfig.load(os.path.join(
-        os.path.dirname(__file__), "..", "..", "clipper_config.json"))
+    from backend.services.pipeline import clipper_config_path
+    cfg = ClipperConfig.load(clipper_config_path())
     # Global defaults from Settings > Clip Generation.
     if settings.CLIP_MIN_DURATION:
         cfg.min_duration_s = settings.CLIP_MIN_DURATION

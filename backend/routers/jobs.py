@@ -1430,9 +1430,10 @@ def _build_active_config_block() -> str:
         Filtered to ``_CONFIG_KEYS_OF_INTEREST`` to keep the noise
         floor low. Secret keys redacted to ``<set>`` / ``<unset>``.
 
-      * ``/app/clipper_config.json`` — the clipper's per-install
-        dataclass (judge selection, VLM toggle, platform list, max
-        clips, etc.). Secret keys redacted the same way.
+      * ``clipper_config.json`` (preferred ``/data/`` mount-backed
+        copy, with ``/app/`` legacy fallback) — the clipper's
+        per-install dataclass (judge selection, VLM toggle, platform
+        list, max clips, etc.). Secret keys redacted the same way.
 
     Snapshot reflects current values at export time, not necessarily
     what was in effect when each job ran — but in practice the user
@@ -1466,15 +1467,11 @@ def _build_active_config_block() -> str:
 
     # ── clipper_config.json ──
     try:
-        clipper_path = "/app/clipper_config.json"
-        if not os.path.isfile(clipper_path):
-            # Fall back to the location pipeline.py uses (project root
-            # discovered from this file's parents). Mirrors the loader
-            # at backend/services/pipeline.py:_PROJECT_ROOT.
-            clipper_path = os.path.join(
-                os.path.dirname(os.path.dirname(os.path.dirname(
-                    os.path.abspath(__file__)))),
-                "clipper_config.json")
+        from backend.services.pipeline import clipper_config_path
+        # Prefers /data/clipper_config.json (mount-backed) then falls
+        # back to the legacy /app/clipper_config.json — same resolver
+        # the settings router and the pipeline loader use.
+        clipper_path = clipper_config_path()
         if os.path.isfile(clipper_path):
             import json as _json
             with open(clipper_path, "r", encoding="utf-8") as f:
