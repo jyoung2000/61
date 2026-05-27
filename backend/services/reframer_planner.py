@@ -1663,7 +1663,7 @@ class Planner:
                 self._ema_target = target_x
 
             # ═══════════════════════════════════════════════════════
-            # POST-EMA CENTERING CONSTRAINT (iterative, face-only)
+            # POST-EMA CENTERING CONSTRAINT (iterative)
             # If the chosen FACE is outside the eval's middle-third
             # boundary (16.7 % off-center), pull the crop toward it.
             # Iterate up to 3× so extreme off-center cases (face at
@@ -1672,13 +1672,25 @@ class Planner:
             # a face at 100 % off lands at 30 % which is STILL outside
             # the middle third. Three iterations of 0.70 close to 97 %
             # of the gap, putting even the worst case at 3 % off-center.
-            # The reference branch's 90 % centering score implicitly
-            # assumed the post-EMA pull converged; on this branch with
-            # the current smoother behaviour it didn't, and the metric
-            # capped at 68 %.
+            #
+            # ``real_faces`` gates on ``_real_tracks`` (track has ≥25
+            # samples across the video), which filters out brief
+            # cutaway shots — exactly the case the screenshot at
+            # t=8:51.84 shows, where a face is on the LEFT side but
+            # the crop sits at the RIGHT speaker's previous position.
+            # FACE_WINS earlier in the loop already accepted this
+            # cutaway face into ``subject_x`` (it uses ``high_conf_faces``,
+            # NOT ``real_faces``); fall back to those here too so the
+            # post-EMA centering pulls the cutaway face into the middle
+            # third instead of leaving the crop pinned to the previous
+            # speaker's position. A human camera op would always frame
+            # the visible face, even a brief one.
             # ═══════════════════════════════════════════════════════
-            if real_faces:
-                face_cx_now = best_face['cx']
+            faces_for_centering = real_faces or high_conf_faces
+            if faces_for_centering:
+                face_cx_now = (best_face['cx'] if real_faces
+                               else max(faces_for_centering,
+                                        key=lambda f: f.get('area', 0))['cx'])
                 # Trigger at the eval's middle-third boundary plus a
                 # small buffer (0.18 vs 0.167) so we catch cases the
                 # eval would mark off-center. Reference used 0.28/0.30
@@ -1689,17 +1701,33 @@ class Planner:
                 blend = 0.70  # per-iteration pull
                 max_iters = 3
 
-                for _it in range(max_iters):
-                    crop_center = target_x + self.crop_w // 2
-                    face_offset = abs(face_cx_now - crop_center)
-                    if face_offset <= trigger_offset:
-                        break
-                    centered_x = clamp_x(face_cx_now - self.crop_w // 2, self.max_x)
-                    new_target = clamp_x(
-                        int(blend * centered_x + (1 - blend) * target_x), self.max_x)
-                    if new_target == target_x:
-                        break  # clamped — can't pull further
-                    target_x = new_target
+                # If the face is FULLY OUTSIDE the post-EMA crop, no
+                # amount of blend at 0.70 will pull it back inside in
+                # one sample (the EMA bias from the previous speaker
+                # position dominates). Snap directly to the centered
+                # position and let downstream smoothing decide whether
+                # to ease the transition. Mirrors the
+                # face_outside-cap-lift in the stabilizer's centering
+                # nudge (reframer_engine.py) and is the planner-side
+                # equivalent of the inclusion-fix that re-centers
+                # face-missing keyframes after the smoother runs.
+                crop_left_now = target_x
+                crop_right_now = target_x + self.crop_w
+                if face_cx_now < crop_left_now or face_cx_now > crop_right_now:
+                    target_x = clamp_x(
+                        face_cx_now - self.crop_w // 2, self.max_x)
+                else:
+                    for _it in range(max_iters):
+                        crop_center = target_x + self.crop_w // 2
+                        face_offset = abs(face_cx_now - crop_center)
+                        if face_offset <= trigger_offset:
+                            break
+                        centered_x = clamp_x(face_cx_now - self.crop_w // 2, self.max_x)
+                        new_target = clamp_x(
+                            int(blend * centered_x + (1 - blend) * target_x), self.max_x)
+                        if new_target == target_x:
+                            break  # clamped — can't pull further
+                        target_x = new_target
                 self._ema_target = target_x
 
             if prev_x is None:
@@ -1715,7 +1743,24 @@ class Planner:
             else:
                 delta = abs(target_x - prev_x)
 
-                if delta <= lock_threshold:
+                # When a visible high-confidence face would fall OUTSIDE
+                # the current prev_x crop, force a snap regardless of
+                # lock_threshold. The lock zone exists to suppress
+                # micro-jitter on a held subject, not to ignore a
+                # cutaway whose face is fully off-screen. Without this
+                # override the planner can lock into the previous
+                # speaker's position even when the visible frame's
+                # face is at the opposite edge — the failure mode
+                # shown at t=8:51.84 in the user's screenshot
+                # (crop_x=411 while face_cx≈300 on a 437-wide max_x).
+                force_snap = False
+                if faces_for_centering:
+                    crop_left_prev = prev_x
+                    crop_right_prev = prev_x + self.crop_w
+                    if face_cx_now < crop_left_prev or face_cx_now > crop_right_prev:
+                        force_snap = True
+
+                if delta <= lock_threshold and not force_snap:
                     # ── LOCK: hold completely still ──
                     # The target is close enough. Don't move at all.
                     pass  # prev_x stays exactly where it is

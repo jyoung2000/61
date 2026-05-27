@@ -345,6 +345,67 @@ def _cps(text: str, duration_s: float) -> float:
     return len(text) / duration_s
 
 
+def _word_timed_midpoint(
+    seg: TranscriptSegment,
+    split_idx: int,
+) -> Optional[tuple[float, list, list]]:
+    """Use Whisper's per-word timestamps to find the actual time of a
+    text-level split point. Returns ``(midpoint_seconds, left_words,
+    right_words)`` when the segment has usable word timing; ``None``
+    when we have to fall back to character-proportional timing.
+
+    Without this, ``_split_segment`` distributes the segment's duration
+    by character count — which assumes uniform speech rate and drifts
+    by hundreds of milliseconds whenever any word is markedly longer
+    than the others (anime opening lyrics, draw-out emphasis, etc).
+    Whisper already returned per-word start/end times because
+    ``word_timestamps=True`` is on in reframer_audio.py; this function
+    just consumes them.
+    """
+    words = getattr(seg, 'words', None)
+    if not words:
+        return None
+    text = seg.text
+    # Walk through the segment text, accumulating character offsets
+    # as we encounter each word from ``seg.words``. We're matching the
+    # whole-word string against the segment text, skipping any
+    # whitespace between matches, so each word gets a (text_start,
+    # text_end) range. The first word whose end-offset is past
+    # ``split_idx`` is the split anchor.
+    cursor = 0
+    left_words: list = []
+    right_words: list = []
+    midpoint = None
+    for w in words:
+        w_text = (getattr(w, 'word', None)
+                  if not isinstance(w, dict)
+                  else w.get('word', '')) or ''
+        w_text = w_text.strip()
+        if not w_text:
+            continue
+        # Find where this word actually starts in the segment text from
+        # the current cursor position.
+        idx = text.find(w_text, cursor)
+        if idx < 0:
+            return None  # text doesn't align with word list — bail out
+        cursor = idx + len(w_text)
+        if midpoint is None and cursor >= split_idx:
+            w_start = (getattr(w, 'start', None)
+                       if not isinstance(w, dict)
+                       else w.get('start', None))
+            if w_start is None:
+                return None
+            midpoint = float(w_start)
+            right_words.append(w)
+        elif midpoint is None:
+            left_words.append(w)
+        else:
+            right_words.append(w)
+    if midpoint is None:
+        return None
+    return midpoint, left_words, right_words
+
+
 def _split_segment(
     seg: TranscriptSegment,
     target_cps: float,
@@ -372,7 +433,36 @@ def _split_segment(
     right_text = text[split_idx:].strip()
     if not left_text or not right_text:
         return [seg]
-    # Split duration proportionally to character count.
+
+    # Prefer Whisper's word-level timestamps over character-proportional
+    # interpolation. The proportional path drifts whenever speech rate
+    # is non-uniform (lyrics, drawn-out emphasis, language transitions)
+    # AND the per-segment ``words=[]`` empty-out below used to delete
+    # the timing data downstream passes need. The word-timed path
+    # preserves the word arrays so subsequent splits stay accurate.
+    word_timed = _word_timed_midpoint(seg, split_idx)
+    if word_timed is not None:
+        midpoint, left_words, right_words = word_timed
+        # Clamp the midpoint to within the segment so a slightly out-of-
+        # range word timestamp can't shrink either side to zero.
+        midpoint = max(seg.start + 0.05, min(seg.end - 0.05, midpoint))
+        left_dur = midpoint - seg.start
+        right_dur = seg.end - midpoint
+        if left_dur < min_piece_duration or right_dur < min_piece_duration:
+            return [seg]
+        left = TranscriptSegment(
+            start=seg.start, end=midpoint, text=left_text,
+            speaker=seg.speaker, words=left_words, confidence=seg.confidence,
+        )
+        right = TranscriptSegment(
+            start=midpoint, end=seg.end, text=right_text,
+            speaker=seg.speaker, words=right_words, confidence=seg.confidence,
+        )
+        return [left, right]
+
+    # No word timing — fall back to character-proportional duration
+    # (the legacy behaviour). Used to be the default; now reserved for
+    # legacy / corrupted segments without a ``words`` array.
     left_dur = duration * (len(left_text) / len(text))
     right_dur = duration - left_dur
     if left_dur < min_piece_duration or right_dur < min_piece_duration:

@@ -31,15 +31,30 @@ SUPPORTED_LANGUAGES = {
 
 TRANSLATION_PROMPT = """Translate the following subtitle segments from {source_lang} to {target_lang}.
 
+These are scripted dialogue lines from a film / TV / streaming production
+intended to display as on-screen subtitles. Treat them the way a
+professional subtitler would: faithful to meaning and character voice,
+not flowery, and timed for reading speed.
+
 CRITICAL RULES:
 1. Translate naturally — produce fluent {target_lang}, not word-for-word translation
-2. Preserve the meaning, tone, and speaker intent
-3. Keep translations concise — each subtitle must be readable in 2-3 seconds
-4. Preserve proper nouns (names of people, brands) UNLESS they have standard {target_lang} translations
-5. Return EXACTLY {count} translated strings as a JSON array
-6. If a segment is very short (e.g., "Yeah", "Okay"), use the natural {target_lang} equivalent
-7. DO NOT leave any words in {source_lang} unless they are proper nouns
-8. DO NOT romanize — output must be in {target_lang} script
+2. Preserve the meaning, tone, and speaker intent — match each line's register
+   (formal/casual/military/intimate) to the {target_lang} equivalent
+3. Preserve dialogue rhythm — short utterances stay short, sentence-final
+   particles become tonal markers, NOT extra words
+4. Keep translations concise — each subtitle must be readable in 2-3 seconds.
+   When in doubt, prefer the shorter / cleaner phrasing
+5. Preserve proper nouns (names of people, brands, ranks like "Lieutenant",
+   organization names like "OZ" / "Alliance") UNLESS they have standard
+   {target_lang} translations
+6. Match published subtitle conventions — no narrator additions, no
+   parenthetical stage directions, no expanded descriptions of what's
+   visible on screen
+7. Return EXACTLY {count} translated strings as a JSON array
+8. If a segment is very short (e.g., "Yeah", "Okay"), use the natural
+   {target_lang} equivalent — do NOT expand short utterances
+9. DO NOT leave any words in {source_lang} unless they are proper nouns
+10. DO NOT romanize — output must be in {target_lang} script
 {extra_rules}
 {context_section}Segments to translate:
 {segments_json}
