@@ -7,6 +7,7 @@ import time as _time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from typing import Optional
 
 import httpx
 
@@ -512,7 +513,9 @@ def _slice_transcript_for_clip(segments: list, start_s: float, end_s: float) -> 
     return "\n".join(lines) if lines else "(no speech in this segment)"
 
 
-async def _refresh_clips_with_translation(job_id: str, translated: list) -> int:
+async def _refresh_clips_with_translation(
+    job_id: str, translated: list, fallback_clips: Optional[list] = None,
+) -> int:
     """Rebuild clip caption / hook_text / title from the translated transcript.
 
     Returns the number of clips updated. Mirrors the bridge's original
@@ -522,14 +525,34 @@ async def _refresh_clips_with_translation(job_id: str, translated: list) -> int:
     re-derived; legacy clips missing ``vlm_hook`` / ``judge_title`` are
     treated as pure-transcript and refreshed unconditionally so the
     Japanese caption gets replaced with the English one either way.
+
+    When the fresh ``database.load_job`` snapshot lacks ``clips`` —
+    occasionally seen in logs where the disk file round-trips clean
+    in tests but reads back empty post-translation — fall back to
+    the caller-supplied ``fallback_clips`` (the ``post_job.clips``
+    captured at ``COMPLETE`` time) so the refresh still runs against
+    the same dataset the rest of the pipeline used.
     """
     job = await database.load_job(job_id)
-    if not job or not job.clips:
+    if job is None:
+        logger.warning(
+            "[%s] clip refresh: load_job returned None — skipping (translated=%d)",
+            job_id, len(translated or []),
+        )
+        return 0
+    source_clips = list(job.clips or [])
+    if not source_clips and fallback_clips:
+        logger.warning(
+            "[%s] clip refresh: DB job has 0 clips — using fallback list (n=%d)",
+            job_id, len(fallback_clips),
+        )
+        source_clips = list(fallback_clips)
+    if not source_clips:
         return 0
 
     updated_clips = []
     changed = 0
-    for clip in job.clips:
+    for clip in source_clips:
         clip_dict = clip.model_dump() if hasattr(clip, "model_dump") else dict(clip)
         start_s = float(clip_dict.get("start_time", 0.0) or 0.0)
         end_s = float(clip_dict.get("end_time", start_s) or start_s)
@@ -578,7 +601,8 @@ async def _refresh_clips_with_translation(job_id: str, translated: list) -> int:
 
 
 async def _auto_generate_clip_seo(
-    job_id: str, transcript: list, orchestrator
+    job_id: str, transcript: list, orchestrator,
+    fallback_clips: Optional[list] = None,
 ) -> tuple[int, int]:
     """Generate SEO (title / description / tags / platform_tips) for every
     clip in the background after analysis completes.
@@ -632,13 +656,33 @@ async def _auto_generate_clip_seo(
         return "\n".join(lines)
 
     job = await database.load_job(job_id)
-    if not job or not job.clips:
-        # Surface the explicit reason — without this log, "SEO generated
-        # for 0 clips" gives no clue whether the clips never made it to
-        # the DB (timing) or whether the loop ran and skipped them all.
+    if job is None:
         logger.info(
-            "[%s] Auto-SEO skipped early: job_loaded=%s, clip_count=%d",
-            job_id, bool(job), len(getattr(job, "clips", []) or []) if job else 0,
+            "[%s] Auto-SEO skipped early: job_loaded=False, clip_count=0",
+            job_id,
+        )
+        return (0, 0)
+    # When the fresh DB snapshot has 0 clips but the caller threaded
+    # through the post-COMPLETE list, run against that — otherwise the
+    # cards on the Viral Clips page ship as bare transcript snippets
+    # for every job whose disk file round-trips empty here. The
+    # round-trip works in isolated tests, but at least one production
+    # job lost its clips between the COMPLETE save and the SEO load
+    # (clipai_logs_20260527_000705.log line ~902).
+    if not job.clips and fallback_clips:
+        logger.warning(
+            "[%s] Auto-SEO: DB job has 0 clips — using fallback list (n=%d)",
+            job_id, len(fallback_clips),
+        )
+        # Mutate the in-memory job so the per-clip loop below sees
+        # the fallback clips, and so the trailing
+        # ``update_job_status(clips=updated_clips)`` re-persists them
+        # alongside the generated SEO.
+        job.clips = list(fallback_clips)
+    if not job.clips:
+        logger.info(
+            "[%s] Auto-SEO skipped early: job_loaded=True, clip_count=0",
+            job_id,
         )
         return (0, 0)
     logger.info(
@@ -739,11 +783,23 @@ async def _auto_generate_clip_seo(
     return (generated, failed)
 
 
-async def _background_post_processing(job_id: str, transcript: list, orchestrator, job):
+async def _background_post_processing(
+    job_id: str, transcript: list, orchestrator, job,
+    clips: Optional[list] = None,
+):
     """Run transcript polishing and subtitle translation in background after analysis.
 
     These are quality-of-life improvements that don't affect clip detection.
     Running them after COMPLETE status saves ~5+ minutes on the critical path.
+
+    ``clips`` is the in-process list of dicts (or ClipCandidate models)
+    captured from the local variable in ``_run_analysis_inner`` right
+    before the COMPLETE save, threaded through so the post-translation
+    refresh and Auto-SEO step have a definitive source of truth even
+    when the fresh ``database.load_job`` round-trip returns an empty
+    ``clips`` field (observed in production in
+    clipai_logs_20260527_000705.log even though the in-isolation
+    round-trip tests round-trip clean).
     """
     # ── Transcript polishing ──
     if settings.AI_TRANSCRIPT_CORRECTION and transcript:
@@ -1081,6 +1137,19 @@ async def _background_post_processing(job_id: str, transcript: list, orchestrato
                 _update_kwargs["transcript_readability"] = _tr_readability
             await database.update_job_status(job_id, **_update_kwargs)
 
+            # ``clips`` is the in-process list captured at the COMPLETE
+            # save in ``_run_analysis_inner``. Prefer it over
+            # ``job.clips`` (also produced by a ``load_job`` round-trip)
+            # so the refresh + Auto-SEO still run when DB reads return
+            # an empty clips field
+            # (clipai_logs_20260527_000705.log line ~902). Computed
+            # once outside the per-step try blocks so both consumers
+            # see the same value even if the refresh raises.
+            _fallback_clips = list(
+                clips if clips is not None
+                else (getattr(job, "clips", []) or [])
+            )
+
             # Re-derive clip caption / hook_text / title from the translated
             # transcript. Clip extraction had to run BEFORE translation so
             # the user could start editing immediately; without this refresh
@@ -1088,7 +1157,9 @@ async def _background_post_processing(job_id: str, transcript: list, orchestrato
             # language (Japanese on a JA→EN job, etc.).
             try:
                 _refreshed = await _refresh_clips_with_translation(
-                    job_id, list(translated))
+                    job_id, list(translated),
+                    fallback_clips=list(_fallback_clips),
+                )
                 if _refreshed > 0:
                     await broadcast_ws(job_id, {
                         "type": "clips_refreshed",
@@ -1122,6 +1193,7 @@ async def _background_post_processing(job_id: str, transcript: list, orchestrato
                 })
                 _seo_gen, _seo_fail = await _auto_generate_clip_seo(
                     job_id, list(translated), orchestrator,
+                    fallback_clips=list(_fallback_clips),
                 )
                 await broadcast_ws(job_id, {
                     "type": "background_task",
@@ -1166,6 +1238,10 @@ async def _background_post_processing(job_id: str, transcript: list, orchestrato
             })
             _seo_gen, _seo_fail = await _auto_generate_clip_seo(
                 job_id, list(transcript), orchestrator,
+                fallback_clips=list(
+                    clips if clips is not None
+                    else (getattr(job, "clips", []) or [])
+                ),
             )
             await broadcast_ws(job_id, {
                 "type": "background_task",
@@ -2401,8 +2477,17 @@ async def _run_analysis_inner(job_id: str):
     # sees the freshly-stored transcript + clip metadata.
     try:
         post_job = await database.load_job(job_id)
+        # Pass the in-process ``clips`` list explicitly so the
+        # post-translation refresh and Auto-SEO have a definitive
+        # source of truth even if a subsequent ``database.load_job``
+        # round-trip somehow returns an empty clips field. The fresh
+        # DB-round-tripped ``post_job`` is still threaded in for
+        # ``language`` / ``subtitle_language`` access.
         _bg = asyncio.create_task(
-            _background_post_processing(job_id, list(transcript), orchestrator, post_job),
+            _background_post_processing(
+                job_id, list(transcript), orchestrator, post_job,
+                clips=list(clips or []),
+            ),
             name=f"post-processing:{job_id}",
         )
         _background_tasks.add(_bg)
