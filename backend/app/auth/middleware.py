@@ -22,6 +22,7 @@ or the SPA's index page) bypass the middleware via
 from __future__ import annotations
 
 import logging
+import os
 import re
 import time
 from typing import Iterable
@@ -38,6 +39,21 @@ logger = logging.getLogger(__name__)
 
 
 SESSION_COOKIE = "clipai_session"
+REMEMBER_COOKIE = "clipai_remember"
+REMEMBER_MAX_AGE = 365 * 24 * 3600
+
+
+def _cookie_secure() -> bool:
+    """Return True when the instance is served over HTTPS.
+
+    Set ``CLIPAI_HTTPS=true`` in the environment when running behind an
+    SSL-terminating reverse proxy so cookies receive the ``Secure`` flag.
+    Defaults to ``false`` so plain-HTTP / localhost installs work without
+    any configuration.
+    """
+    return os.environ.get("CLIPAI_HTTPS", "false").lower() not in (
+        "0", "false", "no", "off",
+    )
 
 
 # Paths that never require auth. SPA routes fall through to index.html
@@ -123,24 +139,40 @@ class AuthMiddleware(BaseHTTPMiddleware):
         if _is_public_path(path):
             return await call_next(request)
 
-        token = request.cookies.get(SESSION_COOKIE)
-        if not token:
-            return JSONResponse(
-                {"detail": "not authenticated"}, status_code=401,
-            )
-
-        session = await get_session(token)
-        if session is None:
-            return self._clear_and_reject("session not found")
-
-        # Fingerprint check: new IP or browser → force re-login.
         ip = _client_ip(request)
         ua = request.headers.get("user-agent", "")
-        if compute_fingerprint(ip, ua) != session.fingerprint:
-            # Kill the session so re-use of the old cookie can't succeed.
-            from backend.app.auth.store import delete_session
-            await delete_session(token)
-            return self._clear_and_reject("session bound to a different browser/IP")
+        token = request.cookies.get(SESSION_COOKIE)
+        session = None
+        new_remember_token = None
+
+        # --- Primary: validate the session cookie ---
+        if token:
+            session = await get_session(token)
+            if session is not None:
+                if compute_fingerprint(ip, ua) != session.fingerprint:
+                    # Fingerprint mismatch — kill the old session and fall
+                    # through to the remember-token fallback below rather
+                    # than immediately rejecting. A remember token can
+                    # transparently issue a fresh fingerprinted session.
+                    from backend.app.auth.store import delete_session
+                    await delete_session(token)
+                    session = None
+                    token = None
+
+        # --- Fallback: exchange a remember-me token for a new session ---
+        if session is None:
+            remember_cookie = request.cookies.get(REMEMBER_COOKIE)
+            if remember_cookie:
+                from backend.app.auth.store import exchange_remember_token
+                result = await exchange_remember_token(
+                    remember_cookie, ip=ip, user_agent=ua
+                )
+                if result is not None:
+                    session, new_remember_token = result
+                    token = session.token
+
+        if session is None:
+            return self._clear_and_reject("not authenticated")
 
         user = await get_user(session.user_id)
         if user is None or not user.active:
@@ -157,7 +189,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
         # within the rolling window.
         now = time.monotonic()
         last = self._touch_cache.get(token, 0.0)
-        refreshed_cookie = False
+        refreshed_cookie = new_remember_token is not None  # always refresh after exchange
         if now - last > self._TOUCH_INTERVAL:
             try:
                 await touch_session(token)
@@ -179,11 +211,25 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 )
             except Exception:
                 pass
+        if new_remember_token is not None:
+            try:
+                response.set_cookie(
+                    key=REMEMBER_COOKIE,
+                    value=new_remember_token.token,
+                    httponly=True,
+                    secure=_cookie_secure(),
+                    samesite="lax",
+                    path="/",
+                    max_age=REMEMBER_MAX_AGE,
+                )
+            except Exception:
+                pass
         return response
 
     def _clear_and_reject(self, detail: str) -> Response:
         resp = JSONResponse({"detail": detail}, status_code=401)
         resp.delete_cookie(SESSION_COOKIE, path="/")
+        resp.delete_cookie(REMEMBER_COOKIE, path="/")
         return resp
 
 
@@ -211,7 +257,7 @@ def set_session_cookie(
         key=SESSION_COOKIE,
         value=token,
         httponly=True,
-        secure=False,  # localhost defaults; reverse proxy can override
+        secure=_cookie_secure(),
         samesite="lax",
         path="/",
     )

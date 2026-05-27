@@ -12,6 +12,7 @@ import base64
 import hashlib
 import hmac
 import os
+import re as _re
 import secrets
 from typing import Optional
 
@@ -63,6 +64,20 @@ def new_token() -> str:
     return secrets.token_urlsafe(_TOKEN_BYTES)
 
 
+def normalize_ua(ua: Optional[str]) -> str:
+    """Collapse version numbers in a User-Agent for stable fingerprinting.
+
+    Replaces every run of digits with the literal "N" so a Chrome/Firefox
+    auto-update (e.g. 123 → 124) doesn't change the fingerprint and sign
+    the user out. Lowercases and compresses whitespace for canonical form.
+    """
+    raw = (ua or "").strip()
+    if not raw:
+        return ""
+    normalised = _re.sub(r"\d+", "N", raw)
+    return _re.sub(r"\s+", " ", normalised).strip().lower()
+
+
 def normalize_ip(ip_raw: Optional[str]) -> str:
     """Collapse an IP header into a canonical form for fingerprinting.
 
@@ -109,11 +124,11 @@ def compute_fingerprint(ip: str, user_agent: str) -> str:
     component entirely (recommended for installs behind a load
     balancer that rewrites the client IP per request).
     """
-    bind_ip = os.environ.get("CLIPAI_BIND_SESSION_TO_IP", "true").lower() not in (
+    bind_ip = os.environ.get("CLIPAI_BIND_SESSION_TO_IP", "false").lower() not in (
         "0", "false", "no", "off",
     )
     norm_ip = normalize_ip(ip) if bind_ip else ""
-    norm_ua = (user_agent or "").strip()
+    norm_ua = normalize_ua(user_agent)
     h = hashlib.sha256()
     h.update(norm_ip.encode("utf-8"))
     h.update(b"|")

@@ -35,6 +35,19 @@ services:
       - CLIPAI_EDITORIAL_PRIOR=1
       - CLIPAI_THIRDS_BIAS=1
       - CLIPAI_GAZE_LEAD_ROOM_V2=1
+      # --- Auth tuning ---
+      # Disable IP binding if behind a load balancer that rewrites the client
+      # IP per request (all sessions would break on round-robin). Default: false.
+      # - CLIPAI_BIND_SESSION_TO_IP=true
+      #
+      # Set to true when serving over HTTPS so cookies receive the Secure flag.
+      # Required for production behind an SSL-terminating reverse proxy.
+      # Default: false (works on plain HTTP / localhost without any config).
+      # - CLIPAI_HTTPS=true
+      #
+      # API key for the /api/v1/ machine-to-machine layer (separate from user
+      # auth). Generate: python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+      # - CLIPAI_API_KEY=<your-key>
     # Pinned to the GTX 1650 by UUID so the container can never bind any
     # other GPU. If this exact device is absent, ``docker compose up`` fails
     # fast — it will NOT fall back to CPU. Update the UUID if the card changes.

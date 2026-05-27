@@ -104,3 +104,31 @@ class Session:
         # crash on existing on-disk records.
         known = {f.name for f in fields(cls)}
         return cls(**{k: v for k, v in data.items() if k in known})
+
+
+@dataclass
+class RememberToken:
+    """Long-lived device-bound token for the "remember me" flow.
+
+    Single-use: ``exchange_remember_token`` atomically replaces this token
+    with a fresh one and issues a new session, so replay attacks are
+    detectable (the old token ceases to exist the moment it is used).
+
+    ``device_hint`` is an opaque UA snippet stored only for the admin's
+    "active devices" view — it is never used in an auth check.
+    """
+
+    token: str
+    user_id: str
+    device_hint: str
+    created_at: str
+    last_used: str
+    expires_at: str
+
+    def to_storage(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_storage(cls, data: dict) -> "RememberToken":
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in data.items() if k in known})

@@ -31,7 +31,13 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 from backend.app.auth.deps import get_current_user, require_admin
-from backend.app.auth.middleware import clear_session_cookie, set_session_cookie
+from backend.app.auth.middleware import (
+    REMEMBER_COOKIE,
+    REMEMBER_MAX_AGE,
+    _cookie_secure,
+    clear_session_cookie,
+    set_session_cookie,
+)
 from backend.app.auth.models import Role, User
 from backend.app.auth.security import (
     MIN_PASSWORD_LEN,
@@ -127,6 +133,20 @@ async def login(
         remember=payload.remember,
     )
     set_session_cookie(response, session.token, remember=payload.remember)
+    if payload.remember:
+        rt = await auth_store.create_remember_token(
+            user_id=user.id,
+            device_hint=(ua[:120] if ua else ""),
+        )
+        response.set_cookie(
+            key=REMEMBER_COOKIE,
+            value=rt.token,
+            httponly=True,
+            secure=_cookie_secure(),
+            samesite="lax",
+            path="/",
+            max_age=REMEMBER_MAX_AGE,
+        )
     logger.info(
         "user %r logged in (ip=%s, remember=%s)",
         user.username, ip, payload.remember,
@@ -142,7 +162,14 @@ async def logout(request: Request, response: Response):
             await auth_store.delete_session(token)
         except Exception as e:
             logger.warning("logout delete_session failed: %s", e)
+    remember_token = request.cookies.get(REMEMBER_COOKIE)
+    if remember_token:
+        try:
+            await auth_store.delete_remember_token(remember_token)
+        except Exception as e:
+            logger.warning("logout delete_remember_token failed: %s", e)
     clear_session_cookie(response)
+    response.delete_cookie(REMEMBER_COOKIE, path="/")
     return {"ok": True}
 
 
@@ -190,10 +217,10 @@ async def change_my_password(
         await auth_store.change_password(user.id, payload.new_password)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    # Revoke every session except this one so other devices are forced
-    # to re-login.
-    # Keep the current token alive by reading it back + preserving it.
+    # Revoke every session AND remember token — all devices must re-login
+    # after a password change.
     await auth_store.delete_sessions_for_user(user.id)
+    await auth_store.delete_remember_tokens_for_user(user.id)
     return {"ok": True, "sessions_revoked": True}
 
 
@@ -346,8 +373,9 @@ async def admin_reset_password(
         await auth_store.change_password(user_id, payload.new_password)
     except (KeyError, ValueError) as e:
         raise HTTPException(status_code=404, detail=str(e))
-    # Force re-login on all devices.
+    # Force re-login on all devices — sessions and remember tokens.
     await auth_store.delete_sessions_for_user(user_id)
+    await auth_store.delete_remember_tokens_for_user(user_id)
     return {"ok": True, "sessions_revoked": True}
 
 

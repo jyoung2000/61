@@ -58,26 +58,33 @@ export function AuthProvider({ children }) {
   const refresh = useCallback(async () => {
     if (inflightRef.current) return inflightRef.current;
     const p = (async () => {
-      try {
-        const me = await apiFetch('/api/auth/me');
-        setUser(me?.user || null);
-        setStatus(me?.user ? 'authenticated' : 'unauthenticated');
-      } catch (e) {
-        if (e.status === 401) {
-          setUser(null);
-          setStatus('unauthenticated');
-        } else {
-          // Unexpected error: keep "loading" so we retry later rather
-          // than showing the user a false "logged out" state.
-          console.error('auth refresh error', e);
-          setUser(null);
-          setStatus('unauthenticated');
+      // Two attempts with 1500ms between them: guards against transient
+      // network hiccups and gives the remember-token cookie rotation a
+      // second chance before declaring the user signed out.
+      for (let attempt = 0; attempt < 2; attempt++) {
+        if (attempt > 0) {
+          await new Promise(r => setTimeout(r, 1500));
         }
-      } finally {
-        inflightRef.current = null;
+        try {
+          const me = await apiFetch('/api/auth/me');
+          setUser(me?.user || null);
+          setStatus(me?.user ? 'authenticated' : 'unauthenticated');
+          return;
+        } catch (e) {
+          if (e.status === 401) {
+            // 401 is definitive — no point retrying.
+            setUser(null);
+            setStatus('unauthenticated');
+            return;
+          }
+          console.error('auth refresh error', e);
+        }
       }
+      // Both attempts failed with a non-401 error.
+      setUser(null);
+      setStatus('unauthenticated');
     })();
-    inflightRef.current = p;
+    inflightRef.current = p.finally(() => { inflightRef.current = null; });
     return p;
   }, []);
 
@@ -99,10 +106,16 @@ export function AuthProvider({ children }) {
         if (resp.status === 401 && url.includes('/api/') && !url.includes('/api/auth/login')) {
           setUser(null);
           setStatus('unauthenticated');
-          // Only redirect if we're not already on the login page.
+          // 800ms grace period before redirecting: gives the remember-token
+          // cookie rotation a chance to complete if another in-flight request
+          // already triggered a session refresh.
           if (!window.location.pathname.startsWith('/login')) {
             const here = window.location.pathname + window.location.search;
-            window.location.href = `/login?next=${encodeURIComponent(here)}`;
+            setTimeout(() => {
+              if (!window.location.pathname.startsWith('/login')) {
+                window.location.href = `/login?next=${encodeURIComponent(here)}`;
+              }
+            }, 800);
           }
         }
       } catch {}

@@ -28,7 +28,7 @@ from typing import Optional
 
 import aiofiles
 
-from backend.app.auth.models import Role, Session, User
+from backend.app.auth.models import RememberToken, Role, Session, User
 from backend.app.auth.security import (
     compute_fingerprint,
     hash_password,
@@ -43,6 +43,8 @@ _FALLBACK_DIR = os.path.join(
     os.path.expanduser("~"), ".clipai", "auth",
 )
 _SESSION_TTL_DAYS = 30
+_REMEMBERED_TTL_DAYS = 90
+_DEVICE_TOKEN_TTL_DAYS = 365
 
 
 def _resolve_dir() -> str:
@@ -63,11 +65,13 @@ def _resolve_dir() -> str:
 AUTH_DIR = _resolve_dir()
 USERS_PATH = os.path.join(AUTH_DIR, "users.json")
 SESSIONS_PATH = os.path.join(AUTH_DIR, "sessions.json")
+REMEMBER_TOKENS_PATH = os.path.join(AUTH_DIR, "remember_tokens.json")
 USER_SETTINGS_DIR = os.path.join(AUTH_DIR, "user_settings")
 os.makedirs(USER_SETTINGS_DIR, exist_ok=True)
 
 _users_lock = asyncio.Lock()
 _sessions_lock = asyncio.Lock()
+_remember_tokens_lock = asyncio.Lock()
 
 
 def _now_iso() -> str:
@@ -299,6 +303,137 @@ async def delete_sessions_for_user(user_id: str) -> None:
         await _atomic_write_json(SESSIONS_PATH, data)
 
 
+# ── Remember tokens ─────────────────────────────────────────────
+
+
+async def create_remember_token(
+    *,
+    user_id: str,
+    device_hint: str,
+) -> RememberToken:
+    """Create a new long-lived device token for the remember-me flow."""
+    token = new_token()
+    now = _now_iso()
+    expires = (
+        datetime.now(timezone.utc) + timedelta(days=_DEVICE_TOKEN_TTL_DAYS)
+    ).replace(microsecond=0).isoformat()
+    rt = RememberToken(
+        token=token,
+        user_id=user_id,
+        device_hint=device_hint,
+        created_at=now,
+        last_used=now,
+        expires_at=expires,
+    )
+    async with _remember_tokens_lock:
+        data = await _read_json(REMEMBER_TOKENS_PATH, {"remember_tokens": []})
+        data["remember_tokens"] = _drop_expired(data.get("remember_tokens", []))
+        data["remember_tokens"].append(rt.to_storage())
+        await _atomic_write_json(REMEMBER_TOKENS_PATH, data)
+    return rt
+
+
+async def exchange_remember_token(
+    old_token: str,
+    *,
+    ip: str,
+    user_agent: str,
+) -> Optional[tuple]:
+    """Validate + rotate a remember token, returning (Session, RememberToken).
+
+    Single-use: the old token is deleted atomically before the new session
+    and token are written. If the token does not exist or has expired,
+    returns None (caller should force re-login).
+    """
+    async with _remember_tokens_lock:
+        data = await _read_json(REMEMBER_TOKENS_PATH, {"remember_tokens": []})
+        rows = data.get("remember_tokens", [])
+        found = None
+        kept = []
+        for r in rows:
+            if r.get("token") == old_token:
+                try:
+                    exp = datetime.fromisoformat(r["expires_at"])
+                    if exp.tzinfo is None:
+                        exp = exp.replace(tzinfo=timezone.utc)
+                    if exp > datetime.now(timezone.utc):
+                        found = r
+                        continue  # don't include in kept → deleted
+                except Exception:
+                    pass  # malformed — drop it
+            else:
+                kept.append(r)
+        if found is None:
+            return None
+        data["remember_tokens"] = _drop_expired(kept)
+        await _atomic_write_json(REMEMBER_TOKENS_PATH, data)
+
+    # Atomically issue fresh remember token + session outside the lock
+    new_rt = await create_remember_token(
+        user_id=found["user_id"],
+        device_hint=found.get("device_hint", ""),
+    )
+    session = await _create_session_with_ttl(
+        user_id=found["user_id"],
+        ip=ip,
+        user_agent=user_agent,
+        ttl_days=_REMEMBERED_TTL_DAYS,
+    )
+    return session, new_rt
+
+
+async def _create_session_with_ttl(
+    *,
+    user_id: str,
+    ip: str,
+    user_agent: str,
+    ttl_days: int,
+) -> Session:
+    """Internal helper: create a session with an explicit TTL."""
+    from backend.app.auth.security import compute_fingerprint, new_token as _new_token
+    token = _new_token()
+    fingerprint = compute_fingerprint(ip, user_agent)
+    now = _now_iso()
+    expires = (
+        datetime.now(timezone.utc) + timedelta(days=ttl_days)
+    ).replace(microsecond=0).isoformat()
+    session = Session(
+        token=token, user_id=user_id,
+        fingerprint=fingerprint,
+        ip=ip or "", user_agent=user_agent or "",
+        created_at=now, last_seen=now, expires_at=expires,
+        remember=True,
+    )
+    async with _sessions_lock:
+        data = await _read_json(SESSIONS_PATH, {"sessions": []})
+        data["sessions"] = _drop_expired(data.get("sessions", []))
+        data["sessions"].append(session.to_storage())
+        await _atomic_write_json(SESSIONS_PATH, data)
+    return session
+
+
+async def delete_remember_token(token: str) -> None:
+    """Delete a single remember token (used on explicit logout)."""
+    async with _remember_tokens_lock:
+        data = await _read_json(REMEMBER_TOKENS_PATH, {"remember_tokens": []})
+        data["remember_tokens"] = [
+            r for r in data.get("remember_tokens", [])
+            if r.get("token") != token
+        ]
+        await _atomic_write_json(REMEMBER_TOKENS_PATH, data)
+
+
+async def delete_remember_tokens_for_user(user_id: str) -> None:
+    """Delete all remember tokens for a user (used on password change)."""
+    async with _remember_tokens_lock:
+        data = await _read_json(REMEMBER_TOKENS_PATH, {"remember_tokens": []})
+        data["remember_tokens"] = [
+            r for r in data.get("remember_tokens", [])
+            if r.get("user_id") != user_id
+        ]
+        await _atomic_write_json(REMEMBER_TOKENS_PATH, data)
+
+
 def _drop_expired(rows: list[dict]) -> list[dict]:
     now = datetime.now(timezone.utc)
     out = []
@@ -357,7 +492,7 @@ async def delete_user_settings(user_id: str) -> None:
 
 async def _reset_for_tests() -> None:
     """Wipe all auth state. Only used in tests."""
-    for p in (USERS_PATH, SESSIONS_PATH):
+    for p in (USERS_PATH, SESSIONS_PATH, REMEMBER_TOKENS_PATH):
         try:
             os.unlink(p)
         except FileNotFoundError:
