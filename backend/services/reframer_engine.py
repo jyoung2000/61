@@ -154,11 +154,11 @@ class ReframeEngine:
         # the 68 %→target gap.
         self._post_smoother_centering()
 
-        # Stage 4.5: Live-action face enforcement
-        # In live-action content, EVERY keyframe must have a face in crop.
-        # This is the hard constraint that distinguishes live-action behavior.
-        if self.perception.is_live_action:
-            self._enforce_live_action_faces()
+        # Stage 4.5: Face enforcement — live-action runs every 800ms,
+        # non-live-action every 1500ms (gentle enough not to jitter on
+        # anime/gaming but catches the long-interval face_missing gaps
+        # that Phase B misses when the perceiver has sparse samples).
+        self._enforce_live_action_faces()
 
         # Final edge-violation elimination — runs last, after all other passes
         self._eliminate_edge_violations()
@@ -238,7 +238,7 @@ class ReframeEngine:
             # Find best face at this time (±200ms window).
             best_face = None
             best_score = 0
-            for dt in [0, -200, 200, -400, 400]:
+            for dt in [0, -200, 200, -400, 400, -600, 600]:
                 faces = self.perception.face_timeline.get(t + dt, [])
                 # Filter non-human faces (figurines, posters) when YOLO
                 # found persons at this moment — mirrors the planner gate
@@ -372,7 +372,7 @@ class ReframeEngine:
             best_face = None
             best_score = 0
             persons_at_t = self.perception.person_timeline.get(time_ms, [])
-            for dt in [0, -200, 200, -400, 400]:
+            for dt in [0, -200, 200, -400, 400, -600, 600]:
                 faces = self.perception.face_timeline.get(time_ms + dt, [])
                 cand_faces = faces
                 if persons_at_t:
@@ -504,8 +504,13 @@ class ReframeEngine:
             # inside the crop.
             if not face_outside and abs(face_cx - crop_center) <= eval_boundary:
                 continue  # already centered at eval time
-            if _has_neighbour(time_ms):
-                continue  # an existing keyframe already covers this sample
+            # When face is INSIDE the crop but off-centre, respect the
+            # neighbour guard — a nearby keyframe already covers the frame.
+            # When face is OUTSIDE the crop entirely, never block on neighbours:
+            # the existing nearby keyframe is at the WRONG position, and we
+            # must override it to prevent the HIGH face_missing problem.
+            if not face_outside and _has_neighbour(time_ms):
+                continue  # face in crop; nearby keyframe covers this sample
             # Snap to face — use a short ease so the new keyframe
             # blends with its neighbours instead of cutting.
             new_x = clamp_x(face_cx - crop_w // 2, max_x)
@@ -537,17 +542,15 @@ class ReframeEngine:
                 f'({revalidated_centering} _centering keyframes re-validated)')
 
     def _enforce_live_action_faces(self):
-        """Hard constraint: in live-action content, ensure every keyframe
-        interval has a face in the crop.
+        """Final guarantee: ensure every face sample has a face in the crop.
 
-        Unlike the predictive anchoring's face inclusion check (which runs
-        before smoothing and gets its corrections smoothed away), this runs
-        AFTER smoothing as a final guarantee. It checks every 500ms of the
-        video, and if the interpolated crop position has no face, it inserts
-        a correction keyframe.
+        Runs for ALL content (not just live-action). Live-action uses a tighter
+        800ms correction gap; non-live-action uses 1500ms to avoid jitter on
+        anime/gaming content where face detections can be sparse or noisy.
 
-        This is what makes live-action reframing behave like a human camera
-        operator who ALWAYS keeps a face in frame."""
+        Unlike predictive anchoring (which runs before smoothing and gets
+        corrections smoothed away), this runs AFTER smoothing as a hard
+        guarantee that no long-interval face_missing gap survives."""
         if not self.perception or not self.plan:
             return
 
@@ -559,7 +562,8 @@ class ReframeEngine:
         if len(kfs) < 2:
             return
 
-        # Build real-track set
+        # Build real-track set (with animated fallback so short clips and
+        # non-live-action content don't end up with an empty real_tracks set).
         track_counts = {}
         for faces in self.perception.face_timeline.values():
             for f in faces:
@@ -567,6 +571,13 @@ class ReframeEngine:
                 if tid >= 0:
                     track_counts[tid] = track_counts.get(tid, 0) + 1
         real_tracks = {tid for tid, cnt in track_counts.items() if cnt >= 25}
+        if not real_tracks and track_counts:
+            real_tracks = set(track_counts.keys())
+
+        # Correction gap: live-action reacts every 800ms; non-live-action
+        # every 1500ms (gentler — avoids chasing sparse/noisy detections
+        # on stylised or gaming content).
+        min_gap_ms = 800 if self.perception.is_live_action else 1500
 
         # Sample times from face_timeline
         sample_times = sorted(self.perception.face_timeline.keys())
@@ -605,7 +616,7 @@ class ReframeEngine:
             # Check if ANY face center is in crop
             any_in_crop = any(crop_left <= f['cx'] <= crop_right for f in real_faces)
 
-            if not any_in_crop and (st - last_correction_t) >= 800:
+            if not any_in_crop and (st - last_correction_t) >= min_gap_ms:
                 # No face in crop — snap to the best face
                 best = max(real_faces, key=lambda f: (
                     f.get('mouth_motion', 0) * 10.0 + f.get('area', 0) * 0.0001
@@ -645,7 +656,8 @@ class ReframeEngine:
             self.plan.keyframes.extend(corrections)
             self.plan.keyframes.sort(key=lambda k: k['time_ms'])
             log.log_stage('SMOOTH',
-                f'Live-action face enforcement: inserted {len(corrections)} corrections')
+                f'Face enforcement ({"live" if self.perception.is_live_action else "non-live"}, '
+                f'min_gap={min_gap_ms}ms): inserted {len(corrections)} corrections')
 
     def _fix_gradient_centering(self):
         """Post-pass: fix stuck-at-left scenes using Sobel gradient centering.
