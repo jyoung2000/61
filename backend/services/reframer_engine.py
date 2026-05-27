@@ -793,6 +793,19 @@ class ReframeEngine:
                 for idx in scene_kf_indices:
                     old_x = self.plan.keyframes[idx]['x']
                     self.plan.keyframes[idx]['x'] = gradient_crop_x
+                    # Tag as a centering correction so subsequent passes
+                    # (the inclusion-fix loop in _stabilize_keyframes, the
+                    # smoother's merge / consolidate / dejitter / drift
+                    # passes) treat it as already-corrected and don't
+                    # snap it to a competing signal. Without this flag,
+                    # the saliency hotspot (the inclusion-fix's third-
+                    # tier fallback) disagrees with the Sobel centroid
+                    # by 1-2 px on title cards / text-only scenes and
+                    # trips the "face_cx < crop_left" outside-crop check,
+                    # silently dragging the crop back to the wrong
+                    # position — observed on the GUNDAM title card in
+                    # clipai_logs_20260527_120641.log line 2300+.
+                    self.plan.keyframes[idx]['_centering'] = True
 
                 fixed_scenes.append({
                     'scene_range': f'{s_start/1000:.1f}-{s_end/1000:.1f}s',
@@ -1209,8 +1222,11 @@ class ReframeEngine:
             # face → YOLO subject → saliency hotspot. Animated /
             # gameplay / wide-landscape moments without a face still
             # get their crop corrected when the main subject drifts
-            # off-frame.
+            # off-frame. Track which signal won so we can be more
+            # conservative about overriding a previous correction
+            # with the weakest source (saliency hotspot).
             face_cx = None
+            face_source = None
             faces = self.perception.face_timeline.get(st, [])
             real_faces = [f for f in faces
                           if f.get('track_id', -1) >= 0
@@ -1221,18 +1237,21 @@ class ReframeEngine:
                     f.get('saliency', 0) + f.get('mouth_motion', 0)
                 ) * max(0.15, f.get('confidence', 0.5)))
                 face_cx = best_face['cx']
+                face_source = 'face'
             else:
                 persons = (self.perception.person_timeline.get(st, [])
                            if hasattr(self.perception, 'person_timeline')
                            else [])
                 if persons:
                     face_cx = max(persons, key=lambda p: p.get('area', 0)).get('cx')
+                    face_source = 'person'
             if face_cx is None:
                 sal = (self.perception.saliency_hotspot.get(st)
                        if hasattr(self.perception, 'saliency_hotspot')
                        else None)
                 if isinstance(sal, dict):
                     face_cx = sal.get('cx')
+                    face_source = 'saliency'
             if face_cx is None:
                 continue
 
@@ -1240,34 +1259,66 @@ class ReframeEngine:
             crop_left = crop_x
             crop_right = crop_x + crop_w
 
-            # Only fix if subject center is FULLY outside crop (not just at edge)
-            if face_cx < crop_left or face_cx > crop_right:
-                corrected_x = clamp_x(face_cx - crop_w // 2, max_x)
+            # Tolerance band around the crop edges. Without this, a
+            # 1-pixel disagreement between the saliency hotspot and an
+            # adjacent gradient-recentered keyframe trips the
+            # "subject_outside_crop" branch and silently undoes the
+            # gradient pass's work (observed on the GUNDAM title card
+            # in clipai_logs_20260527_120641.log line 2300+, where the
+            # Sobel centroid sat at 317 / crop_left at 216 while the
+            # saliency hotspot reported cx=215, off by 1 px). 5 % of
+            # crop_w (≈10 px on a 200-px 9:16 crop) is well below any
+            # visually meaningful "outside" threshold but absorbs the
+            # planner-vs-perceiver rounding noise.
+            tolerance = max(2, int(crop_w * 0.05))
+            if face_cx >= crop_left - tolerance and face_cx <= crop_right + tolerance:
+                continue
 
-                # Don't insert too close to existing keyframes
-                too_close = any(abs(kf['time_ms'] - check_ms) < 500
-                                for kf in anchored)
-                if not too_close:
-                    correction_kfs.append({
-                        'time_ms': check_ms,
-                        'x': corrected_x,
-                        'transition': 'ease_in_out',
-                        'transition_ms': 400,
-                        # Mark as a centering correction so the smoother's
-                        # pan consolidation doesn't collapse two adjacent
-                        # inclusion fixes (which usually target DIFFERENT
-                        # faces) into a single move to the last position
-                        # — that loses the first face's centering.
-                        '_centering': True,
-                    })
-                    self.tracer.event('stabilize_inclusion_fix',
-                                      t_ms=check_ms,
-                                      crop_x=crop_x,
-                                      new_x=corrected_x,
-                                      face_cx=face_cx,
-                                      crop_w=crop_w,
-                                      reason='subject_outside_crop')
-                    inclusion_fixes += 1
+            # When the only signal we have is the saliency hotspot (the
+            # 3rd-tier fallback) AND there's already a centering-
+            # corrected keyframe nearby, leave it alone. The earlier
+            # pass that set _centering used a stronger signal (Sobel
+            # gradient centroid, dedicated face-centering, or YOLO
+            # person), and the saliency hotspot disagreeing by a small
+            # margin is exactly the noise this tolerance was added to
+            # absorb. Same effect as a per-source ranking — face beats
+            # person beats saliency.
+            if face_source == 'saliency':
+                nearby_centering = any(
+                    abs(kf['time_ms'] - check_ms) < 1500
+                    and kf.get('_centering')
+                    for kf in anchored
+                )
+                if nearby_centering:
+                    continue
+
+            corrected_x = clamp_x(face_cx - crop_w // 2, max_x)
+
+            # Don't insert too close to existing keyframes
+            too_close = any(abs(kf['time_ms'] - check_ms) < 500
+                            for kf in anchored)
+            if not too_close:
+                correction_kfs.append({
+                    'time_ms': check_ms,
+                    'x': corrected_x,
+                    'transition': 'ease_in_out',
+                    'transition_ms': 400,
+                    # Mark as a centering correction so the smoother's
+                    # pan consolidation doesn't collapse two adjacent
+                    # inclusion fixes (which usually target DIFFERENT
+                    # faces) into a single move to the last position
+                    # — that loses the first face's centering.
+                    '_centering': True,
+                })
+                self.tracer.event('stabilize_inclusion_fix',
+                                  t_ms=check_ms,
+                                  crop_x=crop_x,
+                                  new_x=corrected_x,
+                                  face_cx=face_cx,
+                                  face_source=face_source,
+                                  crop_w=crop_w,
+                                  reason='subject_outside_crop')
+                inclusion_fixes += 1
 
         if correction_kfs:
             anchored.extend(correction_kfs)
