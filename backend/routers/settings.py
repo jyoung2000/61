@@ -55,6 +55,9 @@ _PERSISTABLE_KEYS = [
     "OPENROUTER_SUMMARY_MODEL", "OLLAMA_PRIMARY_MODEL", "OLLAMA_EDITORIAL_MODEL", "OLLAMA_TRANSLATION_MODEL",
     "WHISPER_MODEL", "WHISPER_MODEL_USER_SET", "WHISPER_BEAM_SIZE",
     "WHISPER_VAD_FILTER", "FRAME_SAMPLE_RATE",
+    "WHISPER_NO_SPEECH_THRESHOLD",
+    "WHISPER_GAP_FILL_ENABLED", "WHISPER_GAP_FILL_MIN_SEC",
+    "WHISPER_GAP_FILL_NO_SPEECH_THRESHOLD",
     "CLIP_MIN_DURATION", "CLIP_MAX_DURATION", "CLIP_COUNT",
     "CLIP_PREFERRED_SUBJECTS", "CLIP_AVOID_SUBJECTS", "CLIP_DISCOVERY_PROMPT",
     # VideoLLaMA3 Enhanced Discovery toggles — non-secret, persisted so
@@ -2077,6 +2080,11 @@ class SaveTranscriptionSettingsRequest(BaseModel):
     beam_size: Optional[int] = None      # 1-5
     vad_filter: Optional[bool] = None
     frame_sample_rate: Optional[int] = None  # 5-30 seconds
+    # ── Speech-coverage knobs (default-tuned for recall over precision) ──
+    no_speech_threshold: Optional[float] = None       # 0.0-1.0
+    gap_fill_enabled: Optional[bool] = None
+    gap_fill_min_sec: Optional[float] = None          # 0.5-10.0
+    gap_fill_no_speech_threshold: Optional[float] = None  # 0.0-1.0
 
 
 @router.get("/transcription/settings")
@@ -2087,6 +2095,14 @@ async def get_transcription_settings():
         "beam_size": settings.WHISPER_BEAM_SIZE,
         "vad_filter": settings.WHISPER_VAD_FILTER,
         "frame_sample_rate": settings.FRAME_SAMPLE_RATE,
+        "no_speech_threshold": float(getattr(
+            settings, "WHISPER_NO_SPEECH_THRESHOLD", 0.4)),
+        "gap_fill_enabled": bool(getattr(
+            settings, "WHISPER_GAP_FILL_ENABLED", True)),
+        "gap_fill_min_sec": float(getattr(
+            settings, "WHISPER_GAP_FILL_MIN_SEC", 1.5)),
+        "gap_fill_no_speech_threshold": float(getattr(
+            settings, "WHISPER_GAP_FILL_NO_SPEECH_THRESHOLD", 0.25)),
     }
 
 
@@ -2112,6 +2128,31 @@ async def save_transcription_settings(req: SaveTranscriptionSettingsRequest):
         if env_path:
             _upsert_env_var(env_path, "FRAME_SAMPLE_RATE", str(clamped))
 
+    if req.no_speech_threshold is not None:
+        clamped = max(0.0, min(1.0, float(req.no_speech_threshold)))
+        settings.WHISPER_NO_SPEECH_THRESHOLD = clamped
+        if env_path:
+            _upsert_env_var(env_path, "WHISPER_NO_SPEECH_THRESHOLD", str(clamped))
+
+    if req.gap_fill_enabled is not None:
+        settings.WHISPER_GAP_FILL_ENABLED = bool(req.gap_fill_enabled)
+        if env_path:
+            _upsert_env_var(env_path, "WHISPER_GAP_FILL_ENABLED",
+                            str(bool(req.gap_fill_enabled)))
+
+    if req.gap_fill_min_sec is not None:
+        clamped = max(0.5, min(10.0, float(req.gap_fill_min_sec)))
+        settings.WHISPER_GAP_FILL_MIN_SEC = clamped
+        if env_path:
+            _upsert_env_var(env_path, "WHISPER_GAP_FILL_MIN_SEC", str(clamped))
+
+    if req.gap_fill_no_speech_threshold is not None:
+        clamped = max(0.0, min(1.0, float(req.gap_fill_no_speech_threshold)))
+        settings.WHISPER_GAP_FILL_NO_SPEECH_THRESHOLD = clamped
+        if env_path:
+            _upsert_env_var(env_path, "WHISPER_GAP_FILL_NO_SPEECH_THRESHOLD",
+                            str(clamped))
+
     _invalidate_status_cache()
     _persist_user_settings()
     return {
@@ -2119,6 +2160,14 @@ async def save_transcription_settings(req: SaveTranscriptionSettingsRequest):
         "beam_size": settings.WHISPER_BEAM_SIZE,
         "vad_filter": settings.WHISPER_VAD_FILTER,
         "frame_sample_rate": settings.FRAME_SAMPLE_RATE,
+        "no_speech_threshold": float(getattr(
+            settings, "WHISPER_NO_SPEECH_THRESHOLD", 0.4)),
+        "gap_fill_enabled": bool(getattr(
+            settings, "WHISPER_GAP_FILL_ENABLED", True)),
+        "gap_fill_min_sec": float(getattr(
+            settings, "WHISPER_GAP_FILL_MIN_SEC", 1.5)),
+        "gap_fill_no_speech_threshold": float(getattr(
+            settings, "WHISPER_GAP_FILL_NO_SPEECH_THRESHOLD", 0.25)),
     }
 
 

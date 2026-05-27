@@ -72,8 +72,20 @@ export default function Settings() {
   const [refreshing, setRefreshing] = useState(false);
 
   // Transcription speed settings
-  const [transSettings, setTransSettings] = useState({ beam_size: 1, vad_filter: true, frame_sample_rate: 10 });
-  const [transSaved, setTransSaved] = useState({ beam_size: 1, vad_filter: true, frame_sample_rate: 10 });
+  const [transSettings, setTransSettings] = useState({
+    beam_size: 1, vad_filter: true, frame_sample_rate: 10,
+    no_speech_threshold: 0.4,
+    gap_fill_enabled: true,
+    gap_fill_min_sec: 1.5,
+    gap_fill_no_speech_threshold: 0.25,
+  });
+  const [transSaved, setTransSaved] = useState({
+    beam_size: 1, vad_filter: true, frame_sample_rate: 10,
+    no_speech_threshold: 0.4,
+    gap_fill_enabled: true,
+    gap_fill_min_sec: 1.5,
+    gap_fill_no_speech_threshold: 0.25,
+  });
   const [transSaving, setTransSaving] = useState(false);
 
   // NOTE: Whisper testing is now in PipelineDiagnostics component
@@ -226,7 +238,15 @@ export default function Settings() {
     fetch('/api/transcription/settings')
       .then((r) => r.json())
       .then((data) => {
-        const s = { beam_size: data.beam_size ?? 1, vad_filter: data.vad_filter ?? true, frame_sample_rate: data.frame_sample_rate ?? 10 };
+        const s = {
+          beam_size: data.beam_size ?? 1,
+          vad_filter: data.vad_filter ?? true,
+          frame_sample_rate: data.frame_sample_rate ?? 10,
+          no_speech_threshold: data.no_speech_threshold ?? 0.4,
+          gap_fill_enabled: data.gap_fill_enabled ?? true,
+          gap_fill_min_sec: data.gap_fill_min_sec ?? 1.5,
+          gap_fill_no_speech_threshold: data.gap_fill_no_speech_threshold ?? 0.25,
+        };
         setTransSettings(s);
         setTransSaved(s);
       })
@@ -709,7 +729,15 @@ export default function Settings() {
   };
 
   // Transcription settings handlers
-  const transHasChanges = transSettings.beam_size !== transSaved.beam_size || transSettings.vad_filter !== transSaved.vad_filter || transSettings.frame_sample_rate !== transSaved.frame_sample_rate;
+  const transHasChanges = (
+    transSettings.beam_size !== transSaved.beam_size
+    || transSettings.vad_filter !== transSaved.vad_filter
+    || transSettings.frame_sample_rate !== transSaved.frame_sample_rate
+    || transSettings.no_speech_threshold !== transSaved.no_speech_threshold
+    || transSettings.gap_fill_enabled !== transSaved.gap_fill_enabled
+    || transSettings.gap_fill_min_sec !== transSaved.gap_fill_min_sec
+    || transSettings.gap_fill_no_speech_threshold !== transSaved.gap_fill_no_speech_threshold
+  );
 
   const handleSaveTransSettings = async () => {
     setTransSaving(true);
@@ -721,7 +749,15 @@ export default function Settings() {
       });
       if (res.ok) {
         const data = await res.json();
-        const saved = { beam_size: data.beam_size, vad_filter: data.vad_filter, frame_sample_rate: data.frame_sample_rate };
+        const saved = {
+          beam_size: data.beam_size,
+          vad_filter: data.vad_filter,
+          frame_sample_rate: data.frame_sample_rate,
+          no_speech_threshold: data.no_speech_threshold,
+          gap_fill_enabled: data.gap_fill_enabled,
+          gap_fill_min_sec: data.gap_fill_min_sec,
+          gap_fill_no_speech_threshold: data.gap_fill_no_speech_threshold,
+        };
         setTransSettings(saved);
         setTransSaved(saved);
         // Persist Whisper bits per-user too. ``frame_sample_rate``
@@ -1576,6 +1612,136 @@ export default function Settings() {
                   <span style={{ fontSize: 10, color: 'var(--text-muted)', display: 'block', marginTop: 4 }}>
                     Lower = more visual detail but slower processing. Higher = faster but less detail.
                   </span>
+                </div>
+
+                {/* ── Speech coverage subsection ───────────────────────── */}
+                <div style={{
+                  marginTop: 14, paddingTop: 12,
+                  borderTop: '1px solid var(--border)',
+                }}>
+                  <h5 style={{
+                    fontSize: 12, margin: '0 0 4px 0',
+                    color: 'var(--text-secondary)', fontWeight: 600,
+                    textTransform: 'uppercase', letterSpacing: '0.05em',
+                  }}>
+                    Speech Coverage
+                  </h5>
+                  <p style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 10, lineHeight: 1.5 }}>
+                    Recover quiet / off-mic / brief-utterance speech that the
+                    VAD filter drops by default. Looser thresholds capture
+                    more speech but may admit more borderline content.
+                  </p>
+
+                  {/* No-speech threshold (main pass) */}
+                  <div style={{ padding: '6px 0' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+                      <span style={{ fontSize: 12, color: 'var(--text-primary)' }}>Main-pass no-speech threshold</span>
+                      <span style={{ fontSize: 11, fontFamily: 'var(--font-mono)', color: 'var(--accent-cyan)' }}>
+                        {Number(transSettings.no_speech_threshold).toFixed(2)}
+                      </span>
+                    </div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <span style={{ fontSize: 10, color: 'var(--text-muted)', flexShrink: 0 }}>0.2 (lax)</span>
+                      <input
+                        type="range"
+                        min="0.20"
+                        max="0.80"
+                        step="0.05"
+                        value={transSettings.no_speech_threshold}
+                        onChange={(e) => setTransSettings((p) => ({ ...p, no_speech_threshold: parseFloat(e.target.value) }))}
+                        style={{ flex: 1, accentColor: 'var(--accent-cyan)' }}
+                      />
+                      <span style={{ fontSize: 10, color: 'var(--text-muted)', flexShrink: 0 }}>0.8 (strict)</span>
+                    </div>
+                    <span style={{ fontSize: 10, color: 'var(--text-muted)', display: 'block', marginTop: 4 }}>
+                      Lower = catch more quiet speech. 0.4 is the recall-leaning default; 0.5 was the legacy value.
+                    </span>
+                  </div>
+
+                  {/* Gap-fill enabled toggle */}
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 10, padding: '6px 0' }}>
+                    <div>
+                      <span style={{ fontSize: 12, color: 'var(--text-primary)' }}>Gap-fill second pass</span>
+                      <span style={{ fontSize: 10, color: 'var(--text-muted)', display: 'block' }}>
+                        Re-transcribe long VAD-silenced runs with relaxed settings
+                      </span>
+                    </div>
+                    <button
+                      onClick={() => setTransSettings((p) => ({ ...p, gap_fill_enabled: !p.gap_fill_enabled }))}
+                      style={{
+                        width: 44, height: 24, borderRadius: 12, border: 'none', cursor: 'pointer',
+                        background: transSettings.gap_fill_enabled ? 'var(--accent-cyan)' : 'var(--border)',
+                        position: 'relative', transition: 'background 0.2s',
+                      }}
+                    >
+                      <div style={{
+                        width: 18, height: 18, borderRadius: '50%', background: 'white',
+                        position: 'absolute', top: 3,
+                        left: transSettings.gap_fill_enabled ? 23 : 3,
+                        transition: 'left 0.2s',
+                      }} />
+                    </button>
+                  </div>
+
+                  {/* Gap-fill min duration */}
+                  <div style={{
+                    padding: '6px 0',
+                    opacity: transSettings.gap_fill_enabled ? 1 : 0.45,
+                    pointerEvents: transSettings.gap_fill_enabled ? 'auto' : 'none',
+                  }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+                      <span style={{ fontSize: 12, color: 'var(--text-primary)' }}>Gap-fill minimum run</span>
+                      <span style={{ fontSize: 11, fontFamily: 'var(--font-mono)', color: 'var(--accent-cyan)' }}>
+                        {Number(transSettings.gap_fill_min_sec).toFixed(1)}s
+                      </span>
+                    </div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <span style={{ fontSize: 10, color: 'var(--text-muted)', flexShrink: 0 }}>0.5s</span>
+                      <input
+                        type="range"
+                        min="0.5"
+                        max="10.0"
+                        step="0.5"
+                        value={transSettings.gap_fill_min_sec}
+                        onChange={(e) => setTransSettings((p) => ({ ...p, gap_fill_min_sec: parseFloat(e.target.value) }))}
+                        style={{ flex: 1, accentColor: 'var(--accent-cyan)' }}
+                      />
+                      <span style={{ fontSize: 10, color: 'var(--text-muted)', flexShrink: 0 }}>10s</span>
+                    </div>
+                    <span style={{ fontSize: 10, color: 'var(--text-muted)', display: 'block', marginTop: 4 }}>
+                      Only fill VAD-silenced runs at least this long. Higher = less re-transcription (faster). 1.5s is the default.
+                    </span>
+                  </div>
+
+                  {/* Gap-fill no-speech threshold */}
+                  <div style={{
+                    padding: '6px 0',
+                    opacity: transSettings.gap_fill_enabled ? 1 : 0.45,
+                    pointerEvents: transSettings.gap_fill_enabled ? 'auto' : 'none',
+                  }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+                      <span style={{ fontSize: 12, color: 'var(--text-primary)' }}>Gap-fill no-speech threshold</span>
+                      <span style={{ fontSize: 11, fontFamily: 'var(--font-mono)', color: 'var(--accent-cyan)' }}>
+                        {Number(transSettings.gap_fill_no_speech_threshold).toFixed(2)}
+                      </span>
+                    </div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <span style={{ fontSize: 10, color: 'var(--text-muted)', flexShrink: 0 }}>0.1 (very lax)</span>
+                      <input
+                        type="range"
+                        min="0.05"
+                        max="0.60"
+                        step="0.05"
+                        value={transSettings.gap_fill_no_speech_threshold}
+                        onChange={(e) => setTransSettings((p) => ({ ...p, gap_fill_no_speech_threshold: parseFloat(e.target.value) }))}
+                        style={{ flex: 1, accentColor: 'var(--accent-cyan)' }}
+                      />
+                      <span style={{ fontSize: 10, color: 'var(--text-muted)', flexShrink: 0 }}>0.6 (cautious)</span>
+                    </div>
+                    <span style={{ fontSize: 10, color: 'var(--text-muted)', display: 'block', marginTop: 4 }}>
+                      Applied only to gap-fill runs. Lower = more borderline speech survives. 0.25 is the default.
+                    </span>
+                  </div>
                 </div>
 
                 {/* Save button */}
