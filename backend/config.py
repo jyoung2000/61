@@ -101,8 +101,25 @@ class Settings(BaseSettings):
     # ``no_speech_threshold`` — Whisper's self-reported confidence that
     # a chunk is NOT speech. 0.8 (previous hard-coded default) threw
     # out a lot of valid quiet speech; 0.5 catches it while the worker
-    # hallucination filter cleans up any false positives.
-    WHISPER_NO_SPEECH_THRESHOLD: float = 0.5
+    # hallucination filter cleans up any false positives. Lowered to
+    # 0.4 to recover more quiet / soft / off-mic speech that the
+    # comparison to YouTube's official subtitle track showed missing
+    # from the medium-model output.
+    WHISPER_NO_SPEECH_THRESHOLD: float = 0.4
+    # ── Gap-fill second pass ──
+    # After the main Whisper pass + Coverage Ledger build, scan for
+    # runs of uncovered audio ≥ ``WHISPER_GAP_FILL_MIN_SEC`` seconds
+    # and re-transcribe just those regions with the VAD filter
+    # disabled and a much lower no-speech threshold. Catches:
+    #   * quiet / whispered speech the main VAD dropped
+    #   * sung lyrics in opening / ending themes
+    #   * brief utterances under the VAD's 300 ms silence break
+    # Gap-fill segments are tagged ``source='gap_fill'`` and routed
+    # through the same hallucination filter; the only difference is
+    # they're allowed to live in regions the main pass left empty.
+    WHISPER_GAP_FILL_ENABLED: bool = True
+    WHISPER_GAP_FILL_MIN_SEC: float = 1.5
+    WHISPER_GAP_FILL_NO_SPEECH_THRESHOLD: float = 0.25
     # Auto-upgrade the Whisper model tier when the detected GPU has
     # spare VRAM. Existing logic already jumped ``small → large-v3-turbo``
     # on ≥6 GB cards; this flag extends the ladder so mid-tier GPUs

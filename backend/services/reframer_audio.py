@@ -24,6 +24,7 @@ from backend.services.reframer_models import (
     interpolate_x, clamp_x, _face_overlaps_person,
     LedgerBin, CoverageLedger, PerceptionResult, SceneSignals, AdaptiveParams,
 )
+from backend.config import settings
 
 logger = logging.getLogger("clipai.reframer_audio")
 
@@ -396,9 +397,12 @@ class AudioIntelligence:
             #   beam_size=5 (better accuracy — captures ~5-8% more words than greedy)
             #   batch_size=self._batch_size (4 on ≤4GB GPUs, 16 elsewhere)
             #   vad min_silence=300ms (catches brief pauses within sentences)
-            #   no_speech_threshold=0.5 (lower = less likely to skip quiet speech)
+            #   no_speech_threshold from settings.WHISPER_NO_SPEECH_THRESHOLD
+            #       (lower = less likely to skip quiet speech)
             #   condition_on_previous_text=True (improves coherence across segments)
             #   word_timestamps=True (per-word timing for subtitle + reframing)
+            _ns_threshold = float(getattr(
+                settings, "WHISPER_NO_SPEECH_THRESHOLD", 0.4))
             try:
                 from faster_whisper import BatchedInferencePipeline
                 batched = BatchedInferencePipeline(model=self.engine)
@@ -412,9 +416,11 @@ class AudioIntelligence:
                     },
                     word_timestamps=True,
                     condition_on_previous_text=True,
-                    no_speech_threshold=0.5,
+                    no_speech_threshold=_ns_threshold,
                 )
-                log.log_stage('AUDIO', 'Using batched inference (batch=16, beam=5)')
+                log.log_stage('AUDIO',
+                    f'Using batched inference (batch=16, beam=5, '
+                    f'no_speech_thresh={_ns_threshold})')
             except Exception as e:
                 err_str = str(e)
                 log.log_stage('AUDIO', f'Batched inference failed: {err_str[:120]}')
@@ -438,7 +444,7 @@ class AudioIntelligence:
                     },
                     word_timestamps=True,
                     condition_on_previous_text=True,
-                    no_speech_threshold=0.5,
+                    no_speech_threshold=_ns_threshold,
                 )
 
             duration_sec = float(getattr(info, 'duration', 0)) or duration_ms / 1000
@@ -536,6 +542,38 @@ class AudioIntelligence:
                             f'  Transcribing {pct}% — {len(segments)} segments, '
                             f'{elapsed_so_far:.1f}s elapsed, ~{remaining:.0f}s remaining')
                         last_log_pct = pct
+
+            # ── Gap-fill pass: re-transcribe uncovered runs ──
+            # The VAD filter + ``no_speech_threshold`` on the main pass
+            # silently drop quiet / soft / off-mic / sung speech. The
+            # YouTube vs ClipAI comparison on the GUNDAM Wing episode 1
+            # showed ClipAI's transcript starting at ~1:59 while YouTube
+            # had dialogue / lyrics from 0:26 — 90 seconds of audio
+            # that VAD classified as silence. Find the uncovered runs
+            # in the segments list and re-transcribe just those
+            # regions with no VAD and a very low no-speech threshold
+            # so quiet speech gets a second chance. Gap-fill segments
+            # are tagged ``source='gap_fill'`` and routed through the
+            # same hallucination filter — the relaxed thresholds only
+            # apply inside the gaps where the main pass already
+            # produced nothing.
+            if (getattr(settings, "WHISPER_GAP_FILL_ENABLED", True)
+                    and segments and duration_sec > 0):
+                try:
+                    gap_segments = self._gap_fill_pass(
+                        audio_path, segments, duration_sec, whisper_lang, log)
+                    if gap_segments:
+                        # Merge gap-fill segments and re-sort by start time
+                        # so the Coverage Ledger / per-segment loops see
+                        # them in temporal order.
+                        segments.extend(gap_segments)
+                        segments.sort(key=lambda s: s.get('start_sec', 0))
+                        log.log_stage('AUDIO',
+                            f'Gap-fill added {len(gap_segments)} segments '
+                            f'(total {len(segments)})')
+                except Exception as gf_err:
+                    log.log_stage('AUDIO',
+                        f'Gap-fill pass failed (non-fatal): {gf_err}')
 
             # ── TACT: Build Coverage Ledger ──
             ledger = CoverageLedger(bin_width_ms=20, duration_ms=int(duration_sec * 1000))
@@ -658,6 +696,185 @@ class AudioIntelligence:
         except Exception as e:
             log.log_error('AUDIO', f'Transcription failed: {e}')
             return {'speech_active': {}, 'segments': [], 'language': ''}
+
+    def _gap_fill_pass(
+        self, audio_path: str, primary_segments: list,
+        duration_sec: float, whisper_lang, log,
+    ) -> list:
+        """Re-transcribe runs of audio the main pass left uncovered.
+
+        Whisper-medium with VAD enabled silently drops:
+          * soft / off-mic / whispered speech (VAD ``no_speech_prob``
+            crosses threshold)
+          * sung audio in opening / ending themes (Whisper trained
+            mostly on spoken audio; high no_speech_prob on lyrics)
+          * brief utterances under the 300 ms VAD silence break
+
+        This helper finds runs of source audio ≥
+        ``WHISPER_GAP_FILL_MIN_SEC`` seconds where the main pass
+        produced no segment, then re-transcribes just those runs
+        with:
+          * ``vad_filter=False`` — VAD already said this was silence,
+            don't ask it again
+          * ``no_speech_threshold`` from
+            ``WHISPER_GAP_FILL_NO_SPEECH_THRESHOLD`` (default 0.25)
+          * ``condition_on_previous_text=False`` — no priming from
+            the (probably very different) main pass
+
+        Each resulting segment is run through the same hallucination
+        filter the main pass uses (boilerplate blocklist, repetition
+        detection, no_speech_prob clamp) before being merged. Returns
+        the list of clean gap-fill segment dicts ready to merge into
+        the main ``segments`` list.
+        """
+        min_gap = float(getattr(settings, "WHISPER_GAP_FILL_MIN_SEC", 1.5))
+        gap_ns_thresh = float(getattr(
+            settings, "WHISPER_GAP_FILL_NO_SPEECH_THRESHOLD", 0.25))
+
+        # Build the list of (start_sec, end_sec) gaps to re-transcribe.
+        # Only consider clean (non-hallucination) segments as 'covered'.
+        covered = sorted(
+            (float(s['start_sec']), float(s['end_sec']))
+            for s in primary_segments
+            if not s.get('is_hallucination')
+        )
+        gaps: list[tuple[float, float]] = []
+        cursor = 0.0
+        for start, end in covered:
+            if start - cursor >= min_gap:
+                gaps.append((cursor, start))
+            cursor = max(cursor, end)
+        if duration_sec - cursor >= min_gap:
+            gaps.append((cursor, duration_sec))
+
+        if not gaps:
+            log.log_stage('AUDIO',
+                'Gap-fill: no gaps ≥ %.1fs — skipping' % min_gap)
+            return []
+
+        total_gap_sec = sum(e - s for s, e in gaps)
+        log.log_stage('AUDIO',
+            f'Gap-fill: re-transcribing {len(gaps)} run(s) '
+            f'totalling {total_gap_sec:.1f}s '
+            f'(threshold={gap_ns_thresh})')
+
+        # ``clip_timestamps`` accepts a flat list of seconds; pairs are
+        # interpreted as (start, end). faster-whisper transcribes ONLY
+        # those ranges and skips everything else, so the gap-fill pass
+        # doesn't waste compute on the already-covered audio.
+        clip_ts: list[float] = []
+        for s, e in gaps:
+            clip_ts.append(round(s, 3))
+            clip_ts.append(round(e, 3))
+
+        try:
+            segs_iter, _info = self.engine.transcribe(
+                audio_path, language=whisper_lang,
+                beam_size=5, vad_filter=False,
+                word_timestamps=True,
+                condition_on_previous_text=False,
+                no_speech_threshold=gap_ns_thresh,
+                clip_timestamps=clip_ts,
+            )
+        except TypeError:
+            # Older faster-whisper builds don't accept clip_timestamps.
+            # Fall back to a full-file second pass with the relaxed
+            # threshold and dedupe overlaps below.
+            log.log_stage('AUDIO',
+                'Gap-fill: clip_timestamps unsupported — full-file fallback')
+            segs_iter, _info = self.engine.transcribe(
+                audio_path, language=whisper_lang,
+                beam_size=5, vad_filter=False,
+                word_timestamps=True,
+                condition_on_previous_text=False,
+                no_speech_threshold=gap_ns_thresh,
+            )
+
+        # Same boilerplate / repetition filter the main pass uses.
+        _BOILERPLATE = {
+            'thank you for watching', 'thanks for watching',
+            'please subscribe', 'like and subscribe',
+            "don't forget to subscribe", 'see you in the next video',
+            'bye bye', 'thanks for listening', 'music playing',
+            'music', 'applause', 'subtitles by', 'captions by',
+            'thank you', 'thanks', 'the end',
+        }
+
+        # Build a fast O(log n) membership check for "is this gap-fill
+        # segment actually inside a real gap?" — used to drop any
+        # segment that leaked into already-covered territory on the
+        # full-file fallback path.
+        from bisect import bisect_right
+        gap_starts = [g[0] for g in gaps]
+
+        def _inside_gap(start_sec: float, end_sec: float) -> bool:
+            i = bisect_right(gap_starts, start_sec) - 1
+            if i < 0:
+                return False
+            gs, ge = gaps[i]
+            # Allow segments that mostly overlap the gap (≥50 %).
+            seg_len = max(0.001, end_sec - start_sec)
+            overlap = max(0.0, min(end_sec, ge) - max(start_sec, gs))
+            return overlap / seg_len >= 0.5
+
+        out: list[dict] = []
+        for seg in segs_iter:
+            text = (seg.text or '').strip()
+            if not text:
+                continue
+            no_speech_prob = float(getattr(seg, 'no_speech_prob', 0.0) or 0.0)
+
+            # Drop common Whisper hallucinations
+            stripped = text.lower().rstrip('.!,')
+            if stripped in _BOILERPLATE:
+                continue
+            # Very high no_speech confidence is true silence
+            if no_speech_prob > 0.85:
+                continue
+            # Repetition check (lighter than the main pass — gap-fill
+            # already lives in low-confidence territory)
+            if len(text) > 20:
+                words_list = text.lower().split()
+                if len(words_list) >= 6:
+                    for plen in range(2, 5):
+                        if len(words_list) >= plen * 3:
+                            pattern = tuple(words_list[:plen])
+                            repeats = sum(
+                                1 for i in range(0, len(words_list) - plen + 1, plen)
+                                if tuple(words_list[i:i + plen]) == pattern
+                            )
+                            if repeats >= 3:
+                                text = None
+                                break
+                    if text is None:
+                        continue
+
+            if not _inside_gap(float(seg.start), float(seg.end)):
+                continue
+
+            words = []
+            if hasattr(seg, 'words') and seg.words:
+                for w in seg.words:
+                    word_conf = (getattr(w, 'probability', None)
+                                 or getattr(w, 'confidence', 1.0) or 1.0)
+                    words.append({
+                        'word': (w.word.strip() if hasattr(w, 'word')
+                                 else str(w).strip()),
+                        'start': round(getattr(w, 'start', seg.start), 3),
+                        'end': round(getattr(w, 'end', seg.end), 3),
+                        'confidence': round(float(word_conf), 3),
+                    })
+
+            out.append({
+                'start_sec': round(float(seg.start), 3),
+                'end_sec': round(float(seg.end), 3),
+                'text': text,
+                'words': words,
+                'is_hallucination': False,
+                'no_speech_prob': round(no_speech_prob, 3),
+                'source': 'gap_fill',
+            })
+        return out
 
     def _reload_on_cpu(self) -> None:
         """Reload Whisper on CPU int8 — used when CUDA runs out of memory.
@@ -783,7 +1000,8 @@ class AudioIntelligence:
                     },
                     word_timestamps=True,
                     condition_on_previous_text=True,
-                    no_speech_threshold=0.5,
+                    no_speech_threshold=float(getattr(
+                        settings, "WHISPER_NO_SPEECH_THRESHOLD", 0.4)),
                 )
             except Exception as e:
                 err_str = str(e)
