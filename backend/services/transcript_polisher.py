@@ -33,20 +33,33 @@ logger = logging.getLogger(__name__)
 
 # ── System prompt: persona + invariants ───────────────────────────────────
 _SYSTEM_PROMPT = (
-    "You are a professional transcript editor. You receive ASR (Whisper) "
-    "output that contains the words the speaker said but lacks proper "
-    "punctuation, may misspell proper nouns, includes filler words, and "
-    "occasionally fragments sentences across segment boundaries.\n\n"
-    "Your job is to produce a clean, readable transcript while preserving "
-    "the speaker's meaning and tone EXACTLY.\n\n"
+    "You are a transcript accuracy editor. You receive Whisper ASR output "
+    "from a SMALLER model (e.g. medium) that the user wants polished to "
+    "the accuracy of a LARGER model (e.g. large-v3) WITHOUT re-running "
+    "transcription. Whisper-medium's typical failure modes:\n"
+    "  - Phonetic mis-hears on short common words (e.g. 'Aiken' for "
+    "'Okay', 'areas' for 'Aries')\n"
+    "  - Mis-spelled proper nouns, especially when the name is unfamiliar "
+    "to the model's training data ('Dorian' for 'Darlian', 'Sex' for "
+    "'Zechs', 'Aaron' for 'Heero')\n"
+    "  - Wrong homophones (their/there, your/you're)\n"
+    "  - Punctuation omitted or misplaced\n\n"
+    "Your job is to correct these specific errors using surrounding "
+    "context, while preserving the speaker's meaning, tone, sentence "
+    "structure, and word count EXACTLY.\n\n"
     "STRICT RULES (must follow every time):\n"
-    "1. Return EXACTLY the same number of segments you receive. Never merge "
-    "or split segments — only edit the text inside each.\n"
-    "2. Preserve speakers' words. You may delete fillers and fix spelling, "
-    "but never paraphrase, summarise, translate, or add content.\n"
-    "3. Never change timing — those fields are not in your output.\n"
-    "4. Return ONLY a JSON array of strings, no preamble, no markdown.\n"
-    "5. The array length must equal the input segment count.\n"
+    "1. Return EXACTLY the same number of segments you receive. Never "
+    "merge or split segments — only edit the text inside each.\n"
+    "2. Word count per segment must stay within ±15 % of the input. If "
+    "you can't find a high-confidence correction for a token, KEEP THE "
+    "ORIGINAL — do not paraphrase, summarise, translate, or compress.\n"
+    "3. Substitutions are only allowed when the new word is BOTH "
+    "phonetically similar to the original AND clearly correct given the "
+    "context (surrounding segments, recurring proper nouns, the show's "
+    "setting).\n"
+    "4. Never change timing — those fields are not in your output.\n"
+    "5. Return ONLY a JSON array of strings, no preamble, no markdown.\n"
+    "6. The array length must equal the input segment count.\n"
 )
 
 # ── Filler-word patterns by language ──────────────────────────────────────
@@ -163,14 +176,40 @@ def _build_user_prompt(
     preserve = getattr(settings, "TRANSCRIPT_PRESERVE_WORDS", True)
     rules: list[str] = []
     if preserve:
-        # Conservative profile: every spoken word stays. Only allowed
-        # edits are punctuation, capitalisation, and homophone fixes —
-        # nothing that would make the on-screen caption diverge from
-        # the audio.
+        # Accuracy-focused profile: the polisher's job is to bridge the
+        # Whisper-medium-to-Whisper-large quality gap by correcting the
+        # specific kinds of errors a smaller ASR model makes — phonetic
+        # mis-hears, mis-spelled proper nouns, dropped homophones —
+        # WITHOUT rewriting, paraphrasing, or restructuring. The model
+        # may substitute individual words when (and ONLY when) the
+        # substitution is grounded in BOTH (a) phonetic similarity to
+        # the input token and (b) the surrounding context segments.
+        # Word count must stay within ±15 % so the model can't
+        # silently compress / expand.
         rules.append(
-            "CRITICAL: Preserve EVERY spoken word — do NOT delete, "
-            "rephrase, summarise, or substitute words. The polished "
-            "text must read the SAME sequence of words as the input."
+            "PRIMARY OBJECTIVE: Correct individual mis-transcribed words "
+            "(phonetic errors, mis-spelled proper nouns, wrong homophones) "
+            "to bridge the Whisper-medium → Whisper-large accuracy gap. "
+            "DO NOT rewrite, paraphrase, summarise, compress, or "
+            "restructure. Sentence structure and word count must remain "
+            "essentially unchanged."
+        )
+        rules.append(
+            "WORD COUNT RULE: Output word count must stay within ±15 % of "
+            "the input. If you can't find a high-confidence correction, "
+            "keep the original word verbatim — false 'corrections' are "
+            "worse than missed errors."
+        )
+        rules.append(
+            "Fix recurring proper nouns by consistent spelling across the "
+            "batch: when the same person / place / organisation is "
+            "transcribed two different ways, pick the spelling that "
+            "fits the surrounding context (use the CONTEXT blocks above "
+            "and the show's setting from earlier batches). Examples of "
+            "the kind of error to catch: 'Dorian' → 'Darlian', "
+            "'Aiken' → 'Okay', 'Sex' → 'Zechs', 'areas' → 'Aries', "
+            "'Aaron' → 'Heero' — i.e. phonetic ASR confusions on names "
+            "and short common words."
         )
         rules.append(
             "You MAY add or correct punctuation, capitalisation, and "
@@ -178,17 +217,31 @@ def _build_user_prompt(
         )
         rules.append(
             "You MAY split a long run-on into multiple sentences by "
-            "inserting punctuation, but every word must remain."
+            "inserting punctuation, but every WORD (after the targeted "
+            "phonetic corrections above) must remain in the same order."
         )
         if language.lower() in _CJK_LANGS:
             rules.append(
                 "Japanese/Korean/Chinese: insert 。 at obvious sentence "
                 "ends and 、 at clause breaks where appropriate. Leave "
-                "particles untouched. Do NOT remove or substitute kana."
+                "particles untouched. Do NOT remove or substitute kana. "
+                "Phonetic corrections are limited to mis-spelled proper "
+                "nouns (katakana name spellings) — do NOT 'correct' "
+                "native words."
             )
         else:
             rules.append("Fix homophones: their/there/they're, your/you're, its/it's.")
-            rules.append("Standardise spellings of proper nouns across all segments in this batch.")
+            rules.append(
+                "Standardise spellings of proper nouns across all "
+                "segments in this batch — but ONLY when the same entity "
+                "is referenced multiple times AND the context makes the "
+                "correct spelling unambiguous."
+            )
+        rules.append(
+            "WHEN IN DOUBT, KEEP THE ORIGINAL TEXT. The cost of an "
+            "incorrect 'correction' is far higher than leaving a "
+            "Whisper-medium artefact in place."
+        )
     else:
         if settings.TRANSCRIPT_FILLER_REMOVAL and language.lower() not in _CJK_LANGS:
             rules.append("Delete filler words: um, uh, like, you know, basically, literally, kinda, sorta.")
@@ -342,20 +395,46 @@ async def correct_transcript(
             language=language, timeout=timeout_per_batch,
         )
 
+        # Length tolerance depends on the polish profile. In the
+        # default ``preserve=True`` (accuracy-focused) path the prompt
+        # explicitly forbids restructuring and bounds word count at
+        # ±15 %; tighten the rejection thresholds to match so the
+        # model can't silently drift into paraphrase territory. In
+        # the ``preserve=False`` (full editing) path the model is
+        # allowed to drop fillers and merge fragments so leave the
+        # legacy looser bounds.
+        preserve_mode = getattr(settings, "TRANSCRIPT_PRESERVE_WORDS", True)
+        len_max_ratio = 1.5 if preserve_mode else 3.0
+        len_min_ratio = 0.6 if preserve_mode else 0.3
         for i, (view, orig_obj) in enumerate(batch_pairs):
             if polished_texts is None:
                 # Fall back: light-touch filler strip rather than nothing.
                 new_text = _light_filler_strip(view.get("text", ""), language)
             else:
                 cand = polished_texts[i].strip()
-                # Defensive: if the model returned something wildly different
-                # in length, fall back. A 3x expansion / 0.3x shrink usually
-                # means the model hallucinated content.
-                orig_len = len(view.get("text", "").strip())
+                orig_text = view.get("text", "").strip()
+                orig_len = len(orig_text)
+                # Length-band guard
                 if orig_len > 0 and (
-                    len(cand) > orig_len * 3 or len(cand) < orig_len * 0.3
+                    len(cand) > orig_len * len_max_ratio
+                    or len(cand) < orig_len * len_min_ratio
                 ):
                     new_text = view.get("text", "")
+                # Word-count guard (preserve mode only) — catches a model
+                # that kept text length but substituted multi-word
+                # paraphrases. Compare token counts via simple whitespace
+                # split; tolerant enough to handle the prompt's ±15 %
+                # allowance plus one or two punctuation-driven shifts.
+                elif preserve_mode and orig_text:
+                    orig_words = orig_text.split()
+                    cand_words = cand.split()
+                    if orig_words and (
+                        len(cand_words) > len(orig_words) * 1.30
+                        or len(cand_words) < len(orig_words) * 0.70
+                    ):
+                        new_text = view.get("text", "")
+                    else:
+                        new_text = cand if cand else view.get("text", "")
                 else:
                     new_text = cand if cand else view.get("text", "")
             polished_out.append(_emit_segment(orig_obj, new_text))
