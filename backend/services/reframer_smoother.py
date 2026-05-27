@@ -92,6 +92,7 @@ class Smoother:
         # This is the most common cause of Stability=0
         dejittered = [smoothed[0]]
         jitter_count = 0
+        centering_protected = 0
         for i in range(1, len(smoothed)):
             if i >= 2:
                 prev2 = dejittered[-2] if len(dejittered) >= 2 else None
@@ -107,19 +108,44 @@ class Smoother:
                     # If we bounced back to near where we were within 2.0s
                     if (dt_total < 2.0 and dx_back < plan.crop_w * 0.15
                             and dx_out > plan.crop_w * 0.05):
-                        # Remove the middle keyframe (the bounce)
-                        popped = dejittered[-1]
-                        self.tracer.event('smoother_drop',
-                                          pass_name='dejitter',
-                                          t_ms=popped['time_ms'],
-                                          x=popped['x'],
-                                          prev_x=prev2['x'],
-                                          next_x=curr['x'],
-                                          dt_total_s=round(dt_total, 3),
-                                          dx_back=dx_back, dx_out=dx_out,
-                                          reason='A_B_A_oscillation')
-                        dejittered.pop()
-                        jitter_count += 1
+                        # ``_centering`` keyframes are the engine's
+                        # face-centering corrections; the merge, pan-
+                        # consolidation and drift-suppress passes already
+                        # honor the flag, but dejitter used to wipe them
+                        # whenever they sat between two anchor frames at
+                        # similar x. That's exactly the case the engine's
+                        # centering nudge produces (anchor → centering
+                        # nudge → next anchor), so dejitter was eating
+                        # most of the work and leaving the metric at
+                        # 70.5%. Keep the flagged keyframe; it's a real
+                        # correction, not random jitter.
+                        if prev1.get('_centering'):
+                            centering_protected += 1
+                            self.tracer.event(
+                                'smoother_keep_centering',
+                                pass_name='dejitter',
+                                t_ms=prev1['time_ms'],
+                                x=prev1['x'],
+                                prev_x=prev2['x'],
+                                next_x=curr['x'],
+                                dt_total_s=round(dt_total, 3),
+                                dx_back=dx_back, dx_out=dx_out,
+                                reason='centering_kf_protected',
+                            )
+                        else:
+                            # Remove the middle keyframe (the bounce)
+                            popped = dejittered[-1]
+                            self.tracer.event('smoother_drop',
+                                              pass_name='dejitter',
+                                              t_ms=popped['time_ms'],
+                                              x=popped['x'],
+                                              prev_x=prev2['x'],
+                                              next_x=curr['x'],
+                                              dt_total_s=round(dt_total, 3),
+                                              dx_back=dx_back, dx_out=dx_out,
+                                              reason='A_B_A_oscillation')
+                            dejittered.pop()
+                            jitter_count += 1
 
             dejittered.append(smoothed[i])
 
@@ -315,7 +341,9 @@ class Smoother:
         log.log_stage('SMOOTH',
             f'Smoothed {len(kfs)} → {len(stabilized)} keyframes '
             f'(clamped {clamped_count} vel, removed {removed_count} dupes, '
-            f'dejittered {jitter_count}, merged {merge_count}, '
+            f'dejittered {jitter_count}, '
+            f'centering-protected {centering_protected}, '
+            f'merged {merge_count}, '
             f'consolidated {consol_count} pans, hold-enforced {hold_enforced}, '
             f'drift-suppressed {drift_suppressed})')
         self.tracer.event('smoother_complete',
@@ -324,6 +352,7 @@ class Smoother:
                           velocity_clamped=clamped_count,
                           temporal_dupes_removed=removed_count,
                           dejittered=jitter_count,
+                          centering_protected=centering_protected,
                           merged=merge_count,
                           consolidated=consol_count,
                           hold_enforced=hold_enforced,

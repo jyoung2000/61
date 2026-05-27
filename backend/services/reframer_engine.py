@@ -1283,7 +1283,16 @@ class ReframeEngine:
         # ══════════════════════════════════════════════════════════════
         NUDGE_MAX = 60          # tight cap — < 10 % of a 600 px crop
         NUDGE_MIN_DELTA = 5     # below this we're indistinguishable from jitter
-        NUDGE_DELTA_CEILING = 150  # above this it's probably a different shot
+        # Was 150. Bumped to 250 after a B-grade run flagged 18 face_missing
+        # HIGH-severity problems whose best-face deltas fell in the 150-250
+        # band — the old ceiling threw away those genuine same-shot
+        # corrections as "probably a different shot" and left centering at
+        # 70.5%. Genuine cross-shot pulls are 300+ px on a 600 px crop and
+        # are bracketed by a ``cut`` transition (which the loop above
+        # already filters out) so the wider ceiling doesn't change the
+        # cross-shot behaviour. Reference: reframe_report.problems[] in
+        # clipai_logs_20260527_000705.log line 1781+.
+        NUDGE_DELTA_CEILING = 250
 
         def _nudge_pass(label):
             count = 0
