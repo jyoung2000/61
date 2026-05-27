@@ -2483,28 +2483,79 @@ async def _run_analysis_inner(job_id: str):
     _total_cost_usd = round(_total_cost_usd, 4)
 
     await _update_progress(job_id, JobStatus.DETECTING_CLIPS, 98, "Saving results...")
+
+    # Coerce ``to_fez_clips`` dicts → ClipCandidate models before the
+    # COMPLETE save. ``update_job_status`` calls ``setattr(job, 'clips',
+    # value)`` without ``validate_assignment``, so a raw list[dict] in
+    # the typed list[ClipCandidate] field triggers
+    # ``PydanticSerializationUnexpectedValue`` during the next
+    # ``model_dump`` and — observed in production on a JA→EN job — can
+    # leave the persisted ``status`` field stuck on ``detecting_clips``
+    # despite this call passing ``status=COMPLETE``. Symptom: UI shows
+    # "Finalizing clip detection..." indefinitely because the disk
+    # round-trip skipped the status update. Pre-coercion eliminates the
+    # warning path entirely.
+    from backend.models import ClipCandidate as _ClipModel
+    _clip_models = []
+    for _c in (clips or []):
+        if isinstance(_c, _ClipModel):
+            _clip_models.append(_c)
+        elif isinstance(_c, dict):
+            try:
+                _clip_models.append(_ClipModel(**_c))
+            except Exception as _coerce_err:
+                logger.warning(
+                    "[%s] Failed to coerce clip dict to ClipCandidate (%s) — saving raw",
+                    job_id, _coerce_err,
+                )
+                _clip_models.append(_c)
+        else:
+            _clip_models.append(_c)
+
     await database.update_job_status(
         job_id,
         status=JobStatus.COMPLETE,
         progress=100,
-        progress_message=f"Analysis complete — {len(clips)} clips, {len(scenes)} scenes",
+        progress_message=f"Analysis complete — {len(_clip_models)} clips, {len(scenes)} scenes",
         summary=summary,
         scenes=scenes,
         transcript=transcript,
-        clips=clips,
+        clips=_clip_models,
         analysis_duration_seconds=_analysis_seconds,
         estimated_cost_usd=_total_cost_usd,
         cost_breakdown=_cost_breakdown,
         default_layout_mode="single",
     )
+
+    # Defensive verification: reload and confirm status persisted as
+    # COMPLETE. Belt-and-suspenders for the
+    # PydanticSerializationUnexpectedValue corruption case the
+    # coercion above is meant to prevent — if for any reason the
+    # status field still didn't round-trip cleanly, re-issue a
+    # status-only save so the UI doesn't get stuck on "Finalizing
+    # clip detection...".
+    try:
+        _verify = await database.load_job(job_id)
+        if _verify is not None and str(getattr(_verify, "status", "")) != JobStatus.COMPLETE.value:
+            logger.warning(
+                "[%s] COMPLETE save did not persist (status=%r) — retrying status-only update",
+                job_id, getattr(_verify, "status", None),
+            )
+            await database.update_job_status(
+                job_id, status=JobStatus.COMPLETE, progress=100,
+            )
+    except Exception as _verify_err:
+        logger.info("[%s] COMPLETE save verify skipped: %s", job_id, _verify_err)
+
     await broadcast_ws(job_id, {
         "type": "complete",
+        "status": JobStatus.COMPLETE.value,
         "message": "Analysis complete",
         "progress": 100,
     })
     logger.info(
         "[%s] Pipeline complete in %.1fs — %d clips, %d scenes, %d transcript segments",
-        job_id, _analysis_seconds, len(clips), len(scenes), len(transcript),
+        job_id, _analysis_seconds, len(_clip_models), len(scenes), len(transcript),
     )
 
     # ── Background post-processing (polish + translation) ──

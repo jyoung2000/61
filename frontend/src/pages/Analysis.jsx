@@ -794,8 +794,18 @@ export default function Analysis() {
             if (!isExportStatus) {
               setJob((prev) => {
                 if (!prev) return prev;
-                // Coerce all values to safe primitives — WS messages are not sanitized
-                const nextStatus = typeof msg.status === 'string' ? msg.status : String(msg.status || prev.status);
+                // Coerce all values to safe primitives — WS messages are not sanitized.
+                // When type==='complete' force status to 'complete' even if the
+                // backend dropped the field — otherwise the UI stays on the last
+                // "Finalizing clip detection..." status because msg.status is
+                // undefined and the fallback (String(prev.status)) keeps the
+                // stale detecting_clips value.
+                let nextStatus;
+                if (msg.type === 'complete') {
+                  nextStatus = typeof msg.status === 'string' ? msg.status : 'complete';
+                } else {
+                  nextStatus = typeof msg.status === 'string' ? msg.status : String(msg.status || prev.status);
+                }
                 const nextProgress = typeof msg.progress === 'number' ? msg.progress : (prev.progress ?? 0);
                 const nextMessage = typeof msg.message === 'string'
                   ? msg.message
