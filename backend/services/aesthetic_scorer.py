@@ -105,13 +105,22 @@ def _load_clip():
             "ViT-B-32", pretrained="laion2b_s34b_b79k",
         )
         model.eval()
+        target = _resolve_device()
         try:
-            model.to(_resolve_device())
-        except Exception:
-            pass
+            model.to(target)
+        except Exception as e:
+            # Log instead of silent pass — otherwise CLIP stays on CPU
+            # while score_frame ships inputs to GPU and every call falls
+            # through the outer except into the heuristic path with no
+            # log explaining why.
+            logger.warning(
+                "aesthetic_scorer CLIP .to(%s) failed (%s) — running CLIP on CPU",
+                target, e,
+            )
         _CACHED_CLIP = (model, preprocess)
         return _CACHED_CLIP
-    except Exception:
+    except Exception as e:
+        logger.info("aesthetic_scorer open_clip load failed: %s", e)
         return None
 
 
@@ -186,7 +195,15 @@ def score_frame(frame_path: Optional[str], crop_rect: Optional[dict] = None) -> 
         import torch
         from PIL import Image
         clip_model, preprocess = clip
-        device = _resolve_device()
+        # Derive the device from the actual CLIP weights — if _load_clip's
+        # .to(target) failed silently, the weights are still on CPU even
+        # though _resolve_device() says CUDA. Aligning inputs to the model's
+        # real device avoids the "Expected all tensors to be on the same
+        # device" path that previously dropped every call to the heuristic.
+        try:
+            device = next(clip_model.parameters()).device
+        except StopIteration:
+            device = _resolve_device()
         img = preprocess(Image.open(frame_path).convert("RGB")).unsqueeze(0).to(device)
         with torch.no_grad():
             emb = clip_model.encode_image(img)
@@ -194,6 +211,16 @@ def score_frame(frame_path: Optional[str], crop_rect: Optional[dict] = None) -> 
             rect = crop_rect or {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}
             crop_t = torch.tensor([[rect["x"], rect["y"], rect["w"], rect["h"]]],
                                   dtype=emb.dtype, device=emb.device)
+            # The MLP head was loaded with map_location=_resolve_device(),
+            # but if CLIP couldn't migrate the head may be on a different
+            # device. Re-align the head to ``emb``'s device on the first
+            # mismatch so model(emb, crop_t) doesn't raise here.
+            try:
+                head_device = next(model.parameters()).device
+                if head_device != emb.device:
+                    model.to(emb.device)
+            except StopIteration:
+                pass
             score = model(emb, crop_t).item()
         return float(max(0.0, min(1.0, score)))
     except Exception as e:

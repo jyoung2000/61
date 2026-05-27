@@ -541,12 +541,14 @@ async def _refresh_clips_with_translation(
         )
         return 0
     source_clips = list(job.clips or [])
+    used_fallback = False
     if not source_clips and fallback_clips:
         logger.warning(
             "[%s] clip refresh: DB job has 0 clips — using fallback list (n=%d)",
             job_id, len(fallback_clips),
         )
         source_clips = list(fallback_clips)
+        used_fallback = True
     if not source_clips:
         return 0
 
@@ -591,11 +593,18 @@ async def _refresh_clips_with_translation(
                 clip_dict["viral_score_reasoning"] = new_reasoning
         updated_clips.append(clip_dict)
 
-    if changed > 0:
+    # Persist when anything changed OR when we ran against the in-process
+    # fallback list — in the fallback case the DB has 0 clips on read, so
+    # we need to write the source_clips back regardless of whether any
+    # captions were rebuilt (the caller's whole reason for threading the
+    # fallback through was to restore the DB state).
+    if changed > 0 or used_fallback:
         await database.update_job_status(job_id, clips=updated_clips)
         logger.info(
-            "[%s] Refreshed %d/%d clip captions/hooks/titles from translated transcript",
+            "[%s] Refreshed %d/%d clip captions/hooks/titles from translated transcript"
+            "%s",
             job_id, changed, len(updated_clips),
+            " (restored from in-process fallback)" if used_fallback else "",
         )
     return changed
 
@@ -669,17 +678,23 @@ async def _auto_generate_clip_seo(
     # round-trip works in isolated tests, but at least one production
     # job lost its clips between the COMPLETE save and the SEO load
     # (clipai_logs_20260527_000705.log line ~902).
-    if not job.clips and fallback_clips:
+    source_clips = list(job.clips or [])
+    if not source_clips and fallback_clips:
         logger.warning(
             "[%s] Auto-SEO: DB job has 0 clips — using fallback list (n=%d)",
             job_id, len(fallback_clips),
         )
-        # Mutate the in-memory job so the per-clip loop below sees
-        # the fallback clips, and so the trailing
-        # ``update_job_status(clips=updated_clips)`` re-persists them
-        # alongside the generated SEO.
-        job.clips = list(fallback_clips)
-    if not job.clips:
+        # Use a local list rather than mutating ``job.clips``. The field
+        # is typed ``list[ClipCandidate]`` on JobResult but ``fallback_clips``
+        # is plain dicts from ``to_fez_clips``; Pydantic v2 silently accepts
+        # the raw-dict assignment today (no ``validate_assignment``), but
+        # writing a list[dict] into a typed-list field corrupts the next
+        # ``model_dump`` round-trip and emits the
+        # ``PydanticSerializationUnexpectedValue`` warning. The trailing
+        # ``update_job_status(clips=updated_clips)`` already persists
+        # updated_clips directly — no need to touch ``job.clips``.
+        source_clips = list(fallback_clips)
+    if not source_clips:
         logger.info(
             "[%s] Auto-SEO skipped early: job_loaded=True, clip_count=0",
             job_id,
@@ -687,7 +702,7 @@ async def _auto_generate_clip_seo(
         return (0, 0)
     logger.info(
         "[%s] Auto-SEO starting on %d clips, %d transcript segments",
-        job_id, len(job.clips), len(transcript or []),
+        job_id, len(source_clips), len(transcript or []),
     )
 
     video_summary = ""
@@ -704,7 +719,7 @@ async def _auto_generate_clip_seo(
     generated = 0
     failed = 0
     updated_clips = []
-    for clip in job.clips:
+    for clip in source_clips:
         clip_dict = clip.model_dump() if hasattr(clip, "model_dump") else dict(clip)
         platform = _resolve(clip_dict.get("platform"))
 
@@ -987,6 +1002,19 @@ async def _background_post_processing(
                 "message": f"Polishing skipped: {str(e)[:80]}",
             })
 
+    # ``_fallback_clips`` is the in-process list captured at the
+    # COMPLETE save in ``_run_analysis_inner``. Hoisted above the
+    # translation branch so BOTH the translation and the no-translation
+    # paths use the same resolution (prefer threaded clips, fall back
+    # to ``job.clips``) when handing the list to refresh / Auto-SEO.
+    # The clipai_logs_20260527_000705.log incident was reproduced on
+    # the translation path; the no-translation path is just as
+    # vulnerable to the same DB round-trip and shouldn't drift.
+    _fallback_clips = list(
+        clips if clips is not None
+        else (getattr(job, "clips", []) or [])
+    )
+
     # ── Subtitle translation ──
     # An explicit job.subtitle_language always wins; otherwise auto-translate
     # non-English audio to English so the default UX matches expectations
@@ -1137,19 +1165,6 @@ async def _background_post_processing(
                 _update_kwargs["transcript_readability"] = _tr_readability
             await database.update_job_status(job_id, **_update_kwargs)
 
-            # ``clips`` is the in-process list captured at the COMPLETE
-            # save in ``_run_analysis_inner``. Prefer it over
-            # ``job.clips`` (also produced by a ``load_job`` round-trip)
-            # so the refresh + Auto-SEO still run when DB reads return
-            # an empty clips field
-            # (clipai_logs_20260527_000705.log line ~902). Computed
-            # once outside the per-step try blocks so both consumers
-            # see the same value even if the refresh raises.
-            _fallback_clips = list(
-                clips if clips is not None
-                else (getattr(job, "clips", []) or [])
-            )
-
             # Re-derive clip caption / hook_text / title from the translated
             # transcript. Clip extraction had to run BEFORE translation so
             # the user could start editing immediately; without this refresh
@@ -1238,10 +1253,7 @@ async def _background_post_processing(
             })
             _seo_gen, _seo_fail = await _auto_generate_clip_seo(
                 job_id, list(transcript), orchestrator,
-                fallback_clips=list(
-                    clips if clips is not None
-                    else (getattr(job, "clips", []) or [])
-                ),
+                fallback_clips=list(_fallback_clips),
             )
             await broadcast_ws(job_id, {
                 "type": "background_task",

@@ -598,12 +598,18 @@ class VideoLLaMA2Discovery:
 
             except RuntimeError as e:
                 if 'CUDA out of memory' in str(e):
-                    logger.warning(f"OOM on chunk {chunk_idx+1}, skipping")
+                    # idx+1 = position in the selected batch (1..n_to_process);
+                    # chunk_idx+1 = position in the full timeline.
+                    logger.warning(
+                        f"OOM on chunk {idx+1}/{n_to_process} "
+                        f"[timeline {chunk_idx+1}], skipping")
                     torch.cuda.empty_cache()
                 else:
                     raise
             except Exception as e:
-                logger.warning(f"VLM error on chunk {chunk_idx+1}: {e}")
+                logger.warning(
+                    f"VLM error on chunk {idx+1}/{n_to_process} "
+                    f"[timeline {chunk_idx+1}]: {e}")
             finally:
                 if chunk_path and os.path.exists(chunk_path):
                     try:
@@ -812,9 +818,11 @@ class ReplicateDiscovery:
                     min_dur_s, max_dur_s, ideal_dur_s,
                     template=discovery_prompt)
 
-                # Upload video chunk to Replicate
+                # Upload video chunk to Replicate. idx+1 = position in the
+                # selected batch; chunk_idx+1 = position in the full timeline.
                 logger.info(
-                    f"Replicate: sending chunk {chunk_idx+1} "
+                    f"Replicate: sending chunk {idx+1}/{n_to_process} "
+                    f"[timeline {chunk_idx+1}] "
                     f"({_fmt_time(start_s)}–{_fmt_time(end_s)}) to {self.model_id}"
                 )
 
@@ -836,7 +844,9 @@ class ReplicateDiscovery:
                 else:
                     response_text = str(output)
 
-                logger.info(f"Replicate chunk {chunk_idx+1} response: {response_text[:200]}...")
+                logger.info(
+                    f"Replicate chunk {idx+1}/{n_to_process} "
+                    f"[timeline {chunk_idx+1}] response: {response_text[:200]}...")
 
                 candidates = _parse_vlm_response(response_text, start_s, end_s)
                 for c in candidates:
@@ -844,7 +854,9 @@ class ReplicateDiscovery:
                 all_candidates.extend(candidates)
 
             except Exception as e:
-                logger.warning(f"Replicate error on chunk {chunk_idx+1}: {e}")
+                logger.warning(
+                    f"Replicate error on chunk {idx+1}/{n_to_process} "
+                    f"[timeline {chunk_idx+1}]: {e}")
             finally:
                 if chunk_path and os.path.exists(chunk_path):
                     try:

@@ -341,47 +341,106 @@ class FaceDetector:
 
         ``nn.Module.to()`` only migrates registered modules / parameters /
         buffers — it does NOT touch plain Python ``Tensor`` attributes.
-        YOLO-World stores its CLIP text embeddings (``txt_feats``) as a
-        plain attribute on the underlying ``WorldModel`` (and on the
-        ``WorldDetect`` head), so a vanilla ``.to(device)`` leaves them
-        on whichever device CLIP encoded them on — typically CPU. The
-        next ``predict()`` then trips "Expected all tensors to be on the
-        same device, but got index is on cpu, different from other
-        tensors on cuda:0" inside ``WorldDetect``'s ``index_select``.
+        YOLO-World stores its CLIP text embeddings as plain attributes on
+        the underlying ``WorldModel`` (and on the ``WorldDetect`` head),
+        so a vanilla ``.to(device)`` leaves them on whichever device CLIP
+        encoded them on — typically CPU. The next ``predict()`` then trips
+        "Expected all tensors to be on the same device, but got index is
+        on cpu, different from other tensors on cuda:0" inside
+        ``WorldDetect``'s ``index_select``.
 
-        This helper migrates the module the normal way and then walks the
-        known text-feature attributes and moves them explicitly. Used by
+        Walks the underlying nn.Module recursively and migrates ANY plain
+        ``Tensor`` attribute that's on the wrong device — version-agnostic
+        across ultralytics releases (a previous hard-coded ['txt_feats',
+        'text_features'] allow-list would silently miss a renamed attr
+        on a future upgrade and silently re-introduce the bug). Used by
         both ``_yolo_set_classes`` (after a CLIP re-encode) and
         ``_yolo_predict`` (when falling back to CPU mid-run).
+
+        Returns True on success, False if the migration failed — callers
+        that need to react (e.g. swap to CPU permanently) can check.
         """
         if self._yolo_model is None:
-            return
+            return True
         try:
             import torch
-            target = (torch.device(f'cuda:{device}')
-                      if isinstance(device, int)
-                      else torch.device(device))
+        except Exception:
+            return False
+        # ``device`` may be the int 0/1 (CUDA index from _pick_yolo_device)
+        # or a str like 'cpu'/'cuda:0'. ``isinstance(device, int)`` is True
+        # for ``bool``, so guard explicitly against the bool subclass —
+        # ``torch.device('cuda:True')`` would raise ValueError.
+        if isinstance(device, bool):
+            return False
+        try:
+            if isinstance(device, int):
+                target = torch.device(f'cuda:{device}')
+            else:
+                target = torch.device(device)
+        except Exception as e:
+            logger.warning(
+                "YOLO sync target build failed (%s) — continuing without migration",
+                str(e)[:140])
+            return False
+        # Move registered params/buffers via the standard nn.Module path.
+        # If this raises (CUDA OOM mid-walk, driver mismatch), the model
+        # is left in a partial state — surface that to the caller.
+        try:
             self._yolo_model.to(target)
+        except Exception as e:
+            logger.warning(
+                "YOLO module.to(%s) failed (%s) — model may be partially migrated",
+                target, str(e)[:140])
+            return False
+        # Walk every plain Tensor attribute on the wrapper, the inner
+        # WorldModel and every submodule, moving anything that isn't
+        # already on ``target``. ``modules()`` includes the root module
+        # so this also covers ``self._yolo_model.model`` and the head.
+        moved = 0
+        try:
+            roots = [self._yolo_model]
             inner = getattr(self._yolo_model, 'model', None)
-            head = None
-            try:
-                head = inner.model[-1] if inner is not None else None
-            except (TypeError, IndexError, AttributeError):
-                head = None
-            for obj in (inner, head):
+            if inner is not None:
+                roots.append(inner)
+                try:
+                    if hasattr(inner, 'modules'):
+                        roots.extend(inner.modules())
+                except Exception:
+                    pass
+            seen_ids = set()
+            for obj in roots:
                 if obj is None:
                     continue
-                for attr in ('txt_feats', 'text_features'):
-                    val = getattr(obj, attr, None)
+                oid = id(obj)
+                if oid in seen_ids:
+                    continue
+                seen_ids.add(oid)
+                try:
+                    names = list(vars(obj).keys()) if hasattr(obj, '__dict__') else []
+                except Exception:
+                    names = []
+                for name in names:
+                    if name.startswith('_'):
+                        continue
+                    try:
+                        val = getattr(obj, name, None)
+                    except Exception:
+                        continue
                     if isinstance(val, torch.Tensor) and val.device != target:
                         try:
-                            setattr(obj, attr, val.to(target))
+                            setattr(obj, name, val.to(target))
+                            moved += 1
                         except Exception:
                             pass
         except Exception as e:
             logger.warning(
-                "YOLO sync to %s failed (%s) — continuing without migration",
-                device, str(e)[:140])
+                "YOLO tensor attr walk failed (%s) — module.to() already ran",
+                str(e)[:140])
+        if moved:
+            logger.info(
+                "YOLO sync to %s migrated %d plain tensor attribute(s)",
+                target, moved)
+        return True
 
     def _yolo_set_classes(self, classes):
         """Set YOLO-World classes and re-sync the model to the active device.
@@ -389,34 +448,32 @@ class FaceDetector:
         YOLO-World's ``set_classes()`` rebuilds the per-class text
         embeddings via its CLIP text encoder. Those embeddings are stored
         as plain ``Tensor`` attributes on the underlying ``WorldModel``
-        (``txt_feats``) and on the ``WorldDetect`` head — not as registered
-        buffers — so ``nn.Module.to(device)`` does NOT move them. They
-        stay on whichever device CLIP encoded them on (usually CPU), and
-        the next ``predict()`` then trips "Expected all tensors to be on
-        the same device, but got index is on cpu, different from other
-        tensors on cuda:0" inside ``WorldDetect``'s ``index_select``.
+        and on the ``WorldDetect`` head — not as registered buffers —
+        so ``nn.Module.to(device)`` does NOT move them. They stay on
+        whichever device CLIP encoded them on (usually CPU), and the
+        next ``predict()`` then trips "Expected all tensors to be on
+        the same device" inside ``WorldDetect``'s ``index_select``.
 
         We delegate to ``_yolo_sync_to_device`` which migrates the whole
-        module via ``.to()`` and then explicitly walks the known
-        text-feature attributes and moves them too.
+        module via ``.to()`` and then walks every plain-tensor attribute
+        on the module tree. When that sync reports failure (returns
+        False), pin the detector to CPU for the rest of this run.
         """
         if self._yolo_model is None:
             raise RuntimeError("YOLO model not loaded")
         self._yolo_model.set_classes(classes)
         if self._yolo_device == 'cpu':
             return
-        try:
-            self._yolo_sync_to_device(self._yolo_device)
-        except Exception as e:
+        # ``_yolo_sync_to_device`` swallows its own internal errors and
+        # returns True/False — relying on it to raise (which the previous
+        # outer try/except did) was dead code. Check the return value.
+        if not self._yolo_sync_to_device(self._yolo_device):
             logger.warning(
-                "YOLO-World to(%s) after set_classes failed (%s) — "
+                "YOLO-World sync to %s after set_classes failed — "
                 "falling back to CPU for the rest of this run",
-                self._yolo_device, str(e)[:140])
+                self._yolo_device)
             self._yolo_device = 'cpu'
-            try:
-                self._yolo_sync_to_device('cpu')
-            except Exception:
-                pass
+            self._yolo_sync_to_device('cpu')
 
     def compute_embedding(self, frame_bgr, face_dict: dict) -> Optional[np.ndarray]:
         """Compute a 128-dim face embedding for identity matching.

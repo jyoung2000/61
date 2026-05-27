@@ -165,7 +165,24 @@ class Smoother:
             if (last_cut_t is not None
                     and kf.get('transition') != 'cut'
                     and kf['time_ms'] - last_cut_t < 800):
-                # Within hold period after cut — suppress this movement
+                # Within hold period after cut — suppress this movement,
+                # UNLESS this is a centering correction. The merge,
+                # consolidation and drift-suppress passes already honor
+                # _centering; hold_enforce was the last gap that was
+                # silently eating centering nudges placed in the 800ms
+                # window after a cut (a frequent need when the speaker
+                # appears off-centre on the post-cut frame).
+                if kf.get('_centering'):
+                    self.tracer.event(
+                        'smoother_keep_centering',
+                        pass_name='hold_enforce',
+                        t_ms=kf['time_ms'], x=kf['x'],
+                        last_cut_t_ms=last_cut_t,
+                        delta_from_cut_ms=kf['time_ms'] - last_cut_t,
+                        reason='centering_kf_protected_post_cut',
+                    )
+                    held.append(kf)
+                    continue
                 self.tracer.event('smoother_drop',
                                   pass_name='hold_enforce',
                                   t_ms=kf['time_ms'], x=kf['x'],

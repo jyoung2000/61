@@ -349,18 +349,31 @@ export default function Settings() {
   };
 
   // Convert a "<provider>:<model>" judge spec to the matching dropdown
-  // model ID. The judge_primary / judge_fallback values stored in
-  // clipper_config.json use spec form; the ModelDropdown options use
-  // the same `id` field as availableModels.editorial[*].id — which is
-  // just the model name for cloud providers and "ollama/<name>" for
-  // local Ollama models. This is the inverse of `_toJudgeSpec` below.
+  // model ID. Inverse of `_toJudgeSpec` below. The dropdown options for
+  // direct Anthropic / Gemini / Groq carry a provider/ slug
+  // (anthropic/claude-…, google/gemini-…, groq/…); legacy specs written
+  // by the old Judge UI use bare ids (anthropic:claude-3-5-sonnet-latest).
+  // Re-attach the prefix so the saved value selects the right dropdown
+  // option on load instead of rendering '-- Select a model --'.
   const _judgeSpecToModelId = (spec) => {
     if (!spec || typeof spec !== 'string') return '';
     const colon = spec.indexOf(':');
     if (colon < 0) return spec;
     const backend = spec.slice(0, colon);
     const rest = spec.slice(colon + 1);
-    return backend === 'ollama' ? `ollama/${rest}` : rest;
+    if (backend === 'ollama') {
+      return rest.startsWith('ollama/') ? rest : `ollama/${rest}`;
+    }
+    if (backend === 'anthropic') {
+      return rest.includes('/') ? rest : `anthropic/${rest}`;
+    }
+    if (backend === 'gemini') {
+      return rest.includes('/') ? rest : `google/${rest}`;
+    }
+    if (backend === 'groq') {
+      return rest.includes('/') ? rest : `groq/${rest}`;
+    }
+    return rest;
   };
 
   // Load available models when any provider is configured
@@ -376,7 +389,9 @@ export default function Settings() {
         fetch('/api/clipper/judge-config'),
       ]);
       const data = mres.ok ? await mres.json() : null;
-      const judge = jres.ok ? await jres.json() : { primary: '', fallback: '' };
+      const judgeRaw = jres.ok ? await jres.json() : null;
+      const judge = (judgeRaw && typeof judgeRaw === 'object')
+        ? judgeRaw : { primary: '', fallback: '' };
       if (data) {
         setAvailableModels({
           transcript: data.transcript || [],
@@ -384,10 +399,16 @@ export default function Settings() {
           editorial: data.editorial || data.text || [],
         });
         if (data.current) {
+          // Editorial primary falls back to the saved judge.primary so a
+          // pre-existing judge config set by the old Judge UI doesn't get
+          // silently overwritten when only the fallback dropdown changes.
+          const editorialFromEnv = data.current.editorial_model
+            || data.current.text_model || '';
+          const editorialFromJudge = _judgeSpecToModelId(judge.primary || '');
           const cur = {
             transcript_model: data.current.transcript_model || '',
             primary_model: data.current.primary_model || data.current.vision_model || '',
-            editorial_model: data.current.editorial_model || data.current.text_model || '',
+            editorial_model: editorialFromEnv || editorialFromJudge,
             editorial_model_fallback: _judgeSpecToModelId(judge.fallback || ''),
           };
           setCurrentModels(cur);
@@ -497,15 +518,38 @@ export default function Settings() {
   // Convert a model dropdown entry's `id` (plus its provider field) to the
   // judge-config spec format ("<backend>:<model>") so the clipper's
   // existing fallback chain keeps working after a save.
+  //
+  // The dropdown entries for direct Anthropic and direct Gemini come from
+  // /api/providers/models/available with prefixed ids — "anthropic/claude-…"
+  // and "google/gemini-…". The clipper's AnthropicJudge / GeminiJudge then
+  // forward the model field VERBATIM to the native APIs, which expect bare
+  // ids like "claude-sonnet-4-5" / "gemini-2.5-flash". So when the picked
+  // model's provider is anthropic / gemini we strip the leading slug —
+  // mirror of the existing 'ollama/' branch.
   const _toJudgeSpec = (modelId) => {
     if (!modelId) return '';
-    const m = (availableModels.editorial || []).find((x) => x.id === modelId);
+    // Look up against editorial first, then primary, so a model that
+    // briefly disappears from one list doesn't get re-tagged 'openrouter'
+    // (the previous default was the largest source of spec corruption).
+    const editorial = availableModels.editorial || [];
+    const primary = availableModels.primary || [];
+    const m = editorial.find((x) => x.id === modelId)
+            || primary.find((x) => x.id === modelId);
     const provider = (m && m.provider) || 'openrouter';
+    const stripPrefix = (s, p) => (s.startsWith(p) ? s.slice(p.length) : s);
     if (provider === 'ollama' || provider === 'local') {
-      const bare = modelId.startsWith('ollama/') ? modelId.slice('ollama/'.length) : modelId;
-      return `ollama:${bare}`;
+      return `ollama:${stripPrefix(modelId, 'ollama/')}`;
     }
-    return `${provider}:${modelId}`;
+    if (provider === 'anthropic') {
+      return `anthropic:${stripPrefix(modelId, 'anthropic/')}`;
+    }
+    if (provider === 'gemini') {
+      return `gemini:${stripPrefix(modelId, 'google/')}`;
+    }
+    if (provider === 'groq') {
+      return `groq:${stripPrefix(modelId, 'groq/')}`;
+    }
+    return `openrouter:${modelId}`;
   };
 
   // Check if any model selection has changed from the saved state
@@ -554,41 +598,52 @@ export default function Settings() {
       || pendingModels.editorial_model_fallback !== currentModels.editorial_model_fallback;
 
     try {
-      const res = await fetch('/api/providers/models/save', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
-      if (res.ok) {
-        const data = await res.json();
-        // Persist per-user picks alongside the global save.
-        const userPatch = {
-          ..._perUserModelPatch('transcript', body.transcript_model),
-          ..._perUserModelPatch('primary', body.primary_model),
-          ..._perUserModelPatch('editorial', body.editorial_model),
-        };
-        await savePerUserSettings(userPatch);
-
-        // Mirror the editorial primary + fallback to the clipper's
-        // judge-config in spec form. This keeps the per-clip editorial
-        // judge wired up (it reads judge_primary / judge_fallback) without
-        // adding a second UI panel.
-        if (editorialChanged) {
-          try {
-            await fetch('/api/clipper/judge-config', {
-              method: 'PUT',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                primary: _toJudgeSpec(pendingModels.editorial_model),
-                fallback: _toJudgeSpec(pendingModels.editorial_model_fallback),
-              }),
-            });
-          } catch (e) {
-            // Non-fatal — main save already succeeded.
-            console.error('Failed to mirror editorial picks to judge-config:', e);
-          }
+      // Skip the /providers/models/save round-trip when no env-var-backed
+      // field changed (e.g. user touched only the Editorial AI Fallback,
+      // which lives in clipper_config.json not the .env). An empty-body
+      // POST returns 200/204 on most servers but used to gate the
+      // judge-config PUT — meaning a fallback-only save could silently
+      // no-op if the empty POST returned non-OK.
+      let primarySaveOk = true;
+      if (Object.keys(body).length > 0) {
+        const res = await fetch('/api/providers/models/save', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        primarySaveOk = res.ok;
+        if (res.ok) {
+          await res.json().catch(() => null);
+          // Persist per-user picks alongside the global save.
+          const userPatch = {
+            ..._perUserModelPatch('transcript', body.transcript_model),
+            ..._perUserModelPatch('primary', body.primary_model),
+            ..._perUserModelPatch('editorial', body.editorial_model),
+          };
+          await savePerUserSettings(userPatch);
         }
+      }
 
+      // Mirror the editorial primary + fallback to the clipper's
+      // judge-config in spec form. Runs independently of the primary
+      // save so a fallback-only change still lands when the primary
+      // POST was empty / failed.
+      if (editorialChanged) {
+        try {
+          await fetch('/api/clipper/judge-config', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              primary: _toJudgeSpec(pendingModels.editorial_model),
+              fallback: _toJudgeSpec(pendingModels.editorial_model_fallback),
+            }),
+          });
+        } catch (e) {
+          console.error('Failed to mirror editorial picks to judge-config:', e);
+        }
+      }
+
+      if (primarySaveOk) {
         // Refresh status, then reload models so the UI reflects the saved state.
         // Do this sequentially to avoid the status-change useEffect from racing
         // and overwriting the just-saved models with stale data.
