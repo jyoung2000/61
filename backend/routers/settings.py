@@ -3385,20 +3385,25 @@ def _read_clipper_config() -> dict:
 def _write_clipper_config_fields(updates: dict) -> dict:
     """Merge ``updates`` into clipper_config.json on disk.
 
-    Loads the existing JSON (transparently migrates from the legacy
-    ``/app/clipper_config.json`` if that's where the read lands),
+    Reads from wherever the file lives today (transparently migrates
+    from the legacy ``/data/clipper_config.json`` ephemeral location
+    or ``/app/clipper_config.json`` if that's where the read lands),
     applies the updates, and ALWAYS writes to the mount-backed
-    ``/data/clipper_config.json`` so the next ``docker compose down``
-    + ``rm -rf clipai`` + rebuild doesn't lose the user's saved
-    judge primary / fallback. Atomic via temp file + rename.
+    canonical location (``/data/logs/clipper_config.json``) so the
+    next ``docker compose down`` + ``rm -rf clipai`` + rebuild
+    doesn't lose the user's saved judge primary / fallback. Only
+    ``/data/logs/`` is mounted from the host in docker-compose.yml
+    (``./data/logs:/data/logs``); ``/data/`` itself isn't, so the
+    earlier ``/data/clipper_config.json`` write path was actually
+    ephemeral. Atomic via temp file + rename.
     """
+    from backend.services.pipeline import _canonical_clipper_config_path
     cfg = _read_clipper_config()  # reads from wherever it lives today
     cfg.update(updates)
-    # Always write to the mount-backed location, regardless of where
-    # the read came from. /data is mounted from the host (see
-    # docker-compose.yml volumes), so the file survives container
-    # rebuilds; /app does not.
-    write_path = "/data/clipper_config.json"
+    # Always write to the mount-backed canonical location regardless
+    # of where the read came from. This auto-migrates anything that
+    # was previously sitting on the ephemeral path.
+    write_path = _canonical_clipper_config_path()
     tmp = write_path + ".tmp"
     os.makedirs(os.path.dirname(write_path) or ".", exist_ok=True)
     with open(tmp, "w") as f:

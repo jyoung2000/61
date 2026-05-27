@@ -31,7 +31,8 @@ logger = logging.getLogger(__name__)
 
 # Project root — the directory that holds the legacy
 # ``/app/clipper_config.json`` location. Kept for the migration read
-# inside :func:`clipper_config_path`; live writes go to ``/data/``.
+# inside :func:`clipper_config_path`; live writes go to
+# ``/data/logs/`` (the mounted location — see _canonical_clipper_config_path).
 _PROJECT_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -39,28 +40,54 @@ _PROJECT_ROOT = os.path.dirname(
 def clipper_config_path() -> str:
     """Return the on-disk path for ``clipper_config.json``.
 
-    Writes always go to ``/data/clipper_config.json`` (a mount-backed
-    location that survives ``docker compose down`` and ``--no-cache``
-    rebuilds). Reads prefer the new location; if it's missing AND a
-    legacy ``/app/clipper_config.json`` exists from before this fix,
-    the legacy one is returned so the next write migrates it
-    automatically. Centralised here so every caller agrees on the
-    path — previously settings.py, pipeline.py, clips.py and
-    jobs.py each re-derived ``project_root + "clipper_config.json"``
-    and pointed at the ephemeral ``/app/`` copy, which silently lost
-    the user's saved judge primary + fallback on every container
-    rebuild.
+    Writes always go to ``/data/logs/clipper_config.json`` — the same
+    mount-backed directory ``user_settings.json`` lives in
+    (``./data/logs:/data/logs`` in docker-compose.yml), so the file
+    survives ``docker compose down``, ``--no-cache`` rebuilds, and
+    ``rm -rf clipai`` re-clones. ``/data/clipper_config.json`` and
+    ``/app/clipper_config.json`` are checked as legacy read locations
+    so existing installs auto-migrate on the next write — neither was
+    actually persisted across rebuilds (``/data/`` itself isn't
+    mounted; only its child dirs are), which is why users were
+    losing the editorial primary + fallback spec on every full
+    rebuild even though the file appeared to be on ``/data/``.
+
+    The editorial AI's primary model env-var name
+    (``OPENROUTER_EDITORIAL_MODEL``) is in ``user_settings.json``; the
+    same primary in spec form plus the fallback spec live here. Both
+    files share the same mount now so they persist together.
     """
-    data_path = "/data/clipper_config.json"
-    legacy_path = os.path.join(_PROJECT_ROOT, "clipper_config.json")
-    # Pure-read callers want a path that exists. Prefer the new
-    # location; fall back to the legacy one ONLY when the new file
-    # hasn't been written yet (so the migration is a one-shot).
-    if os.path.exists(data_path):
-        return data_path
-    if os.path.exists(legacy_path):
-        return legacy_path
-    return data_path
+    canonical = _canonical_clipper_config_path()
+    # Pure-read callers want a path that exists. Prefer the canonical
+    # mount-backed location; fall back to the legacy paths ONLY when
+    # the canonical file hasn't been written yet (so the migration is
+    # a one-shot — the next write lands in the canonical location).
+    if os.path.exists(canonical):
+        return canonical
+    ephemeral_path = "/data/clipper_config.json"  # legacy: in-container only
+    if os.path.exists(ephemeral_path):
+        return ephemeral_path
+    legacy_app_path = os.path.join(_PROJECT_ROOT, "clipper_config.json")
+    if os.path.exists(legacy_app_path):
+        return legacy_app_path
+    return canonical
+
+
+def _canonical_clipper_config_path() -> str:
+    """The single source-of-truth write location for clipper_config.json.
+
+    Prefers ``/data/logs/`` (volume-mounted from the host via
+    docker-compose) so the file survives rebuilds. Falls back to a
+    project-local ``.clipai/`` dir for non-Docker dev runs — matches
+    the same resolution ``user_settings.json`` uses in
+    ``backend/routers/settings.py:_resolve_data_dir``.
+    """
+    docker_dir = "/data/logs"
+    if os.path.isdir(docker_dir) and os.access(docker_dir, os.W_OK):
+        return os.path.join(docker_dir, "clipper_config.json")
+    local_dir = os.path.join(_PROJECT_ROOT, ".clipai")
+    os.makedirs(local_dir, exist_ok=True)
+    return os.path.join(local_dir, "clipper_config.json")
 
 
 def _build_compute_summary(engine, perception) -> dict:
