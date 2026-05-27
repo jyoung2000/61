@@ -106,8 +106,8 @@ class Smoother:
                     dx_out = abs(prev1['x'] - prev2['x'])
 
                     # If we bounced back to near where we were within 2.0s
-                    if (dt_total < 2.0 and dx_back < plan.crop_w * 0.15
-                            and dx_out > plan.crop_w * 0.05):
+                    if (dt_total < 3.0 and dx_back < plan.crop_w * 0.20
+                            and dx_out > plan.crop_w * 0.04):
                         # ``_centering`` keyframes are the engine's
                         # face-centering corrections; the merge, pan-
                         # consolidation and drift-suppress passes already
@@ -164,7 +164,7 @@ class Smoother:
 
             if (last_cut_t is not None
                     and kf.get('transition') != 'cut'
-                    and kf['time_ms'] - last_cut_t < 800):
+                    and kf['time_ms'] - last_cut_t < 1200):
                 # Within hold period after cut — suppress this movement,
                 # UNLESS this is a centering correction. The merge,
                 # consolidation and drift-suppress passes already honor
@@ -264,7 +264,7 @@ class Smoother:
             for j in range(i + 1, len(merged)):
                 nxt = merged[j]
                 dt_total = (nxt['time_ms'] - prev['time_ms']) / 1000.0
-                if dt_total > 2.5:
+                if dt_total > 1.5:
                     break
                 if nxt.get('transition') != 'ease_in_out':
                     break
@@ -281,19 +281,22 @@ class Smoother:
                 final = merged[run_end]
                 total_dist = abs(final['x'] - prev['x'])
                 dist_ratio = total_dist / max(1, plan.crop_w)
-                if dist_ratio < 0.15:
-                    trans_ms = 350
-                elif dist_ratio < 0.30:
-                    trans_ms = 550
-                elif dist_ratio < 0.50:
-                    trans_ms = 750
-                else:
-                    trans_ms = 900
+                # Linear interpolation between 200ms (tiny nudge) and 600ms (full-width pan).
+                # Capped at 600ms — anything slower feels like lag, not cinema.
+                trans_ms = int(200 + min(400, dist_ratio * 400 / 0.50))
 
+                # Centering corrections should ease_out (settle gently onto the face).
+                # Tracking pans should ease_in (start slow as the eye follows).
+                # All other consolidated pans stay ease_in_out.
+                _transition_type = 'ease_in_out'
+                if final.get('_centering'):
+                    _transition_type = 'ease_out'
+                elif all(merged[j].get('source') == 'face_track' for j in range(i, run_end + 1)):
+                    _transition_type = 'ease_in'
                 consolidated.append({
                     'time_ms': final['time_ms'],
                     'x': final['x'],
-                    'transition': 'ease_in_out',
+                    'transition': _transition_type,
                     'transition_ms': trans_ms,
                 })
                 # Emit one drop event per intermediate keyframe absorbed
@@ -330,7 +333,7 @@ class Smoother:
         # without re-introducing the original jitter problem. Centering-
         # tagged keyframes are skipped unconditionally so the eval's
         # middle-third check still passes on faces near the edge.
-        drift_threshold = max(15, int(plan.crop_w * 0.08))
+        drift_threshold = max(10, int(plan.crop_w * 0.05))
         stabilized = [consolidated[0]]
         drift_suppressed = 0
         for i in range(1, len(consolidated)):

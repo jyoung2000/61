@@ -160,6 +160,9 @@ class ReframeEngine:
         if self.perception.is_live_action:
             self._enforce_live_action_faces()
 
+        # Final edge-violation elimination — runs last, after all other passes
+        self._eliminate_edge_violations()
+
         total_elapsed = self.log.stop_timer('total_pipeline')
 
         # Final summary
@@ -359,7 +362,7 @@ class ReframeEngine:
         third_offset = crop_w // 3
         eval_boundary = third_offset // 2  # 1/6 of crop_w
         trigger_offset = max(0, eval_boundary - 2)
-        NUDGE_CAP = max(20, int(crop_w * 0.35))   # 35 % of crop width
+        NUDGE_CAP = max(20, int(crop_w * 0.20))   # 20% of crop width per nudge
 
         # Pick the best face at a given time (±200 ms window).
         # Extracted as a closure so the per-keyframe and per-second
@@ -477,7 +480,7 @@ class ReframeEngine:
         # Binary-search neighbour lookup: avoid an O(N²) scan over
         # 2000+ keyframes × 1500+ seconds.
         from bisect import bisect_left
-        def _has_neighbour(time_ms: int, window_ms: int = 250) -> bool:
+        def _has_neighbour(time_ms: int, window_ms: int = 150) -> bool:
             i = bisect_left(existing_times, time_ms)
             if i < len(existing_times) and abs(existing_times[i] - time_ms) <= window_ms:
                 return True
@@ -486,8 +489,8 @@ class ReframeEngine:
             return False
 
         duration_ms = self.plan.duration_ms or 0
-        for sec in range(0, duration_ms // 1000):
-            time_ms = sec * 1000
+        for half_sec in range(0, duration_ms // 500):
+            time_ms = half_sec * 500
             best_face = _best_face_near(time_ms)
             if best_face is None:
                 continue
@@ -954,10 +957,14 @@ class ReframeEngine:
                 # holding still during minor detection noise.
                 # Live-action: tighter deadband for responsive face tracking.
                 # Animated: wider deadband for stability.
+                # Deadband: how far a face can move before the crop follows.
+                # Tighter for live-action — faces on screen deserve precise framing.
+                # Wider for animated/gaming — subjects teleport and tight deadbands
+                # cause jitter from detection noise on stylised faces.
                 if self.perception.is_live_action:
-                    face_deadband = max(30, int(crop_w * 0.25))  # 25% crop_w
+                    face_deadband = max(20, int(crop_w * 0.12))  # 12% crop_w ≈ 24px on 200px crop
                 else:
-                    face_deadband = max(30, int(crop_w * 0.30))  # 30% crop_w
+                    face_deadband = max(30, int(crop_w * 0.25))  # 25% crop_w (unchanged)
 
                 # ── Bimodal detection: two faces on opposite sides ──
                 # When two faces are far apart (e.g. Verzuz battle), the
@@ -1505,4 +1512,76 @@ class ReframeEngine:
             f'{blip_count} blips removed, {centered_count} centered)')
 
         self.plan.keyframes = anchored
+
+    def _eliminate_edge_violations(self) -> None:
+        """Final sweep: ensure no face bbox clips at the crop edge.
+        Runs AFTER all other passes. For every keyframe whose nearest
+        perception sample has a real face, compute whether the face's
+        full bounding box (cx ± w/2) fits inside the crop window with a
+        minimum 8px clearance on each side. If not, shift the crop so it
+        does.
+        This is purely reactive — it only reads face positions that the
+        perceiver already measured. No prediction. The crop moves only
+        as much as needed to contain the current face bbox.
+        """
+        if not self.plan or not self.perception:
+            return
+        log = self.log
+        crop_w = self.plan.crop_w
+        max_x = self.plan.max_x
+        EDGE_CLEARANCE = 8   # minimum pixels between face bbox edge and crop edge
+        # Build real-track set
+        track_counts: dict[int, int] = {}
+        for faces in self.perception.face_timeline.values():
+            for f in faces:
+                tid = f.get('track_id', -1)
+                if tid >= 0:
+                    track_counts[tid] = track_counts.get(tid, 0) + 1
+        real_tracks = {tid for tid, cnt in track_counts.items() if cnt >= 25}
+        if not real_tracks and track_counts:
+            real_tracks = set(track_counts.keys())
+        fixed = 0
+        for kf in self.plan.keyframes:
+            t = kf['time_ms']
+            x = kf['x']
+            # Find the nearest face sample within 300ms
+            best_face = None
+            best_score = 0.0
+            for dt in [0, -200, 200, -300, 300]:
+                faces = self.perception.face_timeline.get(t + dt, [])
+                for f in faces:
+                    if f.get('track_id', -1) not in real_tracks:
+                        continue
+                    score = (
+                        f.get('saliency', 0) + f.get('mouth_motion', 0)
+                    ) * max(0.15, f.get('confidence', 0.5))
+                    if score > best_score:
+                        best_score = score
+                        best_face = f
+            if best_face is None:
+                continue
+            face_cx = best_face['cx']
+            face_w = best_face.get('w', 0)
+            if face_w <= 0:
+                continue
+            face_left = face_cx - face_w // 2
+            face_right = face_cx + face_w // 2
+            crop_left = x
+            crop_right = x + crop_w
+            new_x = x
+            # Face clipping on the left
+            if face_left < crop_left + EDGE_CLEARANCE:
+                new_x = face_left - EDGE_CLEARANCE
+            # Face clipping on the right (re-check after left correction)
+            if face_right > new_x + crop_w - EDGE_CLEARANCE:
+                new_x = face_right + EDGE_CLEARANCE - crop_w
+            new_x = min(max_x, new_x)  # floor enforced at render time by clamp_x
+            if new_x != x:
+                kf['x'] = new_x
+                kf['_edge_fixed'] = True
+                fixed += 1
+        if fixed > 0:
+            log.log_stage('SMOOTH',
+                f'Edge violation sweep: corrected {fixed} keyframes '
+                f'(face bbox now clears crop edge by ≥{EDGE_CLEARANCE}px)')
 

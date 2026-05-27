@@ -2319,6 +2319,23 @@ async def _run_analysis_inner(job_id: str):
             "[%s] reframe grade: %s (%.0f/100)", job_id,
             reframe_report.get("grade"), reframe_report.get("overall_score", 0),
         )
+        if reframe_report:
+            from backend.services.reframe_evaluator import ReframeEvaluator
+            _summary = ReframeEvaluator.summarise_problems(_grade)
+            logger.info(
+                "[%s] reframe problems: %s",
+                job_id, _summary,
+            )
+            _high = [p for p in (_grade.problems or []) if p.get('severity') == 'HIGH']
+            for _p in _high[:5]:
+                logger.warning(
+                    "[%s] HIGH %s @ t=%ds: crop_x=%s face_cx=%s "
+                    "(kf_bracket: %s→%s)",
+                    job_id, _p.get('type'), _p.get('time_sec', 0),
+                    _p.get('crop_x', '?'), _p.get('best_face_cx', '?'),
+                    _p.get('keyframe_t_ms_before', '?'),
+                    _p.get('keyframe_t_ms_after', '?'),
+                )
     except Exception as _ge:
         logger.warning("[%s] reframe grade failed: %s", job_id, _ge)
 

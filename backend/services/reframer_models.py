@@ -393,7 +393,11 @@ def interpolate_x(keyframes: List[dict], time_ms: float) -> int:
 
     # Eased/linear transitions
     trans_ms = next_kf.get('transition_ms', 300)
-    t_start = next_kf['time_ms'] - trans_ms
+    # transition_ms == 0 means span the full prev→next interval
+    if trans_ms <= 0:
+        t_start = prev_kf['time_ms']
+    else:
+        t_start = next_kf['time_ms'] - trans_ms
     t_end = next_kf['time_ms']
 
     if time_ms <= t_start:
@@ -409,6 +413,12 @@ def interpolate_x(keyframes: List[dict], time_ms: float) -> int:
 
     if next_kf['transition'] == 'linear':
         eased = p
+    elif next_kf['transition'] == 'ease_in':
+        # Slow start, fast finish — use for tracking pans (camera is catching up)
+        eased = p * p
+    elif next_kf['transition'] == 'ease_out':
+        # Fast start, slow finish — use for correction moves (settling on target)
+        eased = 1 - (1 - p) * (1 - p)
     elif next_kf['transition'] == 'ease_in_out':
         eased = 4*p*p*p if p < 0.5 else 1 - (-2*p + 2)**3 / 2
     else:

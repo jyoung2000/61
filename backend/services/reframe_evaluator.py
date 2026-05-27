@@ -351,7 +351,44 @@ class ReframeEvaluator:
 
         if on_progress:
             on_progress(1.0)
+
+        # Full metric log — every axis visible in one grep
+        logger.info(
+            "ReframeReport | grade=%s overall=%.1f | "
+            "face_cov=%.1f%% saliency=%.1f%% centering=%.1f%% | "
+            "stability=%.1f cut_coh=%.1f edge_viol=%.1f%% | "
+            "hold=%.1f decisive=%.1f motion_budget=%.1f watchability=%.1f | "
+            "problems HIGH=%d MED=%d LOW=%d",
+            report.grade, report.overall_score,
+            report.face_coverage_pct, report.saliency_accuracy_pct, report.centering_pct,
+            report.stability_score, report.cut_coherence_score, report.edge_violation_pct,
+            report.hold_quality, report.transition_decisiveness,
+            report.motion_budget, report.watchability_score,
+            sum(1 for p in report.problems if p.get('severity') == 'HIGH'),
+            sum(1 for p in report.problems if p.get('severity') == 'MED'),
+            sum(1 for p in report.problems if p.get('severity') == 'LOW'),
+        )
+        # Log each HIGH problem with its timestamp and keyframe bracket
+        for p in report.problems:
+            if p.get('severity') == 'HIGH':
+                logger.warning(
+                    "  [t=%ds] %s: %s (crop_x=%s face_cx=%s kf_before=%s kf_after=%s)",
+                    p.get('time_sec', 0), p.get('type', '?'), p.get('message', ''),
+                    p.get('crop_x', '?'), p.get('best_face_cx', '?'),
+                    p.get('keyframe_t_ms_before', '?'), p.get('keyframe_t_ms_after', '?'),
+                )
+
         return report
+
+    @staticmethod
+    def summarise_problems(report: 'ReframeReport') -> str:
+        """Return a concise problem summary suitable for a single log line."""
+        by_type: dict[str, int] = {}
+        for p in report.problems:
+            key = f"{p.get('severity','?')}:{p.get('type','?')}"
+            by_type[key] = by_type.get(key, 0) + 1
+        parts = [f"{k}×{v}" for k, v in sorted(by_type.items())]
+        return ' | '.join(parts) if parts else 'no_problems'
 
     @staticmethod
     def _nearest_sample(time_ms: int, face_timeline: dict) -> Optional[int]:

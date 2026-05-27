@@ -797,12 +797,21 @@ class Perceiver:
                 track_id = best_track['id']
                 # Smooth track position with exponential moving average
                 # This prevents the track from jumping on noisy detections
-                alpha = 0.6  # 60% new position, 40% old
+                # Velocity-adaptive EMA: snap to detection faster when face is moving.
+                # This keeps the track on the actual face position while still filtering
+                # single-frame jitter from noisy detections.
+                prev_cx = best_track['cx']
+                prev_cy = best_track['cy']
+                motion_px = abs(face['cx'] - prev_cx) + abs(face['cy'] - prev_cy)
+                max_motion = max(1, face.get('w', 40))  # normalize by face width
+                motion_norm = min(1.0, motion_px / max_motion)
+                # alpha range: 0.60 (still face) → 0.90 (fast-moving face)
+                alpha = 0.60 + motion_norm * 0.30
                 best_track.update({
-                    'cx': int(face['cx'] * alpha + best_track['cx'] * (1 - alpha)),
-                    'cy': int(face['cy'] * alpha + best_track['cy'] * (1 - alpha)),
-                    'w': int(face['w'] * alpha + best_track['w'] * (1 - alpha)),
-                    'h': int(face['h'] * alpha + best_track['h'] * (1 - alpha)),
+                    'cx': int(face['cx'] * alpha + prev_cx * (1 - alpha)),
+                    'cy': int(face['cy'] * alpha + prev_cy * (1 - alpha)),
+                    'w': int(face['w'] * 0.7 + best_track['w'] * 0.3),   # size changes slower
+                    'h': int(face['h'] * 0.7 + best_track['h'] * 0.3),
                     'last_seen_ms': time_ms,
                 })
                 used_tracks.add(track_id)
