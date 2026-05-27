@@ -65,8 +65,8 @@ export default function Settings() {
 
   // Per-task model selection
   const [availableModels, setAvailableModels] = useState({ transcript: [], primary: [], editorial: [] });
-  const [currentModels, setCurrentModels] = useState({ transcript_model: '', primary_model: '', editorial_model: '' });
-  const [pendingModels, setPendingModels] = useState({ transcript_model: '', primary_model: '', editorial_model: '' });
+  const [currentModels, setCurrentModels] = useState({ transcript_model: '', primary_model: '', editorial_model: '', editorial_model_fallback: '' });
+  const [pendingModels, setPendingModels] = useState({ transcript_model: '', primary_model: '', editorial_model: '', editorial_model_fallback: '' });
   const [modelsSaving, setModelsSaving] = useState(false);
   const [modelsLoading, setModelsLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
@@ -75,17 +75,6 @@ export default function Settings() {
   const [transSettings, setTransSettings] = useState({ beam_size: 1, vad_filter: true, frame_sample_rate: 10 });
   const [transSaved, setTransSaved] = useState({ beam_size: 1, vad_filter: true, frame_sample_rate: 10 });
   const [transSaving, setTransSaving] = useState(false);
-
-  // Editorial Judge (clip scoring) — separate from app-wide Editorial AI.
-  // Picks per-clip scoring model + an optional fallback from any
-  // already-connected provider.
-  const [judgeProviders, setJudgeProviders] = useState(null); // /api/clipper/editorial-models payload
-  const [judgePrimary, setJudgePrimary] = useState('');
-  const [judgeFallback, setJudgeFallback] = useState('');
-  const [judgePrimarySaved, setJudgePrimarySaved] = useState('');
-  const [judgeFallbackSaved, setJudgeFallbackSaved] = useState('');
-  const [judgeSaving, setJudgeSaving] = useState(false);
-  const [judgeLoading, setJudgeLoading] = useState(false);
 
   // NOTE: Whisper testing is now in PipelineDiagnostics component
 
@@ -359,13 +348,36 @@ export default function Settings() {
     } catch { showToast('Failed to remove font', 'error'); }
   };
 
+  // Convert a "<provider>:<model>" judge spec to the matching dropdown
+  // model ID. The judge_primary / judge_fallback values stored in
+  // clipper_config.json use spec form; the ModelDropdown options use
+  // the same `id` field as availableModels.editorial[*].id — which is
+  // just the model name for cloud providers and "ollama/<name>" for
+  // local Ollama models. This is the inverse of `_toJudgeSpec` below.
+  const _judgeSpecToModelId = (spec) => {
+    if (!spec || typeof spec !== 'string') return '';
+    const colon = spec.indexOf(':');
+    if (colon < 0) return spec;
+    const backend = spec.slice(0, colon);
+    const rest = spec.slice(colon + 1);
+    return backend === 'ollama' ? `ollama/${rest}` : rest;
+  };
+
   // Load available models when any provider is configured
   const loadAvailableModels = async () => {
     setModelsLoading(true);
     try {
-      const res = await fetch('/api/providers/models/available');
-      if (res.ok) {
-        const data = await res.json();
+      // Fetch the dropdown options + the editorial-judge fallback spec
+      // in parallel. Fallback is stored on the clipper config as a spec
+      // so the per-clip judge keeps working; the UI shows it as a plain
+      // model pick under the Editorial AI primary.
+      const [mres, jres] = await Promise.all([
+        fetch('/api/providers/models/available'),
+        fetch('/api/clipper/judge-config'),
+      ]);
+      const data = mres.ok ? await mres.json() : null;
+      const judge = jres.ok ? await jres.json() : { primary: '', fallback: '' };
+      if (data) {
         setAvailableModels({
           transcript: data.transcript || [],
           primary: data.primary || data.vision || [],
@@ -376,6 +388,7 @@ export default function Settings() {
             transcript_model: data.current.transcript_model || '',
             primary_model: data.current.primary_model || data.current.vision_model || '',
             editorial_model: data.current.editorial_model || data.current.text_model || '',
+            editorial_model_fallback: _judgeSpecToModelId(judge.fallback || ''),
           };
           setCurrentModels(cur);
           setPendingModels(cur);
@@ -397,64 +410,6 @@ export default function Settings() {
       || statuses._active?.ollama_enabled;
     if (hasProvider) loadAvailableModels();
   }, [statuses.openrouter?.status, statuses.anthropic?.status, statuses.gemini?.status, statuses._active?.ollama_enabled]);
-
-  // Editorial Judge — load the available-models manifest + saved picks.
-  const loadJudgeData = async () => {
-    setJudgeLoading(true);
-    try {
-      const [mres, cres] = await Promise.all([
-        fetch('/api/clipper/editorial-models'),
-        fetch('/api/clipper/judge-config'),
-      ]);
-      const mdata = mres.ok ? await mres.json() : { providers: [] };
-      const cdata = cres.ok ? await cres.json() : { primary: '', fallback: '' };
-      setJudgeProviders(mdata);
-      setJudgePrimary(cdata.primary || '');
-      setJudgeFallback(cdata.fallback || '');
-      setJudgePrimarySaved(cdata.primary || '');
-      setJudgeFallbackSaved(cdata.fallback || '');
-    } catch (e) {
-      console.error('Could not load editorial judge data:', e);
-    } finally {
-      setJudgeLoading(false);
-    }
-  };
-
-  useEffect(() => { loadJudgeData(); }, []);
-
-  // Refresh after any provider status change — keeps the dropdown
-  // honest when the user adds / removes an API key.
-  useEffect(() => {
-    if (statuses && Object.keys(statuses).length > 0) loadJudgeData();
-  }, [
-    statuses.openrouter?.status,
-    statuses.anthropic?.status,
-    statuses.gemini?.status,
-    statuses.groq?.status,
-    statuses._active?.ollama_enabled,
-  ]);
-
-  const judgeHasChanges =
-    judgePrimary !== judgePrimarySaved || judgeFallback !== judgeFallbackSaved;
-
-  const handleSaveJudgeConfig = async () => {
-    setJudgeSaving(true);
-    try {
-      const res = await fetch('/api/clipper/judge-config', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ primary: judgePrimary, fallback: judgeFallback }),
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
-      setJudgePrimarySaved(data.primary || '');
-      setJudgeFallbackSaved(data.fallback || '');
-    } catch (e) {
-      console.error('Could not save editorial judge config:', e);
-    } finally {
-      setJudgeSaving(false);
-    }
-  };
 
   // Map our short provider name (the dropdown id) to the backend
   // env-var name expected by the per-user settings overlay.
@@ -529,17 +484,36 @@ export default function Settings() {
     }
   };
 
-  // Buffer a model selection (does NOT save yet)
+  // Buffer a model selection (does NOT save yet). The 'editorial_fallback'
+  // task writes to ``editorial_model_fallback`` so it doesn't collide with
+  // the primary 'editorial' pick.
   const handleSelectModel = (task, modelId) => {
-    const key = task + '_model';
+    const key = task === 'editorial_fallback'
+      ? 'editorial_model_fallback'
+      : task + '_model';
     setPendingModels((prev) => ({ ...prev, [key]: modelId }));
+  };
+
+  // Convert a model dropdown entry's `id` (plus its provider field) to the
+  // judge-config spec format ("<backend>:<model>") so the clipper's
+  // existing fallback chain keeps working after a save.
+  const _toJudgeSpec = (modelId) => {
+    if (!modelId) return '';
+    const m = (availableModels.editorial || []).find((x) => x.id === modelId);
+    const provider = (m && m.provider) || 'openrouter';
+    if (provider === 'ollama' || provider === 'local') {
+      const bare = modelId.startsWith('ollama/') ? modelId.slice('ollama/'.length) : modelId;
+      return `ollama:${bare}`;
+    }
+    return `${provider}:${modelId}`;
   };
 
   // Check if any model selection has changed from the saved state
   const modelsHaveChanges =
     pendingModels.transcript_model !== currentModels.transcript_model ||
     pendingModels.primary_model !== currentModels.primary_model ||
-    pendingModels.editorial_model !== currentModels.editorial_model;
+    pendingModels.editorial_model !== currentModels.editorial_model ||
+    pendingModels.editorial_model_fallback !== currentModels.editorial_model_fallback;
 
   // Build the per-user env-var patch for a model selection. Picks
   // the right OPENROUTER_*_MODEL vs OLLAMA_*_MODEL key by inspecting
@@ -575,6 +549,10 @@ export default function Settings() {
       body.text_model = pendingModels.editorial_model;  // legacy alias
     }
 
+    const editorialChanged =
+      pendingModels.editorial_model !== currentModels.editorial_model
+      || pendingModels.editorial_model_fallback !== currentModels.editorial_model_fallback;
+
     try {
       const res = await fetch('/api/providers/models/save', {
         method: 'POST',
@@ -590,6 +568,26 @@ export default function Settings() {
           ..._perUserModelPatch('editorial', body.editorial_model),
         };
         await savePerUserSettings(userPatch);
+
+        // Mirror the editorial primary + fallback to the clipper's
+        // judge-config in spec form. This keeps the per-clip editorial
+        // judge wired up (it reads judge_primary / judge_fallback) without
+        // adding a second UI panel.
+        if (editorialChanged) {
+          try {
+            await fetch('/api/clipper/judge-config', {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                primary: _toJudgeSpec(pendingModels.editorial_model),
+                fallback: _toJudgeSpec(pendingModels.editorial_model_fallback),
+              }),
+            });
+          } catch (e) {
+            // Non-fatal — main save already succeeded.
+            console.error('Failed to mirror editorial picks to judge-config:', e);
+          }
+        }
 
         // Refresh status, then reload models so the UI reflects the saved state.
         // Do this sequentially to avoid the status-change useEffect from racing
@@ -1066,65 +1064,6 @@ export default function Settings() {
               </span>
             )}
           </div>
-        )}
-      </div>
-    );
-  };
-
-  // Dropdown for the Editorial Judge (clip scoring) primary / fallback
-  // picker. Renders each connected provider as an <optgroup> with its
-  // available models. Disabled providers (no API key set) appear as a
-  // dimmed group with a hint instead of being hidden, so users can see
-  // which keys they're missing.
-  const JudgeModelSelect = ({
-    label, value, onChange, providers,
-    allowNone = true, noneLabel = 'None',
-    disabled = false, disabledHint = '',
-  }) => {
-    const hasAny = (providers || []).some((p) => p.configured && (p.models || []).length > 0);
-    return (
-      <div style={{ marginBottom: 14 }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 4 }}>
-          <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>{label}</span>
-          {value && (
-            <span style={{ fontSize: 10, fontFamily: 'var(--font-mono)', color: 'var(--accent-cyan)' }}>
-              {value}
-            </span>
-          )}
-        </div>
-        <select
-          value={value || ''}
-          onChange={(e) => onChange(e.target.value)}
-          disabled={disabled || !hasAny}
-          style={{
-            ...dropdownStyle,
-            opacity: (disabled || !hasAny) ? 0.5 : 1,
-            cursor: (disabled || !hasAny) ? 'not-allowed' : 'pointer',
-          }}
-        >
-          {allowNone && <option value="">{noneLabel}</option>}
-          {(providers || []).map((p) => {
-            if (!p.configured) {
-              return (
-                <option key={p.backend} value="" disabled>
-                  {p.label} — not connected
-                </option>
-              );
-            }
-            if (!p.models || p.models.length === 0) return null;
-            return (
-              <optgroup key={p.backend} label={p.label}>
-                {p.models.map((m) => (
-                  <option key={m.spec} value={m.spec}>{m.label}</option>
-                ))}
-              </optgroup>
-            );
-          })}
-        </select>
-        {disabled && disabledHint && (
-          <span style={{ fontSize: 10, color: 'var(--text-muted)', display: 'block', marginTop: 4 }}>
-            {disabledHint}
-          </span>
         )}
       </div>
     );
@@ -1653,6 +1592,14 @@ export default function Settings() {
                 label="Editorial AI"
                 desc="Scores clips, generates summaries and tags, and polishes transcripts. Any LLM works — smarter models produce better editorial judgment."
               />
+              <ModelDropdown
+                task="editorial_fallback"
+                models={availableModels.editorial}
+                pendingValue={pendingModels.editorial_model_fallback}
+                savedValue={currentModels.editorial_model_fallback}
+                label="Editorial AI Fallback"
+                desc="Used automatically when the primary Editorial AI is rate-limited or unreachable. Leave blank to disable the fallback."
+              />
 
               {/* ── Save Button ── */}
               <div style={{
@@ -1686,87 +1633,6 @@ export default function Settings() {
                 )}
               </div>
 
-              {/* ── Editorial Judge (clip scoring) ─────────────── */}
-              {/* Separate from the "Editorial AI" dropdown above —
-                  this one only runs inside the clipper's per-candidate
-                  scoring loop. Lets the user pick a primary model and
-                  an optional fallback to handle rate limits / outages. */}
-              <div style={{
-                marginTop: 24, padding: '16px 18px',
-                background: 'var(--bg-panel)', border: '1px solid var(--border)',
-                borderRadius: 'var(--radius-md)',
-              }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 6 }}>
-                  <h4 style={{ fontSize: 13, margin: 0, color: 'var(--text-primary)' }}>
-                    Editorial Judge (Clip Scoring)
-                    {judgeHasChanges && (
-                      <span style={{ fontSize: 10, fontWeight: 400, color: 'var(--accent-amber)', marginLeft: 8 }}>
-                        unsaved
-                      </span>
-                    )}
-                  </h4>
-                </div>
-                <p style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 14, lineHeight: 1.5 }}>
-                  The clipper sends each candidate clip (with keyframes + transcript)
-                  to this model to score hook / payoff / retention. If the primary is
-                  rate-limited or unreachable, the fallback takes over automatically.
-                  Only vision-capable models from your connected providers are shown.
-                </p>
-
-                {judgeLoading && (
-                  <div style={{ padding: 12, color: 'var(--text-muted)', fontSize: 12 }}>
-                    Loading available models...
-                  </div>
-                )}
-
-                {!judgeLoading && judgeProviders && (
-                  <>
-                    <JudgeModelSelect
-                      label="Primary"
-                      value={judgePrimary}
-                      onChange={setJudgePrimary}
-                      providers={judgeProviders.providers}
-                      allowNone={true}
-                      noneLabel="No editorial judge (signal-only scoring)"
-                    />
-                    <JudgeModelSelect
-                      label="Fallback"
-                      value={judgeFallback}
-                      onChange={setJudgeFallback}
-                      providers={judgeProviders.providers}
-                      allowNone={true}
-                      noneLabel="No fallback"
-                      disabled={!judgePrimary}
-                      disabledHint="Pick a primary first"
-                    />
-
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 12 }}>
-                      <button
-                        onClick={handleSaveJudgeConfig}
-                        disabled={!judgeHasChanges || judgeSaving}
-                        style={{
-                          padding: '8px 22px',
-                          background: judgeHasChanges ? 'var(--accent-cyan)' : 'var(--bg-elevated)',
-                          color: judgeHasChanges ? 'var(--bg-base)' : 'var(--text-muted)',
-                          border: judgeHasChanges ? 'none' : '1px solid var(--border)',
-                          borderRadius: 'var(--radius-sm)', fontSize: 12, fontWeight: 600,
-                          opacity: (!judgeHasChanges || judgeSaving) ? 0.5 : 1,
-                        }}
-                      >
-                        {judgeSaving ? 'Saving...' : 'Save Editorial Judge'}
-                      </button>
-                      {!judgeHasChanges && !judgeSaving && judgePrimarySaved && (
-                        <span style={{ fontSize: 11, color: 'var(--success)' }}>Saved</span>
-                      )}
-                      {judgeProviders.providers.every((p) => !p.configured) && (
-                        <span style={{ fontSize: 11, color: 'var(--accent-amber)' }}>
-                          Connect a provider above to pick a judge model
-                        </span>
-                      )}
-                    </div>
-                  </>
-                )}
-              </div>
             </>
           )}
         </div>
