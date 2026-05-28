@@ -1457,8 +1457,14 @@ class Planner:
                         # On switch: go directly to face center (no blending)
                         target_x = center_x
                 else:
-                    # Same target as before — blend home vs live
-                    ab = params.anchor_blend * 0.5  # moderate reduction
+                    # Same target as before — blend home vs live.
+                    # Reduced from 0.5 → 0.3 multiplier so the live face
+                    # position dominates over the static "home" anchor.
+                    # The home anchor was originally added to stabilize
+                    # against jitter, but the EMA already handles that —
+                    # over-weighting home pulls the crop away from where
+                    # the face actually is right now.
+                    ab = params.anchor_blend * 0.3
                     if best_tid in track_homes:
                         home_x = track_homes[best_tid]
                         target_x = clamp_x(int(home_x * ab + center_x * (1 - ab)),
@@ -1548,7 +1554,7 @@ class Planner:
                 #    explosions, any fast-moving content.
                 if subject_x is None:
                     hs = self.p.motion_hotspot.get(t)
-                    if hs and hs['intensity'] > 0.02:
+                    if hs and hs['intensity'] > 0.01:
                         # Blend with hold position using motion_weight
                         mw = params.motion_weight
                         hotspot_x = clamp_x(hs['cx'] - self.crop_w // 2, self.max_x)

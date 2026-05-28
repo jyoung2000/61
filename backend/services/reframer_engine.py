@@ -1541,7 +1541,12 @@ class ReframeEngine:
         log = self.log
         crop_w = self.plan.crop_w
         max_x = self.plan.max_x
-        EDGE_CLEARANCE = 8   # minimum pixels between face bbox edge and crop edge
+        # Wider clearance so faces don't sit hard against the crop edge.
+        # Scales with crop width: 5% of crop_w (with a 12px floor for tiny
+        # crops) — at a 1080×1920 crop_w=608 this is ~30px; for a 4K source
+        # crop_w=1215 it's ~60px. Replaces the previous 8px fixed value
+        # which left visible-only-just-inside faces at the boundary.
+        EDGE_CLEARANCE = max(12, int(crop_w * 0.05))
         # Build real-track set
         track_counts: dict[int, int] = {}
         for faces in self.perception.face_timeline.values():
