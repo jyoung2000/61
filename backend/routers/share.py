@@ -232,7 +232,14 @@ def _scope_clip(job_dict: dict, clip_id: int) -> dict:
     start = float(chosen.get("start_time") or 0.0)
     end = float(chosen.get("end_time") or 0.0)
     pad = 0.5
-    full_transcript = job_dict.get("transcript") or []
+    # Prefer the translated transcript when one exists so a shared clip
+    # shows the same final-language subtitles the owner sees in-app
+    # (e.g. an EN render of a JA source), not the original language.
+    full_transcript = (
+        job_dict.get("translated_transcript")
+        or job_dict.get("transcript")
+        or []
+    )
     clip_transcript = [
         seg for seg in full_transcript
         if isinstance(seg, dict)
@@ -449,20 +456,25 @@ async def public_share_transcript_srt(token: str):
         raise HTTPException(status_code=404, detail="no transcript")
     from backend.models import TranscriptSegment
     from backend.services.srt_generator import generate_srt
+    # Serve the translated transcript when present so the shared SRT is in
+    # the final language (matches the in-app default at jobs.py:376), and
+    # fall back to the original otherwise.
+    translated = getattr(job, "translated_transcript", None) or []
+    source_segments = translated if len(translated) > 0 else job.transcript
     segments = []
     if link.scope == "clip" and link.clip_id is not None:
         clips = getattr(job, "clips", []) or []
         target = next((c for c in clips if getattr(c, "id", None) == link.clip_id), None)
         s = float(getattr(target, "start", 0)) if target else 0.0
         e = float(getattr(target, "end", 0)) if target else 0.0
-        for raw in job.transcript:
+        for raw in source_segments:
             seg = TranscriptSegment(**raw) if isinstance(raw, dict) else raw
             if seg.end < s or seg.start > e:
                 continue
             segments.append(seg)
     else:
         segments = [TranscriptSegment(**raw) if isinstance(raw, dict) else raw
-                    for raw in job.transcript]
+                    for raw in source_segments]
     body = generate_srt(segments, include_speakers=True)
     base = (getattr(job, "filename", "") or token).rsplit(".", 1)[0]
     return Response(
