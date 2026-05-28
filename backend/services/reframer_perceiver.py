@@ -284,6 +284,22 @@ class Perceiver:
             tracked = self._assign_tracks(confirmed, time_ms)
             r.face_timeline[time_ms] = tracked
 
+            # ── Cache dominant-speaker position for saliency biasing ──
+            # When the speaker's face momentarily drops out of detection
+            # (head turn, brief occlusion, motion blur), the saliency
+            # hotspot can still pull toward the last known speaker by
+            # adding a time-decaying Gaussian bump (see saliency block
+            # below). We only cache when mouth motion is clearly above
+            # the noise floor.
+            if tracked:
+                mm_face = max(tracked, key=lambda f: f.get('mouth_motion', 0))
+                mm_strength = float(mm_face.get('mouth_motion', 0))
+                if mm_strength > 0.10:
+                    self._recent_speaker_cx = int(mm_face.get('cx', 0))
+                    self._recent_speaker_cy = int(mm_face.get('cy', 0))
+                    self._recent_speaker_time_ms = time_ms
+                    self._recent_speaker_strength = mm_strength
+
             # ── Scene cuts (histogram at low res — very fast) ──
             hist = cv2.calcHist([gray_small], [0], None, [32], [0, 256])
             cv2.normalize(hist, hist)
@@ -296,44 +312,84 @@ class Perceiver:
                     self.face_detector.clear_nonhuman_cache()
             prev_hist = hist.copy()
 
-            # ── Motion (vectorized frame diff + hotspot + weighted centroid) ──
+            # ── Motion (dense optical flow + camera-motion compensation) ──
+            # Farnebäck dense optical flow gives per-pixel motion vectors,
+            # so we can locate the true center of OBJECT motion vs the old
+            # absdiff approach which conflated "moving" with "high-contrast
+            # texture". Subtracting the median flow removes the global
+            # camera-pan / shake bias so the centroid follows real subject
+            # movement instead of drifting with the camera. Falls back to
+            # the previous frame-diff method on any opencv failure so a
+            # missing build flag never crashes the perceiver.
             if prev_gray_small is not None:
-                diff_frame = cv2.absdiff(prev_gray_small, gray_small)
-                motion_mag = float(np.mean(diff_frame)) / 255.0 * 10.0
-                r.motion_timeline[time_ms] = motion_mag
+                try:
+                    flow = cv2.calcOpticalFlowFarneback(
+                        prev_gray_small, gray_small, None,
+                        0.5,   # pyr_scale
+                        2,     # levels  (was default 3 — fewer = faster)
+                        13,    # winsize (smaller = faster, less smoothing)
+                        2,     # iterations
+                        5,     # poly_n
+                        1.1,   # poly_sigma
+                        0,     # flags
+                    )
+                    fx = flow[..., 0]
+                    fy = flow[..., 1]
+                    # Camera-motion compensation: subtract median flow
+                    fx = fx - float(np.median(fx))
+                    fy = fy - float(np.median(fy))
+                    mag = np.sqrt(fx * fx + fy * fy)
+                    mean_mag = float(np.mean(mag))
+                    # Scale to roughly match the legacy motion_timeline units
+                    # so downstream thresholds (e.g. motion_hotspot intensity
+                    # gate of 0.01) remain meaningful.
+                    motion_mag = mean_mag * 5.0
+                    r.motion_timeline[time_ms] = motion_mag
 
-                # Vectorized motion hotspot: reshape into grid, sum each cell
-                grid_rows, grid_cols = 3, 6
-                cell_h = det_h // grid_rows
-                cell_w = det_w // grid_cols
-                # Crop to exact grid size
-                cropped_diff = diff_frame[:cell_h * grid_rows, :cell_w * grid_cols]
-                # Reshape into (grid_rows, cell_h, grid_cols, cell_w) and mean over cells
-                grid = cropped_diff.reshape(grid_rows, cell_h, grid_cols, cell_w)
-                cell_means = grid.mean(axis=(1, 3))  # (grid_rows, grid_cols)
-                best_idx = np.argmax(cell_means)
-                best_gy, best_gx = divmod(best_idx, grid_cols)
-                best_intensity = float(cell_means[best_gy, best_gx])
+                    total_mag = float(mag.sum())
+                    flow_h, flow_w = mag.shape
+                    if total_mag > 0.5:
+                        gy_idx, gx_idx = np.mgrid[0:flow_h, 0:flow_w]
+                        centroid_x_small = float(np.sum(gx_idx * mag)) / total_mag
+                        centroid_y_small = float(np.sum(gy_idx * mag)) / total_mag
+                    else:
+                        centroid_x_small = flow_w / 2.0
+                        centroid_y_small = flow_h / 2.0
+                    centroid_cx = int(centroid_x_small / det_scale)
+                    centroid_cy = int(centroid_y_small / det_scale)
+                    # Intensity ~ peak flow magnitude, normalised so 1.0 ≈
+                    # large displacement. Capped to match legacy 0–1 range.
+                    best_intensity = float(min(1.0, np.percentile(mag, 99) / 10.0))
+                except Exception:
+                    # Fallback to legacy frame-diff path
+                    diff_frame = cv2.absdiff(prev_gray_small, gray_small)
+                    motion_mag = float(np.mean(diff_frame)) / 255.0 * 10.0
+                    r.motion_timeline[time_ms] = motion_mag
+                    grid_rows, grid_cols = 3, 6
+                    cell_h = det_h // grid_rows
+                    cell_w = det_w // grid_cols
+                    cropped_diff = diff_frame[:cell_h * grid_rows, :cell_w * grid_cols]
+                    grid = cropped_diff.reshape(grid_rows, cell_h, grid_cols, cell_w)
+                    cell_means = grid.mean(axis=(1, 3))
+                    best_idx = np.argmax(cell_means)
+                    best_gy, best_gx = divmod(best_idx, grid_cols)
+                    best_intensity = float(cell_means[best_gy, best_gx]) / 255.0
+                    total_motion = float(cell_means.sum())
+                    if total_motion > 0.1:
+                        gy_indices, gx_indices = np.mgrid[0:grid_rows, 0:grid_cols]
+                        centroid_gx = float(np.sum(gx_indices * cell_means)) / total_motion
+                        centroid_gy = float(np.sum(gy_indices * cell_means)) / total_motion
+                        centroid_cx = int((centroid_gx + 0.5) * cell_w / det_scale)
+                        centroid_cy = int((centroid_gy + 0.5) * cell_h / det_scale)
+                    else:
+                        centroid_cx = int((best_gx + 0.5) * cell_w / det_scale)
+                        centroid_cy = int((best_gy + 0.5) * cell_h / det_scale)
 
-                # Weighted centroid — center of mass of all motion, not just argmax.
-                # More stable than argmax for distributed motion (e.g. camera pan).
-                total_motion = float(cell_means.sum())
-                if total_motion > 0.1:
-                    gy_indices, gx_indices = np.mgrid[0:grid_rows, 0:grid_cols]
-                    centroid_gx = float(np.sum(gx_indices * cell_means)) / total_motion
-                    centroid_gy = float(np.sum(gy_indices * cell_means)) / total_motion
-                    centroid_cx = int((centroid_gx + 0.5) * cell_w / det_scale)
-                    centroid_cy = int((centroid_gy + 0.5) * cell_h / det_scale)
-                else:
-                    centroid_cx = int((best_gx + 0.5) * cell_w / det_scale)
-                    centroid_cy = int((best_gy + 0.5) * cell_h / det_scale)
-
-                # EMA smooth the hotspot to prevent frame-to-frame jumping
-                # Dynamic alpha: high motion = more responsive tracking
+                # EMA smooth the hotspot to prevent frame-to-frame jumping.
+                # Dynamic alpha: high motion = more responsive tracking.
                 raw_cx = centroid_cx
                 raw_cy = centroid_cy
-                motion_intensity = best_intensity / 255.0
-                alpha_hs = min(0.7, 0.25 + motion_intensity * 0.8)  # 0.25–0.70
+                alpha_hs = min(0.7, 0.25 + best_intensity * 0.8)  # 0.25–0.70
                 if hasattr(self, '_prev_hotspot_cx') and self._prev_hotspot_cx is not None:
                     raw_cx = int(alpha_hs * centroid_cx + (1 - alpha_hs) * self._prev_hotspot_cx)
                     raw_cy = int(alpha_hs * centroid_cy + (1 - alpha_hs) * self._prev_hotspot_cy)
@@ -343,7 +399,7 @@ class Perceiver:
                 r.motion_hotspot[time_ms] = {
                     'cx': raw_cx,
                     'cy': raw_cy,
-                    'intensity': round(best_intensity / 255.0, 4),
+                    'intensity': round(best_intensity, 4),
                 }
 
             # ── Non-face subject tracking (YOLO-World + saliency) ──
@@ -414,6 +470,41 @@ class Perceiver:
                         sh = sal_map.shape[0]
                         sal_map[int(sh * 0.85):, :] *= 0.1   # bottom 15%
                         sal_map[:int(sh * 0.05), :] *= 0.3   # top 5%
+                        # ── Mouth-motion bias ──
+                        # Saliency only fires when no face is detected this
+                        # frame, but the speaker may have been visible 200–
+                        # 1500ms ago (head turn, blink, brief occlusion).
+                        # Add a time-decaying Gaussian bump at the last
+                        # known dominant-speaker position so the no-face
+                        # fallback in the planner still tracks the speaker
+                        # rather than wandering to a high-contrast logo.
+                        rec_t = getattr(self, '_recent_speaker_time_ms', -10000)
+                        gap_ms = time_ms - rec_t
+                        DECAY_WINDOW_MS = 2000
+                        if 0 < gap_ms < DECAY_WINDOW_MS:
+                            decay = 1.0 - (gap_ms / DECAY_WINDOW_MS)
+                            sp_strength = float(getattr(
+                                self, '_recent_speaker_strength', 0.0))
+                            sp_cx = int(getattr(self, '_recent_speaker_cx', 0))
+                            sp_cy = int(getattr(self, '_recent_speaker_cy', 0))
+                            sp_x_sal = int(sp_cx / max(1, r.src_w) * sal_size)
+                            sp_y_sal = int(sp_cy / max(1, r.src_h) * sal_size)
+                            sp_x_sal = max(0, min(sal_size - 1, sp_x_sal))
+                            sp_y_sal = max(0, min(sal_size - 1, sp_y_sal))
+                            yy, xx = np.mgrid[0:sal_size, 0:sal_size]
+                            sigma = sal_size * 0.10
+                            bump = np.exp(
+                                -((xx - sp_x_sal) ** 2 + (yy - sp_y_sal) ** 2)
+                                / (2.0 * sigma * sigma)
+                            ).astype(np.float32)
+                            # Max contribution: 0.5 (when fresh + strong),
+                            # scaled by decay × strength so a faint cached
+                            # signal never dominates real saliency peaks.
+                            bump *= float(decay * min(1.0, sp_strength) * 0.5)
+                            sal_map = sal_map + bump
+                            sal_max2 = sal_map.max()
+                            if sal_max2 > 0:
+                                sal_map /= sal_max2
                         # Find peak saliency location
                         peak_idx = np.argmax(sal_map)
                         peak_y, peak_x = divmod(peak_idx, sal_size)
