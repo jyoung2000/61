@@ -727,7 +727,7 @@ class AudioIntelligence:
         the list of clean gap-fill segment dicts ready to merge into
         the main ``segments`` list.
         """
-        min_gap = float(getattr(settings, "WHISPER_GAP_FILL_MIN_SEC", 1.5))
+        min_gap = float(getattr(settings, "WHISPER_GAP_FILL_MIN_SEC", 3.0))
         gap_ns_thresh = float(getattr(
             settings, "WHISPER_GAP_FILL_NO_SPEECH_THRESHOLD", 0.25))
 

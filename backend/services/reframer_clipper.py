@@ -20,6 +20,7 @@ Usage:
     from clipai_clipper import ClipExtractor, ClipperConfig
 """
 
+import concurrent.futures as _cf
 import json
 import logging
 import math
@@ -1047,29 +1048,46 @@ class ReplicateDiscoveryV3:
             n_to_process, len(chunks), self.model_id,
         )
 
-        # ── Step 3: coarse pass ──
+        # ── Step 3: coarse pass (parallel — chunks are independent) ──
+        # Cap at 3 workers: Replicate queues requests server-side, so more
+        # than 3 simultaneous uploads rarely helps and risks rate-limiting.
+        _MAX_CHUNK_WORKERS = 3
         all_candidates: List[ClipCandidate] = []
-        for idx, (chunk_idx, start_s, end_s, sig_score) in enumerate(selected):
-            if on_progress:
-                # Reserve last 25% for refinement / keyframe analysis
-                on_progress((idx / max(1, n_to_process)) * 0.75)
+        _coarse_lock = threading.Lock()
+        _coarse_done = [0]
 
-            candidates = self._coarse_pass_chunk(
+        def _dispatch_chunk(args):
+            idx, chunk_idx, start_s, end_s, sig_score = args
+            return self._coarse_pass_chunk(
                 replicate_sdk, model_ref, video_path, signal_timeline,
                 transcript_segments, start_s, end_s, sig_score,
                 preferred_subjects, avoid_subjects, platforms,
                 min_dur_s, max_dur_s, ideal_dur_s, discovery_prompt,
-                # ``idx`` is the position inside the selected batch
-                # (1..n_to_process). The previous version passed
-                # ``chunk_idx`` (the chunk's position in the full timeline,
-                # e.g. 1..11) which produced nonsensical log lines like
-                # "coarse pass chunk 9/6" once the top-N selection skipped
-                # earlier chunks. Pass the timeline position separately so
-                # both numbers stay visible without breaking the ratio.
                 chunk_idx=idx + 1, n_total=n_to_process,
                 timeline_idx=chunk_idx + 1, n_timeline=len(chunks),
             )
-            all_candidates.extend(candidates)
+
+        chunk_args = [
+            (idx, chunk_idx, start_s, end_s, sig_score)
+            for idx, (chunk_idx, start_s, end_s, sig_score) in enumerate(selected)
+        ]
+
+        if on_progress:
+            on_progress(0.0)
+
+        with _cf.ThreadPoolExecutor(max_workers=min(n_to_process, _MAX_CHUNK_WORKERS)) as _executor:
+            _futures = {_executor.submit(_dispatch_chunk, args): args for args in chunk_args}
+            for _fut in _cf.as_completed(_futures):
+                try:
+                    _chunk_candidates = _fut.result()
+                    all_candidates.extend(_chunk_candidates)
+                except Exception as _e:
+                    logger.warning("VideoLLaMA3-V3: chunk dispatch raised: %s", _e)
+                with _coarse_lock:
+                    _coarse_done[0] += 1
+                    _done = _coarse_done[0]
+                if on_progress:
+                    on_progress((_done / max(1, n_to_process)) * 0.75)
 
         coarse_count = len(all_candidates)
 
@@ -3259,56 +3277,92 @@ class ClipExtractor:
                              on_progress: Callable = None):
         """Send each candidate to the cloud judge for scoring.
 
-        Two safety nets guard against a slow / down LLM endpoint silently
-        stalling the pipeline for 20 + minutes (the previous failure mode:
-        45 s urlopen timeout × ~30 candidates):
-
+        Safety nets:
         * Per-candidate exception wrap so one bad call can't kill the loop.
-        * Circuit breaker: after ``MAX_CONSECUTIVE_FAILURES`` judge errors
-          in a row, give up — the remaining candidates fall back to their
-          signal-only composite score, which is exactly what happens when
-          the judge isn't configured at all, so downstream code is fine.
-        * Total time budget: cap at ``BUDGET_S`` seconds regardless of
-          progress. Stops the worst-case stall at a few minutes instead of
-          ``45 s × n_candidates``.
+        * Circuit breaker: if total failures >= MAX_TOTAL_FAILURES, cancel
+          remaining futures — remaining clips fall back to signal-only scores.
+        * Total time budget: BUDGET_S — caps worst-case stall time.
+        * Concurrency cap (MAX_JUDGE_WORKERS) acts as a soft rate-limiter;
+          replaces the old sequential 0.5s sleep between calls.
         """
         total = len(candidates)
-        MAX_CONSECUTIVE_FAILURES = 3
-        BUDGET_S = 240  # 4 minutes — generous for a healthy LLM, hard cap for a sick one
-        consecutive_failures = 0
+        MAX_JUDGE_WORKERS = 5
+        MAX_TOTAL_FAILURES = 3
+        BUDGET_S = 240
         loop_start = _time.monotonic()
-        for idx, c in enumerate(candidates):
-            elapsed = _time.monotonic() - loop_start
-            if elapsed > BUDGET_S:
-                logger.warning(
-                    "Editorial judge time budget exceeded (%ds) after "
-                    "%d/%d candidates — remaining clips will use "
-                    "signal-only scores", int(elapsed), idx, total)
-                break
+        failure_lock = threading.Lock()
+        failure_count = [0]
+        done_count = [0]
 
-            if on_progress:
-                on_progress(idx / max(1, total))
+        def _judge_one(args):
+            idx, c = args
+            with failure_lock:
+                if failure_count[0] >= MAX_TOTAL_FAILURES:
+                    return idx, c, None  # circuit breaker tripped
+            if _time.monotonic() - loop_start > BUDGET_S:
+                return idx, c, None  # time budget exhausted
 
-            # Extract keyframes from the video for the judge
             keyframes = _extract_keyframes_b64(
                 self.video_path, c.start_s, c.end_s, n_frames=4)
-
             signal_summary = (
                 f"signal_score={c.signal_score:.3f}, "
                 f"source={c.source}, "
                 f"duration={c.duration_s:.0f}s"
             )
-
             try:
                 result = judge.judge(
                     c, c.transcript_slice, keyframes, signal_summary,
                     self.config.preferred_subjects, self.config.avoid_subjects)
             except Exception as e:
-                logger.warning(f"Editorial judge raised on candidate {idx}: {e}")
+                logger.warning("Editorial judge raised on candidate %d: %s", idx, e)
                 result = {"error": str(e)}
 
-            if 'error' not in result:
-                consecutive_failures = 0
+            with failure_lock:
+                if 'error' in result:
+                    failure_count[0] += 1
+                else:
+                    failure_count[0] = 0  # reset on success
+            return idx, c, result
+
+        with _cf.ThreadPoolExecutor(max_workers=MAX_JUDGE_WORKERS) as executor:
+            futures = {
+                executor.submit(_judge_one, (idx, c)): idx
+                for idx, c in enumerate(candidates)
+            }
+            for fut in _cf.as_completed(futures):
+                with failure_lock:
+                    _done = done_count[0] = done_count[0] + 1
+                    _failures = failure_count[0]
+                if on_progress:
+                    on_progress(_done / max(1, total))
+
+                if _failures >= MAX_TOTAL_FAILURES:
+                    logger.warning(
+                        "Editorial judge: %d total failures — cancelling "
+                        "remaining candidates, falling back to signal-only scores",
+                        _failures)
+                    for pending in futures:
+                        pending.cancel()
+                    break
+
+                elapsed = _time.monotonic() - loop_start
+                if elapsed > BUDGET_S:
+                    logger.warning(
+                        "Editorial judge time budget exceeded (%ds) after "
+                        "%d/%d candidates — cancelling remainder",
+                        int(elapsed), _done, total)
+                    for pending in futures:
+                        pending.cancel()
+                    break
+
+                try:
+                    idx, c, result = fut.result()
+                except Exception:
+                    continue
+
+                if result is None or 'error' in result:
+                    continue
+
                 c.judge_scores = {
                     k: result.get(k, 0)
                     for k in ['hook', 'payoff', 'retention',
@@ -3317,7 +3371,6 @@ class ClipExtractor:
                 c.judge_verdict = result.get('verdict', 'keep')
                 c.judge_title = result.get('title', '')
 
-                # Update composite score with judge input
                 if c.judge_scores:
                     judge_avg = sum(
                         v for v in c.judge_scores.values()
@@ -3328,7 +3381,6 @@ class ClipExtractor:
                         0.6 * (judge_avg / 10.0)
                     )
 
-                # Apply trim suggestion
                 trim = result.get('trim_suggestion', '')
                 if trim and c.judge_verdict == 'trim':
                     try:
@@ -3342,18 +3394,6 @@ class ClipExtractor:
                                 c.duration_s = new_end - new_start
                     except Exception:
                         pass
-            else:
-                consecutive_failures += 1
-                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                    logger.warning(
-                        "Editorial judge failed %d consecutive times "
-                        "(last error: %s) — aborting remaining %d "
-                        "candidates, falling back to signal-only scores",
-                        consecutive_failures, result.get('error', '?'),
-                        max(0, total - idx - 1))
-                    break
-
-            _time.sleep(0.5)  # rate limiting
 
         if on_progress:
             on_progress(1.0)
