@@ -491,6 +491,47 @@ async def fetch_openrouter_model_caps():
         logger.warning("OpenRouter model capability fetch failed at startup (non-fatal): %s", e)
 
 @app.on_event("startup")
+async def recover_orphaned_jobs():
+    """Mark jobs that were running when the server last shut down as failed.
+
+    Pipeline worker threads do not survive a process restart.  Any job whose
+    status is still an in-progress value will never advance on its own — mark
+    it failed immediately so the UI shows a clear error instead of an eternal
+    spinner, and so re-analysis can be triggered straight away.
+    """
+    import backend.database as _db
+
+    _IN_PROGRESS = {
+        "analyzing_scenes",
+        "extracting_frames",
+        "generating_summary",
+        "detecting_clips",
+    }
+    try:
+        all_jobs = await _db.list_jobs(include_unowned=True)
+        recovered = 0
+        for job in all_jobs:
+            if job.status in _IN_PROGRESS:
+                await _db.update_job_status(
+                    job.job_id,
+                    status="failed",
+                    progress=0,
+                    progress_message=(
+                        "Analysis interrupted by server restart — please re-analyse"
+                    ),
+                )
+                logger.warning(
+                    "Startup recovery: job %s was stuck in '%s' — marked failed",
+                    job.job_id, job.status,
+                )
+                recovered += 1
+        if recovered:
+            logger.info("Startup recovery: %d orphaned job(s) marked failed", recovered)
+    except Exception as exc:
+        logger.warning("Orphaned job recovery failed (non-fatal): %s", exc)
+
+
+@app.on_event("startup")
 async def recover_uploads():
     """Recover in-progress chunked upload sessions from disk after restart."""
     from backend.routers.chunked_upload import restore_sessions

@@ -358,7 +358,16 @@ _migrate_stale_whisper()
 # Short-lived cache for /api/providers/status (avoid hammering Ollama on rapid re-renders)
 _status_cache: dict = {}
 _status_cache_ts: float = 0
-_STATUS_CACHE_TTL = 5  # seconds
+_STATUS_CACHE_TTL = 30  # seconds
+
+# Separate long-lived cache for the VideoLLaMA2 VRAM availability check.
+# The check runs torch.cuda.mem_get_info() which is cheap, but logs at INFO
+# on every failure — on a permanently undersized GPU this floods logs every
+# few seconds.  Cache the result for 5 minutes so the log line appears at
+# most once per restart window instead of hundreds of times per hour.
+_vl2_cache_ts: float = 0.0
+_vl2_cache_result: bool = False
+_VL2_CHECK_TTL = 300.0  # seconds (5 minutes)
 
 # Env var names per provider
 _PROVIDER_KEY_ENV = {
@@ -491,6 +500,22 @@ def _key_is_set(key: str) -> bool:
 
 
 def _check_videollama2_available() -> bool:
+    """Cached wrapper around the VideoLLaMA2 availability probe.
+
+    Result is memoised for _VL2_CHECK_TTL seconds so a permanently undersized
+    GPU (e.g. GTX 1650 with 4 GB) does not flood logs every few seconds.
+    """
+    global _vl2_cache_ts, _vl2_cache_result
+    now = time.time()
+    if now - _vl2_cache_ts < _VL2_CHECK_TTL:
+        return _vl2_cache_result
+    result = _check_videollama2_uncached()
+    _vl2_cache_ts = now
+    _vl2_cache_result = result
+    return result
+
+
+def _check_videollama2_uncached() -> bool:
     """True when VideoLLaMA2 can actually run, and logs why when it can't.
 
     Requires a CUDA GPU with ~10GB free VRAM and the ``videollama2`` package
