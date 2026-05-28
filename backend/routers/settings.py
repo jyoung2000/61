@@ -194,6 +194,14 @@ def _persist_user_settings() -> bool:
         elif key in skipped_keys:
             logger.debug("Persisting %s: NO (empty in memory and file)", key)
 
+    # Preserve extra backup keys (e.g. _judge_primary / _judge_fallback) so
+    # that an unrelated settings save doesn't silently wipe the backups that
+    # put_judge_config wrote.  Only keys that start with "_" and are not in
+    # _PERSISTABLE_KEYS are preserved — they are owned by other writers.
+    for k, v in existing_data.items():
+        if k not in _PERSISTABLE_KEYS and k.startswith("_") and k not in data:
+            data[k] = v
+
     try:
         os.makedirs(os.path.dirname(USER_SETTINGS_PATH), exist_ok=True)
         with open(USER_SETTINGS_PATH, "w") as f:
@@ -3603,6 +3611,31 @@ async def put_judge_config(req: JudgeConfigRequest):
     if req.fallback is not None:
         updates["judge_fallback"] = req.fallback.strip()
     cfg = _write_clipper_config_fields(updates)
+
+    # Back up judge specs to user_settings.json so they survive any scenario
+    # where clipper_config.json is lost (stale volume, first-time mount, etc.).
+    # A startup handler reads these back and restores clipper_config.json.
+    try:
+        existing_us: dict = {}
+        if os.path.exists(USER_SETTINGS_PATH):
+            with open(USER_SETTINGS_PATH, "r") as _f:
+                existing_us = json.load(_f)
+        changed_us = False
+        if req.primary is not None:
+            existing_us["_judge_primary"] = req.primary.strip()
+            changed_us = True
+        if req.fallback is not None:
+            existing_us["_judge_fallback"] = req.fallback.strip()
+            changed_us = True
+        if changed_us:
+            tmp_us = USER_SETTINGS_PATH + ".tmp"
+            os.makedirs(os.path.dirname(USER_SETTINGS_PATH), exist_ok=True)
+            with open(tmp_us, "w") as _f:
+                json.dump(existing_us, _f, indent=2)
+            os.replace(tmp_us, USER_SETTINGS_PATH)
+    except Exception as _e:
+        logger.warning("Failed to back up judge specs to user_settings.json: %s", _e)
+
     return {
         "primary": cfg.get("judge_primary", "") or "",
         "fallback": cfg.get("judge_fallback", "") or "",

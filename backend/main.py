@@ -491,6 +491,47 @@ async def fetch_openrouter_model_caps():
         logger.warning("OpenRouter model capability fetch failed at startup (non-fatal): %s", e)
 
 @app.on_event("startup")
+async def restore_judge_specs():
+    """Recover judge primary/fallback specs from user_settings.json into clipper_config.json.
+
+    put_judge_config() writes a backup of the judge specs to user_settings.json
+    under the keys ``_judge_primary`` and ``_judge_fallback``.  On every boot
+    this handler reads those backups and writes them back into clipper_config.json
+    if that file is missing the fields — covering the case where a fresh container
+    start, a volume hiccup, or a first-time deployment leaves clipper_config.json
+    at its default (empty judge fields) while user_settings.json retains the
+    user's last-saved specs.
+    """
+    try:
+        import json as _json
+        from backend.routers.settings import (
+            USER_SETTINGS_PATH,
+            _read_clipper_config,  # type: ignore[attr-defined]
+            _write_clipper_config_fields,  # type: ignore[attr-defined]
+        )
+
+        if not os.path.exists(USER_SETTINGS_PATH):
+            return
+        with open(USER_SETTINGS_PATH) as _f:
+            user_data = _json.load(_f)
+        j_primary = user_data.get("_judge_primary", "")
+        j_fallback = user_data.get("_judge_fallback", "")
+        if not j_primary and not j_fallback:
+            return  # nothing backed up — nothing to restore
+        cfg = _read_clipper_config()
+        updates: dict = {}
+        if j_primary and not cfg.get("judge_primary"):
+            updates["judge_primary"] = j_primary
+        if j_fallback and not cfg.get("judge_fallback"):
+            updates["judge_fallback"] = j_fallback
+        if updates:
+            _write_clipper_config_fields(updates)
+            logger.info("Restored judge specs from user_settings.json backup: %s", updates)
+    except Exception as exc:
+        logger.warning("Judge spec restore failed (non-fatal): %s", exc)
+
+
+@app.on_event("startup")
 async def recover_orphaned_jobs():
     """Mark jobs that were running when the server last shut down as failed.
 

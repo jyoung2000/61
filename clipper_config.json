@@ -9,6 +9,8 @@
   "google_ai_model": "gemini-2.0-flash",
   "openrouter_key": "",
   "openrouter_model": "google/gemini-3-flash-preview",
+  "judge_primary": "",
+  "judge_fallback": "",
   "platforms": ["tiktok", "reels", "shorts"],
   "max_clips": 0,
   "min_duration_s": 60,
