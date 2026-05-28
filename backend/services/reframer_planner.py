@@ -1538,7 +1538,7 @@ class Planner:
                 #    bright subjects on dark backgrounds.
                 if subject_x is None:
                     sal = self.p.saliency_hotspot.get(t)
-                    if sal and sal['intensity'] > 0.15:
+                    if sal and sal['intensity'] > 0.10:
                         subject_x = clamp_x(sal['cx'] - self.crop_w // 2, self.max_x)
                         subject_source = 'saliency'
                         subject_cx = sal['cx']
@@ -1639,21 +1639,33 @@ class Planner:
             # ════════════════════════════════════════════════════════════════
 
             # ── Human-editor-style thresholds ──
-            # Live-action: smaller lock zone so face corrections are applied.
+            # Live-action: small lock zone (8%) so face corrections are applied quickly.
+            # The code comment previously said "< 8% → hold still" but used 15%;
+            # this aligns implementation with documentation.
             # Animated: wider lock zone for stability (less critical to center faces).
             if self.is_live_action:
-                lock_threshold = max(12, int(self.crop_w * 0.15))   # 15% = hold unless face moves significantly
+                lock_threshold = max(8, int(self.crop_w * 0.08))    # 8% = responsive face tracking
             else:
-                lock_threshold = max(12, int(self.crop_w * 0.20))   # 20% = stable for non-face
+                lock_threshold = max(12, int(self.crop_w * 0.20))   # 20% = stable for animated
 
-            # ── Low-pass EMA on target position ──
+            # ── Velocity-adaptive EMA on target position ──
+            # When the face is far from the current crop center, use a higher alpha
+            # to snap quickly. When already close, use a low alpha for smooth panning.
+            # This prevents the crop from lagging a second behind a fast-moving subject
+            # while still looking smooth during small adjustments.
             if not switching:
                 if not hasattr(self, '_ema_target'):
                     self._ema_target = target_x
                 else:
-                    # Live-action: faster EMA to track face movement.
-                    # Animated: slower EMA for smooth panning.
-                    ema_alpha = 0.30 if self.is_live_action else 0.25
+                    ema_center_now = self._ema_target + self.crop_w // 2
+                    target_center  = target_x       + self.crop_w // 2
+                    dist_pct = abs(target_center - ema_center_now) / max(1, self.crop_w)
+                    if dist_pct > 0.30:
+                        ema_alpha = 0.55   # far: snap quickly
+                    elif dist_pct > 0.15:
+                        ema_alpha = 0.40   # moderate: track steadily
+                    else:
+                        ema_alpha = 0.25 if not self.is_live_action else 0.30  # close: smooth
                     self._ema_target = clamp_x(
                         int(ema_alpha * target_x + (1 - ema_alpha) * self._ema_target),
                         self.max_x)
@@ -1696,10 +1708,13 @@ class Planner:
                 # eval would mark off-center. Reference used 0.28/0.30
                 # which left a 12 % dead-band where the eval failed but
                 # the planner did nothing.
-                trigger_pct = 0.18
+                # Fire at 12% off-center (tightened from 18%) to close the dead-band
+                # between the 8% lock zone and the centering trigger. 5 iterations
+                # at blend=0.70 close 99.9% of the gap vs 97% at 3 iterations.
+                trigger_pct = 0.12
                 trigger_offset = int(self.crop_w * trigger_pct)
                 blend = 0.70  # per-iteration pull
-                max_iters = 3
+                max_iters = 5
 
                 # If the face is FULLY OUTSIDE the post-EMA crop, no
                 # amount of blend at 0.70 will pull it back inside in
