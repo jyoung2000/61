@@ -75,6 +75,7 @@ def generate_vtt(
     video_width: int = 1920,
     video_height: int = 1080,
     enforce_readability_rules: Optional[bool] = None,
+    include_timestamps_in_text: bool = False,
 ) -> str:
     """Convert transcript segments to WebVTT format.
 
@@ -120,6 +121,9 @@ def generate_vtt(
         # Render multi-line text with literal newlines — WebVTT supports
         # arbitrary line breaks inside a cue.
         body = _escape_text(text)
+        if include_timestamps_in_text:
+            from backend.services.srt_generator import inline_timestamp
+            body = f"{inline_timestamp(seg.start)} {body}"
         if include_speakers and seg.speaker:
             body = f"<v {seg.speaker}>{body}"
         timing = f"{start} --> {end}"

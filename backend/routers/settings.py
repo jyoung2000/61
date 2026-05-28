@@ -9,7 +9,7 @@ import time
 import uuid
 
 import httpx
-from fastapi import APIRouter, File, Request, UploadFile, Form
+from fastapi import APIRouter, File, HTTPException, Request, UploadFile, Form
 from pydantic import BaseModel
 
 from typing import Optional
@@ -66,9 +66,19 @@ _PERSISTABLE_KEYS = [
     "VIDEOLLAMA3_REFINEMENT_PASS", "VIDEOLLAMA3_KEYFRAME_ANALYSIS",
     "VIDEOLLAMA3_AUDIO_ANNOTATION", "VIDEOLLAMA3_ADAPTIVE_CHUNKS",
     "VIDEOLLAMA3_CHUNK_MIN_S", "VIDEOLLAMA3_CHUNK_MAX_S",
+    # Custom vocabulary (Whisper biasing) toggle. The term list itself
+    # lives in /data/logs/custom_vocabulary.json (mount-backed); only the
+    # enable flag rides user_settings.json.
+    "CUSTOM_VOCABULARY_ENABLED",
     # Transcript polishing toggles.
     "TRANSCRIPT_POLISHING_ENABLED", "TRANSCRIPT_POLISHING_BATCH_SIZE",
     "TRANSCRIPT_FILLER_REMOVAL", "TRANSCRIPT_SENTENCE_REPAIR",
+    # Sentence-aware resegmentation toggle.
+    "SENTENCE_SEGMENTATION_ENABLED",
+    # Voiceprint registry (cross-job speaker naming). The registry itself
+    # lives in /data/logs/voiceprints.json (mount-backed); only these knobs
+    # ride user_settings.json.
+    "VOICEPRINT_ENABLED", "VOICEPRINT_MATCH_THRESHOLD",
     # Subtitle readability + safe-zone toggles.
     "SUBTITLE_CPS_ENFORCEMENT", "SUBTITLE_MAX_CPS", "SUBTITLE_MAX_CHARS_PER_LINE",
     "SUBTITLE_MIN_DURATION_MS", "SUBTITLE_MAX_DURATION_MS",
@@ -2118,6 +2128,8 @@ class SaveTranscriptionSettingsRequest(BaseModel):
     gap_fill_enabled: Optional[bool] = None
     gap_fill_min_sec: Optional[float] = None          # 0.5-10.0
     gap_fill_no_speech_threshold: Optional[float] = None  # 0.0-1.0
+    # Sentence-aware resegmentation toggle (Task 4).
+    sentence_segmentation_enabled: Optional[bool] = None
 
 
 @router.get("/transcription/settings")
@@ -2136,6 +2148,8 @@ async def get_transcription_settings():
             settings, "WHISPER_GAP_FILL_MIN_SEC", 1.5)),
         "gap_fill_no_speech_threshold": float(getattr(
             settings, "WHISPER_GAP_FILL_NO_SPEECH_THRESHOLD", 0.25)),
+        "sentence_segmentation_enabled": bool(getattr(
+            settings, "SENTENCE_SEGMENTATION_ENABLED", True)),
     }
 
 
@@ -2186,6 +2200,9 @@ async def save_transcription_settings(req: SaveTranscriptionSettingsRequest):
             _upsert_env_var(env_path, "WHISPER_GAP_FILL_NO_SPEECH_THRESHOLD",
                             str(clamped))
 
+    if req.sentence_segmentation_enabled is not None:
+        settings.SENTENCE_SEGMENTATION_ENABLED = bool(req.sentence_segmentation_enabled)
+
     _invalidate_status_cache()
     _persist_user_settings()
     return {
@@ -2201,7 +2218,108 @@ async def save_transcription_settings(req: SaveTranscriptionSettingsRequest):
             settings, "WHISPER_GAP_FILL_MIN_SEC", 1.5)),
         "gap_fill_no_speech_threshold": float(getattr(
             settings, "WHISPER_GAP_FILL_NO_SPEECH_THRESHOLD", 0.25)),
+        "sentence_segmentation_enabled": bool(getattr(
+            settings, "SENTENCE_SEGMENTATION_ENABLED", True)),
     }
+
+
+# ── Custom Vocabulary (Whisper biasing) ──────────────────────────
+
+class SaveVocabularyRequest(BaseModel):
+    terms: Optional[list[str]] = None
+    enabled: Optional[bool] = None
+
+
+@router.get("/settings/vocabulary")
+async def get_vocabulary():
+    """Return the persisted custom-vocabulary glossary + enable flag."""
+    from backend.services.custom_vocabulary import load_vocabulary, MAX_TERMS
+    terms = load_vocabulary()
+    return {
+        "terms": terms,
+        "enabled": bool(getattr(settings, "CUSTOM_VOCABULARY_ENABLED", True)),
+        "count": len(terms),
+        "max": MAX_TERMS,
+    }
+
+
+@router.put("/settings/vocabulary")
+async def put_vocabulary(req: SaveVocabularyRequest):
+    """Validate + persist the custom-vocabulary glossary and enable flag.
+
+    The term list is written to /data/logs/custom_vocabulary.json
+    (mount-backed); the enable flag is persisted to user_settings.json.
+    """
+    from backend.services.custom_vocabulary import (
+        load_vocabulary, save_vocabulary, MAX_TERMS,
+    )
+    if req.terms is not None:
+        terms = save_vocabulary(req.terms)
+    else:
+        terms = load_vocabulary()
+    if req.enabled is not None:
+        settings.CUSTOM_VOCABULARY_ENABLED = bool(req.enabled)
+        _persist_user_settings()
+    return {
+        "status": "saved",
+        "terms": terms,
+        "enabled": bool(getattr(settings, "CUSTOM_VOCABULARY_ENABLED", True)),
+        "count": len(terms),
+        "max": MAX_TERMS,
+    }
+
+
+# ── Voiceprint registry (cross-job speaker naming) ───────────────
+
+@router.get("/settings/voiceprints")
+async def get_voiceprints():
+    """List enrolled voiceprints (names, sample counts) for review."""
+    from backend.services.voiceprint_registry import get_registry
+    return {
+        "enabled": bool(getattr(settings, "VOICEPRINT_ENABLED", True)),
+        "match_threshold": float(getattr(settings, "VOICEPRINT_MATCH_THRESHOLD", 0.75)),
+        "voiceprints": get_registry().list_voiceprints(),
+    }
+
+
+class SaveVoiceprintSettingsRequest(BaseModel):
+    enabled: Optional[bool] = None
+    match_threshold: Optional[float] = None
+
+
+@router.put("/settings/voiceprints")
+async def put_voiceprint_settings(req: SaveVoiceprintSettingsRequest):
+    """Toggle the voiceprint registry + tune the cosine match threshold."""
+    if req.enabled is not None:
+        settings.VOICEPRINT_ENABLED = bool(req.enabled)
+    if req.match_threshold is not None:
+        settings.VOICEPRINT_MATCH_THRESHOLD = max(0.0, min(1.0, float(req.match_threshold)))
+    _persist_user_settings()
+    from backend.services.voiceprint_registry import get_registry
+    return {
+        "status": "saved",
+        "enabled": bool(getattr(settings, "VOICEPRINT_ENABLED", True)),
+        "match_threshold": float(getattr(settings, "VOICEPRINT_MATCH_THRESHOLD", 0.75)),
+        "voiceprints": get_registry().list_voiceprints(),
+    }
+
+
+@router.delete("/settings/voiceprints/{voiceprint_id}")
+async def delete_voiceprint(voiceprint_id: str):
+    """Forget a single enrolled voice (privacy)."""
+    from backend.services.voiceprint_registry import get_registry
+    deleted = get_registry().delete(voiceprint_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Voiceprint not found")
+    return {"status": "deleted", "id": voiceprint_id}
+
+
+@router.delete("/settings/voiceprints")
+async def clear_voiceprints():
+    """Forget all enrolled voices (privacy)."""
+    from backend.services.voiceprint_registry import get_registry
+    n = get_registry().clear()
+    return {"status": "cleared", "removed": n}
 
 
 # ── Clip Generation Settings (Primary AI / VideoLLaMA3) ───────────

@@ -241,7 +241,28 @@ def extract_word_timestamps(segments) -> list:
     return words
 
 
-def assign_speakers_heuristic(segments, *args, **kwargs):
+def assign_speakers_from_timeline(segments, speaker_timeline=None, *args, **kwargs):
+    """Real diarization→transcript fusion (was an inert stub).
+
+    Delegates to ``speaker_fusion.assign_speakers_from_timeline``. With an
+    empty timeline the segments are returned unchanged.
+    """
+    try:
+        from backend.services.speaker_fusion import (
+            assign_speakers_from_timeline as _fuse,
+        )
+        return _fuse(segments, speaker_timeline, *args, **kwargs)
+    except Exception as e:  # pragma: no cover — never break the pipeline
+        logger.warning("speaker fusion failed (%s) — segments unchanged", e)
+        return segments
+
+
+def assign_speakers_heuristic(segments, speaker_timeline=None, *args, **kwargs):
+    """Backwards-compatible alias. When a diarization timeline is supplied
+    the real fusion runs; otherwise this is a pass-through (the legacy
+    behaviour, with the mouth-motion heuristic standing as the fallback)."""
+    if speaker_timeline:
+        return assign_speakers_from_timeline(segments, speaker_timeline)
     return segments
 
 

@@ -29,6 +29,27 @@ from backend.config import settings
 logger = logging.getLogger("clipai.reframer_audio")
 
 
+def _vocab_bias_kwargs(transcribe_callable, language: str) -> dict:
+    """Build the custom-vocabulary biasing kwargs for a Whisper transcribe call.
+
+    Delegates to ``custom_vocabulary.whisper_bias_kwargs``, which feature-
+    detects ``hotwords`` support (preferred) and falls back to
+    ``initial_prompt`` otherwise. Returns ``{}`` — preserving the current
+    no-prompt behaviour exactly — when the feature is disabled or the
+    glossary is empty.
+    """
+    try:
+        from backend.services.custom_vocabulary import whisper_bias_kwargs
+        return whisper_bias_kwargs(
+            transcribe_callable,
+            language=language,
+            enabled=bool(getattr(settings, "CUSTOM_VOCABULARY_ENABLED", True)),
+        )
+    except Exception as e:
+        logger.warning("Custom vocabulary biasing skipped (%s)", e)
+        return {}
+
+
 def _cross_validate_segments(segments: list) -> list:
     """Remove cross-segment artefacts the per-segment TACT filter misses.
 
@@ -406,6 +427,7 @@ class AudioIntelligence:
             try:
                 from faster_whisper import BatchedInferencePipeline
                 batched = BatchedInferencePipeline(model=self.engine)
+                _bias = _vocab_bias_kwargs(batched.transcribe, language)
                 segments_iter, info = batched.transcribe(
                     audio_path, batch_size=self._batch_size,
                     language=whisper_lang,
@@ -417,6 +439,7 @@ class AudioIntelligence:
                     word_timestamps=True,
                     condition_on_previous_text=True,
                     no_speech_threshold=_ns_threshold,
+                    **_bias,
                 )
                 log.log_stage('AUDIO',
                     f'Using batched inference (batch=16, beam=5, '
@@ -435,6 +458,7 @@ class AudioIntelligence:
                         'CUDA out of memory — reloading Whisper on CPU')
                     self._reload_on_cpu()
                 log.log_stage('AUDIO', 'Falling back to sequential transcription (slower)')
+                _bias = _vocab_bias_kwargs(self.engine.transcribe, language)
                 segments_iter, info = self.engine.transcribe(
                     audio_path, language=whisper_lang,
                     beam_size=5, vad_filter=True,
@@ -445,6 +469,7 @@ class AudioIntelligence:
                     word_timestamps=True,
                     condition_on_previous_text=True,
                     no_speech_threshold=_ns_threshold,
+                    **_bias,
                 )
 
             duration_sec = float(getattr(info, 'duration', 0)) or duration_ms / 1000

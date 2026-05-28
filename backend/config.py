@@ -181,6 +181,14 @@ class Settings(BaseSettings):
     # inference workspace. Lighter touch than the analysis-start preflight.
     GPU_FREE_BEFORE_WHISPER: bool = True
 
+    # ── Custom Vocabulary (Whisper biasing) — Otter.ai-style accuracy lever ──
+    # When enabled and the user has supplied glossary terms (see
+    # backend/services/custom_vocabulary.py + /data/logs/custom_vocabulary.json),
+    # those terms bias the Whisper decoder so jargon / names / acronyms /
+    # brand terms transcribe correctly at the source. Empty glossary →
+    # nothing is passed and Whisper behaves exactly as before.
+    CUSTOM_VOCABULARY_ENABLED: bool = True
+
     # AI transcript post-correction
     AI_TRANSCRIPT_CORRECTION: bool = True  # Use LLM to fix proper nouns, punctuation, fillers
 
@@ -205,6 +213,14 @@ class Settings(BaseSettings):
     # poorly-segmented source can't loop forever.
     TRANSCRIPT_READABILITY_TARGET: float = 90.0
     TRANSCRIPT_READABILITY_MAX_PASSES: int = 3
+
+    # ── Sentence-aware resegmentation (Task 4) ──
+    # Merge same-speaker neighbours then re-split at sentence boundaries
+    # (using Whisper word timestamps) so transcripts/subtitles break by
+    # sentence instead of by raw VAD window. Runs after speaker fusion and
+    # before the readability pass. When False, the raw segments flow
+    # straight to readability enforcement (the legacy behaviour).
+    SENTENCE_SEGMENTATION_ENABLED: bool = True
 
     # ── Subtitle Readability + Safe Zones ──
     # Enforces Netflix-style CPS / line-length / duration limits and
@@ -238,6 +254,15 @@ class Settings(BaseSettings):
     AUDIO_EVENT_DETECTION: bool = True          # spectral audio event classification
     AUDIO_EVENTS_IN_SUBTITLES: bool = False     # inject [applause], [music] into subtitle track
     AUDIO_MUSIC_DETECTION: bool = True          # detect sustained harmonic content
+
+    # ── Voiceprint registry (Task 3) — Otter.ai-style cross-job naming ──
+    # When enabled, a speaker embedding is extracted per diarized speaker
+    # and matched against a persisted registry (/data/logs/voiceprints.json);
+    # matches auto-apply the stored name. Renaming a speaker enrolls/updates
+    # that voice (running-mean centroid → continuous learning). No-ops
+    # gracefully when the pyannote embedding model / HF_TOKEN are absent.
+    VOICEPRINT_ENABLED: bool = True
+    VOICEPRINT_MATCH_THRESHOLD: float = 0.75  # cosine; conservative on purpose
 
     # Speaker diarization (pyannote)
     DIARIZATION_ENABLED: bool = True  # Use pyannote for real speaker diarization

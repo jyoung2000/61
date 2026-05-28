@@ -462,6 +462,114 @@ async def download_vtt(
     )
 
 
+@router.get("/jobs/{job_id}/subtitles")
+async def download_subtitles(
+    job_id: str,
+    format: str = "srt",
+    speakers: bool = True,
+    timestamps: bool = False,
+    translated: bool = True,
+    target_lang: str = "",
+    order: str = "translation_top",
+    include_position: bool = False,
+    platform: str = "horizontal",
+):
+    """Unified subtitle export with Otter-style toggles.
+
+    ``format``:
+      * ``srt``           — SubRip.
+      * ``vtt``           — WebVTT (web players); honors ``include_position``
+                            + ``platform`` safe-zone cues.
+      * ``bilingual_srt`` — translated + original stacked per cue. Requires
+                            ``target_lang`` and translates on demand via the
+                            NMT path (LLM fallback), matching the existing
+                            router precedence.
+
+    Toggles: ``speakers`` (speaker labels), ``timestamps`` (inline
+    ``[mm:ss]`` in the cue text).
+    """
+    job = await database.load_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    fmt = (format or "srt").strip().lower()
+
+    if fmt == "bilingual_srt":
+        if not job.transcript:
+            raise HTTPException(status_code=404, detail="No transcript available")
+        if not target_lang:
+            raise HTTPException(
+                status_code=400, detail="bilingual_srt requires a target_lang")
+        from backend.services.srt_generator import generate_bilingual_srt
+        source_segments = [
+            TranscriptSegment(**s) if isinstance(s, dict) else s
+            for s in job.transcript
+        ]
+        # Reuse an existing translation when it matches the target language,
+        # otherwise translate on demand via NMT→LLM fallback.
+        translated_segments = None
+        if (getattr(job, "subtitle_language", "") == target_lang
+                and job.translated_transcript):
+            translated_segments = [
+                TranscriptSegment(**s) if isinstance(s, dict) else s
+                for s in job.translated_transcript
+            ]
+        if translated_segments is None:
+            from backend.services.translator import translate_segments_with_fallback
+            from backend.services.ai_orchestrator import AIOrchestrator
+            translated_segments = await translate_segments_with_fallback(
+                source_segments,
+                source_language=(job.language or "en"),
+                target_language=target_lang,
+                orchestrator=AIOrchestrator(),
+            )
+        content = generate_bilingual_srt(
+            source_segments, translated_segments, order=order,
+            include_speakers=speakers, include_timestamps_in_text=timestamps,
+        )
+        media_type = "text/srt; charset=utf-8"
+        ext = f"_bilingual_{target_lang}.srt"
+    else:
+        source = job.transcript
+        lang_suffix = ""
+        if translated and job.translated_transcript and len(job.translated_transcript) > 0:
+            source = job.translated_transcript
+            lang_suffix = "_translated"
+        if not source:
+            raise HTTPException(status_code=404, detail="No transcript available")
+        segments = [
+            TranscriptSegment(**s) if isinstance(s, dict) else s for s in source
+        ]
+        if fmt == "vtt":
+            from backend.services.srt_generator import generate_vtt
+            content = generate_vtt(
+                segments, include_speakers=speakers,
+                include_timestamps_in_text=timestamps,
+                include_position=include_position, platform=platform,
+            )
+            media_type = "text/vtt; charset=utf-8"
+            ext = f"{lang_suffix}.vtt"
+        elif fmt == "srt":
+            content = generate_srt(
+                segments, include_speakers=speakers,
+                include_timestamps_in_text=timestamps,
+            )
+            media_type = "text/srt; charset=utf-8"
+            ext = f"{lang_suffix}.srt"
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported format '{fmt}' (use srt | vtt | bilingual_srt)")
+
+    base = job.filename.rsplit(".", 1)[0] if "." in job.filename else job.filename
+    base = (base or "").strip() or "transcript"
+    return Response(
+        content=content,
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{base}{ext}"'},
+    )
+
+
 @router.delete("/jobs/{job_id}/speakers/{speaker}")
 async def delete_speaker(
     job_id: str,
@@ -560,6 +668,28 @@ async def rename_speakers(job_id: str, req: SpeakerRenameRequest):
         transcript=[s.model_dump() for s in updated_transcript],
         speaker_names=name_map,
     )
+
+    # ── Voiceprint learning loop (Task 3) ──
+    # Capture each renamed speaker's voiceprint and enroll/update the
+    # registry so this voice is auto-named in future jobs. Fully optional:
+    # no-ops silently when the embedding backend / audio are unavailable.
+    try:
+        from backend.services.voiceprint_registry import (
+            enroll_from_segments, locate_job_audio, _voiceprint_enabled,
+        )
+        if _voiceprint_enabled():
+            audio_path = locate_job_audio(job_id)
+            if audio_path:
+                for old_label, new_name in req.speaker_names.items():
+                    spk_segments = [
+                        seg for seg in job.transcript
+                        if (seg.get("speaker") if isinstance(seg, dict)
+                            else getattr(seg, "speaker", None)) == old_label
+                    ]
+                    if spk_segments:
+                        enroll_from_segments(audio_path, spk_segments, new_name)
+    except Exception as _vp_err:
+        logger.warning("Voiceprint enrollment skipped (%s)", _vp_err)
 
     return {
         "job_id": job_id,

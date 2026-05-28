@@ -88,6 +88,43 @@ export default function Settings() {
   });
   const [transSaving, setTransSaving] = useState(false);
 
+  // Custom Vocabulary (Whisper biasing) — Otter.ai-style accuracy lever.
+  const [vocabText, setVocabText] = useState('');
+  const [vocabEnabled, setVocabEnabled] = useState(true);
+  const [vocabSavedText, setVocabSavedText] = useState('');
+  const [vocabSavedEnabled, setVocabSavedEnabled] = useState(true);
+  const [vocabMax, setVocabMax] = useState(300);
+  const [vocabSaving, setVocabSaving] = useState(false);
+  const vocabTerms = vocabText.split('\n').map((t) => t.trim()).filter(Boolean);
+  const vocabDirty = vocabText !== vocabSavedText || vocabEnabled !== vocabSavedEnabled;
+
+  const handleSaveVocabulary = async () => {
+    setVocabSaving(true);
+    try {
+      const res = await fetch('/api/settings/vocabulary', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ terms: vocabTerms, enabled: vocabEnabled }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const joined = (data.terms || []).join('\n');
+        setVocabText(joined);
+        setVocabSavedText(joined);
+        setVocabSavedEnabled(!!data.enabled);
+        setVocabEnabled(!!data.enabled);
+        setVocabMax(data.max ?? 300);
+        showToast('Custom vocabulary saved', 'success');
+      } else {
+        showToast('Failed to save vocabulary', 'error');
+      }
+    } catch (e) {
+      showToast('Failed to save vocabulary', 'error');
+    } finally {
+      setVocabSaving(false);
+    }
+  };
+
   // NOTE: Whisper testing is now in PipelineDiagnostics component
 
   // FFmpeg encoding settings
@@ -249,6 +286,21 @@ export default function Settings() {
         };
         setTransSettings(s);
         setTransSaved(s);
+      })
+      .catch(() => {});
+  }, []);
+
+  // Load Custom Vocabulary (Whisper biasing) glossary.
+  useEffect(() => {
+    fetch('/api/settings/vocabulary')
+      .then((r) => r.json())
+      .then((data) => {
+        const joined = (data.terms || []).join('\n');
+        setVocabText(joined);
+        setVocabSavedText(joined);
+        setVocabEnabled(!!data.enabled);
+        setVocabSavedEnabled(!!data.enabled);
+        setVocabMax(data.max ?? 300);
       })
       .catch(() => {});
   }, []);
@@ -1771,6 +1823,69 @@ export default function Settings() {
                     }}
                   >
                     {transSaving ? 'Saving...' : 'Save Transcription Settings'}
+                  </button>
+                )}
+              </div>
+
+              {/* ── Custom Vocabulary (Whisper biasing) ── */}
+              <div style={{
+                background: 'var(--bg-elevated)', border: '1px solid var(--border)',
+                borderRadius: 'var(--radius-sm)', padding: '12px 14px', marginBottom: 12,
+              }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginBottom: 8 }}>
+                  <div>
+                    <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 2 }}>
+                      Custom Vocabulary
+                    </div>
+                    <div style={{ fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.4 }}>
+                      Bias transcription toward jargon, names, acronyms, and brand terms — one term per line. The single biggest accuracy lever for unfamiliar proper nouns.
+                    </div>
+                  </div>
+                  <div
+                    onClick={() => setVocabEnabled((v) => !v)}
+                    style={{
+                      position: 'relative', width: 44, height: 24, flexShrink: 0, cursor: 'pointer',
+                      borderRadius: 12, transition: 'background 0.2s',
+                      background: vocabEnabled ? 'var(--accent-cyan)' : 'var(--border)',
+                    }}
+                  >
+                    <div style={{
+                      position: 'absolute', top: 3, left: vocabEnabled ? 23 : 3,
+                      width: 18, height: 18, borderRadius: '50%', background: '#fff', transition: 'left 0.2s',
+                    }} />
+                  </div>
+                </div>
+                <textarea
+                  value={vocabText}
+                  onChange={(e) => setVocabText(e.target.value)}
+                  placeholder={'Heero Yuy\nZechs Merquise\nGundam\nmobile suit'}
+                  rows={6}
+                  style={{
+                    width: '100%', boxSizing: 'border-box', resize: 'vertical',
+                    background: 'var(--bg-base)', color: 'var(--text-primary)',
+                    border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)',
+                    padding: '8px 10px', fontSize: 12, fontFamily: 'var(--font-mono)',
+                  }}
+                />
+                <div style={{
+                  display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 6,
+                  fontSize: 11, color: vocabTerms.length > vocabMax ? 'var(--accent-red, #ef4444)' : 'var(--text-muted)',
+                }}>
+                  <span>{vocabTerms.length} / {vocabMax} terms</span>
+                  <span style={{ fontSize: 10 }}>Terms over {vocabMax} or longer than 80 chars are dropped on save.</span>
+                </div>
+                {vocabDirty && (
+                  <button
+                    onClick={handleSaveVocabulary}
+                    disabled={vocabSaving}
+                    style={{
+                      marginTop: 10, padding: '7px 20px',
+                      background: 'var(--accent-cyan)', color: 'var(--bg-base)',
+                      border: 'none', borderRadius: 'var(--radius-sm)', fontSize: 12, fontWeight: 600,
+                      opacity: vocabSaving ? 0.5 : 1, width: '100%', cursor: 'pointer',
+                    }}
+                  >
+                    {vocabSaving ? 'Saving...' : 'Save Custom Vocabulary'}
                   </button>
                 )}
               </div>

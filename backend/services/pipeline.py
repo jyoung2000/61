@@ -2273,6 +2273,51 @@ async def _run_analysis_inner(job_id: str):
         )
         subject_track = to_fez_subject_track(perception, reframer_plan)
 
+    # ── Speaker fusion (Task 2): overlap voting + mid-segment splits +
+    # word-level regrouping. Replaces to_fez_transcript's basic per-segment
+    # majority vote with a proper diarization→transcript merge, so speaker
+    # turns follow the diarization timeline instead of acoustic windows.
+    # The mouth-motion heuristic remains the documented fallback: an empty
+    # speaker_timeline leaves the transcript untouched.
+    _speaker_timeline = getattr(perception, "speaker_timeline", None)
+    if _speaker_timeline and transcript:
+        try:
+            from backend.services.speaker_fusion import assign_speakers_from_timeline
+            from backend.services.reframer_bridge import _speaker_label_map
+            _pre_fusion = len(transcript)
+            _label_map = _speaker_label_map(_speaker_timeline)
+            _fused = assign_speakers_from_timeline(
+                transcript, _speaker_timeline, label_map=_label_map,
+            )
+            transcript = [
+                f.model_dump() if hasattr(f, "model_dump") else dict(f)
+                for f in _fused
+            ]
+            logger.info(
+                "[%s] Speaker fusion: %d → %d segments (%d speakers)",
+                job_id, _pre_fusion, len(transcript), len(_label_map),
+            )
+        except Exception as _fusion_err:
+            logger.warning(
+                "[%s] Speaker fusion failed (%s) — keeping basic attribution",
+                job_id, _fusion_err,
+            )
+
+    # ── Voiceprint matching (Task 3): auto-apply names learned in prior
+    # jobs. No-ops gracefully when the pyannote embedding backend / HF_TOKEN
+    # are absent — the per-job "Speaker N" labels simply stand.
+    if _speaker_timeline and transcript:
+        try:
+            from backend.services.voiceprint_registry import apply_voiceprint_names
+            from backend.services.reframer_bridge import _speaker_label_map
+            transcript = apply_voiceprint_names(
+                transcript, _speaker_timeline, video_path,
+                label_map=_speaker_label_map(_speaker_timeline),
+            )
+        except Exception as _vp_err:
+            logger.warning(
+                "[%s] Voiceprint matching skipped (%s)", job_id, _vp_err)
+
     # ── Synchronous transcript polish (BEFORE readability) ──
     # Without this, CJK content (Japanese narration, K-drama dialogue)
     # arrives as 30s blocks with zero 。 — the readability splitter falls
@@ -2313,6 +2358,31 @@ async def _run_analysis_inner(job_id: str):
             logger.warning(
                 "[%s] Critical-path polish failed (%s) — falling back to raw transcript",
                 job_id, _polish_err,
+            )
+
+    # ── Sentence-aware resegmentation (Task 4) ──
+    # Merge same-speaker neighbours then re-split at sentence boundaries
+    # (using word timestamps), so the now-polished transcript breaks by
+    # sentence rather than raw VAD window. Runs after speaker fusion +
+    # polish (which adds the punctuation this relies on) and before the
+    # readability pass, which enforces duration/CPS on the result.
+    if getattr(settings, "SENTENCE_SEGMENTATION_ENABLED", True) and transcript:
+        try:
+            from backend.services.sentence_segmenter import resegment_by_sentence
+            _pre_resegment = len(transcript)
+            _reseg = resegment_by_sentence(transcript)
+            transcript = [
+                t.model_dump() if hasattr(t, "model_dump") else dict(t)
+                for t in _reseg
+            ]
+            logger.info(
+                "[%s] Sentence resegmentation: %d → %d segments",
+                job_id, _pre_resegment, len(transcript),
+            )
+        except Exception as _reseg_err:
+            logger.warning(
+                "[%s] Sentence resegmentation failed (%s) — keeping segments",
+                job_id, _reseg_err,
             )
 
     # ── Apply readability rules to the (now-polished) transcript ──
