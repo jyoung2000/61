@@ -418,23 +418,27 @@ export default function Settings() {
           primary: data.primary || data.vision || [],
           editorial: data.editorial || data.text || [],
         });
-        if (data.current) {
-          // Editorial primary falls back to the saved judge.primary so a
-          // pre-existing judge config set by the old Judge UI doesn't get
-          // silently overwritten when only the fallback dropdown changes.
-          const editorialFromEnv = data.current.editorial_model
-            || data.current.text_model || '';
-          const editorialFromJudge = _judgeSpecToModelId(judge.primary || '');
-          const cur = {
-            transcript_model: data.current.transcript_model || '',
-            primary_model: data.current.primary_model || data.current.vision_model || '',
-            editorial_model: editorialFromEnv || editorialFromJudge,
-            editorial_model_fallback: _judgeSpecToModelId(judge.fallback || ''),
-          };
-          setCurrentModels(cur);
-          setPendingModels(cur);
-        }
       }
+      // Build the saved-model state from BOTH sources. The editorial
+      // fallback (and the judge-derived primary) come from
+      // /api/clipper/judge-config and MUST populate the dropdowns even
+      // when /api/providers/models/available returns no ``current`` block
+      // (no provider marked active, a different response shape, or that
+      // endpoint failing). Gating the fallback behind ``data.current`` was
+      // why a saved Editorial AI Fallback looked like it "didn't persist"
+      // after a refresh / container restart — the value was on disk but the
+      // UI never read it back into the control.
+      const cur = data && data.current ? data.current : {};
+      const editorialFromEnv = cur.editorial_model || cur.text_model || '';
+      const editorialFromJudge = _judgeSpecToModelId(judge.primary || '');
+      const resolved = {
+        transcript_model: cur.transcript_model || '',
+        primary_model: cur.primary_model || cur.vision_model || '',
+        editorial_model: editorialFromEnv || editorialFromJudge,
+        editorial_model_fallback: _judgeSpecToModelId(judge.fallback || ''),
+      };
+      setCurrentModels(resolved);
+      setPendingModels(resolved);
     } catch {} finally {
       setModelsLoading(false);
     }
