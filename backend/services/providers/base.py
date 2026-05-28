@@ -254,21 +254,30 @@ def build_summary_from_transcript(
     This is a deterministic last-resort fallback that always produces
     meaningful content without requiring an LLM call.
     """
-    # Build overview from first several transcript segments
+    # Build overview from first several transcript segments.
+    # Accepts both Pydantic TranscriptSegment models and plain dicts.
+    def _seg_attr(seg, key: str, default=""):
+        if isinstance(seg, dict):
+            return seg.get(key, default)
+        return getattr(seg, key, default)
+
     overview_parts = []
     speakers_seen = set()
     total_chars = 0
     for seg in transcript:
-        speakers_seen.add(seg.speaker)
-        overview_parts.append(seg.text)
-        total_chars += len(seg.text)
+        speakers_seen.add(_seg_attr(seg, "speaker", ""))
+        text = _seg_attr(seg, "text", "")
+        overview_parts.append(text)
+        total_chars += len(text)
         if total_chars > 600:
             break
 
     num_speakers = len(speakers_seen)
     duration_mins = 0
     if transcript:
-        duration_mins = round((transcript[-1].end - transcript[0].start) / 60)
+        duration_mins = round(
+            (_seg_attr(transcript[-1], "end", 0) - _seg_attr(transcript[0], "start", 0)) / 60
+        )
 
     if overview_parts:
         combined_text = " ".join(overview_parts)
@@ -288,14 +297,19 @@ def build_summary_from_transcript(
     else:
         overview = "Video analysis completed but no transcript was available to generate a detailed summary."
 
+    def _scene_attr(scene, key: str, default=None):
+        if isinstance(scene, dict):
+            return scene.get(key, default)
+        return getattr(scene, key, default)
+
     # Extract key topics from high-importance scenes (skip synthetic descriptions)
     _synthetic_prefixes = ("Frame at ", "Video frame at ", "Continuation of video")
     topics = []
     seen_topic_words = set()
-    for scene in sorted(scenes, key=lambda s: s.importance_score, reverse=True):
+    for scene in sorted(scenes, key=lambda s: _scene_attr(s, "importance_score", 0) or 0, reverse=True):
         if len(topics) >= 5:
             break
-        desc = scene.description.strip()
+        desc = (_scene_attr(scene, "description", "") or "").strip()
         if not desc or any(desc.startswith(p) for p in _synthetic_prefixes):
             continue
         if "unavailable" in desc.lower() or "analysis" in desc.lower():
@@ -313,11 +327,13 @@ def build_summary_from_transcript(
         seen_topic_words |= topic_words
         topics.append(topic)
 
-    # If no scene topics, extract from transcript
+    # If no scene topics, extract from transcript (English-safe: skip non-ASCII dominant text)
     if not topics and transcript:
-        # Use unique first words of segments as rough topics
         for seg in transcript[:20]:
-            text = seg.text.strip()
+            text = (_seg_attr(seg, "text", "") or "").strip()
+            ascii_ratio = sum(1 for c in text if ord(c) < 128) / max(1, len(text))
+            if ascii_ratio < 0.5:
+                continue  # skip non-Latin text as topic labels
             if len(text) > 15 and len(topics) < 4:
                 topic = text.split(".")[0].strip()
                 if len(topic) > 60:
@@ -330,7 +346,7 @@ def build_summary_from_transcript(
 
     # Determine tone from scene importance scores
     if scenes:
-        avg_score = sum(s.importance_score for s in scenes) / len(scenes)
+        avg_score = sum((_scene_attr(s, "importance_score", 0) or 0) for s in scenes) / len(scenes)
         if avg_score >= 7:
             tone = "engaging and dynamic"
         elif avg_score >= 5:

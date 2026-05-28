@@ -945,22 +945,25 @@ async def _background_post_processing(
                 job_id, _correction_timeout, len(transcript), _total_batches, _per_batch,
             )
 
-            # Get Whisper's detected language for the correction prompt
+            # Get Whisper's detected language for the correction prompt.
+            # Primary source: the language field stored on the job (persisted
+            # from perception.detected_language at analysis time). Fallback to
+            # the in-memory compat_stubs dict which is only populated when the
+            # analysis and background tasks run in the same process lifetime.
+            _source = (job.language or "").strip().lower()
             from backend.services.compat_stubs import _last_detected_language
-            whisper_lang = _last_detected_language.get("lang", "")
+            if not _source:
+                _source = (_last_detected_language.get("lang", "") or "").strip().lower()
 
             # If Whisper used task="translate", the transcript is already English
             # regardless of the source language. Tell the corrector it's English
             # so it doesn't apply Japanese-specific corrections to English text.
-            _source = job.language.strip().lower() if job.language else ""
-            if not _source:
-                _source = whisper_lang
             _whisper_translated = (
                 job.subtitle_language
                 and job.subtitle_language.strip().lower() == "en"
                 and _source and _source != "en"
             )
-            correction_lang = "en" if _whisper_translated else whisper_lang
+            correction_lang = "en" if _whisper_translated else _source
 
             # ── Polish + readability loop ──
             # Re-polish (up to N passes) until the readability score
@@ -2454,6 +2457,12 @@ async def _run_analysis_inner(job_id: str):
     _n_scenes_val = len(scenes)
     _detected_lang = getattr(perception, "detected_language", "") or ""
     _lang_note = f" [{_detected_lang}]" if _detected_lang else ""
+    # Keep the in-memory compat_stubs dict in sync so the background
+    # post-processing task can use it as a reliable fallback even when
+    # job.language is empty (e.g. reprocessed or test jobs).
+    if _detected_lang:
+        from backend.services.compat_stubs import _last_detected_language
+        _last_detected_language["lang"] = _detected_lang
     await _update_progress(
         job_id, JobStatus.ANALYZING_SCENES, 62,
         f"Analysis complete — {_n_scenes_val} scenes, {_n_segs} transcript segments{_lang_note}",

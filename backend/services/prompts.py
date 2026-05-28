@@ -296,6 +296,8 @@ def get_genre_prompt(content_type) -> str:
 
 DEFAULT_SUMMARY_PROMPT = (
     "You are writing a substantive video summary for a human audience. "
+    "ALWAYS write your entire response in English, regardless of the "
+    "language of the transcript or scene descriptions.\n\n"
     "Write like a real person walking a friend through what they just "
     "watched — but be GENEROUS with detail. We want the reader to walk "
     "away feeling like they have a real sense of how the video unfolds, "
