@@ -1502,6 +1502,7 @@ export default function ClipSEO() {
                   <div style={{ ...sectionStyle, padding: '8px 10px' }}>
                     <TranscriptViewer
                       transcript={job.transcript}
+                      videoName={job?.filename || ''}
                       timeRange={clipTimeRange}
                       currentTime={currentTime}
                       maxHeight={600}
@@ -1769,6 +1770,7 @@ export default function ClipSEO() {
               <div style={{ ...sectionStyle, padding: '8px 10px' }}>
                 <TranscriptViewer
                   transcript={job.transcript}
+                  videoName={job?.filename || ''}
                   timeRange={clipTimeRange}
                   currentTime={currentTime}
                   maxHeight={400}

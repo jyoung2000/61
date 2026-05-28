@@ -384,6 +384,7 @@ async def download_srt(
     srt_content = generate_srt(segments, include_speakers=speakers)
 
     base = job.filename.rsplit(".", 1)[0] if "." in job.filename else job.filename
+    base = (base or "").strip() or "transcript"
     filename = f"{base}{lang_suffix}.srt"
 
     return Response(
@@ -404,6 +405,7 @@ async def download_original_srt(job_id: str, speakers: bool = True):
     segments = [TranscriptSegment(**s) if isinstance(s, dict) else s for s in job.transcript]
     srt_content = generate_srt(segments, include_speakers=speakers)
     base = job.filename.rsplit(".", 1)[0] if "." in job.filename else job.filename
+    base = (base or "").strip() or "transcript"
     return Response(
         content=srt_content,
         media_type="text/srt; charset=utf-8",
@@ -450,6 +452,7 @@ async def download_vtt(
     )
 
     base = job.filename.rsplit(".", 1)[0] if "." in job.filename else job.filename
+    base = (base or "").strip() or "transcript"
     filename = f"{base}{lang_suffix}.vtt"
 
     return Response(

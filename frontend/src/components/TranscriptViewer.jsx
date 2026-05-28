@@ -49,7 +49,20 @@ function toTXT(segments) {
 // the quiet window resumes it.
 const MANUAL_OVERRIDE_MS = 2500;
 
-export default function TranscriptViewer({ transcript, onSeek, jobId, onSpeakerRenamed, onTranscriptUpdated, onSpeakerColorChanged, onSpeakerAdded, speakerColors, timeRange, currentTime, maxHeight, hasTranslation = false, showingOriginal = false, onToggleOriginal = null }) {
+// Derive a safe download base name from the source video filename, e.g.
+// "My Interview.mp4" -> "My Interview". Falls back to "transcript" only
+// when no video name is available so an export is never left unnamed.
+function _transcriptBaseName(videoName) {
+  const raw = (videoName || '').trim();
+  if (!raw) return 'transcript';
+  // Strip the trailing extension (.mp4/.mov/...) if present.
+  const noExt = raw.includes('.') ? raw.slice(0, raw.lastIndexOf('.')) : raw;
+  // Replace characters that are awkward in filenames; collapse whitespace.
+  const safe = noExt.replace(/[\\/:*?"<>|]+/g, '_').replace(/\s+/g, ' ').trim();
+  return safe || 'transcript';
+}
+
+export default function TranscriptViewer({ transcript, onSeek, jobId, onSpeakerRenamed, onTranscriptUpdated, onSpeakerColorChanged, onSpeakerAdded, speakerColors, timeRange, currentTime, maxHeight, hasTranslation = false, showingOriginal = false, onToggleOriginal = null, videoName = '' }) {
   const { isMobile } = useResponsive();
   const scrollContainerRef = useRef(null);
   const activeSegRef = useRef(null);
@@ -283,6 +296,15 @@ export default function TranscriptViewer({ transcript, onSeek, jobId, onSpeakerR
       }
     };
   }, [activeOriginalIdx]);
+
+  // Name exports after the source video (".../My Talk.mp4" -> "My Talk.srt")
+  // rather than the generic "transcript.*". A translated transcript gets a
+  // ``_translated`` suffix to mirror the backend SRT/VTT download endpoints.
+  const _baseName = _transcriptBaseName(videoName);
+  const _exportName = (ext) => {
+    const langSuffix = hasTranslation && !showingOriginal ? '_translated' : '';
+    return `${_baseName}${langSuffix}.${ext}`;
+  };
 
   const download = (content, filename) => {
     const blob = new Blob([content], { type: 'text/plain' });
@@ -912,7 +934,7 @@ export default function TranscriptViewer({ transcript, onSeek, jobId, onSpeakerR
           }}
         />
         <button
-          onClick={() => download(toTXT(timeFiltered), 'transcript.txt')}
+          onClick={() => download(toTXT(timeFiltered), _exportName('txt'))}
           style={{
             padding: '8px 12px',
             background: 'var(--bg-elevated)',
@@ -925,7 +947,7 @@ export default function TranscriptViewer({ transcript, onSeek, jobId, onSpeakerR
           .txt
         </button>
         <button
-          onClick={() => download(toSRT(timeFiltered), 'transcript.srt')}
+          onClick={() => download(toSRT(timeFiltered), _exportName('srt'))}
           style={{
             padding: '8px 12px',
             background: 'var(--bg-elevated)',

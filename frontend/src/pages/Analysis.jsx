@@ -471,6 +471,19 @@ export default function Analysis() {
     return showOriginalTranscript ? original : translated;
   }, [job?.transcript, job?.translated_transcript, hasTranslation, showOriginalTranscript]);
 
+  // Base name for transcript/SRT/VTT downloads — the source video's name
+  // (without extension), so an export is "My Talk.srt" rather than the
+  // generic "transcript.srt". Setting an explicit ``download`` value makes
+  // the filename deterministic even if a proxy strips the server's
+  // Content-Disposition header. Matches the backend's ``_translated`` suffix
+  // convention so the translated and original files are distinguishable.
+  const transcriptFileBase = useMemo(() => {
+    const raw = (job?.filename || '').trim();
+    const noExt = raw.includes('.') ? raw.slice(0, raw.lastIndexOf('.')) : raw;
+    const safe = noExt.replace(/[\\/:*?"<>|]+/g, '_').replace(/\s+/g, ' ').trim();
+    return safe || 'transcript';
+  }, [job?.filename]);
+
   // ── Mark Key Scene inline state ──
   const [showMarkScene, setShowMarkScene] = useState(false);
   const [markSceneDesc, setMarkSceneDesc] = useState('');
@@ -3194,7 +3207,7 @@ export default function Analysis() {
                     <>
                       <a
                         href={`/api/jobs/${jobId}/transcript.srt`}
-                        download
+                        download={`${transcriptFileBase}_translated.srt`}
                         title="Download translated SRT (with speakers)"
                         style={{
                           padding: '6px 14px',
@@ -3212,7 +3225,7 @@ export default function Analysis() {
                       </a>
                       <a
                         href={`/api/jobs/${jobId}/transcript.srt?translated=false`}
-                        download
+                        download={`${transcriptFileBase}.srt`}
                         title="Download the original-language SRT"
                         style={{
                           padding: '6px 14px',
@@ -3229,7 +3242,7 @@ export default function Analysis() {
                       </a>
                       <a
                         href={`/api/jobs/${jobId}/transcript.vtt`}
-                        download
+                        download={`${transcriptFileBase}_translated.vtt`}
                         title="Download translated WebVTT"
                         style={{
                           padding: '6px 14px',
@@ -3246,7 +3259,7 @@ export default function Analysis() {
                       </a>
                       <a
                         href={`/api/jobs/${jobId}/transcript.srt?speakers=false`}
-                        download
+                        download={`${transcriptFileBase}_translated.srt`}
                         title="Download translated SRT without speaker labels"
                         style={{
                           padding: '6px 14px',
@@ -3266,7 +3279,7 @@ export default function Analysis() {
                     <>
                       <a
                         href={`/api/jobs/${jobId}/transcript.srt`}
-                        download
+                        download={`${transcriptFileBase}.srt`}
                         style={{
                           padding: '6px 14px',
                           background: 'var(--bg-elevated)',
@@ -3283,7 +3296,7 @@ export default function Analysis() {
                       </a>
                       <a
                         href={`/api/jobs/${jobId}/transcript.srt?speakers=false`}
-                        download
+                        download={`${transcriptFileBase}.srt`}
                         style={{
                           padding: '6px 14px',
                           background: 'var(--bg-elevated)',
@@ -3299,7 +3312,7 @@ export default function Analysis() {
                       </a>
                       <a
                         href={`/api/jobs/${jobId}/transcript.vtt`}
-                        download
+                        download={`${transcriptFileBase}.vtt`}
                         style={{
                           padding: '6px 14px',
                           background: 'var(--bg-elevated)',
@@ -3391,6 +3404,7 @@ export default function Analysis() {
 
                 <TranscriptViewer
                   transcript={activeTranscript}
+                  videoName={job?.filename || ''}
                   currentTime={videoCurrentTime}
                   speakerColors={clipSettings?.speakerColors}
                   onSpeakerColorChanged={handleSpeakerColorChanged}
