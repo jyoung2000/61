@@ -323,12 +323,23 @@ class Perceiver:
             # missing build flag never crashes the perceiver.
             if prev_gray_small is not None:
                 try:
+                    # Downsample to half det resolution before computing flow.
+                    # Farnebäck complexity is O(pixels), so halving each
+                    # dimension gives 4x speedup. For locating the motion
+                    # centroid we don't need pixel-level accuracy — 320px
+                    # wide is more than enough to distinguish left vs right.
+                    of_h = max(60, det_h // 2)
+                    of_w = max(80, det_w // 2)
+                    prev_of = cv2.resize(prev_gray_small, (of_w, of_h),
+                                         interpolation=cv2.INTER_LINEAR)
+                    curr_of = cv2.resize(gray_small,      (of_w, of_h),
+                                         interpolation=cv2.INTER_LINEAR)
                     flow = cv2.calcOpticalFlowFarneback(
-                        prev_gray_small, gray_small, None,
+                        prev_of, curr_of, None,
                         0.5,   # pyr_scale
-                        2,     # levels  (was default 3 — fewer = faster)
-                        13,    # winsize (smaller = faster, less smoothing)
-                        2,     # iterations
+                        1,     # levels  (1 = faster, sufficient for centroid)
+                        9,     # winsize (smaller = faster)
+                        1,     # iterations
                         5,     # poly_n
                         1.1,   # poly_sigma
                         0,     # flags
@@ -347,16 +358,18 @@ class Perceiver:
                     r.motion_timeline[time_ms] = motion_mag
 
                     total_mag = float(mag.sum())
-                    flow_h, flow_w = mag.shape
+                    flow_h_actual, flow_w_actual = mag.shape
                     if total_mag > 0.5:
-                        gy_idx, gx_idx = np.mgrid[0:flow_h, 0:flow_w]
+                        gy_idx, gx_idx = np.mgrid[0:flow_h_actual, 0:flow_w_actual]
                         centroid_x_small = float(np.sum(gx_idx * mag)) / total_mag
                         centroid_y_small = float(np.sum(gy_idx * mag)) / total_mag
                     else:
-                        centroid_x_small = flow_w / 2.0
-                        centroid_y_small = flow_h / 2.0
-                    centroid_cx = int(centroid_x_small / det_scale)
-                    centroid_cy = int(centroid_y_small / det_scale)
+                        centroid_x_small = flow_w_actual / 2.0
+                        centroid_y_small = flow_h_actual / 2.0
+                    # Scale centroid back to source resolution (flow was at
+                    # of_w×of_h, det was det_w×det_h, source is /det_scale)
+                    centroid_cx = int(centroid_x_small * det_w / max(1, flow_w_actual) / det_scale)
+                    centroid_cy = int(centroid_y_small * det_h / max(1, flow_h_actual) / det_scale)
                     # Intensity ~ peak flow magnitude, normalised so 1.0 ≈
                     # large displacement. Capped to match legacy 0–1 range.
                     best_intensity = float(min(1.0, np.percentile(mag, 99) / 10.0))

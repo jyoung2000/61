@@ -518,11 +518,17 @@ async def restore_judge_specs():
         j_fallback = user_data.get("_judge_fallback", "")
         if not j_primary and not j_fallback:
             return  # nothing backed up — nothing to restore
-        cfg = _read_clipper_config()
+        # Always write backup values to config on startup. The backup is
+        # written atomically alongside every config write, so it represents
+        # the user's last-saved value. Restoring unconditionally (rather than
+        # only when the config field is empty) ensures the judge spec is
+        # recovered even when clipper_config.json already has a value but the
+        # backup holds a more recent one — e.g. after a code update that
+        # re-copies a default clipper_config.json to the volume path.
         updates: dict = {}
-        if j_primary and not cfg.get("judge_primary"):
+        if j_primary:
             updates["judge_primary"] = j_primary
-        if j_fallback and not cfg.get("judge_fallback"):
+        if j_fallback:
             updates["judge_fallback"] = j_fallback
         if updates:
             _write_clipper_config_fields(updates)
