@@ -345,6 +345,90 @@ def _cps(text: str, duration_s: float) -> float:
     return len(text) / duration_s
 
 
+def _word_gap_split_point(
+    seg: TranscriptSegment,
+    min_gap_s: float = 0.25,
+) -> Optional[tuple[int, float, list, list]]:
+    """Find an inter-word silence inside the segment large enough to be
+    a natural caption break. Returns ``(char_idx, time_s, left_words,
+    right_words)`` or ``None`` when no usable gap exists.
+
+    Pause-based splits beat text-based splits on every metric: the
+    timestamp is exact (Whisper observed silence there), the text break
+    falls between phrases the speaker actually paused between, and
+    there's no risk of cutting mid-clause. We use these in preference
+    to ``_find_split_point`` when the segment has word-level timing.
+
+    ``min_gap_s`` defaults to 250 ms — long enough to be a deliberate
+    pause, short enough to fire on dialogue-paced speech.
+    """
+    words = getattr(seg, 'words', None)
+    if not words or len(words) < 2:
+        return None
+    text = seg.text
+    duration = max(0.001, seg.end - seg.start)
+
+    def _w_attr(w, key, default=None):
+        return (getattr(w, key, default)
+                if not isinstance(w, dict) else w.get(key, default))
+
+    # Walk and find the largest gap that is >= min_gap_s AND falls in
+    # the middle 80% of the segment (avoid splitting off a single word
+    # at either end).
+    best_idx = -1
+    best_gap = 0.0
+    for i in range(len(words) - 1):
+        cur_end = _w_attr(words[i], 'end', None)
+        nxt_start = _w_attr(words[i + 1], 'start', None)
+        if cur_end is None or nxt_start is None:
+            continue
+        gap = float(nxt_start) - float(cur_end)
+        if gap < min_gap_s:
+            continue
+        rel = (float(cur_end) - seg.start) / duration
+        if rel < 0.15 or rel > 0.85:
+            continue
+        if gap > best_gap:
+            best_gap = gap
+            best_idx = i
+    if best_idx < 0:
+        return None
+
+    # Compute the text break point by walking words and accumulating
+    # text offsets the same way _word_timed_midpoint does. The break
+    # falls AFTER words[best_idx] and BEFORE words[best_idx + 1].
+    cursor = 0
+    left_words: list = []
+    right_words: list = []
+    split_text_idx = -1
+    for i, w in enumerate(words):
+        w_text = (_w_attr(w, 'word', '') or '').strip()
+        if not w_text:
+            continue
+        idx = text.find(w_text, cursor)
+        if idx < 0:
+            return None
+        cursor = idx + len(w_text)
+        if i <= best_idx:
+            left_words.append(w)
+            split_text_idx = cursor
+        else:
+            right_words.append(w)
+    if split_text_idx < 0 or split_text_idx >= len(text):
+        return None
+    # Snap split point past any trailing whitespace so the right side
+    # starts on a non-blank character.
+    while split_text_idx < len(text) and text[split_text_idx].isspace():
+        split_text_idx += 1
+    # Place the break time at the centre of the silence so the left
+    # piece's end is comfortable and the right piece's start lines up
+    # with the next word.
+    cur_end = float(_w_attr(words[best_idx], 'end'))
+    nxt_start = float(_w_attr(words[best_idx + 1], 'start'))
+    midpoint_t = (cur_end + nxt_start) / 2.0
+    return split_text_idx, midpoint_t, left_words, right_words
+
+
 def _word_timed_midpoint(
     seg: TranscriptSegment,
     split_idx: int,
@@ -426,8 +510,34 @@ def _split_segment(
     # end up with a runaway cascade on fast speech.
     if duration < 2 * min_piece_duration:
         return [seg]
+    # PRIORITY 1: word-level silence — Whisper observed an actual pause
+    # the speaker took, so we know the cut won't fall mid-clause AND
+    # the timestamp is exact (no character-proportional drift).
+    gap_split = _word_gap_split_point(seg)
+    if gap_split is not None:
+        split_text_idx, midpoint, left_words, right_words = gap_split
+        midpoint = max(seg.start + 0.05, min(seg.end - 0.05, midpoint))
+        if (midpoint - seg.start) >= min_piece_duration and (seg.end - midpoint) >= min_piece_duration:
+            left_text = text[:split_text_idx].strip()
+            right_text = text[split_text_idx:].strip()
+            if left_text and right_text:
+                left = TranscriptSegment(
+                    start=seg.start, end=midpoint, text=left_text,
+                    speaker=seg.speaker, words=left_words, confidence=seg.confidence,
+                )
+                right = TranscriptSegment(
+                    start=midpoint, end=seg.end, text=right_text,
+                    speaker=seg.speaker, words=right_words, confidence=seg.confidence,
+                )
+                return [left, right]
+    # PRIORITY 2: text-level boundary (sentence > clause > particle > word)
     split_idx = _find_split_point(text)
-    if split_idx is None or split_idx < 5 or split_idx > len(text) - 5:
+    # Edge buffer: 2 chars for short text (≤ 20 chars, typical of CJK after
+    # one prior split) or 5 chars for normal-length text. This stops the
+    # splitter from emitting orphan single-letter Latin tokens while still
+    # allowing a CJK 11-char clause to be cut at the particle near position 7.
+    _edge = 2 if len(text) <= 20 else 5
+    if split_idx is None or split_idx < _edge or split_idx > len(text) - _edge:
         return [seg]
     left_text = text[:split_idx].strip()
     right_text = text[split_idx:].strip()
@@ -504,7 +614,7 @@ def enforce_readability(
     max_chars_per_line: int = 42,
     max_lines: int = 2,
     min_duration_ms: int = 833,
-    max_duration_ms: int = 7000,
+    max_duration_ms: int = 4500,
     min_gap_ms: int = 80,
     smart_line_breaks: bool = True,
     auto_cjk: bool = True,
@@ -606,46 +716,92 @@ def enforce_readability(
             out.append(p)
 
     # ── Pass 2: Duration enforcement (min + max) ────────────────────────
-    out2: list[TranscriptSegment] = []
-    for seg in out:
-        dur = seg.end - seg.start
-        if dur > max_dur_s:
-            # Try to split.
-            split_idx = _find_split_point(seg.text)
-            if split_idx and 5 < split_idx < len(seg.text) - 5:
-                left_text = seg.text[:split_idx].strip()
-                right_text = seg.text[split_idx:].strip()
-                # Prefer Whisper's word-level timing for the split
-                # midpoint when available; the character-proportional
-                # fallback assumes uniform speech rate and drifts on
-                # CJK / non-uniform delivery. Same logic as
-                # ``_split_segment`` (and same fallback for segments
-                # without a usable ``words`` array).
-                word_timed = _word_timed_midpoint(seg, split_idx)
-                if word_timed is not None:
-                    mid, left_words, right_words = word_timed
-                    mid = max(seg.start + 0.05, min(seg.end - 0.05, mid))
-                else:
-                    ratio = len(left_text) / max(1, len(seg.text))
-                    mid = seg.start + dur * ratio
-                    left_words, right_words = [], []
-                out2.append(TranscriptSegment(
+    # Split iteratively: a 30s segment needs 3 splits to land under 4.5s.
+    # We rerun the splitter on each emitted half until nothing exceeds the
+    # max-duration cap, capped at MAX_SPLIT_ITERS to prevent runaway on
+    # word-dense content with no pause structure.
+    MAX_SPLIT_ITERS = 6
+
+    def _try_split_one(seg: TranscriptSegment):
+        """Return [left, right] when a split succeeded, else None."""
+        # Priority 1: word-level pause split.
+        gap_split = _word_gap_split_point(seg)
+        if gap_split is not None:
+            split_text_idx, mid, left_words, right_words = gap_split
+            mid = max(seg.start + 0.05, min(seg.end - 0.05, mid))
+            left_text = seg.text[:split_text_idx].strip()
+            right_text = seg.text[split_text_idx:].strip()
+            if left_text and right_text:
+                return [
+                    TranscriptSegment(
+                        start=seg.start, end=mid, text=left_text,
+                        speaker=seg.speaker, words=left_words,
+                        confidence=seg.confidence,
+                    ),
+                    TranscriptSegment(
+                        start=mid, end=seg.end, text=right_text,
+                        speaker=seg.speaker, words=right_words,
+                        confidence=seg.confidence,
+                    ),
+                ]
+        # Priority 2: text-level boundary.
+        split_idx = _find_split_point(seg.text)
+        _edge = 2 if len(seg.text) <= 20 else 5
+        if split_idx and _edge <= split_idx <= len(seg.text) - _edge:
+            left_text = seg.text[:split_idx].strip()
+            right_text = seg.text[split_idx:].strip()
+            word_timed = _word_timed_midpoint(seg, split_idx)
+            if word_timed is not None:
+                mid, left_words, right_words = word_timed
+                mid = max(seg.start + 0.05, min(seg.end - 0.05, mid))
+            else:
+                dur = seg.end - seg.start
+                ratio = len(left_text) / max(1, len(seg.text))
+                mid = seg.start + dur * ratio
+                left_words, right_words = [], []
+            return [
+                TranscriptSegment(
                     start=seg.start, end=mid, text=left_text,
                     speaker=seg.speaker, words=left_words,
                     confidence=seg.confidence,
-                ))
-                out2.append(TranscriptSegment(
+                ),
+                TranscriptSegment(
                     start=mid, end=seg.end, text=right_text,
                     speaker=seg.speaker, words=right_words,
                     confidence=seg.confidence,
-                ))
-                continue
-        if dur < min_dur_s:
-            seg = TranscriptSegment(
-                start=seg.start, end=seg.start + min_dur_s, text=seg.text,
-                speaker=seg.speaker, words=seg.words, confidence=seg.confidence,
-            )
-        out2.append(seg)
+                ),
+            ]
+        return None
+
+    out2: list[TranscriptSegment] = []
+    for seg in out:
+        # Recursively split until each piece is within the max-duration
+        # cap or the splitter gives up (no more linguistic boundaries).
+        queue = [seg]
+        iters = 0
+        while queue and iters < MAX_SPLIT_ITERS:
+            iters += 1
+            next_queue: list[TranscriptSegment] = []
+            split_any = False
+            for piece in queue:
+                if (piece.end - piece.start) > max_dur_s:
+                    halves = _try_split_one(piece)
+                    if halves is not None:
+                        next_queue.extend(halves)
+                        split_any = True
+                        continue
+                next_queue.append(piece)
+            queue = next_queue
+            if not split_any:
+                break
+        for piece in queue:
+            dur = piece.end - piece.start
+            if dur < min_dur_s:
+                piece = TranscriptSegment(
+                    start=piece.start, end=piece.start + min_dur_s, text=piece.text,
+                    speaker=piece.speaker, words=piece.words, confidence=piece.confidence,
+                )
+            out2.append(piece)
 
     # ── Pass 2.5: Merge consecutive too-short segments ─────────────────
     # When two short segments belong to the same speaker and the gap
@@ -793,7 +949,7 @@ def compute_readability_report(
     max_cps: Optional[float] = None,
     ideal_cps: Optional[float] = None,
     max_chars_per_line: Optional[int] = None,
-    max_duration_ms: int = 7000,
+    max_duration_ms: int = 4500,
     min_duration_ms: int = 833,
 ) -> dict:
     """Score a subtitle transcript for human readability.

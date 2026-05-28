@@ -894,14 +894,135 @@ async def _auto_generate_clip_seo(
     return (generated, failed)
 
 
+async def _polish_transcript_loop(
+    job_id: str,
+    transcript: list,
+    orchestrator,
+    correction_lang: str,
+) -> tuple[list, Optional[dict]]:
+    """Run the LLM polish + readability loop on a transcript.
+
+    Returns ``(polished_models, best_readability_report)``. On any
+    failure, returns ``(original_as_models, None)`` so callers can
+    treat polishing as best-effort. Used both synchronously from
+    ``_run_analysis_inner`` (so the readability splitter sees punctuated
+    Japanese / Chinese text) and asynchronously from
+    ``_background_post_processing`` if a critical-path run is skipped.
+    """
+    from backend.models import TranscriptSegment as _TS
+
+    def _to_models(items):
+        out = []
+        for t in (items or []):
+            if isinstance(t, _TS):
+                out.append(t)
+            elif isinstance(t, dict):
+                try:
+                    out.append(_TS(**t))
+                except Exception:
+                    continue
+        return out
+
+    if not transcript or not settings.AI_TRANSCRIPT_CORRECTION:
+        return _to_models(transcript), None
+    if not getattr(settings, "TRANSCRIPT_POLISHING_ENABLED", True) or orchestrator is None:
+        return _to_models(transcript), None
+
+    from backend.services.transcript_polisher import correct_transcript
+    from backend.services.compat_stubs import _adaptive_batch_size
+    from backend.services.subtitle_formatter import (
+        enforce_readability, compute_readability_report,
+    )
+
+    polished_models = _to_models(transcript)
+    if not polished_models:
+        return polished_models, None
+
+    _polish_info = orchestrator.get_editorial_model_info()
+    _batch_size = _adaptive_batch_size(len(polished_models))
+    _total_batches = -(-len(polished_models) // _batch_size)
+    _per_batch = 150 if _polish_info.get("is_thinking") else 90
+    _estimated_time = (_total_batches * _per_batch) * 1.5
+    _correction_timeout = max(180, min(1800, int(_estimated_time) + 60))
+    logger.info(
+        "[%s] Polishing timeout: %ds (segments=%d, batches=%d, per_batch=%ds, lang=%s)",
+        job_id, _correction_timeout, len(polished_models), _total_batches,
+        _per_batch, correction_lang or "auto",
+    )
+
+    target_score = float(getattr(settings, "TRANSCRIPT_READABILITY_TARGET", 90.0))
+    max_passes = int(getattr(settings, "TRANSCRIPT_READABILITY_MAX_PASSES", 3))
+    best_models = list(polished_models)
+    best_report: Optional[dict] = None
+    for _pass in range(1, max_passes + 1):
+        try:
+            polished_models = await asyncio.wait_for(
+                correct_transcript(
+                    polished_models,
+                    orchestrator,
+                    job_id=job_id,
+                    language=correction_lang,
+                ),
+                timeout=_correction_timeout,
+            )
+            polished_models = _to_models(polished_models)
+        except Exception as _pe:
+            logger.warning(
+                "[%s] Polish pass %d failed (%s) — keeping previous text",
+                job_id, _pass, _pe,
+            )
+
+        if getattr(settings, "SUBTITLE_CPS_ENFORCEMENT", False) and polished_models:
+            try:
+                polished_models = enforce_readability(
+                    list(polished_models),
+                    max_cps=float(getattr(settings, "SUBTITLE_MAX_CPS", 20.0)),
+                    max_chars_per_line=int(getattr(settings, "SUBTITLE_MAX_CHARS_PER_LINE", 42)),
+                    min_duration_ms=int(getattr(settings, "SUBTITLE_MIN_DURATION_MS", 833)),
+                    max_duration_ms=int(getattr(settings, "SUBTITLE_MAX_DURATION_MS", 4500)),
+                    smart_line_breaks=bool(getattr(settings, "SUBTITLE_SMART_LINE_BREAKS", True)),
+                )
+            except Exception as _rd_err:
+                logger.warning("[%s] Readability enforcement failed (%s) — using unmodified polish",
+                               job_id, _rd_err)
+
+        try:
+            pass_report = compute_readability_report(list(polished_models))
+        except Exception:
+            pass_report = None
+
+        if pass_report and (
+            best_report is None or pass_report.get("score", 0) > best_report.get("score", 0)
+        ):
+            best_report = pass_report
+            best_models = list(polished_models)
+
+        _score = pass_report.get("score") if pass_report else None
+        logger.info(
+            "[%s] Polish pass %d/%d → readability %s%s",
+            job_id, _pass, max_passes,
+            f"{_score:.1f}/100" if _score is not None else "(no score)",
+            " ✓ target met" if _score is not None and _score >= target_score else "",
+        )
+        if _score is not None and _score >= target_score:
+            break
+
+    return best_models, best_report
+
+
 async def _background_post_processing(
     job_id: str, transcript: list, orchestrator, job,
     clips: Optional[list] = None,
+    polished_already: bool = False,
 ):
-    """Run transcript polishing and subtitle translation in background after analysis.
+    """Run subtitle translation (and, if not done already, transcript polishing)
+    in the background after analysis.
 
-    These are quality-of-life improvements that don't affect clip detection.
-    Running them after COMPLETE status saves ~5+ minutes on the critical path.
+    Translation runs after COMPLETE so the user can already start editing
+    while it finishes. Polishing is normally run synchronously on the
+    critical path (see ``_run_analysis_inner``) so the readability splitter
+    sees punctuated text; this background call only re-runs it as a
+    fallback when ``polished_already`` is False.
 
     ``clips`` is the in-process list of dicts (or ClipCandidate models)
     captured from the local variable in ``_run_analysis_inner`` right
@@ -912,19 +1033,14 @@ async def _background_post_processing(
     clipai_logs_20260527_000705.log even though the in-isolation
     round-trip tests round-trip clean).
     """
-    # ── Transcript polishing ──
-    if settings.AI_TRANSCRIPT_CORRECTION and transcript:
+    # ── Transcript polishing (fallback only) ──
+    # Polishing now runs synchronously in ``_run_analysis_inner`` before
+    # the readability pass so the splitter sees punctuated text. This
+    # branch only runs when the critical-path polish was skipped (rare —
+    # only when the orchestrator was unavailable at analysis time).
+    if not polished_already and settings.AI_TRANSCRIPT_CORRECTION and transcript:
         try:
-            # Pick the real polisher when the flag is on; otherwise keep
-            # the inert compat_stubs.correct_transcript pass-through so
-            # behavior is byte-for-byte identical to the legacy path.
-            if getattr(settings, "TRANSCRIPT_POLISHING_ENABLED", True):
-                from backend.services.transcript_polisher import correct_transcript
-            else:
-                from backend.services.compat_stubs import correct_transcript
-            from backend.services.compat_stubs import _adaptive_batch_size
-            logger.info("[%s] Background transcript polishing started (%d segments)", job_id, len(transcript))
-
+            logger.info("[%s] Background transcript polishing (fallback path)", job_id)
             await broadcast_ws(job_id, {
                 "type": "background_task",
                 "task": "transcript_polishing",
@@ -932,32 +1048,10 @@ async def _background_post_processing(
                 "message": "Polishing transcript in background...",
             })
 
-            _polish_info = orchestrator.get_editorial_model_info()
-            _batch_size = _adaptive_batch_size(len(transcript))
-            _total_batches = -(-len(transcript) // _batch_size)
-            _remaining_waves = -(- max(0, _total_batches - 1) // 3)
-            _per_batch = 150 if _polish_info.get("is_thinking") else 90
-            # Scale timeout with segment count — 955 segments at ~7s/batch of 8 = ~835s
-            _estimated_time = (_total_batches * _per_batch) * 1.5
-            _correction_timeout = max(180, min(1800, int(_estimated_time) + 60))
-            logger.info(
-                "[%s] Polishing timeout: %ds (segments=%d, batches=%d, per_batch=%ds)",
-                job_id, _correction_timeout, len(transcript), _total_batches, _per_batch,
-            )
-
-            # Get Whisper's detected language for the correction prompt.
-            # Primary source: the language field stored on the job (persisted
-            # from perception.detected_language at analysis time). Fallback to
-            # the in-memory compat_stubs dict which is only populated when the
-            # analysis and background tasks run in the same process lifetime.
             _source = (job.language or "").strip().lower()
             from backend.services.compat_stubs import _last_detected_language
             if not _source:
                 _source = (_last_detected_language.get("lang", "") or "").strip().lower()
-
-            # If Whisper used task="translate", the transcript is already English
-            # regardless of the source language. Tell the corrector it's English
-            # so it doesn't apply Japanese-specific corrections to English text.
             _whisper_translated = (
                 job.subtitle_language
                 and job.subtitle_language.strip().lower() == "en"
@@ -965,116 +1059,19 @@ async def _background_post_processing(
             )
             correction_lang = "en" if _whisper_translated else _source
 
-            # ── Polish + readability loop ──
-            # Re-polish (up to N passes) until the readability score
-            # clears TRANSCRIPT_READABILITY_TARGET, or we run out of
-            # passes. Type discipline: the polish loop operates on
-            # TranscriptSegment models so enforce_readability /
-            # compute_readability_report (which read seg.text / .start
-            # / .end attributes) work on every iteration. We convert
-            # back to dicts only when writing to the DB or handing
-            # off to the translator (which also expects models — see
-            # the explicit cast at the translation call site below).
-            from backend.services.subtitle_formatter import (
-                enforce_readability, compute_readability_report,
+            polished_models, best_report = await _polish_transcript_loop(
+                job_id, transcript, orchestrator, correction_lang,
             )
-            from backend.models import TranscriptSegment as _TS
-            target_score = float(getattr(settings, "TRANSCRIPT_READABILITY_TARGET", 90.0))
-            max_passes = int(getattr(settings, "TRANSCRIPT_READABILITY_MAX_PASSES", 3))
-
-            def _to_models(items):
-                out = []
-                for t in (items or []):
-                    if isinstance(t, _TS):
-                        out.append(t)
-                    elif isinstance(t, dict):
-                        try:
-                            out.append(_TS(**t))
-                        except Exception:
-                            # Drop irreparable rows rather than crash —
-                            # the polisher tolerates length changes.
-                            continue
-                return out
-
-            polished_models = _to_models(transcript)
-            best_models = list(polished_models)
-            best_report = None
-            for _pass in range(1, max_passes + 1):
-                # correct_transcript round-trips its input shape, so
-                # passing models in → models out keeps the type stable.
-                try:
-                    polished_models = await asyncio.wait_for(
-                        correct_transcript(
-                            polished_models,
-                            orchestrator,
-                            job_id=job_id,
-                            language=correction_lang,
-                        ),
-                        timeout=_correction_timeout,
-                    )
-                    # Defensive: if polisher hand-cracked the type, re-coerce.
-                    polished_models = _to_models(polished_models)
-                except Exception as _pe:
-                    logger.warning(
-                        "[%s] Polish pass %d failed (%s) — keeping previous text",
-                        job_id, _pass, _pe,
-                    )
-
-                if getattr(settings, "SUBTITLE_CPS_ENFORCEMENT", False) and polished_models:
-                    try:
-                        polished_models = enforce_readability(
-                            list(polished_models),
-                            max_cps=float(getattr(settings, "SUBTITLE_MAX_CPS", 20.0)),
-                            max_chars_per_line=int(getattr(settings, "SUBTITLE_MAX_CHARS_PER_LINE", 42)),
-                            min_duration_ms=int(getattr(settings, "SUBTITLE_MIN_DURATION_MS", 833)),
-                            max_duration_ms=int(getattr(settings, "SUBTITLE_MAX_DURATION_MS", 7000)),
-                            smart_line_breaks=bool(getattr(settings, "SUBTITLE_SMART_LINE_BREAKS", True)),
-                        )
-                    except Exception as _rd_err:
-                        logger.warning("[%s] Readability enforcement failed (%s) — using unmodified polish",
-                                       job_id, _rd_err)
-
-                try:
-                    pass_report = compute_readability_report(list(polished_models))
-                except Exception:
-                    pass_report = None
-
-                # Track the best run so a regression doesn't lose progress.
-                if pass_report and (
-                    best_report is None or pass_report.get("score", 0) > best_report.get("score", 0)
-                ):
-                    best_report = pass_report
-                    best_models = list(polished_models)
-
-                _score = pass_report.get("score") if pass_report else None
-                logger.info(
-                    "[%s] Polish pass %d/%d → readability %s%s",
-                    job_id, _pass, max_passes,
-                    f"{_score:.1f}/100" if _score is not None else "(no score)",
-                    " ✓ target met" if _score is not None and _score >= target_score else "",
-                )
-                if _score is not None and _score >= target_score:
-                    break
-
-            polished_models = best_models
-            # Write the polished transcript back as dicts so any reader
-            # that still expects the dict shape (the bridge, the
-            # frontend client, etc.) stays happy.
             polished_dicts = [
                 p.model_dump() if hasattr(p, "model_dump") else dict(p)
                 for p in polished_models
             ]
             if best_report is not None:
                 await database.update_job_status(
-                    job_id,
-                    transcript=polished_dicts,
-                    transcript_readability=best_report,
+                    job_id, transcript=polished_dicts, transcript_readability=best_report,
                 )
             else:
                 await database.update_job_status(job_id, transcript=polished_dicts)
-            # Hand the MODEL list to the translation block — it calls
-            # ``seg.text`` directly, so passing dicts there is what
-            # threw "'dict' object has no attribute 'text'" last run.
             transcript = polished_models
 
             await broadcast_ws(job_id, {
@@ -1083,13 +1080,7 @@ async def _background_post_processing(
                 "status": "complete",
                 "message": "Transcript polished",
             })
-            logger.info("[%s] Background transcript polishing complete", job_id)
         except Exception as e:
-            # Log a full traceback so the next failure surfaces the
-            # exact call site of the crash. The previous one-line
-            # warning ("'str' object has no attribute 'get'") gave
-            # us no way to find the line that converted a model into
-            # a string somewhere mid-loop.
             logger.warning(
                 "[%s] Background transcript polishing failed: %s",
                 job_id, e, exc_info=True,
@@ -2265,15 +2256,57 @@ async def _run_analysis_inner(job_id: str):
         )
         subject_track = to_fez_subject_track(perception, reframer_plan)
 
-    # ── Apply readability rules to the raw transcript ──
+    # ── Synchronous transcript polish (BEFORE readability) ──
+    # Without this, CJK content (Japanese narration, K-drama dialogue)
+    # arrives as 30s blocks with zero 。 — the readability splitter falls
+    # back to particle-boundary guesses. Running the LLM polisher first
+    # gives the splitter actual sentence punctuation to break on, which
+    # is the single biggest lever on transcript readability.
+    _polished_in_critical_path = False
+    if (
+        settings.AI_TRANSCRIPT_CORRECTION
+        and getattr(settings, "TRANSCRIPT_POLISHING_ENABLED", True)
+        and transcript
+    ):
+        try:
+            cancel_check()
+            await _update_progress(
+                job_id, JobStatus.ANALYZING_SCENES, 60,
+                "Polishing transcript (punctuation + proper-noun fixes)...",
+            )
+            # Pass Whisper's detected language so the polisher applies
+            # CJK-specific rules (insert 。/、, smaller batches, no
+            # filler removal) when appropriate.
+            _correction_lang = (_detected_lang or "").lower()
+            _polished_models, _polish_report = await _polish_transcript_loop(
+                job_id, transcript, orchestrator, _correction_lang,
+            )
+            if _polished_models:
+                transcript = [
+                    p.model_dump() if hasattr(p, "model_dump") else dict(p)
+                    for p in _polished_models
+                ]
+                _polished_in_critical_path = True
+                logger.info(
+                    "[%s] Critical-path polish complete: %d segments, readability %s",
+                    job_id, len(transcript),
+                    f"{_polish_report.get('score', 0):.1f}/100" if _polish_report else "(no score)",
+                )
+        except Exception as _polish_err:
+            logger.warning(
+                "[%s] Critical-path polish failed (%s) — falling back to raw transcript",
+                job_id, _polish_err,
+            )
+
+    # ── Apply readability rules to the (now-polished) transcript ──
     # Whisper emits one segment per VAD-detected speech window, which on
     # dialogue-dense content (Japanese narration, podcasts) ends up as
     # 30 s blocks of un-broken text — unreadable as subtitles. Run the
-    # Netflix-style enforcer here so the on-screen captions and the
-    # transcript panel are both segmented to readable chunks BEFORE
-    # translation runs. Translation later applies the enforcer again on
-    # its own output to handle character-density changes (CJK → English
-    # typically doubles segment length).
+    # Netflix/YouTube/TikTok-style enforcer here so the on-screen captions
+    # and the transcript panel are both segmented to readable chunks
+    # BEFORE translation runs. Translation later applies the enforcer
+    # again on its own output to handle character-density changes
+    # (CJK → English typically doubles segment length).
     if getattr(settings, "SUBTITLE_CPS_ENFORCEMENT", True) and transcript:
         try:
             from backend.services.subtitle_formatter import (
@@ -2716,6 +2749,7 @@ async def _run_analysis_inner(job_id: str):
             _background_post_processing(
                 job_id, list(transcript), orchestrator, post_job,
                 clips=list(clips or []),
+                polished_already=_polished_in_critical_path,
             ),
             name=f"post-processing:{job_id}",
         )

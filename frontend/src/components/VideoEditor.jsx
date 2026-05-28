@@ -347,6 +347,7 @@ export default function VideoEditor({
   // Initialize timeline store when clip data changes
   const addItem = useTimelineStore((s) => s.addItem);
   const removeItem = useTimelineStore((s) => s.removeItem);
+  const addSubtitlesFromTranscript = useTimelineStore((s) => s.addSubtitlesFromTranscript);
   const multiTrackInitialized = useRef(false);
   const lastInitClipEnd = useRef(0);
   useEffect(() => {
@@ -367,39 +368,19 @@ export default function VideoEditor({
 
     // ── Late-arriving transcript backfill ──
     // The first mount may run with ``transcript`` still empty
-    // (translation runs in the background after analysis completes
-    // and the frontend WS push lands a few seconds later). Without
-    // this branch the effect short-circuits and the subtitle track
-    // stays empty forever even once the transcript arrives.
+    // (polishing and translation run in the background after analysis
+    // completes and the frontend WS push lands a few seconds later).
+    // Both backfill branches use the shared store action so segments
+    // arrive sorted, overlap-resolved, word-timestamped, and tagged
+    // with ``transcriptIndex`` — identical to the initFromClip path.
     if (!needsInit && !storeClipMismatch) {
       if (Array.isArray(transcript) && transcript.length > 0) {
         const hasSubtitles = timelineStoreItems.some((it) => it.type === 'subtitle');
         if (!hasSubtitles) {
-          transcript.forEach((seg) => {
-            if (seg.end > clipStart && seg.start < effectiveEnd) {
-              const s = Math.max(seg.start, clipStart);
-              const e = Math.min(seg.end, effectiveEnd);
-              addItem({
-                trackId: 't1',
-                type: 'subtitle',
-                mediaRef: null,
-                start: s - clipStart,
-                end: e - clipStart,
-                trimStart: 0,
-                trimEnd: null,
-                volume: 1.0,
-                speed: 1.0,
-                opacity: 1.0,
-                position: { x: 50, y: 90 },
-                size: { w: 100, h: 100 },
-                effects: {},
-                fadeIn: 0,
-                fadeOut: 0,
-                subtitleText: seg.text,
-                subtitleStyle: null,
-                speaker: seg.speaker || null,
-              });
-            }
+          addSubtitlesFromTranscript({
+            subtitleSegments: transcript,
+            clipStart,
+            clipEnd: effectiveEnd,
           });
         }
       }
@@ -413,37 +394,16 @@ export default function VideoEditor({
       // Recovered state but no subtitle items — backfill from transcript
       const hasSubtitles = timelineStoreItems.some((it) => it.type === 'subtitle');
       if (!hasSubtitles) {
-        transcript.forEach((seg) => {
-          if (seg.end > clipStart && seg.start < effectiveEnd) {
-            const s = Math.max(seg.start, clipStart);
-            const e = Math.min(seg.end, effectiveEnd);
-            addItem({
-              trackId: 't1',
-              type: 'subtitle',
-              mediaRef: null,
-              start: s - clipStart,
-              end: e - clipStart,
-              trimStart: 0,
-              trimEnd: null,
-              volume: 1.0,
-              speed: 1.0,
-              opacity: 1.0,
-              position: { x: 50, y: 90 },
-              size: { w: 100, h: 100 },
-              effects: {},
-              fadeIn: 0,
-              fadeOut: 0,
-              subtitleText: seg.text,
-              subtitleStyle: null,
-              speaker: seg.speaker || null,
-            });
-          }
+        addSubtitlesFromTranscript({
+          subtitleSegments: transcript,
+          clipStart,
+          clipEnd: effectiveEnd,
         });
       }
     }
     multiTrackInitialized.current = true;
     lastInitClipEnd.current = effectiveEnd;
-  }, [src, clipStart, clipEnd, initFromClip, recovered, timelineStoreItems.length, transcript, addItem]);
+  }, [src, clipStart, clipEnd, initFromClip, recovered, timelineStoreItems.length, transcript, addItem, addSubtitlesFromTranscript]);
 
   // ── Sync: settings.subtitlesEnabled → timeline track visibility ──
   // The settings toggle is the PRIMARY control for subtitle visibility.

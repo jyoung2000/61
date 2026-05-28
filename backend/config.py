@@ -214,7 +214,10 @@ class Settings(BaseSettings):
     SUBTITLE_MAX_CPS: float = 20.0              # chars/sec (Netflix adult standard)
     SUBTITLE_MAX_CHARS_PER_LINE: int = 42       # Netflix Latin standard
     SUBTITLE_MIN_DURATION_MS: int = 833         # 5/6 second (Netflix minimum)
-    SUBTITLE_MAX_DURATION_MS: int = 7000        # 7 seconds (Netflix maximum)
+    SUBTITLE_MAX_DURATION_MS: int = 4500        # 4.5s — tighter than Netflix (7s),
+                                                # closer to YouTube/TikTok pacing
+                                                # so a long Whisper segment gets
+                                                # broken into bite-sized captions
     SUBTITLE_SMART_LINE_BREAKS: bool = True     # linguistic boundary breaks
     SUBTITLE_PLATFORM_SAFE_ZONES: bool = True   # per-platform margin profiles
     SUBTITLE_PLATFORM_PROFILE: str = ""         # "" | tiktok | reels | shorts | horizontal | square

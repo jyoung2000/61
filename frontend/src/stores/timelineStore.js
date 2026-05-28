@@ -323,6 +323,78 @@ let _itemIdCounter = 1;
 const nextItemId = () => `item-${_itemIdCounter++}`;
 const nextMediaId = () => `media-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
 
+// ── Subtitle item builder (shared by initFromClip + addSubtitlesFromTranscript) ──
+// Sorts segments by start time, resolves overlaps so a late-arriving subtitle
+// never starts before its predecessor ended, preserves word-level timestamps
+// for karaoke highlighting, and tags each item with the source ``transcriptIndex``
+// so the reverse-sync effect in VideoEditor can match edits without falling
+// back to brittle time-proximity heuristics.
+function buildSubtitleItems({ subtitleSegments, clipStart, clipEnd, duration }) {
+  if (!Array.isArray(subtitleSegments) || subtitleSegments.length === 0) return [];
+  const sorted = subtitleSegments
+    .map((seg, origIdx) => ({ ...seg, _origIdx: origIdx }))
+    .filter(seg => seg.end > clipStart && seg.start < clipEnd)
+    .sort((a, b) => a.start - b.start);
+
+  const out = [];
+  let lastSubEnd = 0;
+  sorted.forEach((seg, segIdx) => {
+    const clampedStart = Math.max(seg.start, clipStart);
+    const clampedEnd = Math.min(seg.end, clipEnd);
+    const relStart = clampedStart - clipStart;
+    const relEnd = clampedEnd - clipStart;
+    const adjStart = Math.max(relStart, lastSubEnd);
+    if (adjStart >= relEnd) return;
+
+    let segWords = null;
+    if (seg.words && Array.isArray(seg.words)) {
+      segWords = seg.words
+        .filter(w => w.end > clipStart && w.start < clipEnd)
+        .map(w => ({ ...w, start: w.start - clipStart, end: w.end - clipStart }));
+    }
+    let effectiveEnd = relEnd;
+    if (segWords && segWords.length > 0) {
+      const lastWordEnd = Math.max(...segWords.map(w => w.end));
+      if (lastWordEnd > effectiveEnd) {
+        effectiveEnd = Math.min(lastWordEnd + 0.05, duration);
+      }
+    }
+    const nextSeg = sorted[segIdx + 1];
+    if (nextSeg) {
+      const nextRelStart = Math.max(nextSeg.start, clipStart) - clipStart;
+      effectiveEnd = Math.min(effectiveEnd, nextRelStart);
+    }
+    if (adjStart >= effectiveEnd) return;
+    lastSubEnd = effectiveEnd;
+    out.push({
+      id: nextItemId(),
+      trackId: 't1',
+      type: 'subtitle',
+      mediaRef: null,
+      start: adjStart,
+      end: effectiveEnd,
+      trimStart: 0,
+      trimEnd: null,
+      volume: 1.0,
+      speed: 1.0,
+      opacity: 1.0,
+      position: { x: 50, y: 90 },
+      size: { w: 100, h: 100 },
+      transform: { x: 0, y: 0, scaleX: 1, scaleY: 1, rotation: 0, opacity: 1 },
+      effects: {},
+      fadeIn: 0,
+      fadeOut: 0,
+      subtitleText: seg.text,
+      subtitleStyle: null,
+      speaker: seg.speaker || null,
+      transition: null,
+      words: segWords,
+      transcriptIndex: seg._origIdx,
+    });
+  });
+  return out;
+}
+
 // ── Store with Immer + Zundo ────────────────────────────────────────────────
 const useTimelineStore = create(
   temporal(
@@ -1028,77 +1100,12 @@ const useTimelineStore = create(
           },
         ];
 
-        // Add subtitle items if provided — resolve overlaps from server data
-        let lastSubEnd = 0;
-        if (Array.isArray(subtitleSegments)) {
-          // Sort by start time and pre-compute relative times for overlap prevention
-          const sorted = subtitleSegments
-            .filter(seg => seg.end > clipStart && seg.start < clipEnd)
-            .sort((a, b) => a.start - b.start);
-
-          sorted.forEach((seg, segIdx) => {
-            const clampedStart = Math.max(seg.start, clipStart);
-            const clampedEnd = Math.min(seg.end, clipEnd);
-            // Ensure no overlap with the previous subtitle on the same track
-            const relStart = clampedStart - clipStart;
-            const relEnd = clampedEnd - clipStart;
-            const adjStart = Math.max(relStart, lastSubEnd);
-            if (adjStart >= relEnd) return; // Skip degenerate segments
-            // Preserve word-level timestamps for accurate active word highlighting
-            let segWords = null;
-            if (seg.words && Array.isArray(seg.words)) {
-              segWords = seg.words
-                .filter(w => w.end > clipStart && w.start < clipEnd)
-                .map(w => ({
-                  ...w,
-                  start: w.start - clipStart,
-                  end: w.end - clipStart,
-                }));
-            }
-            // Extend segment end to cover last word if word timestamps exceed it,
-            // but NEVER extend past the next segment's start (prevents overlap)
-            let effectiveEnd = relEnd;
-            if (segWords && segWords.length > 0) {
-              const lastWordEnd = Math.max(...segWords.map(w => w.end));
-              if (lastWordEnd > effectiveEnd) {
-                effectiveEnd = Math.min(lastWordEnd + 0.05, duration);
-              }
-            }
-            // Cap at next segment's start to prevent overlap
-            const nextSeg = sorted[segIdx + 1];
-            if (nextSeg) {
-              const nextRelStart = Math.max(nextSeg.start, clipStart) - clipStart;
-              effectiveEnd = Math.min(effectiveEnd, nextRelStart);
-            }
-            if (adjStart >= effectiveEnd) return; // Skip if capping made it degenerate
-            lastSubEnd = effectiveEnd;
-            items.push({
-              id: nextItemId(),
-              trackId: 't1',
-              type: 'subtitle',
-              mediaRef: null,
-              start: adjStart,
-              end: effectiveEnd,
-              trimStart: 0,
-              trimEnd: null,
-              volume: 1.0,
-              speed: 1.0,
-              opacity: 1.0,
-              position: { x: 50, y: 90 },
-              size: { w: 100, h: 100 },
-              transform: { x: 0, y: 0, scaleX: 1, scaleY: 1, rotation: 0, opacity: 1 },
-              effects: {},
-              fadeIn: 0,
-              fadeOut: 0,
-              subtitleText: seg.text,
-              subtitleStyle: null,
-              speaker: seg.speaker || null,
-              transition: null,
-              words: segWords,
-              transcriptIndex: segIdx,
-            });
-          });
-        }
+        // Add subtitle items — sorted, overlap-resolved, with word-level
+        // timestamps preserved via the shared builder.
+        const subtitleItems = buildSubtitleItems({
+          subtitleSegments, clipStart, clipEnd, duration,
+        });
+        items.push(...subtitleItems);
 
         // Add CTA/hook text overlay item if provided
         if (hookText && hookText.length > 3) {
@@ -1163,6 +1170,34 @@ const useTimelineStore = create(
           activeTool: 'select',
         });
       },
+
+      // ── Add subtitles to an already-initialized timeline ──
+      // Used by the backfill effect in VideoEditor when the transcript
+      // arrives late (e.g. after a background polish/translation completes).
+      // Produces the same sorted, overlap-resolved, word-timestamp-preserving
+      // items as ``initFromClip`` via the shared builder so timeline items
+      // from both code paths look identical to downstream consumers
+      // (waveform, karaoke highlighting, reverse-sync, reset-to-original).
+      addSubtitlesFromTranscript: ({ subtitleSegments, clipStart, clipEnd }) => set((state) => {
+        const duration = clipEnd - clipStart;
+        if (duration <= 0) return;
+        const newItems = buildSubtitleItems({
+          subtitleSegments, clipStart, clipEnd, duration,
+        });
+        state.items.push(...newItems);
+        // Refresh the "original subtitles" snapshot used by the reset
+        // button so reset still works after a backfill.
+        state._originalSubtitles = state.items
+          .filter(it => it.type === 'subtitle')
+          .map(it => ({
+            id: it.id,
+            start: it.start,
+            end: it.end,
+            subtitleText: it.subtitleText,
+            position: { ...it.position },
+            size: { ...it.size },
+          }));
+      }),
 
       // ── Crop segment actions ──
       setCropSegments: (segments) => {
