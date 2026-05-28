@@ -517,10 +517,21 @@ def _resolve_pipeline_stage(status: str, progress: int) -> dict:
     return best or {}
 
 
-async def _update_progress(job_id: str, status: str, progress: int, message: str):
+async def _update_progress(
+    job_id: str, status: str, progress: int, message: str,
+    protect_terminal: bool = True,
+):
     """Update job progress in DB and broadcast via WebSocket.
     If a cancel has been requested, raises CancelledError instead of
-    writing a stale progress update that would overwrite the 'cancelled' status."""
+    writing a stale progress update that would overwrite the 'cancelled' status.
+
+    ``protect_terminal`` defaults True so a progress write that lands after
+    the COMPLETE save (e.g. a clipper progress callback relayed from the
+    worker thread via ``run_coroutine_threadsafe``) cannot revert the job
+    to ``detecting_clips`` and wipe the persisted clips / translated
+    transcript. The one deliberate exception is the QUEUED reset at the
+    top of ``run_analysis``, which re-runs a finished job and therefore
+    passes ``protect_terminal=False``."""
     if is_cancel_requested(job_id):
         raise CancelledError(f"Job {job_id} was cancelled by user")
     await database.update_job_status(
@@ -528,6 +539,7 @@ async def _update_progress(job_id: str, status: str, progress: int, message: str
         status=status,
         progress=progress,
         progress_message=message,
+        protect_terminal=protect_terminal,
     )
     status_str = status.value if hasattr(status, 'value') else str(status)
     _stage = _resolve_pipeline_stage(status_str, progress)
@@ -1373,9 +1385,14 @@ async def run_analysis(job_id: str):
 
     # Broadcast immediately so the Analysis page shows status while waiting
     # for the semaphore (especially when another analysis is already running)
+    # protect_terminal=False: this is the deliberate reset that re-runs a
+    # job which may currently be COMPLETE/FAILED — it MUST be allowed to
+    # move the status back out of a terminal state. Every later progress
+    # write keeps the default guard on.
     await _update_progress(
         job_id, JobStatus.QUEUED, 1,
         "Preparing analysis pipeline...",
+        protect_terminal=False,
     )
 
     async with sem:

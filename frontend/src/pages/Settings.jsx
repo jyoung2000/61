@@ -1074,6 +1074,13 @@ export default function Settings() {
   const ModelDropdown = ({ task, models, pendingValue, savedValue, label, desc }) => {
     const isChanged = pendingValue !== savedValue;
     const selectedModel = models.find((m) => m.id === pendingValue);
+    // A persisted pick (e.g. an OpenRouter ":free" judge fallback, or a
+    // model the live availability list filtered out) may not appear in
+    // ``models``. Without a matching <option> the native <select> renders
+    // blank — which looks exactly like the saved value failed to persist
+    // across a refresh / container restart, even though the server kept it.
+    // Surface it as a synthetic option so the dropdown reflects reality.
+    const valueMissing = pendingValue && !models.some((m) => m.id === pendingValue);
     return (
       <div style={{ marginBottom: 20 }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
@@ -1102,6 +1109,9 @@ export default function Settings() {
             }}
           >
             <option value="">-- Select a model --</option>
+            {valueMissing && (
+              <option value={pendingValue}>{pendingValue} (saved)</option>
+            )}
             {models.map((m) => {
               const price = m.is_free ? '[FREE]' : m.cost_per_hour > 0 ? `[$${m.cost_per_hour.toFixed(3)}/hr]` : '';
               const released = m.created ? `[${formatRelease(m.created)}]` : '';
