@@ -153,6 +153,15 @@ class Settings(BaseSettings):
     SELF_HOSTED_MODE: bool = False
     CLIP_ENGINE_SOURCE: str = "auto"    # auto | local | cloud
     EDITORIAL_AI_SOURCE: str = "auto"   # auto | local | cloud
+
+    # ── Editorial Judge specs ("<backend>:<model>") ──
+    # The Editorial AI + Editorial AI Fallback dropdowns. Persisted here in
+    # user_settings.json via _PERSISTABLE_KEYS (restored at module import) so
+    # they survive container rebuilds exactly like the primary/editorial model
+    # picks above — instead of relying solely on clipper_config.json + the
+    # async startup restore, which could leave the fallback looking unsaved.
+    EDITORIAL_AI_PRIMARY_SPEC: str = ""
+    EDITORIAL_AI_FALLBACK_SPEC: str = ""
     # Adaptive frame extraction
     MIN_FRAMES: int = 30               # minimum for any video
     FRAMES_PER_MINUTE: float = 6       # target density (first 30 min; diminishes for longer videos)

@@ -94,6 +94,10 @@ _PERSISTABLE_KEYS = [
     "AUDIO_EVENT_DETECTION", "AUDIO_EVENTS_IN_SUBTITLES",
     "AUDIO_MUSIC_DETECTION",
     "SELF_HOSTED_MODE", "CLIP_ENGINE_SOURCE", "EDITORIAL_AI_SOURCE",
+    # Editorial Judge primary + fallback specs — persist via user_settings.json
+    # (restored at import) so the Editorial AI Fallback dropdown survives
+    # container rebuilds just like the model picks above.
+    "EDITORIAL_AI_PRIMARY_SPEC", "EDITORIAL_AI_FALLBACK_SPEC",
     "FFMPEG_PRESET", "FFMPEG_CRF", "FFMPEG_THREADS", "FFMPEG_FASTSTART",
     "GPU_ACCELERATION_ENABLED", "GPU_VENDOR_OVERRIDE",
     "GPU_HWDECODE_ENABLED", "GPU_HEVC_FOR_4K", "GPU_DEVICE_INDEX",
@@ -3710,12 +3714,20 @@ class JudgeConfigRequest(BaseModel):
 
 @router.get("/clipper/judge-config")
 async def get_judge_config():
-    """Return the currently saved editorial judge specs."""
+    """Return the currently saved editorial judge specs.
+
+    Prefers the values persisted in user_settings.json (restored at module
+    import — the same bulletproof path the primary/editorial model dropdowns
+    use), falling back to clipper_config.json for installs saved before the
+    spec was mirrored into settings. This is what makes the Editorial AI
+    Fallback dropdown survive a no-cache container rebuild.
+    """
     cfg = _read_clipper_config()
-    return {
-        "primary": cfg.get("judge_primary", "") or "",
-        "fallback": cfg.get("judge_fallback", "") or "",
-    }
+    primary = (getattr(settings, "EDITORIAL_AI_PRIMARY_SPEC", "") or "").strip() \
+        or (cfg.get("judge_primary", "") or "")
+    fallback = (getattr(settings, "EDITORIAL_AI_FALLBACK_SPEC", "") or "").strip() \
+        or (cfg.get("judge_fallback", "") or "")
+    return {"primary": primary, "fallback": fallback}
 
 
 @router.put("/clipper/judge-config")
@@ -3732,6 +3744,16 @@ async def put_judge_config(req: JudgeConfigRequest):
     if req.fallback is not None:
         updates["judge_fallback"] = req.fallback.strip()
     cfg = _write_clipper_config_fields(updates)
+
+    # Mirror into user_settings.json (via _PERSISTABLE_KEYS) — the same path
+    # the primary/editorial dropdowns use — so the Editorial AI Fallback
+    # survives a no-cache container rebuild without depending on the
+    # clipper_config.json restore alone.
+    if req.primary is not None:
+        settings.EDITORIAL_AI_PRIMARY_SPEC = req.primary.strip()
+    if req.fallback is not None:
+        settings.EDITORIAL_AI_FALLBACK_SPEC = req.fallback.strip()
+    _persist_user_settings()
 
     # Back up judge specs to user_settings.json so they survive any scenario
     # where clipper_config.json is lost (stale volume, first-time mount, etc.).
