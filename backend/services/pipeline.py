@@ -529,6 +529,89 @@ def _resolve_pipeline_stage(status: str, progress: int) -> dict:
 _finalizing_jobs: set = set()
 
 
+async def _persist_complete_job(job_id: str, fields: dict) -> bool:
+    """Force-persist the COMPLETE job state and verify it against the raw
+    on-disk bytes, retrying a few times.
+
+    Bypasses ``update_job_status`` (which silently no-ops when its internal
+    load returns None, and writes to ``job.job_id``-derived path) by writing
+    the canonical ``database._job_path(job_id)`` directly with synchronous
+    I/O — so there is no ``await`` between the write and the verify read, and
+    no concurrent task can interleave. Logs the exact cause (load-None,
+    job_id mismatch, serialization error, or a stubborn revert) so a stuck
+    job is never silent again.
+    """
+    import json as _json
+    import os as _os
+    import tempfile as _tf
+    path = database._job_path(job_id)
+    for attempt in range(1, 4):
+        try:
+            job = await database.load_job(job_id)
+            if job is None:
+                logger.error(
+                    "[%s] finalize attempt %d: load_job returned None "
+                    "(path=%s exists=%s) — cannot merge existing fields",
+                    job_id, attempt, path, _os.path.exists(path))
+            else:
+                _stored_id = getattr(job, "job_id", "")
+                if _stored_id != job_id:
+                    logger.error(
+                        "[%s] finalize: job.job_id mismatch (stored=%r) — forcing %r",
+                        job_id, _stored_id, job_id)
+                job.job_id = job_id
+                for _k, _v in fields.items():
+                    if hasattr(job, _k):
+                        setattr(job, _k, _v)
+                try:
+                    data = job.model_dump(mode="json")
+                    content = _json.dumps(
+                        data, indent=2,
+                        default=getattr(database, "_numpy_safe_default", None))
+                except Exception as _ser:
+                    logger.error(
+                        "[%s] finalize attempt %d: serialization failed: %r",
+                        job_id, attempt, _ser, exc_info=True)
+                    raise
+                _os.makedirs(_os.path.dirname(path), exist_ok=True)
+                fd, tmp = _tf.mkstemp(dir=_os.path.dirname(path), suffix=".tmp")
+                try:
+                    with _os.fdopen(fd, "w", encoding="utf-8") as _f:
+                        _f.write(content)
+                    _os.replace(tmp, path)
+                finally:
+                    try:
+                        if _os.path.exists(tmp):
+                            _os.unlink(tmp)
+                    except OSError:
+                        pass
+            # Verify against the raw bytes (no model layer, no await).
+            disk_status = ""
+            disk_clips = 0
+            try:
+                with open(path, "r", encoding="utf-8") as _f:
+                    _raw = _json.load(_f)
+                disk_status = _raw.get("status", "")
+                disk_clips = len(_raw.get("clips", []) or [])
+            except Exception as _re:
+                logger.error("[%s] finalize attempt %d: raw read failed: %r",
+                             job_id, attempt, _re)
+            if disk_status == JobStatus.COMPLETE.value:
+                if attempt > 1:
+                    logger.warning(
+                        "[%s] finalize: COMPLETE persisted on attempt %d (clips=%d)",
+                        job_id, attempt, disk_clips)
+                return True
+            logger.warning(
+                "[%s] finalize attempt %d: on-disk status=%r clips=%d (path=%s)",
+                job_id, attempt, disk_status, disk_clips, path)
+        except Exception as _e:
+            logger.error("[%s] finalize attempt %d raised: %r",
+                         job_id, attempt, _e, exc_info=True)
+        await asyncio.sleep(0.4)
+    return False
+
+
 async def _update_progress(
     job_id: str, status: str, progress: int, message: str,
     protect_terminal: bool = True,
@@ -2899,33 +2982,20 @@ async def _run_analysis_inner(job_id: str):
         cost_breakdown=_cost_breakdown,
         default_layout_mode="single",
     )
-    await database.update_job_status(job_id, **_complete_fields)
-
-    # Defensive verification: reload and confirm status persisted as
-    # COMPLETE. Belt-and-suspenders for the
-    # PydanticSerializationUnexpectedValue corruption case the
-    # coercion above is meant to prevent — if for any reason the
-    # status field still didn't round-trip cleanly, re-issue the FULL
-    # payload (summary/scenes/transcript/clips) so the UI doesn't get
-    # stuck on "Generating summary..." with empty results.
-    try:
-        _verify = await database.load_job(job_id)
-        if _verify is not None and str(getattr(_verify, "status", "")) != JobStatus.COMPLETE.value:
-            logger.warning(
-                "[%s] COMPLETE save did not persist (status=%r) — re-saving full payload",
-                job_id, getattr(_verify, "status", None),
-            )
-            await database.update_job_status(job_id, **_complete_fields)
-            _verify2 = await database.load_job(job_id)
-            _ok = _verify2 is not None and str(getattr(_verify2, "status", "")) == JobStatus.COMPLETE.value
-            _has_summary = bool(getattr(_verify2, "summary", None)) if _verify2 else False
-            logger.warning(
-                "[%s] COMPLETE re-save result: status_ok=%s, summary_present=%s, clips=%d",
-                job_id, _ok, _has_summary,
-                len(getattr(_verify2, "clips", []) or []) if _verify2 else 0,
-            )
-    except Exception as _verify_err:
-        logger.info("[%s] COMPLETE save verify skipped: %s", job_id, _verify_err)
+    # Robust, self-diagnosing finalization. The plain update_job_status was
+    # observed to silently NOT persist the COMPLETE payload (status stayed
+    # detecting_clips, clips=0) even with no exception and no concurrent status
+    # writer — and even an immediate full-payload retry failed. To remove every
+    # failure mode at once we write the job.json DIRECTLY to the canonical path
+    # (bypassing the load→merge→save abstraction, the job.job_id-derived save
+    # path, and the aiofiles large-write path), force the correct job_id,
+    # surface any serialization error, verify against the RAW on-disk bytes,
+    # and retry.
+    _persisted = await _persist_complete_job(job_id, _complete_fields)
+    if not _persisted:
+        logger.error(
+            "[%s] COMPLETE finalization could NOT persist after retries — "
+            "job will appear stuck; see preceding finalize logs for cause", job_id)
 
     await broadcast_ws(job_id, {
         "type": "complete",

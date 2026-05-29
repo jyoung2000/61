@@ -101,3 +101,58 @@ def test_progress_allowed_when_not_finalizing(_patch_io):
     _aiorun(pipeline._update_progress(
         "jobX", JobStatus.DETECTING_CLIPS, 80, "Detecting clips..."))
     assert len(_patch_io) == 1
+
+
+# ── _persist_complete_job: direct write survives + forces job_id ──────────
+
+def test_persist_complete_job_writes_and_verifies(tmp_path, monkeypatch):
+    """The robust finalizer must persist status=COMPLETE + clips to the
+    canonical path even though the DB-merge path was unreliable in prod."""
+    import os
+    import backend.database as db
+    from backend.models import JobResult, JobStatus as _JS, ClipCandidate
+
+    d = str(tmp_path)
+    monkeypatch.setattr(db, "_job_dir", lambda jid: os.path.join(d, jid))
+
+    # Seed a detecting_clips job on disk (what finalization starts from).
+    seed = JobResult(job_id="J", filename="v.mp4", file_path="p",
+                     status=_JS.DETECTING_CLIPS.value)
+    _aiorun(db.save_job(seed))
+
+    clip = ClipCandidate(
+        id=1, title="t", start_time=0, end_time=5, duration=5,
+        viral_score=80, viral_score_reasoning="r", clip_type="x",
+        platform="both", suggested_caption="c", hook_text="h",
+        why_this_works="w")
+    fields = dict(status=_JS.COMPLETE, progress=100, clips=[clip])
+
+    ok = _aiorun(pipeline._persist_complete_job("J", fields))
+    assert ok is True
+    reloaded = _aiorun(db.load_job("J"))
+    assert str(reloaded.status) == str(_JS.COMPLETE)
+    assert len(reloaded.clips) == 1
+
+
+def test_persist_complete_job_forces_job_id(tmp_path, monkeypatch):
+    """If the stored job_id is wrong (the suspected prod cause of saves
+    landing on the wrong path), the finalizer forces it and still persists."""
+    import os
+    import backend.database as db
+    from backend.models import JobResult, JobStatus as _JS
+
+    d = str(tmp_path)
+    monkeypatch.setattr(db, "_job_dir", lambda jid: os.path.join(d, jid))
+    # Stored job carries a DIFFERENT job_id than its directory key.
+    seed = JobResult(job_id="WRONG", filename="v.mp4", file_path="p",
+                     status=_JS.DETECTING_CLIPS.value)
+    os.makedirs(os.path.join(d, "K"), exist_ok=True)
+    import json
+    with open(os.path.join(d, "K", "job.json"), "w") as f:
+        json.dump(seed.model_dump(mode="json"), f)
+
+    ok = _aiorun(pipeline._persist_complete_job("K", dict(status=_JS.COMPLETE, progress=100)))
+    assert ok is True
+    reloaded = _aiorun(db.load_job("K"))
+    assert str(reloaded.status) == str(_JS.COMPLETE)
+    assert reloaded.job_id == "K"   # forced to the directory key
