@@ -712,20 +712,35 @@ def enforce_readability(
     # (e.g. 0.8 s) duration. The CPS splitter below refuses to divide any
     # segment shorter than 2× min_piece_duration, so without this the whole
     # block survives as one unreadable wall-of-text cue. When the text needs
-    # far more time to read than its duration allows, extend the end time to
-    # a readable span so the splitter can break it at sentence boundaries.
+    # far more time to read than its duration allows, extend the end time so
+    # the splitter can break it at sentence boundaries.
+    #
+    # CRITICAL: the extension is BOUNDED by the next cue's start (and a hard
+    # cap), so it can only borrow idle time before the following cue — never
+    # overrun it. Without this bound, the duration-splitter spread a few
+    # extended hallucination dumps across fabricated start times and inflated
+    # a 24-min timeline to 46 min.
+    _MAX_EXTEND_S = 30.0
+    _sorted_in = sorted(
+        (s for s in segments if s and (s.text or "").strip()),
+        key=lambda x: (x.start, x.end),
+    )
     repaired: list[TranscriptSegment] = []
-    for seg in segments:
-        if not (seg and (seg.text or "").strip()):
-            continue
+    for i, seg in enumerate(_sorted_in):
         _txt = seg.text.strip()
         _dur = max(0.001, seg.end - seg.start)
         _needed = len(_txt) / max(1.0, max_cps)   # seconds to read at the cap
         if len(_txt) > 150 and _needed > _dur * 2.0:
-            seg = TranscriptSegment(
-                start=seg.start, end=seg.start + _needed, text=_txt,
-                speaker=seg.speaker, words=seg.words, confidence=seg.confidence,
-            )
+            next_start = (_sorted_in[i + 1].start
+                          if i + 1 < len(_sorted_in) else seg.end + _needed)
+            # Borrow idle time up to the next cue, capped — never overrun.
+            target_end = seg.start + min(_needed, _MAX_EXTEND_S)
+            new_end = max(seg.end, min(target_end, next_start - 0.05))
+            if new_end > seg.end:
+                seg = TranscriptSegment(
+                    start=seg.start, end=new_end, text=_txt,
+                    speaker=seg.speaker, words=seg.words, confidence=seg.confidence,
+                )
         repaired.append(seg)
     segments = repaired
 

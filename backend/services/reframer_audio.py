@@ -104,6 +104,29 @@ def _cross_validate_segments(segments: list) -> list:
     return cleaned
 
 
+def _drop_repetition_loops(segments: list) -> list:
+    """Remove Whisper repetition-loop hallucinations.
+
+    When the gap-fill pass re-transcribes music / quiet regions with VAD off,
+    Whisper loops and emits the SAME text over and over, scattered across the
+    timeline (so the adjacent-only ``_cross_validate_segments`` misses them).
+    Real dialogue almost never repeats verbatim many times across an episode,
+    so an exact-text segment that recurs beyond a small cap is a hallucination.
+
+    Keeps the earliest occurrences (1 for long lines, up to 3 for short
+    interjections like "了解") and drops the rest. Operates on the segment
+    dicts (``text`` + ``start_sec``/``end_sec``); order-preserving.
+    """
+    from backend.services.transcript_dedup import drop_repetition_loops
+    out, dropped = drop_repetition_loops(segments, text_key="text")
+    if dropped > 0:
+        logger.info(
+            "repetition-loop filter removed %d duplicated hallucination segment(s)",
+            dropped,
+        )
+    return out
+
+
 class AudioIntelligence:
     """
     Whisper-based audio analysis for reframing intelligence.
@@ -592,9 +615,15 @@ class AudioIntelligence:
                         # them in temporal order.
                         segments.extend(gap_segments)
                         segments.sort(key=lambda s: s.get('start_sec', 0))
+                        # Drop repetition-loop hallucinations the gap-fill
+                        # pass produces over music / quiet regions (the same
+                        # line emitted dozens of times across the timeline).
+                        _pre_dedup = len(segments)
+                        segments = _drop_repetition_loops(segments)
                         log.log_stage('AUDIO',
                             f'Gap-fill added {len(gap_segments)} segments '
-                            f'(total {len(segments)})')
+                            f'(total {_pre_dedup}, {len(segments)} after '
+                            f'repetition-loop filter)')
                 except Exception as gf_err:
                     log.log_stage('AUDIO',
                         f'Gap-fill pass failed (non-fatal): {gf_err}')
