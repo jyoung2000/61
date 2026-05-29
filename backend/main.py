@@ -337,12 +337,56 @@ async def _startup_preload():
             " | ".join(diag_parts),
         )
 
+    # ── Whisper auto-upgrade → large-v3-turbo on capable GPUs ──
+    # large-v3-turbo is both FASTER and more accurate than medium/small, so
+    # on a GPU with enough VRAM it is a strict win for transcription quality
+    # AND pipeline speed. Gated behind WHISPER_AUTO_UPGRADE (default on) and
+    # only applied in-memory for the session — it never overwrites a model
+    # the user explicitly pinned in the file (the persist layer preserves
+    # WHISPER_MODEL_USER_SET). A deliberate large-tier choice is left alone,
+    # and the audio loader still falls back to a smaller tier / CPU at
+    # runtime if the workspace doesn't fit. Uses nvidia-smi (no CUDA init).
+    from backend.config import settings as cfg
+    try:
+        _cur_whisper = (getattr(cfg, "WHISPER_MODEL", "") or "").lower()
+        _large_tier = {"large-v3-turbo", "large-v3", "large-v2", "large"}
+        if (getattr(cfg, "WHISPER_AUTO_UPGRADE", True)
+                and getattr(cfg, "GPU_ACCELERATION_ENABLED", False)
+                and _cur_whisper not in _large_tier):
+            _vram_total_mb = 0
+            try:
+                _vsmi = subprocess.run(
+                    ["nvidia-smi", "--query-gpu=memory.total",
+                     "--format=csv,noheader,nounits"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if _vsmi.returncode == 0 and _vsmi.stdout.strip():
+                    _vram_total_mb = max(
+                        int(float(x)) for x in _vsmi.stdout.strip().split("\n") if x.strip()
+                    )
+            except Exception:
+                _vram_total_mb = 0
+            # large-v3-turbo int8_float16 needs ~1.6-2.0 GB of workspace;
+            # require ~3.3 GB total so the rest of the pipeline still fits.
+            # If nvidia-smi gave us nothing but the GPU is enabled, upgrade
+            # anyway and let the loader's free-VRAM gate fall back if needed.
+            if _vram_total_mb == 0 or _vram_total_mb >= 3300:
+                logger.info(
+                    "Whisper auto-upgrade: %s → large-v3-turbo "
+                    "(GPU total %s MB; faster + more accurate). "
+                    "Disable with WHISPER_AUTO_UPGRADE=false or pin a model in Settings.",
+                    _cur_whisper or "(unset)",
+                    _vram_total_mb or "unknown",
+                )
+                cfg.WHISPER_MODEL = "large-v3-turbo"
+    except Exception as _wu_err:
+        logger.warning("Whisper auto-upgrade skipped (non-fatal): %s", _wu_err)
+
     # Only preload Whisper in-process if we won't use subprocess transcription.
     # When Ollama is the AI provider, the pipeline runs Whisper in a subprocess
     # to release CTranslate2's CUDA context (~1.6GB) after transcription.
     # Preloading here would permanently hold that VRAM, defeating subprocess
     # isolation and leaving insufficient memory for medium/large models.
-    from backend.config import settings as cfg
     _use_subprocess_whisper = (
         cfg.GPU_ACCELERATION_ENABLED
         and "ollama" in getattr(cfg, "active_provider_chain", [])

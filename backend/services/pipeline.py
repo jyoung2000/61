@@ -2193,15 +2193,24 @@ async def _run_analysis_inner(job_id: str):
         except Exception:
             pass  # progress is best-effort — never break analysis over it
 
-    # Adaptive sampling — the Perceiver cost scales with the number of frames
-    # it analyses. Cap the total at ~3600 samples so a long video stays
-    # tractable; short videos keep the full 5 fps detail.
-    _sample_fps = 5.0
+    # Adaptive sampling — the Perceiver's face/motion cost scales linearly
+    # with the number of frames it analyses (the dominant analysis cost on
+    # long videos). Cap the total sample count so a long video stays
+    # tractable; short videos keep the higher per-frame detail. The cap,
+    # ceiling, and floor are all configurable so the face stage can be sped
+    # up (fewer samples) without touching code. Defaults lowered from
+    # 3600/5.0/2.0 to 1800/5.0/1.2 — roughly halving the face-detection time
+    # on long videos with negligible reframing-accuracy loss.
+    _max_samples = max(300, int(getattr(settings, "REFRAMER_MAX_SAMPLES", 1800)))
+    _fps_ceiling = float(getattr(settings, "REFRAMER_SAMPLE_FPS", 5.0))
+    _fps_floor = float(getattr(settings, "REFRAMER_MIN_SAMPLE_FPS", 1.2))
+    _sample_fps = _fps_ceiling
     if video_duration > 0:
-        _sample_fps = max(2.0, min(5.0, 3600.0 / video_duration))
+        _sample_fps = max(_fps_floor, min(_fps_ceiling, _max_samples / video_duration))
     logger.info(
-        "[%s] Reframer sample rate: %.2f fps (%.1f min video)",
+        "[%s] Reframer sample rate: %.2f fps (%.1f min video, ~%d samples, cap=%d)",
         job_id, _sample_fps, video_duration / 60.0,
+        int(_sample_fps * video_duration) if video_duration > 0 else 0, _max_samples,
     )
 
     await _update_progress(

@@ -128,6 +128,15 @@ class Settings(BaseSettings):
     FRAME_SAMPLE_RATE: int = 10        # seconds between frames (lower=more detail, slower)
     MAX_CLIP_CANDIDATES: int = 12
 
+    # ── Reframer perception sampling (face/motion detection speed) ──
+    # The Perceiver's face-detection cost scales with the number of frames
+    # sampled. These cap the total samples on long videos. Lowering
+    # REFRAMER_MAX_SAMPLES (or REFRAMER_MIN_SAMPLE_FPS) directly speeds up
+    # the dominant analysis stage at a small reframing-accuracy cost.
+    REFRAMER_MAX_SAMPLES: int = 1800       # total face/motion samples cap
+    REFRAMER_SAMPLE_FPS: float = 5.0       # ceiling fps (short videos)
+    REFRAMER_MIN_SAMPLE_FPS: float = 1.2   # floor fps (very long videos)
+
     # ── Clip generation (Primary AI / VideoLLaMA3) defaults ──
     # Exposed in Settings > Clip Generation and overlaid onto the clipper
     # config so the upload pipeline + the regenerate path both honor them.
