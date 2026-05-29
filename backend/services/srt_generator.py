@@ -39,6 +39,21 @@ def inline_timestamp(seconds: float) -> str:
     return f"[{minutes:02d}:{secs:02d}]"
 
 
+def effective_include_speakers(segments, include_speakers: bool) -> bool:
+    """Speaker labels add no value (and clutter the file) when the whole
+    transcript is a single speaker — the common case for narration / a solo
+    talking-head. In that case suppress them even if ``include_speakers`` is
+    True, matching how hand-authored SRTs omit "[Speaker 1]" everywhere."""
+    if not include_speakers:
+        return False
+    distinct = {
+        (s.get("speaker") if isinstance(s, dict) else getattr(s, "speaker", "")) or ""
+        for s in (segments or [])
+    }
+    distinct = {d for d in distinct if d.strip()}
+    return len(distinct) > 1
+
+
 def _decorate_text(
     text: str,
     seg: TranscriptSegment,
@@ -97,11 +112,23 @@ def generate_srt(
             # Never let readability formatting break SRT generation.
             pass
 
+    # SRT cues MUST be chronological; sort defensively so corrupt upstream
+    # ordering can't emit out-of-order / backwards cues.
+    segments = sorted(
+        (s for s in segments if (s.text or "").strip()),
+        key=lambda s: (s.start, s.end),
+    )
+    include_speakers = effective_include_speakers(segments, include_speakers)
+
     lines: list[str] = []
     counter = 0
     for seg in segments:
         text = (seg.text or "").strip()
         if not text:
+            continue
+        # Skip only backwards cues (corrupt timing). Zero-duration cues are
+        # left as-is — the reference SRT format permits them.
+        if seg.end < seg.start:
             continue
         counter += 1
         start = _format_srt_time(seg.start)
@@ -200,12 +227,23 @@ def generate_bilingual_srt(
         except Exception:
             pass
 
+    # Pair each source segment with its translated line, then sort the pairs
+    # chronologically so cues are emitted in order (corrupt upstream ordering
+    # can't produce out-of-order cues).
+    paired = sorted(
+        ((seg, translated_texts[i]) for i, seg in enumerate(segments)),
+        key=lambda p: (p[0].start, p[0].end),
+    )
+    include_speakers = effective_include_speakers(segments, include_speakers)
+
     lines: list[str] = []
     counter = 0
-    for i, seg in enumerate(segments):
+    for seg, _translated_line in paired:
         original = (seg.text or "").strip()
-        translated = (translated_texts[i] or "").strip()
+        translated = (_translated_line or "").strip()
         if not original and not translated:
+            continue
+        if seg.end < seg.start:
             continue
         # Collapse any internal newlines so each side is exactly one line.
         original = " ".join(original.split())

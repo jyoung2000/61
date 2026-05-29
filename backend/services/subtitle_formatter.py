@@ -707,6 +707,28 @@ def enforce_readability(
     min_dur_s = min_duration_ms / 1000.0
     min_gap_s = min_gap_ms / 1000.0
 
+    # ── Pass 0: repair implausibly-short giant cues ────────────────────
+    # A corrupt upstream segment can carry a huge block of text with a tiny
+    # (e.g. 0.8 s) duration. The CPS splitter below refuses to divide any
+    # segment shorter than 2× min_piece_duration, so without this the whole
+    # block survives as one unreadable wall-of-text cue. When the text needs
+    # far more time to read than its duration allows, extend the end time to
+    # a readable span so the splitter can break it at sentence boundaries.
+    repaired: list[TranscriptSegment] = []
+    for seg in segments:
+        if not (seg and (seg.text or "").strip()):
+            continue
+        _txt = seg.text.strip()
+        _dur = max(0.001, seg.end - seg.start)
+        _needed = len(_txt) / max(1.0, max_cps)   # seconds to read at the cap
+        if len(_txt) > 150 and _needed > _dur * 2.0:
+            seg = TranscriptSegment(
+                start=seg.start, end=seg.start + _needed, text=_txt,
+                speaker=seg.speaker, words=seg.words, confidence=seg.confidence,
+            )
+        repaired.append(seg)
+    segments = repaired
+
     # ── Pass 1: CPS-driven splitting + filler trimming + duration extension
     for seg in segments:
         if not (seg and (seg.text or "").strip()):
@@ -885,6 +907,11 @@ def enforce_readability(
                     continue
         merged.append(seg)
     out2 = merged
+
+    # Chronological order is mandatory for SRT/VTT and for the gap-enforcement
+    # pass below (which de-overlaps assuming sorted input). Upstream timing
+    # corruption can leave segments out of order — sort defensively here.
+    out2.sort(key=lambda s: (s.start, s.end))
 
     # ── Pass 3: Smart line breaks (with hard-wrap safety) ──────────────
     if smart_line_breaks:

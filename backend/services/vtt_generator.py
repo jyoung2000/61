@@ -109,11 +109,21 @@ def generate_vtt(
         if include_position else ""
     )
 
+    # WebVTT cues MUST be chronological; sort defensively.
+    segments = sorted(
+        (s for s in segments if (s.text or "").strip()),
+        key=lambda s: (s.start, s.end),
+    )
+    from backend.services.srt_generator import effective_include_speakers
+    include_speakers = effective_include_speakers(segments, include_speakers)
+
     lines: list[str] = ["WEBVTT", ""]
     counter = 0
     for seg in segments:
         text = (seg.text or "").strip()
         if not text:
+            continue
+        if seg.end < seg.start:
             continue
         counter += 1
         start = _format_vtt_time(seg.start)
