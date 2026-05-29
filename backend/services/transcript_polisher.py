@@ -165,6 +165,7 @@ def _build_user_prompt(
     context_before: list[dict],
     context_after: list[dict],
     language: str,
+    glossary_terms: Optional[list[str]] = None,
 ) -> str:
     """Assemble the per-batch user message with surrounding context."""
     lang_hint = (
@@ -175,6 +176,22 @@ def _build_user_prompt(
 
     preserve = getattr(settings, "TRANSCRIPT_PRESERVE_WORDS", True)
     rules: list[str] = []
+    # Custom-vocabulary glossary → authoritative proper-noun spellings.
+    # This is what fixes inconsistent / phonetically-wrong names (e.g.
+    # "Dorian" → "Darlian", "Wing Zero" variants) across the whole
+    # transcript, not just within a batch.
+    if glossary_terms:
+        _terms = ", ".join(str(t).strip() for t in glossary_terms if str(t).strip())
+        if _terms:
+            rules.append(
+                "CANONICAL NAMES (highest priority): these are the correct, "
+                "authoritative spellings of proper nouns / jargon in this "
+                "content — " + _terms + ". Whenever a segment contains a "
+                "phonetically-similar or inconsistently-spelled variant of "
+                "one of these, replace it with the EXACT canonical spelling. "
+                "Never introduce one of these names where the audio clearly "
+                "says something else."
+            )
     if preserve:
         # Accuracy-focused profile: the polisher's job is to bridge the
         # Whisper-medium-to-Whisper-large quality gap by correcting the
@@ -324,10 +341,12 @@ async def _polish_batch(
     context_after: list[dict],
     language: str,
     timeout: float,
+    glossary_terms: Optional[list[str]] = None,
 ) -> Optional[list[str]]:
     """Polish a single batch via the editorial LLM. Returns None on failure
     so the caller can keep the originals."""
-    user_prompt = _build_user_prompt(batch, context_before, context_after, language)
+    user_prompt = _build_user_prompt(
+        batch, context_before, context_after, language, glossary_terms)
     full_prompt = f"[SYSTEM]\n{_SYSTEM_PROMPT}\n\n[USER]\n{user_prompt}"
     try:
         response = await orchestrator.text_completion(full_prompt, timeout=timeout)
@@ -351,6 +370,7 @@ async def correct_transcript(
     batch_size: Optional[int] = None,
     progress_callback: Optional[Callable[[int], Any]] = None,
     timeout_per_batch: float = 90.0,
+    glossary_terms: Optional[list[str]] = None,
 ) -> list:
     """Polish a transcript using the editorial LLM in batches.
 
@@ -358,6 +378,11 @@ async def correct_transcript(
     signature, same return shape. When ``TRANSCRIPT_POLISHING_ENABLED``
     is False or the orchestrator is missing, returns the segments
     unchanged (the legacy behavior).
+
+    ``glossary_terms`` supplies authoritative proper-noun spellings (the
+    custom-vocabulary glossary). When None, it is auto-loaded from the
+    persisted glossary so the polisher enforces consistent names without
+    every caller having to thread it through.
     """
     seg_list = list(segments) if segments else []
     if not seg_list:
@@ -365,6 +390,14 @@ async def correct_transcript(
 
     if not settings.TRANSCRIPT_POLISHING_ENABLED or orchestrator is None:
         return seg_list
+
+    # Auto-load the custom-vocabulary glossary as the canonical name list.
+    if glossary_terms is None and getattr(settings, "CUSTOM_VOCABULARY_ENABLED", True):
+        try:
+            from backend.services.custom_vocabulary import load_vocabulary
+            glossary_terms = load_vocabulary()
+        except Exception:
+            glossary_terms = None
 
     if batch_size is None:
         batch_size = max(1, int(getattr(settings, "TRANSCRIPT_POLISHING_BATCH_SIZE", 15)))
@@ -393,6 +426,7 @@ async def correct_transcript(
         polished_texts = await _polish_batch(
             orchestrator, batch, ctx_before, ctx_after,
             language=language, timeout=timeout_per_batch,
+            glossary_terms=glossary_terms,
         )
 
         # Length tolerance depends on the polish profile. In the

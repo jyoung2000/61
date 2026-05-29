@@ -29,6 +29,11 @@ from backend.config import settings
 logger = logging.getLogger("clipai.reframer_audio")
 
 
+from backend.services.hallucination_filter import (
+    is_boilerplate_hallucination as _is_boilerplate_hallucination,
+)
+
+
 def _vocab_bias_kwargs(transcribe_callable, language: str) -> dict:
     """Build the custom-vocabulary biasing kwargs for a Whisper transcribe call.
 
@@ -481,14 +486,8 @@ class AudioIntelligence:
             transcribe_start = _time.monotonic()
 
             # ── TACT: Hallucination detection constants ──
-            _BOILERPLATE = {
-                'thank you for watching', 'thanks for watching',
-                'please subscribe', 'like and subscribe',
-                "don't forget to subscribe", 'see you in the next video',
-                'bye bye', 'thanks for listening', 'music playing',
-                'music', 'applause', 'subtitles by', 'captions by',
-                'thank you', 'thanks', 'the end',
-            }
+            # Boilerplate phrases live in the module-level
+            # _BOILERPLATE_HALLUCINATIONS (multilingual). See _is_boilerplate_hallucination.
 
             for seg in segments_iter:
                 start_ms = int(seg.start * 1000)
@@ -500,8 +499,8 @@ class AudioIntelligence:
                 # ── TACT: Hallucination filter ──
                 is_hallucination = False
 
-                # 1. Boilerplate blocklist
-                if text.lower().rstrip('.!,') in _BOILERPLATE:
+                # 1. Boilerplate blocklist (multilingual)
+                if _is_boilerplate_hallucination(text):
                     is_hallucination = True
 
                 # 2. High no_speech_prob + text present → likely hallucination
@@ -815,15 +814,8 @@ class AudioIntelligence:
                 no_speech_threshold=gap_ns_thresh,
             )
 
-        # Same boilerplate / repetition filter the main pass uses.
-        _BOILERPLATE = {
-            'thank you for watching', 'thanks for watching',
-            'please subscribe', 'like and subscribe',
-            "don't forget to subscribe", 'see you in the next video',
-            'bye bye', 'thanks for listening', 'music playing',
-            'music', 'applause', 'subtitles by', 'captions by',
-            'thank you', 'thanks', 'the end',
-        }
+        # Same boilerplate / repetition filter the main pass uses
+        # (multilingual — see module-level _is_boilerplate_hallucination).
 
         # Build a fast O(log n) membership check for "is this gap-fill
         # segment actually inside a real gap?" — used to drop any
@@ -849,9 +841,8 @@ class AudioIntelligence:
                 continue
             no_speech_prob = float(getattr(seg, 'no_speech_prob', 0.0) or 0.0)
 
-            # Drop common Whisper hallucinations
-            stripped = text.lower().rstrip('.!,')
-            if stripped in _BOILERPLATE:
+            # Drop common Whisper hallucinations (multilingual)
+            if _is_boilerplate_hallucination(text):
                 continue
             # Very high no_speech confidence is true silence
             if no_speech_prob > 0.85:
