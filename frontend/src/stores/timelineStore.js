@@ -417,6 +417,12 @@ const useTimelineStore = create(
       // ── Original subtitle timings (snapshot from initFromClip for reset) ──
       _originalSubtitles: [],
 
+      // Clip window this timeline was initialised from. Subtitle item times
+      // are RELATIVE to clipStart; the reverse-sync to the transcript adds it
+      // back to recover absolute times. 0 for the untrimmed full video.
+      clipStart: 0,
+      clipEnd: 0,
+
       // ── Crop segments (subject tracking keyframes as editable segments) ──
       cropSegments: [],          // [{id, startTime, endTime, cropX, clusterId, isManualOverride, label}]
       selectedCropSegmentId: null,
@@ -1157,6 +1163,8 @@ const useTimelineStore = create(
           items,
           mediaLibrary,
           _originalSubtitles: originalSubtitles,
+          clipStart,
+          clipEnd,
           cropSegments: [],
           selectedCropSegmentId: null,
           playhead: 0,
@@ -1309,6 +1317,39 @@ const useTimelineStore = create(
       // Get items on a specific track
       getTrackItems: (trackId) => {
         return get().items.filter((item) => item.trackId === trackId);
+      },
+
+      // ── Reverse-sync: derive the transcript from the subtitle timeline ──
+      // Maps every subtitle item back to a transcript segment in ABSOLUTE
+      // time (timeline times are relative to clipStart), sorted chronologically.
+      // This is what the NLE writes back so an element's edited timing / text /
+      // words flow into the canonical transcript (and thus the SRT/VTT/TXT
+      // downloads + transcript panel). Word timings are shifted back too.
+      getSubtitleTranscript: () => {
+        const { items, clipStart } = get();
+        const off = clipStart || 0;
+        return items
+          .filter((it) => it.type === 'subtitle' && (it.subtitleText || '').trim())
+          .map((it) => {
+            const start = (it.start ?? 0) + off;
+            const end = (it.end ?? 0) + off;
+            let words = null;
+            if (Array.isArray(it.words) && it.words.length) {
+              words = it.words.map((w) => ({
+                word: w.word,
+                start: (w.start ?? 0) + off,
+                end: (w.end ?? 0) + off,
+              }));
+            }
+            return {
+              start,
+              end,
+              text: it.subtitleText,
+              speaker: it.speaker || 'Speaker 1',
+              words,
+            };
+          })
+          .sort((a, b) => a.start - b.start);
       },
 
       // Export state for persistence

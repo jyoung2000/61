@@ -40,6 +40,25 @@ function formatDuration(seconds) {
   return `${m}:${s.toString().padStart(2, '0')}`;
 }
 
+// Compare two subtitle/transcript segment lists for meaningful equality
+// (same count, same text, timing within 50 ms). Used by the timeline→
+// transcript reverse-sync to skip a write when nothing actually changed —
+// which also breaks the transcript↔timeline echo loop.
+function subtitleListsEqual(a, b) {
+  const A = a || [];
+  const B = b || [];
+  if (A.length !== B.length) return false;
+  for (let i = 0; i < A.length; i++) {
+    const x = A[i] || {};
+    const y = B[i] || {};
+    if ((x.text || '').trim() !== (y.text || '').trim()) return false;
+    if (Math.abs((x.start || 0) - (y.start || 0)) > 0.05) return false;
+    if (Math.abs((x.end || 0) - (y.end || 0)) > 0.05) return false;
+    if ((x.speaker || '') !== (y.speaker || '')) return false;
+  }
+  return true;
+}
+
 function formatDurationInput(seconds) {
   const m = Math.floor(seconds / 60);
   const s = Math.floor(seconds % 60);
@@ -323,6 +342,7 @@ export default function Analysis() {
   const timelineItems = useTimelineStore((s) => s.items);
   const timelineTracks = useTimelineStore((s) => s.tracks);
   const timelineMediaLibrary = useTimelineStore((s) => s.mediaLibrary);
+  const getSubtitleTranscript = useTimelineStore((s) => s.getSubtitleTranscript);
 
   // ── Server is source of truth for subtitle settings ──
   // On initial load this is handled in fetchJob (same batch as setJob) to avoid
@@ -470,6 +490,56 @@ export default function Analysis() {
     if (!hasTranslation) return original;
     return showOriginalTranscript ? original : translated;
   }, [job?.transcript, job?.translated_transcript, hasTranslation, showOriginalTranscript]);
+
+  // ── Reverse-sync: NLE timeline subtitle edits → transcript ──────────────
+  // When a subtitle ELEMENT's timing / text / words are edited on the
+  // timeline, write the change back to the canonical transcript so the
+  // transcript panel and the SRT/VTT/TXT downloads stay in sync, and the
+  // edit persists to job.json across refreshes / container restarts.
+  //
+  // Guards:
+  //  • Only the UNTRIMMED FULL-VIDEO timeline is synced (no clip preview, no
+  //    trim). A clip / trim only holds a subset of subtitles, so writing it
+  //    back would drop the rest of the transcript.
+  //  • The derived transcript is compared to the current one; an identical
+  //    result is skipped, which also breaks the transcript→timeline→transcript
+  //    echo loop (a re-init from the transcript produces matching items).
+  const reverseSyncTimerRef = useRef(null);
+  useEffect(() => () => { if (reverseSyncTimerRef.current) clearTimeout(reverseSyncTimerRef.current); }, []);
+  useEffect(() => {
+    if (!jobId || clipPreview || fullVideoRange) return;
+    if (!timelineItems || timelineItems.length === 0) return;
+    if (reverseSyncTimerRef.current) clearTimeout(reverseSyncTimerRef.current);
+    reverseSyncTimerRef.current = setTimeout(async () => {
+      let derived;
+      try {
+        derived = getSubtitleTranscript();
+      } catch { return; }
+      if (!derived || derived.length === 0) return;
+      const usingTranslated = hasTranslation && !showOriginalTranscript;
+      const current = usingTranslated
+        ? (job?.translated_transcript || [])
+        : (job?.transcript || []);
+      // No real change → skip the write (and break the echo loop).
+      if (subtitleListsEqual(derived, current)) return;
+      const target = usingTranslated ? 'translated' : 'original';
+      try {
+        const res = await fetch(`/api/jobs/${jobId}/transcript`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ segments: derived, target }),
+        });
+        if (res.ok) {
+          setJob((prev) => (prev ? {
+            ...prev,
+            [usingTranslated ? 'translated_transcript' : 'transcript']: derived,
+          } : prev));
+        }
+      } catch { /* best-effort — IndexedDB autosave still holds the edit */ }
+    }, 1500);
+    return () => { if (reverseSyncTimerRef.current) clearTimeout(reverseSyncTimerRef.current); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [timelineItems, jobId, clipPreview, fullVideoRange, hasTranslation, showOriginalTranscript]);
 
   // Base name for transcript/SRT/VTT downloads — the source video's name
   // (without extension), so an export is "My Talk.srt" rather than the

@@ -6,6 +6,14 @@ import asyncio
 
 import pytest
 
+def _aiorun(coro):
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
+
 from backend.services import audio_analyzer as aa
 from backend.services.audio_analyzer import (
     MUSIC_MARKER, is_subtitle_marker, merge_markers, detect_music_markers,
@@ -67,7 +75,7 @@ def test_detect_music_markers_filters_short_and_speech(monkeypatch):
         ]
     monkeypatch.setattr(aa, "classify_audio_events", _fake_classify)
     transcript = [_seg(61, 65, "dialogue")]
-    markers = asyncio.get_event_loop().run_until_complete(
+    markers = _aiorun(
         detect_music_markers("/x.wav", transcript, min_seconds=5.0))
     assert len(markers) == 1
     assert markers[0]["text"] == MUSIC_MARKER
@@ -78,6 +86,6 @@ def test_detect_music_markers_noop_on_classify_failure(monkeypatch):
     async def _boom(audio_path, window_seconds=1.0):
         raise RuntimeError("numpy unavailable")
     monkeypatch.setattr(aa, "classify_audio_events", _boom)
-    markers = asyncio.get_event_loop().run_until_complete(
+    markers = _aiorun(
         detect_music_markers("/x.wav", [], min_seconds=5.0))
     assert markers == []

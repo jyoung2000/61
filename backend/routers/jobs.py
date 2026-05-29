@@ -735,18 +735,32 @@ class UpdateTranscriptSegmentRequest(BaseModel):
     speaker: str | None = None
     start: float | None = None
     end: float | None = None
+    words: list[dict] | None = None
+    # "translated" edits the translated track (when present), else "original".
+    target: str | None = None
 
 
 @router.put("/jobs/{job_id}/transcript/{segment_index}")
 async def update_transcript_segment(job_id: str, segment_index: int, req: UpdateTranscriptSegmentRequest):
-    """Update the text and/or speaker of a single transcript segment."""
+    """Update a single transcript segment's text/speaker/timing/words.
+
+    Targets the translated transcript when ``target='translated'`` and a
+    translation exists, so edits to the displayed (translated) subtitles
+    persist to the right track instead of silently editing the source text.
+    """
     job = await database.load_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    if not job.transcript or segment_index < 0 or segment_index >= len(job.transcript):
+
+    use_translated = (
+        (req.target or "").strip().lower() == "translated"
+        and bool(job.translated_transcript)
+    )
+    rows = job.translated_transcript if use_translated else job.transcript
+    if not rows or segment_index < 0 or segment_index >= len(rows):
         raise HTTPException(status_code=404, detail="Segment not found")
 
-    seg = job.transcript[segment_index]
+    seg = rows[segment_index]
     if isinstance(seg, dict):
         seg = TranscriptSegment(**seg)
     updates = {}
@@ -758,11 +772,19 @@ async def update_transcript_segment(job_id: str, segment_index: int, req: Update
         updates["start"] = req.start
     if req.end is not None:
         updates["end"] = req.end
+    if req.words is not None:
+        updates["words"] = req.words
     if updates:
         seg = seg.model_copy(update=updates)
-        job.transcript[segment_index] = seg
-        await database.save_job(job)
-    return {"job_id": job_id, "segment_index": segment_index, "text": seg.text, "speaker": seg.speaker, "start": seg.start, "end": seg.end}
+        rows[segment_index] = seg
+        if use_translated:
+            await database.update_job_status(
+                job_id, translated_transcript=[
+                    s.model_dump() if hasattr(s, "model_dump") else s for s in rows])
+        else:
+            await database.save_job(job)
+    return {"job_id": job_id, "segment_index": segment_index, "target": "translated" if use_translated else "original",
+            "text": seg.text, "speaker": seg.speaker, "start": seg.start, "end": seg.end}
 
 
 @router.delete("/jobs/{job_id}/transcript/{segment_index}")
@@ -810,6 +832,51 @@ async def insert_transcript_segment(job_id: str, req: InsertTranscriptSegmentReq
 
     await database.save_job(job)
     return {"job_id": job_id, "inserted_index": insert_index, "segment": new_seg.model_dump()}
+
+
+class BulkTranscriptReplaceRequest(BaseModel):
+    # Full ordered list of segments (start/end/text/speaker/words). This is the
+    # single source of truth for subtitle timing + text, written by both the
+    # transcript editor and the NLE timeline so the two stay in sync.
+    segments: list[dict]
+    # Which transcript to replace: "translated" (default when a translation
+    # exists) or "original". Keeping them separate means editing the
+    # translated subtitles never clobbers the source-language transcript.
+    target: str = "translated"
+
+
+@router.put("/jobs/{job_id}/transcript")
+async def replace_transcript(job_id: str, req: BulkTranscriptReplaceRequest):
+    """Replace a job's transcript wholesale, in chronological order.
+
+    Used by the NLE timeline to write subtitle-element timing / text / word
+    edits back to the canonical transcript (so the SRT/VTT/TXT downloads and
+    the transcript panel all reflect timeline edits), and vice-versa. Edits
+    persist to job.json and therefore survive container restarts.
+    """
+    job = await database.load_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    # Coerce + sort the incoming segments chronologically. Drop blank /
+    # backwards cues so a corrupt timeline edit can't poison the transcript.
+    from backend.services.transcript_sync import clean_and_sort_segments
+    rows = clean_and_sort_segments(req.segments)
+
+    target = (req.target or "translated").strip().lower()
+    # Only write the translated track when one already exists; otherwise the
+    # edit belongs to the original transcript.
+    use_translated = target == "translated" and bool(job.translated_transcript)
+    if use_translated:
+        await database.update_job_status(job_id, translated_transcript=rows)
+    else:
+        await database.update_job_status(job_id, transcript=rows)
+
+    return {
+        "job_id": job_id,
+        "target": "translated" if use_translated else "original",
+        "segments": len(rows),
+    }
 
 
 # --- Word timestamp refresh ---

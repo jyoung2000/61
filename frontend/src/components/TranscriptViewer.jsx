@@ -24,7 +24,18 @@ function formatTime(seconds) {
 }
 
 function toSRT(segments) {
-  return segments
+  // Match the backend / hand-authored SRT format: chronological cues, and
+  // omit the "Speaker:" prefix when the whole transcript is a single speaker
+  // (narration / solo talking-head) — keep it only for multi-speaker content.
+  const cues = (segments || [])
+    .filter((s) => (s.text || '').trim() && s.end >= s.start)
+    .slice()
+    .sort((a, b) => a.start - b.start);
+  const distinctSpeakers = new Set(
+    cues.map((s) => (s.speaker || '').trim()).filter(Boolean),
+  );
+  const showSpeaker = distinctSpeakers.size > 1;
+  return cues
     .map((seg, i) => {
       const startH = Math.floor(seg.start / 3600);
       const startM = Math.floor((seg.start % 3600) / 60);
@@ -34,7 +45,8 @@ function toSRT(segments) {
       const endM = Math.floor((seg.end % 3600) / 60);
       const endS = Math.floor(seg.end % 60);
       const endMs = Math.floor((seg.end % 1) * 1000);
-      return `${i + 1}\n${String(startH).padStart(2, '0')}:${String(startM).padStart(2, '0')}:${String(startS).padStart(2, '0')},${String(startMs).padStart(3, '0')} --> ${String(endH).padStart(2, '0')}:${String(endM).padStart(2, '0')}:${String(endS).padStart(2, '0')},${String(endMs).padStart(3, '0')}\n${seg.speaker}: ${seg.text}`;
+      const body = showSpeaker && seg.speaker ? `${seg.speaker}: ${seg.text}` : seg.text;
+      return `${i + 1}\n${String(startH).padStart(2, '0')}:${String(startM).padStart(2, '0')}:${String(startS).padStart(2, '0')},${String(startMs).padStart(3, '0')} --> ${String(endH).padStart(2, '0')}:${String(endM).padStart(2, '0')}:${String(endS).padStart(2, '0')},${String(endMs).padStart(3, '0')}\n${body}`;
     })
     .join('\n\n');
 }
