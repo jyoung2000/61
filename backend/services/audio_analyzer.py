@@ -391,6 +391,91 @@ async def classify_audio_events(
     return cleaned
 
 
+# Default marker for sustained music regions (OP/ED themes, insert songs).
+# A unicode music note bracketed so it reads as a caption cue, not dialogue.
+MUSIC_MARKER = "[♪ music ♪]"
+
+
+def is_subtitle_marker(text: str) -> bool:
+    """True when ``text`` is a bracketed non-speech caption marker (music /
+    applause / laughter) rather than translatable dialogue. Used to keep
+    such cues verbatim through the translator."""
+    t = (text or "").strip()
+    if not t:
+        return False
+    if not (t.startswith("[") and t.endswith("]")):
+        return False
+    inner = t[1:-1]
+    # A marker has no sentence-like content — just a short tag (+ the note).
+    return ("♪" in t) or (len(inner.split()) <= 2 and inner.replace(" ", "").isalpha())
+
+
+def merge_markers(transcript: list, markers: list) -> list:
+    """Merge non-speech ``markers`` into ``transcript`` (both lists of dicts),
+    returned sorted by start time. Markers that overlap an existing segment
+    are dropped so they never collide with dialogue. Pure / deterministic."""
+    if not markers:
+        return transcript
+
+    def _span(seg):
+        if isinstance(seg, dict):
+            return (float(seg.get("start", seg.get("start_sec", 0)) or 0),
+                    float(seg.get("end", seg.get("end_sec", 0)) or 0))
+        return (float(getattr(seg, "start", 0) or 0), float(getattr(seg, "end", 0) or 0))
+
+    spans = sorted(_span(s) for s in (transcript or []))
+
+    def _overlaps(s, e):
+        for ws, we in spans:
+            if we <= s:
+                continue
+            if ws >= e:
+                break
+            if min(we, e) > max(ws, s):
+                return True
+        return False
+
+    out = list(transcript or [])
+    for m in markers:
+        ms, me = _span(m)
+        if me <= ms or _overlaps(ms, me):
+            continue
+        out.append(m)
+    out.sort(key=lambda s: _span(s)[0])
+    return out
+
+
+async def detect_music_markers(
+    audio_path: str,
+    transcript: list,
+    min_seconds: float = 5.0,
+    label: str = MUSIC_MARKER,
+) -> list:
+    """Classify the audio and return ``[{start,end,text}]`` marker cues for
+    sustained music regions (>= ``min_seconds``) that don't overlap speech.
+
+    No-ops to ``[]`` when numpy/ffmpeg are unavailable or the audio can't be
+    read — so the pipeline degrades to "no markers" without raising.
+    """
+    try:
+        events = await classify_audio_events(audio_path)
+    except Exception as e:
+        logger.info("detect_music_markers: classify failed (%s) — no markers", e)
+        return []
+    music = [e for e in events
+             if e.get("type") == "music" and float(e.get("duration", 0)) >= min_seconds]
+    if not music:
+        return []
+    raw = build_non_speech_subtitle_events(
+        music, transcript, min_event_s=min_seconds)
+    # Relabel to the music marker (build_non_speech_subtitle_events emits
+    # "[music]"; the user wants the ♪ form).
+    for ev in raw:
+        ev["text"] = label
+        ev["speaker"] = ""
+    return raw
+
+
 def build_non_speech_subtitle_events(
     audio_events: list[dict],
     transcript_segments: list,

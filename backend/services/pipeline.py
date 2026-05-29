@@ -1172,8 +1172,16 @@ async def _background_post_processing(
         # Translator calls ``seg.text`` directly, so make sure every
         # row is a TranscriptSegment regardless of upstream shape.
         from backend.models import TranscriptSegment as _TS_for_translate
+        from backend.services.audio_analyzer import is_subtitle_marker as _is_marker
         _trans_input = []
+        _music_markers = []   # non-speech cues kept verbatim, re-merged after
         for t in (transcript or []):
+            _txt = t.get("text", "") if isinstance(t, dict) else getattr(t, "text", "")
+            if _is_marker(_txt):
+                # Language-neutral marker ("[♪ music ♪]") — don't translate it.
+                _music_markers.append(t if isinstance(t, dict) else (
+                    t.model_dump() if hasattr(t, "model_dump") else dict(t)))
+                continue
             if isinstance(t, _TS_for_translate):
                 _trans_input.append(t)
             elif isinstance(t, dict):
@@ -1262,7 +1270,17 @@ async def _background_post_processing(
             except Exception as _trd_err:
                 logger.debug("[%s] Translated readability skipped: %s", job_id, _trd_err)
 
-            _update_kwargs = {"translated_transcript": list(translated)}
+            # Re-insert the language-neutral music markers we held out of
+            # translation so the translated track shows them too.
+            _translated_out = [
+                t.model_dump() if hasattr(t, "model_dump") else dict(t)
+                for t in translated
+            ]
+            if _music_markers:
+                from backend.services.audio_analyzer import merge_markers
+                _translated_out = merge_markers(_translated_out, _music_markers)
+
+            _update_kwargs = {"translated_transcript": _translated_out}
             if _tr_readability is not None:
                 _update_kwargs["transcript_readability"] = _tr_readability
             await database.update_job_status(job_id, **_update_kwargs)
@@ -2450,6 +2468,32 @@ async def _run_analysis_inner(job_id: str):
                 "[%s] Raw transcript readability pass failed (%s) — keeping Whisper output as-is",
                 job_id, _re_err,
             )
+
+    # ── Music marking ──
+    # Insert "[♪ music ♪]" marker cues over sustained music regions (OP/ED
+    # themes, insert songs) instead of leaving a gap or letting Whisper
+    # hallucinate lyrics there. Markers are language-neutral and pass through
+    # the translator verbatim. No-ops gracefully if audio/numpy is missing.
+    if getattr(settings, "SUBTITLE_MARK_MUSIC", True) and transcript:
+        try:
+            _audio_wav = os.path.join(job_dir, "audio.wav")
+            if os.path.isfile(_audio_wav):
+                from backend.services.audio_analyzer import (
+                    detect_music_markers, merge_markers,
+                )
+                _markers = await detect_music_markers(
+                    _audio_wav, transcript,
+                    min_seconds=float(getattr(settings, "SUBTITLE_MUSIC_MIN_SEC", 5.0)),
+                )
+                if _markers:
+                    transcript = merge_markers(transcript, _markers)
+                    logger.info(
+                        "[%s] Music marking: inserted %d [♪ music ♪] cue(s)",
+                        job_id, len(_markers),
+                    )
+        except Exception as _mm_err:
+            logger.warning(
+                "[%s] Music marking skipped (%s)", job_id, _mm_err)
 
     # ── Transcript readability score ──
     # Returns a Netflix-style A-F grade + per-axis sub-scores (CPS,

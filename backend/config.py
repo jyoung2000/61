@@ -264,6 +264,15 @@ class Settings(BaseSettings):
     NMT_NLLB_MODEL: str = "facebook/nllb-200-distilled-600M"
     NMT_OPUS_MT_TEMPLATE: str = "Helsinki-NLP/opus-mt-{src}-{tgt}"
 
+    # ── Music marking ──
+    # Insert a "[♪ music ♪]" marker cue over sustained music regions (OP/ED
+    # themes, insert songs) instead of letting Whisper hallucinate lyrics or
+    # leave a silent gap. The viewer sees that music is playing; lyrics are
+    # NOT transcribed/translated. Markers are language-neutral and pass
+    # through the translator verbatim.
+    SUBTITLE_MARK_MUSIC: bool = True
+    SUBTITLE_MUSIC_MIN_SEC: float = 5.0         # only mark sustained music
+
     # ── Audio Analysis ──
     AUDIO_EVENT_DETECTION: bool = True          # spectral audio event classification
     AUDIO_EVENTS_IN_SUBTITLES: bool = False     # inject [applause], [music] into subtitle track
