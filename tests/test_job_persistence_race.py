@@ -136,3 +136,70 @@ def test_retranscribe_default_allows_terminal_transition(tmp_job_store):
 
     result = _run(scenario())
     assert str(result.status) == str(JobStatus.TRANSCRIBING)
+
+
+# ── Regression: COMPLETE save must carry summary + clips + transcript ──────
+# A JA→EN job reached COMPLETE with empty summary/clips on the frontend
+# ("Generating summary..." forever). Root cause: when the first full
+# COMPLETE save didn't round-trip, the fallback re-saved status ONLY,
+# leaving summary/clips/transcript empty. The pipeline now re-issues the
+# FULL payload on the verify-retry. These tests lock in the persistence
+# contract that fix depends on.
+
+from backend.models import VideoSummary
+
+
+def _mk_summary() -> VideoSummary:
+    return VideoSummary(
+        overview="A Gundam battle.", key_topics=["mecha", "war"],
+        tone="dramatic", estimated_audience="anime fans",
+        content_category="animation",
+    )
+
+
+def test_complete_save_persists_summary_clips_transcript(tmp_job_store):
+    """The full COMPLETE payload round-trips all three result fields."""
+    async def scenario():
+        job = JobResult(job_id="c", filename="f", file_path="p",
+                        status=JobStatus.DETECTING_CLIPS.value)
+        await db.save_job(job)
+        await db.update_job_status(
+            "c", status=JobStatus.COMPLETE.value, progress=100,
+            summary=_mk_summary(), clips=[_mk_clip()],
+            transcript=[_mk_seg("hello"), _mk_seg("world")],
+        )
+        return await db.load_job("c")
+
+    result = _run(scenario())
+    assert str(result.status) == str(JobStatus.COMPLETE)
+    assert result.summary is not None and result.summary.overview
+    assert len(result.clips) == 1
+    assert len(result.transcript) == 2
+
+
+def test_full_payload_resave_restores_after_status_only_loss(tmp_job_store):
+    """Simulate the production failure + the fix: a status-only COMPLETE
+    leaves the results empty; re-issuing the FULL payload restores them."""
+    async def scenario():
+        job = JobResult(job_id="d", filename="f", file_path="p",
+                        status=JobStatus.DETECTING_CLIPS.value)
+        await db.save_job(job)
+        # The old fallback behaviour: status flips to COMPLETE but the
+        # results were never carried → empty summary/clips (the bug).
+        await db.update_job_status("d", status=JobStatus.COMPLETE.value, progress=100)
+        broken = await db.load_job("d")
+        assert str(broken.status) == str(JobStatus.COMPLETE)
+        assert broken.summary is None and len(broken.clips) == 0
+        # The fix: re-issue the FULL payload.
+        complete_fields = dict(
+            status=JobStatus.COMPLETE.value, progress=100,
+            summary=_mk_summary(), clips=[_mk_clip()],
+            transcript=[_mk_seg("hi")],
+        )
+        await db.update_job_status("d", **complete_fields)
+        return await db.load_job("d")
+
+    result = _run(scenario())
+    assert result.summary is not None and result.summary.overview
+    assert len(result.clips) == 1
+    assert len(result.transcript) == 1

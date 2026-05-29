@@ -2273,6 +2273,12 @@ async def _run_analysis_inner(job_id: str):
         )
         subject_track = to_fez_subject_track(perception, reframer_plan)
 
+    # Whisper's detected language — hoisted here so the critical-path polish
+    # block below can pass it to the polisher (CJK-specific rules). It was
+    # previously only assigned much later, which raised UnboundLocalError in
+    # the polish try/except and silently disabled the LLM polish pass.
+    _detected_lang = getattr(perception, "detected_language", "") or ""
+
     # ── Speaker fusion (Task 2): overlap voting + mid-segment splits +
     # word-level regrouping. Replaces to_fez_transcript's basic per-segment
     # majority vote with a proper diarization→transcript merge, so speaker
@@ -2575,7 +2581,7 @@ async def _run_analysis_inner(job_id: str):
     )
     _n_segs = len(transcript)
     _n_scenes_val = len(scenes)
-    _detected_lang = getattr(perception, "detected_language", "") or ""
+    # _detected_lang was hoisted above (right after the bridge conversion).
     _lang_note = f" [{_detected_lang}]" if _detected_lang else ""
     # Keep the in-memory compat_stubs dict in sync so the background
     # post-processing task can use it as a reliable fallback even when
@@ -2770,8 +2776,12 @@ async def _run_analysis_inner(job_id: str):
         else:
             _clip_models.append(_c)
 
-    await database.update_job_status(
-        job_id,
+    # The full COMPLETE payload, kept in one dict so the verify-retry below
+    # can re-issue *everything* (not just status) if the first save didn't
+    # round-trip. Re-saving status alone — the previous behaviour — left the
+    # job COMPLETE but with empty summary/clips/transcript, which the UI
+    # renders as a permanent "Generating summary..." spinner with no clips.
+    _complete_fields = dict(
         status=JobStatus.COMPLETE,
         progress=100,
         progress_message=f"Analysis complete — {len(_clip_models)} clips, {len(scenes)} scenes",
@@ -2784,23 +2794,30 @@ async def _run_analysis_inner(job_id: str):
         cost_breakdown=_cost_breakdown,
         default_layout_mode="single",
     )
+    await database.update_job_status(job_id, **_complete_fields)
 
     # Defensive verification: reload and confirm status persisted as
     # COMPLETE. Belt-and-suspenders for the
     # PydanticSerializationUnexpectedValue corruption case the
     # coercion above is meant to prevent — if for any reason the
-    # status field still didn't round-trip cleanly, re-issue a
-    # status-only save so the UI doesn't get stuck on "Finalizing
-    # clip detection...".
+    # status field still didn't round-trip cleanly, re-issue the FULL
+    # payload (summary/scenes/transcript/clips) so the UI doesn't get
+    # stuck on "Generating summary..." with empty results.
     try:
         _verify = await database.load_job(job_id)
         if _verify is not None and str(getattr(_verify, "status", "")) != JobStatus.COMPLETE.value:
             logger.warning(
-                "[%s] COMPLETE save did not persist (status=%r) — retrying status-only update",
+                "[%s] COMPLETE save did not persist (status=%r) — re-saving full payload",
                 job_id, getattr(_verify, "status", None),
             )
-            await database.update_job_status(
-                job_id, status=JobStatus.COMPLETE, progress=100,
+            await database.update_job_status(job_id, **_complete_fields)
+            _verify2 = await database.load_job(job_id)
+            _ok = _verify2 is not None and str(getattr(_verify2, "status", "")) == JobStatus.COMPLETE.value
+            _has_summary = bool(getattr(_verify2, "summary", None)) if _verify2 else False
+            logger.warning(
+                "[%s] COMPLETE re-save result: status_ok=%s, summary_present=%s, clips=%d",
+                job_id, _ok, _has_summary,
+                len(getattr(_verify2, "clips", []) or []) if _verify2 else 0,
             )
     except Exception as _verify_err:
         logger.info("[%s] COMPLETE save verify skipped: %s", job_id, _verify_err)
