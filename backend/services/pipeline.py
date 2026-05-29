@@ -517,6 +517,18 @@ def _resolve_pipeline_stage(status: str, progress: int) -> dict:
     return best or {}
 
 
+# Jobs currently in the COMPLETE-finalization window. While a job is here,
+# every in-flight / queued progress relay is a no-op so it can NEVER write a
+# non-terminal status (e.g. ``detecting_clips``) over the COMPLETE save. This
+# is stronger than ``protect_terminal`` (which can be defeated by a relay that
+# loaded the pre-COMPLETE snapshot and commits just after the COMPLETE write):
+# the gate is a synchronous set-membership check at coroutine entry, so it
+# holds regardless of lock/loop scheduling. Production symptom it fixes: the
+# UI stuck at 94 % "Asking the VLM…" / "Generating summary…" because the
+# persisted status kept reverting to detecting_clips.
+_finalizing_jobs: set = set()
+
+
 async def _update_progress(
     job_id: str, status: str, progress: int, message: str,
     protect_terminal: bool = True,
@@ -534,6 +546,13 @@ async def _update_progress(
     passes ``protect_terminal=False``."""
     if is_cancel_requested(job_id):
         raise CancelledError(f"Job {job_id} was cancelled by user")
+    # Hard gate: once finalization starts, drop every non-terminal progress
+    # write (queued clipper/perceiver relays included) so the COMPLETE status
+    # cannot be reverted to detecting_clips.
+    _status_str = status.value if hasattr(status, "value") else str(status)
+    if job_id in _finalizing_jobs and _status_str not in (
+            "complete", "failed", "cancelled"):
+        return
     await database.update_job_status(
         job_id,
         status=status,
@@ -1397,6 +1416,9 @@ async def _background_post_processing(
 
 async def run_analysis(job_id: str):
     """Execute the full analysis pipeline for a video job."""
+    # Clear any stale finalization gate from a previous run so this run's
+    # progress writes (and the QUEUED reset below) aren't suppressed.
+    _finalizing_jobs.discard(job_id)
     # Set up cancellation event for this job
     _cancel_events[job_id] = asyncio.Event()
     sem = get_semaphore()
@@ -2799,6 +2821,9 @@ async def _run_analysis_inner(job_id: str):
         pass
     _total_cost_usd = round(_total_cost_usd, 4)
 
+    # Enter the finalization window: from here on, no progress relay may
+    # write a non-terminal status (see _finalizing_jobs / _update_progress).
+    _finalizing_jobs.add(job_id)
     await _update_progress(job_id, JobStatus.DETECTING_CLIPS, 98, "Saving results...")
 
     # Coerce ``to_fez_clips`` dicts → ClipCandidate models before the
@@ -2829,6 +2854,33 @@ async def _run_analysis_inner(job_id: str):
         else:
             _clip_models.append(_c)
 
+    # Coerce scenes + transcript to their models too (clips already are).
+    # Raw list[dict] in a typed list[Model] field triggers
+    # PydanticSerializationUnexpectedValue on model_dump — and, with numpy
+    # values from the reframer (np.float32 precise_x, np.int64 face_count)
+    # bypassing SceneDescription's before-validator, can corrupt the round
+    # trip so the status reverts. Validating here runs the sanitizers and
+    # guarantees a clean, JSON-safe payload.
+    from backend.models import SceneDescription as _SceneModel
+    from backend.models import TranscriptSegment as _TSegModel
+
+    def _coerce_list(rows, model):
+        out = []
+        for r in (rows or []):
+            if isinstance(r, model):
+                out.append(r)
+            elif isinstance(r, dict):
+                try:
+                    out.append(model(**r))
+                except Exception:
+                    out.append(r)
+            else:
+                out.append(r)
+        return out
+
+    _scene_models = _coerce_list(scenes, _SceneModel)
+    _transcript_models = _coerce_list(transcript, _TSegModel)
+
     # The full COMPLETE payload, kept in one dict so the verify-retry below
     # can re-issue *everything* (not just status) if the first save didn't
     # round-trip. Re-saving status alone — the previous behaviour — left the
@@ -2839,8 +2891,8 @@ async def _run_analysis_inner(job_id: str):
         progress=100,
         progress_message=f"Analysis complete — {len(_clip_models)} clips, {len(scenes)} scenes",
         summary=summary,
-        scenes=scenes,
-        transcript=transcript,
+        scenes=_scene_models,
+        transcript=_transcript_models,
         clips=_clip_models,
         analysis_duration_seconds=_analysis_seconds,
         estimated_cost_usd=_total_cost_usd,
