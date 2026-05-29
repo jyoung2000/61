@@ -494,6 +494,7 @@ def _split_segment(
     seg: TranscriptSegment,
     target_cps: float,
     min_piece_duration: float = 0.5,
+    min_split_chars: int = 0,
 ) -> list[TranscriptSegment]:
     """Try to split a single segment in two at a linguistic boundary so
     each half satisfies the CPS limit. Returns ``[seg]`` if no useful
@@ -520,7 +521,8 @@ def _split_segment(
         if (midpoint - seg.start) >= min_piece_duration and (seg.end - midpoint) >= min_piece_duration:
             left_text = text[:split_text_idx].strip()
             right_text = text[split_text_idx:].strip()
-            if left_text and right_text:
+            if (left_text and right_text
+                    and not _split_would_strand(left_text, right_text, min_split_chars)):
                 left = TranscriptSegment(
                     start=seg.start, end=midpoint, text=left_text,
                     speaker=seg.speaker, words=left_words, confidence=seg.confidence,
@@ -542,6 +544,10 @@ def _split_segment(
     left_text = text[:split_idx].strip()
     right_text = text[split_idx:].strip()
     if not left_text or not right_text:
+        return [seg]
+    if _split_would_strand(left_text, right_text, min_split_chars):
+        # Splitting here would strand a sub-readable (e.g. one-word) cue —
+        # keep the phrase together even if it runs a little long.
         return [seg]
 
     # Prefer Whisper's word-level timestamps over character-proportional
@@ -608,6 +614,37 @@ def _truncate_fillers(text: str) -> str:
     return out or text
 
 
+# Minimum text a split piece may carry. Slow / dramatic narration (Whisper
+# detects 5-7 s pauses *between* individual words) used to be shattered into
+# one-word cues by the max-duration splitter — each gap is a valid split
+# point, so the recursion kept cutting until every word was its own cue.
+# That destroys subtitle readability AND translation quality (the per-cue
+# translator is handed a lone word with no phrase to translate). This guard
+# refuses any split that would leave a piece shorter than the threshold, so
+# a slowly-spoken sentence stays grouped into readable phrases (displayed a
+# little longer) instead of a stream of single words.
+def _piece_too_short(text: str, is_cjk: bool, min_chars: int) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return True
+    if is_cjk:
+        n = sum(1 for ch in t if not ch.isspace())
+        return n < max(3, min_chars // 2)
+    # Latin: require both a minimum char count and at least two words so we
+    # never strand a single word on its own cue.
+    return len(t) < min_chars or len(t.split()) < 2
+
+
+def _split_would_strand(left_text: str, right_text: str, min_chars: int) -> bool:
+    """True when splitting into ``left``/``right`` would create a sub-readable
+    (e.g. one-word) cue — in which case the caller should NOT split."""
+    if min_chars <= 0:
+        return False
+    is_cjk = _is_cjk((left_text or "") + (right_text or ""))
+    return (_piece_too_short(left_text, is_cjk, min_chars)
+            or _piece_too_short(right_text, is_cjk, min_chars))
+
+
 def enforce_readability(
     segments: list[TranscriptSegment],
     max_cps: float = 20.0,
@@ -618,6 +655,7 @@ def enforce_readability(
     min_gap_ms: int = 80,
     smart_line_breaks: bool = True,
     auto_cjk: bool = True,
+    min_split_chars: Optional[int] = None,
 ) -> list[TranscriptSegment]:
     """Apply Netflix-style readability rules to a list of subtitle events.
 
@@ -636,6 +674,15 @@ def enforce_readability(
     """
     if not segments:
         return []
+
+    # Resolve the minimum-text split guard (prevents one-word cues on slow
+    # speech). 0 disables it (legacy behaviour).
+    if min_split_chars is None:
+        try:
+            from backend.config import settings as _s
+            min_split_chars = int(getattr(_s, "SUBTITLE_MIN_SPLIT_CHARS", 10))
+        except Exception:
+            min_split_chars = 10
 
     # Auto-detect CJK content and tighten the readability budget.
     # Netflix Japan / Korea spec: CJK characters are read ~60% faster
@@ -676,7 +723,7 @@ def enforce_readability(
             changed = False
             for p in pieces:
                 if _cps(p.text.strip(), max(0.001, p.end - p.start)) > max_cps:
-                    halves = _split_segment(p, max_cps)
+                    halves = _split_segment(p, max_cps, min_split_chars=min_split_chars)
                     if len(halves) > 1:
                         new_pieces.extend(halves)
                         changed = True
@@ -731,7 +778,8 @@ def enforce_readability(
             mid = max(seg.start + 0.05, min(seg.end - 0.05, mid))
             left_text = seg.text[:split_text_idx].strip()
             right_text = seg.text[split_text_idx:].strip()
-            if left_text and right_text:
+            if (left_text and right_text
+                    and not _split_would_strand(left_text, right_text, min_split_chars)):
                 return [
                     TranscriptSegment(
                         start=seg.start, end=mid, text=left_text,
@@ -750,6 +798,8 @@ def enforce_readability(
         if split_idx and _edge <= split_idx <= len(seg.text) - _edge:
             left_text = seg.text[:split_idx].strip()
             right_text = seg.text[split_idx:].strip()
+            if _split_would_strand(left_text, right_text, min_split_chars):
+                return None
             word_timed = _word_timed_midpoint(seg, split_idx)
             if word_timed is not None:
                 mid, left_words, right_words = word_timed

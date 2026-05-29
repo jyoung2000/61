@@ -235,6 +235,11 @@ class Settings(BaseSettings):
                                                 # so a long Whisper segment gets
                                                 # broken into bite-sized captions
     SUBTITLE_SMART_LINE_BREAKS: bool = True     # linguistic boundary breaks
+    # Minimum characters a split piece may carry. Stops the duration
+    # splitter from shattering slow / dramatic narration (Whisper detects
+    # multi-second pauses *between* words) into unreadable one-word cues,
+    # which also wrecks per-cue translation. 0 disables the guard.
+    SUBTITLE_MIN_SPLIT_CHARS: int = 10
     SUBTITLE_PLATFORM_SAFE_ZONES: bool = True   # per-platform margin profiles
     SUBTITLE_PLATFORM_PROFILE: str = ""         # "" | tiktok | reels | shorts | horizontal | square
 
