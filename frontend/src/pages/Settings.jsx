@@ -604,27 +604,22 @@ export default function Settings() {
   // mirror of the existing 'ollama/' branch.
   const _toJudgeSpec = (modelId) => {
     if (!modelId) return '';
-    // Look up against editorial first, then primary, so a model that
-    // briefly disappears from one list doesn't get re-tagged 'openrouter'
-    // (the previous default was the largest source of spec corruption).
-    const editorial = availableModels.editorial || [];
-    const primary = availableModels.primary || [];
-    const m = editorial.find((x) => x.id === modelId)
-            || primary.find((x) => x.id === modelId);
-    const provider = (m && m.provider) || 'openrouter';
-    const stripPrefix = (s, p) => (s.startsWith(p) ? s.slice(p.length) : s);
-    if (provider === 'ollama' || provider === 'local') {
-      return `ollama:${stripPrefix(modelId, 'ollama/')}`;
-    }
-    if (provider === 'anthropic') {
-      return `anthropic:${stripPrefix(modelId, 'anthropic/')}`;
-    }
-    if (provider === 'gemini') {
-      return `gemini:${stripPrefix(modelId, 'google/')}`;
-    }
-    if (provider === 'groq') {
-      return `groq:${stripPrefix(modelId, 'groq/')}`;
-    }
+    // Map a dropdown model ID to a "<backend>:<model>" judge spec.
+    // Only google/anthropic/groq/ollama/openrouter are real judge backends.
+    // OpenRouter model IDs carry a model-FAMILY prefix (qwen/, meta-llama/,
+    // mistralai/, deepseek/ as well as openrouter/) - anything that is NOT a
+    // known direct backend must be routed through OpenRouter with its FULL id,
+    // otherwise the spec round-trips to an invalid "<family>:..." backend and
+    // the dropdown can't restore the selection (the Editorial AI Fallback bug
+    // with qwen/qwen3-next-80b-a3b-instruct:free).
+    const idx = modelId.indexOf('/');
+    const prefix = idx >= 0 ? modelId.slice(0, idx) : '';
+    const rest = idx >= 0 ? modelId.slice(idx + 1) : modelId;
+    if (prefix === 'google') return `gemini:${rest}`;
+    if (prefix === 'anthropic') return `anthropic:${rest}`;
+    if (prefix === 'groq') return `groq:${rest}`;
+    if (prefix === 'ollama') return `ollama:${rest}`;
+    if (prefix === 'openrouter') return `openrouter:${rest}`;
     return `openrouter:${modelId}`;
   };
 
