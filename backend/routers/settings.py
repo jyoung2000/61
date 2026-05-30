@@ -3723,10 +3723,15 @@ async def get_judge_config():
     Fallback dropdown survive a no-cache container rebuild.
     """
     cfg = _read_clipper_config()
+    _setting_fb = (getattr(settings, "EDITORIAL_AI_FALLBACK_SPEC", "") or "").strip()
+    _cfg_fb = (cfg.get("judge_fallback", "") or "")
     primary = (getattr(settings, "EDITORIAL_AI_PRIMARY_SPEC", "") or "").strip() \
         or (cfg.get("judge_primary", "") or "")
-    fallback = (getattr(settings, "EDITORIAL_AI_FALLBACK_SPEC", "") or "").strip() \
-        or (cfg.get("judge_fallback", "") or "")
+    fallback = _setting_fb or _cfg_fb
+    logger.info(
+        "judge-config GET: fallback=%r (setting=%r, clipper_config=%r), primary=%r",
+        fallback, _setting_fb, _cfg_fb, primary,
+    )
     return {"primary": primary, "fallback": fallback}
 
 
@@ -3738,6 +3743,10 @@ async def put_judge_config(req: JudgeConfigRequest):
     or empty strings. Empty primary disables the judge entirely; empty
     fallback disables the safety net but keeps the primary.
     """
+    logger.info(
+        "judge-config PUT received: primary=%r fallback=%r",
+        req.primary, req.fallback,
+    )
     updates = {}
     if req.primary is not None:
         updates["judge_primary"] = req.primary.strip()
@@ -3754,6 +3763,11 @@ async def put_judge_config(req: JudgeConfigRequest):
     if req.fallback is not None:
         settings.EDITORIAL_AI_FALLBACK_SPEC = req.fallback.strip()
     _persist_user_settings()
+    logger.info(
+        "judge-config PUT persisted: EDITORIAL_AI_FALLBACK_SPEC=%r (clipper_config judge_fallback=%r)",
+        getattr(settings, "EDITORIAL_AI_FALLBACK_SPEC", ""),
+        cfg.get("judge_fallback", ""),
+    )
 
     # Back up judge specs to user_settings.json so they survive any scenario
     # where clipper_config.json is lost (stale volume, first-time mount, etc.).
