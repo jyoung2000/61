@@ -127,7 +127,10 @@ async def list_jobs(
     the admin view so legacy jobs remain accessible.
     """
     jobs = []
-    uploads_dir = "/data/uploads"
+    # Derive the uploads root from _job_dir so tests that monkeypatch
+    # _job_dir (and any future relocation) are honored by list_jobs too,
+    # instead of this hard-coding /data/uploads independently.
+    uploads_dir = os.path.dirname(_job_dir("_"))
     if not os.path.exists(uploads_dir):
         return jobs
     norm_username = (owner_username or "").strip().lower() or None

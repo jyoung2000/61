@@ -581,6 +581,33 @@ async def restore_judge_specs():
         logger.warning("Judge spec restore failed (non-fatal): %s", exc)
 
 
+_RECONCILE_IN_PROGRESS = {
+    "analyzing_scenes", "extracting_frames", "generating_summary", "detecting_clips",
+}
+
+
+async def _reconcile_finished_jobs() -> int:
+    """Flip any non-terminal job that actually has results (clips / summary)
+    to COMPLETE. Runs at startup AND periodically so a job whose COMPLETE
+    save didn't persist recovers without a restart. Returns count fixed."""
+    import backend.database as _db
+    fixed = 0
+    for job in await _db.list_jobs(include_unowned=True):
+        if job.status not in _RECONCILE_IN_PROGRESS:
+            continue
+        if bool(getattr(job, "clips", None)) or getattr(job, "summary", None) is not None:
+            await _db.update_job_status(
+                job.job_id, status="complete", progress=100,
+                progress_message="Analysis complete",
+            )
+            logger.warning(
+                "Reconcile: job %s was '%s' but has results — marked COMPLETE",
+                job.job_id, job.status,
+            )
+            fixed += 1
+    return fixed
+
+
 @app.on_event("startup")
 async def recover_orphaned_jobs():
     """Mark jobs that were running when the server last shut down as failed.
@@ -599,6 +626,9 @@ async def recover_orphaned_jobs():
         "detecting_clips",
     }
     try:
+        # First, complete any job that actually finished (has clips / summary)
+        # but was left non-terminal — must NOT be marked failed.
+        completed = await _reconcile_finished_jobs()
         all_jobs = await _db.list_jobs(include_unowned=True)
         recovered = 0
         for job in all_jobs:
@@ -616,8 +646,12 @@ async def recover_orphaned_jobs():
                     job.job_id, job.status,
                 )
                 recovered += 1
-        if recovered:
-            logger.info("Startup recovery: %d orphaned job(s) marked failed", recovered)
+        if recovered or completed:
+            logger.info(
+                "Startup recovery: %d orphaned job(s) marked failed, "
+                "%d finished-but-unmarked job(s) marked complete",
+                recovered, completed,
+            )
     except Exception as exc:
         logger.warning("Orphaned job recovery failed (non-fatal): %s", exc)
 
@@ -642,6 +676,13 @@ async def start_cleanup_task():
                 expire_stale_uploads()
             except Exception as exc:
                 logger.warning("Stale upload cleanup error: %s", exc)
+            # Periodic self-heal: complete any job that finished (has clips /
+            # summary) but whose status was never persisted as COMPLETE, so a
+            # "stuck judging clips" job recovers WITHOUT requiring a restart.
+            try:
+                await _reconcile_finished_jobs()
+            except Exception as exc:
+                logger.warning("Finished-job reconcile error: %s", exc)
 
     asyncio.create_task(cleanup_loop())
 
