@@ -1573,6 +1573,7 @@ async def run_analysis(job_id: str):
             hb.stop()
             _heartbeats.pop(job_id, None)
             _cancel_events.pop(job_id, None)
+            _finalizing_jobs.discard(job_id)
             # Even when the job didn't finish cleanly, persist whatever
             # stage timings + warnings we collected so the UI can show
             # where it died. Best-effort: any DB error is logged but

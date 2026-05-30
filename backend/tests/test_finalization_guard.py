@@ -156,3 +156,61 @@ def test_persist_complete_job_forces_job_id(tmp_path, monkeypatch):
     reloaded = _aiorun(db.load_job("K"))
     assert str(reloaded.status) == str(_JS.COMPLETE)
     assert reloaded.job_id == "K"   # forced to the directory key
+
+
+# ── WS replays current status on connect (recovers a missed COMPLETE) ──────
+
+class _FakeWS:
+    def __init__(self):
+        self.sent = []
+        self._first = True
+
+    async def accept(self):
+        pass
+
+    async def send_json(self, payload):
+        self.sent.append(payload)
+
+    async def receive_text(self):
+        # Disconnect right after the on-connect replay so the endpoint exits.
+        from fastapi import WebSocketDisconnect
+        raise WebSocketDisconnect()
+
+
+def test_ws_replays_complete_status_on_connect(tmp_path, monkeypatch):
+    import os
+    import backend.database as db
+    from backend.models import JobResult, JobStatus as _JS
+    from backend.routers import ws as ws_router
+
+    d = str(tmp_path)
+    monkeypatch.setattr(db, "_job_dir", lambda jid: os.path.join(d, jid))
+    _aiorun(db.save_job(JobResult(
+        job_id="C", filename="v.mp4", file_path="p",
+        status=_JS.COMPLETE.value, progress=100)))
+
+    fake = _FakeWS()
+    _aiorun(ws_router.websocket_job_progress(fake, "C"))
+    # The very first frame must announce completion so a reconnecting client
+    # that missed the live broadcast flips out of the in-progress overlay.
+    assert fake.sent, "no status frame replayed on connect"
+    assert fake.sent[0]["type"] == "complete"
+    assert fake.sent[0]["status"] == "complete"
+
+
+def test_ws_replays_inprogress_status_on_connect(tmp_path, monkeypatch):
+    import os
+    import backend.database as db
+    from backend.models import JobResult, JobStatus as _JS
+    from backend.routers import ws as ws_router
+
+    d = str(tmp_path)
+    monkeypatch.setattr(db, "_job_dir", lambda jid: os.path.join(d, jid))
+    _aiorun(db.save_job(JobResult(
+        job_id="P", filename="v.mp4", file_path="p",
+        status=_JS.DETECTING_CLIPS.value, progress=80)))
+
+    fake = _FakeWS()
+    _aiorun(ws_router.websocket_job_progress(fake, "P"))
+    assert fake.sent[0]["type"] == "status"
+    assert fake.sent[0]["status"] == "detecting_clips"
