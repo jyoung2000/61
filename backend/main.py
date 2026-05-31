@@ -176,6 +176,38 @@ async def _startup_build_stamp():
             pass
     logger.info("ClipAI build: %s — %s", sha or "unknown", subject or "(no subject)")
 
+    # Torch/CUDA readiness — the single biggest analysis-speed factor. A
+    # CPU-only torch build (or a GPU the container can't see) forces YOLO-World
+    # subject detection + face/embedding work onto the CPU, making analysis
+    # ~10-30x slower. Log it loudly + unmistakably so a slow run is instantly
+    # triaged ("torch CPU-only" vs "real GPU but busy") instead of guessed at.
+    try:
+        import torch as _torch
+        _cuda_build = getattr(_torch.version, "cuda", None)
+        _avail = bool(_torch.cuda.is_available())
+        if _avail:
+            try:
+                _name = _torch.cuda.get_device_name(0)
+            except Exception:
+                _name = "?"
+            logger.info(
+                "GPU compute: torch %s (CUDA build %s) — cuda.is_available()=True, device=%s",
+                _torch.__version__, _cuda_build, _name)
+        elif not _cuda_build:
+            logger.error(
+                "GPU compute: torch %s is CPU-ONLY — YOLO-World + face detection "
+                "will run on CPU (analysis ~10-30x slower). The GPU image must "
+                "install the CUDA torch wheel (pip ... --index-url "
+                "https://download.pytorch.org/whl/cu121).", _torch.__version__)
+        else:
+            logger.error(
+                "GPU compute: torch %s is a CUDA build (%s) but cuda.is_available()"
+                "=False — the container can't see the GPU. Run with --gpus all / "
+                "the nvidia-container-toolkit. Analysis will fall back to CPU "
+                "(~10-30x slower).", _torch.__version__, _cuda_build)
+    except Exception as _terr:
+        logger.warning("GPU compute: torch import/probe failed: %s", _terr)
+
 
 @app.on_event("startup")
 async def _startup_seed_auth():

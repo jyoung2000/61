@@ -117,9 +117,24 @@ WORKDIR /app
 # Install Python dependencies (including CUDA-enabled faster-whisper)
 COPY backend/requirements.txt .
 RUN pip3 install --upgrade pip && \
+    # Install the CUDA build of torch FIRST, from PyTorch's CUDA index, and
+    # PIN it so the later ``-r requirements.txt`` / pyannote installs can't
+    # replace it with the default-PyPI CPU-only wheel. Without this the GPU
+    # image silently shipped CPU-only torch (torch.cuda.is_available()==False),
+    # forcing YOLO-World subject detection + face/embedding work onto the CPU —
+    # the cause of the ~10-30x-slower analysis. cu121 matches the CUDA 12.3
+    # runtime base image (forward/backward compatible within CUDA 12.x).
+    pip3 install --no-cache-dir torch>=2.0.0 torchaudio \
+        --index-url https://download.pytorch.org/whl/cu121 && \
     pip3 install --no-cache-dir -r requirements.txt && \
     pip3 install --no-cache-dir nvidia-cublas-cu12 nvidia-cudnn-cu12==9.* && \
-    pip3 install --no-cache-dir pyannote.audio>=3.1.0 torch>=2.0.0 && \
+    # pyannote only — torch is already the CUDA build above; do NOT reinstall
+    # torch here (it would pull the CPU wheel from the default index again).
+    pip3 install --no-cache-dir pyannote.audio>=3.1.0 && \
+    # Hard fail the build if torch can't see CUDA (catches a silent CPU-wheel
+    # regression at build time instead of in production). The CUDA runtime
+    # isn't available during build, so verify the build VARIANT not the device.
+    python3 -c "import torch; assert torch.version.cuda, f'torch is CPU-only ({torch.__version__}) — CUDA wheel install failed'; print(f'torch {torch.__version__} CUDA build {torch.version.cuda} OK')" && \
     # MediaPipe runtime deps (installed separately to avoid protobuf conflict)
     pip3 install --no-cache-dir \
         flatbuffers>=23.1.4 \
