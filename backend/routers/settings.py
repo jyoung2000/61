@@ -199,8 +199,17 @@ def _persist_user_settings() -> bool:
                     )
                     continue
 
-        # Skip empty values for non-key settings
+        # Skip empty values for non-key settings — BUT preserve a real value
+        # already on disk instead of dropping it. ``data`` starts empty and is
+        # written wholesale, so without this an unrelated settings save (which
+        # may run while a string setting like EDITORIAL_AI_FALLBACK_SPEC is
+        # still empty in memory — e.g. before the judge-spec restore populated
+        # it, or any import-ordering hiccup) would silently WIPE the persisted
+        # value. This is the same "preserve from existing file" guarantee API
+        # keys already get, extended to every persisted string setting.
         if not _is_real_value(key, val):
+            if key in existing_data and _is_real_value(key, existing_data[key]):
+                data[key] = existing_data[key]
             continue
         data[key] = val
 
@@ -3779,10 +3788,24 @@ async def put_judge_config(req: JudgeConfigRequest):
                 existing_us = json.load(_f)
         changed_us = False
         if req.primary is not None:
-            existing_us["_judge_primary"] = req.primary.strip()
+            _p = req.primary.strip()
+            existing_us["_judge_primary"] = _p
+            # Write the persistable spec key directly too, and REMOVE it when
+            # cleared — _persist_user_settings preserves on-empty (to avoid an
+            # unrelated save wiping it), so an explicit clear must delete the
+            # key here or the old value would resurrect on restore.
+            if _p:
+                existing_us["EDITORIAL_AI_PRIMARY_SPEC"] = _p
+            else:
+                existing_us.pop("EDITORIAL_AI_PRIMARY_SPEC", None)
             changed_us = True
         if req.fallback is not None:
-            existing_us["_judge_fallback"] = req.fallback.strip()
+            _fb = req.fallback.strip()
+            existing_us["_judge_fallback"] = _fb
+            if _fb:
+                existing_us["EDITORIAL_AI_FALLBACK_SPEC"] = _fb
+            else:
+                existing_us.pop("EDITORIAL_AI_FALLBACK_SPEC", None)
             changed_us = True
         if changed_us:
             tmp_us = USER_SETTINGS_PATH + ".tmp"

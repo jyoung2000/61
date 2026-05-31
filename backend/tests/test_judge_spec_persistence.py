@@ -44,18 +44,22 @@ def test_fallback_spec_persists_and_restores(tmp_path, monkeypatch):
     assert settings.EDITORIAL_AI_PRIMARY_SPEC == "openrouter:google/gemini-3.1-flash-lite"
 
 
-def test_clearing_fallback_does_not_resurrect_old_value(tmp_path, monkeypatch):
+def test_unrelated_save_preserves_persisted_fallback(tmp_path, monkeypatch):
+    # _persist_user_settings now PRESERVES a real on-disk value when the
+    # in-memory value is empty — so an unrelated settings save (fired while
+    # the spec hasn't been restored into memory yet) can't silently wipe it.
+    # This is the fix for the "fallback didn't save / vanished" reports.
     path = _isolate_user_settings(tmp_path, monkeypatch)
     settings.EDITORIAL_AI_FALLBACK_SPEC = "openrouter:some/model"
     s._persist_user_settings()
 
-    # User clears the fallback.
+    # An unrelated save while the spec is empty in memory must NOT drop it.
     settings.EDITORIAL_AI_FALLBACK_SPEC = ""
     s._persist_user_settings()
     data = json.loads(open(path).read())
-    # Empty value is not written, so the stale value can't be restored.
-    assert "EDITORIAL_AI_FALLBACK_SPEC" not in data
+    assert data.get("EDITORIAL_AI_FALLBACK_SPEC") == "openrouter:some/model"
 
-    settings.EDITORIAL_AI_FALLBACK_SPEC = "sentinel"
+    # And it restores on the next boot.
+    settings.EDITORIAL_AI_FALLBACK_SPEC = ""
     s._restore_user_settings()
-    assert settings.EDITORIAL_AI_FALLBACK_SPEC == "sentinel"  # unchanged → stays cleared
+    assert settings.EDITORIAL_AI_FALLBACK_SPEC == "openrouter:some/model"
