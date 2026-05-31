@@ -131,6 +131,40 @@ async def _validation_error_handler(request: Request, exc: RequestValidationErro
 
 
 @app.on_event("startup")
+async def _startup_build_stamp():
+    """Log the running build's git SHA + commit subject at boot.
+
+    Several debugging rounds were lost to "is the new code actually
+    deployed?" ambiguity (the container kept running a stale image whose
+    logs lacked the newest fixes' signatures). This prints an unmistakable
+    marker so any log immediately reveals which build is live. Reads
+    BUILD_SHA / BUILD_REF env vars first (set them in the Dockerfile/compose
+    for reproducible images); falls back to `git rev-parse` when the repo
+    is present.
+    """
+    import os
+    import subprocess
+
+    sha = os.environ.get("BUILD_SHA", "")
+    subject = os.environ.get("BUILD_SUBJECT", "")
+    if not sha:
+        try:
+            sha = subprocess.run(
+                ["git", "rev-parse", "--short", "HEAD"],
+                capture_output=True, text=True, timeout=5,
+                cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            ).stdout.strip()
+            subject = subprocess.run(
+                ["git", "log", "-1", "--pretty=%s"],
+                capture_output=True, text=True, timeout=5,
+                cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            ).stdout.strip()
+        except Exception:
+            sha = sha or "unknown"
+    logger.info("ClipAI build: %s — %s", sha or "unknown", subject or "(no subject)")
+
+
+@app.on_event("startup")
 async def _startup_seed_auth():
     """Ensure the head admin account exists on every boot.
 
