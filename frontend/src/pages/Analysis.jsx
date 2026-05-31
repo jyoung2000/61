@@ -509,8 +509,16 @@ export default function Analysis() {
   useEffect(() => {
     if (!jobId || clipPreview || fullVideoRange) return;
     if (!timelineItems || timelineItems.length === 0) return;
+    // CRITICAL: only sync after a genuine user edit. Without this gate the
+    // sync also fired when the timeline was (re)built from initFromClip or
+    // restored from a STALE IndexedDB cache (a prior corrupt run), which
+    // overwrote the freshly-analysed + translated transcript with the old
+    // out-of-order / duplicated / untranslated timeline. The store sets
+    // subtitlesUserEdited only in the subtitle edit actions.
+    if (!useTimelineStore.getState().subtitlesUserEdited) return;
     if (reverseSyncTimerRef.current) clearTimeout(reverseSyncTimerRef.current);
     reverseSyncTimerRef.current = setTimeout(async () => {
+      if (!useTimelineStore.getState().subtitlesUserEdited) return;
       let derived;
       try {
         derived = getSubtitleTranscript();

@@ -417,6 +417,13 @@ const useTimelineStore = create(
       // ── Original subtitle timings (snapshot from initFromClip for reset) ──
       _originalSubtitles: [],
 
+      // True only after the user EXPLICITLY edits a subtitle item (move/trim/
+      // text/split/delete). The transcript reverse-sync gates on this so it
+      // NEVER fires from initFromClip or an IndexedDB cache-restore — which
+      // could otherwise overwrite a freshly-analysed transcript with a stale
+      // (out-of-order / duplicated / untranslated) timeline from a prior run.
+      subtitlesUserEdited: false,
+
       // Clip window this timeline was initialised from. Subtitle item times
       // are RELATIVE to clipStart; the reverse-sync to the transcript adds it
       // back to recover absolute times. 0 for the untrimmed full video.
@@ -719,6 +726,7 @@ const useTimelineStore = create(
         if (item) {
           const track = state.tracks.find(t => t.id === item.trackId);
           if (track?.locked) return; // Cannot remove items from locked tracks
+          if (item.type === 'subtitle') state.subtitlesUserEdited = true;
         }
         state.items = state.items.filter(i => i.id !== itemId);
         resolveAllOverlaps(state.items);
@@ -754,6 +762,8 @@ const useTimelineStore = create(
         // Prevent modifications to items on locked tracks
         const currentTrack = state.tracks.find(t => t.id === item.trackId);
         if (currentTrack?.locked) return;
+        // Mark a genuine user edit so the transcript reverse-sync may fire.
+        if (item.type === 'subtitle') state.subtitlesUserEdited = true;
         // Validate track change: prevent moving items to incompatible tracks
         if (updates.trackId && updates.trackId !== item.trackId) {
           const targetTrack = state.tracks.find(t => t.id === updates.trackId);
@@ -805,6 +815,7 @@ const useTimelineStore = create(
       updateItemWithSnapshot: (itemId, updates) => set((state) => {
         const item = state.items.find(i => i.id === itemId);
         if (!item) return;
+        if (item.type === 'subtitle') state.subtitlesUserEdited = true;
         Object.assign(item, updates);
         // Overlap prevention when timing or track changes
         if (updates.start !== undefined || updates.end !== undefined || updates.trackId !== undefined) {
@@ -880,6 +891,7 @@ const useTimelineStore = create(
         const track = state.tracks.find(t => t.id === item.trackId);
         if (track?.locked) return;
         if (time <= item.start || time >= item.end) return;
+        if (item.type === 'subtitle') state.subtitlesUserEdited = true;
 
         const newId = nextItemId();
         const offset = time - item.start;
@@ -1163,6 +1175,7 @@ const useTimelineStore = create(
           items,
           mediaLibrary,
           _originalSubtitles: originalSubtitles,
+          subtitlesUserEdited: false,   // fresh transcript load — not a user edit
           clipStart,
           clipEnd,
           cropSegments: [],

@@ -205,6 +205,12 @@ RUN mkdir -p /app/backend/models/insightface && \
 # Copy backend source
 COPY backend/ ./backend/
 
+# Bake build identity so the running container logs which commit it was built
+# from (the repo's .git isn't copied → git rev-parse returns "unknown").
+ARG BUILD_SHA=unknown
+ARG BUILD_SUBJECT=""
+RUN printf '%s\n%s\n' "$BUILD_SHA" "$BUILD_SUBJECT" > /app/BUILD_INFO
+
 # Copy the markdown docs so the cloud storage setup guide (and friends)
 # can be rendered at /docs/cloud-storage/SETUP.md by backend/main.py.
 COPY docs/ ./docs/

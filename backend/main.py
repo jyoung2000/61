@@ -147,20 +147,33 @@ async def _startup_build_stamp():
 
     sha = os.environ.get("BUILD_SHA", "")
     subject = os.environ.get("BUILD_SUBJECT", "")
+    # Baked-in build info (Dockerfile writes /app/BUILD_INFO at build time).
     if not sha:
+        for _p in ("/app/BUILD_INFO",
+                   os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "BUILD_INFO")):
+            try:
+                with open(_p, "r", encoding="utf-8") as _f:
+                    _lines = _f.read().splitlines()
+                if _lines and _lines[0].strip():
+                    sha = _lines[0].strip()
+                    subject = subject or (_lines[1].strip() if len(_lines) > 1 else "")
+                    break
+            except Exception:
+                pass
+    # Last resort: git (only works when the repo is mounted, e.g. dev).
+    if not sha or sha == "unknown":
         try:
+            _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             sha = subprocess.run(
                 ["git", "rev-parse", "--short", "HEAD"],
-                capture_output=True, text=True, timeout=5,
-                cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            ).stdout.strip()
-            subject = subprocess.run(
+                capture_output=True, text=True, timeout=5, cwd=_root,
+            ).stdout.strip() or sha
+            subject = subject or subprocess.run(
                 ["git", "log", "-1", "--pretty=%s"],
-                capture_output=True, text=True, timeout=5,
-                cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                capture_output=True, text=True, timeout=5, cwd=_root,
             ).stdout.strip()
         except Exception:
-            sha = sha or "unknown"
+            pass
     logger.info("ClipAI build: %s — %s", sha or "unknown", subject or "(no subject)")
 
 

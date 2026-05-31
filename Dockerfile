@@ -141,6 +141,16 @@ ${LD_LIBRARY_PATH}
 # Copy backend source
 COPY backend/ ./backend/
 
+# Bake the build identity into the image so the running container can log
+# exactly which commit it was built from (the repo's .git isn't copied, so
+# `git rev-parse` inside the container returns "unknown"). Pass at build time:
+#   docker build --build-arg BUILD_SHA=$(git rev-parse --short HEAD) \
+#                --build-arg BUILD_SUBJECT="$(git log -1 --pretty=%s)" .
+# docker-compose passes these automatically (see docker-compose.yml args).
+ARG BUILD_SHA=unknown
+ARG BUILD_SUBJECT=""
+RUN printf '%s\n%s\n' "$BUILD_SHA" "$BUILD_SUBJECT" > /app/BUILD_INFO
+
 # Copy the markdown docs so the cloud storage setup guide (and friends)
 # can be rendered at /docs/cloud-storage/SETUP.md by backend/main.py.
 # This is a few KB of markdown; excluding it makes the Settings page's

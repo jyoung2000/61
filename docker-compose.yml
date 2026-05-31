@@ -3,6 +3,14 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.gpu
+      args:
+        # Surfaced in the startup log ("ClipAI build: <sha> — <subject>") so
+        # you can verify which commit the running container was built from.
+        # Set these in your shell before `docker compose build`:
+        #   export BUILD_SHA=$(git rev-parse --short HEAD)
+        #   export BUILD_SUBJECT="$(git log -1 --pretty=%s)"
+        BUILD_SHA: ${BUILD_SHA:-unknown}
+        BUILD_SUBJECT: ${BUILD_SUBJECT:-}
     container_name: clipai-app
     restart: unless-stopped
     ports:

@@ -52,7 +52,19 @@ function toSRT(segments) {
 }
 
 function toTXT(segments) {
-  return segments.map((seg) => `[${formatTime(seg.start)}] ${seg.speaker}: ${seg.text}`).join('\n');
+  // Sort chronologically so the export is ordered even if upstream data is not
+  // (mirrors toSRT). A single-speaker transcript omits the redundant prefix.
+  const cues = (segments || [])
+    .filter((s) => (s.text || '').trim())
+    .slice()
+    .sort((a, b) => a.start - b.start);
+  const distinctSpeakers = new Set(cues.map((s) => (s.speaker || '').trim()).filter(Boolean));
+  const showSpeaker = distinctSpeakers.size > 1;
+  return cues
+    .map((seg) => (showSpeaker && seg.speaker
+      ? `[${formatTime(seg.start)}] ${seg.speaker}: ${seg.text}`
+      : `[${formatTime(seg.start)}] ${seg.text}`))
+    .join('\n');
 }
 
 // After any wheel / touchmove / keydown on the scroll container we pause
