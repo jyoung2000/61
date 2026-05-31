@@ -39,3 +39,59 @@ def clean_and_sort_segments(segments: list) -> list[dict]:
         coerced.append(seg)
     coerced.sort(key=lambda x: (x.start, x.end))
     return [s.model_dump() for s in coerced]
+
+
+def is_editor_state_corrupt(state: dict) -> tuple[bool, str]:
+    """Detect a corrupt NLE editor-state (the server-side mirror of the
+    frontend validator).
+
+    Corruption from the reverse-sync bug shows as subtitle ``items`` that are
+    out of chronological order, duplicated en masse, or backwards
+    (end < start). Such a cached state must never be served back — it would
+    re-poison the transcript. Returns ``(corrupt, reason)``.
+    """
+    if not isinstance(state, dict):
+        return False, ""
+    items = state.get("items")
+    if not isinstance(items, list):
+        return False, ""
+    subs = [
+        it for it in items
+        if isinstance(it, dict)
+        and it.get("type") == "subtitle"
+        and str(it.get("subtitleText") or "").strip()
+    ]
+    if not subs:
+        return False, ""
+
+    def _num(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    # 1) Backwards / invalid cues.
+    for s in subs:
+        st, en = _num(s.get("start")), _num(s.get("end"))
+        if st is None or en is None or en < st - 0.001:
+            return True, f"backwards/invalid cue (start={s.get('start')} end={s.get('end')})"
+
+    # 2) Out-of-order cues.
+    for i in range(1, len(subs)):
+        prev, cur = _num(subs[i - 1].get("start")), _num(subs[i].get("start"))
+        if prev is not None and cur is not None and cur < prev - 0.05:
+            return True, f"out-of-order cue at index {i}"
+
+    # 3) Mass-duplicated (start, text) cues.
+    seen: dict = {}
+    dupes = 0
+    for s in subs:
+        st = _num(s.get("start")) or 0.0
+        key = (round(st * 10), str(s.get("subtitleText") or "").strip())
+        seen[key] = seen.get(key, 0) + 1
+        if seen[key] > 1:
+            dupes += 1
+    if dupes >= 5 and dupes > len(subs) * 0.1:
+        return True, f"{dupes}/{len(subs)} duplicate cues"
+
+    return False, ""

@@ -1962,6 +1962,20 @@ async def save_editor_state(job_id: str, clip_id: int, state: dict):
     other, so a partial save wiped the saved subtitle and crop tracks.
     """
     import json
+    # Reject a corrupt timeline so it never persists server-side (and can't be
+    # served back to any browser to re-poison the transcript via reverse-sync).
+    try:
+        from backend.services.transcript_sync import is_editor_state_corrupt
+        _corrupt, _reason = is_editor_state_corrupt(state or {})
+        if _corrupt:
+            logger.warning(
+                "Rejected corrupt editor state for job %s clip %d: %s",
+                job_id, clip_id, _reason,
+            )
+            return {"status": "rejected", "reason": _reason,
+                    "job_id": job_id, "clip_id": clip_id}
+    except Exception:
+        pass
     state_dir = os.path.join(EDITOR_STATE_DIR, job_id, "editor-state")
     os.makedirs(state_dir, exist_ok=True)
     state_file = os.path.join(state_dir, f"clip_{clip_id}.json")
@@ -1991,6 +2005,23 @@ async def get_editor_state(job_id: str, clip_id: int):
     try:
         with open(state_file, "r") as f:
             state = json.load(f)
+        # Purge + skip a corrupt cached state so it can't be restored into the
+        # editor (which would feed corruption back into the transcript).
+        try:
+            from backend.services.transcript_sync import is_editor_state_corrupt
+            _corrupt, _reason = is_editor_state_corrupt(state)
+            if _corrupt:
+                logger.warning(
+                    "Discarding corrupt editor state for job %s clip %d: %s",
+                    job_id, clip_id, _reason,
+                )
+                try:
+                    os.remove(state_file)
+                except OSError:
+                    pass
+                return {"state": None}
+        except Exception:
+            pass
         return {"state": state}
     except Exception:
         return {"state": None}
