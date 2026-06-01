@@ -1155,14 +1155,24 @@ async def _background_post_processing(
     clips: Optional[list] = None,
     polished_already: bool = False,
 ):
-    """Run subtitle translation (and, if not done already, transcript polishing)
-    in the background after analysis.
+    """Run subtitle translation, then polish + readability in the target
+    language, in the background after analysis.
 
-    Translation runs after COMPLETE so the user can already start editing
-    while it finishes. Polishing is normally run synchronously on the
-    critical path (see ``_run_analysis_inner``) so the readability splitter
-    sees punctuated text; this background call only re-runs it as a
-    fallback when ``polished_already`` is False.
+    Order (when a target language differs from the source):
+      1. Translate source → target via the orchestrator chain (the
+         dedicated ``OPENROUTER_TRANSLATION_MODEL`` if set, else the
+         editorial model).
+      2. LLM polish on the TRANSLATED text with ``correction_lang =
+         target_lang`` so punctuation / proper-noun fixes happen in the
+         language viewers will read.
+      3. Sentence resegmentation + readability enforcement in the target
+         language so cue lengths reflect the target's character density.
+      4. Final dedup + persist ``translated_transcript`` +
+         ``transcript_readability``.
+
+    When no translation is needed (target == source, or no target set),
+    polish + readability run on the source-language transcript here as
+    a fallback for the rare case the critical path skipped them.
 
     ``clips`` is the in-process list of dicts (or ClipCandidate models)
     captured from the local variable in ``_run_analysis_inner`` right
@@ -1173,64 +1183,13 @@ async def _background_post_processing(
     clipai_logs_20260527_000705.log even though the in-isolation
     round-trip tests round-trip clean).
     """
-    # ── Transcript polishing (fallback only) ──
-    # Polishing now runs synchronously in ``_run_analysis_inner`` before
-    # the readability pass so the splitter sees punctuated text. This
-    # branch only runs when the critical-path polish was skipped (rare —
-    # only when the orchestrator was unavailable at analysis time).
-    if not polished_already and settings.AI_TRANSCRIPT_CORRECTION and transcript:
-        try:
-            logger.info("[%s] Background transcript polishing (fallback path)", job_id)
-            await broadcast_ws(job_id, {
-                "type": "background_task",
-                "task": "transcript_polishing",
-                "status": "running",
-                "message": "Polishing transcript in background...",
-            })
-
-            _source = (job.language or "").strip().lower()
-            from backend.services.compat_stubs import _last_detected_language
-            if not _source:
-                _source = (_last_detected_language.get("lang", "") or "").strip().lower()
-            _whisper_translated = (
-                job.subtitle_language
-                and job.subtitle_language.strip().lower() == "en"
-                and _source and _source != "en"
-            )
-            correction_lang = "en" if _whisper_translated else _source
-
-            polished_models, best_report = await _polish_transcript_loop(
-                job_id, transcript, orchestrator, correction_lang,
-            )
-            polished_dicts = [
-                p.model_dump() if hasattr(p, "model_dump") else dict(p)
-                for p in polished_models
-            ]
-            if best_report is not None:
-                await database.update_job_status(
-                    job_id, transcript=polished_dicts, transcript_readability=best_report,
-                )
-            else:
-                await database.update_job_status(job_id, transcript=polished_dicts)
-            transcript = polished_models
-
-            await broadcast_ws(job_id, {
-                "type": "background_task",
-                "task": "transcript_polishing",
-                "status": "complete",
-                "message": "Transcript polished",
-            })
-        except Exception as e:
-            logger.warning(
-                "[%s] Background transcript polishing failed: %s",
-                job_id, e, exc_info=True,
-            )
-            await broadcast_ws(job_id, {
-                "type": "background_task",
-                "task": "transcript_polishing",
-                "status": "failed",
-                "message": f"Polishing skipped: {str(e)[:80]}",
-            })
+    logger.info(
+        "[%s] _background_post_processing entered (segments=%d, polished_already=%s, "
+        "job.language=%s, subtitle_language=%s)",
+        job_id, len(transcript or []), polished_already,
+        getattr(job, "language", "") or "(unset)",
+        getattr(job, "subtitle_language", "") or "(unset)",
+    )
 
     # ``_fallback_clips`` is the in-process list captured at the
     # COMPLETE save in ``_run_analysis_inner``. Hoisted above the
@@ -1318,6 +1277,11 @@ async def _background_post_processing(
                 except Exception:
                     pass
         try:
+            logger.info(
+                "[%s] >>> translate: %s → %s (%d segments, glossary=%d)",
+                job_id, source_name, target_name, len(_trans_input),
+                len(glossary or {}),
+            )
             orchestrator.reset_circuit_breaker()
             translated = await asyncio.wait_for(
                 translate_segments_with_fallback(
@@ -1329,6 +1293,88 @@ async def _background_post_processing(
                 ),
                 timeout=_trans_timeout,
             )
+            logger.info(
+                "[%s] <<< translate: produced %d segments",
+                job_id, len(translated),
+            )
+
+            # ── LLM polish on the TRANSLATED text ──
+            # The previous flow polished the SOURCE-language transcript on
+            # the critical path and then translated, which meant the user's
+            # final English subtitle never saw an LLM polish pass — only the
+            # raw translation followed by a generic readability cap. Now we
+            # polish in the target language so punctuation / proper-noun
+            # fixes / sentence boundaries happen in the language viewers
+            # will actually read.
+            await broadcast_ws(job_id, {
+                "type": "background_task",
+                "task": "transcript_polishing",
+                "status": "running",
+                "message": f"Polishing translated subtitles ({target_name})...",
+            })
+            logger.info(
+                "[%s] >>> polish translated transcript (lang=%s)",
+                job_id, target_lang,
+            )
+            try:
+                _polished_translated, _polish_report_tr = await _polish_transcript_loop(
+                    job_id, list(translated), orchestrator, target_lang,
+                )
+                if _polished_translated:
+                    translated = _polished_translated
+                    logger.info(
+                        "[%s] <<< polish translated: %d segments, readability %s",
+                        job_id, len(translated),
+                        f"{_polish_report_tr.get('score', 0):.1f}/100"
+                            if _polish_report_tr else "(no score)",
+                    )
+            except Exception as _pe:
+                logger.warning(
+                    "[%s] Translated-transcript polish failed (%s) — keeping raw translation",
+                    job_id, _pe,
+                )
+            await broadcast_ws(job_id, {
+                "type": "background_task",
+                "task": "transcript_polishing",
+                "status": "complete",
+                "message": f"Translated subtitles polished ({target_name})",
+            })
+
+            # ── Sentence-aware resegmentation in the TARGET language ──
+            # Now that the translated text carries target-language
+            # punctuation, the sentence splitter can break on real sentence
+            # boundaries (English . / Japanese 。) instead of guessing on
+            # the wrong language. Skipped on translate-only failures.
+            if (
+                getattr(settings, "SENTENCE_SEGMENTATION_ENABLED", True)
+                and translated
+            ):
+                try:
+                    from backend.services.sentence_segmenter import resegment_by_sentence
+                    _pre_reseg = len(translated)
+                    _reseg_input = [
+                        t.model_dump() if hasattr(t, "model_dump") else dict(t)
+                        for t in translated
+                    ]
+                    _reseg = resegment_by_sentence(_reseg_input)
+                    # Restore TranscriptSegment shape for the readability
+                    # pass that follows.
+                    from backend.models import TranscriptSegment as _TS_post
+                    translated = [
+                        t if isinstance(t, _TS_post) else _TS_post(**(
+                            t.model_dump() if hasattr(t, "model_dump") else dict(t)
+                        ))
+                        for t in _reseg
+                    ]
+                    logger.info(
+                        "[%s] Sentence resegmentation (post-translate, lang=%s): %d → %d segments",
+                        job_id, target_lang, _pre_reseg, len(translated),
+                    )
+                except Exception as _reseg_err:
+                    logger.warning(
+                        "[%s] Post-translate sentence resegmentation failed (%s) — keeping segments",
+                        job_id, _reseg_err,
+                    )
 
             # ── Re-enforce readability after translation ──
             # Translation changes character length dramatically — a CJK
@@ -1377,6 +1423,11 @@ async def _background_post_processing(
             # so the loop works whether the caller handed us dicts or
             # models — the older zip(translated, transcript) crashed
             # the moment ``transcript`` was a list of dicts.
+            #
+            # Note: post-polish/resegment the count may have changed, so
+            # zip() truncates to the shorter list — that's the right
+            # behaviour: we only care that the visible text is no longer
+            # in the source language.
             changed = sum(
                 1 for t, o in zip(translated, _trans_input)
                 if (getattr(t, "text", "") or "") != (getattr(o, "text", "") or "")
@@ -1407,6 +1458,33 @@ async def _background_post_processing(
             if _music_markers:
                 from backend.services.audio_analyzer import merge_markers
                 _translated_out = merge_markers(_translated_out, _music_markers)
+
+            # ── Final dedup on the polished translated transcript ──
+            # Mirrors the critical-path dedup so back-to-back duplicates
+            # introduced by readability splitting / resegmentation are
+            # collapsed in the translated track too.
+            try:
+                from backend.services.transcript_dedup import (
+                    collapse_adjacent_duplicates, drop_repetition_loops,
+                    collapse_overlapping_duplicates,
+                )
+                _pre_dd = len(_translated_out)
+                _translated_out, _adj_t = collapse_adjacent_duplicates(_translated_out)
+                _translated_out, _loop_t = drop_repetition_loops(_translated_out)
+                _translated_out, _ov_t = collapse_overlapping_duplicates(
+                    _translated_out, text_key="text", start_key="start", end_key="end",
+                )
+                if _adj_t or _loop_t or _ov_t:
+                    logger.info(
+                        "[%s] Translated-transcript dedup: %d → %d "
+                        "(%d adjacent, %d loop, %d overlap)",
+                        job_id, _pre_dd, len(_translated_out),
+                        _adj_t, _loop_t, _ov_t,
+                    )
+            except Exception as _td_err:
+                logger.warning(
+                    "[%s] Translated-transcript dedup skipped (%s)", job_id, _td_err,
+                )
 
             # Pin status=COMPLETE on the translated-transcript save too: this
             # is the first DB write after the COMPLETE finalize, so if a stray
@@ -1496,10 +1574,74 @@ async def _background_post_processing(
 
     else:
         # No translation needed (source already in target language, or no
-        # subtitle_language requested) — still seed SEO so the cards on the
-        # Viral Clips page don't ship as bare transcript snippets. Uses the
-        # source-language transcript directly since that's what the user
-        # will publish with.
+        # subtitle_language requested). When the critical-path polish was
+        # skipped (rare: orchestrator unavailable at analysis time, OR the
+        # critical path saw a target_lang that ended up not running here),
+        # run it now as a fallback so the source-language transcript still
+        # gets the LLM polish pass it would normally receive.
+        if (
+            not polished_already
+            and settings.AI_TRANSCRIPT_CORRECTION
+            and getattr(settings, "TRANSCRIPT_POLISHING_ENABLED", True)
+            and transcript
+        ):
+            try:
+                logger.info(
+                    "[%s] Background transcript polish (no-translate fallback)",
+                    job_id,
+                )
+                await broadcast_ws(job_id, {
+                    "type": "background_task",
+                    "task": "transcript_polishing",
+                    "status": "running",
+                    "message": "Polishing transcript in background...",
+                })
+
+                _source = (job.language or "").strip().lower()
+                from backend.services.compat_stubs import _last_detected_language
+                if not _source:
+                    _source = (_last_detected_language.get("lang", "") or "").strip().lower()
+                # No translation happened — polish in the source language.
+                # The legacy "assume Whisper translated to en" shortcut was
+                # always false on the reframer's task='transcribe' path and
+                # is removed; translation is the LLM step that produces
+                # English, not Whisper.
+                correction_lang = _source
+
+                polished_models, best_report = await _polish_transcript_loop(
+                    job_id, transcript, orchestrator, correction_lang,
+                )
+                polished_dicts = [
+                    p.model_dump() if hasattr(p, "model_dump") else dict(p)
+                    for p in polished_models
+                ]
+                _polish_update = {"transcript": polished_dicts}
+                if best_report is not None:
+                    _polish_update["transcript_readability"] = best_report
+                await database.update_job_status(job_id, **_polish_update)
+                transcript = polished_models
+
+                await broadcast_ws(job_id, {
+                    "type": "background_task",
+                    "task": "transcript_polishing",
+                    "status": "complete",
+                    "message": "Transcript polished",
+                })
+            except Exception as e:
+                logger.warning(
+                    "[%s] Background transcript polishing failed: %s",
+                    job_id, e, exc_info=True,
+                )
+                await broadcast_ws(job_id, {
+                    "type": "background_task",
+                    "task": "transcript_polishing",
+                    "status": "failed",
+                    "message": f"Polishing skipped: {str(e)[:80]}",
+                })
+
+        # Seed SEO so the cards on the Viral Clips page don't ship as bare
+        # transcript snippets. Uses the source-language transcript directly
+        # since that's what the user will publish with.
         try:
             await broadcast_ws(job_id, {
                 "type": "background_task",
@@ -1529,6 +1671,8 @@ async def _background_post_processing(
                 "status": "failed",
                 "message": f"Auto-SEO skipped: {str(_seo_err)[:80]}",
             })
+
+    logger.info("[%s] _background_post_processing exit", job_id)
 
 
 async def run_analysis(job_id: str):
@@ -2392,8 +2536,23 @@ async def _run_analysis_inner(job_id: str):
     # "tracing disabled" so callers that don't pass one continue to
     # work unchanged.
     _trace_path = os.path.join(job_dir, "reframe_trace.jsonl")
+    # Thread the upload-page source-language pick into Whisper. The engine
+    # forwards ``source_language`` to AudioIntelligence.transcribe(); blank /
+    # "auto" preserves Whisper's auto-detect. Without this, ``job.language``
+    # was persisted but never reached the engine, so a Japanese video the
+    # user explicitly tagged as Japanese was still transcribed with
+    # ``language=auto`` (and downstream code that branches on the detected
+    # language never saw the user's hint).
+    _source_lang_for_engine = (getattr(job, "language", "") or "").strip() or "auto"
+    logger.info(
+        "[%s] Whisper source_language=%s (job.language=%s, subtitle_language=%s)",
+        job_id, _source_lang_for_engine,
+        getattr(job, "language", "") or "(unset)",
+        getattr(job, "subtitle_language", "") or "(unset)",
+    )
     engine = ReframeEngine(video_path, sample_fps=_sample_fps,
-                           aspect_ratio="9:16", trace_path=_trace_path)
+                           aspect_ratio="9:16", trace_path=_trace_path,
+                           source_language=_source_lang_for_engine)
     async with _stage_timer(job_id, "reframer_analysis"):
         reframer_plan = await asyncio.to_thread(engine.analyze, _engine_progress)
     perception = engine.perception
@@ -2491,15 +2650,58 @@ async def _run_analysis_inner(job_id: str):
             logger.warning(
                 "[%s] Voiceprint matching skipped (%s)", job_id, _vp_err)
 
+    # ── Will translation follow? ──
+    # When the user picked a subtitle language that differs from the
+    # detected source, the heavy polish + sentence resegmentation +
+    # readability reflow MUST run on the translated text, not the source.
+    # Running them here on Japanese and then translating would (a) waste
+    # an LLM polish pass on text the user will never see and (b) lock the
+    # transcript into segment boundaries that don't fit English character
+    # density. Hold the heavy work for ``_background_post_processing``
+    # which runs after the translator. We still do the music marker +
+    # final dedup below since those are language-neutral.
+    _job_for_lang = job  # local alias for clarity
+    _target_subtitle_lang = (
+        getattr(_job_for_lang, "subtitle_language", "") or ""
+    ).strip().lower()
+    _src_for_branch = (_detected_lang or "").strip().lower()
+    _will_translate = bool(
+        _target_subtitle_lang
+        and _src_for_branch
+        and _target_subtitle_lang != _src_for_branch
+    )
+    # Auto-translation also kicks in when the source isn't English and the
+    # user didn't pick a subtitle language — the background path defaults
+    # ``target_lang="en"`` in that case. Mirror that here so we defer the
+    # heavy passes consistently.
+    if (
+        not _target_subtitle_lang
+        and _src_for_branch
+        and _src_for_branch not in ("en", "english")
+    ):
+        _will_translate = True
+
+    logger.info(
+        "[%s] Polish branch: detected_lang=%s, target_subtitle=%s, will_translate=%s",
+        job_id, _src_for_branch or "(unset)",
+        _target_subtitle_lang or "(auto)",
+        _will_translate,
+    )
+
     # ── Synchronous transcript polish (BEFORE readability) ──
     # Without this, CJK content (Japanese narration, K-drama dialogue)
     # arrives as 30s blocks with zero 。 — the readability splitter falls
     # back to particle-boundary guesses. Running the LLM polisher first
     # gives the splitter actual sentence punctuation to break on, which
     # is the single biggest lever on transcript readability.
+    #
+    # Skipped here when ``_will_translate`` is True: the polish gets run
+    # in the target language after translation instead, so we don't pay
+    # for LLM time on a transcript the user is about to throw away.
     _polished_in_critical_path = False
     if (
-        settings.AI_TRANSCRIPT_CORRECTION
+        not _will_translate
+        and settings.AI_TRANSCRIPT_CORRECTION
         and getattr(settings, "TRANSCRIPT_POLISHING_ENABLED", True)
         and transcript
     ):
@@ -2532,6 +2734,11 @@ async def _run_analysis_inner(job_id: str):
                 "[%s] Critical-path polish failed (%s) — falling back to raw transcript",
                 job_id, _polish_err,
             )
+    elif _will_translate:
+        logger.info(
+            "[%s] Skipping critical-path polish — will run after translation in target language",
+            job_id,
+        )
 
     # ── Sentence-aware resegmentation (Task 4) ──
     # Merge same-speaker neighbours then re-split at sentence boundaries
@@ -2539,7 +2746,16 @@ async def _run_analysis_inner(job_id: str):
     # sentence rather than raw VAD window. Runs after speaker fusion +
     # polish (which adds the punctuation this relies on) and before the
     # readability pass, which enforces duration/CPS on the result.
-    if getattr(settings, "SENTENCE_SEGMENTATION_ENABLED", True) and transcript:
+    #
+    # Skipped here when translation will follow: the resegmentation must
+    # use sentence boundaries that exist in the TARGET language. Running
+    # it on Japanese and then translating each segment locks viewers into
+    # CJK sentence breaks that read awkwardly in English.
+    if (
+        not _will_translate
+        and getattr(settings, "SENTENCE_SEGMENTATION_ENABLED", True)
+        and transcript
+    ):
         try:
             from backend.services.sentence_segmenter import resegment_by_sentence
             _pre_resegment = len(transcript)
@@ -2567,7 +2783,17 @@ async def _run_analysis_inner(job_id: str):
     # BEFORE translation runs. Translation later applies the enforcer
     # again on its own output to handle character-density changes
     # (CJK → English typically doubles segment length).
-    if getattr(settings, "SUBTITLE_CPS_ENFORCEMENT", True) and transcript:
+    #
+    # Skipped here when translation will follow: enforcing CPS on the
+    # source language locks the segments at CJK character density (which
+    # is much shorter than the English equivalent), then translation
+    # widens the text and the post-translation enforcer has to undo
+    # those splits anyway.
+    if (
+        not _will_translate
+        and getattr(settings, "SUBTITLE_CPS_ENFORCEMENT", True)
+        and transcript
+    ):
         try:
             from backend.services.subtitle_formatter import (
                 enforce_readability, compute_readability_report,
@@ -2639,24 +2865,33 @@ async def _run_analysis_inner(job_id: str):
     # The per-segment hallucination filters run inside the Whisper stage, but
     # speaker fusion, sentence resegmentation and the readability reflow can
     # all re-introduce duplicates downstream: back-to-back identical cues
-    # (observed as ``[11:25] …`` twice in a row) and scattered repetition-loop
+    # (observed as ``[11:25] …`` twice in a row), scattered repetition-loop
     # hallucinations (the garbled ``ドーリアンリ`` name repeated 8× across the
-    # episode). Run BOTH collapses one last time on the fully-assembled
+    # episode), AND non-adjacent duplicates that share a timestamp window
+    # (gap-fill re-emitting the same line interleaved with the main pass).
+    # Run all three collapses one last time on the fully-assembled
     # transcript — this is the version that gets persisted, translated and
     # exported, so it's the one the user actually sees in the TXT/SRT/VTT.
     if transcript:
         try:
             from backend.services.transcript_dedup import (
                 collapse_adjacent_duplicates, drop_repetition_loops,
+                collapse_overlapping_duplicates,
             )
             _pre_dedup = len(transcript)
             transcript, _adj = collapse_adjacent_duplicates(transcript)
             transcript, _loop = drop_repetition_loops(transcript)
-            if _adj or _loop:
+            # Overlap-aware pass keys off TranscriptSegment ``start`` / ``end``
+            # (the Fez contract uses bare ``start`` / ``end`` floats, not the
+            # internal ``start_sec`` / ``end_sec`` keys the gap-fill emits).
+            transcript, _ov = collapse_overlapping_duplicates(
+                transcript, text_key="text", start_key="start", end_key="end",
+            )
+            if _adj or _loop or _ov:
                 logger.info(
                     "[%s] Final transcript dedup: %d → %d segments "
-                    "(%d adjacent dup, %d repetition-loop)",
-                    job_id, _pre_dedup, len(transcript), _adj, _loop,
+                    "(%d adjacent dup, %d repetition-loop, %d overlap-dup)",
+                    job_id, _pre_dedup, len(transcript), _adj, _loop, _ov,
                 )
         except Exception as _dd_err:
             logger.warning(
@@ -3101,16 +3336,27 @@ async def _run_analysis_inner(job_id: str):
         job_id, _analysis_seconds, len(_clip_models), len(scenes), len(transcript),
     )
 
-    # ── Background post-processing (polish + translation) ──
+    # ── Background post-processing (translate → polish → resegment → readability) ──
     # Kick this off AFTER COMPLETE has been broadcast so the user can
-    # already start editing while polishing + translation finish. The
+    # already start editing while translation + polishing finish. The
     # call to ``_background_post_processing`` was lost in the legacy →
-    # reframer pipeline rewrite, which is why non-English jobs were
-    # shipping with their source-language transcripts and no translated
-    # subtitle track. Reload the job snapshot first so the function
-    # sees the freshly-stored transcript + clip metadata.
+    # reframer pipeline rewrite once before, which is why non-English
+    # jobs were shipping with their source-language transcripts. We
+    # protect against the silent drop by (1) loading the post-job snapshot
+    # in a separate try, (2) logging task creation, and (3) attaching a
+    # done-callback that surfaces any unhandled exception from the bg
+    # coroutine instead of letting it disappear into the task GC.
     try:
         post_job = await database.load_job(job_id)
+        logger.info(
+            "[%s] Scheduling background post-processing "
+            "(transcript=%d, language=%s, subtitle_language=%s, "
+            "polished_already=%s)",
+            job_id, len(transcript or []),
+            getattr(post_job, "language", "") or "(unset)",
+            getattr(post_job, "subtitle_language", "") or "(unset)",
+            _polished_in_critical_path,
+        )
         # Pass the in-process ``clips`` list explicitly so the
         # post-translation refresh and Auto-SEO have a definitive
         # source of truth even if a subsequent ``database.load_job``
@@ -3126,9 +3372,34 @@ async def _run_analysis_inner(job_id: str):
             name=f"post-processing:{job_id}",
         )
         _background_tasks.add(_bg)
-        _bg.add_done_callback(_background_tasks.discard)
+
+        def _bg_done(task: asyncio.Task, _jid: str = job_id) -> None:
+            _background_tasks.discard(task)
+            try:
+                exc = task.exception()
+            except asyncio.CancelledError:
+                logger.info("[%s] background post-processing cancelled", _jid)
+                return
+            except Exception as _exc_err:
+                logger.warning(
+                    "[%s] background post-processing exception() probe failed: %s",
+                    _jid, _exc_err,
+                )
+                return
+            if exc:
+                logger.error(
+                    "[%s] background post-processing crashed: %s",
+                    _jid, exc, exc_info=exc,
+                )
+            else:
+                logger.info(
+                    "[%s] background post-processing finished cleanly", _jid,
+                )
+
+        _bg.add_done_callback(_bg_done)
+        logger.info("[%s] background post-processing scheduled", job_id)
     except Exception as _bg_err:
-        logger.warning(
+        logger.error(
             "[%s] Failed to launch background post-processing: %s",
-            job_id, _bg_err,
+            job_id, _bg_err, exc_info=True,
         )

@@ -45,6 +45,9 @@ OVERLAYABLE_KEYS: tuple[str, ...] = (
     "OPENROUTER_PRIMARY_MODEL",
     "OPENROUTER_EDITORIAL_MODEL",
     "OPENROUTER_SUMMARY_MODEL",
+    # Dedicated OpenRouter translation model. Mirrors OLLAMA_TRANSLATION_MODEL
+    # for the cloud provider — blank ⇒ fall back to editorial at translate time.
+    "OPENROUTER_TRANSLATION_MODEL",
     "OLLAMA_PRIMARY_MODEL",
     "OLLAMA_EDITORIAL_MODEL",
     "OLLAMA_TRANSLATION_MODEL",

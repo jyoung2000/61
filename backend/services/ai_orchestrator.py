@@ -1037,7 +1037,7 @@ class AIOrchestrator:
             except Exception:
                 continue
 
-    async def text_completion(self, prompt: str, max_tokens: int = 4096, timeout: float = 60, job_id: str = "", skip_circuit_breaker: bool = False) -> str:
+    async def text_completion(self, prompt: str, max_tokens: int = 4096, timeout: float = 60, job_id: str = "", skip_circuit_breaker: bool = False, model_override: str | None = None) -> str:
         """Generic text completion using the configured provider chain.
 
         Used by transcript correction, translation, and other text-only tasks.
@@ -1049,18 +1049,33 @@ class AIOrchestrator:
                 circuit breaker. Use this for non-critical/optional operations
                 (like transcript polishing) that should not degrade the provider
                 for subsequent critical operations (summary, clip detection).
+            model_override: Optional model ID to swap in instead of the
+                provider's configured editorial model — currently used by
+                the translator so a dedicated OPENROUTER_TRANSLATION_MODEL
+                pick can route through the same fallback chain. Applied
+                only when the active provider is OpenRouter (the override
+                IDs are OpenRouter-routable but would 404 elsewhere);
+                restored in ``finally``.
         """
         for provider in self._get_active_chain():
             pname = provider.provider_name
             model_name = provider.text_model_name
-            # Apply model override for Ollama if we've downgraded after failures
-            if pname == "ollama" and self._current_model_override:
+            original_model = None
+            # An explicit caller override is OpenRouter-scoped: model IDs
+            # like ``google/gemini-2.5-flash`` are OpenRouter-routable but
+            # would 404 on Ollama / direct provider APIs. Apply it only
+            # when the active provider is OpenRouter; fall through to the
+            # provider's configured editorial model otherwise so the
+            # fallback chain still works. Restore in ``finally`` either way.
+            if model_override and pname == "openrouter" and hasattr(provider, "_editorial_model"):
+                original_model = provider._editorial_model
+                provider._editorial_model = model_override
+                model_name = model_override
+            elif pname == "ollama" and self._current_model_override:
+                # Apply model override for Ollama if we've downgraded after failures
                 model_name = self._current_model_override
-                # Temporarily override the provider's text model
                 original_model = provider._editorial_model
                 provider._editorial_model = self._current_model_override
-            else:
-                original_model = None
             try:
                 # Clear VRAM before first Ollama call in a job
                 if pname == "ollama" and hasattr(provider, 'clear_vram') and self._consecutive_ollama_failures == 0 and not self._current_model_override:

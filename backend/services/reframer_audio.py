@@ -58,12 +58,15 @@ def _vocab_bias_kwargs(transcribe_callable, language: str) -> dict:
 def _cross_validate_segments(segments: list) -> list:
     """Remove cross-segment artefacts the per-segment TACT filter misses.
 
-    Drops:
-      - Exact text duplicates of the immediately preceding segment.
-      - Segments that start before the previous segment ended (temporal
-        overlap by more than 100 ms).
-      - Segments with >80% word overlap with the previous segment (a
-        common Whisper hallucination pattern on noisy audio).
+    Two passes:
+      1. Adjacent pass — drops exact-text duplicates, segments that start
+         before the previous segment ended (temporal overlap by more than
+         100 ms), and >80% word-overlap repeats of the immediately
+         preceding segment (the legacy behaviour, kept verbatim).
+      2. Global overlap pass — catches non-adjacent near-duplicates that
+         overlap in time (e.g. the same line re-emitted ~5 s later by the
+         gap-fill pass over music). Delegates to
+         ``transcript_dedup.collapse_overlapping_duplicates``.
 
     Lightweight pure-Python pass — no feature flag, only removes clearly
     invalid output.
@@ -73,14 +76,17 @@ def _cross_validate_segments(segments: list) -> list:
     cleaned: list = []
     prev_text = ""
     prev_end = 0.0
+    adj_dropped = 0
     for seg in segments:
         text = (seg.get("text", "") or "").strip()
         start = seg.get("start_sec", seg.get("start", 0)) or 0
         end = seg.get("end_sec", seg.get("end", 0)) or 0
 
         if text and text == prev_text:
+            adj_dropped += 1
             continue
         if cleaned and start < prev_end - 0.1:
+            adj_dropped += 1
             continue
         if prev_text and text:
             # Strip punctuation so "fine," and "fine" compare equal.
@@ -89,17 +95,31 @@ def _cross_validate_segments(segments: list) -> list:
             prev_words = set(prev_text.lower().translate(_tbl).split())
             curr_words = set(text.lower().translate(_tbl).split())
             if prev_words and len(prev_words & curr_words) / len(prev_words) > 0.8:
+                adj_dropped += 1
                 continue
 
         cleaned.append(seg)
         prev_text = text
         prev_end = float(end) or prev_end
 
-    dropped = len(segments) - len(cleaned)
+    # Global timestamp-overlap pass — catches duplicates that aren't adjacent
+    # in the list (gap-fill over the same music region re-emits the same line
+    # interleaved with the main-pass cues).
+    try:
+        from backend.services.transcript_dedup import collapse_overlapping_duplicates
+        cleaned, overlap_dropped = collapse_overlapping_duplicates(
+            cleaned, text_key="text", start_key="start_sec", end_key="end_sec",
+        )
+    except Exception as _ov_err:
+        logger.warning("overlap-dedup skipped (%s)", _ov_err)
+        overlap_dropped = 0
+
+    dropped = adj_dropped + overlap_dropped
     if dropped > 0:
         logger.info(
-            "cross-segment validation removed %d duplicate/overlapping segments",
-            dropped,
+            "cross-segment validation removed %d segment(s) "
+            "(%d adjacent dup/overlap, %d non-adjacent overlap)",
+            dropped, adj_dropped, overlap_dropped,
         )
     return cleaned
 
@@ -820,10 +840,24 @@ class AudioIntelligence:
             clip_ts.append(round(s, 3))
             clip_ts.append(round(e, 3))
 
+        # Keep VAD enabled even on the gap pass. The original "VAD off,
+        # very low no_speech threshold" combo invited 700 s of music /
+        # narration to collapse into one giant 707-second run-on segment
+        # near 24:07 (observed on the GUNDAM Wing JA→EN job). VAD on
+        # gives Whisper a chance to break on real silence inside the gap;
+        # the lowered no_speech_threshold still lets quiet speech through.
+        # ``WHISPER_GAP_FILL_VAD`` defaults to True; flip to False in
+        # settings to restore legacy behavior. Either way the run-length
+        # cap below clamps any cue Whisper emits to ≤ 8 s.
+        _vad_on_gap = bool(getattr(settings, "WHISPER_GAP_FILL_VAD", True))
         try:
             segs_iter, _info = self.engine.transcribe(
                 audio_path, language=whisper_lang,
-                beam_size=5, vad_filter=False,
+                beam_size=5, vad_filter=_vad_on_gap,
+                vad_parameters=(
+                    {"min_silence_duration_ms": 300, "speech_pad_ms": 200}
+                    if _vad_on_gap else None
+                ),
                 word_timestamps=True,
                 condition_on_previous_text=False,
                 no_speech_threshold=gap_ns_thresh,
@@ -837,7 +871,11 @@ class AudioIntelligence:
                 'Gap-fill: clip_timestamps unsupported — full-file fallback')
             segs_iter, _info = self.engine.transcribe(
                 audio_path, language=whisper_lang,
-                beam_size=5, vad_filter=False,
+                beam_size=5, vad_filter=_vad_on_gap,
+                vad_parameters=(
+                    {"min_silence_duration_ms": 300, "speech_pad_ms": 200}
+                    if _vad_on_gap else None
+                ),
                 word_timestamps=True,
                 condition_on_previous_text=False,
                 no_speech_threshold=gap_ns_thresh,
@@ -863,7 +901,81 @@ class AudioIntelligence:
             overlap = max(0.0, min(end_sec, ge) - max(start_sec, gs))
             return overlap / seg_len >= 0.5
 
+        # Hard cap on per-segment length so a gap-fill run can't ever emit
+        # a single 700 s "segment" stretching across music + narration. If
+        # Whisper hands us anything longer, split it by word timestamps
+        # into windows of ≤ ``WHISPER_GAP_FILL_MAX_SEG_SEC`` (default 8 s).
+        # When words aren't available, split the duration uniformly so
+        # downstream readability still has a sane upper bound.
+        _max_seg_sec = float(getattr(settings, "WHISPER_GAP_FILL_MAX_SEG_SEC", 8.0))
+
+        def _split_long(seg_obj):
+            """Return a list of (start, end, text, words) tuples, splitting
+            anything longer than ``_max_seg_sec``."""
+            seg_start = float(seg_obj.start)
+            seg_end = float(seg_obj.end)
+            seg_text = (seg_obj.text or '').strip()
+            seg_words = getattr(seg_obj, 'words', None) or []
+            duration = seg_end - seg_start
+            if duration <= _max_seg_sec or duration <= 0:
+                return [(seg_start, seg_end, seg_text, seg_words)]
+
+            # Prefer to split on the word grid so subtitles align to actual
+            # speech boundaries.
+            if seg_words:
+                pieces = []
+                cur_words = []
+                cur_start = seg_start
+                for w in seg_words:
+                    w_end = float(getattr(w, 'end', seg_end) or seg_end)
+                    cur_words.append(w)
+                    if (w_end - cur_start) >= _max_seg_sec:
+                        piece_text = ' '.join(
+                            (getattr(ww, 'word', '') or '').strip()
+                            for ww in cur_words
+                        ).strip()
+                        if piece_text:
+                            pieces.append((cur_start, w_end, piece_text, cur_words))
+                        cur_start = w_end
+                        cur_words = []
+                if cur_words:
+                    piece_end = float(getattr(cur_words[-1], 'end', seg_end) or seg_end)
+                    piece_text = ' '.join(
+                        (getattr(ww, 'word', '') or '').strip()
+                        for ww in cur_words
+                    ).strip()
+                    if piece_text:
+                        pieces.append((cur_start, piece_end, piece_text, cur_words))
+                if pieces:
+                    return pieces
+            # No word grid — split text + duration uniformly so at least the
+            # timing stays well-bounded.
+            n = max(1, int(duration / _max_seg_sec) + 1)
+            piece_dur = duration / n
+            if seg_text:
+                # Naïve char-proportional split; falls back to repeating the
+                # text in each piece if it's a single word (rare).
+                chunk = max(1, len(seg_text) // n)
+                pieces = []
+                for i in range(n):
+                    ps = seg_start + i * piece_dur
+                    pe = seg_start + (i + 1) * piece_dur if i < n - 1 else seg_end
+                    pt = seg_text[i * chunk: (i + 1) * chunk] if i < n - 1 else seg_text[i * chunk:]
+                    pt = pt.strip()
+                    if pt:
+                        pieces.append((ps, pe, pt, []))
+                return pieces or [(seg_start, seg_end, seg_text, [])]
+            return [(seg_start, seg_end, seg_text, [])]
+
         out: list[dict] = []
+        _dropped_outside_gap = 0
+        _dropped_hallucination = 0
+        _dropped_duplicate = 0
+        _dropped_high_no_speech = 0
+        _dropped_repetition = 0
+        _split_runs = 0
+        _max_emitted_sec = 0.0
+        _seen_keys: set[str] = set()
         for seg in segs_iter:
             text = (seg.text or '').strip()
             if not text:
@@ -872,9 +984,11 @@ class AudioIntelligence:
 
             # Drop common Whisper hallucinations (multilingual)
             if _is_boilerplate_hallucination(text):
+                _dropped_hallucination += 1
                 continue
             # Very high no_speech confidence is true silence
             if no_speech_prob > 0.85:
+                _dropped_high_no_speech += 1
                 continue
             # Repetition check (lighter than the main pass — gap-fill
             # already lives in low-confidence territory)
@@ -892,33 +1006,71 @@ class AudioIntelligence:
                                 text = None
                                 break
                     if text is None:
+                        _dropped_repetition += 1
                         continue
 
-            if not _inside_gap(float(seg.start), float(seg.end)):
-                continue
+            # Cap whole-segment length BEFORE the inside-gap test so a
+            # 700-second blob gets sliced into pieces that can still be
+            # individually inside-gap'd.
+            try:
+                pieces = _split_long(seg)
+            except Exception:
+                pieces = [(float(seg.start), float(seg.end), text, getattr(seg, 'words', None) or [])]
 
-            words = []
-            if hasattr(seg, 'words') and seg.words:
-                for w in seg.words:
+            if len(pieces) > 1:
+                _split_runs += 1
+
+            for (p_start, p_end, p_text, p_words) in pieces:
+                if not p_text:
+                    continue
+                if not _inside_gap(p_start, p_end):
+                    _dropped_outside_gap += 1
+                    continue
+
+                # In-pass duplicate guard: gap-fill on music + condition_on_previous_text=False
+                # can still emit the SAME normalized line twice on the
+                # same gap run. Catch it before merge so the cross-segment
+                # filter has less work to do.
+                import re as _re_mod
+                _key = _re_mod.sub(r"\s+", "", p_text.lower())
+                if _key and _key in _seen_keys:
+                    _dropped_duplicate += 1
+                    continue
+                if _key:
+                    _seen_keys.add(_key)
+
+                words = []
+                for w in (p_words or []):
                     word_conf = (getattr(w, 'probability', None)
                                  or getattr(w, 'confidence', 1.0) or 1.0)
                     words.append({
                         'word': (w.word.strip() if hasattr(w, 'word')
                                  else str(w).strip()),
-                        'start': round(getattr(w, 'start', seg.start), 3),
-                        'end': round(getattr(w, 'end', seg.end), 3),
+                        'start': round(getattr(w, 'start', p_start), 3),
+                        'end': round(getattr(w, 'end', p_end), 3),
                         'confidence': round(float(word_conf), 3),
                     })
 
-            out.append({
-                'start_sec': round(float(seg.start), 3),
-                'end_sec': round(float(seg.end), 3),
-                'text': text,
-                'words': words,
-                'is_hallucination': False,
-                'no_speech_prob': round(no_speech_prob, 3),
-                'source': 'gap_fill',
-            })
+                _max_emitted_sec = max(_max_emitted_sec, p_end - p_start)
+                out.append({
+                    'start_sec': round(float(p_start), 3),
+                    'end_sec': round(float(p_end), 3),
+                    'text': p_text,
+                    'words': words,
+                    'is_hallucination': False,
+                    'no_speech_prob': round(no_speech_prob, 3),
+                    'source': 'gap_fill',
+                })
+
+        logger.info(
+            "Gap-fill summary: kept=%d, dropped_outside_gap=%d, "
+            "dropped_duplicate=%d, dropped_hallucination=%d, "
+            "dropped_high_no_speech=%d, dropped_repetition=%d, "
+            "long_runs_split=%d, max_segment_sec=%.2f",
+            len(out), _dropped_outside_gap, _dropped_duplicate,
+            _dropped_hallucination, _dropped_high_no_speech,
+            _dropped_repetition, _split_runs, _max_emitted_sec,
+        )
         return out
 
     def _reload_on_cpu(self) -> None:

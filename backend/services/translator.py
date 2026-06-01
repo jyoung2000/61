@@ -321,9 +321,25 @@ async def translate_segments(
         )
 
         batch_success = False
+        # Dedicated OpenRouter translation model overrides the editorial
+        # model when set — keeps polishing on the editorial model while
+        # translation runs through a model the user picked for that task.
+        # Blank → no override, the editorial model handles translation
+        # (the previous, single-knob behavior).
+        _translation_override = (
+            getattr(settings, "OPENROUTER_TRANSLATION_MODEL", "") or ""
+        ).strip() or None
+        if _translation_override and batch_idx == 0:
+            logger.info(
+                "Translation batch via OpenRouter override model: %s",
+                _translation_override,
+            )
         for attempt in range(2):  # 2 attempts per batch
             try:
-                response = await orchestrator.text_completion(prompt, timeout=120)
+                response = await orchestrator.text_completion(
+                    prompt, timeout=120,
+                    model_override=_translation_override,
+                )
                 translations = _parse_translation_response(response)
 
                 if isinstance(translations, list):

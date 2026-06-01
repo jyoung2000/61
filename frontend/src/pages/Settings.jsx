@@ -65,8 +65,8 @@ export default function Settings() {
 
   // Per-task model selection
   const [availableModels, setAvailableModels] = useState({ transcript: [], primary: [], editorial: [] });
-  const [currentModels, setCurrentModels] = useState({ transcript_model: '', primary_model: '', editorial_model: '', editorial_model_fallback: '' });
-  const [pendingModels, setPendingModels] = useState({ transcript_model: '', primary_model: '', editorial_model: '', editorial_model_fallback: '' });
+  const [currentModels, setCurrentModels] = useState({ transcript_model: '', primary_model: '', editorial_model: '', editorial_model_fallback: '', translation_model: '' });
+  const [pendingModels, setPendingModels] = useState({ transcript_model: '', primary_model: '', editorial_model: '', editorial_model_fallback: '', translation_model: '' });
   const [modelsSaving, setModelsSaving] = useState(false);
   const [modelsLoading, setModelsLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
@@ -488,6 +488,9 @@ export default function Settings() {
         primary_model: cur.primary_model || cur.vision_model || '',
         editorial_model: editorialFromEnv || editorialFromJudge,
         editorial_model_fallback: _judgeSpecToModelId(judge.fallback || ''),
+        // Dedicated OpenRouter translation model — distinct from editorial.
+        // Blank means "fall back to editorial" at translate time.
+        translation_model: cur.translation_model || '',
       };
       setCurrentModels(resolved);
       setPendingModels(resolved);
@@ -583,7 +586,8 @@ export default function Settings() {
 
   // Buffer a model selection (does NOT save yet). The 'editorial_fallback'
   // task writes to ``editorial_model_fallback`` so it doesn't collide with
-  // the primary 'editorial' pick.
+  // the primary 'editorial' pick. The 'translation' task writes to
+  // ``translation_model`` (mapped to OPENROUTER_TRANSLATION_MODEL on save).
   const handleSelectModel = (task, modelId) => {
     const key = task === 'editorial_fallback'
       ? 'editorial_model_fallback'
@@ -633,7 +637,8 @@ export default function Settings() {
     pendingModels.transcript_model !== currentModels.transcript_model ||
     pendingModels.primary_model !== currentModels.primary_model ||
     pendingModels.editorial_model !== currentModels.editorial_model ||
-    pendingModels.editorial_model_fallback !== currentModels.editorial_model_fallback;
+    pendingModels.editorial_model_fallback !== currentModels.editorial_model_fallback ||
+    pendingModels.translation_model !== currentModels.translation_model;
 
   // Build the per-user env-var patch for a model selection. Picks
   // the right OPENROUTER_*_MODEL vs OLLAMA_*_MODEL key by inspecting
@@ -668,6 +673,11 @@ export default function Settings() {
       body.editorial_model = pendingModels.editorial_model;
       body.text_model = pendingModels.editorial_model;  // legacy alias
     }
+    // Translation model — distinct from editorial. Send the full value
+    // (including empty string, so the user can clear the override).
+    if (pendingModels.translation_model !== currentModels.translation_model) {
+      body.translation_model = pendingModels.translation_model || '';
+    }
 
     const editorialChanged =
       pendingModels.editorial_model !== currentModels.editorial_model
@@ -696,6 +706,11 @@ export default function Settings() {
             ..._perUserModelPatch('primary', body.primary_model),
             ..._perUserModelPatch('editorial', body.editorial_model),
           };
+          // Mirror the translation model pick if it changed. Treat blank
+          // explicitly — it clears the per-user override too.
+          if (Object.prototype.hasOwnProperty.call(body, 'translation_model')) {
+            userPatch.OPENROUTER_TRANSLATION_MODEL = body.translation_model || '';
+          }
           await savePerUserSettings(userPatch);
         }
       }
@@ -1939,8 +1954,8 @@ export default function Settings() {
                 models={availableModels.editorial}
                 pendingValue={pendingModels.editorial_model}
                 savedValue={currentModels.editorial_model}
-                label="Editorial AI"
-                desc="Scores clips, generates summaries and tags, and polishes transcripts. Any LLM works — smarter models produce better editorial judgment."
+                label="Editorial AI (transcript polishing)"
+                desc="Used to polish and clean up transcript text — punctuation, proper nouns, sentence boundaries. Also scores clips and writes summaries / tags. Pick the OpenRouter model you want for editorial polish."
               />
               <ModelDropdown
                 task="editorial_fallback"
@@ -1949,6 +1964,14 @@ export default function Settings() {
                 savedValue={currentModels.editorial_model_fallback}
                 label="Editorial AI Fallback"
                 desc="Used automatically when the primary Editorial AI is rate-limited or unreachable. Leave blank to disable the fallback."
+              />
+              <ModelDropdown
+                task="translation"
+                models={availableModels.editorial}
+                pendingValue={pendingModels.translation_model}
+                savedValue={currentModels.translation_model}
+                label="Translation AI (OpenRouter)"
+                desc="Used only for subtitle translation (e.g. Japanese → English). Distinct from the Editorial AI above, so you can pick a fast / cheap model for translation while keeping a smarter model for polishing. Leave blank to fall back to the Editorial AI model."
               />
 
               {/* ── Save Button ── */}

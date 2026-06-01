@@ -14,6 +14,10 @@ class Settings(BaseSettings):
     OPENROUTER_PRIMARY_MODEL: str = "google/gemini-2.5-flash"
     OPENROUTER_EDITORIAL_MODEL: str = "google/gemini-2.5-pro"
     OPENROUTER_SUMMARY_MODEL: str = "google/gemini-2.5-flash"
+    # Dedicated translation model. Blank → fall back to OPENROUTER_EDITORIAL_MODEL
+    # so existing behavior is preserved when the user hasn't picked one.
+    # Mirrors OLLAMA_TRANSLATION_MODEL for the cloud provider.
+    OPENROUTER_TRANSLATION_MODEL: str = ""
 
     # Direct provider keys
     ANTHROPIC_API_KEY: str = ""
@@ -120,6 +124,17 @@ class Settings(BaseSettings):
     WHISPER_GAP_FILL_ENABLED: bool = True
     WHISPER_GAP_FILL_MIN_SEC: float = 1.5
     WHISPER_GAP_FILL_NO_SPEECH_THRESHOLD: float = 0.25
+    # Keep VAD on for the gap-fill re-transcribe. The previous default of
+    # "VAD off + relaxed no_speech threshold" let music regions collapse
+    # into single 700 s run-on segments; VAD on at the same low threshold
+    # still recovers quiet speech but breaks on real silence. Flip to
+    # False to restore the legacy behaviour.
+    WHISPER_GAP_FILL_VAD: bool = True
+    # Hard cap on per-segment length emitted by the gap-fill pass.
+    # Anything longer is split at word boundaries (or uniformly when no
+    # word grid is available). 8 s matches the ``SUBTITLE_MAX_DURATION_MS``
+    # ceiling so the readability pass never has to cut a giant cue in half.
+    WHISPER_GAP_FILL_MAX_SEG_SEC: float = 8.0
     # Auto-upgrade the Whisper model tier when the detected GPU has
     # spare VRAM. Existing logic already jumped ``small → large-v3-turbo``
     # on ≥6 GB cards; this flag extends the ladder so mid-tier GPUs
