@@ -158,6 +158,41 @@ class AudioIntelligence:
     _cached_engine = None
     _cached_model_name = None
     _cached_device = None
+    # Sticky record of the model/device that ACTUALLY loaded most recently.
+    # Unlike ``_cached_model_name`` (which ``_release_whisper_vram`` nulls when
+    # it frees the engine after a job), these survive the VRAM release so the
+    # Settings page can always report the real effective model that ran — even
+    # after the engine has been unloaded. Set wherever a real load succeeds.
+    _last_loaded_model_name = None
+    _last_loaded_device = None
+
+    @classmethod
+    def _record_loaded(cls, model_name, device):
+        """Stamp the model/device that just loaded (sticky, for the GUI)."""
+        cls._last_loaded_model_name = model_name
+        cls._last_loaded_device = device
+
+    @classmethod
+    def invalidate_cache(cls, reason: str = ""):
+        """Drop the cached engine so the next job loads a freshly-selected
+        model. Safe to call from anywhere (e.g. when the user changes
+        WHISPER_MODEL in Settings) — frees the old engine's VRAM too. Leaves
+        the sticky ``_last_loaded_*`` record intact for display."""
+        had = cls._cached_model_name
+        cls._cached_engine = None
+        cls._cached_model_name = None
+        cls._cached_device = None
+        try:
+            import gc
+            gc.collect()
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+        if had:
+            logger.info("AudioIntelligence cache invalidated (was '%s')%s",
+                        had, f" — {reason}" if reason else "")
 
     def __init__(self, model_name: str = 'small'):
         self.available = False
@@ -197,6 +232,7 @@ class AudioIntelligence:
             self.engine = AudioIntelligence._cached_engine
             self.device_used = AudioIntelligence._cached_device
             self.available = True
+            AudioIntelligence._record_loaded(self.model_name, self.device_used)
             # Re-derive batch size from the cached device tier so a reused
             # GPU engine doesn't suddenly run with the wrong workspace.
             if self.device_used and self.device_used.startswith('cuda'):
@@ -349,6 +385,7 @@ class AudioIntelligence:
                 AudioIntelligence._cached_engine = self.engine
                 AudioIntelligence._cached_model_name = self.model_name
                 AudioIntelligence._cached_device = self.device_used
+                AudioIntelligence._record_loaded(self.model_name, self.device_used)
                 log.log_stage('AUDIO', f'Whisper ready: {tier}')
                 # The user's requested model loaded — honor it (Task 4). If we
                 # only fit it by falling to CPU while a GPU was available, say so
@@ -394,6 +431,7 @@ class AudioIntelligence:
                 AudioIntelligence._cached_engine = self.engine
                 AudioIntelligence._cached_model_name = 'base'
                 AudioIntelligence._cached_device = self.device_used
+                AudioIntelligence._record_loaded('base', self.device_used)
                 log.log_stage('AUDIO',
                     f'Whisper ready: CPU int8 base (effective model=base, '
                     f'requested={self.requested_model_name})')
@@ -1070,6 +1108,7 @@ class AudioIntelligence:
         AudioIntelligence._cached_engine = self.engine
         AudioIntelligence._cached_model_name = self.model_name
         AudioIntelligence._cached_device = self.device_used
+        AudioIntelligence._record_loaded(self.model_name, self.device_used)
         log.log_stage('AUDIO', f'Whisper reloaded on CPU int8 ({self.model_name})')
 
     def whisper_translate(self, video_path: str, source_lang: str = None,

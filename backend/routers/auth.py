@@ -264,6 +264,10 @@ async def update_my_settings(
         "REPLICATE_API_KEY",
         # Whisper
         "WHISPER_MODEL",
+        # Persist the explicit-choice flag alongside the model so the user's
+        # pick survives the runtime auto-upgrade/downgrade protection and the
+        # per-user overlay (Task 3).
+        "WHISPER_MODEL_USER_SET",
         "WHISPER_BEAM_SIZE",
         "WHISPER_VAD_FILTER",
         # Human-reframe per-user knobs

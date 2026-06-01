@@ -1,3 +1,81 @@
+# ClipAI — Whisper model: show the real one + let the user change it
+
+Two Settings fixes for the Whisper transcription model: (1) the GUI now shows
+the model that **actually loaded** (not just the configured value — the 4 GB
+GTX 1650 can auto-downgrade), and (2) the read-only "Whisper Model" row is now a
+**dropdown** whose pick is persisted, marked as a deliberate user choice, and
+applied to the next transcription without a container restart.
+
+All changes on this branch (`claude/inspiring-maxwell-GG90I`).
+
+### Task 1 — Expose the effective (actually-loaded) Whisper model
+
+- `backend/services/reframer_audio.py`: new **sticky** class attrs
+  `AudioIntelligence._last_loaded_model_name` / `_last_loaded_device`, stamped by
+  `_record_loaded(...)` at every real load (GPU tier success, base fallback,
+  cache reuse, CPU reload). Unlike `_cached_model_name` — which
+  `_release_whisper_vram()` nulls after a job — these survive the VRAM release so
+  the GUI can always report what ran.
+- `backend/routers/settings.py`: new helper `_effective_whisper_info()` +
+  endpoint **`GET /api/providers/whisper/effective`** (and the same fields added
+  to `GET /api/providers/models/available` → `current`). Returns:
+  `whisper_model_selected`, `whisper_model_user_set`, `whisper_model_effective`
+  (cached → sticky → `null`), `whisper_model_loaded`, and `whisper_downgraded`
+  (`effective != selected`). Reads the `AudioIntelligence` class attrs out of
+  `sys.modules` **without** importing the heavy reframer_audio module, so it's
+  cheap to poll.
+
+### Task 2 — Real dropdown instead of a read-only label
+
+- `frontend/src/pages/Settings.jsx`: the Analysis-Settings "Whisper Model" row is
+  now a `<select>` over the valid faster-whisper models (`tiny`, `base`, `small`,
+  `medium`, `large-v3`, `large-v3-turbo`, `distil-small.en`, `distil-medium.en`,
+  `distil-large-v3`, with 4 GB-oriented VRAM hints; `.en` variants labelled
+  English-only). Below it, an effective-model line shows
+  *"Selected: large-v3-turbo · Running: medium (downgraded — not enough VRAM…)"*
+  when they differ, just *"Running: <model>"* when they match, "Not loaded yet"
+  before the first job, and a ↻ refresh button. `backend/routers/settings.py`
+  `_WHISPER_MODELS` gained the two distil `.en` entries (`english_only: true`).
+
+### Task 3 — Persist the override and actually apply it
+
+- `_perUserModelPatch('transcript')` now returns
+  `{ WHISPER_MODEL: id, WHISPER_MODEL_USER_SET: true }`; the picker saves
+  immediately (global `/providers/models/save` **and** the per-user patch).
+- `backend/routers/auth.py`: added `WHISPER_MODEL_USER_SET` to the per-user
+  `PUT /me/settings` allow-list so the flag actually persists.
+- `backend/routers/settings.py` `save_models`: on a model change it now
+  **invalidates** `AudioIntelligence` (new `invalidate_cache()` classmethod,
+  sys.modules-guarded) so the next job loads the new selection without a restart
+  (the old `reload_model()` was a no-op). The cache is also model-name-keyed, so
+  a new pick reloads regardless.
+
+### Task 4 — Honest downgrade behavior (and stop overwriting a user pick)
+
+- `backend/main.py`: the startup Whisper auto-upgrade now skips when
+  `WHISPER_MODEL_USER_SET` is true — a deliberate `small`/`medium`/`base` pick is
+  no longer silently bumped to `large-v3-turbo` on a GPU box. Auto-upgrade still
+  applies for the default (non-user-set) case.
+- `reframer_audio.py` already records the real loaded model in `_cached_model_name`
+  for both the downgrade and base-fallback paths; the new sticky fields mirror it
+  for display so the GUI reflects reality.
+
+### Tests
+
+- `backend/tests/test_whisper_effective_endpoint.py` — effective/selected/
+  downgraded/sticky reporting + the distil `.en` model list. (5 tests.)
+
+```
+$ python3 -m pytest backend/tests/test_whisper_effective_endpoint.py -q
+5 passed
+```
+
+> The Settings dropdown + the GTX-1650 selected-vs-downgraded screenshot must be
+> captured on the GPU box (no GPU/CUDA/faster-whisper here). The frontend JSX was
+> verified to parse/transform with esbuild; the backend logic is unit-tested.
+
+---
+
 # ClipAI — Automatic + reliable offline translation, model lifecycle, Whisper fix
 
 Make offline NMT translation the automatic default (no manual Settings download),

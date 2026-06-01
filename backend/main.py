@@ -429,8 +429,14 @@ async def _startup_preload():
     try:
         _cur_whisper = (getattr(cfg, "WHISPER_MODEL", "") or "").lower()
         _large_tier = {"large-v3-turbo", "large-v3", "large-v2", "large"}
+        # Never override a model the user explicitly picked in Settings —
+        # WHISPER_MODEL_USER_SET is the flag the dropdown sets on selection, and
+        # honoring it here is what stops a deliberate ``small``/``medium`` pick
+        # from being silently bumped to large-v3-turbo on a GPU box (acceptance
+        # #4). Auto-upgrade still applies for the non-user-set (default) case.
         if (getattr(cfg, "WHISPER_AUTO_UPGRADE", True)
                 and getattr(cfg, "GPU_ACCELERATION_ENABLED", False)
+                and not getattr(cfg, "WHISPER_MODEL_USER_SET", False)
                 and _cur_whisper not in _large_tier):
             _vram_total_mb = 0
             try:

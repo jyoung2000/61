@@ -35,6 +35,22 @@ const dropdownStyle = {
 
 const TAB_NAME_TO_INDEX = { 'ai-provider': 0, prompts: 1, fonts: 2, presets: 3, advanced: 4, 'usage-costs': 5, 'api-access': 6, 'about': 7, 'users': 8 };
 
+// Static fallback list for the Whisper Model dropdown, used only when the
+// backend's /providers/models/available hasn't populated availableModels yet.
+// VRAM hints are sized for a 4 GB GPU (GTX 1650). English-only ``.en`` variants
+// are labelled as such.
+const WHISPER_FALLBACK_MODELS = [
+  { id: 'tiny', hint: 'fastest, lowest accuracy (~39M)' },
+  { id: 'base', hint: 'fast, low accuracy (~74M)' },
+  { id: 'small', hint: 'good balance (~244M)' },
+  { id: 'medium', hint: 'high accuracy, fits 4 GB (~769M)' },
+  { id: 'large-v3', hint: 'best accuracy, tight on 4 GB (~1.5B)' },
+  { id: 'large-v3-turbo', hint: 'near large-v3, 40% faster (~809M)' },
+  { id: 'distil-small.en', hint: 'English-only, very fast (~166M)', english_only: true },
+  { id: 'distil-medium.en', hint: 'English-only, fast (~394M)', english_only: true },
+  { id: 'distil-large-v3', hint: 'distilled large-v3, 6× faster (~756M)' },
+];
+
 export default function Settings() {
   const { isMobile } = useResponsive();
   const [searchParams] = useSearchParams();
@@ -67,6 +83,13 @@ export default function Settings() {
   const [availableModels, setAvailableModels] = useState({ transcript: [], primary: [], editorial: [] });
   const [currentModels, setCurrentModels] = useState({ transcript_model: '', primary_model: '', editorial_model: '', editorial_model_fallback: '', translation_model: '' });
   const [pendingModels, setPendingModels] = useState({ transcript_model: '', primary_model: '', editorial_model: '', editorial_model_fallback: '', translation_model: '' });
+  // Configured vs actually-loaded Whisper model (so the Settings page shows
+  // what really ran, including a low-VRAM downgrade — not only what was asked).
+  const [whisperInfo, setWhisperInfo] = useState({
+    whisper_model_selected: '', whisper_model_user_set: false,
+    whisper_model_effective: null, whisper_model_loaded: false,
+    whisper_downgraded: false,
+  });
   const [modelsSaving, setModelsSaving] = useState(false);
   const [modelsLoading, setModelsLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
@@ -493,6 +516,18 @@ export default function Settings() {
       };
       setCurrentModels(resolved);
       setPendingModels(resolved);
+      // Effective (actually-loaded) Whisper model comes back in the same
+      // ``current`` block — surface it so the Analysis Settings row can show
+      // selected-vs-running and flag a downgrade.
+      if (cur && cur.whisper_model_selected !== undefined) {
+        setWhisperInfo({
+          whisper_model_selected: cur.whisper_model_selected || '',
+          whisper_model_user_set: !!cur.whisper_model_user_set,
+          whisper_model_effective: cur.whisper_model_effective ?? null,
+          whisper_model_loaded: !!cur.whisper_model_loaded,
+          whisper_downgraded: !!cur.whisper_downgraded,
+        });
+      }
     } catch {} finally {
       setModelsLoading(false);
     }
@@ -643,7 +678,11 @@ export default function Settings() {
   // the model's ``provider`` field returned by /api/providers/models/available.
   const _perUserModelPatch = (task, modelId) => {
     if (!modelId) return null;
-    if (task === 'transcript') return { WHISPER_MODEL: modelId };
+    // Mark the Whisper pick as an explicit user choice so the runtime
+    // auto-upgrade/downgrade protection keeps it (and the per-user overlay
+    // re-applies it). WHISPER_MODEL_USER_SET is what makes the selection
+    // stick instead of being bumped to large-v3-turbo on a GPU box.
+    if (task === 'transcript') return { WHISPER_MODEL: modelId, WHISPER_MODEL_USER_SET: true };
     const list = availableModels[task] || [];
     const m = list.find((x) => x.id === modelId);
     const provider = (m && m.provider) || '';
@@ -783,6 +822,29 @@ export default function Settings() {
     } catch {
       showToast('Failed to save model', 'error');
     }
+  };
+
+  // Poll the cheap effective-model endpoint so the row shows the model that
+  // actually loaded (incl. a low-VRAM downgrade), not only the requested one.
+  const refreshWhisperEffective = async () => {
+    try {
+      const res = await fetch('/api/providers/whisper/effective');
+      if (res.ok) setWhisperInfo(await res.json());
+    } catch {}
+  };
+
+  // Whisper dropdown change → save immediately (sets WHISPER_MODEL_USER_SET),
+  // reflect the pick, and refresh the effective-model line.
+  const handleSelectWhisperModel = async (modelId) => {
+    if (!modelId || modelId === currentModels.transcript_model) return;
+    setPendingModels((p) => ({ ...p, transcript_model: modelId }));
+    setCurrentModels((p) => ({ ...p, transcript_model: modelId }));
+    setWhisperInfo((p) => ({
+      ...p, whisper_model_selected: modelId,
+      whisper_downgraded: !!(p.whisper_model_effective && p.whisper_model_effective !== modelId),
+    }));
+    await handleSaveModel('transcript', modelId);
+    await refreshWhisperEffective();
   };
 
   // Refresh models from OpenRouter
@@ -3273,9 +3335,56 @@ export default function Settings() {
             <h3 style={{ fontSize: 14, marginBottom: 16, color: 'var(--text-secondary)' }}>Analysis Settings</h3>
 
             <div style={{ display: 'grid', gap: 12 }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 12px', background: 'var(--bg-panel)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)' }}>
-                <span style={{ fontSize: 13 }}>Whisper Model</span>
-                <span style={{ fontSize: 12, fontFamily: 'var(--font-mono)', color: 'var(--text-secondary)' }}>{String(currentModels.transcript_model || 'base')}</span>
+              {/* Whisper Model — editable dropdown + the model that ACTUALLY loaded */}
+              <div style={{ padding: '10px 12px', background: 'var(--bg-panel)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+                  <span style={{ fontSize: 13 }}>Whisper Model</span>
+                  <select
+                    value={currentModels.transcript_model || whisperInfo.whisper_model_selected || 'small'}
+                    onChange={(e) => handleSelectWhisperModel(e.target.value)}
+                    disabled={modelsSaving}
+                    style={{ ...dropdownStyle, width: 'auto', minWidth: 230, maxWidth: '70%' }}
+                    title="Transcription model — your pick is saved immediately and used on the next analysis"
+                  >
+                    {(availableModels.transcript && availableModels.transcript.length
+                      ? availableModels.transcript.map((m) => ({
+                          id: m.id,
+                          english_only: m.english_only,
+                          hint: (m.desc || '').replace(/\s*\(.*$/, '') || m.quality || '',
+                        }))
+                      : WHISPER_FALLBACK_MODELS
+                    ).map((m) => (
+                      <option key={m.id} value={m.id}>
+                        {m.id}{m.english_only ? ' [EN-only]' : ''}{m.hint ? ` — ${m.hint}` : ''}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                {/* Effective (actually-loaded) model — the core "show the real one" fix */}
+                <div style={{ marginTop: 8, fontSize: 11, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', color: whisperInfo.whisper_downgraded ? 'var(--warning, #e0a800)' : 'var(--text-muted)' }}>
+                  {whisperInfo.whisper_model_effective ? (
+                    whisperInfo.whisper_downgraded ? (
+                      <span>⚠ Selected: <b>{whisperInfo.whisper_model_selected || currentModels.transcript_model}</b>
+                        {' · Running: '}<b>{whisperInfo.whisper_model_effective}</b>
+                        {' (downgraded — not enough VRAM on this GPU)'}
+                        {!whisperInfo.whisper_model_loaded ? ' [last run]' : ''}</span>
+                    ) : (
+                      <span>Running: <b style={{ color: 'var(--success)' }}>{whisperInfo.whisper_model_effective}</b>
+                        {!whisperInfo.whisper_model_loaded ? ' [last run — not resident now]' : ''}</span>
+                    )
+                  ) : (
+                    <span>Not loaded yet — loads on the next analysis.</span>
+                  )}
+                  <button
+                    onClick={refreshWhisperEffective}
+                    style={{ fontSize: 10, padding: '1px 8px', background: 'transparent', color: 'var(--text-muted)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', cursor: 'pointer' }}
+                    title="Re-check the running model"
+                  >↻ refresh</button>
+                </div>
+                <span style={{ fontSize: 10, color: 'var(--text-muted)', display: 'block', marginTop: 6 }}>
+                  Your pick is saved immediately and used on the next analysis (no restart). On a 4 GB GPU large models may
+                  auto-downgrade — the “Running” line always shows the model that actually loaded.
+                </span>
               </div>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 12px', background: 'var(--bg-panel)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)' }}>
                 <span style={{ fontSize: 13 }}>Beam Size</span>

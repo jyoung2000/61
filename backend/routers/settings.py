@@ -1642,6 +1642,8 @@ _WHISPER_MODELS = [
     {"id": "large-v3", "name": "Whisper Large V3", "provider": "local", "desc": "Best accuracy, needs GPU (~1.5B params)", "cost_per_hour": 0, "is_free": True, "quality_score": 5, "quality": "best"},
     {"id": "large-v3-turbo", "name": "Whisper Large V3 Turbo", "provider": "local", "desc": "Near large-v3 accuracy, 40% faster (~809M params)", "cost_per_hour": 0, "is_free": True, "quality_score": 5, "quality": "best"},
     {"id": "distil-large-v3", "name": "Whisper Distil Large V3", "provider": "local", "desc": "Distilled large-v3, 6x faster, English-optimized (~756M params)", "cost_per_hour": 0, "is_free": True, "quality_score": 4, "quality": "excellent"},
+    {"id": "distil-small.en", "name": "Whisper Distil Small (English-only)", "provider": "local", "desc": "Distilled small, English-only — very fast, light on VRAM (~166M params)", "cost_per_hour": 0, "is_free": True, "quality_score": 3, "quality": "good", "english_only": True},
+    {"id": "distil-medium.en", "name": "Whisper Distil Medium (English-only)", "provider": "local", "desc": "Distilled medium, English-only — fast, fits a 4 GB GPU (~394M params)", "cost_per_hour": 0, "is_free": True, "quality_score": 4, "quality": "excellent", "english_only": True},
 ]
 
 # Known models for direct providers (when user has their API key)
@@ -1772,6 +1774,48 @@ def _vision_tracking_compat(model_id: str, context_length: int) -> tuple[bool, i
     if context_length >= 16000:
         return True, 2  # 16K → tight but workable
     return True, 1  # Below 16K but passed blocklist — marginal
+
+
+def _effective_whisper_info() -> dict:
+    """Report the configured vs actually-loaded Whisper model.
+
+    Reads the ``AudioIntelligence`` class attrs WITHOUT importing the heavy
+    reframer_audio module (cv2 / torch) when it isn't already loaded — so the
+    Settings page can poll this cheaply. ``whisper_model_effective`` is the
+    model currently resident in VRAM/RAM, falling back to the last model that
+    loaded this process (sticky across the post-job VRAM release); it is
+    ``None`` only when nothing has loaded since startup. ``whisper_downgraded``
+    is True when the effective model differs from the selected one (the GTX
+    1650 auto-downgrade, e.g. large-v3-turbo → medium, or the base fallback).
+    """
+    import sys as _sys
+    selected = getattr(settings, "WHISPER_MODEL", "small")
+    user_set = bool(getattr(settings, "WHISPER_MODEL_USER_SET", False))
+    effective = None
+    loaded_now = False
+    mod = _sys.modules.get("backend.services.reframer_audio")
+    ai = getattr(mod, "AudioIntelligence", None) if mod else None
+    if ai is not None:
+        cached = getattr(ai, "_cached_model_name", None)
+        last = getattr(ai, "_last_loaded_model_name", None)
+        loaded_now = bool(cached)
+        effective = cached or last
+    return {
+        "whisper_model_selected": selected,
+        "whisper_model_user_set": user_set,
+        "whisper_model_effective": effective,
+        "whisper_model_loaded": loaded_now,
+        "whisper_downgraded": bool(effective and effective != selected),
+    }
+
+
+@router.get("/providers/whisper/effective")
+async def get_whisper_effective():
+    """Configured vs actually-loaded Whisper model — cheap, safe to poll.
+
+    Lets the Settings page always show the model that REALLY ran (including a
+    silent low-VRAM downgrade) instead of only the requested value."""
+    return _effective_whisper_info()
 
 
 @router.get("/providers/models/available")
@@ -1990,6 +2034,10 @@ async def available_models():
             # editorial model" — the frontend renders that as the default
             # option in the Translation AI dropdown.
             "translation_model": settings.OPENROUTER_TRANSLATION_MODEL or "",
+            # Configured vs actually-loaded Whisper model so the Settings page
+            # shows what really ran (incl. a low-VRAM downgrade), not only the
+            # requested value.
+            **_effective_whisper_info(),
         },
     }
 
@@ -2017,13 +2065,23 @@ async def save_models(req: SaveModelsRequest):
         if env_path:
             _upsert_env_var(env_path, "WHISPER_MODEL", req.transcript_model)
             _upsert_env_var(env_path, "WHISPER_MODEL_USER_SET", "true")
-        # Force reload if model changed — without this, the _whisper_model
-        # singleton holds the old model and _get_whisper_model() returns it.
+        # Force reload if model changed — without this, the cached
+        # AudioIntelligence engine holds the OLD model and the next job reuses
+        # it. Invalidate the class-level cache so the next transcription loads
+        # the new selection without a container restart (Task 3). Guarded via
+        # sys.modules so we don't trigger the heavy reframer_audio import here
+        # if it isn't already loaded (nothing to invalidate in that case).
         if req.transcript_model != old_model:
             from backend.services.compat_stubs import reload_model as reload_whisper
             reload_whisper()
+            import sys as _sys
+            _ra = _sys.modules.get("backend.services.reframer_audio")
+            _ai = getattr(_ra, "AudioIntelligence", None) if _ra else None
+            if _ai is not None and hasattr(_ai, "invalidate_cache"):
+                _ai.invalidate_cache(reason=f"model changed {old_model}→{req.transcript_model}")
             logger.info(
-                "Whisper model changed: '%s' → '%s' — triggering background download",
+                "Whisper model changed: '%s' → '%s' — cache invalidated, "
+                "triggering background download",
                 old_model, req.transcript_model,
             )
             # Pre-download the new model in background so it's cached before
