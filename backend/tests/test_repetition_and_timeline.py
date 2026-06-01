@@ -13,7 +13,10 @@ These tests pin the two fixes:
 """
 
 from backend.models import TranscriptSegment, WordTimestamp
-from backend.services.transcript_dedup import drop_repetition_loops
+from backend.services.transcript_dedup import (
+    collapse_adjacent_duplicates,
+    drop_repetition_loops,
+)
 from backend.services.subtitle_formatter import enforce_readability
 
 
@@ -48,6 +51,44 @@ def test_distinct_lines_all_kept():
 def test_blank_segments_passthrough():
     segs = [_d(0, 1, ""), _d(1, 2, "  ")]
     kept, dropped = drop_repetition_loops(segs)
+    assert dropped == 0 and len(kept) == 2
+
+
+# ── adjacent-duplicate collapse ──────────────────────────────────────────
+
+def _a(start, end, text):
+    return {"start": start, "end": end, "text": text}
+
+
+def test_back_to_back_long_dup_collapsed_and_end_extended():
+    # The exact prod symptom: the same long narration cue emitted twice in a
+    # row. drop_repetition_loops would keep only one globally, but the adjacent
+    # collapse is what merges the timing into a single clean cue.
+    line = "アフターコロニー195年、作戦名オペレーション・メテオ。"
+    segs = [_a(685.0, 688.0, line), _a(685.0, 691.0, line)]
+    kept, dropped = collapse_adjacent_duplicates(segs)
+    assert dropped == 1
+    assert len(kept) == 1
+    assert kept[0]["end"] == 691.0     # stretched to cover the dropped copy
+
+
+def test_non_adjacent_dup_not_collapsed_here():
+    # Two identical cues separated by a different one are NOT adjacent, so this
+    # pass leaves them (drop_repetition_loops handles scattered repeats).
+    segs = [_a(0, 1, "x"), _a(1, 2, "y"), _a(2, 3, "x")]
+    kept, dropped = collapse_adjacent_duplicates(segs)
+    assert dropped == 0 and len(kept) == 3
+
+
+def test_whitespace_insensitive_adjacent_match():
+    segs = [_a(0, 2, "ド ー リ ア ンリ"), _a(2, 4, "ドー リアンリ")]
+    kept, dropped = collapse_adjacent_duplicates(segs)
+    assert dropped == 1 and len(kept) == 1
+
+
+def test_distinct_adjacent_lines_kept():
+    segs = [_a(0, 1, "alpha"), _a(1, 2, "beta")]
+    kept, dropped = collapse_adjacent_duplicates(segs)
     assert dropped == 0 and len(kept) == 2
 
 

@@ -2635,6 +2635,33 @@ async def _run_analysis_inner(job_id: str):
             logger.warning(
                 "[%s] Music marking skipped (%s)", job_id, _mm_err)
 
+    # ── Final de-duplication pass ──
+    # The per-segment hallucination filters run inside the Whisper stage, but
+    # speaker fusion, sentence resegmentation and the readability reflow can
+    # all re-introduce duplicates downstream: back-to-back identical cues
+    # (observed as ``[11:25] …`` twice in a row) and scattered repetition-loop
+    # hallucinations (the garbled ``ドーリアンリ`` name repeated 8× across the
+    # episode). Run BOTH collapses one last time on the fully-assembled
+    # transcript — this is the version that gets persisted, translated and
+    # exported, so it's the one the user actually sees in the TXT/SRT/VTT.
+    if transcript:
+        try:
+            from backend.services.transcript_dedup import (
+                collapse_adjacent_duplicates, drop_repetition_loops,
+            )
+            _pre_dedup = len(transcript)
+            transcript, _adj = collapse_adjacent_duplicates(transcript)
+            transcript, _loop = drop_repetition_loops(transcript)
+            if _adj or _loop:
+                logger.info(
+                    "[%s] Final transcript dedup: %d → %d segments "
+                    "(%d adjacent dup, %d repetition-loop)",
+                    job_id, _pre_dedup, len(transcript), _adj, _loop,
+                )
+        except Exception as _dd_err:
+            logger.warning(
+                "[%s] Final transcript dedup skipped (%s)", job_id, _dd_err)
+
     # ── Transcript readability score ──
     # Returns a Netflix-style A-F grade + per-axis sub-scores (CPS,
     # line length, duration, gap). Persisted on the job so the Analysis
