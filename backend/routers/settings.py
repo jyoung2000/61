@@ -2728,23 +2728,51 @@ async def report_client_gpu(req: ClientGpuReport):
 
     The server uses this to skip server-side transcription if the client will
     handle it, or to prepare server-side fallback if the client can't.
-    Also stores the user's selected GPU index for FFmpeg device selection.
 
-    When the client reports an NVIDIA GPU and server-side GPU acceleration
-    is not yet enabled, this triggers auto-detection and enables it.
+    IMPORTANT: this describes the CLIENT's (browser / phone) GPU, which is
+    irrelevant to where the SERVER runs analysis. It must NOT change the
+    server's own GPU targeting:
+      * ``GPU_DEVICE_INDEX`` (which physical CUDA device the server's FFmpeg /
+        pipeline use) is never set from here — a phone reporting "Adreno 740,
+        index 0" used to overwrite it and mis-point the server.
+      * Server GPU acceleration is only AUTO-ENABLED, never reconfigured, and
+        only when the SERVER itself actually has an NVIDIA GPU (verified via
+        nvidia-smi / device nodes), not merely because the client claims one.
+    Client capabilities (whisper_capable, encode flags, etc.) are still stored
+    so the client-side offload decision works.
     """
-    # Store the selected GPU index so FFmpeg can target the right device
-    if req.gpu_index:
-        settings.GPU_DEVICE_INDEX = req.gpu_index
-        logger.info("GPU device index set to %s (%s)", req.gpu_index, req.gpu_name)
-        _persist_user_settings()
-
-    # Auto-enable server GPU acceleration if client reports NVIDIA GPU
-    # and server hasn't enabled it yet
-    if req.gpu_vendor and "nvidia" in req.gpu_vendor.lower() and not settings.GPU_ACCELERATION_ENABLED:
+    # NOTE: deliberately do NOT touch settings.GPU_DEVICE_INDEX here — see
+    # docstring. The server picks its own device; the client's index is
+    # meaningless server-side and persisting it corrupted GPU selection.
+    if req.gpu_index and req.gpu_index != (settings.GPU_DEVICE_INDEX or ""):
         logger.info(
-            "Client reports NVIDIA GPU (%s) — auto-enabling server GPU acceleration",
-            req.gpu_name,
+            "Client reported GPU index %s (%s) — ignored for server device "
+            "targeting (server keeps GPU_DEVICE_INDEX=%r)",
+            req.gpu_index, req.gpu_name, settings.GPU_DEVICE_INDEX,
+        )
+
+    # Auto-enable server GPU acceleration ONLY when the SERVER actually has an
+    # NVIDIA GPU — never on the strength of the client's claim alone (a phone
+    # reporting Adreno/Qualcomm must not flip the server into NVIDIA mode).
+    # Probe the SERVER directly: nvidia-smi first, then /dev/nvidia* nodes.
+    _server_has_nvidia = False
+    try:
+        import subprocess as _sp
+        _smi = _sp.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=10)
+        _server_has_nvidia = _smi.returncode == 0 and "GPU" in (_smi.stdout or "")
+    except Exception:
+        _server_has_nvidia = False
+    if not _server_has_nvidia:
+        try:
+            import glob as _glob
+            _server_has_nvidia = bool(_glob.glob("/dev/nvidia[0-9]*"))
+        except Exception:
+            _server_has_nvidia = False
+
+    if _server_has_nvidia and not settings.GPU_ACCELERATION_ENABLED:
+        logger.info(
+            "Server has an NVIDIA GPU — auto-enabling server GPU acceleration "
+            "(client report was the trigger, not the source)",
         )
         settings.GPU_ACCELERATION_ENABLED = True
         settings.GPU_VENDOR_OVERRIDE = "nvidia"
