@@ -1818,6 +1818,39 @@ async def get_whisper_effective():
     return _effective_whisper_info()
 
 
+def _current_translation_model() -> str:
+    """Resolve the translation-model id for the UI dropdown, provider-aware.
+
+    Mirrors how ``current_vision`` / ``current_text`` are resolved in
+    ``available_models`` so an Ollama translation pick reads back as
+    ``ollama/<model>`` instead of blank. Returns ``''`` to mean "reuse the
+    editorial model" — the dropdown's default option.
+
+    ``OLLAMA_TRANSLATION_MODEL`` has a non-empty default (``qwen2.5:3b``) in
+    config.py, so it is surfaced ONLY when the Ollama path is the active one.
+    This preserves the existing "blank == reuse editorial" semantics for
+    OpenRouter-only users (who must never see the Ollama default leak in).
+    """
+    chain = settings.active_provider_chain
+    ollama_is_primary = bool(chain and chain[0] == "ollama")
+    ollama_active = ollama_is_primary or (
+        "ollama" in chain and not _key_is_set(settings.OPENROUTER_API_KEY)
+    )
+    ollama_tm = (settings.OLLAMA_TRANSLATION_MODEL or "").strip()
+    openrouter_tm = (settings.OPENROUTER_TRANSLATION_MODEL or "").strip()
+
+    # On the Ollama path, surface the dedicated Ollama translation model
+    # prefixed so the dropdown selects the matching "ollama/<model>" option.
+    if ollama_active and ollama_tm:
+        return f"ollama/{ollama_tm}"
+    # Otherwise prefer an explicit OpenRouter translation pick. On the
+    # OpenRouter path the Ollama default is intentionally NOT surfaced, keeping
+    # "blank == reuse editorial" intact for OpenRouter-only users.
+    if openrouter_tm:
+        return openrouter_tm
+    return ""
+
+
 @router.get("/providers/models/available")
 async def available_models():
     """Return all available models grouped by task (transcript, vision, text).
@@ -2032,8 +2065,10 @@ async def available_models():
             "text_model": current_text,
             # Dedicated subtitle-translation model. Blank means "use the
             # editorial model" — the frontend renders that as the default
-            # option in the Translation AI dropdown.
-            "translation_model": settings.OPENROUTER_TRANSLATION_MODEL or "",
+            # option in the Translation AI dropdown. Resolved provider-aware
+            # so an Ollama pick reads back as "ollama/<model>" (not blank),
+            # exactly like vision_model / text_model above.
+            "translation_model": _current_translation_model(),
             # Configured vs actually-loaded Whisper model so the Settings page
             # shows what really ran (incl. a low-VRAM downgrade), not only the
             # requested value.
@@ -2208,14 +2243,14 @@ async def save_models(req: SaveModelsRequest):
             "transcript_model": settings.WHISPER_MODEL,
             "vision_model": f"ollama/{settings.OLLAMA_PRIMARY_MODEL}",
             "text_model": f"ollama/{settings.OLLAMA_EDITORIAL_MODEL}",
-            "translation_model": settings.OPENROUTER_TRANSLATION_MODEL or "",
+            "translation_model": _current_translation_model(),
         }
     return {
         "status": "saved",
         "transcript_model": settings.WHISPER_MODEL,
         "vision_model": settings.OPENROUTER_PRIMARY_MODEL,
         "text_model": settings.OPENROUTER_EDITORIAL_MODEL,
-        "translation_model": settings.OPENROUTER_TRANSLATION_MODEL or "",
+        "translation_model": _current_translation_model(),
     }
 
 
