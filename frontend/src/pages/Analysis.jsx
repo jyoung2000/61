@@ -979,6 +979,11 @@ export default function Analysis() {
           } else if (msg.type === 'fallback') {
             pushLog('warning', `Provider fallback: ${String(msg.from_provider || '?')} → ${String(msg.to_provider || '?')} (${String(msg.reason || 'unknown')})`);
             showToast(`Fallback: ${String(msg.from_provider || '?')} -> ${String(msg.to_provider || '?')}: ${String(msg.reason || '')}`, 'warning');
+          } else if (msg.type === 'compute_warning') {
+            // The pipeline ran a heavy stage on CPU despite GPU being enabled.
+            const m = String(msg.message || 'Running on CPU — analysis will be slow.');
+            pushLog('warning', m);
+            showToast(m, 'warning');
           } else if (msg.type === 'export_complete') {
             const label = msg.clip_id === 0 ? 'Full video' : `Clip ${msg.clip_id}`;
             pushLog('success', `${label} exported`);

@@ -2725,6 +2725,37 @@ async def _run_analysis_inner(job_id: str):
         ", ".join(f"{k}={v.get('device')}" for k, v in compute_summary.items()),
     )
 
+    # ── CPU-fallback warning ──
+    # When GPU acceleration is enabled the user EXPECTS the GPU. If any heavy
+    # stage actually ran on CPU (CUDA-only torch missing, CTranslate2 "CUDA
+    # failed", GPU not passed through, etc.) the run is ~10-30x slower and used
+    # to look "stuck". Surface it as a visible job warning + WS notice so the
+    # UI can tell the user instead of silently crawling.
+    try:
+        from backend.services.pipeline_helpers import cpu_fallback_stages
+        _cpu_stages = cpu_fallback_stages(compute_summary)
+        if _cpu_stages and bool(getattr(settings, "GPU_ACCELERATION_ENABLED", False)):
+            _names = ", ".join(_cpu_stages)
+            _warn = (
+                f"Running on CPU: {_names}. The GPU was enabled but couldn't be "
+                "used — analysis is much slower (~10–30×). Check that the "
+                "container sees the GPU (nvidia-container-toolkit, host driver "
+                "≥ R525, and the CUDA torch build)."
+            )
+            _record_pipeline_warning(job_id, _warn)
+            logger.warning("[%s] %s", job_id, _warn)
+            try:
+                await broadcast_ws(job_id, {
+                    "type": "compute_warning",
+                    "level": "warning",
+                    "message": _warn,
+                    "cpu_stages": _cpu_stages,
+                })
+            except Exception:
+                pass
+    except Exception as _cpu_warn_err:
+        logger.debug("[%s] CPU-fallback warning skipped: %s", job_id, _cpu_warn_err)
+
     await database.update_job_status(
         job_id,
         scenes=scenes,

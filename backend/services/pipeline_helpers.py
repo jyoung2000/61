@@ -104,6 +104,30 @@ def _record_pipeline_warning(job_id: str, message: str) -> None:
         bag.append(message)
 
 
+_COMPUTE_STAGE_LABELS = {
+    "frame_extract": "Frame extraction",
+    "yolo_world": "Subject detection (YOLO-World)",
+    "whisper": "Transcription (Whisper)",
+}
+
+
+def cpu_fallback_stages(compute_summary: dict) -> list:
+    """Return human labels of stages in ``compute_summary`` that ran on CPU.
+
+    ``compute_summary`` shape: ``{stage: {"device": "cuda:0"|"cpu", ...}}``.
+    Used to warn the user when the GPU was enabled but a heavy stage fell
+    back to CPU (~10-30x slower) — instead of the run silently crawling.
+    """
+    out = []
+    for k, v in (compute_summary or {}).items():
+        dev = ""
+        if isinstance(v, dict):
+            dev = str(v.get("device", ""))
+        if dev.startswith("cpu"):
+            out.append(_COMPUTE_STAGE_LABELS.get(k, k))
+    return out
+
+
 def _drain_pipeline_telemetry(job_id: str) -> tuple[dict[str, float], list[str]]:
     """Pop the accumulated timings + warnings for ``job_id``.
 
