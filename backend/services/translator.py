@@ -397,10 +397,23 @@ async def _translate_via_nmt(
         return None
     engine = pick_local_engine(source_language, target_language)
     if engine is None:
+        logger.info(
+            "NMT: no local model for %s→%s — caller will fall back to LLM",
+            source_language, target_language,
+        )
         return None
+    # Name the exact engine + model used for this job so the log makes it
+    # unambiguous which offline backend ran (and that no LLM was called).
+    if isinstance(engine, NMTTranslator):
+        model_label = engine.model_id
+    else:
+        model_label = "Helsinki-NLP/opus-mt-{}-{}".format(
+            getattr(engine, "source", source_language),
+            getattr(engine, "target", target_language),
+        )
     logger.info(
-        "NMT: using %s for %s→%s (%d segments)",
-        type(engine).__name__, source_language, target_language, len(segments),
+        "NMT: using %s (%s) for %s→%s (%d segments)",
+        type(engine).__name__, model_label, source_language, target_language, len(segments),
     )
     context_window = max(0, min(20, int(getattr(settings, "TRANSLATION_CONTEXT_WINDOW", 5))))
     out: list[TranscriptSegment] = []
@@ -467,8 +480,11 @@ def _resolve_translation_engine(source: str, target: str) -> str:
         engine = pick_local_engine(source, target)
         if engine is not None:
             return "opus-mt" if engine.__class__.__name__ == "OpusMTTranslator" else "nllb"
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("NMT: engine probe failed for %s→%s (%s)", source, target, e)
+    # No local NMT model downloaded for this pair — auto falls back to the LLM
+    # path. Log it clearly so it's obvious why the offline engine didn't run.
+    logger.info("NMT: no local model for %s→%s, falling back to LLM", source, target)
     return "llm"
 
 

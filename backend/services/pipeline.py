@@ -1344,6 +1344,21 @@ async def _background_post_processing(
             # ── (a) Translate ──
             logger.info("[%s] Translate START: %s → %s (%d segments)",
                         job_id, source_name, target_name, len(_trans_input))
+            # On a 4 GB GPU, a local NMT engine (NLLB on CUDA) must not load on
+            # top of the reframer's Whisper engine. Whisper VRAM is already
+            # released during analysis (_release_whisper_vram at the post-reframer
+            # stage), but re-run it defensively + log when the resolved engine is
+            # a local NMT so the OOM-avoidance ordering is explicit in the log.
+            try:
+                from backend.services.translator import _resolve_translation_engine
+                _resolved_engine = _resolve_translation_engine(
+                    source_lang if source_lang else "auto", target_lang)
+                if _resolved_engine in ("nllb", "opus-mt"):
+                    logger.info("[%s] Local NMT engine '%s' selected — freeing "
+                                "Whisper VRAM before NMT load", job_id, _resolved_engine)
+                    await _release_whisper_vram(job_id)
+            except Exception as _nmt_pre_err:
+                logger.debug("[%s] NMT pre-release skipped: %s", job_id, _nmt_pre_err)
             orchestrator.reset_circuit_breaker()
             translated = await asyncio.wait_for(
                 translate_segments_with_fallback(

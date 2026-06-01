@@ -285,6 +285,11 @@ class Settings(BaseSettings):
     # NMT model identifiers — downloaded on demand (NOT at startup).
     NMT_NLLB_MODEL: str = "facebook/nllb-200-distilled-600M"
     NMT_OPUS_MT_TEMPLATE: str = "Helsinki-NLP/opus-mt-{src}-{tgt}"
+    # NMT device policy. ``auto`` → CUDA when available (int8_float16), else CPU
+    # (int8). On a 4 GB GPU (GTX 1650) where Whisper + Ollama already compete
+    # for VRAM, ``cpu`` is the safe choice — a 24-min video still translates in
+    # a couple of minutes on CPU and avoids OOM. Opus-MT always runs on CPU.
+    NMT_DEVICE: str = "auto"                    # auto | cpu | cuda
 
     # ── Music marking ──
     # Insert a "[♪ music ♪]" marker cue over sustained music regions (OP/ED

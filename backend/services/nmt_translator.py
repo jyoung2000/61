@@ -94,10 +94,12 @@ class NMTTranslator:
     the GTX 1650 has only 4 GB and the three engines must take turns.
     """
 
-    def __init__(self, model_id: Optional[str] = None, device: str = "auto"):
+    def __init__(self, model_id: Optional[str] = None, device: Optional[str] = None):
         from backend.config import settings as _settings
         self.model_id = model_id or _settings.NMT_NLLB_MODEL
-        self.device = device  # "auto" | "cpu" | "cuda"
+        # Device policy: explicit arg wins, else the NMT_DEVICE setting
+        # ("auto" | "cpu" | "cuda"). cpu is the safe choice on 4 GB GPUs.
+        self.device = (device or getattr(_settings, "NMT_DEVICE", "auto") or "auto").lower()
         self._translator = None
         self._tokenizer = None
         self._loaded = False
@@ -160,6 +162,24 @@ class NMTTranslator:
                 device = "cuda" if torch.cuda.is_available() else "cpu"
             except Exception:
                 device = "cpu"
+
+        # On CUDA, confirm Whisper (and any prior CUDA tenant) has released
+        # VRAM before we load NLLB — on a 4 GB GTX 1650 the engines must take
+        # turns or this load OOMs. Translation runs post-analysis, so the
+        # pipeline's _release_whisper_vram() has already run; this is the
+        # confirmation log + a defensive empty_cache().
+        if device == "cuda":
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    free_mb, total_mb = [x / (1024 * 1024) for x in torch.cuda.mem_get_info()]
+                    logger.info(
+                        "NMT: Whisper VRAM freed before NLLB load — %.0f MB free / %.0f MB total",
+                        free_mb, total_mb,
+                    )
+            except Exception:
+                pass
 
         # int8 keeps the 600M model under 1 GB VRAM.
         compute_type = "int8_float16" if device == "cuda" else "int8"

@@ -46,8 +46,17 @@ torchaudio==2.5.1
 # Enabled via CLIPAI_FACE_EMBEDDING=arcface (default: sface).
 insightface==0.7.3
 onnxruntime>=1.17.0
+# Offline NMT translation (NLLB-200 + Opus-MT) via CTranslate2.
+# ctranslate2 is pulled transitively by faster-whisper, but pin it
+# explicitly so the int8 inference + the TransformersConverter (used by the
+# on-demand download endpoint) are guaranteed present. faster-whisper 1.1.0
+# requires ctranslate2>=4.0,<5.
+ctranslate2>=4.0,<5
+# transformers powers ctranslate2.converters.TransformersConverter, which the
+# Settings "Download model" button uses to fetch + convert NLLB / Opus-MT to
+# the int8 CTranslate2 format. Cap <5 to stay compatible with torch==2.5.1.
+# NOTE: model weights are downloaded on demand (NEVER at startup) and the
+# converted int8 model is cached under the models dir (/data/models).
+transformers>=4.40,<5
 # SentencePiece tokenizer for NLLB-200 / Opus-MT NMT translation.
-# ctranslate2 is already installed by faster-whisper; the actual NLLB and
-# Opus-MT model weights are downloaded on demand via the Settings UI
-# (see backend/services/nmt_translator.py).
 sentencepiece>=0.1.99

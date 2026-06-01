@@ -50,12 +50,40 @@ const ENGINE_OPTIONS = [
   { value: 'whisper', label: 'Whisper translate (legacy, lower quality)' },
 ];
 
+// ISO 639-1 codes shared with the Upload page language picker. Used to
+// choose the source→target pair to pre-download (NLLB / Opus-MT).
+const LANG_OPTIONS = [
+  { value: 'en', label: 'English' },   { value: 'es', label: 'Spanish' },
+  { value: 'fr', label: 'French' },    { value: 'de', label: 'German' },
+  { value: 'it', label: 'Italian' },   { value: 'pt', label: 'Portuguese' },
+  { value: 'ru', label: 'Russian' },   { value: 'ja', label: 'Japanese' },
+  { value: 'ko', label: 'Korean' },    { value: 'zh', label: 'Chinese' },
+  { value: 'ar', label: 'Arabic' },    { value: 'hi', label: 'Hindi' },
+  { value: 'nl', label: 'Dutch' },     { value: 'pl', label: 'Polish' },
+  { value: 'tr', label: 'Turkish' },   { value: 'vi', label: 'Vietnamese' },
+  { value: 'th', label: 'Thai' },      { value: 'uk', label: 'Ukrainian' },
+  { value: 'sv', label: 'Swedish' },   { value: 'id', label: 'Indonesian' },
+  { value: 'ms', label: 'Malay' },     { value: 'tl', label: 'Filipino' },
+];
+
+// NMT device policy — cpu is the safe choice on 4 GB GPUs.
+const NMT_DEVICE_OPTIONS = [
+  { value: 'auto', label: 'Auto (CUDA if available, else CPU)' },
+  { value: 'cpu',  label: 'CPU (safe on 4 GB GPUs, ~minutes/video)' },
+  { value: 'cuda', label: 'CUDA (GPU — may OOM on 4 GB)' },
+];
+
 export default function SubtitleQualitySettings() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState('');
-  const [downloadingNLLB, setDownloadingNLLB] = useState(false);
+  const [downloadingModel, setDownloadingModel] = useState(false);
+  const [downloadMsg, setDownloadMsg] = useState('');
+  // Source→target pair to pre-download (Opus-MT needs a specific pair; NLLB is
+  // a single multilingual model). Defaults: Japanese → English.
+  const [dlSource, setDlSource] = useState('ja');
+  const [dlTarget, setDlTarget] = useState('en');
   const [form, setForm] = useState({
     subtitle_cps_enforcement: true,
     subtitle_max_cps: 20,
@@ -71,6 +99,7 @@ export default function SubtitleQualitySettings() {
     translation_engine: 'auto',
     translation_context_window: 5,
     translation_glossary_enabled: true,
+    nmt_device: 'auto',
     audio_event_detection: true,
     audio_events_in_subtitles: false,
     audio_music_detection: true,
@@ -124,25 +153,37 @@ export default function SubtitleQualitySettings() {
     }
   };
 
-  const downloadNLLB = async () => {
-    setDownloadingNLLB(true);
+  // Engine-aware model download. NLLB is a single multilingual model;
+  // Opus-MT is per-pair so we pass the selected source→target. For `auto`
+  // we pre-download the Opus-MT pair (preferred local engine), falling the
+  // user back to the explicit NLLB button if they want broad coverage.
+  const downloadModel = async (engine) => {
+    setDownloadingModel(true);
     setError('');
+    setDownloadMsg('');
+    const isOpus = engine === 'opus-mt';
+    const body = isOpus
+      ? { engine: 'opus-mt', source: dlSource, target: dlTarget }
+      : { engine: 'nllb' };
+    const label = isOpus
+      ? `Opus-MT ${dlSource}→${dlTarget}`
+      : 'NLLB-200';
     try {
       const res = await fetch('/api/translation/download-model', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ engine: 'nllb' }),
+        body: JSON.stringify(body),
       });
       const d = await res.json();
       if (d.status === 'ok') {
-        setSaved(true);
+        setDownloadMsg(`${label} ready ✓ (${d.path || 'cached'})`);
       } else {
-        setError(`NLLB download failed: ${d.message || 'unknown'}`);
+        setError(`${label} download failed: ${d.message || 'unknown'}`);
       }
     } catch (e) {
-      setError(`NLLB download failed: ${e.message || e}`);
+      setError(`${label} download failed: ${e.message || e}`);
     } finally {
-      setDownloadingNLLB(false);
+      setDownloadingModel(false);
     }
   };
 
@@ -291,16 +332,29 @@ export default function SubtitleQualitySettings() {
         <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 8 }}>
           Translation Engine
         </div>
-        <div style={{ marginBottom: 10 }}>
-          <label style={labelStyle}>Engine</label>
-          <select
-            style={selectStyle} value={form.translation_engine}
-            onChange={(e) => set('translation_engine', e.target.value)}
-          >
-            {ENGINE_OPTIONS.map((o) => (
-              <option key={o.value} value={o.value}>{o.label}</option>
-            ))}
-          </select>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 12, marginBottom: 10 }}>
+          <div style={{ flex: '1 1 260px' }}>
+            <label style={labelStyle}>Engine</label>
+            <select
+              style={selectStyle} value={form.translation_engine}
+              onChange={(e) => set('translation_engine', e.target.value)}
+            >
+              {ENGINE_OPTIONS.map((o) => (
+                <option key={o.value} value={o.value}>{o.label}</option>
+              ))}
+            </select>
+          </div>
+          <div style={{ flex: '1 1 200px' }}>
+            <label style={labelStyle}>Local NMT device</label>
+            <select
+              style={selectStyle} value={form.nmt_device}
+              onChange={(e) => set('nmt_device', e.target.value)}
+            >
+              {NMT_DEVICE_OPTIONS.map((o) => (
+                <option key={o.value} value={o.value}>{o.label}</option>
+              ))}
+            </select>
+          </div>
         </div>
 
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 12, marginBottom: 10 }}>
@@ -346,33 +400,76 @@ export default function SubtitleQualitySettings() {
           </div>
         </div>
 
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center', marginTop: 6 }}>
-          <button
-            type="button"
-            onClick={downloadNLLB}
-            disabled={downloadingNLLB}
-            style={{
-              padding: '6px 12px', background: 'var(--bg-elevated)',
-              color: 'var(--text-secondary)', border: '1px solid var(--border)',
-              borderRadius: 'var(--radius-sm)', fontSize: 11, cursor: 'pointer',
-              opacity: downloadingNLLB ? 0.5 : 1,
-            }}
-          >
-            {downloadingNLLB ? 'Downloading NLLB-200…' : 'Download NLLB-200 (~600 MB)'}
-          </button>
-          <label
-            style={{
-              padding: '6px 12px', background: 'var(--bg-elevated)',
-              color: 'var(--text-secondary)', border: '1px solid var(--border)',
-              borderRadius: 'var(--radius-sm)', fontSize: 11, cursor: 'pointer',
-            }}
-          >
-            Validate glossary JSON
-            <input
-              type="file" accept=".json" onChange={uploadGlossary}
-              style={{ display: 'none' }}
-            />
-          </label>
+        {/* Offline model download — NLLB (single multilingual) + Opus-MT (per-pair) */}
+        <div style={{ marginTop: 6 }}>
+          <label style={labelStyle}>Download offline model (one-time, on-demand)</label>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center', marginBottom: 8 }}>
+            <select
+              style={{ ...selectStyle, width: 'auto', flex: '0 0 130px' }}
+              value={dlSource} onChange={(e) => setDlSource(e.target.value)}
+              title="Opus-MT source language"
+            >
+              {LANG_OPTIONS.map((o) => (
+                <option key={o.value} value={o.value}>{o.label}</option>
+              ))}
+            </select>
+            <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>→</span>
+            <select
+              style={{ ...selectStyle, width: 'auto', flex: '0 0 130px' }}
+              value={dlTarget} onChange={(e) => setDlTarget(e.target.value)}
+              title="Opus-MT target language"
+            >
+              {LANG_OPTIONS.map((o) => (
+                <option key={o.value} value={o.value}>{o.label}</option>
+              ))}
+            </select>
+          </div>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
+            <button
+              type="button"
+              onClick={() => downloadModel('opus-mt')}
+              disabled={downloadingModel || dlSource === dlTarget}
+              style={{
+                padding: '6px 12px', background: 'var(--bg-elevated)',
+                color: 'var(--text-secondary)', border: '1px solid var(--border)',
+                borderRadius: 'var(--radius-sm)', fontSize: 11, cursor: 'pointer',
+                opacity: (downloadingModel || dlSource === dlTarget) ? 0.5 : 1,
+              }}
+            >
+              {downloadingModel ? 'Downloading…' : `Download Opus-MT (${dlSource}→${dlTarget}, ~300 MB)`}
+            </button>
+            <button
+              type="button"
+              onClick={() => downloadModel('nllb')}
+              disabled={downloadingModel}
+              style={{
+                padding: '6px 12px', background: 'var(--bg-elevated)',
+                color: 'var(--text-secondary)', border: '1px solid var(--border)',
+                borderRadius: 'var(--radius-sm)', fontSize: 11, cursor: 'pointer',
+                opacity: downloadingModel ? 0.5 : 1,
+              }}
+            >
+              {downloadingModel ? 'Downloading…' : 'Download NLLB-200 (~600 MB)'}
+            </button>
+            <label
+              style={{
+                padding: '6px 12px', background: 'var(--bg-elevated)',
+                color: 'var(--text-secondary)', border: '1px solid var(--border)',
+                borderRadius: 'var(--radius-sm)', fontSize: 11, cursor: 'pointer',
+              }}
+            >
+              Validate glossary JSON
+              <input
+                type="file" accept=".json" onChange={uploadGlossary}
+                style={{ display: 'none' }}
+              />
+            </label>
+          </div>
+          {downloadMsg && (
+            <div style={{ fontSize: 11, color: 'var(--success, #30D158)', marginTop: 8 }}>
+              {downloadMsg}
+            </div>
+          )}
         </div>
       </div>
 

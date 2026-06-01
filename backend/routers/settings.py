@@ -90,7 +90,7 @@ _PERSISTABLE_KEYS = [
     "SUBTITLE_MARK_MUSIC", "SUBTITLE_MUSIC_MIN_SEC",
     # Translation engine + glossary toggles.
     "TRANSLATION_ENGINE", "TRANSLATION_CONTEXT_WINDOW",
-    "TRANSLATION_GLOSSARY_ENABLED",
+    "TRANSLATION_GLOSSARY_ENABLED", "NMT_DEVICE",
     # Audio event detection toggles.
     "AUDIO_EVENT_DETECTION", "AUDIO_EVENTS_IN_SUBTITLES",
     "AUDIO_MUSIC_DETECTION",
@@ -3374,6 +3374,7 @@ def _subtitle_quality_state() -> dict:
         "translation_engine": str(getattr(settings, "TRANSLATION_ENGINE", "auto")),
         "translation_context_window": int(getattr(settings, "TRANSLATION_CONTEXT_WINDOW", 5)),
         "translation_glossary_enabled": bool(getattr(settings, "TRANSLATION_GLOSSARY_ENABLED", True)),
+        "nmt_device": str(getattr(settings, "NMT_DEVICE", "auto")),
         "audio_event_detection": bool(getattr(settings, "AUDIO_EVENT_DETECTION", True)),
         "audio_events_in_subtitles": bool(getattr(settings, "AUDIO_EVENTS_IN_SUBTITLES", False)),
         "audio_music_detection": bool(getattr(settings, "AUDIO_MUSIC_DETECTION", True)),
@@ -3401,6 +3402,7 @@ class SaveSubtitleQualityRequest(BaseModel):
     translation_engine: Optional[str] = None
     translation_context_window: Optional[int] = None
     translation_glossary_enabled: Optional[bool] = None
+    nmt_device: Optional[str] = None
     audio_event_detection: Optional[bool] = None
     audio_events_in_subtitles: Optional[bool] = None
     audio_music_detection: Optional[bool] = None
@@ -3409,6 +3411,7 @@ class SaveSubtitleQualityRequest(BaseModel):
 
 
 _VALID_TRANSLATION_ENGINES = {"auto", "llm", "nllb", "opus-mt", "google", "deepl", "whisper"}
+_VALID_NMT_DEVICES = {"auto", "cpu", "cuda"}
 _VALID_PLATFORM_PROFILES = {"", "tiktok", "reels", "shorts", "horizontal", "square"}
 
 
@@ -3457,6 +3460,10 @@ async def save_subtitle_quality(req: SaveSubtitleQualityRequest):
         settings.TRANSLATION_CONTEXT_WINDOW = max(0, min(20, int(req.translation_context_window)))
     if req.translation_glossary_enabled is not None:
         settings.TRANSLATION_GLOSSARY_ENABLED = bool(req.translation_glossary_enabled)
+    if req.nmt_device is not None:
+        dev = (req.nmt_device or "").strip().lower()
+        if dev in _VALID_NMT_DEVICES:
+            settings.NMT_DEVICE = dev
     if req.audio_event_detection is not None:
         settings.AUDIO_EVENT_DETECTION = bool(req.audio_event_detection)
     if req.audio_events_in_subtitles is not None:

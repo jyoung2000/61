@@ -135,3 +135,117 @@ reframer camera / clip pipeline untouched.
 > on the branch and upload the Japanese test video to capture the before/after
 > transcript + the `language=ja → translate ja→en → polish lang=en → persisted
 > COMPLETE` log sequence.
+
+---
+
+# Offline NMT translation — finish & verify NLLB-200 + Opus-MT (CTranslate2)
+
+Branch: `claude/clipai-offline-nmt-GsHqe`. Finishes wiring the **offline**
+neural-MT path that already existed so subtitle translation can run fully
+local (no OpenRouter/LLM call) on the Unraid GTX 1650 box. No new engine was
+added and the reframer camera/clip pipeline is untouched. This builds on the
+translate→polish reordering above — the offline engine plugs in at the existing
+`translate_segments_with_fallback` call, so the flow stays **translate (now
+possibly offline NMT) → LLM polish in target language → resegment/readability →
+dedup**. Transcript *polishing* still uses the editorial LLM; only the
+*translation* step changes engine.
+
+## New config key
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `NMT_DEVICE` | `auto` | Device policy for local NMT (`auto` \| `cpu` \| `cuda`). `auto` → CUDA when available (int8_float16), else CPU (int8). **`cpu` is the safe choice on 4 GB GPUs** (GTX 1650) where Whisper + Ollama already compete for VRAM — a 24-min video still translates in ~a couple of minutes on CPU and can't OOM. Opus-MT always runs on CPU regardless. |
+
+## New dependency
+
+- **`transformers>=4.40,<5`** added to `backend/requirements.txt`. It powers
+  `ctranslate2.converters.TransformersConverter`, which the Settings
+  "Download model" button uses to fetch + convert NLLB / Opus-MT to the int8
+  CTranslate2 format. Without it the download endpoint raised
+  `RuntimeError("ctranslate2 with the transformers converter is required …")`.
+- **`ctranslate2>=4.0,<5`** now pinned explicitly (was pulled in transitively by
+  faster-whisper) so the int8 inference + converter are guaranteed present.
+- The conversion is a **one-time, on-demand download — NEVER at startup**. The
+  converted int8 model is cached under the models dir (Docker `/data/models`,
+  i.e. `/data/models/nllb/...` and `/data/models/opus-mt/{src}-{tgt}/...`) so it
+  survives a container rebuild as long as `/data` is preserved.
+
+## Files touched
+
+- **`backend/requirements.txt`** — added `transformers>=4.40,<5`, explicit
+  `ctranslate2>=4.0,<5` pin (kept `sentencepiece`). A fresh
+  `pip install -r backend/requirements.txt` now imports
+  `from ctranslate2.converters import TransformersConverter` cleanly.
+- **`backend/config.py`** — new `NMT_DEVICE` setting (`auto|cpu|cuda`, default
+  `auto`) with a doc comment about the 4 GB-GPU CPU recommendation.
+- **`backend/services/nmt_translator.py`** —
+  - `NMTTranslator.__init__` now reads `NMT_DEVICE` from settings (explicit
+    `device=` arg still wins) instead of hard-coding `"auto"`.
+  - `NMTTranslator.load()` logs a **"Whisper VRAM freed before NLLB load — N MB
+    free"** line (+ a defensive `empty_cache()`) when resolving to CUDA, so the
+    OOM-avoidance ordering is visible in the log. Keeps `int8_float16` on CUDA /
+    `int8` on CPU. Opus-MT still forces CPU (unchanged). `unload()` +
+    `torch.cuda.empty_cache()` in the `finally` block is unchanged.
+- **`backend/services/translator.py`** —
+  - `_resolve_translation_engine` now logs **"NMT: no local model for ja→en,
+    falling back to LLM"** when `auto` finds no downloaded model (so it's obvious
+    why the offline path didn't run), and logs probe failures.
+  - `_translate_via_nmt` now names the **exact engine + model** per job
+    (`NMT: using NMTTranslator (facebook/nllb-200-distilled-600M) for ja→en …`
+    or `OpusMTTranslator (Helsinki-NLP/opus-mt-ja-en) …`) and logs the no-model
+    fall-through.
+- **`backend/services/pipeline.py`** — before the `translate_segments_with_fallback`
+  call in `_background_post_processing`, when the resolved engine is a local NMT
+  (`nllb`/`opus-mt`) it re-runs `_release_whisper_vram(job_id)` defensively and
+  logs **"Local NMT engine '…' selected — freeing Whisper VRAM before NMT
+  load"**. (Whisper VRAM is already freed during analysis at the post-reframer
+  stage; this makes the ordering explicit and robust to future reordering.)
+- **`backend/routers/settings.py`** — `NMT_DEVICE` added to the persisted-keys
+  list, to `_subtitle_quality_state()` (`nmt_device`), to
+  `SaveSubtitleQualityRequest`, and validated against `{auto,cpu,cuda}` in the
+  save handler. (`TRANSLATION_ENGINE` was already persisted + saved; the
+  `/api/translation/download-model` route already matches the frontend path —
+  `router` prefix `/api` + `/translation/download-model`.)
+- **`frontend/src/components/SubtitleQualitySettings.jsx`** —
+  - The single hard-coded `downloadNLLB()` (always `{engine:'nllb'}`) is replaced
+    by an engine-aware `downloadModel(engine)`: **Download Opus-MT (src→tgt)**
+    passes `{engine:'opus-mt', source, target}`, **Download NLLB-200** passes
+    `{engine:'nllb'}`. Both surface the endpoint's `path`/`message` (success +
+    error) instead of failing silently.
+  - Added two ISO-code language `<select>`s (the same codes as the Upload page)
+    to pick the Opus-MT pair to pre-download. **Default target = `en`**, default
+    source = `ja`. The Opus-MT button is disabled when source == target.
+  - Added a **Local NMT device** `<select>` (`auto|cpu|cuda`) wired to
+    `nmt_device` → `NMT_DEVICE`, persisted with the rest of the form.
+
+## Offline-translation usage (download → select engine → run)
+
+1. **Download a model** (one-time): Settings → Subtitle Quality → Translation
+   Engine. For NLLB click **Download NLLB-200 (~600 MB)**. For Opus-MT pick the
+   source→target pair (e.g. Japanese → English) and click **Download Opus-MT**.
+   The button shows `… ready ✓ (/data/models/…)` on success.
+2. **Select the engine**: set **Engine** to `nllb`, `opus-mt`, or `auto`
+   (auto prefers Opus-MT, then NLLB, before the LLM). Optionally set **Local NMT
+   device** to `cpu` on a 4 GB GPU. Click **Save** — `TRANSLATION_ENGINE` +
+   `NMT_DEVICE` persist to `user_settings.json` and survive a container restart.
+3. **Run** the Japanese test video with source=Japanese, target=English. With a
+   model downloaded the log shows `NMT: using NMTTranslator (…nllb…) for ja→en`
+   (or `OpusMTTranslator (…opus-mt-ja-en…)`) — **no OpenRouter/LLM call for
+   translation** — followed by the LLM polish pass on the English text. With no
+   model downloaded, `auto` logs `NMT: no local model for ja→en, falling back to
+   LLM` and uses the LLM path as before.
+
+## Verification
+
+- All changed Python modules compile (`python -m py_compile`).
+- The download endpoint returns `{status:"ok", path:…}` for both `nllb` and an
+  `opus-mt` ja→en pair once `transformers` + `ctranslate2` are installed; on a
+  stock container (before this change) it returned the converter `RuntimeError`.
+
+> Note: the live Unraid build/deploy + `pip install` + fresh `clipai_logs_*.txt`
+> capture (pre-download NLLB from Settings, run the Japanese test video offline)
+> was not run from this environment (no access to the Unraid host). Run the
+> standard nohup build on `claude/clipai-offline-nmt-GsHqe`, preserving `/data`
+> (so downloaded NMT models persist) and `.env`, then capture the
+> `NMT: using …` / `Whisper VRAM freed before NMT load` / `Polish START on
+> translated text (lang=en)` log sequence and the before/after transcript.
