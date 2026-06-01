@@ -547,60 +547,80 @@ async def _persist_complete_job(job_id: str, fields: dict) -> bool:
     path = database._job_path(job_id)
     for attempt in range(1, 4):
         try:
-            job = await database.load_job(job_id)
-            if job is None:
-                logger.error(
-                    "[%s] finalize attempt %d: load_job returned None "
-                    "(path=%s exists=%s) — cannot merge existing fields",
-                    job_id, attempt, path, _os.path.exists(path))
-            else:
-                _stored_id = getattr(job, "job_id", "")
-                if _stored_id != job_id:
+            # CRITICAL: hold the SAME per-job lock that ``update_job_status``
+            # and ``load_job`` take, across the whole load→write→verify cycle.
+            # The earlier lock-free version raced and silently lost COMPLETE:
+            # a clipper progress relay that passed the finalization gate just
+            # before it was set, then ``await``-ed ``update_job_status`` and
+            # loaded the *pre-COMPLETE* snapshot under the lock, could save
+            # ``detecting_clips`` / 0-clips back AFTER this unlocked write
+            # landed — clobbering the finished job with no log line (its
+            # ``protect_terminal`` check saw the stale non-terminal snapshot
+            # it had already loaded). Production symptom: "Pipeline complete"
+            # logged, yet 30 s later the background clip-refresh load saw
+            # ``DB job has 0 clips`` and the UI stayed stuck on "judging clip
+            # candidates". Taking the lock serializes against that relay so
+            # either the relay's detecting_clips write happens first (then we
+            # overwrite it with COMPLETE) or it happens after (and its
+            # ``protect_terminal`` correctly blocks the now-terminal job).
+            async with database._get_lock(job_id):
+                job = await database._load_job_unlocked(job_id)
+                if job is None:
                     logger.error(
-                        "[%s] finalize: job.job_id mismatch (stored=%r) — forcing %r",
-                        job_id, _stored_id, job_id)
-                job.job_id = job_id
-                for _k, _v in fields.items():
-                    if hasattr(job, _k):
-                        setattr(job, _k, _v)
-                try:
-                    data = job.model_dump(mode="json")
-                    content = _json.dumps(
-                        data, indent=2,
-                        default=getattr(database, "_numpy_safe_default", None))
-                except Exception as _ser:
-                    logger.error(
-                        "[%s] finalize attempt %d: serialization failed: %r",
-                        job_id, attempt, _ser, exc_info=True)
-                    raise
-                _os.makedirs(_os.path.dirname(path), exist_ok=True)
-                fd, tmp = _tf.mkstemp(dir=_os.path.dirname(path), suffix=".tmp")
-                try:
-                    with _os.fdopen(fd, "w", encoding="utf-8") as _f:
-                        _f.write(content)
-                    _os.replace(tmp, path)
-                finally:
+                        "[%s] finalize attempt %d: load returned None "
+                        "(path=%s exists=%s) — cannot merge existing fields",
+                        job_id, attempt, path, _os.path.exists(path))
+                else:
+                    _stored_id = getattr(job, "job_id", "")
+                    if _stored_id != job_id:
+                        logger.error(
+                            "[%s] finalize: job.job_id mismatch (stored=%r) — forcing %r",
+                            job_id, _stored_id, job_id)
+                    job.job_id = job_id
+                    for _k, _v in fields.items():
+                        if hasattr(job, _k):
+                            setattr(job, _k, _v)
                     try:
-                        if _os.path.exists(tmp):
-                            _os.unlink(tmp)
-                    except OSError:
-                        pass
-            # Verify against the raw bytes (no model layer, no await).
-            disk_status = ""
-            disk_clips = 0
-            try:
-                with open(path, "r", encoding="utf-8") as _f:
-                    _raw = _json.load(_f)
-                disk_status = _raw.get("status", "")
-                disk_clips = len(_raw.get("clips", []) or [])
-            except Exception as _re:
-                logger.error("[%s] finalize attempt %d: raw read failed: %r",
-                             job_id, attempt, _re)
+                        data = job.model_dump(mode="json")
+                        content = _json.dumps(
+                            data, indent=2,
+                            default=getattr(database, "_numpy_safe_default", None))
+                    except Exception as _ser:
+                        logger.error(
+                            "[%s] finalize attempt %d: serialization failed: %r",
+                            job_id, attempt, _ser, exc_info=True)
+                        raise
+                    _os.makedirs(_os.path.dirname(path), exist_ok=True)
+                    fd, tmp = _tf.mkstemp(dir=_os.path.dirname(path), suffix=".tmp")
+                    try:
+                        with _os.fdopen(fd, "w", encoding="utf-8") as _f:
+                            _f.write(content)
+                        _os.replace(tmp, path)
+                    finally:
+                        try:
+                            if _os.path.exists(tmp):
+                                _os.unlink(tmp)
+                        except OSError:
+                            pass
+                # Verify against the raw bytes (no model layer, no await),
+                # still under the lock so no writer can interleave.
+                disk_status = ""
+                disk_clips = 0
+                try:
+                    with open(path, "r", encoding="utf-8") as _f:
+                        _raw = _json.load(_f)
+                    disk_status = _raw.get("status", "")
+                    disk_clips = len(_raw.get("clips", []) or [])
+                except Exception as _re:
+                    logger.error("[%s] finalize attempt %d: raw read failed: %r",
+                                 job_id, attempt, _re)
             if disk_status == JobStatus.COMPLETE.value:
-                if attempt > 1:
-                    logger.warning(
-                        "[%s] finalize: COMPLETE persisted on attempt %d (clips=%d)",
-                        job_id, attempt, disk_clips)
+                # Log success unconditionally (not just on retries) so a
+                # future stuck-job report can confirm the write actually
+                # landed instead of being silent on the happy path.
+                logger.info(
+                    "[%s] finalize: COMPLETE persisted on attempt %d (clips=%d)",
+                    job_id, attempt, disk_clips)
                 return True
             logger.warning(
                 "[%s] finalize attempt %d: on-disk status=%r clips=%d (path=%s)",
@@ -809,7 +829,13 @@ async def _refresh_clips_with_translation(
     # captions were rebuilt (the caller's whole reason for threading the
     # fallback through was to restore the DB state).
     if changed > 0 or used_fallback:
-        await database.update_job_status(job_id, clips=updated_clips)
+        # Re-assert COMPLETE alongside the clips. This runs only after the
+        # COMPLETE save (post-translation), so the status is always terminal
+        # here — pinning it heals the job if any stray writer reverted it to
+        # detecting_clips, which is exactly the "0 clips on read" path that
+        # left the UI stuck on "judging clip candidates".
+        await database.update_job_status(
+            job_id, status=JobStatus.COMPLETE, clips=updated_clips)
         logger.info(
             "[%s] Refreshed %d/%d clip captions/hooks/titles from translated transcript"
             "%s",
@@ -1382,7 +1408,15 @@ async def _background_post_processing(
                 from backend.services.audio_analyzer import merge_markers
                 _translated_out = merge_markers(_translated_out, _music_markers)
 
-            _update_kwargs = {"translated_transcript": _translated_out}
+            # Pin status=COMPLETE on the translated-transcript save too: this
+            # is the first DB write after the COMPLETE finalize, so if a stray
+            # relay reverted the status it gets healed here before the user's
+            # next poll, instead of the translated track landing on a job the
+            # UI still renders as "judging clips".
+            _update_kwargs = {
+                "translated_transcript": _translated_out,
+                "status": JobStatus.COMPLETE,
+            }
             if _tr_readability is not None:
                 _update_kwargs["transcript_readability"] = _tr_readability
             await database.update_job_status(job_id, **_update_kwargs)

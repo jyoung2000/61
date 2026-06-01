@@ -158,6 +158,45 @@ def test_persist_complete_job_forces_job_id(tmp_path, monkeypatch):
     assert reloaded.job_id == "K"   # forced to the directory key
 
 
+def test_persist_complete_job_survives_concurrent_relay(tmp_path, monkeypatch):
+    """The finalizer must not lose COMPLETE to a clipper progress relay that
+    runs concurrently. Reproduces the prod race: a relay's locked
+    read-modify-write (load pre-COMPLETE snapshot → save detecting_clips)
+    interleaving with the finalize write. Because both now take the same
+    per-job lock, the terminal COMPLETE state always wins."""
+    import os
+    import backend.database as db
+    from backend.models import JobResult, JobStatus as _JS, ClipCandidate
+
+    d = str(tmp_path)
+    monkeypatch.setattr(db, "_job_dir", lambda jid: os.path.join(d, jid))
+    _aiorun(db.save_job(JobResult(
+        job_id="R", filename="v.mp4", file_path="p",
+        status=_JS.DETECTING_CLIPS.value, progress=80)))
+
+    clip = ClipCandidate(
+        id=1, title="t", start_time=0, end_time=5, duration=5,
+        viral_score=80, viral_score_reasoning="r", clip_type="x",
+        platform="both", suggested_caption="c", hook_text="h",
+        why_this_works="w")
+    fields = dict(status=_JS.COMPLETE, progress=100, clips=[clip])
+
+    async def _race():
+        # A stale relay write (detecting_clips, no clips) racing the finalize.
+        # protect_terminal mirrors the real ``_update_progress`` relay.
+        relay = db.update_job_status(
+            "R", status=_JS.DETECTING_CLIPS, progress=94,
+            protect_terminal=True)
+        persist = pipeline._persist_complete_job("R", fields)
+        await asyncio.gather(relay, persist)
+
+    _aiorun(_race())
+    reloaded = _aiorun(db.load_job("R"))
+    assert str(reloaded.status) == str(_JS.COMPLETE), (
+        "concurrent relay reverted the finished job")
+    assert len(reloaded.clips) == 1
+
+
 # ── WS replays current status on connect (recovers a missed COMPLETE) ──────
 
 class _FakeWS:
