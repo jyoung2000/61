@@ -9,6 +9,10 @@ class JobStatus(str, Enum):
     TRANSCRIBING = "transcribing"
     ANALYZING_SCENES = "analyzing_scenes"
     GENERATING_SUMMARY = "generating_summary"
+    # Distinct phase for subtitle translation + target-language polish. Runs
+    # AFTER summary and BEFORE clip detection, so a stuck/failed translation is
+    # never mistaken for clip detection in the status field or diagnostics.
+    TRANSLATING = "translating"
     DETECTING_CLIPS = "detecting_clips"
     COMPLETE = "complete"
     FAILED = "failed"
@@ -237,6 +241,16 @@ class JobResult(BaseModel):
     scenes: list[SceneDescription] = []
     transcript: list[TranscriptSegment] = []
     translated_transcript: list[TranscriptSegment] = []  # Translated subtitle segments
+    # Visible outcome of a *planned* subtitle translation. Surfaced so a job
+    # that planned a translation (subtitle_language != source) but couldn't
+    # produce target-language output never silently presents as a clean
+    # COMPLETE with the original-language subtitles.
+    #   None                 → no translation was planned (target == source).
+    #   "translated"         → target-language transcript produced + persisted.
+    #   "translation_failed" → planned translation did not produce output; the
+    #                          source transcript is polished + kept instead.
+    translation_status: Optional[str] = None
+    translation_error: Optional[str] = None  # short reason when translation_status == "translation_failed"
     clips: list[ClipCandidate] = []
     speaker_names: dict[str, str] = {}  # {"Speaker 1": "Eric", "Speaker 2": "Alice"}
     scene_cut_timestamps: list[float] = []  # Timestamps of camera cuts from frame extraction

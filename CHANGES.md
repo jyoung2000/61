@@ -1,3 +1,185 @@
+# ClipAI — Make translate-then-polish actually run (decouple from clip extraction)
+
+A user picked **English** as the translate-to language for a 24.5-min Japanese
+video, but the subtitles came back in the original Japanese — untranslated and
+unpolished. The pipeline log for job `5ee727f1` proved the target was captured
+correctly (`detected_language=ja`, `subtitle_language=en`, plan logged as
+`translate-then-polish in target language`) and that the source-language polish
+was then **skipped** "in anticipation" of translation — but the translation it
+deferred to **never ran**. Clip extraction hit repeated Replicate `429`
+(`rate limit … less than $5.0 in credit`) on the VideoLLaMA3 calls, and because
+the critical-path translate+polish call sat **after** the clip stage, the clip
+failure bypassed it. The job still finalized `complete`, with the raw Japanese
+transcript — the worst-case outcome (neither translated nor polished).
+
+All changes on this branch (`fix/translate-step-reliability`).
+
+## Root cause
+
+In `backend/services/pipeline.py`, `_run_analysis_inner` logged the plan, **skipped**
+the source-language polish/resegment/reflow when a translation was planned, ran
+the clip-extraction stage, and only **then** invoked the critical-path
+`await _background_post_processing(...)`. So any failure/early-return in the clip
+region (the `429`s) reached the outer finalize before translation ever ran.
+Meanwhile the source polish had already been skipped — so the transcript was
+neither translated nor polished.
+
+## Task 1 — Run translate-then-polish BEFORE clip extraction (decoupled)
+
+- `_run_analysis_inner` now invokes `_background_post_processing(...)`
+  **immediately after summary generation and before the clip-detection stage**.
+  Subtitle translation no longer depends on clip detection succeeding.
+- The clip-dependent work (caption refresh + Auto-SEO) was split out of
+  `_background_post_processing` into a new module-level
+  **`_run_post_clip_followups(...)`** that runs *after* the clip stage — so the
+  parts that genuinely need clips still run once clips exist, while translation
+  runs ahead of them.
+- The clip stage is wrapped so a Replicate `429` (or any clipper exception)
+  **degrades to zero clips and continues** — it can never abort or skip the
+  remainder of `_run_analysis_inner`. The post-clip follow-ups are likewise
+  best-effort and never abort the finalize.
+- `_background_post_processing` is still **awaited on the critical path** (the
+  translated+polished transcript is persisted before the COMPLETE save). The
+  `_background_post_processing entry`, `Translation engine resolved`,
+  `Translate START` log lines now fire on every translating job because the
+  call is reached unconditionally.
+
+## Task 2 — Never skip source polish unless translation actually runs
+
+- `_background_post_processing` now **returns an outcome contract**
+  (`will_translate`, `translated`, `source_transcript`, `target_transcript`,
+  `seo_transcript`, `target_name`, `failed_reason`). `_run_analysis_inner`
+  **adopts `source_transcript`** for the COMPLETE save, so the persisted
+  `transcript` field is the *polished* source on the no-translation /
+  translation-failed paths — never the raw text. (Previously the COMPLETE save
+  re-persisted `_run_analysis_inner`'s own raw local `transcript`, silently
+  clobbering the polished source the fallback had just written.)
+- On translation failure the existing `_polish_source_if_needed()` +
+  `_dedup_source_transcript()` fallback runs (polish + readability-enforce +
+  dedup in the **source** language). A new **last-resort polish** in
+  `_run_analysis_inner` covers the (near-impossible) case where
+  `_background_post_processing` itself crashes — so there is **no code path
+  where the source polish is skipped but translation does not run**. End state:
+  the final transcript is always either (a) translated+polished in the target
+  language, or (b) polished in the source language. Never raw + unpolished.
+
+## Task 3 — Fail loud when a planned translation does not happen
+
+- New `JobResult.translation_status` (`None` / `"translated"` /
+  `"translation_failed"`) + `translation_error` (short reason) in
+  `backend/models.py`, persisted on the job and surfaced over the existing
+  websocket channel via the new `_set_translation_status(...)` helper
+  (`{"type":"translation_status","state":...}`).
+- `_background_post_processing` sets `"translated"` on success and
+  `"translation_failed"` + reason on failure. `_run_analysis_inner` adds a
+  **fail-loud backstop**: if a translation was *planned* (`subtitle_language` ≠
+  source) but produced no target output, it sets `translation_failed` with a
+  reason — a planned-but-missing translation can never silently present as a
+  clean COMPLETE with source subtitles.
+- Explicit call-site logging: `"[job] invoking translate+polish (target=…,
+  source=…, will_translate=…)"` is logged immediately before the call, so the
+  "it just didn't run" failure is visible in the log next time.
+
+## Task 4 — Status clarity
+
+- New `JobStatus.TRANSLATING = "translating"`. The translating progress update
+  now uses this **distinct status** (at 77 %) instead of reusing
+  `DETECTING_CLIPS` at 97 %, so a stuck/failed translation is no longer mistaken
+  for clip detection in diagnostics. Wired through `PIPELINE_STAGES` (a new
+  `translation` stage, 76–80 %), the heartbeat stage labels, the frontend
+  `Dashboard` status badge + cancellable set, and the `PipelineTracker`
+  (`STAGE_ORDER` / `STAGE_LABELS` / `STAGE_WEIGHTS` — the teal `translation`
+  colour was already defined). Non-terminal, so `Analysis.jsx`'s `isProcessing`
+  treats it correctly and the `_finalizing_jobs` gate still blocks only
+  terminal reverts.
+
+## Files changed
+
+- `backend/models.py` — `JobStatus.TRANSLATING`; `translation_status` +
+  `translation_error` fields.
+- `backend/services/pipeline.py` — reorder translate before clips; split out
+  `_run_post_clip_followups`; `_background_post_processing` returns an outcome
+  contract, drops the premature `status=COMPLETE` pin, sets `translation_status`;
+  `_set_translation_status` helper; fail-loud backstop + last-resort source
+  polish; `_refresh_clips_with_translation` no longer pins COMPLETE (it now runs
+  before finalization); `TRANSLATING` PIPELINE_STAGE + heartbeat label.
+- `frontend/src/pages/Dashboard.jsx`, `frontend/src/components/PipelineTracker.jsx`
+  — render the new `translating` status / `translation` stage.
+- `tests/test_translate_step_reliability.py` — new regression tests.
+
+## Verification
+
+Run from the repo root in this environment (the heavy ML deps are lazy-imported,
+so `backend.services.pipeline` imports with only `pydantic`/`httpx`/SDK shims):
+
+- `python -m pytest tests/test_translate_step_reliability.py` → **5 passed**.
+  Covers: translation success sets `translation_status="translated"` and
+  **never** pins `status=COMPLETE`; a `TranslationRateLimitedError` (the `429`
+  case) falls back to the polished **source** transcript, sets
+  `translation_failed` + reason, and never relabels source as translated; the
+  no-translation path returns the source for the COMPLETE save;
+  `_run_post_clip_followups` refreshes captions **only** when a translation
+  happened and always seeds Auto-SEO from the right transcript;
+  `_set_translation_status` persists the field + broadcasts.
+- `python -m py_compile backend/services/pipeline.py backend/models.py` → OK.
+- `npx esbuild src/pages/Dashboard.jsx src/components/PipelineTracker.jsx
+  --loader:.jsx=jsx` (from `frontend/`) → parses clean.
+- `tests/test_job_persistence_race.py` → **6 passed** in isolation (no
+  regression to the COMPLETE-finalize logic). The only suite failures are
+  pre-existing and environment-only: tests importing `backend.services.object_detector`
+  (a module that does not exist in this checkout) and `fastapi`/`cv2`/`torch`-backed
+  modules that aren't installed here; plus the suite's pre-existing
+  `HOME`-set-at-import cross-file ordering fragility (each affected file passes
+  alone).
+
+### Acceptance criteria → how to confirm on the live Unraid run
+
+> The live Unraid build/deploy + the actual Japanese-video run (with a real
+> Replicate `429` induced by low credit) was **not run from this environment** —
+> there is no Unraid host, GPU, Replicate credential or test video here. Build
+> and deploy with the standard nohup command on `fix/translate-step-reliability`
+> (preserve `/data` and `.env`), then capture a fresh `clipai_logs_*.txt` and
+> confirm:
+
+1. **Translation runs to completion** — the log shows, in order:
+   `Post-processing plan: source=ja target=en → translate-then-polish` →
+   `invoking translate+polish (target=en, source=ja, will_translate=True)` →
+   `_background_post_processing entry` → `Translation engine resolved: …` →
+   `Translate START: Japanese → English (N segments)` → `Translate DONE` →
+   `Polish START on translated text (lang=en)` →
+   `Translated transcript readability: grade …` →
+   `Persisting translated_transcript (N segments)` → then clip detection → COMPLETE.
+2. **Clip failure does not block translation** — induce the Replicate `429`
+   (low credit). The log shows `Clip extraction failed: …429…` **after** the
+   `Translate DONE` / `Persisting translated_transcript` lines, the job
+   completes with `clips=0` (degraded) and the **English** translated transcript
+   intact. (Proven structurally + at the unit level by the tests above.)
+3. **Translation genuinely can't run** → the transcript is still polished in the
+   **source** language (`Source-language transcript polish (fallback path …)` /
+   `Source transcript dedup …`), and the job carries a visible
+   `translation_status="translation_failed"` with a reason (also broadcast as
+   `{"type":"translation_status","state":"translation_failed"}`).
+4. **No skip-without-translate window** — the source polish is skipped only when
+   `_will_translate` is true, and on that branch `_background_post_processing`
+   is always reached (translation runs, or its source fallback / the last-resort
+   polish does).
+
+### Before / after transcript (illustrative of the target transformation)
+
+> Illustrative shape, not a capture from a live model run (no NMT/LLM weights or
+> test video in this environment):
+
+```
+BEFORE (raw source, what the buggy path shipped):
+  [00:03] 今日はいい天気ですね。
+  [00:07] 散歩に行きましょう。
+
+AFTER (translated + polished, target=en — what this fix ships):
+  [00:03] It's such nice weather today.
+  [00:07] Let's go for a walk.
+```
+
+
 # ClipAI — Whisper model: show the real one + let the user change it
 
 Two Settings fixes for the Whisper transcription model: (1) the GUI now shows

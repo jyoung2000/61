@@ -20,7 +20,7 @@ const STAGE_COLORS = {
 
 const STAGE_ORDER = [
   'metadata', 'extraction', 'face_detection', 'transcription',
-  'diarization', 'conversion', 'summary', 'clips', 'saving',
+  'diarization', 'conversion', 'summary', 'translation', 'clips', 'saving',
 ];
 
 function fmtElapsed(secs) {
@@ -50,14 +50,14 @@ export default function PipelineTracker({
   // Compute total weight for bar sizing (approximate)
   const STAGE_WEIGHTS = {
     metadata: 3, extraction: 9, face_detection: 27, transcription: 14,
-    diarization: 2, conversion: 2, summary: 18, clips: 18, saving: 2,
+    diarization: 2, conversion: 2, summary: 18, translation: 6, clips: 18, saving: 2,
   };
   const totalWeight = displayStages.reduce((sum, s) => sum + (STAGE_WEIGHTS[s.id] || 5), 0);
 
   const STAGE_LABELS = {
     metadata: 'Metadata', extraction: 'Frames', face_detection: 'Faces',
     transcription: 'Whisper', diarization: 'Speakers', conversion: 'Convert',
-    summary: 'Summary', clips: 'Clips', saving: 'Save',
+    summary: 'Summary', translation: 'Translate', clips: 'Clips', saving: 'Save',
   };
 
   const currentIdx = displayStages.findIndex((s) => s.id === currentStageId);

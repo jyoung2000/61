@@ -506,7 +506,8 @@ PIPELINE_STAGES = [
     {"id": "transcription",  "label": "Audio Transcription",  "status": "analyzing_scenes",   "start_pct": 42,  "end_pct": 56},
     {"id": "diarization",    "label": "Speaker Detection",    "status": "analyzing_scenes",   "start_pct": 56,  "end_pct": 58},
     {"id": "conversion",     "label": "Scene Conversion",     "status": "analyzing_scenes",   "start_pct": 60,  "end_pct": 62},
-    {"id": "summary",        "label": "Video Summary",        "status": "generating_summary", "start_pct": 62,  "end_pct": 80},
+    {"id": "summary",        "label": "Video Summary",        "status": "generating_summary", "start_pct": 62,  "end_pct": 76},
+    {"id": "translation",    "label": "Subtitle Translation", "status": "translating",        "start_pct": 76,  "end_pct": 80},
     {"id": "clips",          "label": "Clip Detection",       "status": "detecting_clips",    "start_pct": 80,  "end_pct": 98},
     {"id": "saving",         "label": "Saving Results",       "status": "detecting_clips",    "start_pct": 98,  "end_pct": 100},
 ]
@@ -699,6 +700,7 @@ async def _update_progress(
             "transcribing": "transcription",
             "analyzing_scenes": "scene analysis",
             "generating_summary": "summary generation",
+            "translating": "subtitle translation",
             "detecting_clips": "clip detection",
         }
         stage_label = _stage_labels.get(status_str, status_str)
@@ -839,13 +841,13 @@ async def _refresh_clips_with_translation(
     # captions were rebuilt (the caller's whole reason for threading the
     # fallback through was to restore the DB state).
     if changed > 0 or used_fallback:
-        # Re-assert COMPLETE alongside the clips. This runs only after the
-        # COMPLETE save (post-translation), so the status is always terminal
-        # here — pinning it heals the job if any stray writer reverted it to
-        # detecting_clips, which is exactly the "0 clips on read" path that
-        # left the UI stuck on "judging clip candidates".
-        await database.update_job_status(
-            job_id, status=JobStatus.COMPLETE, clips=updated_clips)
+        # Persist ONLY the clips — no status pin. This now runs from
+        # ``_run_post_clip_followups`` BEFORE the COMPLETE save (translation was
+        # decoupled to run ahead of clip extraction), so the job is not yet
+        # terminal; pinning COMPLETE here would prematurely finalize it ahead of
+        # the authoritative ``_persist_complete_job`` save. ``update_job_status``
+        # merges, so the current (TRANSLATING / DETECTING_CLIPS) status stands.
+        await database.update_job_status(job_id, clips=updated_clips)
         logger.info(
             "[%s] Refreshed %d/%d clip captions/hooks/titles from translated transcript"
             "%s",
@@ -1160,41 +1162,159 @@ async def _polish_transcript_loop(
     return best_models, best_report
 
 
+async def _set_translation_status(job_id: str, status: str, reason: Optional[str] = None):
+    """Persist a visible, job-level translation outcome + broadcast it (Task 3).
+
+    ``status`` is ``"translated"`` or ``"translation_failed"``. A *planned*
+    translation that does not produce target-language output must surface here
+    so the job never silently presents as a clean COMPLETE with source-language
+    subtitles. Best-effort: never raises into callers.
+    """
+    try:
+        await database.update_job_status(
+            job_id,
+            translation_status=status,
+            translation_error=(reason or None),
+        )
+    except Exception as _e:
+        logger.debug("[%s] translation_status persist skipped: %s", job_id, _e)
+    try:
+        await broadcast_ws(job_id, {
+            "type": "translation_status",
+            "state": status,
+            "status": status,
+            "message": reason or (
+                "Subtitles translated" if status == "translated"
+                else "Translation did not run — keeping source-language subtitles"),
+        })
+    except Exception:
+        pass
+
+
+async def _run_post_clip_followups(job_id: str, orchestrator, pp_result: Optional[dict], clips):
+    """Clip-dependent finishers that run AFTER clip extraction: rebuild clip
+    captions from the translated transcript (when translation succeeded) and
+    seed per-clip Auto-SEO from the best-available transcript.
+
+    Split out of ``_background_post_processing`` so subtitle translation can run
+    BEFORE clip extraction (and therefore never be skipped when the clip stage
+    fails) while the parts that genuinely need clips still run once the clips
+    exist. Best-effort throughout — a failure here never aborts the finalize.
+    ``clips`` (the in-process list) is threaded as the fallback for both
+    finishers because the DB round-trip can read back 0 clips before the
+    COMPLETE save lands.
+    """
+    pp = pp_result or {}
+    fallback_clips = list(clips or [])
+    target_name = pp.get("target_name") or "the target language"
+
+    # (a) Re-derive clip caption / hook_text / title from the translated
+    #     transcript so the Viral Clips cards show the target language.
+    if pp.get("translated") and pp.get("target_transcript"):
+        try:
+            _refreshed = await _refresh_clips_with_translation(
+                job_id, list(pp["target_transcript"]),
+                fallback_clips=fallback_clips,
+            )
+            if _refreshed > 0:
+                await broadcast_ws(job_id, {
+                    "type": "clips_refreshed",
+                    "message": f"Refreshed {_refreshed} clip captions in {target_name}",
+                })
+        except Exception as _cr_err:
+            logger.warning("[%s] Post-translation clip refresh failed: %s", job_id, _cr_err)
+
+    # (b) Seed per-clip SEO from the final transcript (translated when
+    #     available, otherwise the polished source).
+    seo_segments = pp.get("seo_transcript")
+    if seo_segments is None:
+        try:
+            _j = await database.load_job(job_id)
+            seo_segments = [
+                s.model_dump() if hasattr(s, "model_dump") else s
+                for s in (getattr(_j, "transcript", []) or [])
+            ]
+        except Exception:
+            seo_segments = []
+    try:
+        await broadcast_ws(job_id, {
+            "type": "background_task", "task": "auto_seo", "status": "running",
+            "message": "Generating SEO titles, captions, and tags for clips...",
+        })
+        _g, _f = await _auto_generate_clip_seo(
+            job_id, list(seo_segments or []), orchestrator,
+            fallback_clips=fallback_clips,
+        )
+        await broadcast_ws(job_id, {
+            "type": "background_task", "task": "auto_seo", "status": "complete",
+            "message": (f"SEO generated for {_g} clips"
+                        + (f" ({_f} failed)" if _f else "")),
+        })
+    except Exception as _seo_err:
+        logger.warning("[%s] Auto-SEO seeding failed: %s", job_id, _seo_err, exc_info=True)
+        await broadcast_ws(job_id, {
+            "type": "background_task", "task": "auto_seo", "status": "failed",
+            "message": f"Auto-SEO skipped: {str(_seo_err)[:80]}",
+        })
+
+
 async def _background_post_processing(
     job_id: str, transcript: list, orchestrator, job,
-    clips: Optional[list] = None,
     polished_already: bool = False,
 ):
     """Run subtitle translation + target-language polish (and, when no
-    translation is needed, the source-language polish fallback).
+    translation is needed or translation fails, the source-language polish
+    fallback). Returns an outcome ``dict`` (see ``_result`` below) — it does
+    NOT touch clips.
 
-    Awaited on the critical path from ``_run_analysis_inner`` BEFORE the
-    COMPLETE save, so the translated + polished transcript is part of the
-    finalize and the job never reaches COMPLETE with an un-translated
-    transcript. (It used to be a fire-and-forget task scheduled after
-    COMPLETE, which was being lost on this deployment.)
-
-    ``clips`` is the in-process list of dicts (or ClipCandidate models)
-    captured from the local variable in ``_run_analysis_inner`` right
-    before the COMPLETE save, threaded through so the post-translation
-    refresh and Auto-SEO step have a definitive source of truth even
-    when the fresh ``database.load_job`` round-trip returns an empty
-    ``clips`` field (observed in production in
-    clipai_logs_20260527_000705.log even though the in-isolation
-    round-trip tests round-trip clean).
+    Awaited on the critical path from ``_run_analysis_inner`` BEFORE clip
+    extraction (Task 1), so a clip-stage failure (Replicate 429, etc.) can never
+    bypass translation. The clip-dependent finishers (caption refresh + Auto-SEO)
+    were split out into ``_run_post_clip_followups``, which the caller runs after
+    the clip stage using the returned outcome.
 
     Reordered to translate-THEN-polish: the reframer's Whisper path runs
     task="transcribe" (source-language output), so the LLM translator is what
     actually produces the target language. The sequence is (a) translate →
     (b) LLM polish on the translated text (lang=target) → (c) sentence
     resegment + readability reflow in the target language → (d) final dedup →
-    persist. When no translation is needed, the source-language polish runs
-    here only if it wasn't already done on the critical path. On any failure
-    the best available transcript is kept — we never persist the raw source
-    while labelling it translated.
+    persist ``translated_transcript`` (no status pin — the job is not terminal
+    yet; the COMPLETE save happens in the caller after clips). When no
+    translation is needed, the source-language polish runs here only if it
+    wasn't already done on the critical path. On any failure the best available
+    transcript is kept and a visible ``translation_failed`` status is set — we
+    never persist the raw source while labelling it translated, and never ship
+    a raw, unpolished transcript.
+
+    Returns ``_result`` with keys: ``will_translate``, ``translated``,
+    ``source_transcript`` (for the caller's ``transcript`` field — polished on
+    the fallback paths), ``target_transcript`` (translated+polished, for clip
+    refresh), ``seo_transcript`` (what Auto-SEO should read), ``target_name``
+    and ``failed_reason``.
     """
     logger.info("[%s] _background_post_processing entry (polished_already=%s)",
                 job_id, polished_already)
+
+    def _as_dicts(items):
+        return [
+            t.model_dump() if hasattr(t, "model_dump") else dict(t)
+            for t in (items or [])
+        ]
+
+    # Outcome contract returned to ``_run_analysis_inner`` so it can (a) adopt
+    # the finalized SOURCE transcript for the COMPLETE save (polished on the
+    # no-translation / translation-failed paths — never raw), (b) drive the
+    # post-clip caption refresh + Auto-SEO from the right transcript, and
+    # (c) fail loud when a planned translation produced no output (Task 3).
+    _result = {
+        "will_translate": False,
+        "translated": False,
+        "source_transcript": None,   # SOURCE transcript for the `transcript` field
+        "target_transcript": None,   # translated+polished transcript (clip refresh)
+        "seo_transcript": None,      # transcript Auto-SEO should read from
+        "target_name": "",
+        "failed_reason": None,
+    }
 
     # ── Resolve source / target languages (used by every branch below) ──
     # An explicit job.subtitle_language always wins; otherwise auto-translate
@@ -1217,37 +1337,7 @@ async def _background_post_processing(
         source_lang or "auto",
     )
     _will_translate = bool(target_lang and target_lang != source_lang and transcript)
-
-    # ``_fallback_clips`` — the in-process list captured at the COMPLETE save
-    # in ``_run_analysis_inner``; the definitive clip source for the
-    # post-translation refresh / Auto-SEO even if a DB round-trip reads empty.
-    _fallback_clips = list(
-        clips if clips is not None
-        else (getattr(job, "clips", []) or [])
-    )
-
-    async def _run_auto_seo(seg_list):
-        """Seed per-clip SEO from ``seg_list`` (translated or source text)."""
-        try:
-            await broadcast_ws(job_id, {
-                "type": "background_task", "task": "auto_seo", "status": "running",
-                "message": "Generating SEO titles, captions, and tags for clips...",
-            })
-            _g, _f = await _auto_generate_clip_seo(
-                job_id, list(seg_list), orchestrator,
-                fallback_clips=list(_fallback_clips),
-            )
-            await broadcast_ws(job_id, {
-                "type": "background_task", "task": "auto_seo", "status": "complete",
-                "message": (f"SEO generated for {_g} clips"
-                            + (f" ({_f} failed)" if _f else "")),
-            })
-        except Exception as _seo_err:
-            logger.warning("[%s] Auto-SEO seeding failed: %s", job_id, _seo_err, exc_info=True)
-            await broadcast_ws(job_id, {
-                "type": "background_task", "task": "auto_seo", "status": "failed",
-                "message": f"Auto-SEO skipped: {str(_seo_err)[:80]}",
-            })
+    _result["will_translate"] = _will_translate
 
     # ── Transcript polishing — SOURCE language, fallback only ──
     # Runs only when NO translation was applied (when a translation follows,
@@ -1344,6 +1434,7 @@ async def _background_post_processing(
         )
         target_name = SUPPORTED_LANGUAGES.get(target_lang, target_lang)
         source_name = SUPPORTED_LANGUAGES.get(source_lang, source_lang) if source_lang else "auto-detected"
+        _result["target_name"] = target_name
         logger.info("[%s] Subtitle translation: %s → %s (%d segments)",
                     job_id, source_name, target_name, len(transcript))
 
@@ -1578,37 +1669,18 @@ async def _background_post_processing(
                 _translated_out = merge_markers(_translated_out, _music_markers)
 
             # ── Persist the translated, polished transcript ──
-            # Pin status=COMPLETE so a stray relay can't leave the translated
-            # track on a job the UI still renders as "judging clips".
+            # No status pin here: translation now runs BEFORE clip extraction,
+            # so the job is NOT terminal yet — the COMPLETE save happens in
+            # ``_run_analysis_inner`` after clips. The post-clip caption refresh
+            # + Auto-SEO run from ``_run_post_clip_followups`` using ``_result``.
             logger.info(
-                "[%s] Persisting translated_transcript (%d segments) + status=COMPLETE",
+                "[%s] Persisting translated_transcript (%d segments)",
                 job_id, len(_translated_out),
             )
-            _update_kwargs = {
-                "translated_transcript": _translated_out,
-                "status": JobStatus.COMPLETE,
-            }
+            _update_kwargs = {"translated_transcript": _translated_out}
             if _tr_readability is not None:
                 _update_kwargs["transcript_readability"] = _tr_readability
             await database.update_job_status(job_id, **_update_kwargs)
-
-            # Re-derive clip caption / hook_text / title from the translated
-            # transcript so the Viral Clips cards show the target language.
-            try:
-                _refreshed = await _refresh_clips_with_translation(
-                    job_id, list(translated),
-                    fallback_clips=list(_fallback_clips),
-                )
-                if _refreshed > 0:
-                    await broadcast_ws(job_id, {
-                        "type": "clips_refreshed",
-                        "message": f"Refreshed {_refreshed} clip captions in {target_name}",
-                    })
-            except Exception as _cr_err:
-                logger.warning(
-                    "[%s] Post-translation clip refresh failed: %s",
-                    job_id, _cr_err,
-                )
 
             await broadcast_ws(job_id, {
                 "type": "background_task",
@@ -1619,17 +1691,24 @@ async def _background_post_processing(
             logger.info("[%s] Translate+polish complete: %d/%d segments to %s",
                         job_id, changed, len(translated), target_lang)
 
-            # Seed SEO from the translated transcript, then we're done.
-            await _run_auto_seo(list(translated))
-            return
+            # Visible, persisted success state (Task 3) + outcome contract.
+            await _set_translation_status(job_id, "translated", None)
+            _result.update(
+                translated=True,
+                source_transcript=_as_dicts(transcript),
+                target_transcript=_translated_out,
+                seo_transcript=_translated_out,
+            )
+            return _result
 
         except Exception as e:
-            # Fail loudly + visibly (Task 2). A rate-limited / unavailable model
-            # gets a specific, actionable message; we NEVER persist the source
-            # under translated_transcript (the changed==0 guard above raised, so
-            # nothing was relabelled). The job stays COMPLETE/usable with the
-            # clean source transcript, but the failure is surfaced in the job's
-            # pipeline_warnings and over the websocket as a failed task.
+            # Fail loudly + visibly (Task 2/3). A rate-limited / unavailable
+            # model gets a specific, actionable message; we NEVER persist the
+            # source under translated_transcript (the changed==0 guard above
+            # raised, so nothing was relabelled). The pipeline continues to clip
+            # extraction + finalization with the clean (polished) source
+            # transcript, and the failure is surfaced in the job's
+            # translation_status + pipeline_warnings and over the websocket.
             if isinstance(e, TranslationRateLimitedError):
                 _msg = ("Translation model rate-limited or unavailable — offline "
                         "model (NMT) or a paid/local model is recommended")
@@ -1653,16 +1732,24 @@ async def _background_post_processing(
                 "state": "translation_failed",
                 "message": _msg,
             })
-            # Fall through: polish + dedup + SEO still run on the source transcript
-            # so the job stays usable (and never ships Japanese labelled English).
+            # Visible, persisted failure state (Task 3) so a planned-but-missing
+            # translation never presents as a clean COMPLETE with source subs.
+            await _set_translation_status(job_id, "translation_failed", _msg)
+            _result["failed_reason"] = _msg
+            # Fall through: polish + dedup still run on the source transcript so
+            # the job stays usable (and never ships Japanese labelled English).
 
     # Reached when no translation was needed OR translation failed above.
     # Polish the source transcript (if the critical path didn't already), run a
     # guaranteed dedup + timing pass (Task 5 — so a translation failure can't
-    # leave duplicate cues in the shipped transcript), then seed SEO.
+    # leave duplicate cues in the shipped transcript). The polished SOURCE
+    # transcript is returned so ``_run_analysis_inner`` persists IT (never raw)
+    # and Auto-SEO seeds from it post-clips.
     await _polish_source_if_needed()
     await _dedup_source_transcript()
-    await _run_auto_seo(list(transcript))
+    _src_final = _as_dicts(transcript)
+    _result.update(source_transcript=_src_final, seo_transcript=_src_final)
+    return _result
 
 
 async def run_analysis(job_id: str):
@@ -3059,6 +3146,73 @@ async def _run_analysis_inner(job_id: str):
                 estimated_audience="general", content_category="generic",
             )
 
+    # ── Subtitle translation + target-language polish (BEFORE clip extraction) ──
+    # Decoupled from clip detection (Task 1): translation used to run AFTER the
+    # clip stage, so a clip-stage failure (e.g. Replicate 429 / no credit) could
+    # bypass it and the job finalized COMPLETE with the raw source transcript.
+    # Running it here guarantees transcription → translation → polish (target
+    # language) → readability/resegment/dedup happens regardless of what the clip
+    # stage does. The clip-dependent finishers (caption refresh + Auto-SEO) run
+    # AFTER clips in ``_run_post_clip_followups``.
+    #
+    # Persist the summary first so the post-clip Auto-SEO (which reads
+    # job.summary for prompt context) sees it.
+    try:
+        await database.update_job_status(job_id, summary=summary)
+    except Exception as _sum_err:
+        logger.debug("[%s] pre-translation summary persist skipped: %s", job_id, _sum_err)
+    if _will_translate:
+        await _update_progress(
+            job_id, JobStatus.TRANSLATING, 77, "Translating + polishing subtitles...",
+        )
+    logger.info(
+        "[%s] invoking translate+polish (target=%s, source=%s, will_translate=%s)",
+        job_id, _bg_target or "(none)", _bg_source or "auto", _will_translate,
+    )
+    _pp_result = None
+    try:
+        _pp_job = await database.load_job(job_id) or job
+        _pp_result = await _background_post_processing(
+            job_id, list(transcript), orchestrator, _pp_job,
+            polished_already=_polished_in_critical_path,
+        )
+    except Exception as _pp_err:
+        logger.error(
+            "[%s] translate+polish step raised (non-fatal — continuing to clips): %s",
+            job_id, _pp_err, exc_info=True,
+        )
+    # Adopt the SOURCE transcript exactly as post-processing finalized it —
+    # polished on the no-translation / translation-failed paths — so the COMPLETE
+    # save persists a clean transcript, never raw (Task 2). The translated track
+    # is persisted separately as translated_transcript by post-processing.
+    if _pp_result and _pp_result.get("source_transcript") is not None:
+        transcript = _pp_result["source_transcript"]
+    # Fail loud when a PLANNED translation did not produce target output (Task 3).
+    if _will_translate:
+        if _pp_result is None:
+            # Crashed before it could translate OR run its source-language
+            # fallback — last-resort polish so we never ship raw, plus a status.
+            logger.error(
+                "[%s] translate+polish crashed before completing — polishing "
+                "source transcript as a last resort", job_id)
+            try:
+                _src_models, _ = await _polish_transcript_loop(
+                    job_id, list(transcript), orchestrator, _bg_source)
+                if _src_models:
+                    transcript = [
+                        m.model_dump() if hasattr(m, "model_dump") else dict(m)
+                        for m in _src_models
+                    ]
+            except Exception as _lp_err:
+                logger.warning("[%s] last-resort source polish failed: %s", job_id, _lp_err)
+            await _set_translation_status(
+                job_id, "translation_failed",
+                "translate+polish step crashed; kept source-language transcript")
+        elif not _pp_result.get("translated") and not _pp_result.get("failed_reason"):
+            await _set_translation_status(
+                job_id, "translation_failed",
+                "planned translation produced no target-language output")
+
     # ── Clip detection (reframer clipper) ──
     cancel_check()
     await _update_progress(
@@ -3156,6 +3310,25 @@ async def _run_analysis_inner(job_id: str):
             logger.exception("[%s] Clip extraction failed: %s", job_id, _ce)
             clips = []
 
+    # ── Post-clip translation finishers (caption refresh + Auto-SEO) ──
+    # These need the clips, so they run here — AFTER extraction. They can never
+    # block or skip translation, which already ran above the clip stage. The
+    # in-process ``clips`` is threaded as the fallback for the DB-round-trip-empty
+    # case. Best-effort: a failure here never aborts the finalize.
+    try:
+        await _run_post_clip_followups(job_id, orchestrator, _pp_result, clips)
+        _pp_after = await database.load_job(job_id)
+        if _pp_after is not None and getattr(_pp_after, "clips", None):
+            clips = [
+                c.model_dump() if hasattr(c, "model_dump") else c
+                for c in _pp_after.clips
+            ]
+    except Exception as _fu_err:
+        logger.warning(
+            "[%s] Post-clip follow-ups failed (non-fatal): %s",
+            job_id, _fu_err, exc_info=True,
+        )
+
     # ── Final save ──
     cancel_check()
     _analysis_seconds = round(_time.monotonic() - _pipeline_start, 1)
@@ -3185,50 +3358,13 @@ async def _run_analysis_inner(job_id: str):
         pass
     _total_cost_usd = round(_total_cost_usd, 4)
 
-    # ── Translate + polish on the CRITICAL PATH (before the COMPLETE save) ──
-    # Reordered from a fire-and-forget background task that was being lost on
-    # this deployment (job stalled at detecting_clips with the Japanese
-    # transcript, zero translation activity in the log). Awaiting it here
-    # guarantees the sequence transcription → translation → polish (target
-    # language) → readability/resegment/dedup runs and is persisted BEFORE the
-    # job is finalized COMPLETE. _background_post_processing persists
-    # translated_transcript + transcript_readability and refreshes the clip
-    # captions itself; we reload the clips afterwards so the single COMPLETE
-    # save below carries the refreshed/translated captions rather than
-    # clobbering them with the pre-translation copies. translated_transcript
-    # and transcript_readability are preserved by _persist_complete_job's
-    # load→merge (they are not in _complete_fields).
-    #
-    # Persist the summary first so the Auto-SEO step inside post-processing
-    # (which loads job.summary for prompt context) sees it — previously the
-    # COMPLETE save wrote the summary AFTER post-processing ran.
-    try:
-        await database.update_job_status(job_id, summary=summary)
-    except Exception as _sum_err:
-        logger.debug("[%s] pre-post-processing summary persist skipped: %s", job_id, _sum_err)
-    if _will_translate:
-        await _update_progress(
-            job_id, JobStatus.DETECTING_CLIPS, 97,
-            "Translating + polishing subtitles...",
-        )
-    try:
-        _pp_job = await database.load_job(job_id) or job
-        await _background_post_processing(
-            job_id, list(transcript), orchestrator, _pp_job,
-            clips=list(clips or []),
-            polished_already=_polished_in_critical_path,
-        )
-        _pp_after = await database.load_job(job_id)
-        if _pp_after is not None and getattr(_pp_after, "clips", None):
-            clips = [
-                c.model_dump() if hasattr(c, "model_dump") else c
-                for c in _pp_after.clips
-            ]
-    except Exception as _pp_err:
-        logger.warning(
-            "[%s] Critical-path translate+polish step failed (non-fatal): %s",
-            job_id, _pp_err, exc_info=True,
-        )
+    # NOTE: translate + polish (``_background_post_processing``) now runs ABOVE,
+    # BEFORE clip extraction — so a clip-stage failure can never bypass it — and
+    # the clip-dependent caption refresh + Auto-SEO already ran in
+    # ``_run_post_clip_followups`` after the clip stage. The translated track
+    # (translated_transcript) + transcript_readability + translation_status are
+    # already persisted and are preserved through the COMPLETE save by
+    # ``_persist_complete_job``'s load→merge (they are not in _complete_fields).
 
     # Enter the finalization window: from here on, no progress relay may
     # write a non-terminal status (see _finalizing_jobs / _update_progress).
@@ -3333,10 +3469,11 @@ async def _run_analysis_inner(job_id: str):
         "[%s] Pipeline complete in %.1fs — %d clips, %d scenes, %d transcript segments",
         job_id, _analysis_seconds, len(_clip_models), len(scenes), len(transcript),
     )
-    # NOTE: translate + polish (``_background_post_processing``) already ran
-    # synchronously on the critical path ABOVE — before this COMPLETE save —
-    # so the translated/polished transcript and refreshed clips are already
-    # persisted and reflected in the COMPLETE payload. It is no longer kicked
-    # off as a fire-and-forget task here (that task was being lost on this
-    # deployment, leaving non-English jobs stuck at detecting_clips with an
-    # un-translated transcript).
+    # NOTE: translate + polish (``_background_post_processing``) ran on the
+    # critical path BEFORE clip extraction (decoupled so a clip-stage failure
+    # cannot bypass it), and the clip-dependent caption refresh + Auto-SEO ran
+    # right after the clip stage. The translated/polished transcript, refreshed
+    # clips and translation_status are already persisted and reflected in (or
+    # preserved through) this COMPLETE save. It is no longer a fire-and-forget
+    # task (that task was being lost on this deployment, leaving non-English jobs
+    # stuck at detecting_clips with an un-translated transcript).

@@ -29,6 +29,7 @@ const STATUS_STYLES = {
   transcribing: { className: 'badge-cyan pulse', label: 'Processing' },
   analyzing_scenes: { className: 'badge-cyan pulse', label: 'Processing' },
   generating_summary: { className: 'badge-cyan pulse', label: 'Processing' },
+  translating: { className: 'badge-cyan pulse', label: 'Translating' },
   detecting_clips: { className: 'badge-cyan pulse', label: 'Processing' },
   complete: { className: 'badge-green', label: 'Complete' },
   failed: { className: 'badge-red', label: 'Failed' },
@@ -37,7 +38,7 @@ const STATUS_STYLES = {
 
 const CANCELLABLE = [
   'queued', 'extracting_frames', 'transcribing',
-  'analyzing_scenes', 'generating_summary', 'detecting_clips',
+  'analyzing_scenes', 'generating_summary', 'translating', 'detecting_clips',
 ];
 
 export default function Dashboard() {
