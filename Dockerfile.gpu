@@ -121,28 +121,32 @@ COPY backend/requirements.txt .
 # isolated + obvious and the rest of the image still builds. Without the CUDA
 # wheel the GPU image silently shipped CPU-only torch
 # (torch.cuda.is_available()==False), forcing YOLO-World + face/embedding work
-# onto the CPU — the ~10-30x-slower analysis. The cu121 index serves the CUDA
-# build (matches the CUDA 12.x runtime base + GTX 1650 / sm_75); <2.6 keeps
-# torch on a range with a paired torchaudio wheel on that index. If the CUDA
-# index is unreachable at build time the ``||`` falls back to the default
-# index so the build STILL COMPLETES — the runtime then emits the visible
-# "running on CPU" warning instead of bricking the image.
+# onto the CPU — the ~10-30x-slower analysis. EXACT-pin torch+torchaudio to
+# the versions also pinned in requirements.txt (==2.5.1), from the cu121 index
+# (matches the CUDA 12.x runtime base + GTX 1650 / sm_75). The exact pin is
+# critical: a range let `-r requirements.txt` (via pyannote) UPGRADE torch to
+# 2.12, uninstall this CUDA wheel, and pull ~2 GB of cu13 packages until the
+# disk filled. If the cu121 index is unreachable the ``||`` falls back so the
+# build STILL COMPLETES; the runtime then emits the visible "running on CPU"
+# warning instead of bricking the image.
 RUN pip3 install --upgrade pip && \
     ( pip3 install --no-cache-dir \
-        "torch>=2.0.0,<2.6" torchaudio \
+        torch==2.5.1 torchaudio==2.5.1 \
         --index-url https://download.pytorch.org/whl/cu121 \
-      || pip3 install --no-cache-dir "torch>=2.0.0" torchaudio ) && \
+      || pip3 install --no-cache-dir torch==2.5.1 torchaudio==2.5.1 ) && \
     python3 -c 'import torch; print("torch", torch.__version__, "CUDA-build:", torch.version.cuda or "NONE (CPU-only)")'
 
-# requirements.txt already lists pyannote.audio>=3.1.0 and torch>=2.0.0; the
-# CUDA torch installed above SATISFIES torch>=2.0.0, so pip resolves it as
-# already-installed and does NOT replace it with the CPU wheel. pyannote gets
-# its full dependency tree here in the normal requirements install.
+# requirements.txt pins torch==2.5.1 / torchaudio==2.5.1 (and pyannote<4), so
+# the CUDA torch installed above is treated as already-satisfied and pip does
+# NOT swap it for a CPU wheel. pyannote 3.x gets its full dependency tree here
+# in the normal requirements install.
 RUN pip3 install --no-cache-dir -r requirements.txt && \
     pip3 install --no-cache-dir nvidia-cublas-cu12 nvidia-cudnn-cu12==9.* && \
-    # Confirm torch is still the CUDA build after the requirements install
-    # (catches a regression where something pulled the CPU wheel back in).
-    python3 -c 'import torch; print("post-reqs torch", torch.__version__, "CUDA-build:", torch.version.cuda or "NONE (CPU-only)")' && \
+    # FAIL the build if the requirements install swapped torch off the pinned
+    # cu121 wheel (e.g. a dep loosened its constraint and pip upgraded torch to
+    # a giant cu13 build — the exact failure that filled the disk). Catching it
+    # here aborts in seconds instead of after a 2 GB download.
+    python3 -c 'import torch,sys; cu=torch.version.cuda; print("post-reqs torch",torch.__version__,"CUDA-build:",cu or "NONE (CPU-only)"); sys.exit(0 if (cu and cu.startswith("12")) else 1)' && \
     # MediaPipe runtime deps (installed separately to avoid protobuf conflict)
     pip3 install --no-cache-dir \
         flatbuffers>=23.1.4 \

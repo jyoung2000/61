@@ -30,8 +30,17 @@ opencv-python-headless>=4.8.0
 # faceless frames and the camera drifts onto background motion.
 ultralytics>=8.0.0
 mcp>=1.8.0
-pyannote.audio>=3.1.0
-torch>=2.0.0
+# pyannote.audio 4.x requires torchaudio>=2.8 → torch>=2.8, which makes pip
+# UPGRADE torch to 2.12 (a huge CPU/cu13 wheel from the default index) during
+# this install — uninstalling the CUDA torch the Dockerfile pinned and bloating
+# the image by ~2 GB (filling the disk). Cap to 3.x: it's CUDA-torch-2.5
+# compatible and keeps the GPU build intact.
+pyannote.audio>=3.1.0,<4.0
+# Pin torch so `-r requirements.txt` treats the Dockerfile's torch==2.5.1+cu121
+# (the CUDA build) as already-satisfied and NEVER swaps it for a CPU wheel.
+# (==2.5.1 matches the local "+cu121" build identifier.)
+torch==2.5.1
+torchaudio==2.5.1
 # ArcFace (InsightFace buffalo_s) for identity embeddings.
 # CPU-only via onnxruntime — must not compete with Whisper/Ollama on the GPU.
 # Enabled via CLIPAI_FACE_EMBEDDING=arcface (default: sface).
