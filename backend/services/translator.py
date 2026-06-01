@@ -256,6 +256,7 @@ async def translate_segments(
     progress_callback=None,
     context_window: int | None = None,
     glossary: dict | None = None,
+    model_override: str | None = None,
 ) -> list[TranscriptSegment]:
     """Translate transcript segments to the target language.
 
@@ -323,7 +324,8 @@ async def translate_segments(
         batch_success = False
         for attempt in range(2):  # 2 attempts per batch
             try:
-                response = await orchestrator.text_completion(prompt, timeout=120)
+                response = await orchestrator.text_completion(
+                    prompt, timeout=120, model_override=model_override)
                 translations = _parse_translation_response(response)
 
                 if isinstance(translations, list):
@@ -499,6 +501,15 @@ async def translate_segments_with_fallback(
     logger.info("Translation engine resolved: %s (requested=%s)",
                 engine, getattr(settings, "TRANSLATION_ENGINE", "auto"))
 
+    # Dedicated OpenRouter translation model. Blank → orchestrator keeps using
+    # the editorial model (current behaviour). When set, the LLM batch calls
+    # route through it so subtitle translation can use a translation-strong
+    # model while transcript polishing stays on the editorial model.
+    _or_translation_model = (getattr(settings, "OPENROUTER_TRANSLATION_MODEL", "") or "").strip() or None
+    if _or_translation_model:
+        logger.info("Subtitle translation will use OpenRouter model override: %s",
+                    _or_translation_model)
+
     # ── Cloud NMT engines (DeepL, Google) ──
     if engine == "deepl":
         try:
@@ -535,6 +546,7 @@ async def translate_segments_with_fallback(
     probe_result = await translate_segments(
         probe_sample, source_language, target_language,
         orchestrator, batch_size=probe_size, glossary=glossary,
+        model_override=_or_translation_model,
     )
     probe_changed = sum(1 for t, o in zip(probe_result, probe_sample) if t.text != o.text)
 
@@ -545,6 +557,7 @@ async def translate_segments_with_fallback(
             segments, source_language, target_language,
             orchestrator, batch_size, progress_callback,
             glossary=glossary,
+            model_override=_or_translation_model,
         )
         changed = sum(1 for t, o in zip(result, segments) if t.text != o.text)
         if changed > 0:

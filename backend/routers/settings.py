@@ -52,7 +52,8 @@ _PERSISTABLE_KEYS = [
     # Translation cloud NMT secrets.
     "GOOGLE_TRANSLATE_API_KEY", "DEEPL_API_KEY",
     "OPENROUTER_PRESET", "OPENROUTER_PRIMARY_MODEL", "OPENROUTER_EDITORIAL_MODEL",
-    "OPENROUTER_SUMMARY_MODEL", "OLLAMA_PRIMARY_MODEL", "OLLAMA_EDITORIAL_MODEL", "OLLAMA_TRANSLATION_MODEL",
+    "OPENROUTER_SUMMARY_MODEL", "OPENROUTER_TRANSLATION_MODEL",
+    "OLLAMA_PRIMARY_MODEL", "OLLAMA_EDITORIAL_MODEL", "OLLAMA_TRANSLATION_MODEL",
     "WHISPER_MODEL", "WHISPER_MODEL_USER_SET", "WHISPER_BEAM_SIZE",
     "WHISPER_VAD_FILTER", "FRAME_SAMPLE_RATE", "WHISPER_AUTO_UPGRADE",
     # Reframer perception sampling (face-detection speed).
@@ -1985,6 +1986,10 @@ async def available_models():
             "transcript_model": settings.WHISPER_MODEL,
             "vision_model": current_vision,
             "text_model": current_text,
+            # Dedicated subtitle-translation model. Blank means "use the
+            # editorial model" — the frontend renders that as the default
+            # option in the Translation AI dropdown.
+            "translation_model": settings.OPENROUTER_TRANSLATION_MODEL or "",
         },
     }
 
@@ -1993,6 +1998,11 @@ class SaveModelsRequest(BaseModel):
     transcript_model: str = ""
     vision_model: str = ""
     text_model: str = ""
+    # Dedicated OpenRouter subtitle-translation model (separate from the
+    # editorial/text model used for transcript polishing). Optional so an
+    # absent field (None) is left untouched while an explicit "" clears it
+    # back to the editorial fallback.
+    translation_model: Optional[str] = None
 
 
 @router.post("/providers/models/save")
@@ -2050,6 +2060,23 @@ async def save_models(req: SaveModelsRequest):
                 _upsert_env_var(env_path, "OPENROUTER_EDITORIAL_MODEL", req.text_model)
                 _upsert_env_var(env_path, "OPENROUTER_SUMMARY_MODEL", req.text_model)
                 _upsert_env_var(env_path, "OPENROUTER_PRESET", "custom")
+
+    # Dedicated OpenRouter subtitle-translation model. Kept distinct from the
+    # editorial model so polishing and translation can run different models.
+    # Ollama-prefixed picks aren't applicable here (translation routes through
+    # OLLAMA_TRANSLATION_MODEL on the Ollama fallback path), so only the
+    # OpenRouter id is persisted.
+    if req.translation_model is not None:
+        _tm = (req.translation_model or "").strip()
+        if _tm.startswith("ollama/"):
+            _tm = _tm[len("ollama/"):]
+            settings.OLLAMA_TRANSLATION_MODEL = _tm
+            if env_path:
+                _upsert_env_var(env_path, "OLLAMA_TRANSLATION_MODEL", _tm)
+        else:
+            settings.OPENROUTER_TRANSLATION_MODEL = _tm
+            if env_path:
+                _upsert_env_var(env_path, "OPENROUTER_TRANSLATION_MODEL", _tm)
 
     # If the user selected Ollama models, ensure Ollama is in the fallback chain
     # so it actually gets used for analysis. Put it first since that's the user's intent.
@@ -2123,12 +2150,14 @@ async def save_models(req: SaveModelsRequest):
             "transcript_model": settings.WHISPER_MODEL,
             "vision_model": f"ollama/{settings.OLLAMA_PRIMARY_MODEL}",
             "text_model": f"ollama/{settings.OLLAMA_EDITORIAL_MODEL}",
+            "translation_model": settings.OPENROUTER_TRANSLATION_MODEL or "",
         }
     return {
         "status": "saved",
         "transcript_model": settings.WHISPER_MODEL,
         "vision_model": settings.OPENROUTER_PRIMARY_MODEL,
         "text_model": settings.OPENROUTER_EDITORIAL_MODEL,
+        "translation_model": settings.OPENROUTER_TRANSLATION_MODEL or "",
     }
 
 

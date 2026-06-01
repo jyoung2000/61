@@ -96,10 +96,22 @@ def _cross_validate_segments(segments: list) -> list:
         prev_end = float(end) or prev_end
 
     dropped = len(segments) - len(cleaned)
+
+    # Second pass: collapse NON-adjacent near-duplicates — segments that
+    # overlap in time and carry similar (not just identical) text. The
+    # adjacency-only logic above misses re-transcriptions that land a few
+    # hundred ms apart with the same line (the repeated proper-noun cue the
+    # gap-fill pass produces over music). Operates on start_sec/end_sec keys.
+    from backend.services.transcript_dedup import collapse_overlapping_duplicates
+    cleaned, overlap_dropped = collapse_overlapping_duplicates(
+        cleaned, start_key="start_sec", end_key="end_sec")
+    dropped += overlap_dropped
+
     if dropped > 0:
         logger.info(
-            "cross-segment validation removed %d duplicate/overlapping segments",
-            dropped,
+            "cross-segment validation removed %d duplicate/overlapping segments "
+            "(%d adjacent, %d overlapping near-duplicate)",
+            dropped, dropped - overlap_dropped, overlap_dropped,
         )
     return cleaned
 
@@ -863,7 +875,27 @@ class AudioIntelligence:
             overlap = max(0.0, min(end_sec, ge) - max(start_sec, gs))
             return overlap / seg_len >= 0.5
 
+        # Hard ceiling on gap-fill segment length. With ``vad_filter=False``
+        # Whisper can fold a whole OP song / minutes of narration into ONE
+        # run-on cue stamped at a single timestamp; splitting at word
+        # boundaries (and at inter-word silences) keeps each emitted cue
+        # short and time-accurate.
+        max_gap_seg = float(getattr(settings, "WHISPER_GAP_FILL_MAX_SEC", 8.0))
+        GAP_BREAK = 1.0  # seconds of silence that forces a split
+
+        def _word_dict(w):
+            word_conf = (getattr(w, 'probability', None)
+                         or getattr(w, 'confidence', 1.0) or 1.0)
+            return {
+                'word': (w.word.strip() if hasattr(w, 'word')
+                         else str(w).strip()),
+                'start': round(float(getattr(w, 'start', 0.0) or 0.0), 3),
+                'end': round(float(getattr(w, 'end', 0.0) or 0.0), 3),
+                'confidence': round(float(word_conf), 3),
+            }
+
         out: list[dict] = []
+        dropped_outside = 0
         for seg in segs_iter:
             text = (seg.text or '').strip()
             if not text:
@@ -894,31 +926,85 @@ class AudioIntelligence:
                     if text is None:
                         continue
 
-            if not _inside_gap(float(seg.start), float(seg.end)):
+            seg_start = float(seg.start)
+            seg_end = float(seg.end)
+            # Overlap guard — applied on BOTH the clip_timestamps path and the
+            # full-file fallback path, so a segment that leaked into
+            # already-covered territory is dropped regardless of which
+            # transcribe call produced it.
+            if not _inside_gap(seg_start, seg_end):
+                dropped_outside += 1
                 continue
 
-            words = []
-            if hasattr(seg, 'words') and seg.words:
-                for w in seg.words:
-                    word_conf = (getattr(w, 'probability', None)
-                                 or getattr(w, 'confidence', 1.0) or 1.0)
-                    words.append({
-                        'word': (w.word.strip() if hasattr(w, 'word')
-                                 else str(w).strip()),
-                        'start': round(getattr(w, 'start', seg.start), 3),
-                        'end': round(getattr(w, 'end', seg.end), 3),
-                        'confidence': round(float(word_conf), 3),
-                    })
+            raw_words = list(seg.words) if (hasattr(seg, 'words') and seg.words) else []
 
-            out.append({
-                'start_sec': round(float(seg.start), 3),
-                'end_sec': round(float(seg.end), 3),
-                'text': text,
-                'words': words,
-                'is_hallucination': False,
-                'no_speech_prob': round(no_speech_prob, 3),
-                'source': 'gap_fill',
-            })
+            # ── Split over-long run-on cues into ≤ max_gap_seg sub-cues ──
+            pieces: list[list] = []
+            if max_gap_seg > 0 and (seg_end - seg_start) > max_gap_seg and raw_words:
+                cur: list = []
+                cur_start = None
+                prev_end = None
+                for w in raw_words:
+                    w_start = float(getattr(w, 'start', seg_start) or seg_start)
+                    w_end = float(getattr(w, 'end', w_start) or w_start)
+                    if cur and (
+                        (w_end - cur_start > max_gap_seg)
+                        or (prev_end is not None and w_start - prev_end >= GAP_BREAK)
+                    ):
+                        pieces.append(cur)
+                        cur = []
+                        cur_start = None
+                    if cur_start is None:
+                        cur_start = w_start
+                    cur.append(w)
+                    prev_end = w_end
+                if cur:
+                    pieces.append(cur)
+
+            if len(pieces) > 1:
+                for ch in pieces:
+                    # Reconstruct chunk text from the RAW word tokens so the
+                    # original spacing (latin) / non-spacing (CJK) survives.
+                    c_text = ''.join(
+                        (w.word if hasattr(w, 'word') else str(w)) for w in ch
+                    ).strip()
+                    if not c_text:
+                        continue
+                    c_start = round(float(getattr(ch[0], 'start', seg_start) or seg_start), 3)
+                    c_end = round(float(getattr(ch[-1], 'end', c_start) or c_start), 3)
+                    out.append({
+                        'start_sec': c_start,
+                        'end_sec': c_end,
+                        'text': c_text,
+                        'words': [_word_dict(w) for w in ch],
+                        'is_hallucination': False,
+                        'no_speech_prob': round(no_speech_prob, 3),
+                        'source': 'gap_fill',
+                    })
+            else:
+                out.append({
+                    'start_sec': round(seg_start, 3),
+                    'end_sec': round(seg_end, 3),
+                    'text': text,
+                    'words': [_word_dict(w) for w in raw_words],
+                    'is_hallucination': False,
+                    'no_speech_prob': round(no_speech_prob, 3),
+                    'source': 'gap_fill',
+                })
+
+        # Collapse near-duplicate re-transcriptions (overlapping in time AND
+        # similar in text — e.g. the repeated 作戦名オペレーション・メテオ) that the
+        # adjacent-only filters miss.
+        from backend.services.transcript_dedup import collapse_overlapping_duplicates
+        out, dropped_dup = collapse_overlapping_duplicates(
+            out, start_key='start_sec', end_key='end_sec')
+
+        max_seg_len = max((s['end_sec'] - s['start_sec'] for s in out), default=0.0)
+        log.log_stage('AUDIO',
+            f'Gap-fill output: {len(out)} segment(s) kept, '
+            f'{dropped_outside} dropped-outside-gap, '
+            f'{dropped_dup} dropped-as-duplicate, '
+            f'max segment length {max_seg_len:.1f}s')
         return out
 
     def _reload_on_cpu(self) -> None:

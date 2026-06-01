@@ -1037,7 +1037,7 @@ class AIOrchestrator:
             except Exception:
                 continue
 
-    async def text_completion(self, prompt: str, max_tokens: int = 4096, timeout: float = 60, job_id: str = "", skip_circuit_breaker: bool = False) -> str:
+    async def text_completion(self, prompt: str, max_tokens: int = 4096, timeout: float = 60, job_id: str = "", skip_circuit_breaker: bool = False, model_override: str | None = None) -> str:
         """Generic text completion using the configured provider chain.
 
         Used by transcript correction, translation, and other text-only tasks.
@@ -1049,18 +1049,31 @@ class AIOrchestrator:
                 circuit breaker. Use this for non-critical/optional operations
                 (like transcript polishing) that should not degrade the provider
                 for subsequent critical operations (summary, clip detection).
+            model_override: When set and the active provider is OpenRouter,
+                use this model for the call instead of the editorial model
+                (restored afterwards). Lets the subtitle translator route
+                through a dedicated OPENROUTER_TRANSLATION_MODEL while
+                transcript polishing keeps using OPENROUTER_EDITORIAL_MODEL.
+                Ignored for non-OpenRouter providers and when the Ollama
+                downgrade override is already active.
         """
         for provider in self._get_active_chain():
             pname = provider.provider_name
             model_name = provider.text_model_name
+            original_model = None
             # Apply model override for Ollama if we've downgraded after failures
             if pname == "ollama" and self._current_model_override:
                 model_name = self._current_model_override
                 # Temporarily override the provider's text model
                 original_model = provider._editorial_model
                 provider._editorial_model = self._current_model_override
-            else:
-                original_model = None
+            elif model_override and pname == "openrouter" and hasattr(provider, "_editorial_model"):
+                # Caller-requested model for this call only (the dedicated
+                # OpenRouter translation model). Temporarily swap the
+                # provider's text model; restored in the finally below.
+                model_name = model_override
+                original_model = provider._editorial_model
+                provider._editorial_model = model_override
             try:
                 # Clear VRAM before first Ollama call in a job
                 if pname == "ollama" and hasattr(provider, 'clear_vram') and self._consecutive_ollama_failures == 0 and not self._current_model_override:

@@ -14,6 +14,12 @@ class Settings(BaseSettings):
     OPENROUTER_PRIMARY_MODEL: str = "google/gemini-2.5-flash"
     OPENROUTER_EDITORIAL_MODEL: str = "google/gemini-2.5-pro"
     OPENROUTER_SUMMARY_MODEL: str = "google/gemini-2.5-flash"
+    # Dedicated subtitle-translation model. Blank → fall back to
+    # OPENROUTER_EDITORIAL_MODEL (mirrors OLLAMA_TRANSLATION_MODEL's intent).
+    # Lets users pick a separate, translation-strong OpenRouter model for
+    # the subtitle translation pass while keeping the editorial model for
+    # transcript polishing.
+    OPENROUTER_TRANSLATION_MODEL: str = ""
 
     # Direct provider keys
     ANTHROPIC_API_KEY: str = ""
@@ -120,6 +126,13 @@ class Settings(BaseSettings):
     WHISPER_GAP_FILL_ENABLED: bool = True
     WHISPER_GAP_FILL_MIN_SEC: float = 1.5
     WHISPER_GAP_FILL_NO_SPEECH_THRESHOLD: float = 0.25
+    # Hard ceiling on the duration of any single gap-fill segment. With
+    # ``vad_filter=False`` Whisper can collapse a whole OP song / minutes of
+    # narration into one run-on cue stamped at a single timestamp. Any
+    # gap-fill segment longer than this is split at word boundaries into
+    # sub-segments ≤ this length so timestamps stay accurate and the
+    # subtitle track never shows a giant block. 0 disables the split.
+    WHISPER_GAP_FILL_MAX_SEC: float = 8.0
     # Auto-upgrade the Whisper model tier when the detected GPU has
     # spare VRAM. Existing logic already jumped ``small → large-v3-turbo``
     # on ≥6 GB cards; this flag extends the ladder so mid-tier GPUs
