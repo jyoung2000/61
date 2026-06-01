@@ -15,12 +15,23 @@ path cleanly.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import re
+import shutil
+import tempfile
+import time
 from typing import Iterable, Optional
 
 logger = logging.getLogger(__name__)
+
+# Rough free-disk floors required before a download/convert starts. The HF
+# converter pulls the full-precision model into a cache, then writes the
+# smaller int8 CTranslate2 copy — so we need headroom for BOTH transiently.
+# NLLB-200-distilled-600M is ~2.4 GB fp32 on the Hub + ~0.6 GB int8 out.
+_NLLB_MIN_FREE_BYTES = 6 * 1024 ** 3   # 6 GB headroom for HF cache + int8 out
+_OPUS_MIN_FREE_BYTES = 3 * 1024 ** 3   # 3 GB headroom per Opus-MT pair
 
 
 # ── ISO 639-1 → Flores-200 mapping for NLLB ──────────────────────────────
@@ -82,6 +93,146 @@ def _nllb_dir(model_id: str) -> str:
 
 def _opus_dir(src: str, tgt: str) -> str:
     return os.path.join(_models_dir(), "opus-mt", f"{src}-{tgt}")
+
+
+# ── Disk-space / cleanup helpers ─────────────────────────────────────────
+
+def _free_bytes(path: str) -> int:
+    """Free bytes on the filesystem holding ``path`` (walks up to an
+    existing ancestor so the check works before the dir is created)."""
+    probe = path
+    while probe and not os.path.exists(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    try:
+        return shutil.disk_usage(probe or "/").free
+    except Exception:
+        return 0
+
+
+def _dir_size_bytes(path: str) -> int:
+    """Total size of all files under ``path`` (0 if missing)."""
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                pass
+    return total
+
+
+def _human(nbytes: float) -> str:
+    """Human-readable byte size."""
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(nbytes) < 1024.0:
+            return f"{nbytes:.1f} {unit}"
+        nbytes /= 1024.0
+    return f"{nbytes:.1f} PB"
+
+
+@contextlib.contextmanager
+def _hf_cache_redirect():
+    """Point the Hugging Face cache at a throwaway dir for the duration of a
+    convert, then delete it.
+
+    ``TransformersConverter`` downloads the full-precision HF model into the
+    HF cache (``HF_HOME`` / ``HF_HUB_CACHE`` / ``TRANSFORMERS_CACHE``) before
+    emitting the small int8 CTranslate2 model. That full model is several GB
+    of dead weight afterwards. We redirect the cache to a temp dir on the
+    SAME volume as the models (so the converter's downloads don't fill the
+    container's root fs, and a cross-device move isn't needed) and remove it
+    once the int8 model is written — logging the bytes reclaimed.
+    """
+    models_root = _models_dir()
+    tmp_root = os.path.join(models_root, ".hf_cache_tmp")
+    os.makedirs(tmp_root, exist_ok=True)
+    tmp_dir = tempfile.mkdtemp(prefix="convert-", dir=tmp_root)
+    _keys = ("HF_HOME", "HF_HUB_CACHE", "TRANSFORMERS_CACHE", "HUGGINGFACE_HUB_CACHE")
+    _saved = {k: os.environ.get(k) for k in _keys}
+    for k in _keys:
+        os.environ[k] = tmp_dir
+    try:
+        yield tmp_dir
+    finally:
+        for k, v in _saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        try:
+            reclaimed = _dir_size_bytes(tmp_dir)
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            # Drop the parent scratch dir too when it's now empty.
+            with contextlib.suppress(OSError):
+                if not os.listdir(tmp_root):
+                    os.rmdir(tmp_root)
+            logger.info(
+                "NMT: cleaned HF intermediate cache — reclaimed %s", _human(reclaimed)
+            )
+        except Exception as e:
+            logger.warning("NMT: HF cache cleanup skipped (%s)", e)
+
+
+def _require_free_space(target_dir: str, min_free: int, label: str) -> None:
+    """Raise ``OSError`` when the volume holding ``target_dir`` lacks
+    ``min_free`` bytes — so we fail with a clear message instead of writing a
+    half-finished model dir that blocks later retries."""
+    free = _free_bytes(target_dir)
+    if free < min_free:
+        raise OSError(
+            f"Not enough disk space to download {label}: "
+            f"{_human(free)} free, need ~{_human(min_free)} on the models "
+            f"volume ({_models_dir()}). Free up space or pre-download a model."
+        )
+
+
+def _enforce_opus_pair_cap() -> None:
+    """Keep at most ``NMT_MAX_OPUS_PAIRS`` Opus-MT pair dirs, evicting the
+    least-recently-used extras. NLLB is a single model and is never touched."""
+    from backend.config import settings as _settings
+    cap = int(getattr(_settings, "NMT_MAX_OPUS_PAIRS", 5) or 0)
+    if cap <= 0:
+        return
+    opus_root = os.path.join(_models_dir(), "opus-mt")
+    if not os.path.isdir(opus_root):
+        return
+    pairs = []
+    for name in os.listdir(opus_root):
+        d = os.path.join(opus_root, name)
+        if os.path.isdir(d) and os.path.exists(os.path.join(d, "model.bin")):
+            # Prefer the access marker we stamp on use; fall back to mtime.
+            marker = os.path.join(d, ".last_used")
+            try:
+                ts = os.path.getmtime(marker if os.path.exists(marker) else d)
+            except OSError:
+                ts = 0.0
+            pairs.append((ts, d, name))
+    if len(pairs) <= cap:
+        return
+    pairs.sort()  # oldest first
+    for _ts, d, name in pairs[: len(pairs) - cap]:
+        try:
+            freed = _dir_size_bytes(d)
+            shutil.rmtree(d, ignore_errors=True)
+            logger.info(
+                "NMT: evicted least-recently-used Opus-MT pair '%s' (%s) — "
+                "over the %d-pair cap", name, _human(freed), cap,
+            )
+        except Exception as e:
+            logger.warning("NMT: failed to evict Opus-MT pair '%s' (%s)", name, e)
+
+
+def _touch_opus_pair(src: str, tgt: str) -> None:
+    """Stamp an Opus-MT pair as recently used for the LRU cap."""
+    marker = os.path.join(_opus_dir(src, tgt), ".last_used")
+    try:
+        with open(marker, "w") as f:
+            f.write(str(time.time()))
+    except OSError:
+        pass
 
 
 # ── NLLB-200 wrapper (CTranslate2) ───────────────────────────────────────
@@ -159,7 +310,22 @@ class NMTTranslator:
         if device == "auto":
             try:
                 import torch
-                device = "cuda" if torch.cuda.is_available() else "cpu"
+                if torch.cuda.is_available():
+                    # On a small GPU (≤4 GB total, e.g. the GTX 1650) Whisper +
+                    # Ollama already fight over VRAM — auto picks CPU there so a
+                    # parallel-load never OOMs. Larger cards keep the GPU.
+                    total_gb = torch.cuda.get_device_properties(0).total_memory / 1_073_741_824
+                    if total_gb <= 4.5:
+                        device = "cpu"
+                        logger.info(
+                            "NMT: NMT_DEVICE=auto → cpu (GPU has %.1f GB ≤ 4 GB; "
+                            "CPU is the OOM-safe choice — set NMT_DEVICE=cuda to override)",
+                            total_gb,
+                        )
+                    else:
+                        device = "cuda"
+                else:
+                    device = "cpu"
             except Exception:
                 device = "cpu"
 
@@ -445,15 +611,57 @@ def apply_glossary(source_text: str, translated_text: str, glossary: dict) -> st
 
 # ── Download helpers (for the Settings UI button) ─────────────────────────
 
+def _convert_with_cleanup(model_id: str, target_dir: str, label: str) -> None:
+    """Run ``TransformersConverter`` into ``target_dir`` with:
+
+      * the HF intermediate cache redirected to a temp dir that is deleted
+        afterwards (so only the int8 CT2 model survives — see
+        ``_hf_cache_redirect``), and
+      * removal of a partially-written ``target_dir`` if the convert raises,
+        so a corrupt cache can't block the next retry.
+    """
+    try:
+        from ctranslate2.converters import TransformersConverter
+    except Exception as e:
+        raise RuntimeError(
+            f"ctranslate2 with the transformers converter is required to "
+            f"download {label}. pip install 'ctranslate2[transformers]'"
+        ) from e
+
+    os.makedirs(target_dir, exist_ok=True)
+    out_before = _free_bytes(target_dir)
+    try:
+        with _hf_cache_redirect():
+            converter = TransformersConverter(model_id)
+            converter.convert(target_dir, quantization="int8", force=False)
+    except Exception:
+        # Tear down the half-written model dir so it isn't mistaken for a
+        # complete download (and so a retry starts clean).
+        shutil.rmtree(target_dir, ignore_errors=True)
+        logger.warning(
+            "NMT: %s convert failed — removed partial model dir %s", label, target_dir
+        )
+        raise
+    kept = _dir_size_bytes(target_dir)
+    logger.info(
+        "NMT: %s converted to int8 at %s (kept %s; %s free remains)",
+        label, target_dir, _human(kept), _human(_free_bytes(target_dir)),
+    )
+    _ = out_before  # (retained for symmetry / future delta logging)
+
+
 def ensure_nllb_downloaded(
     model_id: Optional[str] = None,
     progress_callback=None,
 ) -> str:
-    """Download + convert NLLB-200 to CTranslate2 format on demand.
+    """Download + convert NLLB-200 to CTranslate2 (int8) on demand.
 
     Returns the absolute path to the model directory. Raises
-    ``RuntimeError`` if dependencies are missing. Safe to call repeatedly
-    — does nothing when the converted model already exists.
+    ``RuntimeError`` if dependencies are missing or ``OSError`` when the
+    models volume is out of space. Safe to call repeatedly — does nothing
+    when the converted model already exists. The multi-GB full-precision HF
+    model pulled during conversion is removed afterwards; only the ~600 MB
+    int8 CT2 model is kept.
     """
     from backend.config import settings as _settings
     model_id = model_id or _settings.NMT_NLLB_MODEL
@@ -461,41 +669,38 @@ def ensure_nllb_downloaded(
     if NMTTranslator._model_files_present(model_id):
         logger.info("NLLB %s already downloaded at %s", model_id, target_dir)
         return target_dir
-    try:
-        from ctranslate2.converters import TransformersConverter
-    except Exception as e:
-        raise RuntimeError(
-            "ctranslate2 with the transformers converter is required to "
-            "download NLLB. pip install 'ctranslate2[transformers]'"
-        ) from e
-    os.makedirs(target_dir, exist_ok=True)
-    converter = TransformersConverter(model_id)
-    converter.convert(target_dir, quantization="int8", force=False)
-    logger.info("NLLB downloaded + converted to %s", target_dir)
+    _require_free_space(target_dir, _NLLB_MIN_FREE_BYTES, f"NLLB ({model_id})")
+    logger.info(
+        "NMT: downloading + converting NLLB %s (one-time, ~600 MB int8) → %s",
+        model_id, target_dir,
+    )
+    _convert_with_cleanup(model_id, target_dir, f"NLLB {model_id}")
     return target_dir
 
 
 def ensure_opus_mt_downloaded(source: str, target: str) -> str:
-    """Download + convert an Opus-MT pair to CTranslate2 format.
+    """Download + convert an Opus-MT pair to CTranslate2 (int8) on demand.
 
-    Same semantics as ``ensure_nllb_downloaded``.
+    Same semantics as ``ensure_nllb_downloaded`` (disk guard, HF-cache
+    cleanup, partial-dir cleanup on failure), plus an LRU cap on how many
+    pair dirs are kept (``NMT_MAX_OPUS_PAIRS``).
     """
     from backend.config import settings as _settings
     src, tgt = source.lower(), target.lower()
     target_dir = _opus_dir(src, tgt)
     if os.path.exists(os.path.join(target_dir, "model.bin")):
+        _touch_opus_pair(src, tgt)
         return target_dir
-    try:
-        from ctranslate2.converters import TransformersConverter
-    except Exception as e:
-        raise RuntimeError(
-            "ctranslate2 with the transformers converter is required to "
-            "download Opus-MT. pip install 'ctranslate2[transformers]'"
-        ) from e
-    os.makedirs(target_dir, exist_ok=True)
+    _require_free_space(target_dir, _OPUS_MIN_FREE_BYTES, f"Opus-MT {src}-{tgt}")
     model_id = _settings.NMT_OPUS_MT_TEMPLATE.format(src=src, tgt=tgt)
-    converter = TransformersConverter(model_id)
-    converter.convert(target_dir, quantization="int8", force=False)
+    logger.info(
+        "NMT: downloading + converting Opus-MT %s (one-time) → %s",
+        model_id, target_dir,
+    )
+    _convert_with_cleanup(model_id, target_dir, f"Opus-MT {src}-{tgt}")
+    _touch_opus_pair(src, tgt)
+    # Prune least-recently-used pairs beyond the cap now that a new one landed.
+    _enforce_opus_pair_cap()
     return target_dir
 
 
@@ -507,8 +712,40 @@ def pick_local_engine(source: str, target: str):
     """
     opus = OpusMTTranslator.get(source, target)
     if opus.is_available():
+        _touch_opus_pair(source, target)
         return opus
     nllb = NMTTranslator()
     if nllb.is_available() and iso_to_flores(source) and iso_to_flores(target):
         return nllb
     return None
+
+
+def auto_download_for_pair(source: str, target: str, prefer: str = "nllb"):
+    """Ensure a local NMT model exists for ``source→target``, downloading +
+    converting one on demand, then return the instantiated local engine.
+
+    Synchronous (the convert is CPU/IO-bound) — call from a worker thread
+    via ``asyncio.to_thread``. NLLB-200 is preferred (one model, 200
+    languages); Opus-MT is fetched only when explicitly requested
+    (``prefer="opus-mt"``) or when the pair isn't in NLLB's Flores map.
+
+    Returns the engine, or ``None`` if the pair is unsupported. Raises
+    ``OSError`` / ``RuntimeError`` when the download itself fails (network,
+    disk, or missing converter deps) so the caller can fall back to the LLM
+    and log the failure distinctly.
+    """
+    existing = pick_local_engine(source, target)
+    if existing is not None:
+        return existing
+
+    nllb_capable = bool(iso_to_flores(source) and iso_to_flores(target))
+    if prefer == "opus-mt" or not nllb_capable:
+        if prefer != "opus-mt":
+            logger.info(
+                "NMT: %s→%s not in NLLB's Flores map — auto-downloading Opus-MT pair",
+                source, target,
+            )
+        ensure_opus_mt_downloaded(source, target)
+    else:
+        ensure_nllb_downloaded()
+    return pick_local_engine(source, target)

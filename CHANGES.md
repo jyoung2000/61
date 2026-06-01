@@ -1,3 +1,115 @@
+# ClipAI — Automatic + reliable offline translation, model lifecycle, Whisper fix
+
+Make offline NMT translation the automatic default (no manual Settings download),
+fail loudly instead of silently shipping the untranslated source, clean up model
+downloads so disk/VRAM don't fill, honor the user-selected Whisper model, and
+guarantee a clean, de-duplicated transcript even when translation fails.
+
+All changes on this branch (`claude/inspiring-maxwell-GG90I`).
+
+## New / changed settings (`backend/config.py`)
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `NMT_AUTODOWNLOAD` | `True` | Auto-download + convert the offline NMT model the first time a translation needs it — no manual Settings step. The LLM is only used if the download itself fails. |
+| `NMT_MAX_OPUS_PAIRS` | `5` | LRU cap on per-pair Opus-MT model dirs; least-recently-used pairs beyond the cap are pruned after a new download. NLLB-200 is a single model and is never counted against this cap. |
+| `NMT_DEVICE` | `auto` (unchanged) | **Behavior change:** when `auto` and the GPU has ≤ 4 GB total VRAM (e.g. GTX 1650) the NMT engine resolves to **CPU** (OOM-safe on a card Whisper + Ollama already share). Larger GPUs keep CUDA. Set `cuda`/`cpu` to force. |
+
+### Task 1 — Offline NMT auto-downloads on demand (no manual Settings step)
+
+- `backend/services/translator.py`
+  - `_resolve_translation_engine()`: with `TRANSLATION_ENGINE=auto` and **no cloud
+    keys**, when no local model is on disk it now resolves to **`nllb`** (or
+    `opus-mt` for pairs outside NLLB's Flores map) instead of falling straight to
+    `llm`. The NMT path downloads it on first use; the LLM is the last resort only
+    when `NMT_AUTODOWNLOAD` is off or the download fails.
+  - `_translate_via_nmt()`: when no local engine exists and auto-download is on, it
+    downloads + converts in a worker thread (`asyncio.to_thread(auto_download_for_pair,…)`),
+    broadcasts **"Downloading offline translation model (one-time)…"** over the
+    websocket `background_task` channel, re-resolves the local engine, and translates
+    offline. Only a *download* failure falls back to the LLM, logged distinctly.
+- `backend/services/nmt_translator.py`: new `auto_download_for_pair(src, tgt, prefer="nllb")`
+  — NLLB-200 preferred (one model, 200 languages); Opus-MT only when explicitly
+  requested or when the pair isn't in NLLB's Flores map.
+- **faster-whisper** keeps its own on-first-use model download (unchanged).
+- **pyannote diarization** is the only model needing a manual token (`HF_AUTH_TOKEN`);
+  absent → `try_load()` returns `False` and the pipeline degrades to the existing
+  spatial pseudo-diarization / mouth-motion ↔ audio-energy speaker mapping. Never
+  blocks. (Documented; no code change.)
+
+### Task 2 — No more silent fall-through to a rate-limited free model
+
+- `backend/services/translator.py`: new `TranslationFailedError` /
+  `TranslationRateLimitedError`. `translate_segments()` detects sustained 429s
+  (`ProviderRateLimitError`) and **aborts after 2 rate-limited attempts** instead of
+  crawling every batch; the counter **resets on success** so a recovered transient
+  429 never trips it. A `:free` translation model logs a one-line warning (not blocked).
+- `backend/services/ai_orchestrator.py`: `text_completion()` raises
+  `ProviderRateLimitError` (not generic `AllProvidersFailedError`) when every provider
+  failed with 429, so callers can fail fast + loud.
+- `backend/services/pipeline.py`: translation failure now ends in a visible
+  **`translation_failed`** state — a `pipeline_warnings` entry plus a `background_task`
+  `failed` broadcast (`state: "translation_failed"`) with an actionable message. The
+  source is never persisted under `translated_transcript` when translation didn't
+  complete.
+
+### Task 3 — Model lifecycle: download, cache, clean up (`nmt_translator.py`)
+
+- **HF intermediate-cache cleanup:** `_hf_cache_redirect()` points HF cache env at a
+  throwaway dir on the **same volume** as the models for the convert, then deletes it
+  — only the ~600 MB int8 CT2 model survives. **Bytes reclaimed are logged.**
+- **Disk-space guard** before download (~6 GB NLLB, ~3 GB per Opus pair) → clear failure
+  instead of a half-written dir.
+- **Partial-convert cleanup:** target dir removed if `convert()` raises (clean retry).
+- **Opus-MT LRU cap** (`NMT_MAX_OPUS_PAIRS`, `.last_used` markers).
+- **VRAM:** `NMT_DEVICE=auto` → CPU on ≤ 4 GB GPUs; confirmed (already correct) that
+  `NMTTranslator.unload()` + `empty_cache()` run in a `finally` after translation,
+  `_release_whisper_vram()` runs before the NMT load, and NMT is unloaded before polish.
+
+### Task 4 — Honor the user-selected Whisper model (`large-v3-turbo` → `medium` mismatch)
+
+- `reframer_audio.py`: `AudioIntelligence` records `requested_model_name`, logs the
+  requested model up front, honors it (falls to **CPU** rather than swapping size when
+  GPU VRAM is short — logged), and logs the genuine last-resort change as an explicit
+  **`DOWNGRADE: requested <model> … → loading base on CPU`** with free-VRAM numbers.
+- `reframer_engine.py` + `pipeline.py`: the **effective** loaded model is surfaced in
+  the compute summary (`summary["whisper"]["model"]`/`requested_model`) so the active
+  config can't disagree with what ran.
+- `settings_overlay.py`: a per-user `WHISPER_MODEL` that differs from the global pin is
+  logged loudly (`global=… → per-user=…`). `WHISPER_AUTO_UPGRADE` (non-user-set)
+  unchanged.
+
+### Task 5 — Clean timing/dedup even when translation fails (`pipeline.py`)
+
+- New `_dedup_source_transcript()` runs `collapse_adjacent_duplicates` →
+  `collapse_overlapping_duplicates` → `drop_repetition_loops` on the **source**
+  transcript whenever translation is skipped or fails, mirroring the post-translation
+  dedup, and persists the cleaned transcript (removed-count logged). Verified
+  `collapse_overlapping_duplicates` collapses identical / near-identical-timestamp
+  duplicates (the `[6:23]`/`[6:23]`, `[2:30]`/`[2:30]` cases).
+
+### Tests (dependency-light — no ctranslate2 / torch / GPU)
+
+- `backend/tests/test_nmt_autodownload_and_cleanup.py` — disk guard, HF-cache
+  redirect + cleanup, partial-convert cleanup, Opus-MT LRU cap, `auto_download_for_pair`
+  routing.
+- `backend/tests/test_translation_fail_loud.py` — rate-limit detection, exception
+  hierarchy, fast abort on sustained 429s, no-abort on a recovered transient 429.
+
+```
+$ python3 -m pytest backend/tests/test_nmt_autodownload_and_cleanup.py \
+                    backend/tests/test_translation_fail_loud.py -q
+12 passed
+```
+
+> The Unraid build/deploy + the two Japanese-video runs (empty `/data/models`, then
+> cached) must be run on the GPU box — this dev container has no GPU / CUDA /
+> ctranslate2 / faster-whisper / `/data`, so the heavy ML paths can't run here. The
+> logic above is unit-tested; the six acceptance criteria are confirmable from a fresh
+> `clipai_logs_*.txt` on the box.
+
+---
+
 # ClipAI — Transcription / Translation / Polish fixes
 
 Branch base: `claude/otter-transcription-parity-mTjAh` (identical commit to the

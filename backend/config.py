@@ -285,10 +285,24 @@ class Settings(BaseSettings):
     # NMT model identifiers — downloaded on demand (NOT at startup).
     NMT_NLLB_MODEL: str = "facebook/nllb-200-distilled-600M"
     NMT_OPUS_MT_TEMPLATE: str = "Helsinki-NLP/opus-mt-{src}-{tgt}"
+    # Auto-download the offline NMT model the first time a translation needs
+    # it (no manual Settings step). When ``auto`` resolves to a local engine
+    # but nothing is on disk yet, the translator fetches + converts NLLB-200
+    # (a one-time ~600 MB int8 download), then translates fully offline. The
+    # LLM path is only used as a last resort if the download itself fails.
+    NMT_AUTODOWNLOAD: bool = True
+    # Each Opus-MT language pair is a separate model dir. Cap how many pairs
+    # we keep on disk; least-recently-used pair dirs beyond the cap are pruned
+    # after a new download so translating many directions can't fill the disk.
+    # NLLB-200 is a single model covering 200 languages, so it stays the
+    # preferred auto-download and is never counted against this cap.
+    NMT_MAX_OPUS_PAIRS: int = 5
     # NMT device policy. ``auto`` → CUDA when available (int8_float16), else CPU
-    # (int8). On a 4 GB GPU (GTX 1650) where Whisper + Ollama already compete
-    # for VRAM, ``cpu`` is the safe choice — a 24-min video still translates in
-    # a couple of minutes on CPU and avoids OOM. Opus-MT always runs on CPU.
+    # (int8) — EXCEPT on a small GPU (total VRAM ≤ 4 GB, e.g. the GTX 1650)
+    # where Whisper + Ollama already compete for VRAM: there ``auto`` resolves
+    # to CPU, the safe choice that avoids OOM (a 24-min video still translates
+    # in a couple of minutes on CPU). Set ``cuda`` to force the GPU anyway, or
+    # ``cpu`` to force CPU everywhere. Opus-MT always runs on CPU.
     NMT_DEVICE: str = "auto"                    # auto | cpu | cuda
 
     # ── Music marking ──

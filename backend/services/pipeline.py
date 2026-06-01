@@ -149,10 +149,20 @@ def _build_compute_summary(engine, perception) -> dict:
             # "cpu_int8_base" / etc. Split on the first underscore.
             on_gpu = whisper_dev.startswith("cuda")
             compute_type = whisper_dev.split("_", 1)[1] if "_" in whisper_dev else ""
+            # Report the EFFECTIVE model that actually loaded (post any VRAM
+            # downgrade) so the active config can't disagree with what ran.
+            _eff_model = getattr(engine, "_perceiver_audio_model", None)
+            _req_model = getattr(engine, "_perceiver_audio_model_requested", None)
+            _detail = f"CTranslate2 {compute_type}".strip() if compute_type else "CTranslate2"
+            if _eff_model:
+                _detail = f"{_eff_model} ({_detail})"
+                if _req_model and _req_model != _eff_model:
+                    _detail += f" — downgraded from requested '{_req_model}'"
             summary["whisper"] = {
                 "device": "cuda:0" if on_gpu else "cpu",
-                "detail": f"CTranslate2 {compute_type}".strip()
-                          if compute_type else "CTranslate2",
+                "model": _eff_model or "",
+                "requested_model": _req_model or "",
+                "detail": _detail,
             }
     except Exception:
         pass
@@ -1287,9 +1297,51 @@ async def _background_post_processing(
                 "status": "failed", "message": f"Polishing skipped: {str(e)[:80]}",
             })
 
+    async def _dedup_source_transcript():
+        """Guaranteed dedup + timing cleanup on the SOURCE transcript (Task 5).
+
+        The translated path runs its own dedup before persisting; this mirror
+        runs whenever translation was skipped OR failed, so the shipped
+        transcript never carries duplicate / overlapping cues (the
+        ``[6:23]``/``[6:23]`` and scattered-loop cases) just because the
+        post-translation cleanup didn't get to run. Persists the cleaned
+        ``transcript`` field. Best-effort: never raises into the caller.
+        """
+        nonlocal transcript
+        if not transcript:
+            return
+        try:
+            from backend.services.transcript_dedup import (
+                collapse_adjacent_duplicates, drop_repetition_loops,
+                collapse_overlapping_duplicates,
+            )
+            _src = [
+                t.model_dump() if hasattr(t, "model_dump") else dict(t)
+                for t in transcript
+            ]
+            _pre = len(_src)
+            _src, _a = collapse_adjacent_duplicates(_src)
+            _src, _o = collapse_overlapping_duplicates(_src)
+            _src, _l = drop_repetition_loops(_src)
+            if _a or _o or _l:
+                logger.info(
+                    "[%s] Source transcript dedup (translation %s): %d → %d "
+                    "(%d adjacent, %d overlapping, %d repetition-loop)",
+                    job_id, "skipped/failed", _pre, len(_src), _a, _o, _l,
+                )
+                transcript = _src
+                await database.update_job_status(job_id, transcript=_src)
+            else:
+                logger.debug("[%s] Source transcript dedup: nothing to remove", job_id)
+        except Exception as _dd_err:
+            logger.warning("[%s] Source transcript dedup skipped (%s)", job_id, _dd_err)
+
     # ── Subtitle translation, then polish in the target language ──
     if _will_translate:
-        from backend.services.translator import translate_segments_with_fallback, SUPPORTED_LANGUAGES
+        from backend.services.translator import (
+            translate_segments_with_fallback, SUPPORTED_LANGUAGES,
+            TranslationFailedError, TranslationRateLimitedError,
+        )
         target_name = SUPPORTED_LANGUAGES.get(target_lang, target_lang)
         source_name = SUPPORTED_LANGUAGES.get(source_lang, source_lang) if source_lang else "auto-detected"
         logger.info("[%s] Subtitle translation: %s → %s (%d segments)",
@@ -1360,6 +1412,18 @@ async def _background_post_processing(
             except Exception as _nmt_pre_err:
                 logger.debug("[%s] NMT pre-release skipped: %s", job_id, _nmt_pre_err)
             orchestrator.reset_circuit_breaker()
+
+            # Surface the one-time offline-model auto-download to the UI over
+            # the existing websocket channel (Task 1).
+            async def _nmt_status(msg: str):
+                logger.info("[%s] %s", job_id, msg)
+                await broadcast_ws(job_id, {
+                    "type": "background_task",
+                    "task": "subtitle_translation",
+                    "status": "running",
+                    "message": msg,
+                })
+
             translated = await asyncio.wait_for(
                 translate_segments_with_fallback(
                     _trans_input,
@@ -1367,6 +1431,7 @@ async def _background_post_processing(
                     target_language=target_lang,
                     orchestrator=orchestrator,
                     glossary=glossary,
+                    status_callback=_nmt_status,
                 ),
                 timeout=_trans_timeout,
             )
@@ -1559,21 +1624,44 @@ async def _background_post_processing(
             return
 
         except Exception as e:
-            logger.error("[%s] Translate+polish failed: %s — keeping best (source) transcript",
-                         job_id, e, exc_info=True)
+            # Fail loudly + visibly (Task 2). A rate-limited / unavailable model
+            # gets a specific, actionable message; we NEVER persist the source
+            # under translated_transcript (the changed==0 guard above raised, so
+            # nothing was relabelled). The job stays COMPLETE/usable with the
+            # clean source transcript, but the failure is surfaced in the job's
+            # pipeline_warnings and over the websocket as a failed task.
+            if isinstance(e, TranslationRateLimitedError):
+                _msg = ("Translation model rate-limited or unavailable — offline "
+                        "model (NMT) or a paid/local model is recommended")
+                _status_label = "translation_failed (rate-limited)"
+            elif isinstance(e, TranslationFailedError):
+                _msg = f"Translation did not complete — {str(e)[:120]}"
+                _status_label = "translation_failed"
+            else:
+                _msg = f"Translation failed: {str(e)[:120]}"
+                _status_label = "translation_failed"
+            logger.error("[%s] %s: %s — keeping clean (source) transcript",
+                         job_id, _status_label, e, exc_info=True)
+            try:
+                _record_pipeline_warning(job_id, f"Subtitle translation failed: {_msg}")
+            except Exception:
+                pass
             await broadcast_ws(job_id, {
                 "type": "background_task",
                 "task": "subtitle_translation",
                 "status": "failed",
-                "message": f"Translation failed: {str(e)[:80]}",
+                "state": "translation_failed",
+                "message": _msg,
             })
-            # Fall through: polish + SEO still run on the source transcript so
-            # the job stays usable (and never ships Japanese labelled English).
+            # Fall through: polish + dedup + SEO still run on the source transcript
+            # so the job stays usable (and never ships Japanese labelled English).
 
     # Reached when no translation was needed OR translation failed above.
-    # Polish the source transcript (if the critical path didn't already), then
-    # seed SEO from whatever transcript we have (source language).
+    # Polish the source transcript (if the critical path didn't already), run a
+    # guaranteed dedup + timing pass (Task 5 — so a translation failure can't
+    # leave duplicate cues in the shipped transcript), then seed SEO.
     await _polish_source_if_needed()
+    await _dedup_source_transcript()
     await _run_auto_seo(list(transcript))
 
 

@@ -103,10 +103,17 @@ class ReframeEngine:
                               source_language=self.source_language)
         self.perception = perceiver.run(on_progress=on_progress)
 
-        # Store audio device info for GUI display
+        # Store audio device + EFFECTIVE model info for GUI display. The
+        # effective model name is what actually loaded (post any VRAM
+        # downgrade), so the active-config readout can't silently disagree
+        # with what ran (Task 4).
         if hasattr(perceiver, 'audio_intel') and perceiver.audio_intel.available:
             self._perceiver_audio_device = getattr(
                 perceiver.audio_intel, 'device_used', 'unknown')
+            self._perceiver_audio_model = getattr(
+                perceiver.audio_intel, 'model_name', None)
+            self._perceiver_audio_model_requested = getattr(
+                perceiver.audio_intel, 'requested_model_name', None)
 
         self.tracer.event('perceive_complete',
                           src_w=self.perception.src_w,

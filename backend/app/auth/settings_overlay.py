@@ -138,10 +138,22 @@ def apply_overlay_dict(overrides: dict) -> dict:
         except Exception:
             snapshot[key] = None
         try:
-            object.__setattr__(_settings, key, _coerce(key, new_val))
+            _coerced = _coerce(key, new_val)
+            _prev = snapshot.get(key)
+            # Make a per-user WHISPER_MODEL override that differs from the
+            # global pin LOUD rather than silent — this is exactly the
+            # "config dump said large-v3-turbo but the run loaded medium"
+            # mismatch, which is only confusing when it happens quietly (Task 4).
+            if key == "WHISPER_MODEL" and _coerced and _coerced != _prev:
+                logger.info(
+                    "settings overlay: WHISPER_MODEL global=%s → per-user=%s "
+                    "(this user's profile pins a different transcription model)",
+                    _prev, _coerced,
+                )
+            object.__setattr__(_settings, key, _coerced)
             # Also expose to subprocesses via env so faster-whisper
             # / ollama subprocesses get the overlay.
-            os.environ[key] = str(_coerce(key, new_val))
+            os.environ[key] = str(_coerced)
         except Exception as e:
             logger.warning("settings overlay: failed to set %s: %s", key, e)
 

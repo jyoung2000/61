@@ -163,6 +163,9 @@ class AudioIntelligence:
         self.available = False
         self.engine = None
         self.model_name = model_name
+        # The model the caller asked for, preserved across any VRAM downgrade
+        # so the pipeline can report requested-vs-effective accurately (Task 4).
+        self.requested_model_name = model_name
         self.device_used = 'unknown'
         # try_load() picks an appropriate batched-inference batch size
         # based on the GPU's total VRAM (4 → batch=4, larger → batch=16).
@@ -181,6 +184,12 @@ class AudioIntelligence:
             log.log_stage('AUDIO',
                 'faster-whisper not installed. Run: pip install faster-whisper')
             return False
+
+        # State the requested model up front so the log makes any later
+        # downgrade unambiguous — and so "what was asked for" vs "what loaded"
+        # can be compared at a glance (Task 4).
+        log.log_stage('AUDIO',
+            f'Whisper model requested: {self.requested_model_name}')
 
         # Check if we already have this model loaded (skip re-download)
         if (AudioIntelligence._cached_engine is not None
@@ -341,6 +350,14 @@ class AudioIntelligence:
                 AudioIntelligence._cached_model_name = self.model_name
                 AudioIntelligence._cached_device = self.device_used
                 log.log_stage('AUDIO', f'Whisper ready: {tier}')
+                # The user's requested model loaded — honor it (Task 4). If we
+                # only fit it by falling to CPU while a GPU was available, say so
+                # explicitly: the model is unchanged, but it'll be slower.
+                if device == 'cpu' and cuda_available:
+                    log.log_stage('AUDIO',
+                        f'NOTE: requested {self.requested_model_name} loaded on CPU '
+                        f'(only {_gpu_free_gb if _gpu_free_gb is not None else 0:.2f} GB VRAM free) '
+                        f'— honoring your model choice; transcription will be slower')
                 return True
             except Exception as e:
                 log.log_stage('AUDIO', f'{tier} FAILED: {type(e).__name__}: {str(e)[:150]}')
@@ -359,10 +376,17 @@ class AudioIntelligence:
                 except Exception:
                     pass
 
-        # Last resort: try 'base' model on CPU
+        # Last resort: try 'base' model on CPU. This is the ONLY path that
+        # actually changes the model the user asked for, so log it as an
+        # explicit, accurate downgrade (Task 4) — never silently report a model
+        # other than what loaded.
         if self.model_name != 'base':
             try:
-                log.log_stage('AUDIO', 'Trying base model on CPU...')
+                _free_txt = (f'{_gpu_free_gb:.2f} GB VRAM free'
+                             if _gpu_free_gb is not None else 'no GPU')
+                log.log_stage('AUDIO',
+                    f'DOWNGRADE: requested {self.requested_model_name} would not '
+                    f'load on any tier ({_free_txt}) → loading base on CPU')
                 self.engine = WhisperModel('base', device='cpu', compute_type='int8')
                 self.available = True
                 self.model_name = 'base'
@@ -370,7 +394,9 @@ class AudioIntelligence:
                 AudioIntelligence._cached_engine = self.engine
                 AudioIntelligence._cached_model_name = 'base'
                 AudioIntelligence._cached_device = self.device_used
-                log.log_stage('AUDIO', 'Whisper ready: CPU int8 base (lowest quality)')
+                log.log_stage('AUDIO',
+                    f'Whisper ready: CPU int8 base (effective model=base, '
+                    f'requested={self.requested_model_name})')
                 return True
             except Exception as e:
                 log.log_stage('AUDIO', f'Base model FAILED: {e}')

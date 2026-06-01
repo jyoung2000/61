@@ -1057,6 +1057,12 @@ class AIOrchestrator:
                 Ignored for non-OpenRouter providers and when the Ollama
                 downgrade override is already active.
         """
+        # Remember if any provider failed specifically due to upstream
+        # rate-limiting (HTTP 429) so the caller (e.g. the subtitle translator)
+        # can stop early + surface a visible ``translation_failed`` rather than
+        # crawling every batch. Without this the rate-limit nature is lost in
+        # the generic AllProvidersFailedError.
+        saw_rate_limit = False
         for provider in self._get_active_chain():
             pname = provider.provider_name
             model_name = provider.text_model_name
@@ -1103,6 +1109,8 @@ class AIOrchestrator:
             except Exception as e:
                 if not skip_circuit_breaker:
                     self._circuit_breaker.record_failure(pname)
+                if isinstance(e, ProviderRateLimitError) or "429" in str(e) or "rate limit" in str(e).lower():
+                    saw_rate_limit = True
                 logger.warning("text_completion via %s model=%s failed: %s — trying next provider", pname, model_name, e)
                 if pname == "ollama" and ("stalled" in str(e).lower() or "overloaded" in str(e).lower()):
                     await self._maybe_downgrade_ollama_model(provider)
@@ -1112,6 +1120,9 @@ class AIOrchestrator:
                 # Restore original model if we overrode it
                 if original_model is not None:
                     provider._editorial_model = original_model
+        if saw_rate_limit:
+            # Preserve the rate-limit nature so callers can fail loudly/early.
+            raise ProviderRateLimitError("All providers rate-limited (HTTP 429) for text completion")
         raise AllProvidersFailedError("All providers failed for text completion")
 
     async def generate_seo(
