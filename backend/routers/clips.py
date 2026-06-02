@@ -1359,8 +1359,9 @@ async def clip_diagnostics(job_id: str):
 @router.post("/jobs/{job_id}/translate-subtitles")
 async def translate_subtitles(job_id: str, req: TranslateRequest):
     """Translate the transcript for a job into a target language."""
-    from backend.services.translator import translate_segments_with_fallback, SUPPORTED_LANGUAGES, TranslationFailedError
+    from backend.services.translator import SUPPORTED_LANGUAGES, TranslationFailedError
     from backend.services.ai_orchestrator import AIOrchestrator
+    from backend.services.pipeline import translate_offline
 
     job = await database.load_job(job_id)
     if not job or not job.transcript:
@@ -1373,10 +1374,14 @@ async def translate_subtitles(job_id: str, req: TranslateRequest):
     segments = [TranscriptSegment(**s) if isinstance(s, dict) else s for s in job.transcript]
 
     try:
-        translated = await translate_segments_with_fallback(
+        # Same offline router the pipeline uses: Whisper-native audio→English for
+        # →en (re-runs ASR on the source video), offline NMT otherwise. Never an
+        # LLM. (Bilingual SRT export stays on NMT — it needs 1:1 cue alignment.)
+        translated, _engine = await translate_offline(
             segments,
-            source_language=req.source_language or job.language or "en",
-            target_language=req.target_language,
+            req.source_language or job.language or "en",
+            req.target_language,
+            video_path=getattr(job, "file_path", None),
             orchestrator=orchestrator,
         )
     except TranslationFailedError as e:
@@ -1395,6 +1400,7 @@ async def translate_subtitles(job_id: str, req: TranslateRequest):
         "status": "ok",
         "target_language": req.target_language,
         "segments": len(translated),
+        "engine": _engine,  # "whisper" (native audio→en) or "nmt"
     }
 
 
