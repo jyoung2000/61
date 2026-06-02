@@ -1,3 +1,34 @@
+# ClipAI — Local audio diarization without a HF token + Whisper-translate reuse
+
+Two local-first quality wins that need no external API and no token.
+
+**Speaker diarization without a HF_TOKEN.** Without a token, pyannote's gated
+model can't load and diarization fell back to a *visual* left/right mouth-motion
+heuristic — useless for off-screen or audio-only voices, and it collapses
+same-side speakers into one. There's now a real LOCAL audio diarizer
+(`local_diarizer.py`): SpeechBrain ECAPA-TDNN speaker embeddings on Whisper's
+speech segments, clustered (scipy, cosine) into who-spoke-when, emitting the
+same `{time_ms: "SPEAKER_xx"}` timeline pyannote does — so speaker fusion and
+the "Speaker N" labelling work unchanged. The ECAPA checkpoint is a PUBLIC
+model (no token) fetched once (~80 MB) into `/data/models`, then fully offline.
+Order is now: pyannote (if a token is set) → **local ECAPA** → visual heuristic.
+It runs on CPU by default to avoid GPU contention during perception. Quality:
+pyannote 3.1 (token) > local ECAPA > visual-only.
+
+**Whisper native →English translate reuses the loaded model (works on 4 GB).**
+Whisper's audio→English translate is the best LOCAL English path but was skipped
+whenever <4 GB VRAM was free, because it would *reload* a second model — so on a
+4 GB card it never ran. The analyze stage now KEEPS the transcription Whisper
+engine loaded when an English translate is pending (instead of releasing it
+early), the translate gate REUSES that resident model (no second load, so the
+4 GB reload gate no longer applies), and the per-pass pre-flight uses a lower
+free-VRAM floor when reusing (1.5 GB vs 3.0) so it can stay on the GPU — with a
+clean OOM→CPU fallback and a defensive, idempotent VRAM release before the VLM
+summary. Net: high-quality local Whisper translation for English targets even on
+small GPUs; non-English targets still use NLLB + the AI post-edit.
+
+---
+
 # ClipAI — Translate to ANY language, completely (no cap, no source-language leftovers)
 
 Subtitle translation must work — and finish — for whatever language the user

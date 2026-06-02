@@ -1174,7 +1174,7 @@ class AudioIntelligence:
         log.log_stage('AUDIO', f'Whisper reloaded on CPU int8 ({self.model_name})')
 
     def whisper_translate(self, video_path: str, source_lang: str = None,
-                          on_progress=None) -> List[dict]:
+                          on_progress=None, reuse_loaded: bool = False) -> List[dict]:
         """Direct audio→English translation via Whisper's native translate task.
 
         For non-English → English, this single-step pass (Whisper run with
@@ -1218,15 +1218,21 @@ class AudioIntelligence:
 
             # Pre-flight VRAM check — mirrors transcribe(). On low-VRAM GPUs,
             # batched translate OOMs just as readily as batched transcribe.
+            # When REUSING an already-loaded model, no reload headroom is needed
+            # (the weights are already resident) — only inference activations —
+            # so allow a lower free-VRAM floor before dropping to the slow CPU
+            # path. This is what lets a 4 GB card translate on the GPU via reuse;
+            # a genuine OOM below still falls back to CPU cleanly.
             if self.device_used.startswith('cuda'):
                 try:
                     import torch as _torch
                     if _torch.cuda.is_available():
                         _free_bytes, _ = _torch.cuda.mem_get_info()
                         _free_gb = _free_bytes / 1_073_741_824
-                        if _free_gb < 3.0:
+                        _floor = 1.5 if reuse_loaded else 3.0
+                        if _free_gb < _floor:
                             log.log_stage('TRANSLATE',
-                                f'Only {_free_gb:.1f} GB VRAM free '
+                                f'Only {_free_gb:.1f} GB VRAM free (< {_floor:.1f}) '
                                 '— using CPU for translation')
                             self._reload_on_cpu()
                 except Exception:

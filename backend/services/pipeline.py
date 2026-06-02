@@ -268,11 +268,15 @@ def _whisper_native_translate_segments(video_path: str, source_lang: str,
     from backend.models import TranscriptSegment
 
     model_name = (getattr(settings, "WHISPER_MODEL", "small") or "small")
+    # Was the engine already loaded? If so, try_load reuses it and the translate
+    # pass needs only inference VRAM (no reload), so it can stay on the GPU at a
+    # lower free-VRAM floor — the whole point of reuse on small cards.
+    _was_cached = getattr(AudioIntelligence, "_cached_engine", None) is not None
     ai = AudioIntelligence(model_name=model_name)
     if not ai.try_load():
         logger.warning("Whisper native translate: engine failed to load (model=%s)", model_name)
         return []
-    raw = ai.whisper_translate(video_path, source_lang=source_lang)
+    raw = ai.whisper_translate(video_path, source_lang=source_lang, reuse_loaded=_was_cached)
     if not raw:
         return []
 
@@ -332,6 +336,18 @@ def _gpu_free_vram_gb() -> float:
     return 0.0
 
 
+def _whisper_engine_cached() -> bool:
+    """True when the reframer's Whisper engine is still loaded (so a Whisper-
+    native translate can REUSE it with no second load). The analyze stage keeps
+    it loaded — instead of releasing it early — exactly when an English translate
+    is pending, so this is the signal that reuse is possible."""
+    try:
+        from backend.services.reframer_audio import AudioIntelligence
+        return getattr(AudioIntelligence, "_cached_engine", None) is not None
+    except Exception:
+        return False
+
+
 async def translate_offline(segments, source_lang, target_lang, *, video_path=None,
                             glossary=None, orchestrator=None, status_callback=None,
                             job_id=None, whisper_timeout=None, nmt_timeout=None):
@@ -367,13 +383,24 @@ async def translate_offline(segments, source_lang, target_lang, *, video_path=No
     # go straight to NMT — never eat the CPU path.
     _WHISPER_MIN_FREE_GB = float(getattr(settings, "WHISPER_TRANSLATE_MIN_FREE_GB", 4.0))
     _free_gb = _gpu_free_vram_gb() if _want_whisper else 0.0
-    use_whisper = _want_whisper and _free_gb >= _WHISPER_MIN_FREE_GB
+    # Reuse: when the transcription Whisper model is STILL loaded (the analyze
+    # stage deferred its VRAM release for exactly this), the translate pass
+    # reuses it with NO second load — so the reload gate doesn't apply. This is
+    # what makes Whisper-native →English usable on small (4 GB) cards. The
+    # per-pass pre-flight in whisper_translate still picks GPU vs CPU from the
+    # free VRAM at that moment, and an OOM there falls back cleanly.
+    _engine_cached = _whisper_engine_cached() if _want_whisper else False
+    use_whisper = _want_whisper and (_engine_cached or _free_gb >= _WHISPER_MIN_FREE_GB)
     if _want_whisper and not use_whisper:
         logger.info(
-            "Whisper-native translate skipped (%.1f GB GPU free < %.1f GB needed to "
-            "run on GPU) — using offline NMT instead (avoids the slow CPU pass).",
+            "Whisper-native translate skipped (%.1f GB GPU free < %.1f GB to reload "
+            "on GPU, and no cached engine to reuse) — using offline NMT instead.",
             _free_gb, _WHISPER_MIN_FREE_GB,
         )
+    elif _want_whisper and _engine_cached and _free_gb < _WHISPER_MIN_FREE_GB:
+        logger.info(
+            "Whisper-native translate: REUSING the already-loaded model "
+            "(%.1f GB free, no second load).", _free_gb)
     if use_whisper:
         if status_callback:
             try:
@@ -2863,9 +2890,29 @@ async def _run_analysis_inner(job_id: str):
         job_id, JobStatus.ANALYZING_SCENES, 57,
         "Running speaker diarization + audio correlation...",
     )
-    # Whisper ran inside the Perceiver — free its VRAM before the VLM stage.
-    await _release_whisper_vram(job_id)
-    _log_gpu_memory(job_id, "post-whisper-release")
+    # Whisper ran inside the Perceiver. Normally free its VRAM now (before the
+    # VLM/summary stage). EXCEPTION: when this job will do a Whisper-native
+    # audio→English translate, KEEP the engine loaded so that pass REUSES it
+    # (no second load) — the translate step frees the VRAM afterwards, and a
+    # defensive release runs right before the summary regardless of path.
+    _det_lang_pp = (getattr(perception, "detected_language", "") or "").strip().lower()
+    _pp_tgt = (job.subtitle_language or "").strip().lower()
+    _pp_src = (job.language or "").strip().lower() or _det_lang_pp
+    if not _pp_tgt and _pp_src and _pp_src not in ("en", "english"):
+        _pp_tgt = "en"  # auto-translate non-English → English
+    _keep_whisper_for_translate = (
+        bool(getattr(settings, "WHISPER_TRANSLATE_TO_EN", True))
+        and _pp_tgt == "en"
+        and _pp_src not in ("en", "english", "")
+        and bool(getattr(perception, "transcript_segments", None))
+    )
+    if _keep_whisper_for_translate:
+        logger.info(
+            "[%s] Keeping Whisper engine loaded for native audio→English translate "
+            "(reuse — no second load on small GPUs)", job_id)
+    else:
+        await _release_whisper_vram(job_id)
+        _log_gpu_memory(job_id, "post-whisper-release")
 
     _n_face_samples = sum(1 for v in (perception.face_timeline or {}).values() if v)
     logger.info(
@@ -3415,6 +3462,10 @@ async def _run_analysis_inner(job_id: str):
                 "planned translation produced no target-language output")
 
     # ── VLM summary (kept ai_orchestrator) — runs AFTER translation now ──
+    # Defensive, idempotent: free the Whisper engine before the VLM stage in
+    # case we deferred its release above to let a Whisper-native translate reuse
+    # it. No-ops when it was already released (the normal, non-reuse path).
+    await _release_whisper_vram(job_id)
     cancel_check()
     await _update_progress(
         job_id, JobStatus.GENERATING_SUMMARY, 70, "Generating video summary...",

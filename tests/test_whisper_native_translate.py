@@ -65,7 +65,7 @@ class _FakeAI:
     def try_load(self):
         return _FakeAI._loads
 
-    def whisper_translate(self, video_path, source_lang=None):
+    def whisper_translate(self, video_path, source_lang=None, reuse_loaded=False):
         _FakeAI.last_args = (video_path, source_lang)
         return list(_FakeAI._segments)
 
@@ -282,3 +282,37 @@ def test_pipeline_skips_whisper_native_on_low_vram_and_uses_nmt(monkeypatch):
     assert whisper_calls["n"] == 0   # the slow CPU pass was never attempted
     assert nmt_calls["n"] == 1       # offline NMT did the work
     assert result["target_transcript"][0]["text"].startswith("NMT ")
+
+
+def test_pipeline_reuses_loaded_whisper_on_low_vram(monkeypatch):
+    """When the transcription Whisper model is STILL loaded (the analyze stage
+    deferred its release), Whisper-native translate REUSES it even on a low-VRAM
+    card — no second load — instead of skipping to NMT."""
+    db = _FakeDB({"subtitle_language": "en", "language": "ja", "clips": [], "summary": None})
+    _install_pipeline(monkeypatch, db)
+    monkeypatch.setattr(pipeline, "_gpu_free_vram_gb", lambda: 2.6)   # below the reload gate
+    monkeypatch.setattr(pipeline, "_whisper_engine_cached", lambda: True)  # but cached → reuse
+
+    whisper_calls = {"n": 0}
+    def _wn(*a, **k):
+        whisper_calls["n"] += 1
+        return [TranscriptSegment(text="WN", start=0.0, end=1.0, speaker="Speaker 1")]
+    monkeypatch.setattr(pipeline, "_whisper_native_translate_segments", _wn)
+
+    nmt_calls = {"n": 0}
+    async def _nmt(segs, **k):
+        nmt_calls["n"] += 1
+        return [TranscriptSegment(text="NMT " + s.text, start=s.start, end=s.end,
+                                  speaker=s.speaker) for s in segs]
+    monkeypatch.setattr(translator, "translate_segments_with_fallback", _nmt)
+
+    job = SimpleNamespace(subtitle_language="en", language="ja", clips=[],
+                          summary=None, file_path="/v.mp4")
+    transcript = [_src("こんにちは", 0.0, 1.0), _src("世界", 1.0, 2.0)]
+
+    result = _run(pipeline._background_post_processing(
+        "jobReuse", transcript, _fake_orchestrator(), job, polished_already=False))
+
+    assert result["translated"] is True
+    assert whisper_calls["n"] == 1   # reused the loaded model instead of skipping
+    assert nmt_calls["n"] == 0

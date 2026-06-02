@@ -41,6 +41,12 @@ pyannote.audio>=3.1.0,<4.0
 # (==2.5.1 matches the local "+cu121" build identifier.)
 torch==2.5.1
 torchaudio==2.5.1
+# Local, no-HF-token speaker diarization: SpeechBrain ECAPA embeddings +
+# clustering on Whisper's speech segments (the fallback used when pyannote's
+# gated model can't load without HF_TOKEN). The ECAPA model (~80 MB) is a PUBLIC
+# checkpoint fetched on demand into /data/models — never at startup. Compatible
+# with the pinned torch 2.5.1; clustering uses scipy (already a dep).
+speechbrain>=1.0.0
 # ArcFace (InsightFace buffalo_s) for identity embeddings.
 # CPU-only via onnxruntime — must not compete with Whisper/Ollama on the GPU.
 # Enabled via CLIPAI_FACE_EMBEDDING=arcface (default: sface).

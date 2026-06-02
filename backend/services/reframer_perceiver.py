@@ -614,9 +614,32 @@ class Perceiver:
             if r.speaker_timeline:
                 self._link_tracks_to_speakers(r)
 
-        # ── Spatial pseudo-diarization (fallback when pyannote unavailable) ──
-        # If real diarization didn't produce results, cluster tracks by spatial
-        # position to build a pseudo track_speaker_map for speaker lock
+        # ── Local audio-embedding diarization (no HF token) ──
+        # When pyannote can't load (no HF_TOKEN), do REAL audio diarization with
+        # a local SpeechBrain ECAPA model on Whisper's speech segments — before
+        # falling back to the visual-only heuristic. Works for off-screen /
+        # audio-only voices too. Guarded: if speechbrain isn't installed it
+        # no-ops and the visual fallback below still runs.
+        if not r.speaker_timeline:
+            try:
+                from backend.services.local_diarizer import LocalEmbeddingDiarizer
+                _local = LocalEmbeddingDiarizer()
+                if _local.is_available():
+                    r.speaker_timeline = _local.diarize(
+                        self.path, r.transcript_segments, r.duration_ms)
+                    if r.speaker_timeline:
+                        get_logger().log_stage(
+                            'PERCEIVE',
+                            'Speaker diarization: local SpeechBrain ECAPA '
+                            '(audio-based, no HF token)')
+                        self._link_tracks_to_speakers(r)
+            except Exception as _lde:
+                get_logger().log_stage(
+                    'PERCEIVE', f'Local diarizer skipped: {str(_lde)[:120]}')
+
+        # ── Spatial pseudo-diarization (fallback when audio diarization unavailable) ──
+        # If neither pyannote nor the local audio diarizer produced results,
+        # cluster tracks by spatial position to build a pseudo track_speaker_map.
         if not r.track_speaker_map:
             self._build_spatial_speakers(r)
 

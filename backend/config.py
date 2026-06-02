@@ -377,6 +377,14 @@ class Settings(BaseSettings):
     DIARIZATION_MAX_SPEAKERS: int = 0  # 0 = unlimited (pyannote auto-detects)
     HF_AUTH_TOKEN: str = ""  # HuggingFace token for pyannote model access
 
+    # Local audio diarization (SpeechBrain ECAPA) — the no-HF-token fallback used
+    # when pyannote can't load. Real audio diarization (not just the visual
+    # left/right heuristic), fully offline after a one-time ~80 MB model fetch.
+    LOCAL_DIARIZATION_ENABLED: bool = True
+    LOCAL_DIARIZER_MODEL: str = "speechbrain/spkrec-ecapa-voxceleb"
+    LOCAL_DIARIZER_DEVICE: str = "cpu"   # tiny model; CPU avoids GPU contention
+    LOCAL_DIARIZER_THRESHOLD: float = 0.55  # cosine distance for speaker split
+
     # Camera solver (per-shot AutoFlip-style crop planning)
     CLIPAI_CAMERA_SOLVER: str = "on"  # "on" | "off" — env CLIPAI_CAMERA_SOLVER
 
