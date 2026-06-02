@@ -1,23 +1,11 @@
 import React, { useRef, useEffect, useMemo } from 'react';
-import { interpolateSubjectX } from '../utils/subjectTracking';
+import { getCropXForTime } from '../utils/subjectTracking';
 import useTimelineStore from '../stores/timelineStore';
 
-// Look up the active crop X (0–100%) at a given clip-relative time.
-// Mirrors the legacy ClipPreview / VideoEditor rAF helper so the
-// canvas overlay tracks the same user edits the export uses.
-export function getCropXForTime(relTime, cropSegments, subjectKeyframes) {
-  if (Array.isArray(cropSegments) && cropSegments.length > 0) {
-    const seg = cropSegments.find((s) => relTime >= s.startTime && relTime < s.endTime);
-    if (seg && Number.isFinite(seg.cropX)) return seg.cropX;
-    const last = cropSegments[cropSegments.length - 1];
-    if (last && relTime >= last.endTime && Number.isFinite(last.cropX)) return last.cropX;
-  }
-  try {
-    const v = interpolateSubjectX(subjectKeyframes, relTime);
-    if (typeof v === 'number' && !Number.isNaN(v)) return v;
-  } catch (_) { /* fall through */ }
-  return 50;
-}
+// getCropXForTime now lives in utils/subjectTracking as the single source
+// of truth shared by every preview surface (this canvas overlay, the
+// VideoEditor / ClipPreview rAF loops, and ReframeStatsPanel) so they can
+// never drift apart again.
 
 // Binary search: index of the first key >= target (lower_bound).
 function lowerBound(sortedKeys, target) {

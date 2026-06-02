@@ -1,6 +1,7 @@
 import React, { useRef, useEffect, useMemo } from 'react';
 import useTimelineStore from '../stores/timelineStore';
-import { findNearestKey, getCropXForTime } from './ReframePreview';
+import { findNearestKey } from './ReframePreview';
+import { getCropXForTime } from '../utils/subjectTracking';
 
 const STATS_UPDATE_HZ = 12;        // ~12 stat refreshes per second
 const SCENE_CUT_WARN_MS = 500;     // flag scene cuts within 500ms

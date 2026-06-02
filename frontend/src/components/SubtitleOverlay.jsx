@@ -275,7 +275,18 @@ export default function SubtitleOverlay({
     return subTrack ? subTrack.visible !== false : true;
   }, [tracks]);
 
-  // Per-segment subtitle override: segment's subtitlesEnabled takes precedence
+  // Per-segment subtitle override: segment's subtitlesEnabled takes precedence.
+  //
+  // COORDINATE BASE — deliberate split (keep in sync):
+  //   • This gate compares ABSOLUTE `currentTime` against editor `segments`,
+  //     whose `.start`/`.end` are absolute (full-video) seconds.
+  //   • The active-line finder below compares CLIP-RELATIVE
+  //     `relTime = currentTime - clipStart` against `clipSegments`, whose
+  //     timings are clip-relative.
+  // Each is internally correct, but they intentionally use different bases.
+  // If either collection's base ever changes, both call sites must change
+  // together — this is the one spot a clip-vs-absolute mix-up would surface
+  // (only when clipStart > 0).
   const perSegmentEnabled = useMemo(() => {
     if (!segments || segments.length === 0) return true; // no segments = always on
     const absTime = currentTime;

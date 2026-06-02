@@ -109,6 +109,53 @@ function pushFocusHistory(current, query) {
   return [q, ...existing].slice(0, 10);
 }
 
+/**
+ * Build the `subject_keyframes` payload for a crop/reframe export.
+ *
+ * The dense, correctly-timed `editorSubjectKeyframes` are the source of
+ * truth for camera motion — the backend smoothstep-interpolates between
+ * them, so shipping them reproduces exactly what the preview shows.
+ * Crop SEGMENTS are an editing overlay; sending one keyframe per segment
+ * boundary (the old behavior) froze the crop at a mid-transition value and
+ * decorrelated the render from the real subject motion.
+ *
+ * So: ship the smooth track, and only where the user MANUALLY pinned a
+ * segment do we flat-hold that window (two keyframes at the segment's
+ * value bracketing its span). Segments are used as the sole source only as
+ * a last resort, when the dense track is unavailable.
+ *
+ * @returns {Array<{time:number,x:number}>|null}
+ */
+function buildExportSubjectKeyframes(editorSubjectKeyframes, cropSegments) {
+  const overrides = (cropSegments || []).filter(
+    (s) => s.isManualOverride && Number.isFinite(s.cropX),
+  );
+  const hasTrack = editorSubjectKeyframes?.length > 0;
+
+  if (hasTrack && overrides.length === 0) {
+    // Pure auto-reframe: ship the smooth, correctly-timed track.
+    return editorSubjectKeyframes.map((kf) => ({ time: +kf.t.toFixed(3), x: kf.x }));
+  }
+  if (hasTrack) {
+    // Merge: smooth track everywhere except inside pinned windows, which
+    // are flat-held at the user's value.
+    const kfs = editorSubjectKeyframes
+      .filter((kf) => !overrides.some((o) => kf.t >= o.startTime && kf.t < o.endTime))
+      .map((kf) => ({ time: +kf.t.toFixed(3), x: kf.x }));
+    for (const o of overrides) {
+      kfs.push({ time: +o.startTime.toFixed(3), x: o.cropX });
+      kfs.push({ time: +Math.max(o.startTime, o.endTime - 0.001).toFixed(3), x: o.cropX });
+    }
+    kfs.sort((a, b) => a.time - b.time);
+    return kfs;
+  }
+  if (cropSegments?.length > 0) {
+    // Fallback only when the dense track is unavailable (cache-restore edge).
+    return cropSegments.map((seg) => ({ time: +seg.startTime.toFixed(3), x: seg.cropX }));
+  }
+  return null;
+}
+
 const TABS = ['Summary', 'Key Scenes', 'Transcript', 'Viral Clips'];
 
 // sanitizeJob imported from ../utils/sanitizeJob
@@ -1308,21 +1355,13 @@ export default function Analysis() {
       timelineItems_types: [...new Set(timelineItems.map(it => it.type))],
     }));
 
-    // Include subject tracking keyframes for export parity.
-    // Prefer crop segments from timeline (may have user edits) over raw keyframes.
+    // Include subject tracking keyframes for export parity. Ship the smooth
+    // dense track and layer any manual segment overrides on top (see
+    // buildExportSubjectKeyframes) so the render matches the preview.
     if (exportBody.aspect_ratio) {
       const { cropSegments } = useTimelineStore.getState();
-      if (cropSegments?.length > 0) {
-        exportBody.subject_keyframes = cropSegments.map(seg => ({
-          time: +seg.startTime.toFixed(3),
-          x: seg.cropX,
-        }));
-      } else if (editorSubjectKeyframes?.length > 0) {
-        exportBody.subject_keyframes = editorSubjectKeyframes.map(kf => ({
-          time: +kf.t.toFixed(3),
-          x: kf.x,
-        }));
-      }
+      const kfs = buildExportSubjectKeyframes(editorSubjectKeyframes, cropSegments);
+      if (kfs) exportBody.subject_keyframes = kfs;
     }
 
     encoding.startExport(jobId, clip.id, clip.title || `Clip ${clip.id}`, exportBody);
@@ -1404,20 +1443,12 @@ export default function Analysis() {
       body.edited_subtitle_segments = fvSubtitleItems;
     }
 
-    // Include subject tracking keyframes — prefer crop segments (may have user edits)
+    // Include subject tracking keyframes — ship the smooth dense track with
+    // any manual segment overrides layered on top (see buildExportSubjectKeyframes).
     if (body.aspect_ratio) {
       const { cropSegments } = useTimelineStore.getState();
-      if (cropSegments?.length > 0) {
-        body.subject_keyframes = cropSegments.map(seg => ({
-          time: +seg.startTime.toFixed(3),
-          x: seg.cropX,
-        }));
-      } else if (editorSubjectKeyframes?.length > 0) {
-        body.subject_keyframes = editorSubjectKeyframes.map(kf => ({
-          time: +kf.t.toFixed(3),
-          x: kf.x,
-        }));
-      }
+      const kfs = buildExportSubjectKeyframes(editorSubjectKeyframes, cropSegments);
+      if (kfs) body.subject_keyframes = kfs;
     }
 
     encoding.startExport(jobId, 0, job.filename || 'Full Video', body, {

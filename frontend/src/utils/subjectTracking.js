@@ -1450,6 +1450,53 @@ export function interpolateSubjectX(keyframes, t) {
 }
 
 /**
+ * Resolve the active crop X (0–100%) at a clip-relative time.
+ *
+ * This is the single source of truth shared by every preview surface
+ * (ReframePreview canvas, VideoEditor / ClipPreview objectPosition rAF
+ * loops, ReframeStatsPanel) so they can never drift apart.
+ *
+ * The dense, correctly-timed `subjectKeyframes` are authoritative for
+ * camera motion. `cropSegments` are an *editing overlay*: they quantize
+ * that motion into one static value per cluster, sampled at the instant
+ * the cluster changed — i.e. mid-transition. Letting them drive the crop
+ * window froze it at a transitional value across entire holds and made it
+ * step/jitter on noisy tracks. So a segment's static value wins ONLY when
+ * the user has explicitly pinned it (`isManualOverride`); otherwise we
+ * ride the smooth track.
+ *
+ * @param {number} relTime - Clip-relative time in seconds
+ * @param {Array<{startTime:number,endTime:number,cropX:number,isManualOverride?:boolean}>} cropSegments
+ * @param {Array<{t:number,x:number,snap?:boolean}>} subjectKeyframes - dense smooth track
+ * @returns {number} crop X in [0,100]
+ */
+export function getCropXForTime(relTime, cropSegments, subjectKeyframes) {
+  // Helper: the segment covering relTime (or the last one, past the end).
+  const segmentAt = () => {
+    if (!Array.isArray(cropSegments) || cropSegments.length === 0) return null;
+    const hit = cropSegments.find((s) => relTime >= s.startTime && relTime < s.endTime);
+    if (hit) return hit;
+    const last = cropSegments[cropSegments.length - 1];
+    return last && relTime >= last.endTime ? last : null;
+  };
+
+  // 1. A manually-pinned segment overrides the smooth track in its window.
+  const seg = segmentAt();
+  if (seg && seg.isManualOverride && Number.isFinite(seg.cropX)) return seg.cropX;
+
+  // 2. Default: ride the smooth, correctly-timed subject track.
+  try {
+    const v = interpolateSubjectX(subjectKeyframes, relTime);
+    if (typeof v === 'number' && !Number.isNaN(v)) return v;
+  } catch (_) { /* fall through to segment fallback */ }
+
+  // 3. Last resort — only when the dense track is missing (e.g. a
+  //    cache-restore edge case): use whatever value the segment carries.
+  if (seg && Number.isFinite(seg.cropX)) return seg.cropX;
+  return 50;
+}
+
+/**
  * Build preview keyframes directly from the backend's dense subject
  * track (``JobResult.subject_track``). The track is already at ~2 Hz
  * with the face → saliency → object → scene fallback cascade applied
@@ -1832,10 +1879,19 @@ export function keyframesToCropSegments(keyframes, duration, clusters, sceneCuts
   // Build segments by cluster assignment, not exact position.
   // This prevents the LP solver's smooth ease curves from creating
   // dozens of micro-segments during transitions.  A segment break
-  // occurs only when the keyframe's cluster changes (i.e., the camera
-  // has arrived at a different speaker position) OR a scene cut lands
-  // inside the running segment — giving the user a natural handle to
-  // tweak the crop separately on each side of a shot boundary.
+  // occurs only when the keyframe's cluster changes *and that change
+  // persists* (debounced below), i.e. the camera has settled on a
+  // different speaker position, OR a scene cut lands inside the running
+  // segment — giving the user a natural handle to tweak the crop
+  // separately on each side of a shot boundary.
+  //
+  // NOTE: segments are an editing OVERLAY, not the motion source. The
+  // preview and export ride the dense `subjectKeyframes` (see
+  // getCropXForTime); a segment's static cropX only drives the crop
+  // window when the user manually pins it. So each segment's value is set
+  // to its settled cluster CENTER (not the transitional sample at the
+  // break instant), which keeps the timeline labels honest and gives a
+  // manual override a correct starting point.
   const sortedCuts = Array.isArray(sceneCuts)
     ? [...sceneCuts]
         .map((c) => Number(c))
@@ -1848,6 +1904,15 @@ export function keyframesToCropSegments(keyframes, duration, clusters, sceneCuts
   let segStart = keyframes[0].t;
   let segX = keyframes[0].x;
   let segCluster = clusterLookup(segX);
+
+  // Debounce thresholds: a differing cluster must persist this long before
+  // it opens a new segment, so single-keyframe blips on a noisy track don't
+  // churn into sub-second flip-flop segments.
+  const MIN_CLUSTER_HOLD_KF = 2;     // keyframes
+  const MIN_CLUSTER_HOLD_SEC = 0.4;  // wall-clock seconds
+  let pendingCluster = -1;           // candidate cluster awaiting confirmation
+  let pendingCount = 0;              // consecutive keyframes seen in the candidate
+  let pendingStartT = 0;            // time the candidate first appeared
 
   for (let i = 1; i < keyframes.length; i++) {
     const kf = keyframes[i];
@@ -1869,13 +1934,34 @@ export function keyframesToCropSegments(keyframes, duration, clusters, sceneCuts
       nextCutIdx++;
     }
 
-    // Break on cluster change — smooth transitions between clusters
-    // are absorbed into the preceding segment (the camera is "in transit")
-    if (kfCluster !== segCluster && kfCluster !== -1) {
-      segments.push({ startTime: segStart, endTime: kf.t, cropX: segX });
-      segStart = kf.t;
-      segX = kf.x;
-      segCluster = kfCluster;
+    // Break on a *confirmed* cluster change. Smooth transitions between
+    // clusters are absorbed into the preceding segment (the camera is "in
+    // transit"), and a differing cluster must persist (>= MIN_CLUSTER_HOLD_KF
+    // keyframes AND >= MIN_CLUSTER_HOLD_SEC) before it opens a new segment.
+    // This debounce keeps a wobbly track near a cluster boundary from
+    // churning into many short flip-flop segments. (Scene cuts above are
+    // never debounced — they stay hard, intentional boundaries.)
+    if (kfCluster === segCluster || kfCluster === -1) {
+      // Back on the running cluster (or unclassifiable) — drop any candidate.
+      pendingCluster = -1;
+      pendingCount = 0;
+    } else {
+      if (kfCluster === pendingCluster) {
+        pendingCount += 1;
+      } else {
+        pendingCluster = kfCluster;
+        pendingCount = 1;
+        pendingStartT = kf.t;
+      }
+      if (pendingCount >= MIN_CLUSTER_HOLD_KF
+          && (kf.t - pendingStartT) >= MIN_CLUSTER_HOLD_SEC) {
+        segments.push({ startTime: segStart, endTime: kf.t, cropX: segX });
+        segStart = kf.t;
+        segX = kf.x;
+        segCluster = kfCluster;
+        pendingCluster = -1;
+        pendingCount = 0;
+      }
     }
   }
   // Drain remaining scene cuts before the clip ends.
@@ -1903,17 +1989,21 @@ export function keyframesToCropSegments(keyframes, duration, clusters, sceneCuts
   // Annotate with IDs, cluster info, and labels. Each segment gets a
   // unique id even when two adjacent ones share a cluster so the user
   // can still select and edit them independently in the timeline.
+  // Use the settled cluster CENTER as the segment value (falling back to
+  // the raw sample only when no cluster is within range), so a hold reads
+  // as the speaker's true position instead of a mid-transition value.
   return filtered.map((seg, i) => {
     const cId = clusterLookup(seg.cropX);
+    const settledX = (cId >= 0 && clusters?.[cId]) ? clusters[cId].center : seg.cropX;
     return {
       id: `crop-${i}`,
       startTime: seg.startTime,
       endTime: seg.endTime,
-      cropX: seg.cropX,
-      originalCropX: seg.cropX,
+      cropX: settledX,
+      originalCropX: settledX,
       clusterId: cId,
       isManualOverride: false,
-      label: `${Math.round(seg.cropX)}%`,
+      label: `${Math.round(settledX)}%`,
     };
   });
 }

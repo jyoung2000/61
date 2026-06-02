@@ -1,5 +1,5 @@
 import React, { useRef, useState, useEffect, useMemo, useCallback } from 'react';
-import { processKeyframes, interpolateSubjectX, isDynamic, safeSubjectX, subjectXToCenterPct, computeLayoutAtTime, computeFaceYCenter, faceYToCenterPct } from '../utils/subjectTracking';
+import { processKeyframes, getCropXForTime, isDynamic, safeSubjectX, subjectXToCenterPct, computeLayoutAtTime, computeFaceYCenter, faceYToCenterPct } from '../utils/subjectTracking';
 import ReframeDebugOverlay from './ReframeDebugOverlay';
 import useTimelineStore from '../stores/timelineStore';
 import { outlineTextShadow } from '../utils/textOutline';
@@ -720,18 +720,14 @@ export default function ClipPreview({
       (isReframeSegmentMode ? ' [reframe-segment mode]' : '')
     );
 
-    // Look up cropX from editable crop segments (user may have adjusted).
-    // Falls back to interpolateSubjectX from the original keyframes.
-    const getCropXAtTime = (relTime) => {
-      const { cropSegments } = useTimelineStore.getState();
-      if (cropSegments?.length > 0) {
-        const seg = cropSegments.find(s => relTime >= s.startTime && relTime < s.endTime);
-        if (seg) return seg.cropX;
-        const last = cropSegments[cropSegments.length - 1];
-        if (relTime >= last.endTime) return last.cropX;
-      }
-      return interpolateSubjectX(subjectKeyframes, relTime);
-    };
+    // Look up the active cropX via the shared resolver: ride the smooth
+    // subject track, honoring a crop segment's static value only when the
+    // user has manually pinned it (see getCropXForTime). Reframe-segment
+    // mode (easeMs keyframes) is unaffected — interpolateSubjectX inside
+    // the resolver still holds-then-snaps on `snap` keyframes, and the
+    // JS easeState below smooths those steps exactly as before.
+    const getCropXAtTime = (relTime) =>
+      getCropXForTime(relTime, useTimelineStore.getState().cropSegments, subjectKeyframes);
 
     // ── Reframe-segment easing state ──
     // Instead of CSS transitions (which fight with rAF writes), we implement

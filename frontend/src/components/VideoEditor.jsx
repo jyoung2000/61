@@ -1,5 +1,5 @@
 import React, { useRef, useState, useEffect, useMemo, useCallback } from 'react';
-import { processKeyframes, interpolateSubjectX, isDynamic, safeSubjectX, subjectXToCenterPct, detectPositionClusters, buildSubjectKeyframes, keyframesToCropSegments, keyframesToCropSegmentsWithSlots, extractSlotTimelineFromRenderPlan, buildKeyframesFromSubjectTrack } from '../utils/subjectTracking';
+import { processKeyframes, interpolateSubjectX, isDynamic, safeSubjectX, subjectXToCenterPct, detectPositionClusters, buildSubjectKeyframes, keyframesToCropSegments, keyframesToCropSegmentsWithSlots, extractSlotTimelineFromRenderPlan, buildKeyframesFromSubjectTrack, getCropXForTime } from '../utils/subjectTracking';
 import useTimelineStore from '../stores/timelineStore';
 import useResponsive from '../hooks/useResponsive';
 import useTimelinePersistence from '../hooks/useTimelinePersistence';
@@ -1802,19 +1802,11 @@ export default function VideoEditor({
     const video = videoRef.current;
     if (!video) return;
 
-    // Helper: look up cropX from editable crop segments at a given relative time.
-    // Falls back to interpolateSubjectX from the original keyframes.
-    const getCropXAtTime = (relTime) => {
-      const { cropSegments } = useTimelineStore.getState();
-      if (cropSegments?.length > 0) {
-        const seg = cropSegments.find(s => relTime >= s.startTime && relTime < s.endTime);
-        if (seg) return seg.cropX;
-        // Past end — use last segment
-        const last = cropSegments[cropSegments.length - 1];
-        if (relTime >= last.endTime) return last.cropX;
-      }
-      return interpolateSubjectX(subjectKeyframes, relTime);
-    };
+    // Look up the active cropX via the shared resolver: ride the smooth
+    // subject track, honoring a crop segment's static value only when the
+    // user has manually pinned it (see getCropXForTime).
+    const getCropXAtTime = (relTime) =>
+      getCropXForTime(relTime, useTimelineStore.getState().cropSegments, subjectKeyframes);
 
     // Detect reframe-segment mode (keyframes carry easeMs metadata)
     const isReframeMode = subjectKeyframes?.some(k => k.easeMs !== undefined);
