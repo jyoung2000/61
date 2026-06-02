@@ -16,6 +16,12 @@ RUN npm run build
 FROM nvidia/cuda:12.3.2-cudnn9-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
+# Make pip tolerant of slow/large wheel downloads. The CUDA torch stack pulls
+# multi-hundred-MB nvidia-*-cu12 wheels (e.g. nvidia-cudnn-cu12 ~665 MB); the
+# 15 s default socket timeout turns a slow CDN read into a hard build failure.
+# Applies to every pip call in this image.
+ENV PIP_DEFAULT_TIMEOUT=300 \
+    PIP_RETRIES=10
 ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
 # Ensure CUDA libraries are on the library path for ctranslate2/faster-whisper

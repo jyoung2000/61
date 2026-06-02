@@ -9,6 +9,12 @@ RUN npm run build
 ## Stage 2: Runtime
 FROM python:3.11-slim
 
+# Make pip tolerant of slow/large wheel downloads (torch + nvidia-*-cu12 wheels
+# can be hundreds of MB; the 15 s default socket timeout turns a slow CDN read
+# into a hard build failure). Applies to every pip call in this image.
+ENV PIP_DEFAULT_TIMEOUT=300 \
+    PIP_RETRIES=10
+
 # Make NVIDIA GPUs visible when passed through with --gpus
 ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
@@ -67,14 +73,26 @@ WORKDIR /app
 
 # Install Python dependencies
 COPY backend/requirements.txt .
-RUN pip install --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
 
-# Install pyannote.audio for neural speaker diarization (CPU torch for non-GPU builds)
-RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu && \
-    pip install --no-cache-dir pyannote.audio>=3.1.0 && \
-    # MediaPipe runtime deps (installed separately to avoid protobuf conflict)
-    pip install --no-cache-dir \
+# Install CPU-only torch + torchaudio FIRST, pinned to the requirements.txt
+# version, so the subsequent `-r requirements.txt` treats torch==2.5.1 as
+# already satisfied and does NOT pull the multi-GB CUDA (nvidia-*-cu12) wheel
+# stack from PyPI as a torch dependency. Those wheels are useless in the CPU
+# image, and the ~665 MB nvidia-cudnn-cu12 download was both wasteful and a
+# frequent build-failure point. (Mirrors the GPU Dockerfile, which likewise
+# installs torch before requirements; the requirements.txt torch pin exists
+# precisely so the pre-installed wheel is treated as satisfied.)
+RUN pip install --upgrade pip && \
+    pip install --no-cache-dir torch==2.5.1 torchaudio==2.5.1 \
+        --index-url https://download.pytorch.org/whl/cpu
+
+# Remaining Python deps. requirements.txt pins torch==2.5.1 / torchaudio==2.5.1
+# and pyannote.audio<4, so torch stays the CPU wheel installed above (pip does
+# not swap in CUDA torch) and pyannote is installed here — no separate pass.
+RUN pip install --no-cache-dir -r requirements.txt
+
+# MediaPipe (installed separately to avoid the protobuf<4 conflict with torch).
+RUN pip install --no-cache-dir \
         flatbuffers>=23.1.4 \
         attrs>=23.1.0 \
         sounddevice>=0.4.6 \
