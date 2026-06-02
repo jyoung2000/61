@@ -1051,6 +1051,7 @@ async def _polish_transcript_loop(
     transcript: list,
     orchestrator,
     correction_lang: str,
+    mode: str = "asr",
 ) -> tuple[list, Optional[dict]]:
     """Run the LLM polish + readability loop on a transcript.
 
@@ -1060,6 +1061,10 @@ async def _polish_transcript_loop(
     ``_run_analysis_inner`` (so the readability splitter sees punctuated
     Japanese / Chinese text) and asynchronously from
     ``_background_post_processing`` if a critical-path run is skipped.
+
+    ``mode='translation'`` polishes ALREADY-translated subtitles for
+    readability only (preserve meaning + timing, never re-translate); the
+    default ``mode='asr'`` is the Whisper-accuracy correction profile.
     """
     from backend.models import TranscriptSegment as _TS
 
@@ -1114,6 +1119,7 @@ async def _polish_transcript_loop(
                     orchestrator,
                     job_id=job_id,
                     language=correction_lang,
+                    mode=mode,
                 ),
                 timeout=_correction_timeout,
             )
@@ -1559,13 +1565,17 @@ async def _background_post_processing(
                     "translation produced 0 changed segments — keeping source transcript")
 
             # ── (b) LLM polish on the TRANSLATED text (correction_lang=target) ──
-            logger.info("[%s] Polish START on translated text (lang=%s, %d segments)",
+            # Readability-only mode: the OpenRouter editorial model polishes the
+            # already-translated lines for readability WITHOUT re-translating or
+            # altering meaning/timing (offline NMT did the translation).
+            logger.info("[%s] Polish START on translated text (lang=%s, %d segments, readability-only)",
                         job_id, target_lang, len(translated))
             try:
                 _pol_models, _pol_report = await _polish_transcript_loop(
                     job_id,
                     [t.model_dump() if hasattr(t, "model_dump") else dict(t) for t in translated],
                     orchestrator, target_lang,
+                    mode="translation",
                 )
                 if _pol_models:
                     translated = _pol_models

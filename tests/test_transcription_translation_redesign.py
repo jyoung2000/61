@@ -28,8 +28,14 @@ _TMP = Path(tempfile.mkdtemp(prefix="clipai_redesign_test_"))
 os.environ["HOME"] = str(_TMP)
 
 # ── stubs so the target modules import without GPU/provider deps ──
+import importlib.machinery  # noqa: E402
 for _name in ("cv2", "numpy"):
-    sys.modules.setdefault(_name, types.ModuleType(_name))
+    if _name not in sys.modules:
+        _stub = types.ModuleType(_name)
+        # A valid __spec__ so importlib.util.find_spec(_name) (used by some
+        # libraries' availability probes) doesn't raise on the bare stub.
+        _stub.__spec__ = importlib.machinery.ModuleSpec(_name, loader=None)
+        sys.modules[_name] = _stub
 
 if "backend.services.ai_orchestrator" not in sys.modules:
     _orch_mod = types.ModuleType("backend.services.ai_orchestrator")
@@ -430,6 +436,55 @@ def test_music_suppression_noops_without_spans():
 # ════════════════════════════════════════════════════════════════════════
 #  Task 5 — source resegmentation into one-utterance cues
 # ════════════════════════════════════════════════════════════════════════
+
+# ════════════════════════════════════════════════════════════════════════
+#  Translation AI dropdown — only translation-capable models
+# ════════════════════════════════════════════════════════════════════════
+
+def test_translation_capability_filter():
+    pytest.importorskip("fastapi")
+    try:
+        from backend.routers.settings import _is_translation_capable as cap
+    except Exception:
+        pytest.skip("settings router deps unavailable in this environment")
+    # Excluded: reasoning / 'thinking' models (break the JSON translator) and
+    # image / audio generators — the classes that "can't be used for translation".
+    assert cap("liquid/lfm-2.5-1.2b-thinking:free") is False   # the model the user hit
+    assert cap("openai/o3") is False
+    assert cap("openai/o4-mini") is False
+    assert cap("openai/o1-preview") is False
+    assert cap("deepseek/deepseek-r1") is False
+    assert cap("openai/gpt-5-image", ["image", "text"]) is False
+    assert cap("openai/gpt-audio", ["audio", "text"]) is False
+    # Kept: standard instruct chat models — including ids that merely contain
+    # an 'o' (must not false-match the o1/o3/o4 reasoning rule).
+    assert cap("google/gemini-3.1-flash-lite") is True
+    assert cap("openai/gpt-4o-mini") is True
+    assert cap("anthropic/claude-opus-4") is True
+    assert cap("x-ai/grok-2-1212") is True
+
+
+# ════════════════════════════════════════════════════════════════════════
+#  Translation polish — readability only, preserve meaning + timing
+# ════════════════════════════════════════════════════════════════════════
+
+def test_translation_polish_mode_is_readability_only():
+    import backend.services.transcript_polisher as tp
+    batch = [{"index": 0, "text": "the colony destroyed by enemy", "start": 1.0, "end": 3.0}]
+    asr = tp._build_user_prompt(batch, [], [], "en", None, mode="asr")
+    tr = tp._build_user_prompt(batch, [], [], "en", None, mode="translation")
+    # Translation prompt is readability-only and NOT Whisper/ASR-framed.
+    assert "phonetic" not in tr.lower() and "whisper" not in tr.lower()
+    assert "re-translate" in tr.lower() and "meaning" in tr.lower()
+    # The ASR prompt keeps its phonetic-correction framing.
+    assert "phonetic" in asr.lower() or "whisper" in asr.lower()
+    # Distinct translation system prompt that still forbids timing changes.
+    assert tp._SYSTEM_PROMPT_TRANSLATION != tp._SYSTEM_PROMPT
+    assert "Never change timing" in tp._SYSTEM_PROMPT_TRANSLATION
+    # CJK target → CJK punctuation guidance, never Western punctuation.
+    tr_ja = tp._build_user_prompt(batch, [], [], "ja", None, mode="translation")
+    assert "。" in tr_ja
+
 
 def test_resegment_splits_runon_into_one_utterance_cues():
     def W(w, s, e):

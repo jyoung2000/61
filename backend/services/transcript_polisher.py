@@ -62,6 +62,33 @@ _SYSTEM_PROMPT = (
     "6. The array length must equal the input segment count.\n"
 )
 
+# Translation-polish persona — used when polishing subtitles that have ALREADY
+# been translated into the target language (offline NMT does the translation;
+# the OpenRouter editorial model only polishes for readability here). Same hard
+# invariants as above (segment count, timing, no re-translation), but the
+# objective is the READABILITY of the translation, NOT phonetic ASR correction —
+# so it never "corrects" already-correct translated words or alters meaning.
+_SYSTEM_PROMPT_TRANSLATION = (
+    "You are a subtitle readability editor. You receive subtitle lines that "
+    "have ALREADY been translated into the target language by a separate "
+    "translation engine. Your ONLY job is to make each line read naturally and "
+    "cleanly WITHOUT changing its meaning.\n\n"
+    "You MAY: fix punctuation, capitalisation and spacing; fix obvious "
+    "machine-translation grammar glitches (articles, plural / verb agreement, "
+    "awkward word order within a phrase); make stilted phrasing read naturally.\n"
+    "You MUST NOT: re-translate, change the meaning, paraphrase into different "
+    "wording, add or remove information, merge or split lines, reorder ideas, or "
+    "change timing.\n\n"
+    "STRICT RULES (must follow every time):\n"
+    "1. Return EXACTLY the same number of segments you receive. Never merge or "
+    "split — only edit the text inside each.\n"
+    "2. Preserve the meaning of each line EXACTLY. If a line already reads "
+    "cleanly, return it UNCHANGED. When unsure, keep the original.\n"
+    "3. Never change timing — those fields are not in your output.\n"
+    "4. Return ONLY a JSON array of strings, no preamble, no markdown.\n"
+    "5. The array length must equal the input segment count.\n"
+)
+
 # ── Filler-word patterns by language ──────────────────────────────────────
 _EN_FILLERS = re.compile(
     r"\b("
@@ -166,8 +193,14 @@ def _build_user_prompt(
     context_after: list[dict],
     language: str,
     glossary_terms: Optional[list[str]] = None,
+    mode: str = "asr",
 ) -> str:
-    """Assemble the per-batch user message with surrounding context."""
+    """Assemble the per-batch user message with surrounding context.
+
+    ``mode='translation'`` polishes already-translated subtitles for readability
+    only (preserving meaning + timing); ``mode='asr'`` (default) is the
+    Whisper-accuracy correction profile.
+    """
     lang_hint = (
         f"\nLanguage: {language}\n"
         if language and language not in ("", "auto", "unknown")
@@ -192,7 +225,37 @@ def _build_user_prompt(
                 "Never introduce one of these names where the audio clearly "
                 "says something else."
             )
-    if preserve:
+    if mode == "translation":
+        # Readability-only profile for ALREADY-translated subtitles. Offline
+        # NMT did the translation; the LLM must NOT re-translate or change
+        # meaning — only make the existing translation read cleanly.
+        rules.append(
+            "PRIMARY OBJECTIVE: improve the READABILITY of these already-"
+            "translated subtitle lines — punctuation, capitalisation, spacing, "
+            "and obvious machine-translation grammar glitches — while keeping "
+            "the MEANING of every line exactly the same."
+        )
+        rules.append(
+            "DO NOT re-translate, change the meaning, paraphrase into different "
+            "wording, summarise, expand, or add / remove information. If a line "
+            "already reads cleanly, return it VERBATIM."
+        )
+        rules.append(
+            "Keep exactly one line per input segment — never merge or split — "
+            "and never change timing."
+        )
+        if language.lower() in _CJK_LANGS:
+            rules.append(
+                "Target is Japanese/Korean/Chinese: use 。 and 、 punctuation; "
+                "do NOT add Western punctuation; leave particles untouched."
+            )
+        else:
+            rules.append(
+                "Fix obvious grammar / agreement and homophones (their/there, "
+                "your/you're) ONLY where clearly wrong — never reword a line "
+                "that is already correct."
+            )
+    elif preserve:
         # Accuracy-focused profile: the polisher's job is to bridge the
         # Whisper-medium-to-Whisper-large quality gap by correcting the
         # specific kinds of errors a smaller ASR model makes — phonetic
@@ -342,12 +405,14 @@ async def _polish_batch(
     language: str,
     timeout: float,
     glossary_terms: Optional[list[str]] = None,
+    mode: str = "asr",
 ) -> Optional[list[str]]:
     """Polish a single batch via the editorial LLM. Returns None on failure
     so the caller can keep the originals."""
     user_prompt = _build_user_prompt(
-        batch, context_before, context_after, language, glossary_terms)
-    full_prompt = f"[SYSTEM]\n{_SYSTEM_PROMPT}\n\n[USER]\n{user_prompt}"
+        batch, context_before, context_after, language, glossary_terms, mode=mode)
+    system_prompt = _SYSTEM_PROMPT_TRANSLATION if mode == "translation" else _SYSTEM_PROMPT
+    full_prompt = f"[SYSTEM]\n{system_prompt}\n\n[USER]\n{user_prompt}"
     try:
         response = await orchestrator.text_completion(full_prompt, timeout=timeout)
     except Exception as e:
@@ -371,8 +436,13 @@ async def correct_transcript(
     progress_callback: Optional[Callable[[int], Any]] = None,
     timeout_per_batch: float = 90.0,
     glossary_terms: Optional[list[str]] = None,
+    mode: str = "asr",
 ) -> list:
     """Polish a transcript using the editorial LLM in batches.
+
+    ``mode='translation'`` polishes already-translated subtitles for readability
+    only (preserve meaning + timing, never re-translate); ``mode='asr'``
+    (default) is the Whisper-accuracy correction profile.
 
     Drop-in replacement for ``compat_stubs.correct_transcript`` — same
     signature, same return shape. When ``TRANSCRIPT_POLISHING_ENABLED``
@@ -426,7 +496,7 @@ async def correct_transcript(
         polished_texts = await _polish_batch(
             orchestrator, batch, ctx_before, ctx_after,
             language=language, timeout=timeout_per_batch,
-            glossary_terms=glossary_terms,
+            glossary_terms=glossary_terms, mode=mode,
         )
 
         # Length tolerance depends on the polish profile. In the
@@ -437,7 +507,11 @@ async def correct_transcript(
         # the ``preserve=False`` (full editing) path the model is
         # allowed to drop fillers and merge fragments so leave the
         # legacy looser bounds.
-        preserve_mode = getattr(settings, "TRANSCRIPT_PRESERVE_WORDS", True)
+        # Translation polish is readability-only, so hold it to the tight
+        # (preserve) length band + word-count guard regardless of the global
+        # TRANSCRIPT_PRESERVE_WORDS setting, so the LLM can't drift into
+        # paraphrase / re-translation.
+        preserve_mode = (mode == "translation") or getattr(settings, "TRANSCRIPT_PRESERVE_WORDS", True)
         len_max_ratio = 1.5 if preserve_mode else 3.0
         len_min_ratio = 0.6 if preserve_mode else 0.3
         for i, (view, orig_obj) in enumerate(batch_pairs):

@@ -1,3 +1,31 @@
+# ClipAI — Translation AI dropdown filter + translation-readability polish
+
+Two follow-up requests after the offline-NMT fix:
+
+**Translation AI dropdown — only models that can translate.** The dropdown was
+fed the full text-model list, which (on OpenRouter's catalog) includes reasoning
+/ "thinking" models whose chain-of-thought breaks the strict JSON-array the
+batch translator parses (the `…-1.2b-thinking:free` the user hit) and
+image/audio generators. `available_models()` now also returns a dedicated
+`translation` list — text models minus those two classes (`_is_translation_capable`)
+— and the Translation AI dropdown uses it. Against the live 343-model catalog
+this excludes 39 (28 reasoning, 11 image/audio gens) and keeps every standard
+instruct translator; ids that merely contain an `o` (e.g. `grok-2`, `claude-opus`)
+are not false-matched by the o1/o3/o4 rule.
+
+**Offline-first, OpenRouter polishes readability only.** Offline NMT already
+translates first; the OpenRouter editorial model only polishes the result. That
+polish now runs in a new **`mode="translation"`** profile: a readability-only
+persona (`_SYSTEM_PROMPT_TRANSLATION`) that fixes punctuation / capitalisation /
+spacing / obvious MT grammar glitches but **must not re-translate, change
+meaning, reorder, merge/split, or change timing**. It replaces the old
+ASR-correction framing (which would "phonetically correct" already-correct
+translated words), and the tight length band + word-count guard are forced on so
+the LLM can't drift into paraphrase. Timing and segment count were already
+preserved (those fields aren't in the LLM's output); this protects *meaning* too.
+
+---
+
 # ClipAI — Offline translation reliability + transcription quality redesign (TACT)
 
 A 24.5-min Japanese anime episode (Gundam Wing) with subtitle target = English
