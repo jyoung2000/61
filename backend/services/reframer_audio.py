@@ -55,6 +55,57 @@ def _vocab_bias_kwargs(transcribe_callable, language: str) -> dict:
         return {}
 
 
+def _decoding_kwargs(transcribe_callable, condition_on_previous_text=None) -> dict:
+    """Anti-repetition / anti-hallucination decoding kwargs for a Whisper
+    transcribe call, filtered to those the installed faster-whisper build
+    accepts (mirrors ``_vocab_bias_kwargs``' feature-detection so an older
+    build never raises on an unknown kwarg).
+
+    ``condition_on_previous_text`` defaults to the
+    ``WHISPER_CONDITION_ON_PREVIOUS_TEXT`` setting; pass an explicit value to
+    force it (the gap-fill pass forces ``False`` over music/quiet regions
+    regardless of the global default).
+
+    These make the decoder REJECT looped / degenerate output instead of
+    emitting it (Task 3):
+      * ``condition_on_previous_text`` defaults OFF — it is the primary driver
+        of the looped-narration hallucination on music / singing.
+      * ``no_repeat_ngram_size`` blocks verbatim n-gram loops within a window.
+      * ``compression_ratio_threshold`` + ``log_prob_threshold`` trip Whisper's
+        ``temperature`` fallback so a degenerate segment is re-decoded hotter
+        rather than kept.
+      * ``repetition_penalty`` discourages token-level loops.
+    Only kwargs that appear as explicit named parameters of the callable are
+    returned (a ``**kwargs`` catch-all does NOT count — same rule as the vocab
+    biasing helper), so passing the result is always safe.
+    """
+    import inspect
+    cond = (bool(getattr(settings, "WHISPER_CONDITION_ON_PREVIOUS_TEXT", False))
+            if condition_on_previous_text is None
+            else bool(condition_on_previous_text))
+    desired = {
+        "condition_on_previous_text": cond,
+        "no_repeat_ngram_size": int(getattr(
+            settings, "WHISPER_NO_REPEAT_NGRAM_SIZE", 3)),
+        "compression_ratio_threshold": float(getattr(
+            settings, "WHISPER_COMPRESSION_RATIO_THRESHOLD", 2.4)),
+        "log_prob_threshold": float(getattr(
+            settings, "WHISPER_LOG_PROB_THRESHOLD", -1.0)),
+        "repetition_penalty": float(getattr(
+            settings, "WHISPER_REPETITION_PENALTY", 1.1)),
+        "temperature": tuple(getattr(
+            settings, "WHISPER_TEMPERATURE_FALLBACK",
+            (0.0, 0.2, 0.4, 0.6, 0.8, 1.0))),
+    }
+    try:
+        params = inspect.signature(transcribe_callable).parameters
+    except (TypeError, ValueError):
+        # Can't introspect — pass nothing extra rather than risk an unknown
+        # kwarg. The caller still sets condition_on_previous_text explicitly.
+        return {}
+    return {k: v for k, v in desired.items() if k in params}
+
+
 def _cross_validate_segments(segments: list) -> list:
     """Remove cross-segment artefacts the per-segment TACT filter misses.
 
@@ -524,7 +575,9 @@ class AudioIntelligence:
             #   vad min_silence=300ms (catches brief pauses within sentences)
             #   no_speech_threshold from settings.WHISPER_NO_SPEECH_THRESHOLD
             #       (lower = less likely to skip quiet speech)
-            #   condition_on_previous_text=True (improves coherence across segments)
+            #   anti-repetition decoding via _decoding_kwargs(): cond_prev OFF
+            #       by default + no_repeat_ngram_size / compression-ratio +
+            #       log-prob thresholds + temperature fallback (rejects loops)
             #   word_timestamps=True (per-word timing for subtitle + reframing)
             _ns_threshold = float(getattr(
                 settings, "WHISPER_NO_SPEECH_THRESHOLD", 0.4))
@@ -532,6 +585,7 @@ class AudioIntelligence:
                 from faster_whisper import BatchedInferencePipeline
                 batched = BatchedInferencePipeline(model=self.engine)
                 _bias = _vocab_bias_kwargs(batched.transcribe, language)
+                _decode = _decoding_kwargs(batched.transcribe)
                 segments_iter, info = batched.transcribe(
                     audio_path, batch_size=self._batch_size,
                     language=whisper_lang,
@@ -541,13 +595,15 @@ class AudioIntelligence:
                         "speech_pad_ms": 200,
                     },
                     word_timestamps=True,
-                    condition_on_previous_text=True,
                     no_speech_threshold=_ns_threshold,
+                    **_decode,
                     **_bias,
                 )
                 log.log_stage('AUDIO',
                     f'Using batched inference (batch=16, beam=5, '
-                    f'no_speech_thresh={_ns_threshold})')
+                    f'no_speech_thresh={_ns_threshold}, '
+                    f'cond_prev={_decode.get("condition_on_previous_text")}, '
+                    f'no_repeat_ngram={_decode.get("no_repeat_ngram_size")})')
             except Exception as e:
                 err_str = str(e)
                 log.log_stage('AUDIO', f'Batched inference failed: {err_str[:120]}')
@@ -563,6 +619,7 @@ class AudioIntelligence:
                     self._reload_on_cpu()
                 log.log_stage('AUDIO', 'Falling back to sequential transcription (slower)')
                 _bias = _vocab_bias_kwargs(self.engine.transcribe, language)
+                _decode = _decoding_kwargs(self.engine.transcribe)
                 segments_iter, info = self.engine.transcribe(
                     audio_path, language=whisper_lang,
                     beam_size=5, vad_filter=True,
@@ -571,8 +628,8 @@ class AudioIntelligence:
                         "speech_pad_ms": 200,
                     },
                     word_timestamps=True,
-                    condition_on_previous_text=True,
                     no_speech_threshold=_ns_threshold,
+                    **_decode,
                     **_bias,
                 )
 
@@ -896,14 +953,19 @@ class AudioIntelligence:
             clip_ts.append(round(s, 3))
             clip_ts.append(round(e, 3))
 
+        # Gap-fill lives in music / quiet regions, so force priming OFF
+        # regardless of the global condition_on_previous_text default, and add
+        # the same anti-repetition decoding guards the main pass uses.
+        _gap_decode = _decoding_kwargs(
+            self.engine.transcribe, condition_on_previous_text=False)
         try:
             segs_iter, _info = self.engine.transcribe(
                 audio_path, language=whisper_lang,
                 beam_size=5, vad_filter=False,
                 word_timestamps=True,
-                condition_on_previous_text=False,
                 no_speech_threshold=gap_ns_thresh,
                 clip_timestamps=clip_ts,
+                **_gap_decode,
             )
         except TypeError:
             # Older faster-whisper builds don't accept clip_timestamps.
@@ -915,8 +977,8 @@ class AudioIntelligence:
                 audio_path, language=whisper_lang,
                 beam_size=5, vad_filter=False,
                 word_timestamps=True,
-                condition_on_previous_text=False,
                 no_speech_threshold=gap_ns_thresh,
+                **_gap_decode,
             )
 
         # Same boilerplate / repetition filter the main pass uses
@@ -1185,6 +1247,7 @@ class AudioIntelligence:
             try:
                 from faster_whisper import BatchedInferencePipeline
                 batched = BatchedInferencePipeline(model=self.engine)
+                _decode = _decoding_kwargs(batched.transcribe)
                 segments_iter, info = batched.transcribe(
                     audio_path, batch_size=self._batch_size,
                     language=whisper_lang,
@@ -1195,9 +1258,9 @@ class AudioIntelligence:
                         "speech_pad_ms": 200,
                     },
                     word_timestamps=True,
-                    condition_on_previous_text=True,
                     no_speech_threshold=float(getattr(
                         settings, "WHISPER_NO_SPEECH_THRESHOLD", 0.4)),
+                    **_decode,
                 )
             except Exception as e:
                 err_str = str(e)
@@ -1215,7 +1278,7 @@ class AudioIntelligence:
                     task='translate',
                     beam_size=5, vad_filter=True,
                     word_timestamps=True,
-                    condition_on_previous_text=True,
+                    **_decoding_kwargs(self.engine.transcribe),
                 )
 
             segments = []

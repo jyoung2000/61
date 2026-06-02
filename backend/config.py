@@ -133,6 +133,27 @@ class Settings(BaseSettings):
     # sub-segments ≤ this length so timestamps stay accurate and the
     # subtitle track never shows a giant block. 0 disables the split.
     WHISPER_GAP_FILL_MAX_SEC: float = 8.0
+    # ── Anti-repetition / anti-hallucination decoding (Task 3) ──
+    # condition_on_previous_text feeds each window the previous window's text
+    # as a prompt. On music / singing / sparse-speech content (anime OP/ED,
+    # insert songs) this DRIVES Whisper's repetition-loop pathology — the
+    # opening narration re-emitted at six separated timestamps on the Gundam
+    # Wing episode. Default it OFF; the small coherence loss on dialogue-dense
+    # video is worth never generating the loop. Per-user overridable.
+    WHISPER_CONDITION_ON_PREVIOUS_TEXT: bool = False
+    # Block verbatim n-gram loops in the decoder (0 disables).
+    WHISPER_NO_REPEAT_NGRAM_SIZE: int = 3
+    # A segment whose gzip compression ratio exceeds this is degenerate/looped
+    # → Whisper re-decodes it at the next temperature in the fallback ladder.
+    WHISPER_COMPRESSION_RATIO_THRESHOLD: float = 2.4
+    # Average log-probability floor; below it a segment is re-decoded hotter.
+    WHISPER_LOG_PROB_THRESHOLD: float = -1.0
+    # Token-level repetition penalty (>1 discourages loops). Dropped silently
+    # on faster-whisper builds that don't expose it.
+    WHISPER_REPETITION_PENALTY: float = 1.1
+    # Temperature fallback ladder — on a degenerate/low-confidence segment
+    # Whisper retries at the next temperature instead of emitting the loop.
+    WHISPER_TEMPERATURE_FALLBACK: tuple = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
     # Auto-upgrade the Whisper model tier when the detected GPU has
     # spare VRAM. Existing logic already jumped ``small → large-v3-turbo``
     # on ≥6 GB cards; this flag extends the ladder so mid-tier GPUs
