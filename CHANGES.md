@@ -1,3 +1,17 @@
+# ClipAI — Offline NMT uses the GPU when there's room (4 GB card), CPU fallback
+
+A `ja→en` run finally translated offline via NLLB end-to-end (tokenizer fix
+landed: `saved tokenizer file … → using NMTTranslator … for ja→en`), but it
+picked CPU and crawled: the device heuristic looked at *total* VRAM (`≤4 GB →
+cpu`) instead of what's *free*. Translation runs after Whisper's VRAM is
+released, so a 4 GB GTX 1650 has ~2.6 GB free and NLLB-600M int8 needs only
+~1 GB. NMT_DEVICE=auto now decides on **free VRAM** (`_NLLB_CUDA_MIN_FREE_GB`,
+1.8 GB) and uses the GPU when the model + workspace genuinely fit — and a CUDA
+load error (OOM) now **retries on CPU** instead of dropping to the LLM, so cuda
+is never fatal. Net: much faster offline translation on small cards, same safety.
+
+---
+
 # ClipAI — Run translation right after transcription/speakers (before summary)
 
 Per request, subtitle translation now runs **immediately after transcription +

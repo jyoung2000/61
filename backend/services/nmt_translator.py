@@ -33,6 +33,11 @@ logger = logging.getLogger(__name__)
 _NLLB_MIN_FREE_BYTES = 6 * 1024 ** 3   # 6 GB headroom for HF cache + int8 out
 _OPUS_MIN_FREE_BYTES = 3 * 1024 ** 3   # 3 GB headroom per Opus-MT pair
 
+# Free VRAM (GB) needed to load NLLB-600M int8 on CUDA: ~1 GB weights + CT2
+# activation workspace + margin. Above this, NMT_DEVICE=auto uses the GPU even
+# on a 4 GB card (Whisper VRAM is released before translation); below it, CPU.
+_NLLB_CUDA_MIN_FREE_GB = 1.8
+
 
 # ── ISO 639-1 → Flores-200 mapping for NLLB ──────────────────────────────
 # Covers the languages already in translator.SUPPORTED_LANGUAGES.
@@ -356,19 +361,28 @@ class NMTTranslator:
             try:
                 import torch
                 if torch.cuda.is_available():
-                    # On a small GPU (≤4 GB total, e.g. the GTX 1650) Whisper +
-                    # Ollama already fight over VRAM — auto picks CPU there so a
-                    # parallel-load never OOMs. Larger cards keep the GPU.
-                    total_gb = torch.cuda.get_device_properties(0).total_memory / 1_073_741_824
-                    if total_gb <= 4.5:
-                        device = "cpu"
+                    # NLLB-600M int8 is small (~1 GB). Translation runs AFTER the
+                    # reframer releases Whisper's VRAM, so the GPU is usually free
+                    # by now — decide on FREE VRAM, not total card size, and use
+                    # the GPU whenever the model + workspace genuinely fit (the
+                    # GTX 1650's CPU path is many times slower). A CUDA OOM at
+                    # load time still retries on CPU below, so cuda is never fatal.
+                    torch.cuda.empty_cache()
+                    free_gb = torch.cuda.mem_get_info()[0] / 1_073_741_824
+                    if free_gb >= _NLLB_CUDA_MIN_FREE_GB:
+                        device = "cuda"
                         logger.info(
-                            "NMT: NMT_DEVICE=auto → cpu (GPU has %.1f GB ≤ 4 GB; "
-                            "CPU is the OOM-safe choice — set NMT_DEVICE=cuda to override)",
-                            total_gb,
+                            "NMT: NMT_DEVICE=auto → cuda (%.1f GB VRAM free ≥ %.1f GB "
+                            "needed for NLLB int8; GPU is much faster than CPU)",
+                            free_gb, _NLLB_CUDA_MIN_FREE_GB,
                         )
                     else:
-                        device = "cuda"
+                        device = "cpu"
+                        logger.info(
+                            "NMT: NMT_DEVICE=auto → cpu (only %.1f GB VRAM free < %.1f GB "
+                            "needed for NLLB int8 — CPU is the OOM-safe choice)",
+                            free_gb, _NLLB_CUDA_MIN_FREE_GB,
+                        )
                 else:
                     device = "cpu"
             except Exception:
@@ -395,7 +409,24 @@ class NMTTranslator:
         # int8 keeps the 600M model under 1 GB VRAM.
         compute_type = "int8_float16" if device == "cuda" else "int8"
         logger.info("NMT: loading NLLB %s on %s (%s)", self.model_id, device, compute_type)
-        self._translator = ctranslate2.Translator(path, device=device, compute_type=compute_type)
+        try:
+            self._translator = ctranslate2.Translator(path, device=device, compute_type=compute_type)
+        except Exception as e:
+            # A CUDA OOM (or any GPU load error) must never drop us to the LLM —
+            # retry on CPU (slower but always works) so offline NMT still wins.
+            if device == "cuda":
+                logger.warning(
+                    "NMT: NLLB CUDA load failed (%s) — retrying on CPU (slower but safe)", e)
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                device = "cpu"
+                self._translator = ctranslate2.Translator(path, device="cpu", compute_type="int8")
+            else:
+                raise
 
         tok_file = None
         for name in ("sentencepiece.bpe.model", "spiece.model"):
