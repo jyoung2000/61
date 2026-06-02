@@ -29,7 +29,12 @@ def _stub_provider_sdks():
 
 _stub_provider_sdks()
 
+import asyncio  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+
 import backend.services.pipeline as pipeline  # noqa: E402
+import backend.services.translator as translator  # noqa: E402
+from backend.models import TranscriptSegment  # noqa: E402
 
 
 # ── Fakes for the modules the helper imports lazily ──────────────────────────
@@ -135,3 +140,107 @@ def test_returns_empty_when_engine_fails_to_load(monkeypatch):
 def test_returns_empty_when_whisper_yields_nothing(monkeypatch):
     _install(monkeypatch, segments=[])
     assert pipeline._whisper_native_translate_segments("/v.mp4", "ja", None) == []
+
+
+# ── Pipeline integration: the _background_post_processing translate branch ───
+
+def _run(coro):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    return loop.run_until_complete(coro)
+
+
+class _FakeDB:
+    def __init__(self, initial=None):
+        self.fields = dict(initial or {})
+        self.update_calls = []
+
+    async def update_job_status(self, job_id, **kw):
+        self.update_calls.append(kw)
+        self.fields.update(kw)
+
+    async def load_job(self, job_id):
+        return SimpleNamespace(**self.fields)
+
+
+def _fake_orchestrator():
+    return SimpleNamespace(
+        reset_circuit_breaker=lambda: None,
+        get_editorial_model_info=lambda: {"is_thinking": False},
+    )
+
+
+def _src(text, start, end, speaker="Speaker 1"):
+    return {"text": text, "start": start, "end": end, "speaker": speaker}
+
+
+def _install_pipeline(monkeypatch, db, *, engine="nllb"):
+    async def _bcast(job_id, message):
+        return None
+    monkeypatch.setattr(pipeline.database, "update_job_status", db.update_job_status)
+    monkeypatch.setattr(pipeline.database, "load_job", db.load_job)
+    monkeypatch.setattr(pipeline, "broadcast_ws", _bcast)
+    monkeypatch.setattr(translator, "_resolve_translation_engine", lambda s, t: engine)
+    # Keep the heavy optional passes out of the unit under test.
+    for flag in ("AI_TRANSCRIPT_CORRECTION", "SENTENCE_SEGMENTATION_ENABLED",
+                 "SUBTITLE_CPS_ENFORCEMENT", "TRANSLATION_GLOSSARY_ENABLED",
+                 "TRANSCRIPT_POLISHING_ENABLED"):
+        monkeypatch.setattr(pipeline.settings, flag, False, raising=False)
+    monkeypatch.setattr(pipeline.settings, "WHISPER_TRANSLATE_TO_EN", True, raising=False)
+
+
+def test_pipeline_uses_whisper_native_for_ja_en_and_skips_nmt(monkeypatch):
+    db = _FakeDB({"subtitle_language": "en", "language": "ja", "clips": [], "summary": None})
+    _install_pipeline(monkeypatch, db)
+
+    nmt_calls = {"n": 0}
+    async def _nmt(*a, **k):
+        nmt_calls["n"] += 1
+        return []
+    monkeypatch.setattr(translator, "translate_segments_with_fallback", _nmt)
+
+    def _wn(video_path, source_lang, glossary=None, source_segments=None):
+        assert video_path == "/v.mp4" and source_lang == "ja"
+        return [TranscriptSegment(text="EN one", start=0.0, end=1.0, speaker="Speaker 1"),
+                TranscriptSegment(text="EN two", start=1.0, end=2.0, speaker="Speaker 1")]
+    monkeypatch.setattr(pipeline, "_whisper_native_translate_segments", _wn)
+
+    job = SimpleNamespace(subtitle_language="en", language="ja", clips=[],
+                          summary=None, file_path="/v.mp4")
+    transcript = [_src("こんにちは", 0.0, 1.0), _src("世界", 1.0, 2.0)]
+
+    result = _run(pipeline._background_post_processing(
+        "jobW", transcript, _fake_orchestrator(), job, polished_already=False))
+
+    assert result["translated"] is True
+    assert nmt_calls["n"] == 0  # Whisper-native handled it; NMT never called
+    assert result["target_transcript"][0]["text"] == "EN one"
+    assert db.fields.get("translation_status") == "translated"
+    assert any("translated_transcript" in c for c in db.update_calls)
+
+
+def test_pipeline_falls_back_to_nmt_when_whisper_native_empty(monkeypatch):
+    db = _FakeDB({"subtitle_language": "en", "language": "ja", "clips": [], "summary": None})
+    _install_pipeline(monkeypatch, db)
+
+    nmt_calls = {"n": 0}
+    async def _nmt(segs, **k):
+        nmt_calls["n"] += 1
+        return [TranscriptSegment(text="NMT " + s.text, start=s.start, end=s.end,
+                                  speaker=s.speaker) for s in segs]
+    monkeypatch.setattr(translator, "translate_segments_with_fallback", _nmt)
+    # Whisper-native unavailable → empty → must fall back to offline NMT.
+    monkeypatch.setattr(pipeline, "_whisper_native_translate_segments",
+                        lambda *a, **k: [])
+
+    job = SimpleNamespace(subtitle_language="en", language="ja", clips=[],
+                          summary=None, file_path="/v.mp4")
+    transcript = [_src("こんにちは", 0.0, 1.0), _src("世界", 1.0, 2.0)]
+
+    result = _run(pipeline._background_post_processing(
+        "jobN", transcript, _fake_orchestrator(), job, polished_already=False))
+
+    assert result["translated"] is True
+    assert nmt_calls["n"] == 1  # fell back to the offline NMT path
+    assert result["target_transcript"][0]["text"].startswith("NMT ")
+    assert db.fields.get("translation_status") == "translated"
