@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # Dockerfile.gpu — GPU-accelerated ClipAI build
 # Supports: NVIDIA (NVENC/NVDEC/CUDA), Intel (VAAPI/QSV), AMD (VAAPI)
 
@@ -135,32 +136,44 @@ COPY backend/requirements.txt .
 # disk filled. If the cu121 index is unreachable the ``||`` falls back so the
 # build STILL COMPLETES; the runtime then emits the visible "running on CPU"
 # warning instead of bricking the image.
-RUN pip3 install --upgrade pip && \
-    ( pip3 install --no-cache-dir \
-        torch==2.5.1 torchaudio==2.5.1 \
-        --index-url https://download.pytorch.org/whl/cu121 \
-      || pip3 install --no-cache-dir torch==2.5.1 torchaudio==2.5.1 ) && \
+# Hardened against transient failures on the large (~2 GB) CUDA download:
+#  - a BuildKit pip cache mount so each retry / rebuild reuses wheels that
+#    already downloaded and only re-fetches what's missing (image size is
+#    unaffected — the cache lives in the build cache, not a layer);
+#  - a 3x retry-with-backoff loop so a dropped read doesn't fail the build.
+# pip itself also retries (PIP_RETRIES) with a long socket timeout
+# (PIP_DEFAULT_TIMEOUT). cu121 index first; PyPI as a fallback.
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    pip3 install --upgrade pip && \
+    for attempt in 1 2 3; do \
+        echo "==> torch/CUDA install attempt $attempt/3"; \
+        ( pip3 install torch==2.5.1 torchaudio==2.5.1 \
+            --index-url https://download.pytorch.org/whl/cu121 \
+          || pip3 install torch==2.5.1 torchaudio==2.5.1 ) && break; \
+        echo "==> attempt $attempt failed; retrying in $((attempt * 15))s"; sleep $((attempt * 15)); \
+    done && \
     python3 -c 'import torch; print("torch", torch.__version__, "CUDA-build:", torch.version.cuda or "NONE (CPU-only)")'
 
 # requirements.txt pins torch==2.5.1 / torchaudio==2.5.1 (and pyannote<4), so
 # the CUDA torch installed above is treated as already-satisfied and pip does
 # NOT swap it for a CPU wheel. pyannote 3.x gets its full dependency tree here
 # in the normal requirements install.
-RUN pip3 install --no-cache-dir -r requirements.txt && \
-    pip3 install --no-cache-dir nvidia-cublas-cu12 nvidia-cudnn-cu12==9.* && \
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    pip3 install -r requirements.txt && \
+    pip3 install nvidia-cublas-cu12 nvidia-cudnn-cu12==9.* && \
     # FAIL the build if the requirements install swapped torch off the pinned
     # cu121 wheel (e.g. a dep loosened its constraint and pip upgraded torch to
     # a giant cu13 build — the exact failure that filled the disk). Catching it
     # here aborts in seconds instead of after a 2 GB download.
     python3 -c 'import torch,sys; cu=torch.version.cuda; print("post-reqs torch",torch.__version__,"CUDA-build:",cu or "NONE (CPU-only)"); sys.exit(0 if (cu and cu.startswith("12")) else 1)' && \
     # MediaPipe runtime deps (installed separately to avoid protobuf conflict)
-    pip3 install --no-cache-dir \
+    pip3 install \
         flatbuffers>=23.1.4 \
         attrs>=23.1.0 \
         sounddevice>=0.4.6 \
         absl-py>=1.0.0 && \
     # MediaPipe itself — skip deps to avoid protobuf<4 constraint
-    pip3 install --no-cache-dir --no-deps mediapipe==0.10.8 && \
+    pip3 install --no-deps mediapipe==0.10.8 && \
     # Verify MediaPipe can actually load (fail build early if broken)
     python3 -c "import mediapipe; print(f'MediaPipe {mediapipe.__version__} installed')" && \
     python3 -c "import mediapipe.python.solutions.face_mesh; print('FaceMesh available')" && \
@@ -173,9 +186,11 @@ RUN pip3 install --no-cache-dir -r requirements.txt && \
 # Download SFace recognition model for identity embeddings (~2MB, one-time)
 # Download lbpcascade_animeface for v2 Phase 6 anime face detection (~110KB)
 RUN mkdir -p /app/backend/models && \
-    curl -sL -o /app/backend/models/face_detection_yunet_2023mar.onnx \
+    curl --retry 4 --retry-delay 5 --retry-all-errors -fsSL \
+    -o /app/backend/models/face_detection_yunet_2023mar.onnx \
     "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx" && \
-    curl -sL -o /app/backend/models/face_recognition_sface_2021dec.onnx \
+    curl --retry 4 --retry-delay 5 --retry-all-errors -fsSL \
+    -o /app/backend/models/face_recognition_sface_2021dec.onnx \
     "https://github.com/opencv/opencv_zoo/raw/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx" && \
     curl --retry 4 --retry-delay 5 --retry-all-errors -fsSL \
     -o /app/backend/models/lbpcascade_animeface.xml \
