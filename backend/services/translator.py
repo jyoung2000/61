@@ -86,13 +86,46 @@ def _llm_translation_model_is_free(orchestrator, model_override) -> tuple[bool, 
             return (_is_free_openrouter_model(s), s)
     return (False, "")
 
+# Friendly names for every language the offline NMT engine can target. Kept in
+# sync with nmt_translator._FLORES_CODES (same key set) so the translate-subtitles
+# endpoint accepts — and the pipeline names — any of them. The user can pick any
+# of these as a subtitle target; translation is never capped to a short list.
 SUPPORTED_LANGUAGES = {
+    # Western European
     "en": "English", "es": "Spanish", "fr": "French", "de": "German",
-    "it": "Italian", "pt": "Portuguese", "ru": "Russian", "ja": "Japanese",
-    "ko": "Korean", "zh": "Chinese (Simplified)", "ar": "Arabic",
-    "hi": "Hindi", "nl": "Dutch", "pl": "Polish", "tr": "Turkish",
-    "vi": "Vietnamese", "th": "Thai", "uk": "Ukrainian", "sv": "Swedish",
-    "id": "Indonesian", "ms": "Malay", "tl": "Filipino",
+    "it": "Italian", "pt": "Portuguese", "nl": "Dutch", "ca": "Catalan",
+    "gl": "Galician", "eu": "Basque", "ga": "Irish", "cy": "Welsh",
+    "is": "Icelandic", "lb": "Luxembourgish", "mt": "Maltese",
+    # Nordic
+    "sv": "Swedish", "da": "Danish", "no": "Norwegian", "nb": "Norwegian Bokmål",
+    "nn": "Norwegian Nynorsk", "fi": "Finnish",
+    # Slavic / Baltic / other Eastern European
+    "ru": "Russian", "uk": "Ukrainian", "pl": "Polish", "cs": "Czech",
+    "sk": "Slovak", "sl": "Slovenian", "hr": "Croatian", "sr": "Serbian",
+    "bs": "Bosnian", "bg": "Bulgarian", "mk": "Macedonian", "be": "Belarusian",
+    "ro": "Romanian", "hu": "Hungarian", "et": "Estonian", "lv": "Latvian",
+    "lt": "Lithuanian", "sq": "Albanian", "el": "Greek",
+    # Middle East / Caucasus / Central Asia
+    "ar": "Arabic", "he": "Hebrew", "fa": "Persian", "tr": "Turkish",
+    "az": "Azerbaijani", "kk": "Kazakh", "ky": "Kyrgyz", "uz": "Uzbek",
+    "tg": "Tajik", "hy": "Armenian", "ka": "Georgian", "ku": "Kurdish",
+    "ps": "Pashto",
+    # South Asia
+    "hi": "Hindi", "bn": "Bengali", "ur": "Urdu", "pa": "Punjabi",
+    "gu": "Gujarati", "mr": "Marathi", "ta": "Tamil", "te": "Telugu",
+    "kn": "Kannada", "ml": "Malayalam", "ne": "Nepali", "si": "Sinhala",
+    "or": "Odia", "as": "Assamese",
+    # East / Southeast Asia
+    "ja": "Japanese", "ko": "Korean", "zh": "Chinese (Simplified)",
+    "zh-tw": "Chinese (Traditional)", "yue": "Cantonese",
+    "vi": "Vietnamese", "th": "Thai", "id": "Indonesian", "ms": "Malay",
+    "tl": "Filipino", "my": "Burmese", "km": "Khmer", "lo": "Lao",
+    "jv": "Javanese", "su": "Sundanese", "mn": "Mongolian",
+    # Africa
+    "sw": "Swahili", "am": "Amharic", "ha": "Hausa", "yo": "Yoruba",
+    "ig": "Igbo", "zu": "Zulu", "xh": "Xhosa", "sn": "Shona",
+    "so": "Somali", "af": "Afrikaans", "mg": "Malagasy", "ny": "Chichewa",
+    "st": "Sesotho",
 }
 
 TRANSLATION_PROMPT = """Translate the following subtitle segments from {source_lang} to {target_lang}.
@@ -571,19 +604,42 @@ async def _translate_via_nmt(
                 except Exception:
                     pass
 
-        # ── Completeness pass: re-translate any cue still in the SOURCE script ──
-        # A long run-on can exceed the decoder and come back untranslated (the
-        # engine keeps the source for a failed cue). For a non-CJK target, detect
-        # leftover source-script cues and retry them in ISOLATION — the per-cue
-        # path chunks long inputs, so it succeeds where the batched / context-
-        # joined pass did not. Offline-only; the AI is never called here.
-        if not _flores_is_cjk(iso_to_flores(target_language)):
+        # ── Completeness pass: re-translate any cue the batched pass left
+        # UNtranslated, for ANY target language (offline-only; the AI is never
+        # called here). A long run-on can exceed the decoder and come back as
+        # source text, and for some pairs NLLB simply echoes a cue. We retry
+        # those in ISOLATION — the per-cue path chunks long inputs, so it
+        # succeeds where the batched / context-joined pass did not — so no
+        # source-language text is ever left behind regardless of the target.
+        _src_l = (source_language or "").strip().lower().split("-")[0]
+        _tgt_l = (target_language or "").strip().lower().split("-")[0]
+        _tgt_is_cjk = _flores_is_cjk(iso_to_flores(target_language))
+
+        def _untranslated(translated_text: str, source_text: str) -> bool:
+            t = (translated_text or "").strip()
+            s = (source_text or "").strip()
+            if not s:
+                return False
+            if not t:
+                return True
+            # Output still in a CJK source script while the target isn't CJK.
+            if not _tgt_is_cjk and _looks_cjk(t):
+                return True
+            # Unchanged from source (NMT dropped / echoed it). Only flag
+            # substantial cues so trivial tokens (names, numbers, "OK") aren't
+            # needlessly retried.
+            if t == s and len(s) >= 8 and len(s.split()) >= 2:
+                return True
+            return False
+
+        if _src_l and _tgt_l and _src_l != _tgt_l:
             leftover = [i for i, t in enumerate(out)
-                        if _looks_cjk(getattr(t, "text", "") or "")]
+                        if _untranslated(getattr(t, "text", ""),
+                                         getattr(segments[i], "text", ""))]
             if leftover:
                 logger.info(
-                    "NMT: completeness pass — %d/%d cue(s) still in source script, "
-                    "retrying per-cue", len(leftover), len(out),
+                    "NMT: completeness pass — %d/%d cue(s) untranslated, retrying per-cue",
+                    len(leftover), len(out),
                 )
                 recovered = 0
                 for i in leftover:
@@ -601,7 +657,7 @@ async def _translate_via_nmt(
                         logger.debug("NMT: completeness retry failed for cue %d (%s)", i, _re)
                         continue
                     new_text = (retry[0] if retry else "") or ""
-                    if new_text.strip() and not _looks_cjk(new_text):
+                    if new_text.strip() and not _untranslated(new_text, src_text):
                         out[i] = _apply_batch_translations([orig], [new_text])[0]
                         recovered += 1
                 logger.info("NMT: completeness pass recovered %d/%d cue(s)",

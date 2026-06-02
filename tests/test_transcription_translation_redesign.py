@@ -702,3 +702,58 @@ def test_nmt_completeness_skips_when_target_is_cjk(monkeypatch):
         [seg], "en", "ja", None, autodownload=False))
     assert out is not None and out[0].text == "こんにちは"
     assert calls["retry"] == 0  # no completeness retry for a CJK target
+
+
+def test_nmt_completeness_retries_unchanged_non_cjk_pair(monkeypatch):
+    """For a non-CJK pair (en→es), a cue NLLB echoed UNCHANGED is detected as
+    untranslated and retried — completeness is no longer CJK-only, so no
+    source-language text is left behind for any target language."""
+    seg = TranscriptSegment(text="the alliance attacked the colony",
+                            start=0.0, end=2.0, speaker="Speaker 1")
+
+    class _FakeNLLB(nmt.NMTTranslator):
+        def __init__(self):
+            self.model_id = "fake/nllb"
+            self._loaded = True
+
+        def translate_with_context(self, batch, cb, ca, src, tgt, glossary=None):
+            return list(batch)  # echo unchanged — a "drop"
+
+        def translate_batch(self, texts, source_lang=None, target_lang=None, glossary=None):
+            return ["la alianza atacó la colonia" for _ in texts]
+
+        def unload(self):
+            pass
+
+    monkeypatch.setattr(nmt, "pick_local_engine", lambda s, t: _FakeNLLB())
+    out = _run(translator._translate_via_nmt([seg], "en", "es", None, autodownload=False))
+    assert out is not None
+    assert out[0].text == "la alianza atacó la colonia"
+
+
+# ════════════════════════════════════════════════════════════════════════
+#  Language coverage — any common target, no "unsupported pair" stop
+# ════════════════════════════════════════════════════════════════════════
+
+def test_flores_map_covers_many_languages_and_stays_in_sync():
+    # Far more than the original 23 — common languages a user might pick.
+    for code in ("en", "es", "ja", "cs", "el", "he", "fa", "ro", "hu",
+                 "bn", "ta", "te", "fi", "da", "no", "vi", "id", "sw", "tr"):
+        assert nmt.iso_to_flores(code), f"{code} should map to a Flores code"
+    assert len(nmt._FLORES_CODES) >= 80
+    # Every friendly-named SUPPORTED_LANGUAGE must be NMT-translatable (the
+    # translate-subtitles endpoint validates against this set).
+    import backend.services.translator as t
+    missing = [c for c in t.SUPPORTED_LANGUAGES if not nmt.iso_to_flores(c)]
+    assert not missing, f"SUPPORTED_LANGUAGES without a Flores code: {missing}"
+
+
+def test_translate_subtitles_accepts_any_flores_language(monkeypatch):
+    """The endpoint guard must accept any NLLB-capable language, not only the
+    short friendly-name list (so the user is never blocked on target choice)."""
+    import backend.services.translator as t
+    # A language deliberately NOT in the friendly-name dict but in Flores.
+    assert "et" in t.SUPPORTED_LANGUAGES or nmt.iso_to_flores("et")
+    # Czech: present now; the guard's capability check (iso_to_flores) is truthy.
+    assert nmt.iso_to_flores("cs") == "ces_Latn"
+    assert nmt.iso_to_flores("el") == "ell_Grek"

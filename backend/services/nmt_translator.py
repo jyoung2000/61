@@ -40,32 +40,49 @@ _NLLB_CUDA_MIN_FREE_GB = 1.8
 
 
 # ── ISO 639-1 → Flores-200 mapping for NLLB ──────────────────────────────
-# Covers the languages already in translator.SUPPORTED_LANGUAGES.
+# NLLB-200 covers ~200 languages; this maps the common ISO 639-1 codes (plus a
+# few regional aliases) to their Flores-200 codes so the user can pick ANY of
+# these as a subtitle target — and so an auto-detected SOURCE in any of them
+# still translates — instead of failing with "unsupported pair". Keep in sync
+# with translator.SUPPORTED_LANGUAGES (same key set).
 _FLORES_CODES = {
-    "en": "eng_Latn",
-    "es": "spa_Latn",
-    "fr": "fra_Latn",
-    "de": "deu_Latn",
-    "it": "ita_Latn",
-    "pt": "por_Latn",
-    "ru": "rus_Cyrl",
-    "ja": "jpn_Jpan",
-    "ko": "kor_Hang",
-    "zh": "zho_Hans",
-    "zh-cn": "zho_Hans",
-    "zh-tw": "zho_Hant",
-    "ar": "arb_Arab",
-    "hi": "hin_Deva",
-    "nl": "nld_Latn",
-    "pl": "pol_Latn",
-    "tr": "tur_Latn",
-    "vi": "vie_Latn",
-    "th": "tha_Thai",
-    "uk": "ukr_Cyrl",
-    "sv": "swe_Latn",
-    "id": "ind_Latn",
-    "ms": "zsm_Latn",
-    "tl": "tgl_Latn",
+    # ── Western European ──
+    "en": "eng_Latn", "es": "spa_Latn", "fr": "fra_Latn", "de": "deu_Latn",
+    "it": "ita_Latn", "pt": "por_Latn", "nl": "nld_Latn", "ca": "cat_Latn",
+    "gl": "glg_Latn", "eu": "eus_Latn", "ga": "gle_Latn", "cy": "cym_Latn",
+    "is": "isl_Latn", "lb": "ltz_Latn", "mt": "mlt_Latn",
+    # ── Nordic ──
+    "sv": "swe_Latn", "da": "dan_Latn", "no": "nob_Latn", "nb": "nob_Latn",
+    "nn": "nno_Latn", "fi": "fin_Latn",
+    # ── Slavic / Baltic / other Eastern European ──
+    "ru": "rus_Cyrl", "uk": "ukr_Cyrl", "pl": "pol_Latn", "cs": "ces_Latn",
+    "sk": "slk_Latn", "sl": "slv_Latn", "hr": "hrv_Latn", "sr": "srp_Cyrl",
+    "bs": "bos_Latn", "bg": "bul_Cyrl", "mk": "mkd_Cyrl", "be": "bel_Cyrl",
+    "ro": "ron_Latn", "hu": "hun_Latn", "et": "est_Latn", "lv": "lvs_Latn",
+    "lt": "lit_Latn", "sq": "als_Latn", "el": "ell_Grek",
+    # ── Middle East / Caucasus / Central Asia ──
+    "ar": "arb_Arab", "he": "heb_Hebr", "iw": "heb_Hebr", "fa": "pes_Arab",
+    "tr": "tur_Latn", "az": "azj_Latn", "kk": "kaz_Cyrl", "ky": "kir_Cyrl",
+    "uz": "uzn_Latn", "tg": "tgk_Cyrl", "hy": "hye_Armn", "ka": "kat_Geor",
+    "ku": "kmr_Latn", "ps": "pbt_Arab",
+    # ── South Asia ──
+    "hi": "hin_Deva", "bn": "ben_Beng", "ur": "urd_Arab", "pa": "pan_Guru",
+    "gu": "guj_Gujr", "mr": "mar_Deva", "ta": "tam_Taml", "te": "tel_Telu",
+    "kn": "kan_Knda", "ml": "mal_Mlym", "ne": "npi_Deva", "si": "sin_Sinh",
+    "or": "ory_Orya", "as": "asm_Beng",
+    # ── East / Southeast Asia ──
+    "ja": "jpn_Jpan", "ko": "kor_Hang",
+    "zh": "zho_Hans", "zh-cn": "zho_Hans", "zh-hans": "zho_Hans",
+    "zh-tw": "zho_Hant", "zh-hk": "zho_Hant", "zh-hant": "zho_Hant",
+    "yue": "yue_Hant",
+    "vi": "vie_Latn", "th": "tha_Thai", "id": "ind_Latn", "ms": "zsm_Latn",
+    "tl": "tgl_Latn", "fil": "tgl_Latn", "my": "mya_Mymr", "km": "khm_Khmr",
+    "lo": "lao_Laoo", "jv": "jav_Latn", "su": "sun_Latn", "mn": "khk_Cyrl",
+    # ── Africa ──
+    "sw": "swh_Latn", "am": "amh_Ethi", "ha": "hau_Latn", "yo": "yor_Latn",
+    "ig": "ibo_Latn", "zu": "zul_Latn", "xh": "xho_Latn", "sn": "sna_Latn",
+    "so": "som_Latn", "af": "afr_Latn", "mg": "plt_Latn", "ny": "nya_Latn",
+    "st": "sot_Latn",
 }
 
 

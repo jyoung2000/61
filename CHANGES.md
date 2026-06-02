@@ -1,3 +1,29 @@
+# ClipAI — Translate to ANY language, completely (no cap, no source-language leftovers)
+
+Subtitle translation must work — and finish — for whatever language the user
+picks, with the transcript in the *target* language, not the source.
+
+**Any target language, no "unsupported" stop.** The offline NLLB engine covers
+~200 languages, but the ISO→Flores map (and the friendly-name
+`SUPPORTED_LANGUAGES` the `translate-subtitles` endpoint validated against) only
+listed 23 — so picking, say, Czech/Greek/Hebrew/Persian was rejected outright,
+and an auto-detected *source* outside the 23 silently failed. Both maps now cover
+~100 common languages (kept in sync), the endpoint guard accepts any
+Flores-capable target (capability, not a short name list), and the Upload
+language dropdown was widened to match.
+
+**No source-language leftovers for any pair.** The completeness retry was
+CJK-only — it caught Japanese left in an English track but not, e.g., English
+left in a German track. It now flags an untranslated cue for ANY pair (output
+still in a CJK source script when the target isn't CJK, OR a substantial cue the
+engine echoed back unchanged) and retries it per-cue (which chunks long inputs).
+The offline path has no early-stop cap; the rate-limit/consecutive-failure bail
+only ever lived in the unused LLM translator, never in the NMT path. Net: the
+persisted `translated_transcript` (what the UI shows when a target is set) is
+fully in the user's chosen language.
+
+---
+
 # ClipAI — Complete offline translation + AI post-edit, and no phantom speaker color
 
 Three fixes from a `ja→en` run whose subtitles came back half-Japanese with a

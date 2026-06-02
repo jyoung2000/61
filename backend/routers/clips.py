@@ -1360,6 +1360,7 @@ async def clip_diagnostics(job_id: str):
 async def translate_subtitles(job_id: str, req: TranslateRequest):
     """Translate the transcript for a job into a target language."""
     from backend.services.translator import SUPPORTED_LANGUAGES, TranslationFailedError
+    from backend.services.nmt_translator import iso_to_flores
     from backend.services.ai_orchestrator import AIOrchestrator
     from backend.services.pipeline import translate_offline
 
@@ -1367,7 +1368,10 @@ async def translate_subtitles(job_id: str, req: TranslateRequest):
     if not job or not job.transcript:
         raise HTTPException(404, "Job not found or has no transcript")
 
-    if req.target_language not in SUPPORTED_LANGUAGES:
+    # Accept any language the offline NMT engine can actually handle (its
+    # Flores-200 map), not just those with a friendly name — so the user is
+    # never blocked from picking a target the engine supports.
+    if req.target_language not in SUPPORTED_LANGUAGES and not iso_to_flores(req.target_language):
         raise HTTPException(400, f"Unsupported language: {req.target_language}")
 
     orchestrator = AIOrchestrator()
