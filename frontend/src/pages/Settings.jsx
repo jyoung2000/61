@@ -80,7 +80,7 @@ export default function Settings() {
   const [providerResults, setProviderResults] = useState({});
 
   // Per-task model selection
-  const [availableModels, setAvailableModels] = useState({ transcript: [], primary: [], editorial: [] });
+  const [availableModels, setAvailableModels] = useState({ transcript: [], primary: [], editorial: [], translation: [] });
   const [currentModels, setCurrentModels] = useState({ transcript_model: '', primary_model: '', editorial_model: '', editorial_model_fallback: '', translation_model: '' });
   const [pendingModels, setPendingModels] = useState({ transcript_model: '', primary_model: '', editorial_model: '', editorial_model_fallback: '', translation_model: '' });
   // Configured vs actually-loaded Whisper model (so the Settings page shows
@@ -492,6 +492,10 @@ export default function Settings() {
           transcript: data.transcript || [],
           primary: data.primary || data.vision || [],
           editorial: data.editorial || data.text || [],
+          // Translation-capable subset (reasoning/'thinking' + image/audio
+          // generators filtered out by the backend). Falls back to the full
+          // text list if an older backend doesn't return it.
+          translation: data.translation || data.editorial || data.text || [],
         });
       }
       // Build the saved-model state from BOTH sources. The editorial
@@ -2032,11 +2036,11 @@ export default function Settings() {
               />
               <ModelDropdown
                 task="translation"
-                models={availableModels.editorial}
+                models={availableModels.translation}
                 pendingValue={pendingModels.translation_model}
                 savedValue={currentModels.translation_model}
                 label="Translation AI (OpenRouter)"
-                desc="Used only for subtitle translation (e.g. Japanese → English). Pick a translation-strong OpenRouter model here; transcript polishing stays on the Editorial AI above. Leave blank to reuse the Editorial AI model."
+                desc="Used only for subtitle translation (e.g. Japanese → English). Only translation-capable models are listed (reasoning/'thinking' and image/audio models are excluded). Offline NMT is tried first; this is the cloud fallback. Leave blank to reuse the Editorial AI model."
               />
 
               {/* ── Save Button ── */}

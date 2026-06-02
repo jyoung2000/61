@@ -1851,6 +1851,38 @@ def _current_translation_model() -> str:
     return ""
 
 
+# Model-id markers for reasoning / "thinking" models. Their chain-of-thought
+# output breaks the strict JSON-array the batch translator parses, so they are
+# unusable for subtitle translation (the '…-1.2b-thinking:free' the user hit).
+_REASONING_ID_MARKERS = (
+    "thinking", "reasoning", "deepseek-r1", "qwq", ":r1", "-r1-", "/r1",
+)
+
+
+def _is_translation_capable(model_id: str, output_modalities=None) -> bool:
+    """True when a model is usable for SUBTITLE TRANSLATION.
+
+    OpenRouter's catalog is all text-I/O chat models, so the classes that
+    cannot be used for the batch JSON translation task — and that should not
+    appear in the Translation AI dropdown — are:
+      * generators that also OUTPUT image/audio (not a text-translation tool), and
+      * reasoning / 'thinking' models, whose chain-of-thought breaks the strict
+        JSON-array the translator parses.
+    Editorial polishing keeps the full text list; this only governs translation.
+    """
+    mid = (model_id or "").lower()
+    if output_modalities:
+        om = [str(x).lower() for x in output_modalities]
+        if "image" in om or "audio" in om:
+            return False
+    if any(tok in mid for tok in _REASONING_ID_MARKERS):
+        return False
+    leaf = mid.rsplit("/", 1)[-1]
+    if leaf in ("o1", "o3") or leaf.startswith(("o1-", "o3-", "o4-")):
+        return False
+    return True
+
+
 @router.get("/providers/models/available")
 async def available_models():
     """Return all available models grouped by task (transcript, vision, text).
@@ -1859,6 +1891,9 @@ async def available_models():
     transcript = list(_WHISPER_MODELS)
     vision = []
     text = []
+    # Translation AI dropdown: only models that can actually translate
+    # (text-output chat models, no reasoning/'thinking' or image/audio gens).
+    translation = []
 
     # Always add the OpenRouter free auto-router at the top
     if _key_is_set(settings.OPENROUTER_API_KEY):
@@ -1871,7 +1906,9 @@ async def available_models():
             **_auto_speed,
         }
         vision.append(dict(_auto))
-        text.append({**_auto, **_estimate_speed("openrouter/free", "text", True)})
+        _auto_text = {**_auto, **_estimate_speed("openrouter/free", "text", True)}
+        text.append(_auto_text)
+        translation.append(dict(_auto_text))
 
     # Fetch OpenRouter models
     all_models = await _fetch_openrouter_models() if _key_is_set(settings.OPENROUTER_API_KEY) else None
@@ -1911,9 +1948,12 @@ async def available_models():
 
             t_cost = _cost_per_hour(m, "text")
             t_speed = _estimate_speed(mid, "text", is_free)
-            text.append({**entry_base, "cost_per_hour": round(t_cost, 4),
-                         "desc": f"{'FREE' if is_free else f'~${t_cost:.3f}/hr'} — {ctx:,} ctx",
-                         **t_speed})
+            _t_entry = {**entry_base, "cost_per_hour": round(t_cost, 4),
+                        "desc": f"{'FREE' if is_free else f'~${t_cost:.3f}/hr'} — {ctx:,} ctx",
+                        **t_speed}
+            text.append(_t_entry)
+            if _is_translation_capable(mid, arch.get("output_modalities")):
+                translation.append(dict(_t_entry))
 
     # Add direct provider models if keys are set
     if _key_is_set(settings.ANTHROPIC_API_KEY):
@@ -1923,7 +1963,10 @@ async def available_models():
                      "desc": f"Direct Anthropic API — {m['context_length']:,} ctx"}
             if m.get("vision"):
                 vision.append({**entry, **_estimate_speed(mid, "vision", False)})
-            text.append({**entry, **_estimate_speed(mid, "text", False)})
+            _t = {**entry, **_estimate_speed(mid, "text", False)}
+            text.append(_t)
+            if _is_translation_capable(mid):
+                translation.append(dict(_t))
 
     if _key_is_set(settings.GEMINI_API_KEY):
         for m in _GEMINI_MODELS:
@@ -1932,7 +1975,10 @@ async def available_models():
                      "desc": f"Direct Gemini API — {m['context_length']:,} ctx"}
             if m.get("vision"):
                 vision.append({**entry, **_estimate_speed(mid, "vision", False)})
-            text.append({**entry, **_estimate_speed(mid, "text", False)})
+            _t = {**entry, **_estimate_speed(mid, "text", False)}
+            text.append(_t)
+            if _is_translation_capable(mid):
+                translation.append(dict(_t))
 
     # Add Ollama local models if Ollama is in the chain and reachable
     _VISION_FAMILIES = {"llava", "moondream", "bakllava", "minicpm-v", "llava-llama3", "llava-phi3", "nanollava"}
@@ -1989,6 +2035,8 @@ async def available_models():
                                 vision.append(entry)
                         # All models can do text
                         text.append(entry)
+                        if _is_translation_capable(entry["id"]):
+                            translation.append(dict(entry))
         except Exception as e:
             logger.warning("Failed to fetch Ollama models for available list: %s", e)
 
@@ -2024,6 +2072,8 @@ async def available_models():
             if _is_vision:
                 vision.append(_def_entry)
             text.append(_def_entry)
+            if _is_translation_capable(_def_id):
+                translation.append(dict(_def_entry))
             _ollama_seen_ids.add(_def_id)
 
     # Sort: free first, then newer + cheaper towards the top
@@ -2036,6 +2086,7 @@ async def available_models():
 
     vision.sort(key=_sort_key)
     text.sort(key=_sort_key)
+    translation.sort(key=_sort_key)
 
     # Limit to top 100 per category to avoid overwhelming the UI
     # Return current models based on which provider is primary.
@@ -2059,6 +2110,9 @@ async def available_models():
         "transcript": transcript,
         "vision": vision[:100],
         "text": text[:100],
+        # Translation AI dropdown — text models minus reasoning/'thinking' and
+        # image/audio generators that can't be used for subtitle translation.
+        "translation": translation[:100],
         "current": {
             "transcript_model": settings.WHISPER_MODEL,
             "vision_model": current_vision,
