@@ -68,10 +68,13 @@ def _run(coro):
 #  Task 1 — NMT convert bug: temp-dir then atomic rename
 # ════════════════════════════════════════════════════════════════════════
 
-def _install_fake_converter(monkeypatch, *, boom: bool = False):
+def _install_fake_converter(monkeypatch, *, boom: bool = False, with_tokenizer: bool = True):
     """Install a fake ``ctranslate2.converters`` whose ``convert`` mimics the
-    REAL behaviour: it refuses a pre-existing output dir unless force=True.
-    With ``boom=True`` it writes a partial dir then raises (interrupted DL)."""
+    REAL behaviour: it refuses a pre-existing output dir unless force=True, and
+    (like real CTranslate2) writes ``model.bin`` + vocab but the SentencePiece
+    tokenizer only when ``with_tokenizer`` (real CT2 does NOT — see the
+    tokenizer-fetch test). With ``boom=True`` it writes a partial dir then
+    raises (interrupted DL)."""
     mod = types.ModuleType("ctranslate2.converters")
 
     class _Converter:
@@ -91,8 +94,9 @@ def _install_fake_converter(monkeypatch, *, boom: bool = False):
             os.makedirs(out_dir, exist_ok=False)
             with open(os.path.join(out_dir, "model.bin"), "wb") as f:
                 f.write(b"X" * 64)
-            with open(os.path.join(out_dir, "sentencepiece.bpe.model"), "wb") as f:
-                f.write(b"Y" * 32)
+            if with_tokenizer:
+                with open(os.path.join(out_dir, "sentencepiece.bpe.model"), "wb") as f:
+                    f.write(b"Y" * 32)
 
     mod.TransformersConverter = _Converter
     monkeypatch.setitem(sys.modules, "ctranslate2.converters", mod)
@@ -149,6 +153,74 @@ def test_convert_failure_cleans_up_and_unblocks_retry(monkeypatch, tmp_path):
     _install_fake_converter(monkeypatch, boom=False)
     nmt._convert_with_cleanup("m", target, "NLLB")
     assert _model_present(target)
+
+
+def test_convert_fetches_missing_tokenizer(monkeypatch, tmp_path):
+    """Real CTranslate2 writes model.bin but NOT the .spm tokenizer the runtime
+    needs — without it the model is on disk yet is_available() is False and the
+    job silently falls back to the LLM (the user's 599 MB-model-no-tokenizer
+    stall). The convert must fetch + save the tokenizer alongside the model."""
+    monkeypatch.setattr(nmt, "_models_dir", lambda: str(tmp_path / "models"))
+    _install_fake_converter(monkeypatch, with_tokenizer=False)
+
+    # Stand-in HF download → returns a path to a fake sentencepiece file.
+    import huggingface_hub
+    src_spm = tmp_path / "src_sentencepiece.bpe.model"
+    src_spm.write_bytes(b"SPM" * 100)
+
+    def _fake_dl(model_id, filename, *a, **k):
+        if filename == "sentencepiece.bpe.model":
+            return str(src_spm)
+        raise FileNotFoundError(filename)
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", _fake_dl)
+
+    target = str(tmp_path / "models" / "nllb" / "m")
+    nmt._convert_with_cleanup(
+        "facebook/nllb-200-distilled-600M", target, "NLLB",
+        tokenizer_files=("sentencepiece.bpe.model",),
+    )
+    # Both files present → _model_files_present() would now be True.
+    assert os.path.exists(os.path.join(target, "model.bin"))
+    assert os.path.exists(os.path.join(target, "sentencepiece.bpe.model"))
+
+
+def test_ensure_nllb_repairs_missing_tokenizer_without_reconvert(monkeypatch, tmp_path):
+    """A pre-fix model dir (model.bin, no tokenizer) is repaired by fetching the
+    ~5 MB tokenizer — NOT by re-downloading + re-converting 2.4 GB."""
+    monkeypatch.setattr(nmt, "_models_dir", lambda: str(tmp_path / "models"))
+    model_id = "facebook/nllb-200-distilled-600M"
+    target = nmt._nllb_dir(model_id)
+    os.makedirs(target, exist_ok=True)
+    with open(os.path.join(target, "model.bin"), "wb") as f:
+        f.write(b"X" * 64)  # model present, tokenizer absent (the broken state)
+
+    import huggingface_hub
+    src = tmp_path / "spm"
+    src.write_bytes(b"SPM" * 50)
+
+    def _fake_dl(mid, filename, *a, **k):
+        if filename == "sentencepiece.bpe.model":
+            return str(src)
+        raise FileNotFoundError(filename)
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", _fake_dl)
+
+    # The converter must NOT run for a tokenizer-only repair.
+    boom = types.ModuleType("ctranslate2.converters")
+
+    class _Boom:
+        def __init__(self, *a, **k):
+            raise AssertionError("convert must NOT run during a tokenizer-only repair")
+    boom.TransformersConverter = _Boom
+    monkeypatch.setitem(sys.modules, "ctranslate2.converters", boom)
+    # _has_dependencies() probes these — provide light stand-ins so the repair's
+    # final check passes without a real ctranslate2/sentencepiece install.
+    monkeypatch.setitem(sys.modules, "ctranslate2", types.ModuleType("ctranslate2"))
+    monkeypatch.setitem(sys.modules, "sentencepiece", types.ModuleType("sentencepiece"))
+
+    out = nmt.ensure_nllb_downloaded(model_id)
+    assert os.path.exists(os.path.join(out, "model.bin"))
+    assert os.path.exists(os.path.join(out, "sentencepiece.bpe.model"))
 
 
 def test_torch_load_guard_neutralised_during_convert(monkeypatch):

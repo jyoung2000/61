@@ -1,3 +1,26 @@
+# ClipAI — Offline NMT: save the SentencePiece tokenizer with the converted model
+
+The torch.load fix let the NLLB convert succeed (log: `converted to int8 … kept
+599.4 MB`), but translation *still* fell back to a stalling Ollama path. Cause:
+CTranslate2's converter writes `model.bin` + the CT2 vocab but **not** the
+SentencePiece tokenizer the runtime needs, so `NMTTranslator._model_files_present`
+was False → `pick_local_engine("ja","en")` returned None → `NMT: no local model …
+unsupported — caller will fall back to the LLM` (the `:free` model was correctly
+skipped, then `qwen2.5:3b` limped through 59/78 segments with JSON parse errors).
+
+Fix:
+- The convert now fetches the tokenizer alongside the model — `sentencepiece.bpe.model`
+  for NLLB, `source.spm`/`target.spm`/`vocab.json` for Opus-MT — reusing the HF
+  snapshot the convert already pulled (a copy, not a re-download).
+- `ensure_nllb_downloaded` **fails loud** if the tokenizer (or `ctranslate2` /
+  `sentencepiece`) is still missing, instead of silently falling back to the LLM.
+- **Repair shortcut:** an existing `model.bin` with no tokenizer (the broken
+  state already on the user's `/data`) is fixed by fetching just the ~5 MB
+  tokenizer — no 2.4 GB re-convert. So the next run self-heals and translates
+  offline via NLLB (Ollama is never reached).
+
+---
+
 # ClipAI — Translation AI dropdown filter + translation-readability polish
 
 Two follow-up requests after the offline-NMT fix:

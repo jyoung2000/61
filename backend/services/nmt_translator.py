@@ -656,7 +656,41 @@ def apply_glossary(source_text: str, translated_text: str, glossary: dict) -> st
 
 # ── Download helpers (for the Settings UI button) ─────────────────────────
 
-def _convert_with_cleanup(model_id: str, target_dir: str, label: str) -> None:
+def _fetch_tokenizer_into(model_id: str, out_dir: str, candidates) -> bool:
+    """Copy the SentencePiece tokenizer file(s) the runtime loader needs into
+    ``out_dir``.
+
+    CTranslate2's ``TransformersConverter`` writes ``model.bin`` + the CT2 vocab
+    but NOT the ``.spm`` tokenizer file. Without it the model is on disk yet
+    ``NMTTranslator._model_files_present`` is False, so ``pick_local_engine``
+    returns None and the engine silently falls back to the LLM even though the
+    convert "succeeded" (the 599 MB model with no tokenizer). Best-effort per
+    file; returns True if at least one landed. Call INSIDE the HF-cache redirect
+    so the snapshot the convert already pulled is reused (no re-download)."""
+    try:
+        from huggingface_hub import hf_hub_download
+    except Exception as e:
+        logger.warning("NMT: huggingface_hub unavailable to fetch tokenizer (%s)", e)
+        return False
+    got = False
+    for fname in candidates:
+        dest = os.path.join(out_dir, fname)
+        if os.path.exists(dest):
+            got = True
+            continue
+        try:
+            src = hf_hub_download(model_id, fname)
+            shutil.copyfile(src, dest)
+            got = True
+            logger.info("NMT: saved tokenizer file '%s' alongside the converted model", fname)
+        except Exception as e:
+            logger.debug("NMT: tokenizer file '%s' not in %s (%s)", fname, model_id, e)
+    return got
+
+
+def _convert_with_cleanup(
+    model_id: str, target_dir: str, label: str, tokenizer_files=(),
+) -> None:
     """Convert ``model_id`` to an int8 CTranslate2 model at ``target_dir``.
 
     Network: the converter pulls the source weights from Hugging Face, so
@@ -699,6 +733,11 @@ def _convert_with_cleanup(model_id: str, target_dir: str, label: str) -> None:
             converter = TransformersConverter(model_id)
             with _allow_trusted_torch_load():
                 converter.convert(convert_dir, quantization="int8", force=False)
+            # CT2 writes model.bin + vocab but NOT the SentencePiece tokenizer
+            # the runtime needs — copy it in now, while the HF snapshot the
+            # convert pulled is still cached (so this is a copy, not a download).
+            if tokenizer_files:
+                _fetch_tokenizer_into(model_id, convert_dir, tokenizer_files)
         # Promote atomically. If a stale/partial target exists, rename it ASIDE
         # first (atomic, same volume) rather than rmtree-ing it in place: a
         # rmtree(ignore_errors=True) that silently fails to fully clear the dir
@@ -760,12 +799,49 @@ def ensure_nllb_downloaded(
     if NMTTranslator._model_files_present(model_id):
         logger.info("NLLB %s already downloaded at %s", model_id, target_dir)
         return target_dir
+    # Repair shortcut: a prior convert (before the tokenizer-save fix) may have
+    # left a 599 MB model.bin with NO SentencePiece tokenizer — fetch just the
+    # ~5 MB tokenizer instead of re-downloading + re-converting 2.4 GB.
+    if os.path.exists(os.path.join(target_dir, "model.bin")):
+        logger.info(
+            "NLLB %s present but tokenizer missing — fetching tokenizer only "
+            "(repair, no full re-convert)", model_id)
+        try:
+            with _hf_cache_redirect():
+                _fetch_tokenizer_into(model_id, target_dir, ("sentencepiece.bpe.model",))
+        except Exception as _rep_err:
+            logger.warning("NMT: tokenizer repair failed (%s) — re-converting", _rep_err)
+        if NMTTranslator._model_files_present(model_id):
+            logger.info("NLLB %s repaired (tokenizer added) at %s", model_id, target_dir)
+            return target_dir
+        logger.warning("NLLB %s tokenizer repair did not complete — re-converting", model_id)
     _require_free_space(target_dir, _NLLB_MIN_FREE_BYTES, f"NLLB ({model_id})")
     logger.info(
         "NMT: downloading + converting NLLB %s (one-time, ~600 MB int8) → %s",
         model_id, target_dir,
     )
-    _convert_with_cleanup(model_id, target_dir, f"NLLB {model_id}")
+    _convert_with_cleanup(
+        model_id, target_dir, f"NLLB {model_id}",
+        tokenizer_files=("sentencepiece.bpe.model",),
+    )
+    # Fail LOUD if the SentencePiece tokenizer didn't land — otherwise the model
+    # is on disk yet pick_local_engine() returns None and the job silently falls
+    # back to the LLM (the '599 MB model, no tokenizer' regression).
+    if not NMTTranslator._model_files_present(model_id):
+        present = sorted(os.listdir(target_dir)) if os.path.isdir(target_dir) else []
+        raise RuntimeError(
+            f"NLLB {model_id} converted but the model dir is missing a required "
+            f"file (have: {present}). Need model.bin + a SentencePiece tokenizer "
+            f"(sentencepiece.bpe.model)."
+        )
+    # Files are present — confirm the runtime deps too, so a missing
+    # sentencepiece surfaces clearly instead of another silent LLM fallback.
+    if not NMTTranslator._has_dependencies():
+        raise RuntimeError(
+            "NLLB converted but ctranslate2 + sentencepiece are not BOTH "
+            "importable at runtime — offline NMT can't load. Ensure "
+            "'sentencepiece' is installed in the image."
+        )
     return target_dir
 
 
@@ -788,7 +864,16 @@ def ensure_opus_mt_downloaded(source: str, target: str) -> str:
         "NMT: downloading + converting Opus-MT %s (one-time) → %s",
         model_id, target_dir,
     )
-    _convert_with_cleanup(model_id, target_dir, f"Opus-MT {src}-{tgt}")
+    _convert_with_cleanup(
+        model_id, target_dir, f"Opus-MT {src}-{tgt}",
+        tokenizer_files=("source.spm", "target.spm", "vocab.json"),
+    )
+    if not os.path.exists(os.path.join(target_dir, "source.spm")):
+        present = sorted(os.listdir(target_dir)) if os.path.isdir(target_dir) else []
+        raise RuntimeError(
+            f"Opus-MT {src}-{tgt} converted but the SentencePiece tokenizer "
+            f"(source.spm) is missing (have: {present})."
+        )
     _touch_opus_pair(src, tgt)
     # Prune least-recently-used pairs beyond the cap now that a new one landed.
     _enforce_opus_pair_cap()
