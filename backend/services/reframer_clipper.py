@@ -940,6 +940,25 @@ Respond ONLY with JSON:
 {{"start": "MM:SS", "end": "MM:SS", "hook_timestamp": "MM:SS", "needs_trim": true/false, "trim_suggestion": "MM:SS-MM:SS", "confidence": 0.0-1.0, "title": "...", "hashtags": ["...", "...", "..."], "reason": "..."}}"""
 
 
+def _is_rate_limited_error(exc) -> bool:
+    """True when a Replicate error is an upstream rate-limit / throttle (429).
+
+    These can't be retried away within a job (the account's per-minute budget is
+    exhausted), so the discovery should stop hammering Replicate and fall back to
+    the signal-based clips instead of grinding every chunk through 429 retries.
+    """
+    s = str(exc).lower()
+    return (
+        "429" in s
+        or "too many requests" in s
+        or "rate limit" in s
+        or "rate-limit" in s
+        or "throttl" in s
+        or "reduced to" in s          # "...rate limit ... is reduced to N requests..."
+        or "quota" in s
+    )
+
+
 class ReplicateDiscoveryV3:
     """VideoLLaMA3-enhanced cloud GPU discovery.
 
@@ -1017,6 +1036,11 @@ class ReplicateDiscoveryV3:
 
         os.environ["REPLICATE_API_TOKEN"] = self.api_key
         t_start_total = _time.time()
+        # Circuit breaker: once Replicate returns a 429/throttle, stop sending
+        # the remaining chunks (and skip the refine/keyframe passes) so a
+        # rate-limited account doesn't hang clip detection for many minutes —
+        # the caller falls back to the signal-based clips instead.
+        self._rate_limited = threading.Event()
 
         model_ref = self._resolve_model_version(replicate_sdk)
         duration_s = _get_video_duration(video_path)
@@ -1092,8 +1116,9 @@ class ReplicateDiscoveryV3:
         coarse_count = len(all_candidates)
 
         # ── Step 4: refinement pass on top candidates ──
+        # Skip when rate-limited — more Replicate calls would just 429 too.
         refined_count = 0
-        if self.refinement_enabled and all_candidates:
+        if self.refinement_enabled and all_candidates and not self._rate_limited.is_set():
             try:
                 refined_count = self._refinement_pass(
                     replicate_sdk, model_ref, video_path, signal_timeline,
@@ -1103,7 +1128,7 @@ class ReplicateDiscoveryV3:
                 logger.warning("VideoLLaMA3-V3: refinement pass failed (%s) — using coarse results", e)
 
         # ── Step 5: optional keyframe image analysis on top candidates ──
-        if self.keyframe_analysis and all_candidates:
+        if self.keyframe_analysis and all_candidates and not self._rate_limited.is_set():
             try:
                 self._keyframe_pass(
                     replicate_sdk, model_ref, video_path, signal_timeline,
@@ -1349,6 +1374,14 @@ class ReplicateDiscoveryV3:
         chunk_idx, n_total,
         timeline_idx=None, n_timeline=None,
     ):
+        # Circuit breaker tripped by an earlier chunk's 429 — skip all work
+        # (no fps probe, no upload, no Replicate call) and fall back to signals.
+        if getattr(self, "_rate_limited", None) is not None and self._rate_limited.is_set():
+            logger.info(
+                "VideoLLaMA3-V3: coarse pass chunk %d/%d skipped (Replicate rate-limited)",
+                chunk_idx, n_total,
+            )
+            return []
         chunk_path = None
         chunk_fps = self._compute_chunk_fps(signal_timeline, start_s, end_s)
         t_start = _time.time()
@@ -1406,10 +1439,20 @@ class ReplicateDiscoveryV3:
             return candidates
 
         except Exception as e:
-            logger.warning(
-                "VideoLLaMA3-V3: coarse pass chunk %d/%d%s failed: %s",
-                chunk_idx, n_total, timeline_suffix, e,
-            )
+            if _is_rate_limited_error(e) and getattr(self, "_rate_limited", None) is not None:
+                if not self._rate_limited.is_set():
+                    self._rate_limited.set()
+                    logger.warning(
+                        "VideoLLaMA3-V3: Replicate rate-limited (429) on chunk %d/%d%s — "
+                        "skipping remaining chunks and the refine/keyframe passes; "
+                        "falling back to signal-based clips.",
+                        chunk_idx, n_total, timeline_suffix,
+                    )
+            else:
+                logger.warning(
+                    "VideoLLaMA3-V3: coarse pass chunk %d/%d%s failed: %s",
+                    chunk_idx, n_total, timeline_suffix, e,
+                )
             return []
         finally:
             if chunk_path and os.path.exists(chunk_path):

@@ -71,4 +71,5 @@ jobs:
             tests/test_transcription_translation_redesign.py \
             tests/test_translate_step_reliability.py \
             tests/test_whisper_native_translate.py \
+            tests/test_clip_detection_graceful.py \
             backend/tests/test_translation_fail_loud.py

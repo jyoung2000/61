@@ -3510,9 +3510,24 @@ async def _run_analysis_inner(job_id: str):
                 except Exception:
                     pass  # best-effort — never break clip extraction
 
-            raw_clips = await asyncio.to_thread(clip_extractor.run, _clipper_progress)
+            # Hard cap so clip detection can never hang the job indefinitely
+            # (e.g. the VLM can't load + Replicate is rate-limited). The clipper
+            # already trips a 429 circuit breaker and always has the signal-based
+            # pass; this is the last-resort backstop — on timeout we continue
+            # with no VLM clips rather than leaving the UI stuck.
+            raw_clips = await asyncio.wait_for(
+                asyncio.to_thread(clip_extractor.run, _clipper_progress),
+                timeout=_SUMMARY_CLIP_TIMEOUT,
+            )
             clips = to_fez_clips(raw_clips)
             logger.info("[%s] Clip extraction produced %d clips", job_id, len(clips))
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[%s] Clip detection exceeded %ds — continuing without clips "
+                "(check VLM VRAM / Replicate rate limits).",
+                job_id, _SUMMARY_CLIP_TIMEOUT,
+            )
+            clips = []
         except Exception as _ce:
             logger.exception("[%s] Clip extraction failed: %s", job_id, _ce)
             clips = []

@@ -18,9 +18,11 @@ const STAGE_COLORS = {
   seo:           '#64748b', // slate
 };
 
+// Order matches the backend pipeline: translation runs right after conversion
+// (so clips/summary use the translated transcript) and BEFORE the summary.
 const STAGE_ORDER = [
   'metadata', 'extraction', 'face_detection', 'transcription',
-  'diarization', 'conversion', 'summary', 'translation', 'clips', 'saving',
+  'diarization', 'conversion', 'translation', 'summary', 'clips', 'saving',
 ];
 
 function fmtElapsed(secs) {
