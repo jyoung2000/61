@@ -541,17 +541,22 @@ def test_translation_capability_filter():
 
 
 # ════════════════════════════════════════════════════════════════════════
-#  Translation polish — readability only, preserve meaning + timing
+#  Translation post-edit (MTPE) — fluent rewrite, preserve meaning + timing
 # ════════════════════════════════════════════════════════════════════════
 
-def test_translation_polish_mode_is_readability_only():
+def test_translation_polish_mode_is_mt_post_editing():
     import backend.services.transcript_polisher as tp
     batch = [{"index": 0, "text": "the colony destroyed by enemy", "start": 1.0, "end": 3.0}]
     asr = tp._build_user_prompt(batch, [], [], "en", None, mode="asr")
     tr = tp._build_user_prompt(batch, [], [], "en", None, mode="translation")
-    # Translation prompt is readability-only and NOT Whisper/ASR-framed.
+    # MTPE prompt: natural-rewrite framed, NOT Whisper/ASR/phonetic framed.
     assert "phonetic" not in tr.lower() and "whisper" not in tr.lower()
-    assert "re-translate" in tr.lower() and "meaning" in tr.lower()
+    assert "post-edit" in tr.lower() and "natural" in tr.lower()
+    assert "meaning" in tr.lower()
+    # It still forbids translating into a DIFFERENT language (no re-translation).
+    assert "re-translate" in tr.lower()
+    # Friendly target-language name surfaces (not the bare ISO code).
+    assert "English" in tr
     # The ASR prompt keeps its phonetic-correction framing.
     assert "phonetic" in asr.lower() or "whisper" in asr.lower()
     # Distinct translation system prompt that still forbids timing changes.
@@ -560,6 +565,22 @@ def test_translation_polish_mode_is_readability_only():
     # CJK target → CJK punctuation guidance, never Western punctuation.
     tr_ja = tp._build_user_prompt(batch, [], [], "ja", None, mode="translation")
     assert "。" in tr_ja
+
+
+def test_translation_mtpe_includes_source_reference_when_provided():
+    """When source lines are threaded in, the MTPE prompt shows each draft line
+    NEXT TO its original source so mistranslations can be repaired."""
+    import backend.services.transcript_polisher as tp
+    batch = [{"index": 0, "text": "the colony destroyed by enemy", "start": 1.0, "end": 3.0}]
+    src = ["連合に反目するコロニー"]
+    tr = tp._build_user_prompt(batch, [], [], "en", None, source_texts=src, mode="translation")
+    # The source line is embedded and labelled, and the prompt tells the model
+    # to treat it as ground truth (not to translate from scratch).
+    assert "連合に反目するコロニー" in tr
+    assert "source" in tr.lower() and "ground truth" in tr.lower()
+    # Without source, no source field is injected.
+    tr_nosrc = tp._build_user_prompt(batch, [], [], "en", None, mode="translation")
+    assert "連合に反目するコロニー" not in tr_nosrc
 
 
 def test_translation_runs_before_summary_and_clips_in_pipeline():
@@ -589,3 +610,95 @@ def test_resegment_splits_runon_into_one_utterance_cues():
     assert len(out) == 3
     for a, b in zip(out, out[1:]):
         assert a.end <= b.start + 1e-6  # monotonic, non-overlapping
+
+
+# ════════════════════════════════════════════════════════════════════════
+#  Offline NMT completeness — long-cue chunking + source-script retry
+# ════════════════════════════════════════════════════════════════════════
+
+def test_flores_is_cjk_and_looks_cjk():
+    assert nmt._flores_is_cjk("jpn_Jpan") is True
+    assert nmt._flores_is_cjk("zho_Hans") is True
+    assert nmt._flores_is_cjk("kor_Hang") is True
+    assert nmt._flores_is_cjk("eng_Latn") is False
+    assert nmt._flores_is_cjk(None) is False
+    # _looks_cjk flags untranslated source text, not English output.
+    assert nmt._looks_cjk("連合に反目するコロニー居住者たち") is True
+    assert nmt._looks_cjk("rebel colonists opposed to the Alliance") is False
+    assert nmt._looks_cjk("") is False
+
+
+def test_split_for_nmt_breaks_long_runon_into_bounded_chunks():
+    # A long Japanese run-on (no sentence punctuation) must still be split so
+    # NLLB never receives an over-long input that truncates to source.
+    runon = "あ" * 300
+    chunks = nmt._split_for_nmt(runon, max_chars=80, cjk=True)
+    assert len(chunks) >= 4
+    assert all(len(c) <= 80 for c in chunks)
+    assert "".join(chunks) == runon  # order-preserving, lossless
+    # Sentence-terminated text breaks at 。 boundaries, keeping the terminator.
+    sented = "これは一文。" * 30
+    out = nmt._split_for_nmt(sented, max_chars=40, cjk=True)
+    assert all(len(c) <= 40 for c in out)
+    assert "".join(out) == sented
+    # Short text is returned as-is (single chunk).
+    assert nmt._split_for_nmt("短い", max_chars=80, cjk=True) == ["短い"]
+
+
+def test_nmt_completeness_retries_leftover_source_script(monkeypatch):
+    """A cue the batched pass leaves in the SOURCE script is retried per-cue and
+    recovered — the offline engine never returns untranslated Japanese."""
+    seg_ok = TranscriptSegment(text="連合", start=0.0, end=1.0, speaker="Speaker 1")
+    seg_long = TranscriptSegment(text="あ" * 120, start=1.0, end=3.0, speaker="Speaker 1")
+
+    class _FakeNLLB(nmt.NMTTranslator):
+        def __init__(self):
+            self.model_id = "fake/nllb"
+            self._loaded = True
+
+        def translate_with_context(self, batch, cb, ca, src, tgt, glossary=None):
+            # Short cue translates; the long run-on is "dropped" (kept source).
+            return ["UNION" if t == "連合" else t for t in batch]
+
+        def translate_batch(self, texts, source_lang=None, target_lang=None, glossary=None):
+            return ["(recovered)" for _ in texts]  # per-cue retry succeeds
+
+        def unload(self):
+            pass
+
+    monkeypatch.setattr(nmt, "pick_local_engine", lambda s, t: _FakeNLLB())
+    out = _run(translator._translate_via_nmt(
+        [seg_ok, seg_long], "ja", "en", None, autodownload=False))
+    assert out is not None
+    assert out[0].text == "UNION"
+    # The long cue was recovered by the completeness pass (no Japanese left).
+    assert out[1].text == "(recovered)"
+    assert not nmt._looks_cjk(out[1].text)
+
+
+def test_nmt_completeness_skips_when_target_is_cjk(monkeypatch):
+    """For an X→CJK target, untranslated-source detection is meaningless, so the
+    completeness retry must not fire (output script == target script)."""
+    seg = TranscriptSegment(text="hello", start=0.0, end=1.0, speaker="Speaker 1")
+    calls = {"retry": 0}
+
+    class _FakeNLLB(nmt.NMTTranslator):
+        def __init__(self):
+            self.model_id = "fake/nllb"
+            self._loaded = True
+
+        def translate_with_context(self, batch, cb, ca, src, tgt, glossary=None):
+            return ["こんにちは" for _ in batch]
+
+        def translate_batch(self, texts, source_lang=None, target_lang=None, glossary=None):
+            calls["retry"] += 1
+            return ["こんにちは" for _ in texts]
+
+        def unload(self):
+            pass
+
+    monkeypatch.setattr(nmt, "pick_local_engine", lambda s, t: _FakeNLLB())
+    out = _run(translator._translate_via_nmt(
+        [seg], "en", "ja", None, autodownload=False))
+    assert out is not None and out[0].text == "こんにちは"
+    assert calls["retry"] == 0  # no completeness retry for a CJK target

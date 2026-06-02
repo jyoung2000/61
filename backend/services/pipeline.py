@@ -1234,9 +1234,11 @@ async def _polish_transcript_loop(
     Japanese / Chinese text) and asynchronously from
     ``_background_post_processing`` if a critical-path run is skipped.
 
-    ``mode='translation'`` polishes ALREADY-translated subtitles for
-    readability only (preserve meaning + timing, never re-translate); the
-    default ``mode='asr'`` is the Whisper-accuracy correction profile.
+    ``mode='translation'`` post-edits ALREADY-translated subtitles toward
+    natural phrasing (preserve meaning + timing, never re-translate into another
+    language); the default ``mode='asr'`` is the Whisper-accuracy correction
+    profile. (The translation post-edit now runs as a dedicated source-aligned
+    pass in ``_background_post_processing``; this loop stays mode-agnostic.)
     """
     from backend.models import TranscriptSegment as _TS
 
@@ -1735,29 +1737,48 @@ async def _background_post_processing(
                 raise RuntimeError(
                     "translation produced 0 changed segments — keeping source transcript")
 
-            # ── (b) LLM polish on the TRANSLATED text (correction_lang=target) ──
-            # Readability-only mode: the OpenRouter editorial model polishes the
-            # already-translated lines for readability WITHOUT re-translating or
-            # altering meaning/timing (offline NMT did the translation).
-            logger.info("[%s] Polish START on translated text (lang=%s, %d segments, readability-only)",
-                        job_id, target_lang, len(translated))
-            try:
-                _pol_models, _pol_report = await _polish_transcript_loop(
-                    job_id,
-                    [t.model_dump() if hasattr(t, "model_dump") else dict(t) for t in translated],
-                    orchestrator, target_lang,
-                    mode="translation",
-                )
-                if _pol_models:
-                    translated = _pol_models
+            # ── (b) AI post-edit on the TRANSLATED text (MT post-editing) ──
+            # Offline NMT produced the base translation; the editorial LLM now
+            # POLISHES that rough draft toward natural, professional subtitles —
+            # closing the quality gap WITHOUT doing the translation itself. This
+            # is ONE source-aligned pass (the readability reflow is steps (c)/(c-
+            # cont) below), so the model can post-edit each draft line against
+            # its ORIGINAL source line (the ground truth for meaning).
+            from backend.services.transcript_polisher import correct_transcript as _mtpe
+            # Source↔draft alignment holds only for the offline-NMT path (1:1);
+            # Whisper-native emits its own cue count, so drop the source ref then.
+            _src_texts = [getattr(s, "text", "") or "" for s in _trans_input]
+            if _used_whisper_native or len(_src_texts) != len(translated):
+                _src_texts = None
+            # Respect the master AI-correction switch (the old polish loop gated
+            # on it too); when off, keep the raw NMT draft.
+            if not getattr(settings, "AI_TRANSCRIPT_CORRECTION", True):
+                logger.info("[%s] AI post-edit skipped (AI_TRANSCRIPT_CORRECTION off) — "
+                            "keeping NMT draft", job_id)
+            else:
                 logger.info(
-                    "[%s] Polish DONE on translated text: %d segments, readability %s",
-                    job_id, len(translated),
-                    f"{_pol_report.get('score', 0):.1f}/100" if _pol_report else "(no score)",
+                    "[%s] AI post-edit START on translated text (lang=%s, %d segments, "
+                    "MT post-editing%s)",
+                    job_id, target_lang, len(translated),
+                    ", source-aligned" if _src_texts is not None else "",
                 )
-            except Exception as _pol_err:
-                logger.warning("[%s] Post-translation polish failed (%s) — keeping translated text",
-                               job_id, _pol_err)
+                try:
+                    _pol = await asyncio.wait_for(
+                        _mtpe(
+                            translated, orchestrator,
+                            job_id=job_id, language=target_lang,
+                            source_texts=_src_texts, source_language=source_lang,
+                            mode="translation",
+                        ),
+                        timeout=max(600, len(translated) * 8),
+                    )
+                    if _pol:
+                        translated = _pol
+                    logger.info("[%s] AI post-edit DONE on translated text: %d segments",
+                                job_id, len(translated))
+                except Exception as _pol_err:
+                    logger.warning("[%s] Post-translation AI post-edit failed (%s) — keeping NMT draft",
+                                   job_id, _pol_err)
 
             # ── (c) Sentence resegmentation in the target language ──
             if getattr(settings, "SENTENCE_SEGMENTATION_ENABLED", True):

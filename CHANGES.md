@@ -1,3 +1,46 @@
+# ClipAI — Complete offline translation + AI post-edit, and no phantom speaker color
+
+Three fixes from a `ja→en` run whose subtitles came back half-Japanese with a
+duplicate speaker swatch.
+
+**Duplicate speaker colors.** Non-speech cues (`[♪ music ♪]`) are emitted with
+an EMPTY speaker. The transcript-derived speaker list (`Analysis.jsx`,
+`TranscriptViewer.jsx`) included that empty string as a distinct "speaker", so it
+rendered as a phantom, unnamed swatch whose palette-by-position color collided
+with a real speaker's — the two identical oranges. Both speaker lists now skip
+blank/whitespace speakers (and de-dupe after trim).
+
+**Translation left long cues untranslated.** The log said `70/78 changed → en`,
+but the 8 misses were the long run-on cues (Whisper loops) — and those dominate
+by volume, so the output read as mostly Japanese once the readability splitter
+fanned them out. NLLB was handed each long cue whole, exceeding the fixed
+256-token decode cap, and a failed cue silently kept its source text. Now the
+offline engine is made *complete*:
+
+  * `NMTTranslator`/`OpusMTTranslator` CHUNK over-long source cues at sentence →
+    clause → hard boundaries before translating, and scale the decode budget
+    with input length (was a fixed 256) — so a long run-on can't truncate into
+    untranslated source.
+  * `translate_with_context` skips the fragile context-join (which loses its `¶`
+    markers when long) and goes per-segment for long batches.
+  * A **completeness pass** in `_translate_via_nmt` detects any cue still in the
+    source script (non-CJK target) and retries it per-cue (which chunks), so the
+    offline engine never returns source-language text. Still offline-only — the
+    AI is never called to translate.
+
+**AI polishing now closes the quality gap (MTPE).** Per request, the offline NMT
+still does the base translation, but the editorial LLM step is now machine-
+translation *post-editing* instead of "readability-only": it aggressively
+rewrites the rough NMT draft into natural, professional subtitles while
+preserving meaning, line count, and timing. It runs as ONE dedicated, source-
+aligned pass (the readability reflow stays in the steps after it), so each draft
+line is shown next to its ORIGINAL source line as ground truth — letting the
+model repair mistranslations without translating from scratch. The translation-
+mode length guards were loosened (no word-count clamp) so fluent rewrites aren't
+rejected. Gated on `AI_TRANSCRIPT_CORRECTION` as before.
+
+---
+
 # ClipAI — Offline NMT uses the GPU when there's room (4 GB card), CPU fallback
 
 A `ja→en` run finally translated offline via NLLB end-to-end (tokenizer fix

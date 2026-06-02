@@ -76,6 +76,98 @@ def iso_to_flores(code: str) -> Optional[str]:
     return _FLORES_CODES.get(code.strip().lower())
 
 
+# ── Script helpers + long-cue chunking ───────────────────────────────────
+# CJK / no-space Flores script suffixes (joined without spaces on output).
+_CJK_SCRIPTS = {"Jpan", "Hans", "Hant", "Hang", "Hira", "Kana", "Bopo"}
+
+# Source-length caps (chars) before a cue is chunked for NMT. NLLB decodes
+# ~200 source tokens reliably; beyond that the output is truncated at
+# max_decoding_length and a long run-on comes back UNtranslated. CJK is denser
+# (~1.5 tokens/char) so it gets a tighter cap than Latin scripts.
+_MAX_SRC_CHARS_CJK = 80
+_MAX_SRC_CHARS_LATIN = 300
+
+_SENT_SPLIT_RE = re.compile(r".*?(?:[。．！？!?…]+|$)", re.DOTALL)
+_CLAUSE_CHARS = "、，,；;:："
+
+
+def _flores_is_cjk(flores_code: Optional[str]) -> bool:
+    """True when a Flores-200 code targets a CJK / no-space script."""
+    return bool(flores_code) and flores_code.rsplit("_", 1)[-1] in _CJK_SCRIPTS
+
+
+def _looks_cjk(text: str) -> bool:
+    """Heuristic: >= 30% of non-space chars are CJK ideographs / kana / hangul.
+
+    Used to detect a cue that came back UNtranslated (still in the source
+    script) so the completeness pass can retry it.
+    """
+    if not text:
+        return False
+    cjk = 0
+    total = 0
+    for ch in text:
+        if ch.isspace():
+            continue
+        total += 1
+        o = ord(ch)
+        if (
+            0x3040 <= o <= 0x30FF   # hiragana / katakana
+            or 0x3400 <= o <= 0x4DBF   # CJK ext A
+            or 0x4E00 <= o <= 0x9FFF   # CJK unified ideographs
+            or 0xAC00 <= o <= 0xD7A3   # hangul syllables
+        ):
+            cjk += 1
+    return total > 0 and (cjk / total) >= 0.30
+
+
+def _hard_split(text: str, max_chars: int, cjk: bool) -> list[str]:
+    """Last-resort split of an over-long sentence at clause separators (or
+    spaces, for Latin scripts), falling back to fixed-width slices."""
+    out: list[str] = []
+    buf = ""
+    seps = _CLAUSE_CHARS if cjk else _CLAUSE_CHARS + " "
+    for ch in text:
+        buf += ch
+        if len(buf) >= max_chars:
+            cut = max((buf.rfind(s) for s in seps), default=-1)
+            if cut >= max_chars // 2:
+                out.append(buf[: cut + 1])
+                buf = buf[cut + 1:]
+            else:
+                out.append(buf)
+                buf = ""
+    if buf:
+        out.append(buf)
+    return out
+
+
+def _split_for_nmt(text: str, max_chars: int, cjk: bool) -> list[str]:
+    """Split an over-long source cue into <= ``max_chars`` pieces at
+    sentence -> clause -> hard boundaries, so NMT never truncates a long
+    run-on into an UNtranslated source line. Order-preserving."""
+    text = (text or "").strip()
+    if len(text) <= max_chars:
+        return [text] if text else []
+    sentences = [m.group(0) for m in _SENT_SPLIT_RE.finditer(text) if m.group(0).strip()]
+    pieces: list[str] = []
+    buf = ""
+    for s in sentences:
+        if len(buf) + len(s) <= max_chars:
+            buf += s
+            continue
+        if buf:
+            pieces.append(buf)
+            buf = ""
+        if len(s) <= max_chars:
+            buf = s
+        else:
+            pieces.extend(_hard_split(s, max_chars, cjk))
+    if buf:
+        pieces.append(buf)
+    return [p.strip() for p in pieces if p.strip()]
+
+
 # ── Disk locations ────────────────────────────────────────────────────────
 
 def _models_dir() -> str:
@@ -494,26 +586,52 @@ class NMTTranslator:
                 results.append(raw)
                 continue
             try:
-                tokens = self._tokenizer.encode_as_pieces(text)
-                source = [flores_src] + tokens + ["</s>"]
-                output = self._translator.translate_batch(
-                    [source],
-                    target_prefix=[[flores_tgt]],
-                    beam_size=4,
-                    max_decoding_length=256,
-                )
-                pieces = output[0].hypotheses[0]
-                # Drop the language token prefix.
-                if pieces and pieces[0] == flores_tgt:
-                    pieces = pieces[1:]
-                translated = self._tokenizer.decode(pieces)
+                translated = self._translate_text(text, flores_src, flores_tgt)
                 if glossary:
                     translated = apply_glossary(text, translated, glossary)
-                results.append(translated)
+                results.append(translated if translated.strip() else raw)
             except Exception as e:
                 logger.warning("NMT: translation failed for one segment (%s) — keeping original", e)
                 results.append(raw)
         return results
+
+    def _translate_text(self, text: str, flores_src: str, flores_tgt: str) -> str:
+        """Translate one cue, CHUNKING over-long input so a long run-on never
+        truncates into an untranslated source line, then rejoining."""
+        cjk_src = _flores_is_cjk(flores_src)
+        max_chars = _MAX_SRC_CHARS_CJK if cjk_src else _MAX_SRC_CHARS_LATIN
+        chunks = _split_for_nmt(text, max_chars, cjk_src)
+        if not chunks:
+            return text
+        joiner = "" if _flores_is_cjk(flores_tgt) else " "
+        parts: list[str] = []
+        for ch in chunks:
+            try:
+                parts.append(self._translate_chunk(ch, flores_src, flores_tgt))
+            except Exception as e:
+                logger.debug("NMT: chunk translate failed (%s) — keeping chunk source", e)
+                parts.append(ch)
+        return joiner.join(p for p in parts if p).strip()
+
+    def _translate_chunk(self, text: str, flores_src: str, flores_tgt: str) -> str:
+        tokens = self._tokenizer.encode_as_pieces(text)
+        source = [flores_src] + tokens + ["</s>"]
+        # Scale the decode budget with input length — the English of a long
+        # Japanese line far exceeds the old fixed 256-token cap (which silently
+        # truncated long cues) — but keep a ceiling so a degenerate input can't
+        # run away.
+        max_dec = min(512, max(128, len(tokens) * 3))
+        output = self._translator.translate_batch(
+            [source],
+            target_prefix=[[flores_tgt]],
+            beam_size=4,
+            max_decoding_length=max_dec,
+        )
+        pieces = output[0].hypotheses[0]
+        # Drop the language token prefix.
+        if pieces and pieces[0] == flores_tgt:
+            pieces = pieces[1:]
+        return self._tokenizer.decode(pieces)
 
     def translate_with_context(
         self,
@@ -539,6 +657,13 @@ class NMTTranslator:
         joined = sep.join(context_before + batch + context_after).strip()
         if not joined:
             return list(batch)
+        # A long joined string would itself be chunked (losing the ¶ markers, so
+        # the split below misaligns) or truncated by the decoder. When it exceeds
+        # one safe chunk, skip the context-join trick and translate per-segment —
+        # ``translate_batch`` chunks each long cue, guaranteeing completeness.
+        cap = _MAX_SRC_CHARS_CJK if _looks_cjk(joined) else _MAX_SRC_CHARS_LATIN
+        if len(joined) > cap:
+            return self.translate_batch(batch, source_lang, target_lang, glossary=glossary)
         translated_joined = self.translate_batch(
             [joined], source_lang, target_lang, glossary=glossary,
         )[0]
@@ -631,6 +756,7 @@ class OpusMTTranslator:
             return []
         if not self._loaded:
             self.load()
+        tgt_cjk = self.target.split("-")[0] in ("ja", "zh", "ko", "yue")
         results: list[str] = []
         for raw in texts:
             text = (raw or "").strip()
@@ -638,14 +764,21 @@ class OpusMTTranslator:
                 results.append(raw)
                 continue
             try:
-                tokens = self._tokenizer.encode_as_pieces(text)
-                output = self._translator.translate_batch(
-                    [tokens + ["</s>"]],
-                    beam_size=4,
-                    max_decoding_length=256,
-                )
-                pieces = output[0].hypotheses[0]
-                translated = self._tokenizer.decode(pieces)
+                src_cjk = _looks_cjk(text)
+                max_chars = _MAX_SRC_CHARS_CJK if src_cjk else _MAX_SRC_CHARS_LATIN
+                chunks = _split_for_nmt(text, max_chars, src_cjk) or [text]
+                joiner = "" if tgt_cjk else " "
+                parts: list[str] = []
+                for ch in chunks:
+                    tokens = self._tokenizer.encode_as_pieces(ch)
+                    max_dec = min(512, max(128, len(tokens) * 3))
+                    output = self._translator.translate_batch(
+                        [tokens + ["</s>"]],
+                        beam_size=4,
+                        max_decoding_length=max_dec,
+                    )
+                    parts.append(self._tokenizer.decode(output[0].hypotheses[0]))
+                translated = (joiner.join(p for p in parts if p).strip()) or text
                 if glossary:
                     translated = apply_glossary(text, translated, glossary)
                 results.append(translated)

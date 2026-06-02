@@ -1656,7 +1656,12 @@ export default function Analysis() {
   const speakers = useMemo(() => {
     const sp = [];
     (job?.transcript || []).forEach((seg) => {
-      if (!sp.includes(seg.speaker)) sp.push(seg.speaker);
+      // Non-speech cues (e.g. "[♪ music ♪]") carry an EMPTY speaker. Skipping
+      // blank/whitespace speakers (and de-duping after trim) keeps the empty
+      // string from showing up as a phantom, unnamed swatch whose palette color
+      // collides with a real speaker's — the "two duplicate colors" bug.
+      const name = (seg?.speaker == null ? '' : String(seg.speaker)).trim();
+      if (name && !sp.includes(name)) sp.push(name);
     });
     return sp;
   }, [job?.transcript]);

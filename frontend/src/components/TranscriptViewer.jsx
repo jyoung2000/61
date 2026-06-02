@@ -120,11 +120,14 @@ export default function TranscriptViewer({ transcript, onSeek, jobId, onSpeakerR
   const [insertEnd, setInsertEnd] = useState('');
   const [insertSaving, setInsertSaving] = useState(false);
 
-  // Build ordered list of unique speakers and assign colors by position
+  // Build ordered list of unique speakers and assign colors by position.
+  // Skip blank/whitespace speakers (non-speech cues like "[♪ music ♪]" carry an
+  // empty speaker) so they never render as a phantom, unnamed color swatch.
   const speakers = useMemo(() => {
     const seen = [];
     transcript.forEach((seg) => {
-      if (!seen.includes(seg.speaker)) seen.push(seg.speaker);
+      const name = (seg?.speaker == null ? '' : String(seg.speaker)).trim();
+      if (name && !seen.includes(name)) seen.push(name);
     });
     return seen;
   }, [transcript]);

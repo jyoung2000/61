@@ -486,6 +486,7 @@ async def _translate_via_nmt(
         from backend.services.nmt_translator import (
             pick_local_engine, auto_download_for_pair,
             NMTTranslator, OpusMTTranslator,
+            iso_to_flores, _flores_is_cjk, _looks_cjk,
         )
     except Exception as e:
         logger.warning("NMT module unavailable: %s", e)
@@ -569,6 +570,42 @@ async def _translate_via_nmt(
                         await res
                 except Exception:
                     pass
+
+        # ── Completeness pass: re-translate any cue still in the SOURCE script ──
+        # A long run-on can exceed the decoder and come back untranslated (the
+        # engine keeps the source for a failed cue). For a non-CJK target, detect
+        # leftover source-script cues and retry them in ISOLATION — the per-cue
+        # path chunks long inputs, so it succeeds where the batched / context-
+        # joined pass did not. Offline-only; the AI is never called here.
+        if not _flores_is_cjk(iso_to_flores(target_language)):
+            leftover = [i for i, t in enumerate(out)
+                        if _looks_cjk(getattr(t, "text", "") or "")]
+            if leftover:
+                logger.info(
+                    "NMT: completeness pass — %d/%d cue(s) still in source script, "
+                    "retrying per-cue", len(leftover), len(out),
+                )
+                recovered = 0
+                for i in leftover:
+                    orig = segments[i]
+                    src_text = getattr(orig, "text", "") or ""
+                    if not src_text.strip():
+                        continue
+                    try:
+                        if isinstance(engine, NMTTranslator):
+                            retry = engine.translate_batch(
+                                [src_text], source_language, target_language, glossary=glossary)
+                        else:
+                            retry = engine.translate_batch([src_text], glossary=glossary)
+                    except Exception as _re:
+                        logger.debug("NMT: completeness retry failed for cue %d (%s)", i, _re)
+                        continue
+                    new_text = (retry[0] if retry else "") or ""
+                    if new_text.strip() and not _looks_cjk(new_text):
+                        out[i] = _apply_batch_translations([orig], [new_text])[0]
+                        recovered += 1
+                logger.info("NMT: completeness pass recovered %d/%d cue(s)",
+                            recovered, len(leftover))
     finally:
         try:
             engine.unload()

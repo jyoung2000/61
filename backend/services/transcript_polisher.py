@@ -62,32 +62,58 @@ _SYSTEM_PROMPT = (
     "6. The array length must equal the input segment count.\n"
 )
 
-# Translation-polish persona — used when polishing subtitles that have ALREADY
-# been translated into the target language (offline NMT does the translation;
-# the OpenRouter editorial model only polishes for readability here). Same hard
-# invariants as above (segment count, timing, no re-translation), but the
-# objective is the READABILITY of the translation, NOT phonetic ASR correction —
-# so it never "corrects" already-correct translated words or alters meaning.
+# Translation-polish persona — machine-translation post-editing (MTPE). A
+# separate OFFLINE engine (NLLB / Opus-MT) produces the base translation; that
+# raw output is often stilted or grammatically rough. The editorial model's job
+# here is to POLISH that draft toward natural, professional subtitles — closing
+# the quality gap WITHOUT doing the translation itself. It is aggressive on
+# fluency/grammar/word-choice but strict on meaning, line count, and timing.
+# When the ORIGINAL source line is supplied alongside the draft, the source is
+# the ground truth for meaning (so mistranslations can be repaired).
 _SYSTEM_PROMPT_TRANSLATION = (
-    "You are a subtitle readability editor. You receive subtitle lines that "
-    "have ALREADY been translated into the target language by a separate "
-    "translation engine. Your ONLY job is to make each line read naturally and "
-    "cleanly WITHOUT changing its meaning.\n\n"
-    "You MAY: fix punctuation, capitalisation and spacing; fix obvious "
-    "machine-translation grammar glitches (articles, plural / verb agreement, "
-    "awkward word order within a phrase); make stilted phrasing read naturally.\n"
-    "You MUST NOT: re-translate, change the meaning, paraphrase into different "
-    "wording, add or remove information, merge or split lines, reorder ideas, or "
-    "change timing.\n\n"
+    "You are a professional subtitle localization editor doing machine-"
+    "translation post-editing (MTPE). You receive subtitle lines that an OFFLINE "
+    "translation engine has already translated into the target language. That raw "
+    "draft is often stilted, awkward, or grammatically rough. Rewrite each line "
+    "so it reads like a professional human subtitler wrote it — natural, "
+    "idiomatic, fluent target language — while preserving the original meaning.\n\n"
+    "When the ORIGINAL source line is provided next to the draft, treat the "
+    "source as the ground truth for MEANING and use it to repair mistranslations, "
+    "dropped words, wrong pronouns/subjects, and garbled names in the draft. You "
+    "are EDITING the draft, not translating from scratch.\n\n"
+    "You MAY (and should): rephrase awkward machine-translation wording into "
+    "natural target language; fix grammar, agreement, articles, tense, and word "
+    "order; choose idiomatic vocabulary; fix punctuation and capitalisation; "
+    "correct proper nouns; tighten verbose phrasing to subtitle length.\n"
+    "You MUST NOT: re-translate into a different language; change the meaning of "
+    "a line; add information not in the source/draft; merge or split lines; "
+    "reorder lines; or change timing.\n\n"
     "STRICT RULES (must follow every time):\n"
-    "1. Return EXACTLY the same number of segments you receive. Never merge or "
-    "split — only edit the text inside each.\n"
-    "2. Preserve the meaning of each line EXACTLY. If a line already reads "
-    "cleanly, return it UNCHANGED. When unsure, keep the original.\n"
-    "3. Never change timing — those fields are not in your output.\n"
-    "4. Return ONLY a JSON array of strings, no preamble, no markdown.\n"
-    "5. The array length must equal the input segment count.\n"
+    "1. Return EXACTLY the same number of lines you receive, in order — one "
+    "rewritten line per input segment. Never merge or split.\n"
+    "2. Each output line must be in the TARGET language only — never leave "
+    "source-language words (except proper nouns with no target form).\n"
+    "3. Preserve the meaning of every line. When unsure, keep the draft.\n"
+    "4. Never change timing — those fields are not in your output.\n"
+    "5. Return ONLY a JSON array of strings, no preamble, no markdown.\n"
+    "6. The array length must equal the input segment count.\n"
 )
+
+# Friendly target-language names for the MTPE prompt (ISO 639-1 → English name).
+_LANG_NAMES = {
+    "en": "English", "es": "Spanish", "fr": "French", "de": "German",
+    "it": "Italian", "pt": "Portuguese", "ru": "Russian", "ja": "Japanese",
+    "ko": "Korean", "zh": "Chinese", "ar": "Arabic", "hi": "Hindi",
+    "nl": "Dutch", "pl": "Polish", "tr": "Turkish", "vi": "Vietnamese",
+    "th": "Thai", "uk": "Ukrainian", "sv": "Swedish", "id": "Indonesian",
+    "ms": "Malay", "tl": "Filipino",
+}
+
+
+def _lang_name(code: str) -> str:
+    """Friendly language name for prompts ('en' → 'English')."""
+    c = (code or "").strip().lower().split("-")[0]
+    return _LANG_NAMES.get(c, code or "the target language")
 
 # ── Filler-word patterns by language ──────────────────────────────────────
 _EN_FILLERS = re.compile(
@@ -193,13 +219,16 @@ def _build_user_prompt(
     context_after: list[dict],
     language: str,
     glossary_terms: Optional[list[str]] = None,
+    source_texts: Optional[list[str]] = None,
     mode: str = "asr",
 ) -> str:
     """Assemble the per-batch user message with surrounding context.
 
-    ``mode='translation'`` polishes already-translated subtitles for readability
-    only (preserving meaning + timing); ``mode='asr'`` (default) is the
-    Whisper-accuracy correction profile.
+    ``mode='translation'`` post-edits an already-translated draft toward natural,
+    professional subtitles (aggressive on fluency, strict on meaning + timing);
+    when ``source_texts`` is given, each draft line is shown next to its ORIGINAL
+    source line so mistranslations can be repaired. ``mode='asr'`` (default) is
+    the Whisper-accuracy correction profile.
     """
     lang_hint = (
         f"\nLanguage: {language}\n"
@@ -226,23 +255,32 @@ def _build_user_prompt(
                 "says something else."
             )
     if mode == "translation":
-        # Readability-only profile for ALREADY-translated subtitles. Offline
-        # NMT did the translation; the LLM must NOT re-translate or change
-        # meaning — only make the existing translation read cleanly.
+        # MT post-editing profile. A separate OFFLINE engine produced the base
+        # translation; the LLM rewrites that rough draft into natural,
+        # professional subtitles WITHOUT doing the translation itself —
+        # aggressive on fluency/grammar/word-choice, strict on meaning, count,
+        # and timing. When the source line is supplied it is the ground truth.
+        tgt_name = _lang_name(language)
         rules.append(
-            "PRIMARY OBJECTIVE: improve the READABILITY of these already-"
-            "translated subtitle lines — punctuation, capitalisation, spacing, "
-            "and obvious machine-translation grammar glitches — while keeping "
-            "the MEANING of every line exactly the same."
+            "PRIMARY OBJECTIVE: post-edit each machine-translated subtitle line "
+            "into natural, fluent, idiomatic " + tgt_name + " that reads like "
+            "professional human subtitles. Aggressively fix stilted machine-"
+            "translation phrasing, grammar, agreement, tense, articles, word "
+            "choice, and word order — while preserving the original meaning."
         )
+        if source_texts is not None:
+            rules.append(
+                'Each segment gives the ORIGINAL source line ("source") and the '
+                'machine-translation draft ("text"). Use the source as the ground '
+                "truth for MEANING: repair mistranslations, restore dropped "
+                "meaning, fix wrong subjects/pronouns, and correct names. Edit "
+                "the draft — do NOT translate from scratch — and output ONLY the "
+                "polished " + tgt_name + " line (never the source text)."
+            )
         rules.append(
-            "DO NOT re-translate, change the meaning, paraphrase into different "
-            "wording, summarise, expand, or add / remove information. If a line "
-            "already reads cleanly, return it VERBATIM."
-        )
-        rules.append(
-            "Keep exactly one line per input segment — never merge or split — "
-            "and never change timing."
+            "Do NOT re-translate into a different language, change the meaning, "
+            "add information, merge or split lines, reorder, or change timing. "
+            "Keep exactly one line per input segment."
         )
         if language.lower() in _CJK_LANGS:
             rules.append(
@@ -251,9 +289,9 @@ def _build_user_prompt(
             )
         else:
             rules.append(
-                "Fix obvious grammar / agreement and homophones (their/there, "
-                "your/you're) ONLY where clearly wrong — never reword a line "
-                "that is already correct."
+                "Output must be entirely in " + tgt_name + " — never leave "
+                "source-language words untranslated (except proper nouns that "
+                "have no accepted " + tgt_name + " form)."
             )
     elif preserve:
         # Accuracy-focused profile: the polisher's job is to bridge the
@@ -355,7 +393,14 @@ def _build_user_prompt(
     batch_items = []
     for i, s in enumerate(batch):
         t = (s.get("text") or "").strip()
-        batch_items.append({"index": i, "text": t})
+        item = {"index": i, "text": t}
+        # MTPE with source reference: show the original line so the model edits
+        # the draft against the source meaning instead of translating blind.
+        if mode == "translation" and source_texts is not None and i < len(source_texts):
+            src_line = (source_texts[i] or "").strip()
+            if src_line:
+                item["source"] = src_line
+        batch_items.append(item)
 
     prompt = (
         f"{lang_hint}"
@@ -405,12 +450,14 @@ async def _polish_batch(
     language: str,
     timeout: float,
     glossary_terms: Optional[list[str]] = None,
+    source_texts: Optional[list[str]] = None,
     mode: str = "asr",
 ) -> Optional[list[str]]:
     """Polish a single batch via the editorial LLM. Returns None on failure
     so the caller can keep the originals."""
     user_prompt = _build_user_prompt(
-        batch, context_before, context_after, language, glossary_terms, mode=mode)
+        batch, context_before, context_after, language, glossary_terms,
+        source_texts=source_texts, mode=mode)
     system_prompt = _SYSTEM_PROMPT_TRANSLATION if mode == "translation" else _SYSTEM_PROMPT
     full_prompt = f"[SYSTEM]\n{system_prompt}\n\n[USER]\n{user_prompt}"
     try:
@@ -436,13 +483,18 @@ async def correct_transcript(
     progress_callback: Optional[Callable[[int], Any]] = None,
     timeout_per_batch: float = 90.0,
     glossary_terms: Optional[list[str]] = None,
+    source_texts: Optional[list[str]] = None,
+    source_language: str = "",
     mode: str = "asr",
 ) -> list:
     """Polish a transcript using the editorial LLM in batches.
 
-    ``mode='translation'`` polishes already-translated subtitles for readability
-    only (preserve meaning + timing, never re-translate); ``mode='asr'``
-    (default) is the Whisper-accuracy correction profile.
+    ``mode='translation'`` post-edits an already-translated draft toward natural,
+    professional subtitles (aggressive on fluency, strict on meaning + timing,
+    never re-translates into another language). When ``source_texts`` is given
+    (aligned 1:1 with ``segments``), each draft line is shown next to its
+    ORIGINAL source line so the model can repair mistranslations against the
+    source. ``mode='asr'`` (default) is the Whisper-accuracy correction profile.
 
     Drop-in replacement for ``compat_stubs.correct_transcript`` — same
     signature, same return shape. When ``TRANSCRIPT_POLISHING_ENABLED``
@@ -484,6 +536,15 @@ async def correct_transcript(
 
     polished_out: list = []
     total = len(batches)
+    # Length tolerance by profile. ASR/preserve modes keep the tight band +
+    # word-count clamp so the model can't paraphrase. MT post-editing
+    # (mode='translation') is SUPPOSED to rephrase the rough draft into fluent
+    # subtitles, so it gets a generous band and NO word-count clamp — clamping
+    # would reject exactly the fluent rewrites we want; only gross runaway
+    # (likely hallucination) is rejected.
+    preserve_mode = getattr(settings, "TRANSCRIPT_PRESERVE_WORDS", True)
+    len_max_ratio = 1.5 if preserve_mode else 3.0
+    len_min_ratio = 0.6 if preserve_mode else 0.3
     for idx, batch_pairs in enumerate(batches):
         batch = [pair[0] for pair in batch_pairs]
         # Sliding 3-segment context windows (separate from the
@@ -492,47 +553,48 @@ async def correct_transcript(
         ctx_before = [v[0] for v in views[ctx_before_start: idx * batch_size]]
         ctx_after_start = (idx + 1) * batch_size
         ctx_after = [v[0] for v in views[ctx_after_start: ctx_after_start + 3]]
+        # Source reference for MTPE, sliced to match this batch (aligned 1:1
+        # with ``segments``). None when no source was threaded in.
+        batch_src = None
+        if source_texts is not None:
+            _bs = idx * batch_size
+            batch_src = source_texts[_bs: _bs + len(batch)]
 
         polished_texts = await _polish_batch(
             orchestrator, batch, ctx_before, ctx_after,
             language=language, timeout=timeout_per_batch,
-            glossary_terms=glossary_terms, mode=mode,
+            glossary_terms=glossary_terms, source_texts=batch_src, mode=mode,
         )
 
-        # Length tolerance depends on the polish profile. In the
-        # default ``preserve=True`` (accuracy-focused) path the prompt
-        # explicitly forbids restructuring and bounds word count at
-        # ±15 %; tighten the rejection thresholds to match so the
-        # model can't silently drift into paraphrase territory. In
-        # the ``preserve=False`` (full editing) path the model is
-        # allowed to drop fillers and merge fragments so leave the
-        # legacy looser bounds.
-        # Translation polish is readability-only, so hold it to the tight
-        # (preserve) length band + word-count guard regardless of the global
-        # TRANSCRIPT_PRESERVE_WORDS setting, so the LLM can't drift into
-        # paraphrase / re-translation.
-        preserve_mode = (mode == "translation") or getattr(settings, "TRANSCRIPT_PRESERVE_WORDS", True)
-        len_max_ratio = 1.5 if preserve_mode else 3.0
-        len_min_ratio = 0.6 if preserve_mode else 0.3
         for i, (view, orig_obj) in enumerate(batch_pairs):
+            orig_full = view.get("text", "")
             if polished_texts is None:
-                # Fall back: light-touch filler strip rather than nothing.
-                new_text = _light_filler_strip(view.get("text", ""), language)
+                # Batch failed. Keep the MT draft for translation mode; for ASR
+                # fall back to a light-touch filler strip rather than nothing.
+                new_text = (orig_full if mode == "translation"
+                            else _light_filler_strip(orig_full, language))
+                polished_out.append(_emit_segment(orig_obj, new_text))
+                continue
+            cand = polished_texts[i].strip()
+            orig_text = orig_full.strip()
+            if mode == "translation":
+                # Accept fluent rewrites (longer OR terser); reject only empty
+                # output or gross runaway. The 80-char floor lets a short, badly
+                # truncated draft be expanded to a correct full line.
+                if cand and len(cand) <= max(80, len(orig_text) * 3):
+                    new_text = cand
+                else:
+                    new_text = orig_full
             else:
-                cand = polished_texts[i].strip()
-                orig_text = view.get("text", "").strip()
                 orig_len = len(orig_text)
                 # Length-band guard
                 if orig_len > 0 and (
                     len(cand) > orig_len * len_max_ratio
                     or len(cand) < orig_len * len_min_ratio
                 ):
-                    new_text = view.get("text", "")
-                # Word-count guard (preserve mode only) — catches a model
-                # that kept text length but substituted multi-word
-                # paraphrases. Compare token counts via simple whitespace
-                # split; tolerant enough to handle the prompt's ±15 %
-                # allowance plus one or two punctuation-driven shifts.
+                    new_text = orig_full
+                # Word-count guard (preserve mode only) — catches a model that
+                # kept text length but substituted multi-word paraphrases.
                 elif preserve_mode and orig_text:
                     orig_words = orig_text.split()
                     cand_words = cand.split()
@@ -540,11 +602,11 @@ async def correct_transcript(
                         len(cand_words) > len(orig_words) * 1.30
                         or len(cand_words) < len(orig_words) * 0.70
                     ):
-                        new_text = view.get("text", "")
+                        new_text = orig_full
                     else:
-                        new_text = cand if cand else view.get("text", "")
+                        new_text = cand if cand else orig_full
                 else:
-                    new_text = cand if cand else view.get("text", "")
+                    new_text = cand if cand else orig_full
             polished_out.append(_emit_segment(orig_obj, new_text))
 
         if progress_callback:
