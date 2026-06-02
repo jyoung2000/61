@@ -145,6 +145,36 @@ def test_convert_failure_cleans_up_and_unblocks_retry(monkeypatch, tmp_path):
     assert _model_present(target)
 
 
+def test_torch_load_guard_neutralised_during_convert(monkeypatch):
+    """The convert temporarily neutralises transformers' torch<2.6 torch.load
+    CVE guard (so NLLB/Opus-MT .bin checkpoints load on the pinned torch 2.5.1)
+    and restores it afterwards. Uses injected fake transformers modules so it is
+    deterministic without the torch-only real import; the mechanism is also
+    verified against the real transformers guard during development."""
+    def _guard(*a, **k):
+        raise ValueError("torch<2.6 torch.load guard (CVE-2025-32434)")
+    pkg = types.ModuleType("transformers"); pkg.__path__ = []
+    utils = types.ModuleType("transformers.utils"); utils.__path__ = []
+    mu = types.ModuleType("transformers.modeling_utils")
+    iu = types.ModuleType("transformers.utils.import_utils")
+    mu.check_torch_load_is_safe = _guard
+    iu.check_torch_load_is_safe = _guard
+    for name, mod in [("transformers", pkg), ("transformers.utils", utils),
+                      ("transformers.modeling_utils", mu),
+                      ("transformers.utils.import_utils", iu)]:
+        monkeypatch.setitem(sys.modules, name, mod)
+
+    with pytest.raises(ValueError):
+        mu.check_torch_load_is_safe()              # guard fires (simulating torch<2.6)
+    with nmt._allow_trusted_torch_load():
+        mu.check_torch_load_is_safe()              # neutralised at the call-site binding
+        iu.check_torch_load_is_safe()              # and at the definition site
+    assert mu.check_torch_load_is_safe is _guard   # restored after the convert
+    assert iu.check_torch_load_is_safe is _guard
+    with pytest.raises(ValueError):
+        mu.check_torch_load_is_safe()
+
+
 # ════════════════════════════════════════════════════════════════════════
 #  Task 2 — never grind a :free OpenRouter model; offline is the default
 # ════════════════════════════════════════════════════════════════════════

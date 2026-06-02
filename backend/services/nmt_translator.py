@@ -176,6 +176,51 @@ def _hf_cache_redirect():
             logger.warning("NMT: HF cache cleanup skipped (%s)", e)
 
 
+@contextlib.contextmanager
+def _allow_trusted_torch_load():
+    """Neutralise transformers' torch.load CVE guard for the duration of a
+    convert (CVE-2025-32434).
+
+    transformers >= 4.50 refuses ``torch.load`` of a ``pytorch_model.bin`` on
+    torch < 2.6 via ``check_torch_load_is_safe()``. NLLB-200 and Opus-MT ship
+    ONLY ``.bin`` (no safetensors), and this repo pins ``torch==2.5.1+cu121``
+    (torch 2.6 has no cu121 wheel, so bumping it would force a whole CUDA-base
+    migration) — so every offline-NMT convert hit that guard and silently fell
+    back to the LLM. We convert TRUSTED, HTTPS-fetched official HF model-hub
+    checkpoints, loaded with ``weights_only=True`` — precisely the case the
+    guard is over-cautious about (it even skips itself when the caller opts out
+    of safety) — so we temporarily neutralise it.
+
+    Restored afterwards. It is a no-op on torch >= 2.6 (the guard would pass
+    anyway) and harmless if a future transformers renames/removes the symbol.
+    The guard is imported as a module global into ``modeling_utils`` (the call
+    sites), so that binding is the one that must be patched; ``import_utils``
+    (its definition site) is patched too for any other caller.
+    """
+    import importlib
+    saved = []
+    for modname in ("transformers.modeling_utils", "transformers.utils.import_utils"):
+        try:
+            mod = importlib.import_module(modname)
+        except Exception:
+            continue
+        if hasattr(mod, "check_torch_load_is_safe"):
+            saved.append((mod, mod.check_torch_load_is_safe))
+            mod.check_torch_load_is_safe = lambda *a, **k: None
+    if saved:
+        logger.info(
+            "NMT: neutralised transformers' torch<2.6 torch.load guard for a "
+            "trusted HF checkpoint (weights_only=True retained)")
+    try:
+        yield
+    finally:
+        for mod, orig in saved:
+            try:
+                mod.check_torch_load_is_safe = orig
+            except Exception:
+                pass
+
+
 def _require_free_space(target_dir: str, min_free: int, label: str) -> None:
     """Raise ``OSError`` when the volume holding ``target_dir`` lacks
     ``min_free`` bytes — so we fail with a clear message instead of writing a
@@ -652,7 +697,8 @@ def _convert_with_cleanup(model_id: str, target_dir: str, label: str) -> None:
     try:
         with _hf_cache_redirect():
             converter = TransformersConverter(model_id)
-            converter.convert(convert_dir, quantization="int8", force=False)
+            with _allow_trusted_torch_load():
+                converter.convert(convert_dir, quantization="int8", force=False)
         # Promote atomically. If a stale/partial target exists, rename it ASIDE
         # first (atomic, same volume) rather than rmtree-ing it in place: a
         # rmtree(ignore_errors=True) that silently fails to fully clear the dir
