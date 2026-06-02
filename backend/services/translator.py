@@ -41,6 +41,51 @@ def _looks_rate_limited(exc: Exception) -> bool:
     s = str(exc).lower()
     return "429" in s or "rate limit" in s or "rate-limit" in s or "too many requests" in s
 
+
+def _is_free_openrouter_model(spec: str) -> bool:
+    """True when ``spec`` names a FREE OpenRouter model (``…:free``).
+
+    Accepts bare ids (``vendor/model:free``) and provider-prefixed specs
+    (``openrouter:vendor/model:free``)."""
+    s = (spec or "").strip().lower()
+    return bool(s) and s.endswith(":free")
+
+
+def _llm_translation_model_is_free(orchestrator, model_override) -> tuple[bool, str]:
+    """Best-effort: would the LLM translation path call a FREE OpenRouter model?
+
+    Returns ``(is_free, label)``. Free OpenRouter endpoints are rate-limited
+    upstream and only burn a job in 429s, so the router skips them (Task 2).
+    An explicit translation override wins; otherwise we inspect the
+    orchestrator's active provider chain (the model it would actually use),
+    then fall back to the relevant settings. We treat the model as NOT free
+    whenever the first provider the chain would try is not OpenRouter (a paid
+    OpenAI/Anthropic key, or local Ollama) — so the skip only fires when a free
+    OpenRouter endpoint is genuinely what the translator would hit."""
+    if model_override:
+        return (_is_free_openrouter_model(model_override), model_override)
+    try:
+        chain = orchestrator._get_active_chain()
+    except Exception:
+        chain = None
+    if chain:
+        for provider in chain:
+            pname = getattr(provider, "provider_name", "")
+            model = getattr(provider, "text_model_name", "") or ""
+            if pname == "openrouter":
+                return (_is_free_openrouter_model(model), model)
+            # First provider isn't OpenRouter — not the free-grind case.
+            return (False, model)
+    for spec in (
+        getattr(settings, "OPENROUTER_TRANSLATION_MODEL", ""),
+        getattr(settings, "OPENROUTER_EDITORIAL_MODEL", ""),
+        getattr(settings, "EDITORIAL_AI_FALLBACK_SPEC", ""),
+    ):
+        s = (spec or "").strip()
+        if s:
+            return (_is_free_openrouter_model(s), s)
+    return (False, "")
+
 SUPPORTED_LANGUAGES = {
     "en": "English", "es": "Spanish", "fr": "French", "de": "German",
     "it": "Italian", "pt": "Portuguese", "ru": "Russian", "ja": "Japanese",
@@ -626,14 +671,26 @@ async def translate_segments_with_fallback(
     if _or_translation_model:
         logger.info("Subtitle translation will use OpenRouter model override: %s",
                     _or_translation_model)
-    # Free OpenRouter models are rate-limited upstream — warn (don't block) so
-    # the user knows why a translation may stall and what to switch to (Task 2).
-    if _or_translation_model and _or_translation_model.lower().endswith(":free"):
+    # Free OpenRouter models are rate-limited upstream — attempting them only
+    # burns the job in 429s (the reported 10-minute stall). Detect whether the
+    # LLM path would actually call a :free model and, if so, SKIP the OpenRouter
+    # LLM entirely: fall through to the local Ollama model if one is configured,
+    # else fail fast with an actionable reason (Task 2). Offline NMT remains the
+    # real default; this only governs the LLM last-resort path.
+    _is_free, _free_model_label = _llm_translation_model_is_free(
+        orchestrator, _or_translation_model)
+    _skip_openrouter_llm = bool(_is_free)
+    if _skip_openrouter_llm:
+        _has_ollama = bool((getattr(settings, "OLLAMA_TRANSLATION_MODEL", "") or "").strip())
         logger.warning(
-            "Translation model '%s' is a FREE model — these are rate-limited "
-            "upstream and may fail mid-job. For reliable subtitles use offline "
-            "NMT (TRANSLATION_ENGINE=auto/nllb) or a paid/local model.",
-            _or_translation_model,
+            "Translation LLM model '%s' is a FREE OpenRouter model (rate-limited "
+            "upstream) — skipping it to avoid a 429 storm; %s. For reliable "
+            "subtitles use offline NMT (TRANSLATION_ENGINE=auto/nllb) or a "
+            "paid/local model.",
+            _free_model_label,
+            ("falling back to the local Ollama translation model"
+             if _has_ollama else
+             "no local Ollama model is configured, so translation fails fast"),
         )
 
     # ── Cloud NMT engines (DeepL, Google) ──
@@ -673,45 +730,63 @@ async def translate_segments_with_fallback(
     # ``translate_segments`` raises TranslationRateLimitedError on sustained 429s
     # — catch it so we still try the local Ollama fallback, but remember it so a
     # subsequent total failure surfaces the rate-limit reason (Task 2).
+    # When the LLM model is a :free OpenRouter endpoint we skip this block
+    # outright (see _skip_openrouter_llm) — no probe, no 429 grind.
     _rate_limited_err: TranslationRateLimitedError | None = None
-    probe_size = min(10, len(segments))
-    probe_sample = segments[:probe_size]
-    try:
-        probe_result = await translate_segments(
-            probe_sample, source_language, target_language,
-            orchestrator, batch_size=probe_size, glossary=glossary,
-            model_override=_or_translation_model,
-        )
-        probe_changed = sum(1 for t, o in zip(probe_result, probe_sample) if t.text != o.text)
-    except TranslationRateLimitedError as e:
-        logger.error("Orchestrator probe rate-limited: %s — skipping LLM, trying Ollama", e)
-        _rate_limited_err = e
-        probe_changed = 0
-
-    if _rate_limited_err is None and probe_changed > 0:
-        logger.info("Orchestrator probe: %d/%d segments changed — proceeding with full translation",
-                     probe_changed, probe_size)
+    if _skip_openrouter_llm:
+        logger.info(
+            "Skipping the OpenRouter LLM translation attempt (free model '%s') "
+            "— going straight to the local fallback / fail-fast", _free_model_label)
+    else:
+        probe_size = min(10, len(segments))
+        probe_sample = segments[:probe_size]
         try:
-            result = await translate_segments(
-                segments, source_language, target_language,
-                orchestrator, batch_size, progress_callback,
-                glossary=glossary,
+            probe_result = await translate_segments(
+                probe_sample, source_language, target_language,
+                orchestrator, batch_size=probe_size, glossary=glossary,
                 model_override=_or_translation_model,
             )
-            changed = sum(1 for t, o in zip(result, segments) if t.text != o.text)
-            if changed > 0:
-                logger.info("Translation via orchestrator succeeded: %d/%d segments changed", changed, len(segments))
-                return result
+            probe_changed = sum(1 for t, o in zip(probe_result, probe_sample) if t.text != o.text)
         except TranslationRateLimitedError as e:
-            logger.error("Full orchestrator translation rate-limited: %s — trying Ollama", e)
+            logger.error("Orchestrator probe rate-limited: %s — skipping LLM, trying Ollama", e)
             _rate_limited_err = e
-    elif _rate_limited_err is None:
-        logger.info("Orchestrator probe: 0/%d segments changed — skipping full orchestrator attempt",
-                     probe_size)
+            probe_changed = 0
+
+        if _rate_limited_err is None and probe_changed > 0:
+            logger.info("Orchestrator probe: %d/%d segments changed — proceeding with full translation",
+                         probe_changed, probe_size)
+            try:
+                result = await translate_segments(
+                    segments, source_language, target_language,
+                    orchestrator, batch_size, progress_callback,
+                    glossary=glossary,
+                    model_override=_or_translation_model,
+                )
+                changed = sum(1 for t, o in zip(result, segments) if t.text != o.text)
+                if changed > 0:
+                    logger.info("Translation via orchestrator succeeded: %d/%d segments changed", changed, len(segments))
+                    return result
+            except TranslationRateLimitedError as e:
+                logger.error("Full orchestrator translation rate-limited: %s — trying Ollama", e)
+                _rate_limited_err = e
+        elif _rate_limited_err is None:
+            logger.info("Orchestrator probe: 0/%d segments changed — skipping full orchestrator attempt",
+                         probe_size)
 
     # --- Attempt 2: Direct Ollama with dedicated translation model ---
     translation_model = settings.OLLAMA_TRANSLATION_MODEL
     if not translation_model:
+        if _skip_openrouter_llm:
+            # The only LLM was a free, rate-limited model and there's no local
+            # model to fall back to — refuse fast with an actionable reason
+            # rather than relabelling the source as a translation (Task 2).
+            raise TranslationFailedError(
+                f"Translation model '{_free_model_label}' is a free, rate-limited "
+                "OpenRouter model and no offline NMT or local Ollama model is "
+                "available. Enable offline NMT (TRANSLATION_ENGINE=auto with "
+                "NMT_AUTODOWNLOAD on), or configure a paid OPENROUTER_TRANSLATION_MODEL "
+                "or an OLLAMA_TRANSLATION_MODEL."
+            )
         if _rate_limited_err is not None:
             raise _rate_limited_err
         raise RuntimeError("Translation produced no changes and no OLLAMA_TRANSLATION_MODEL configured")

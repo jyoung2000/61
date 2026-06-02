@@ -1706,8 +1706,9 @@ async def _background_post_processing(
             # model gets a specific, actionable message; we NEVER persist the
             # source under translated_transcript (the changed==0 guard above
             # raised, so nothing was relabelled). The pipeline continues to clip
-            # extraction + finalization with the clean (polished) source
-            # transcript, and the failure is surfaced in the job's
+            # extraction + finalization with the polished SOURCE-LANGUAGE
+            # transcript (labelled as such, never as a translation), and the
+            # failure is surfaced in the job's
             # translation_status + pipeline_warnings and over the websocket.
             if isinstance(e, TranslationRateLimitedError):
                 _msg = ("Translation model rate-limited or unavailable — offline "
@@ -1719,7 +1720,8 @@ async def _background_post_processing(
             else:
                 _msg = f"Translation failed: {str(e)[:120]}"
                 _status_label = "translation_failed"
-            logger.error("[%s] %s: %s — keeping clean (source) transcript",
+            logger.error("[%s] %s: %s — keeping the source-language transcript "
+                         "(deduped, NOT a translation)",
                          job_id, _status_label, e, exc_info=True)
             try:
                 _record_pipeline_warning(job_id, f"Subtitle translation failed: {_msg}")
