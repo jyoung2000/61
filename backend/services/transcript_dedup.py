@@ -9,6 +9,20 @@ from __future__ import annotations
 import re
 
 
+def _is_marker_text(s: str) -> bool:
+    """True for a bracketed non-speech caption marker (``[♪ music ♪]``,
+    ``[applause]`` …). Mirrors ``audio_analyzer.is_subtitle_marker`` without
+    importing it, so this module stays dependency-light. Such cues are
+    intentional and language-neutral, so they must NEVER be treated as
+    repetition-loop hallucinations even when several identical ones appear
+    (an episode can have OP + ED + insert songs, i.e. >3 ``[♪ music ♪]`` cues)."""
+    t = (s or "").strip()
+    if not (t.startswith("[") and t.endswith("]")):
+        return False
+    inner = t[1:-1]
+    return ("♪" in t) or (len(inner.split()) <= 2 and inner.replace(" ", "").isalpha())
+
+
 def drop_repetition_loops(
     segments: list,
     text_key: str = "text",
@@ -44,6 +58,10 @@ def drop_repetition_loops(
         raw = (seg.get(text_key, "") or "").strip() if isinstance(seg, dict) else \
             (getattr(seg, text_key, "") or "").strip()
         if not raw:
+            out.append(seg)
+            continue
+        if _is_marker_text(raw):
+            # Intentional non-speech marker — keep every occurrence.
             out.append(seg)
             continue
         key = re.sub(r"\s+", "", raw)

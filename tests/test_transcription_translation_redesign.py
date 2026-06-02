@@ -324,6 +324,21 @@ def test_fuzzy_repetition_loop_collapses_near_identical_long_blocks():
     assert dropped == 6
 
 
+def test_repetition_filter_keeps_all_music_markers():
+    # OP + ED + two insert songs → four identical [♪ music ♪] cues. All must
+    # survive the repetition-loop filter (markers are intentional, not loops).
+    segs = [
+        {"text": "[♪ music ♪]", "start": 26.0, "end": 96.0},
+        {"text": "本編のセリフ", "start": 120.0, "end": 123.0},
+        {"text": "[♪ music ♪]", "start": 300.0, "end": 340.0},
+        {"text": "[♪ music ♪]", "start": 700.0, "end": 760.0},
+        {"text": "[♪ music ♪]", "start": 1300.0, "end": 1380.0},
+    ]
+    kept, dropped = dedup.drop_repetition_loops(segs)
+    assert sum(1 for s in kept if s["text"] == "[♪ music ♪]") == 4
+    assert dropped == 0
+
+
 def test_normalize_text_strips_punctuation():
     assert dedup._normalize_text("fine,") == dedup._normalize_text("fine")
     assert dedup._normalize_text("テスト。") == dedup._normalize_text("テスト、")
