@@ -2880,31 +2880,34 @@ async def _run_analysis_inner(job_id: str):
                 job_id, _re_err,
             )
 
-    # ── Music marking ──
-    # Insert "[♪ music ♪]" marker cues over sustained music regions (OP/ED
-    # themes, insert songs) instead of leaving a gap or letting Whisper
-    # hallucinate lyrics there. Markers are language-neutral and pass through
-    # the translator verbatim. No-ops gracefully if audio/numpy is missing.
+    # ── Music suppression + marking (Task 4) ──
+    # In sustained music-only spans (OP/ED themes, insert songs), DROP Whisper's
+    # hallucinated lyrics/vocalisations and positively label the span with a
+    # "[♪ music ♪]" marker instead. Dialogue OVER music is classified `speech`
+    # (not `music`) by the spectral classifier, so real dialogue is untouched.
+    # Markers are language-neutral and pass through the translator verbatim.
+    # One classify pass feeds both suppression and marking. No-ops gracefully
+    # if audio/numpy is missing.
     if getattr(settings, "SUBTITLE_MARK_MUSIC", True) and transcript:
         try:
             _audio_wav = os.path.join(job_dir, "audio.wav")
             if os.path.isfile(_audio_wav):
-                from backend.services.audio_analyzer import (
-                    detect_music_markers, merge_markers,
-                )
-                _markers = await detect_music_markers(
+                from backend.services.audio_analyzer import mark_and_suppress_music
+                transcript, _n_suppressed, _n_markers = await mark_and_suppress_music(
                     _audio_wav, transcript,
                     min_seconds=float(getattr(settings, "SUBTITLE_MUSIC_MIN_SEC", 5.0)),
+                    suppress=bool(getattr(settings, "SUBTITLE_SUPPRESS_SPEECH_IN_MUSIC", True)),
+                    min_overlap_frac=float(getattr(settings, "SUBTITLE_MUSIC_SUPPRESS_OVERLAP", 0.6)),
                 )
-                if _markers:
-                    transcript = merge_markers(transcript, _markers)
+                if _n_suppressed or _n_markers:
                     logger.info(
-                        "[%s] Music marking: inserted %d [♪ music ♪] cue(s)",
-                        job_id, len(_markers),
+                        "[%s] Music suppression+marking: dropped %d hallucinated "
+                        "speech cue(s) over music, inserted %d [♪ music ♪] cue(s)",
+                        job_id, _n_suppressed, _n_markers,
                     )
         except Exception as _mm_err:
             logger.warning(
-                "[%s] Music marking skipped (%s)", job_id, _mm_err)
+                "[%s] Music suppression/marking skipped (%s)", job_id, _mm_err)
 
     # ── Final de-duplication pass ──
     # The per-segment hallucination filters run inside the Whisper stage, but

@@ -466,14 +466,130 @@ async def detect_music_markers(
              if e.get("type") == "music" and float(e.get("duration", 0)) >= min_seconds]
     if not music:
         return []
+    return _markers_from_music_events(music, transcript, min_seconds, label)
+
+
+def _markers_from_music_events(music_events: list, transcript: list,
+                               min_seconds: float, label: str) -> list:
+    """Build ``[♪ music ♪]`` marker cues from sustained-music events.
+
+    Wraps ``build_non_speech_subtitle_events`` (which emits ``"[music]"``) and
+    relabels to the ♪ form. Shared by ``detect_music_markers`` and
+    ``mark_and_suppress_music`` so the marker shape is identical."""
     raw = build_non_speech_subtitle_events(
-        music, transcript, min_event_s=min_seconds)
-    # Relabel to the music marker (build_non_speech_subtitle_events emits
-    # "[music]"; the user wants the ♪ form).
+        music_events, transcript, min_event_s=min_seconds)
     for ev in raw:
         ev["text"] = label
         ev["speaker"] = ""
     return raw
+
+
+def _music_spans_from_events(events: list, min_seconds: float) -> list:
+    """Absolute ``(start, end)`` spans for sustained music events."""
+    spans = []
+    for e in events or []:
+        if e.get("type") != "music":
+            continue
+        dur = float(e.get("duration", 0) or 0)
+        if dur < min_seconds:
+            continue
+        start = float(e.get("timestamp", e.get("start", 0)) or 0)
+        spans.append((start, start + dur))
+    return spans
+
+
+def suppress_speech_in_music_spans(
+    transcript: list,
+    music_spans: list,
+    min_overlap_frac: float = 0.6,
+) -> tuple[list, list]:
+    """Drop transcribed speech cues sitting inside sustained music-only spans.
+
+    In an OP/ED/insert-song span the spectral classifier labels the whole span
+    ``music``; BGM-under-dialogue is classified ``speech`` instead, so REAL
+    dialogue over music is NOT inside a music span and is left untouched.
+    Whisper nonetheless hallucinates lyrics / vocalisations (the ``ああああ`` /
+    fake-lyric cues) over the song — this removes any cue whose timespan is ≥
+    ``min_overlap_frac`` inside a music span so the span can be positively
+    labelled ``[♪ music ♪]`` instead. Bracketed markers are always kept.
+
+    Returns ``(kept, suppressed)``. Pure / deterministic."""
+    if not transcript or not music_spans:
+        return list(transcript or []), []
+    spans = sorted((float(s), float(e)) for s, e in music_spans if float(e) > float(s))
+    if not spans:
+        return list(transcript), []
+
+    def _span(seg):
+        if isinstance(seg, dict):
+            return (float(seg.get("start", seg.get("start_sec", 0)) or 0),
+                    float(seg.get("end", seg.get("end_sec", 0)) or 0))
+        return (float(getattr(seg, "start", 0) or 0),
+                float(getattr(seg, "end", 0) or 0))
+
+    def _txt(seg):
+        return seg.get("text", "") if isinstance(seg, dict) else getattr(seg, "text", "")
+
+    def _music_overlap_frac(s, e):
+        seg_len = max(1e-6, e - s)
+        ov = 0.0
+        for ms, me in spans:
+            if me <= s:
+                continue
+            if ms >= e:
+                break
+            ov += max(0.0, min(e, me) - max(s, ms))
+        return ov / seg_len
+
+    kept, suppressed = [], []
+    for seg in transcript:
+        if is_subtitle_marker(_txt(seg)):
+            kept.append(seg)
+            continue
+        s, e = _span(seg)
+        if e > s and _music_overlap_frac(s, e) >= min_overlap_frac:
+            suppressed.append(seg)
+        else:
+            kept.append(seg)
+    return kept, suppressed
+
+
+async def mark_and_suppress_music(
+    audio_path: str,
+    transcript: list,
+    min_seconds: float = 5.0,
+    suppress: bool = True,
+    min_overlap_frac: float = 0.6,
+    label: str = MUSIC_MARKER,
+) -> tuple[list, int, int]:
+    """Classify the audio ONCE, then suppress hallucinated speech in sustained
+    music-only spans and insert ``[♪ music ♪]`` markers over them.
+
+    Returns ``(new_transcript, n_suppressed, n_markers)``. Degrades to a no-op
+    ``(transcript, 0, 0)`` when audio/numpy is unavailable. The single classify
+    pass is shared between suppression and marking (Task 4)."""
+    try:
+        events = await classify_audio_events(audio_path)
+    except Exception as e:
+        logger.info("mark_and_suppress_music: classify failed (%s) — no-op", e)
+        return transcript, 0, 0
+    music_events = [e for e in events
+                    if e.get("type") == "music"
+                    and float(e.get("duration", 0) or 0) >= min_seconds]
+    if not music_events:
+        return transcript, 0, 0
+    n_suppressed = 0
+    if suppress:
+        spans = _music_spans_from_events(music_events, min_seconds)
+        transcript, dropped = suppress_speech_in_music_spans(
+            transcript, spans, min_overlap_frac=min_overlap_frac)
+        n_suppressed = len(dropped)
+    # Build markers AFTER suppression so they fill the now-cleared song spans
+    # (a marker that overlapped a hallucinated lyric would have been dropped).
+    markers = _markers_from_music_events(music_events, transcript, min_seconds, label)
+    if markers:
+        transcript = merge_markers(transcript, markers)
+    return transcript, n_suppressed, len(markers)
 
 
 def build_non_speech_subtitle_events(

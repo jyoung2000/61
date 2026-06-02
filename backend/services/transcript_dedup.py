@@ -9,22 +9,35 @@ from __future__ import annotations
 import re
 
 
-def drop_repetition_loops(segments: list, text_key: str = "text") -> tuple[list, int]:
+def drop_repetition_loops(
+    segments: list,
+    text_key: str = "text",
+    *,
+    similarity_threshold: float = 0.9,
+    long_block_chars: int = 24,
+) -> tuple[list, int]:
     """Remove Whisper repetition-loop hallucinations.
 
-    When the gap-fill pass re-transcribes music / quiet regions with VAD off,
-    Whisper loops and emits the SAME text repeatedly, scattered across the
-    timeline (so an adjacent-only dedup misses them). Real dialogue almost
-    never repeats verbatim many times across an episode, so an exact-text
-    segment that recurs beyond a small cap is a hallucination.
+    When the main/gap-fill passes run over music / quiet regions, Whisper loops
+    and emits the same content repeatedly, scattered across the timeline (so an
+    adjacent-only dedup misses them). Real dialogue almost never repeats across
+    an episode, so a recurring block is a hallucination.
 
-    Keeps the earliest occurrences — 1 for long lines (a repeating sentence is
-    unambiguous hallucination), up to 3 for short interjections (e.g. "了解",
-    "Roger") that can legitimately recur — and drops the rest. Order-preserving.
+    Two rules, order-preserving, keeping the earliest occurrence:
+
+      * **Long blocks** (> ``long_block_chars`` normalised chars): caught by
+        text SIMILARITY, not exact match. A block that is ≥
+        ``similarity_threshold`` similar to one already kept is dropped — this
+        is the implausible-recurrence rule, and it catches the NEAR-identical
+        copies the old exact-only filter missed (the opening narration re-emitted
+        at six separated timestamps with tiny ASR differences).
+      * **Short interjections** (e.g. "了解", "Roger") can legitimately recur, so
+        exact (whitespace-insensitive) repeats are capped at 3.
 
     Returns ``(kept_segments, dropped_count)``.
     """
-    seen: dict = {}
+    seen: dict = {}            # exact-key counts for short interjections
+    kept_long: list[str] = []  # raw text of long blocks already kept (fuzzy cmp)
     out = []
     dropped = 0
     for seg in segments or []:
@@ -34,13 +47,22 @@ def drop_repetition_loops(segments: list, text_key: str = "text") -> tuple[list,
             out.append(seg)
             continue
         key = re.sub(r"\s+", "", raw)
-        cap = 1 if len(key) > 24 else 3
-        n = seen.get(key, 0)
-        if n >= cap:
-            dropped += 1
-            continue
-        seen[key] = n + 1
-        out.append(seg)
+        if len(key) > long_block_chars:
+            # A verbatim OR near-identical recurrence anywhere on the timeline
+            # is a loop, not real dialogue → keep the first, quarantine the rest.
+            if any(_text_similarity(raw, prev) >= similarity_threshold
+                   for prev in kept_long):
+                dropped += 1
+                continue
+            kept_long.append(raw)
+            out.append(seg)
+        else:
+            n = seen.get(key, 0)
+            if n >= 3:
+                dropped += 1
+                continue
+            seen[key] = n + 1
+            out.append(seg)
     return out, dropped
 
 
@@ -101,8 +123,16 @@ def collapse_adjacent_duplicates(
 
 
 def _normalize_text(s: str) -> str:
-    """Whitespace-stripped text for similarity comparison."""
-    return re.sub(r"\s+", "", (s or "")).strip()
+    """Punctuation- and whitespace-stripped text for similarity comparison.
+
+    Strips ALL Unicode punctuation (so "アフターコロニー195。" and
+    "アフターコロニー195、" — the same narration with different trailing CJK
+    punctuation from two ASR passes — normalise equal) and all whitespace."""
+    import unicodedata
+    return "".join(
+        ch for ch in (s or "")
+        if not ch.isspace() and not unicodedata.category(ch).startswith("P")
+    )
 
 
 def _text_similarity(a: str, b: str) -> float:

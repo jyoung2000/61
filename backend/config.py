@@ -334,6 +334,13 @@ class Settings(BaseSettings):
     # through the translator verbatim.
     SUBTITLE_MARK_MUSIC: bool = True
     SUBTITLE_MUSIC_MIN_SEC: float = 5.0         # only mark sustained music
+    # In a sustained music-only span, drop Whisper "speech" cues (hallucinated
+    # lyrics / vocalisations) so the span is positively labelled music instead.
+    # Dialogue OVER music is classified `speech` (not `music`), so it is not in
+    # a music span and is untouched. A cue is suppressed when this fraction of
+    # its timespan falls inside a music span.
+    SUBTITLE_SUPPRESS_SPEECH_IN_MUSIC: bool = True
+    SUBTITLE_MUSIC_SUPPRESS_OVERLAP: float = 0.6
 
     # ── Audio Analysis ──
     AUDIO_EVENT_DETECTION: bool = True          # spectral audio event classification
