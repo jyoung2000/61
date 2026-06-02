@@ -612,13 +612,27 @@ def apply_glossary(source_text: str, translated_text: str, glossary: dict) -> st
 # ── Download helpers (for the Settings UI button) ─────────────────────────
 
 def _convert_with_cleanup(model_id: str, target_dir: str, label: str) -> None:
-    """Run ``TransformersConverter`` into ``target_dir`` with:
+    """Convert ``model_id`` to an int8 CTranslate2 model at ``target_dir``.
 
-      * the HF intermediate cache redirected to a temp dir that is deleted
-        afterwards (so only the int8 CT2 model survives — see
-        ``_hf_cache_redirect``), and
-      * removal of a partially-written ``target_dir`` if the convert raises,
-        so a corrupt cache can't block the next retry.
+    Network: the converter pulls the source weights from Hugging Face, so
+    ``huggingface.co`` must be reachable. For NLLB-200 that is a ~2.5 GB
+    transient full-precision download into a redirected HF cache; only the
+    ~600 MB int8 CT2 model is kept (the cache is deleted by
+    ``_hf_cache_redirect``).
+
+    The convert is done into a **fresh temp dir** on the same volume and then
+    promoted onto ``target_dir`` with an atomic ``os.replace``. This is
+    deliberate, and fixes the bug that bricked offline NMT:
+
+      * ``TransformersConverter.convert`` *refuses* a pre-existing output
+        directory unless ``force=True`` — so converting straight into a
+        ``target_dir`` we just ``makedirs``'d failed every single time and
+        the caller silently fell back to the LLM. Handing the converter a
+        path that does **not** yet exist lets it create the dir itself
+        (``force`` irrelevant), and the rename means a half-written model is
+        never visible at ``target_dir`` as "present".
+      * On any convert/download failure we remove the temp dir **and** any
+        partial ``target_dir``, so a retry is never blocked by a stale dir.
     """
     try:
         from ctranslate2.converters import TransformersConverter
@@ -628,26 +642,42 @@ def _convert_with_cleanup(model_id: str, target_dir: str, label: str) -> None:
             f"download {label}. pip install 'ctranslate2[transformers]'"
         ) from e
 
-    os.makedirs(target_dir, exist_ok=True)
-    out_before = _free_bytes(target_dir)
+    parent = os.path.dirname(target_dir) or "."
+    os.makedirs(parent, exist_ok=True)
+    # A sibling temp dir on the SAME volume so the final promotion is an atomic
+    # rename (not a cross-device copy). The converter writes into a child of it
+    # that does NOT yet exist, so it never trips the "dir already exists" guard.
+    tmp_holder = tempfile.mkdtemp(prefix=".convert-", dir=parent)
+    convert_dir = os.path.join(tmp_holder, "ct2")
     try:
         with _hf_cache_redirect():
             converter = TransformersConverter(model_id)
-            converter.convert(target_dir, quantization="int8", force=False)
+            converter.convert(convert_dir, quantization="int8", force=False)
+        # Promote atomically: clear any stale/partial target first, then rename
+        # the freshly-converted model in. After this, ``convert_dir`` no longer
+        # exists (it became ``target_dir``); ``tmp_holder`` is emptied below.
+        if os.path.exists(target_dir):
+            shutil.rmtree(target_dir, ignore_errors=True)
+        os.replace(convert_dir, target_dir)
     except Exception:
-        # Tear down the half-written model dir so it isn't mistaken for a
-        # complete download (and so a retry starts clean).
+        # Tear down BOTH the temp dir and any partial target_dir so neither is
+        # mistaken for a complete download (and so a retry starts clean).
+        shutil.rmtree(tmp_holder, ignore_errors=True)
         shutil.rmtree(target_dir, ignore_errors=True)
         logger.warning(
-            "NMT: %s convert failed — removed partial model dir %s", label, target_dir
+            "NMT: %s convert failed — removed temp + partial model dir %s",
+            label, target_dir,
         )
         raise
+    finally:
+        # ``tmp_holder`` is now empty on success (its only child was renamed
+        # away) and already gone on failure; this drops the empty holder.
+        shutil.rmtree(tmp_holder, ignore_errors=True)
     kept = _dir_size_bytes(target_dir)
     logger.info(
         "NMT: %s converted to int8 at %s (kept %s; %s free remains)",
         label, target_dir, _human(kept), _human(_free_bytes(target_dir)),
     )
-    _ = out_before  # (retained for symmetry / future delta logging)
 
 
 def ensure_nllb_downloaded(
