@@ -80,9 +80,9 @@ export default function Settings() {
   const [providerResults, setProviderResults] = useState({});
 
   // Per-task model selection
-  const [availableModels, setAvailableModels] = useState({ transcript: [], primary: [], editorial: [], translation: [] });
-  const [currentModels, setCurrentModels] = useState({ transcript_model: '', primary_model: '', editorial_model: '', editorial_model_fallback: '', translation_model: '' });
-  const [pendingModels, setPendingModels] = useState({ transcript_model: '', primary_model: '', editorial_model: '', editorial_model_fallback: '', translation_model: '' });
+  const [availableModels, setAvailableModels] = useState({ transcript: [], primary: [], editorial: [] });
+  const [currentModels, setCurrentModels] = useState({ transcript_model: '', primary_model: '', editorial_model: '', editorial_model_fallback: '' });
+  const [pendingModels, setPendingModels] = useState({ transcript_model: '', primary_model: '', editorial_model: '', editorial_model_fallback: '' });
   // Configured vs actually-loaded Whisper model (so the Settings page shows
   // what really ran, including a low-VRAM downgrade — not only what was asked).
   const [whisperInfo, setWhisperInfo] = useState({
@@ -492,10 +492,6 @@ export default function Settings() {
           transcript: data.transcript || [],
           primary: data.primary || data.vision || [],
           editorial: data.editorial || data.text || [],
-          // Translation-capable subset (reasoning/'thinking' + image/audio
-          // generators filtered out by the backend). Falls back to the full
-          // text list if an older backend doesn't return it.
-          translation: data.translation || data.editorial || data.text || [],
         });
       }
       // Build the saved-model state from BOTH sources. The editorial
@@ -515,8 +511,6 @@ export default function Settings() {
         primary_model: cur.primary_model || cur.vision_model || '',
         editorial_model: editorialFromEnv || editorialFromJudge,
         editorial_model_fallback: _judgeSpecToModelId(judge.fallback || ''),
-        // Dedicated OpenRouter subtitle-translation model ('' = use editorial).
-        translation_model: cur.translation_model || '',
       };
       setCurrentModels(resolved);
       setPendingModels(resolved);
@@ -674,8 +668,7 @@ export default function Settings() {
     pendingModels.transcript_model !== currentModels.transcript_model ||
     pendingModels.primary_model !== currentModels.primary_model ||
     pendingModels.editorial_model !== currentModels.editorial_model ||
-    pendingModels.editorial_model_fallback !== currentModels.editorial_model_fallback ||
-    pendingModels.translation_model !== currentModels.translation_model;
+    pendingModels.editorial_model_fallback !== currentModels.editorial_model_fallback;
 
   // Build the per-user env-var patch for a model selection. Picks
   // the right OPENROUTER_*_MODEL vs OLLAMA_*_MODEL key by inspecting
@@ -714,11 +707,6 @@ export default function Settings() {
       body.editorial_model = pendingModels.editorial_model;
       body.text_model = pendingModels.editorial_model;  // legacy alias
     }
-    // Dedicated OpenRouter subtitle-translation model. '' clears it back to
-    // the editorial fallback (distinct from the editorial/text model above).
-    if (pendingModels.translation_model !== currentModels.translation_model) {
-      body.translation_model = pendingModels.translation_model;
-    }
 
     const editorialChanged =
       pendingModels.editorial_model !== currentModels.editorial_model
@@ -742,20 +730,10 @@ export default function Settings() {
         if (res.ok) {
           await res.json().catch(() => null);
           // Persist per-user picks alongside the global save.
-          // Translation model maps to OPENROUTER_TRANSLATION_MODEL (or
-          // OLLAMA_TRANSLATION_MODEL for an ollama pick); '' clears it.
-          let _transPatch = {};
-          if (body.translation_model !== undefined) {
-            const _tm = body.translation_model || '';
-            _transPatch = _tm.startsWith('ollama/')
-              ? { OLLAMA_TRANSLATION_MODEL: _tm.slice('ollama/'.length) }
-              : { OPENROUTER_TRANSLATION_MODEL: _tm };
-          }
           const userPatch = {
             ..._perUserModelPatch('transcript', body.transcript_model),
             ..._perUserModelPatch('primary', body.primary_model),
             ..._perUserModelPatch('editorial', body.editorial_model),
-            ..._transPatch,
           };
           await savePerUserSettings(userPatch);
         }
@@ -2024,7 +2002,7 @@ export default function Settings() {
                 pendingValue={pendingModels.editorial_model}
                 savedValue={currentModels.editorial_model}
                 label="Editorial AI (transcript polishing)"
-                desc="Used to polish and clean up transcript text (punctuation, proper nouns), and to score clips and generate summaries/tags. This is your OpenRouter polishing AI — separate from the Translation AI below."
+                desc="Used to polish and clean up transcript text (punctuation, proper nouns), score clips, and generate summaries/tags. It also polishes the offline-translated subtitles for readability — it never translates (translation runs fully offline via Whisper/NMT)."
               />
               <ModelDropdown
                 task="editorial_fallback"
@@ -2033,14 +2011,6 @@ export default function Settings() {
                 savedValue={currentModels.editorial_model_fallback}
                 label="Editorial AI Fallback"
                 desc="Used automatically when the primary Editorial AI is rate-limited or unreachable. Leave blank to disable the fallback."
-              />
-              <ModelDropdown
-                task="translation"
-                models={availableModels.translation}
-                pendingValue={pendingModels.translation_model}
-                savedValue={currentModels.translation_model}
-                label="Translation AI (deprecated)"
-                desc="No longer used: subtitle translation now runs fully OFFLINE (Whisper audio→English, then local NMT) and never calls an LLM — the AI only polishes the result, handled by the Editorial AI above. This setting no longer affects translation and will be removed."
               />
 
               {/* ── Save Button ── */}

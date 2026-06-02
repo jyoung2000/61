@@ -518,9 +518,11 @@ async def _startup_preload():
             import httpx
             host = cfg.OLLAMA_HOST
             if _ollama_is_primary:
-                # Ollama is primary — pull all configured models + extras
+                # Ollama is primary — pull all configured models + extras.
+                # (Translation no longer uses Ollama — it runs offline via
+                # Whisper/NMT — so OLLAMA_TRANSLATION_MODEL is not pre-pulled.)
                 models = [cfg.OLLAMA_PRIMARY_MODEL, cfg.OLLAMA_EDITORIAL_MODEL]
-                for extra in ("llava", "llama3.2:3b", cfg.OLLAMA_TRANSLATION_MODEL):
+                for extra in ("llava", "llama3.2:3b"):
                     if extra and extra not in models:
                         models.append(extra)
             else:
