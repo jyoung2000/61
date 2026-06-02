@@ -1592,11 +1592,16 @@ async def _background_post_processing(
                 # language for its translate pass.
                 await _nmt_status("Translating audio directly to English (Whisper, offline)…")
                 try:
+                    # Whisper native translate is a full ASR pass over the audio,
+                    # which on a low-VRAM card falls back to CPU and can run much
+                    # longer than the text-NMT path — give it generous headroom
+                    # (it still falls through to NMT on timeout).
+                    _whisper_timeout = max(1800, _trans_timeout)
                     _wt = await asyncio.wait_for(
                         asyncio.to_thread(
                             _whisper_native_translate_segments,
                             job.file_path, source_lang, glossary),
-                        timeout=_trans_timeout,
+                        timeout=_whisper_timeout,
                     )
                 except Exception as _wt_err:
                     _wt = None

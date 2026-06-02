@@ -506,7 +506,7 @@ async def download_subtitles(
             for s in job.transcript
         ]
         # Reuse an existing translation when it matches the target language,
-        # otherwise translate on demand via NMT→LLM fallback.
+        # otherwise translate on demand via the offline NMT engine.
         translated_segments = None
         if (getattr(job, "subtitle_language", "") == target_lang
                 and job.translated_transcript):
@@ -515,14 +515,21 @@ async def download_subtitles(
                 for s in job.translated_transcript
             ]
         if translated_segments is None:
-            from backend.services.translator import translate_segments_with_fallback
-            from backend.services.ai_orchestrator import AIOrchestrator
-            translated_segments = await translate_segments_with_fallback(
-                source_segments,
-                source_language=(job.language or "en"),
-                target_language=target_lang,
-                orchestrator=AIOrchestrator(),
+            from backend.services.translator import (
+                translate_segments_with_fallback, TranslationFailedError,
             )
+            from backend.services.ai_orchestrator import AIOrchestrator
+            try:
+                translated_segments = await translate_segments_with_fallback(
+                    source_segments,
+                    source_language=(job.language or "en"),
+                    target_language=target_lang,
+                    orchestrator=AIOrchestrator(),
+                )
+            except TranslationFailedError as e:
+                # Offline-only translation (no LLM fallback) — return an
+                # actionable 503 instead of a generic 500 for the SRT download.
+                raise HTTPException(status_code=503, detail=str(e))
         content = generate_bilingual_srt(
             source_segments, translated_segments, order=order,
             include_speakers=speakers, include_timestamps_in_text=timestamps,

@@ -1359,7 +1359,7 @@ async def clip_diagnostics(job_id: str):
 @router.post("/jobs/{job_id}/translate-subtitles")
 async def translate_subtitles(job_id: str, req: TranslateRequest):
     """Translate the transcript for a job into a target language."""
-    from backend.services.translator import translate_segments_with_fallback, SUPPORTED_LANGUAGES
+    from backend.services.translator import translate_segments_with_fallback, SUPPORTED_LANGUAGES, TranslationFailedError
     from backend.services.ai_orchestrator import AIOrchestrator
 
     job = await database.load_job(job_id)
@@ -1372,12 +1372,17 @@ async def translate_subtitles(job_id: str, req: TranslateRequest):
     orchestrator = AIOrchestrator()
     segments = [TranscriptSegment(**s) if isinstance(s, dict) else s for s in job.transcript]
 
-    translated = await translate_segments_with_fallback(
-        segments,
-        source_language=req.source_language or job.language or "en",
-        target_language=req.target_language,
-        orchestrator=orchestrator,
-    )
+    try:
+        translated = await translate_segments_with_fallback(
+            segments,
+            source_language=req.source_language or job.language or "en",
+            target_language=req.target_language,
+            orchestrator=orchestrator,
+        )
+    except TranslationFailedError as e:
+        # Translation is offline-only (no LLM fallback). Surface an actionable
+        # 503 rather than a generic 500 when the NMT engine can't run.
+        raise HTTPException(status_code=503, detail=str(e))
 
     # Store translated transcript and update subtitle_language
     await database.update_job_status(

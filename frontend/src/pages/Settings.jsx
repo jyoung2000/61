@@ -2039,8 +2039,8 @@ export default function Settings() {
                 models={availableModels.translation}
                 pendingValue={pendingModels.translation_model}
                 savedValue={currentModels.translation_model}
-                label="Translation AI (OpenRouter)"
-                desc="Used only for subtitle translation (e.g. Japanese → English). Only translation-capable models are listed (reasoning/'thinking' and image/audio models are excluded). Offline NMT is tried first; this is the cloud fallback. Leave blank to reuse the Editorial AI model."
+                label="Translation AI (deprecated)"
+                desc="No longer used: subtitle translation now runs fully OFFLINE (Whisper audio→English, then local NMT) and never calls an LLM — the AI only polishes the result, handled by the Editorial AI above. This setting no longer affects translation and will be removed."
               />
 
               {/* ── Save Button ── */}
