@@ -1,3 +1,19 @@
+# ClipAI — Run translation right after transcription/speakers (before summary)
+
+Per request, subtitle translation now runs **immediately after transcription +
+speaker assignment**, before the VLM summary and clip stages — instead of after
+the summary. In `_run_analysis_inner` the translate+polish block was moved above
+the summary block (new order: analyze → **translate+polish** → summary → clips →
+post-clip finishers). It operates on the freshly transcribed, speaker-labelled,
+deduped, music-marked transcript; the summary then runs on the polished source
+transcript, and the clip-dependent finishers (caption refresh + Auto-SEO) still
+run after clips. Progress stays monotonic (analysis 62% → translate 63% →
+summary 70% → clips 80%); the summary is persisted right after it is generated so
+post-clip Auto-SEO still sees it. Translation already ran before clips (so a
+clip-stage failure can't skip it); this moves it earlier still.
+
+---
+
 # ClipAI — Offline NMT: save the SentencePiece tokenizer with the converted model
 
 The torch.load fix let the NLLB convert succeed (log: `converted to int8 … kept

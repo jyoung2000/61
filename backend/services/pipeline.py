@@ -3151,50 +3151,20 @@ async def _run_analysis_inner(job_id: str):
         f"Analysis complete — {_n_scenes_val} scenes, {_n_segs} transcript segments{_lang_note}",
     )
 
-    # ── VLM summary (kept ai_orchestrator) ──
+    # ── Subtitle translation + target-language polish (right after transcription
+    # + speaker assignment; BEFORE summary + clips) ──
+    # Translation runs as early as possible — on the freshly transcribed,
+    # speaker-labelled, deduped, music-marked transcript — so the translated
+    # subtitles are produced immediately after transcription/diarization and are
+    # never blocked or delayed by the summary or clip stages. Offline NMT does
+    # the translation; the OpenRouter editorial model only polishes the result
+    # for readability (meaning + timing preserved). The clip-dependent finishers
+    # (caption refresh + Auto-SEO) still run AFTER clips in
+    # ``_run_post_clip_followups``.
     cancel_check()
-    await _update_progress(
-        job_id, JobStatus.GENERATING_SUMMARY, 66, "Generating video summary...",
-    )
-    summary = None
-    async with _stage_timer(job_id, "summary"):
-        try:
-            _sr = await orchestrator.generate_summary(transcript, scenes, job_id, tier=tier)
-            summary = _sr[0] if isinstance(_sr, tuple) else _sr
-        except Exception as _se:
-            logger.warning(
-                "[%s] VLM summary failed (%s) — falling back to transcript summary",
-                job_id, _se,
-            )
-    summary_dict = summary.model_dump() if hasattr(summary, "model_dump") else summary
-    if summary is None or not has_real_summary_content(summary_dict):
-        try:
-            summary = VideoSummary(**build_summary_from_transcript(transcript, scenes))
-        except Exception:
-            summary = VideoSummary(
-                overview="Summary unavailable for this video.",
-                key_topics=[], tone="neutral",
-                estimated_audience="general", content_category="generic",
-            )
-
-    # ── Subtitle translation + target-language polish (BEFORE clip extraction) ──
-    # Decoupled from clip detection (Task 1): translation used to run AFTER the
-    # clip stage, so a clip-stage failure (e.g. Replicate 429 / no credit) could
-    # bypass it and the job finalized COMPLETE with the raw source transcript.
-    # Running it here guarantees transcription → translation → polish (target
-    # language) → readability/resegment/dedup happens regardless of what the clip
-    # stage does. The clip-dependent finishers (caption refresh + Auto-SEO) run
-    # AFTER clips in ``_run_post_clip_followups``.
-    #
-    # Persist the summary first so the post-clip Auto-SEO (which reads
-    # job.summary for prompt context) sees it.
-    try:
-        await database.update_job_status(job_id, summary=summary)
-    except Exception as _sum_err:
-        logger.debug("[%s] pre-translation summary persist skipped: %s", job_id, _sum_err)
     if _will_translate:
         await _update_progress(
-            job_id, JobStatus.TRANSLATING, 77, "Translating + polishing subtitles...",
+            job_id, JobStatus.TRANSLATING, 63, "Translating + polishing subtitles...",
         )
     logger.info(
         "[%s] invoking translate+polish (target=%s, source=%s, will_translate=%s)",
@@ -3209,7 +3179,7 @@ async def _run_analysis_inner(job_id: str):
         )
     except Exception as _pp_err:
         logger.error(
-            "[%s] translate+polish step raised (non-fatal — continuing to clips): %s",
+            "[%s] translate+polish step raised (non-fatal — continuing): %s",
             job_id, _pp_err, exc_info=True,
         )
     # Adopt the SOURCE transcript exactly as post-processing finalized it —
@@ -3243,6 +3213,39 @@ async def _run_analysis_inner(job_id: str):
             await _set_translation_status(
                 job_id, "translation_failed",
                 "planned translation produced no target-language output")
+
+    # ── VLM summary (kept ai_orchestrator) — runs AFTER translation now ──
+    cancel_check()
+    await _update_progress(
+        job_id, JobStatus.GENERATING_SUMMARY, 70, "Generating video summary...",
+    )
+    summary = None
+    async with _stage_timer(job_id, "summary"):
+        try:
+            _sr = await orchestrator.generate_summary(transcript, scenes, job_id, tier=tier)
+            summary = _sr[0] if isinstance(_sr, tuple) else _sr
+        except Exception as _se:
+            logger.warning(
+                "[%s] VLM summary failed (%s) — falling back to transcript summary",
+                job_id, _se,
+            )
+    summary_dict = summary.model_dump() if hasattr(summary, "model_dump") else summary
+    if summary is None or not has_real_summary_content(summary_dict):
+        try:
+            summary = VideoSummary(**build_summary_from_transcript(transcript, scenes))
+        except Exception:
+            summary = VideoSummary(
+                overview="Summary unavailable for this video.",
+                key_topics=[], tone="neutral",
+                estimated_audience="general", content_category="generic",
+            )
+    # Persist the summary so the post-clip Auto-SEO (which reads job.summary for
+    # prompt context) sees it.
+    try:
+        await database.update_job_status(job_id, summary=summary)
+    except Exception as _sum_err:
+        logger.debug("[%s] summary persist skipped: %s", job_id, _sum_err)
+
 
     # ── Clip detection (reframer clipper) ──
     cancel_check()

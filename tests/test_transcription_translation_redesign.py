@@ -558,6 +558,19 @@ def test_translation_polish_mode_is_readability_only():
     assert "。" in tr_ja
 
 
+def test_translation_runs_before_summary_and_clips_in_pipeline():
+    """Translation is invoked right after transcription/speaker assignment —
+    BEFORE the summary and clip stages. The full pipeline needs the GPU/ML stack
+    to execute, so this is a source-order guard against accidental reordering."""
+    src = Path(__file__).resolve().parents[1] / "backend" / "services" / "pipeline.py"
+    text = src.read_text()
+    i_translate = text.index("invoking translate+polish")
+    i_summary = text.index("Generating video summary")
+    i_clips = text.index("Detecting viral clip candidates")
+    assert i_translate < i_summary < i_clips, (
+        "translate+polish must precede summary, which must precede clips")
+
+
 def test_resegment_splits_runon_into_one_utterance_cues():
     def W(w, s, e):
         return WordTimestamp(word=w, start=s, end=e)
