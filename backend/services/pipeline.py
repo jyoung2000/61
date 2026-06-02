@@ -244,7 +244,8 @@ async def _release_whisper_vram(job_id: str):
 
 
 def _whisper_native_translate_segments(video_path: str, source_lang: str,
-                                       glossary: dict | None = None) -> list:
+                                       glossary: dict | None = None,
+                                       source_segments: list | None = None) -> list:
     """Run Whisper's native audio→English translate task (offline, no LLM).
 
     Returns a list of ``TranscriptSegment`` (English, with Whisper's own
@@ -257,6 +258,11 @@ def _whisper_native_translate_segments(video_path: str, source_lang: str,
     repo-60): a single ASR-translate pass that avoids the transcribe-then-
     translate double-error and never touches an LLM. The AI model only polishes
     the result downstream.
+
+    Whisper's translate task does NOT diarize, so each English cue is assigned
+    the speaker of the diarized ``source_segments`` cue it overlaps most (both
+    are wall-clock timestamps from the same audio); it falls back to
+    ``"Speaker 1"`` when no source overlap is found.
     """
     from backend.services.reframer_audio import AudioIntelligence
     from backend.models import TranscriptSegment
@@ -279,6 +285,24 @@ def _whisper_native_translate_segments(video_path: str, source_lang: str,
     except Exception:
         apply_glossary = None
 
+    # Index the diarized source cues (start, end, speaker) so each translated
+    # cue can inherit a speaker label by max time-overlap.
+    src_spans = []
+    for s in (source_segments or []):
+        ss = s.get("start") if isinstance(s, dict) else getattr(s, "start", None)
+        se = s.get("end") if isinstance(s, dict) else getattr(s, "end", None)
+        sp = s.get("speaker") if isinstance(s, dict) else getattr(s, "speaker", None)
+        if ss is not None and se is not None and sp:
+            src_spans.append((float(ss), float(se), sp))
+
+    def _speaker_for(a, b):
+        best, best_ov = "Speaker 1", 0.0
+        for (ss, se, sp) in src_spans:
+            ov = min(b, se) - max(a, ss)
+            if ov > best_ov:
+                best_ov, best = ov, sp
+        return best
+
     out: list = []
     for seg in raw:
         txt = (seg.get("text") or "").strip()
@@ -289,9 +313,10 @@ def _whisper_native_translate_segments(video_path: str, source_lang: str,
                 txt = apply_glossary(txt, txt, glossary)
             except Exception:
                 pass
-        start = seg.get("start_sec", seg.get("start", 0.0)) or 0.0
-        end = seg.get("end_sec", seg.get("end", 0.0)) or 0.0
-        out.append(TranscriptSegment(text=txt, start=float(start), end=float(end)))
+        start = float(seg.get("start_sec", seg.get("start", 0.0)) or 0.0)
+        end = float(seg.get("end_sec", seg.get("end", 0.0)) or 0.0)
+        out.append(TranscriptSegment(
+            text=txt, start=start, end=end, speaker=_speaker_for(start, end)))
     return out
 
 
@@ -1600,7 +1625,7 @@ async def _background_post_processing(
                     _wt = await asyncio.wait_for(
                         asyncio.to_thread(
                             _whisper_native_translate_segments,
-                            job.file_path, source_lang, glossary),
+                            job.file_path, source_lang, glossary, transcript),
                         timeout=_whisper_timeout,
                     )
                 except Exception as _wt_err:

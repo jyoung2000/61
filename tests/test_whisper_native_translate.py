@@ -1,0 +1,137 @@
+"""Unit tests for the offline Whisper-native audio→English translate helper
+(``backend.services.pipeline._whisper_native_translate_segments``).
+
+Importing the pipeline pulls in the AI orchestrator (optional provider SDKs)
+and, lazily, the reframer audio module (OpenCV) + the NMT translator. None of
+those are needed for this pure helper, so we stub the optional provider SDKs at
+import time and inject lightweight fakes for the lazily-imported modules per
+test (via ``monkeypatch.setitem`` so they're auto-restored — no leakage). No
+network, no models, no GPU.
+"""
+import sys
+import types
+
+import pytest
+
+
+def _stub_provider_sdks():
+    for name in ["google", "google.generativeai", "groq", "openai", "anthropic"]:
+        if name not in sys.modules:
+            sys.modules[name] = types.ModuleType(name)
+    sys.modules["google"].generativeai = sys.modules["google.generativeai"]
+    g = sys.modules["google.generativeai"]
+    g.configure = lambda *a, **k: None
+    g.GenerativeModel = object
+    sys.modules["groq"].AsyncGroq = sys.modules["groq"].Groq = object
+    sys.modules["openai"].AsyncOpenAI = sys.modules["openai"].OpenAI = object
+    sys.modules["anthropic"].AsyncAnthropic = sys.modules["anthropic"].Anthropic = object
+
+
+_stub_provider_sdks()
+
+import backend.services.pipeline as pipeline  # noqa: E402
+
+
+# ── Fakes for the modules the helper imports lazily ──────────────────────────
+
+def _real_apply_glossary(source_text, translated_text, glossary):
+    """Copy of nmt_translator.apply_glossary (kept in sync) so the stub behaves
+    like production for the glossary assertion."""
+    if not glossary or not translated_text:
+        return translated_text
+    out = translated_text
+    for src, tgt in glossary.items():
+        s, t = (src or "").strip(), (tgt or "").strip()
+        if not s or not t or s not in source_text:
+            continue
+        if s in out:
+            out = out.replace(s, t)
+    return out
+
+
+class _FakeAI:
+    last_args = None
+    _loads = True
+    _segments = ()
+
+    def __init__(self, model_name="small"):
+        self.model_name = model_name
+
+    def try_load(self):
+        return _FakeAI._loads
+
+    def whisper_translate(self, video_path, source_lang=None):
+        _FakeAI.last_args = (video_path, source_lang)
+        return list(_FakeAI._segments)
+
+
+def _install(monkeypatch, *, loads=True, segments=()):
+    _FakeAI._loads = loads
+    _FakeAI._segments = segments
+    _FakeAI.last_args = None
+    fake_reframer = types.ModuleType("backend.services.reframer_audio")
+    fake_reframer.AudioIntelligence = _FakeAI
+    fake_nmt = types.ModuleType("backend.services.nmt_translator")
+    fake_nmt.apply_glossary = _real_apply_glossary
+    monkeypatch.setitem(sys.modules, "backend.services.reframer_audio", fake_reframer)
+    monkeypatch.setitem(sys.modules, "backend.services.nmt_translator", fake_nmt)
+
+
+def test_maps_whisper_dicts_to_transcript_segments(monkeypatch):
+    """start_sec/end_sec/text dicts → TranscriptSegment with correct fields."""
+    _install(monkeypatch, segments=[
+        {"start_sec": 0.0, "end_sec": 1.5, "text": "  Hello there  ", "words": []},
+        {"start_sec": 1.5, "end_sec": 3.0, "text": "second line", "words": []},
+    ])
+    out = pipeline._whisper_native_translate_segments("/v.mp4", "ja", None)
+    assert len(out) == 2
+    assert out[0].text == "Hello there"                  # stripped
+    assert out[0].start == 0.0 and out[0].end == 1.5     # start_sec/end_sec mapped
+    assert out[1].start == 1.5 and out[1].end == 3.0
+    assert out[0].speaker == "Speaker 1"                 # default when no source given
+    assert _FakeAI.last_args == ("/v.mp4", "ja")         # video path + source forwarded
+
+
+def test_speaker_inherited_from_source_by_overlap(monkeypatch):
+    """Each translated cue inherits the diarized source speaker it overlaps most."""
+    _install(monkeypatch, segments=[
+        {"start_sec": 0.0, "end_sec": 2.0, "text": "first", "words": []},
+        {"start_sec": 2.0, "end_sec": 4.0, "text": "second", "words": []},
+    ])
+    source = [
+        {"start": 0.0, "end": 2.1, "speaker": "Alice", "text": "x"},
+        {"start": 2.1, "end": 4.0, "speaker": "Bob", "text": "y"},
+    ]
+    out = pipeline._whisper_native_translate_segments("/v.mp4", "ja", None, source)
+    assert out[0].speaker == "Alice"
+    assert out[1].speaker == "Bob"
+
+
+def test_glossary_fixes_leaked_source_terms(monkeypatch):
+    """A glossary source term that leaked into the English output is replaced."""
+    _install(monkeypatch, segments=[
+        {"start_sec": 0.0, "end_sec": 2.0, "text": "ゼクス reporting in", "words": []},
+    ])
+    out = pipeline._whisper_native_translate_segments("/v.mp4", "ja", {"ゼクス": "Zechs"})
+    assert out[0].text == "Zechs reporting in"
+
+
+def test_blank_lines_are_dropped(monkeypatch):
+    _install(monkeypatch, segments=[
+        {"start_sec": 0.0, "end_sec": 1.0, "text": "   ", "words": []},
+        {"start_sec": 1.0, "end_sec": 2.0, "text": "kept", "words": []},
+    ])
+    out = pipeline._whisper_native_translate_segments("/v.mp4", "ja", None)
+    assert [s.text for s in out] == ["kept"]
+
+
+def test_returns_empty_when_engine_fails_to_load(monkeypatch):
+    _install(monkeypatch, loads=False, segments=[
+        {"start_sec": 0.0, "end_sec": 1.0, "text": "ignored", "words": []},
+    ])
+    assert pipeline._whisper_native_translate_segments("/v.mp4", "ja", None) == []
+
+
+def test_returns_empty_when_whisper_yields_nothing(monkeypatch):
+    _install(monkeypatch, segments=[])
+    assert pipeline._whisper_native_translate_segments("/v.mp4", "ja", None) == []
