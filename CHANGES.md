@@ -76,12 +76,16 @@ global default (it lives over music/quiet regions where priming is harmful).
   `speech` (not `music`) by the spectral classifier, so real dialogue over music
   is untouched. The pipeline now suppresses, then marks.
 - **Fuzzy repetition quarantine.** `transcript_dedup.drop_repetition_loops` now
-  clusters long blocks (> 24 normalised chars) by **text similarity ≥ 0.9**
-  instead of exact match, so a near-identical narration block recurring at
-  separated timestamps keeps only the first occurrence (the six-timestamp loop
-  the old exact-only filter missed). `_normalize_text` strips Unicode
-  punctuation so CJK copies with differing trailing punctuation normalise equal.
-  Short interjections keep the exact cap of 3.
+  catches near-identical long blocks (> 24 normalised chars), not just exact
+  ones: (a) an **exact normalised-key** match with unbounded timeline reach —
+  `_normalize_text` strips Unicode punctuation + whitespace, so the narration
+  re-emitted at six separated timestamps with only punctuation/spacing
+  differences collapses to one (the case the old exact-only filter missed); plus
+  (b) a **length-gated fuzzy match (≥ 0.9)** over a bounded recent window for
+  genuine ASR character drift. The length gate (`min/max ≥ 0.9`) means a
+  distinct *longer* line that merely *contains* a shorter kept line is never
+  dropped, and the window keeps the pass O(n) instead of O(n²) on long episodes.
+  Short interjections keep the exact cap of 3; `[♪ music ♪]` markers are exempt.
 
 ## Task 5 — Otter-parity segmentation + glossary
 

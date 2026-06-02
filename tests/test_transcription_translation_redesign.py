@@ -324,6 +324,33 @@ def test_fuzzy_repetition_loop_collapses_near_identical_long_blocks():
     assert dropped == 6
 
 
+def test_repetition_filter_keeps_distinct_longer_extension():
+    # A distinct longer line that merely CONTAINS an earlier line must NOT be
+    # dropped (the containment-branch false-positive). Their lengths differ by
+    # more than the similarity ratio, so the length gate excludes them.
+    segs = [
+        {"text": "I will protect this colony from the enemy", "start": 1.0, "end": 4.0},
+        {"text": "I will protect this colony from the enemy until my dying breath",
+         "start": 300.0, "end": 304.0},
+    ]
+    kept, dropped = dedup.drop_repetition_loops(segs)
+    assert dropped == 0 and len(kept) == 2
+
+
+def test_repetition_filter_is_bounded_on_many_distinct_long_cues():
+    # 1500 distinct long cues must not trigger an O(n^2) blow-up.
+    import time
+    segs = [{"text": f"This is distinct dialogue line number {i:04d} here.",
+             "start": float(i), "end": float(i) + 1.0} for i in range(1500)]
+    t0 = time.perf_counter()
+    kept, dropped = dedup.drop_repetition_loops(segs)
+    assert dropped == 0 and len(kept) == 1500
+    # Bounded (exact-key O(1) + fixed fuzzy window) vs the ~24s full-history
+    # O(n^2) scan — generous ceiling so it's not flaky on slow CI but still
+    # unambiguously rules out the quadratic blow-up.
+    assert (time.perf_counter() - t0) < 6.0
+
+
 def test_repetition_filter_keeps_all_music_markers():
     # OP + ED + two insert songs → four identical [♪ music ♪] cues. All must
     # survive the repetition-loop filter (markers are intentional, not loops).

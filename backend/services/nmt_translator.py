@@ -653,12 +653,27 @@ def _convert_with_cleanup(model_id: str, target_dir: str, label: str) -> None:
         with _hf_cache_redirect():
             converter = TransformersConverter(model_id)
             converter.convert(convert_dir, quantization="int8", force=False)
-        # Promote atomically: clear any stale/partial target first, then rename
-        # the freshly-converted model in. After this, ``convert_dir`` no longer
-        # exists (it became ``target_dir``); ``tmp_holder`` is emptied below.
+        # Promote atomically. If a stale/partial target exists, rename it ASIDE
+        # first (atomic, same volume) rather than rmtree-ing it in place: a
+        # rmtree(ignore_errors=True) that silently fails to fully clear the dir
+        # (e.g. a locked file) would leave it non-empty, os.replace would then
+        # refuse with ENOTEMPTY, and the except branch would delete the FRESH
+        # model. Swapping the stale dir aside means os.replace always targets a
+        # non-existent path, and the fresh model is never the thing at risk.
+        backup = None
         if os.path.exists(target_dir):
-            shutil.rmtree(target_dir, ignore_errors=True)
-        os.replace(convert_dir, target_dir)
+            backup = f"{target_dir}.old-{os.getpid()}"
+            shutil.rmtree(backup, ignore_errors=True)
+            os.replace(target_dir, backup)
+        try:
+            os.replace(convert_dir, target_dir)
+        except Exception:
+            if backup is not None and not os.path.exists(target_dir):
+                os.replace(backup, target_dir)  # restore the stale model
+                backup = None
+            raise
+        if backup is not None:
+            shutil.rmtree(backup, ignore_errors=True)
     except Exception:
         # Tear down BOTH the temp dir and any partial target_dir so neither is
         # mistaken for a complete download (and so a retry starts clean).

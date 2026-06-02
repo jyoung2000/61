@@ -29,29 +29,41 @@ def drop_repetition_loops(
     *,
     similarity_threshold: float = 0.9,
     long_block_chars: int = 24,
+    fuzzy_window: int = 64,
 ) -> tuple[list, int]:
     """Remove Whisper repetition-loop hallucinations.
 
     When the main/gap-fill passes run over music / quiet regions, Whisper loops
     and emits the same content repeatedly, scattered across the timeline (so an
     adjacent-only dedup misses them). Real dialogue almost never repeats across
-    an episode, so a recurring block is a hallucination.
+    an episode, so a recurring long block is a hallucination.
 
-    Two rules, order-preserving, keeping the earliest occurrence:
+    Long blocks (> ``long_block_chars`` normalised chars) are caught two ways,
+    order-preserving, keeping the earliest occurrence:
 
-      * **Long blocks** (> ``long_block_chars`` normalised chars): caught by
-        text SIMILARITY, not exact match. A block that is ≥
-        ``similarity_threshold`` similar to one already kept is dropped — this
-        is the implausible-recurrence rule, and it catches the NEAR-identical
-        copies the old exact-only filter missed (the opening narration re-emitted
-        at six separated timestamps with tiny ASR differences).
-      * **Short interjections** (e.g. "了解", "Roger") can legitimately recur, so
-        exact (whitespace-insensitive) repeats are capped at 3.
+      * **Exact (normalised) recurrence — anywhere on the timeline.** Text is
+        normalised by stripping punctuation + whitespace, so the opening
+        narration re-emitted at six separated timestamps with only punctuation /
+        spacing differences collapses to one. This is an O(1) dict lookup, so it
+        is unbounded in reach yet cheap (a 1400-cue episode is near-instant), and
+        it is what real Whisper loops (byte-identical re-emissions) trip.
+      * **Fuzzy near-identical recurrence — within the last ``fuzzy_window``
+        long cues.** Catches copies that differ by genuine ASR character drift.
+        A length gate (``min/max ≥ similarity_threshold``) is applied first, so a
+        DISTINCT longer line that merely CONTAINS a shorter kept line (e.g.
+        "…protect this colony" then "…protect this colony until my dying breath")
+        is never matched and the fuller line is kept. The window bounds the cost
+        to O(n·window) instead of an O(n²) full-history scan.
+
+    Short interjections (e.g. "了解", "Roger") can legitimately recur, so exact
+    repeats are capped at 3.
 
     Returns ``(kept_segments, dropped_count)``.
     """
-    seen: dict = {}            # exact-key counts for short interjections
-    kept_long: list[str] = []  # raw text of long blocks already kept (fuzzy cmp)
+    from collections import deque
+    seen: dict = {}                    # exact-key counts for short interjections
+    long_exact: set = set()            # normalised text of long blocks kept
+    recent_long = deque(maxlen=max(1, int(fuzzy_window)))  # (raw, norm_len) recents
     out = []
     dropped = 0
     for seg in segments or []:
@@ -66,13 +78,27 @@ def drop_repetition_loops(
             continue
         key = re.sub(r"\s+", "", raw)
         if len(key) > long_block_chars:
-            # A verbatim OR near-identical recurrence anywhere on the timeline
-            # is a loop, not real dialogue → keep the first, quarantine the rest.
-            if any(_text_similarity(raw, prev) >= similarity_threshold
-                   for prev in kept_long):
+            nrm = _normalize_text(raw)
+            # 1. Exact (punctuation/space-insensitive) recurrence, unbounded reach.
+            if nrm in long_exact:
                 dropped += 1
                 continue
-            kept_long.append(raw)
+            # 2. Fuzzy near-identical recurrence among recent long cues, length-
+            #    gated so a longer line that merely contains a shorter one is not
+            #    treated as a loop.
+            L = len(nrm)
+            is_loop = False
+            for prev_raw, prev_len in recent_long:
+                ratio = (min(L, prev_len) / max(L, prev_len)) if max(L, prev_len) else 1.0
+                if ratio >= similarity_threshold and \
+                        _text_similarity(raw, prev_raw) >= similarity_threshold:
+                    is_loop = True
+                    break
+            if is_loop:
+                dropped += 1
+                continue
+            long_exact.add(nrm)
+            recent_long.append((raw, L))
             out.append(seg)
         else:
             n = seen.get(key, 0)
