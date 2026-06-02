@@ -3197,6 +3197,11 @@ class ClipExtractor:
         if on_progress:
             on_progress(0.55)
 
+        # Record whether VLM discovery actually contributed, so the pipeline /
+        # UI can flag the degraded "signal-only" mode (VLM unavailable on this
+        # GPU, or the cloud VLM was rate-limited).
+        self.vlm_discovery_used = bool(vlm_candidates)
+
         # Enrich VLM candidates with transcript
         for c in vlm_candidates:
             c.transcript_slice = _slice_transcript(

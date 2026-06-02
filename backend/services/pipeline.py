@@ -3426,6 +3426,7 @@ async def _run_analysis_inner(job_id: str):
         job_id, JobStatus.DETECTING_CLIPS, 80, "Detecting viral clip candidates...",
     )
     clips = []
+    clip_discovery_mode = None  # "vlm" | "signal_only" | None (set after run)
     async with _stage_timer(job_id, "clip_extraction"):
         try:
             from backend.services.reframer_clipper import ClipExtractor, ClipperConfig
@@ -3520,6 +3521,18 @@ async def _run_analysis_inner(job_id: str):
                 timeout=_SUMMARY_CLIP_TIMEOUT,
             )
             clips = to_fez_clips(raw_clips)
+            # Flag the degraded path so the UI can say so: VLM discovery either
+            # ran (vlm) or was unavailable/rate-limited → signal-only ranking.
+            if clips:
+                clip_discovery_mode = (
+                    "vlm" if getattr(clip_extractor, "vlm_discovery_used", False)
+                    else "signal_only"
+                )
+            if clip_discovery_mode == "signal_only":
+                logger.info(
+                    "[%s] Clip detection used signal-only ranking (VLM unavailable "
+                    "or rate-limited)", job_id,
+                )
             logger.info("[%s] Clip extraction produced %d clips", job_id, len(clips))
         except asyncio.TimeoutError:
             logger.warning(
@@ -3661,6 +3674,7 @@ async def _run_analysis_inner(job_id: str):
         scenes=_scene_models,
         transcript=_transcript_models,
         clips=_clip_models,
+        clip_discovery_mode=clip_discovery_mode,
         analysis_duration_seconds=_analysis_seconds,
         estimated_cost_usd=_total_cost_usd,
         cost_breakdown=_cost_breakdown,

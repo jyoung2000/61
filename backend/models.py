@@ -252,6 +252,10 @@ class JobResult(BaseModel):
     translation_status: Optional[str] = None
     translation_error: Optional[str] = None  # short reason when translation_status == "translation_failed"
     clips: list[ClipCandidate] = []
+    # How the clips were discovered: "vlm" (VideoLLaMA enhanced) or "signal_only"
+    # (VLM unavailable on this GPU / cloud VLM rate-limited → ranked by signal
+    # density). None when clip detection didn't run. Surfaced in the UI.
+    clip_discovery_mode: Optional[str] = None
     speaker_names: dict[str, str] = {}  # {"Speaker 1": "Eric", "Speaker 2": "Alice"}
     scene_cut_timestamps: list[float] = []  # Timestamps of camera cuts from frame extraction
     exported_clips: list[dict] = []

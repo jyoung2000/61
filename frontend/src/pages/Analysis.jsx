@@ -3550,6 +3550,18 @@ export default function Analysis() {
             </div>
           )}
 
+          {/* Signal-only fallback note — shown when the visual AI (VideoLLaMA)
+              couldn't run on this GPU or the cloud VLM was rate-limited, so
+              clips were ranked by audio/visual engagement signals instead. */}
+          {job.clip_discovery_mode === 'signal_only' && job.clips?.length > 0 && (
+            <div style={{ padding: '10px 16px', background: 'var(--amber-dim)', border: '1px solid var(--accent-amber)', marginBottom: 16, fontSize: 13, color: 'var(--accent-amber)', borderRadius: 'var(--radius-sm)' }}>
+              <strong>Signal-based clips.</strong> The visual AI (VideoLLaMA) couldn’t run —
+              not enough GPU VRAM for the local model, or the cloud VLM was rate-limited —
+              so these clips were ranked by audio/visual engagement signals instead of VLM
+              scene understanding. Add Replicate credit or use a larger GPU for VLM-curated clips.
+            </div>
+          )}
+
           {/* Clip Discovery bar — same relaxed gate as the sidebar
               below so users with empty scenes still see the
               "Generate Clips" controls. The clip-detector falls back
