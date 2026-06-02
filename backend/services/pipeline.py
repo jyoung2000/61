@@ -320,6 +320,18 @@ def _whisper_native_translate_segments(video_path: str, source_lang: str,
     return out
 
 
+def _gpu_free_vram_gb() -> float:
+    """Free CUDA VRAM in GiB (0.0 when there's no GPU / torch is unavailable)."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            free_bytes, _ = torch.cuda.mem_get_info()
+            return free_bytes / 1_073_741_824
+    except Exception:
+        pass
+    return 0.0
+
+
 async def translate_offline(segments, source_lang, target_lang, *, video_path=None,
                             glossary=None, orchestrator=None, status_callback=None,
                             job_id=None, whisper_timeout=None, nmt_timeout=None):
@@ -342,11 +354,26 @@ async def translate_offline(segments, source_lang, target_lang, *, video_path=No
 
     src = (source_lang or "").lower()
     tgt = (target_lang or "").lower()
-    use_whisper = (
+    _want_whisper = (
         bool(video_path)
         and getattr(settings, "WHISPER_TRANSLATE_TO_EN", True)
         and tgt == "en" and src not in ("en", "english")
     )
+    # Whisper-native is a SECOND full ASR pass — only worth it when it can run on
+    # the GPU. On a low-VRAM card (e.g. 4 GB, where VRAM is freed for the next
+    # stages) it falls back to CPU and takes ~30 min for a 25-min video, then
+    # times out; meanwhile offline NMT (NLLB int8) loads in the freed VRAM and
+    # finishes in well under a minute. So gate on free GPU memory and otherwise
+    # go straight to NMT — never eat the CPU path.
+    _WHISPER_MIN_FREE_GB = float(getattr(settings, "WHISPER_TRANSLATE_MIN_FREE_GB", 4.0))
+    _free_gb = _gpu_free_vram_gb() if _want_whisper else 0.0
+    use_whisper = _want_whisper and _free_gb >= _WHISPER_MIN_FREE_GB
+    if _want_whisper and not use_whisper:
+        logger.info(
+            "Whisper-native translate skipped (%.1f GB GPU free < %.1f GB needed to "
+            "run on GPU) — using offline NMT instead (avoids the slow CPU pass).",
+            _free_gb, _WHISPER_MIN_FREE_GB,
+        )
     if use_whisper:
         if status_callback:
             try:

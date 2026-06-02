@@ -309,6 +309,11 @@ class Settings(BaseSettings):
     # target language is not English), translation falls back to the offline NMT
     # engines below.
     WHISPER_TRANSLATE_TO_EN: bool = True
+    # Whisper-native translate is a second full ASR pass; it's only worth it when
+    # it can run on the GPU. Below this much FREE VRAM it would fall back to CPU
+    # (~30 min for a 25-min video), so the pipeline skips it and uses offline NMT
+    # (NLLB int8, which loads in the freed VRAM and finishes in seconds) instead.
+    WHISPER_TRANSLATE_MIN_FREE_GB: float = 4.0
     TRANSLATION_CONTEXT_WINDOW: int = 5         # segments before/after for context
     TRANSLATION_GLOSSARY_ENABLED: bool = True   # per-video KNP glossary support
     GOOGLE_TRANSLATE_API_KEY: str = ""          # for Google Cloud Translation v3

@@ -187,6 +187,9 @@ def _install_pipeline(monkeypatch, db, *, engine="nllb"):
                  "TRANSCRIPT_POLISHING_ENABLED"):
         monkeypatch.setattr(pipeline.settings, flag, False, raising=False)
     monkeypatch.setattr(pipeline.settings, "WHISPER_TRANSLATE_TO_EN", True, raising=False)
+    # Pretend a capable GPU is free by default so the Whisper-native gate opens;
+    # individual tests override this to exercise the low-VRAM skip.
+    monkeypatch.setattr(pipeline, "_gpu_free_vram_gb", lambda: 8.0)
 
 
 def test_pipeline_uses_whisper_native_for_ja_en_and_skips_nmt(monkeypatch):
@@ -244,3 +247,38 @@ def test_pipeline_falls_back_to_nmt_when_whisper_native_empty(monkeypatch):
     assert nmt_calls["n"] == 1  # fell back to the offline NMT path
     assert result["target_transcript"][0]["text"].startswith("NMT ")
     assert db.fields.get("translation_status") == "translated"
+
+
+def test_pipeline_skips_whisper_native_on_low_vram_and_uses_nmt(monkeypatch):
+    """On a low-VRAM GPU the Whisper-native pass would fall back to CPU (~30 min),
+    so the gate must skip it entirely and translate via offline NMT instead —
+    Whisper-native must NOT even be attempted."""
+    db = _FakeDB({"subtitle_language": "en", "language": "ja", "clips": [], "summary": None})
+    _install_pipeline(monkeypatch, db)
+    # Only ~2.6 GB free (the 4 GB-card case) — below the 4 GB gate.
+    monkeypatch.setattr(pipeline, "_gpu_free_vram_gb", lambda: 2.6)
+
+    whisper_calls = {"n": 0}
+    def _wn(*a, **k):
+        whisper_calls["n"] += 1
+        return [TranscriptSegment(text="WN", start=0.0, end=1.0, speaker="Speaker 1")]
+    monkeypatch.setattr(pipeline, "_whisper_native_translate_segments", _wn)
+
+    nmt_calls = {"n": 0}
+    async def _nmt(segs, **k):
+        nmt_calls["n"] += 1
+        return [TranscriptSegment(text="NMT " + s.text, start=s.start, end=s.end,
+                                  speaker=s.speaker) for s in segs]
+    monkeypatch.setattr(translator, "translate_segments_with_fallback", _nmt)
+
+    job = SimpleNamespace(subtitle_language="en", language="ja", clips=[],
+                          summary=None, file_path="/v.mp4")
+    transcript = [_src("こんにちは", 0.0, 1.0), _src("世界", 1.0, 2.0)]
+
+    result = _run(pipeline._background_post_processing(
+        "jobLowVram", transcript, _fake_orchestrator(), job, polished_already=False))
+
+    assert result["translated"] is True
+    assert whisper_calls["n"] == 0   # the slow CPU pass was never attempted
+    assert nmt_calls["n"] == 1       # offline NMT did the work
+    assert result["target_transcript"][0]["text"].startswith("NMT ")
