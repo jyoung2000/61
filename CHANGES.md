@@ -1,3 +1,141 @@
+# ClipAI — Offline translation reliability + transcription quality redesign (TACT)
+
+A 24.5-min Japanese anime episode (Gundam Wing) with subtitle target = English
+came back with: subtitles still in Japanese, the opening narration repeated at
+six separated timestamps, hallucinated vocalisations over the music bed,
+mistimed cues, and mangled song lyrics. Three stacked failures, fixed in
+priority order. Full design rationale: `docs/redesign-transcription-translation.md`.
+
+> Branch note: this work was developed on `claude/sharp-lamport-JBXmK` (the
+> session's designated branch), which is identical to the task's stated base
+> `fix/translate-step-reliability`.
+
+## Task 1 (P0) — Fix the NMT convert bug so offline translation can succeed
+
+**Root cause.** `nmt_translator._convert_with_cleanup` did
+`os.makedirs(target_dir, exist_ok=True)` and then
+`converter.convert(target_dir, quantization="int8", force=False)`. CTranslate2's
+`TransformersConverter.convert` *refuses* a pre-existing output dir unless
+`force=True` — and the `makedirs` had just created it. So **every** offline NMT
+download raised, the cleanup ran only after the failure, and the caller fell
+back to the LLM. Offline NMT had never succeeded on any branch.
+
+**Fix.** Convert into a **fresh sibling temp dir** on the same volume (a path the
+converter creates itself, so `force` is irrelevant), then promote it onto
+`target_dir` with an atomic `os.replace` (clearing any stale/partial target
+first). On any convert/download failure, remove the temp dir **and** any partial
+`target_dir`, so a retry is never blocked by a stale directory and a half-written
+model is never visible as "present". The HF-intermediate-cache redirect+cleanup,
+the disk-space guard, and the Opus-MT pair cap are all retained.
+
+**Network / disk.** The converter pulls NLLB-200 from `huggingface.co` (must be
+reachable) — a ~2.5 GB transient full-precision download into a redirected HF
+cache that is deleted afterwards, leaving the ~600 MB int8 CT2 model under
+`/data/models/nllb/…`. Documented in the function docstring.
+
+## Task 2 (P0) — Offline NMT the guaranteed default; never grind a free model
+
+- Offline-NMT-as-default was already correct in
+  `translator._resolve_translation_engine` (auto → NLLB when no cloud keys +
+  `NMT_AUTODOWNLOAD`); the convert bug was what stopped it from ever running.
+- **`:free` model policy.** Before touching the orchestrator LLM, the router now
+  detects whether the model the LLM path would actually call is a `:free`
+  OpenRouter model (the translation override, else the orchestrator's active
+  OpenRouter model, else settings). If so it **skips the OpenRouter LLM entirely**
+  — no probe, no 10-minute 429 storm — and falls through to a local Ollama model
+  if one is configured, otherwise raises `TranslationFailedError` **fast** with an
+  actionable reason (use offline NMT / a paid or local model).
+- The retained untranslated transcript is no longer logged as "clean"; it is the
+  **source-language** transcript (deduped, explicitly *not* a translation). The
+  fail-loud `translation_failed` status + reason are unchanged.
+
+## Task 3 — Kill repetition-loop generation at the source (transcription)
+
+`condition_on_previous_text=True` on the main Whisper pass drove the
+repetition-loop pathology through the musical opening. New `_decoding_kwargs()`
+helper (signature-filtered like `_vocab_bias_kwargs`, so an older faster-whisper
+build never sees an unknown kwarg) now supplies, on the main + native-translate
+passes:
+
+- `condition_on_previous_text` defaulting **OFF** (`WHISPER_CONDITION_ON_PREVIOUS_TEXT`);
+- `no_repeat_ngram_size=3`, `compression_ratio_threshold=2.4`,
+  `log_prob_threshold=-1.0`, `repetition_penalty=1.1`, and a `temperature`
+  fallback ladder — so degenerate/looped output is **rejected by the decoder**
+  (re-decoded hotter) instead of emitted.
+
+The gap-fill pass forces `condition_on_previous_text=False` regardless of the
+global default (it lives over music/quiet regions where priming is harmful).
+
+## Task 4 — Music-aware suppression + fuzzy hallucination quarantine
+
+- **Music suppression.** `audio_analyzer.mark_and_suppress_music` classifies the
+  audio **once**, drops Whisper "speech" cues that sit ≥ 60 %
+  (`SUBTITLE_MUSIC_SUPPRESS_OVERLAP`) inside a sustained music-only span
+  (≥ `SUBTITLE_MUSIC_MIN_SEC`) — the hallucinated lyrics/vocalisations — then
+  positively labels the span `[♪ music ♪]`. BGM-under-dialogue is classified
+  `speech` (not `music`) by the spectral classifier, so real dialogue over music
+  is untouched. The pipeline now suppresses, then marks.
+- **Fuzzy repetition quarantine.** `transcript_dedup.drop_repetition_loops` now
+  clusters long blocks (> 24 normalised chars) by **text similarity ≥ 0.9**
+  instead of exact match, so a near-identical narration block recurring at
+  separated timestamps keeps only the first occurrence (the six-timestamp loop
+  the old exact-only filter missed). `_normalize_text` strips Unicode
+  punctuation so CJK copies with differing trailing punctuation normalise equal.
+  Short interjections keep the exact cap of 3.
+
+## Task 5 — Otter-parity segmentation + glossary
+
+- The dialogue-only source (markers held out) is passed through
+  `sentence_segmenter.resegment_by_sentence` **before** translation, so the NMT
+  sees clean one-utterance-per-cue units aligned to word timestamps rather than
+  run-on blocks; the target side still resegments post-translation.
+- Per-noun glossary enforcement already flows into the NMT path
+  (`apply_glossary`) and is left in place.
+- TACT heterogeneous-engine consensus (a Parakeet/Canary second pass) is left as
+  documented future work — explicitly optional, VRAM-risky on the 1650, and not
+  verifiable in this environment.
+
+## New / changed settings
+
+`WHISPER_CONDITION_ON_PREVIOUS_TEXT` (False), `WHISPER_NO_REPEAT_NGRAM_SIZE` (3),
+`WHISPER_COMPRESSION_RATIO_THRESHOLD` (2.4), `WHISPER_LOG_PROB_THRESHOLD` (-1.0),
+`WHISPER_REPETITION_PENALTY` (1.1), `WHISPER_TEMPERATURE_FALLBACK` (ladder),
+`SUBTITLE_SUPPRESS_SPEECH_IN_MUSIC` (True), `SUBTITLE_MUSIC_SUPPRESS_OVERLAP` (0.6).
+
+## Verification
+
+**Done here** — 16 dependency-light unit tests
+(`tests/test_transcription_translation_redesign.py`, all green):
+
+- Convert fix with a converter mock faithful to CTranslate2's `force=False`
+  refusal — the fresh-target case **fails against the old code, passes against
+  the fix**; stale-target replacement; failure cleanup + retry-unblocked.
+- `:free` detection + the fast-skip path: `text_completion` is **never called**
+  (no 429 grind); fail-fast when no Ollama; fall-through to Ollama when set.
+- `_decoding_kwargs` defaults (cond_prev OFF), signature-filtering for old
+  builds, `**kwargs`-only safety, and the gap-fill override.
+- Fuzzy quarantine: six near-identical narration copies → one, dialogue + 3×
+  short interjection kept; music suppression: hallucinated lyrics dropped,
+  marker + dialogue kept; source resegmentation: run-on → one-utterance cues.
+
+**Must be run on the Unraid host** (this sandbox has no GPU, no
+faster-whisper/CTranslate2 weights, and no media, so a full pipeline run +
+fresh `clipai_logs_*.txt` cannot be produced here):
+
+1. Build/deploy on the branch, preserving `/data` (so the NMT model persists)
+   and `.env`. First `ja→en` job: expect log lines
+   `NMT: downloading + converting NLLB …`, `NMT: … converted to int8 at
+   /data/models/nllb/…`, `NMT: using NMTTranslator (…) for ja→en`, and **no**
+   `text_completion attempting via openrouter` for translation. Re-run: expect
+   `NLLB … already downloaded` (no re-download, no convert error).
+2. Re-run the Gundam Wing video (target=English) and confirm against the
+   reference transcript: opening narration appears **once** at its real time; the
+   song renders as `[♪ music ♪]` (no looped lyric fragments); no cues over
+   silent/music-only spans; one clean utterance per cue. Capture the log + a
+   side-by-side of the new output vs the reference.
+
+---
+
 # ClipAI — Make translate-then-polish actually run (decouple from clip extraction)
 
 A user picked **English** as the translate-to language for a 24.5-min Japanese
