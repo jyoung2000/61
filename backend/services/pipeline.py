@@ -1641,8 +1641,14 @@ async def _background_post_processing(
             "message": f"Translating subtitles to {target_name}...",
         })
 
-        # Scale timeout with segment count — allow extra time for model pull + fallback
-        _trans_timeout = max(600, len(transcript) * 4)
+        # Scale timeout generously with segment count. Offline NMT is LOCAL and
+        # FREE, so there's no cost reason to cap it tightly — a timeout here would
+        # discard the whole translation and revert the user to source-language
+        # subtitles, which we never want. 8 s/segment with a 30-min floor is
+        # ~16x the measured NLLB rate even with the per-cue completeness retries,
+        # so a real video never times out mid-translation. (The one-time offline
+        # model download, when needed, also fits inside this floor.)
+        _trans_timeout = max(1800, len(transcript) * 8)
         # Translator calls ``seg.text`` directly, so make sure every
         # row is a TranscriptSegment regardless of upstream shape.
         from backend.models import TranscriptSegment as _TS_for_translate
