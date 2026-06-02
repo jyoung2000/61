@@ -243,6 +243,58 @@ async def _release_whisper_vram(job_id: str):
         logger.warning("[%s] VRAM release error: %s", job_id, e)
 
 
+def _whisper_native_translate_segments(video_path: str, source_lang: str,
+                                       glossary: dict | None = None) -> list:
+    """Run Whisper's native audio→English translate task (offline, no LLM).
+
+    Returns a list of ``TranscriptSegment`` (English, with Whisper's own
+    audio-aligned timing), or ``[]`` when unavailable. Synchronous — Whisper is
+    blocking, so call it via ``asyncio.to_thread``. Loads the configured Whisper
+    model (reusing the cached engine when present; ``try_load`` / the translate
+    method handle the GPU→CPU fallback on low-VRAM cards).
+
+    This is the preferred offline path for non-English → English (matches
+    repo-60): a single ASR-translate pass that avoids the transcribe-then-
+    translate double-error and never touches an LLM. The AI model only polishes
+    the result downstream.
+    """
+    from backend.services.reframer_audio import AudioIntelligence
+    from backend.models import TranscriptSegment
+
+    model_name = (getattr(settings, "WHISPER_MODEL", "small") or "small")
+    ai = AudioIntelligence(model_name=model_name)
+    if not ai.try_load():
+        logger.warning("Whisper native translate: engine failed to load (model=%s)", model_name)
+        return []
+    raw = ai.whisper_translate(video_path, source_lang=source_lang)
+    if not raw:
+        return []
+
+    # Force any leaked source-term → target-term glossary fixes into the English
+    # output (best-effort; reuses the NMT post-processor). Whisper translated
+    # straight from audio, so there is no aligned per-cue source text — we treat
+    # the English line as both sides, which only swaps source terms that leaked.
+    try:
+        from backend.services.nmt_translator import apply_glossary
+    except Exception:
+        apply_glossary = None
+
+    out: list = []
+    for seg in raw:
+        txt = (seg.get("text") or "").strip()
+        if not txt:
+            continue
+        if glossary and apply_glossary:
+            try:
+                txt = apply_glossary(txt, txt, glossary)
+            except Exception:
+                pass
+        start = seg.get("start_sec", seg.get("start", 0.0)) or 0.0
+        end = seg.get("end_sec", seg.get("end", 0.0)) or 0.0
+        out.append(TranscriptSegment(text=txt, start=float(start), end=float(end)))
+    return out
+
+
 def release_torch_gpu_memory():
     """Release all torch GPU memory. Safe to call multiple times, even if torch not loaded."""
     try:
@@ -1506,28 +1558,13 @@ async def _background_post_processing(
                 logger.warning("[%s] Source resegmentation skipped (%s)",
                                job_id, _src_seg_err)
         try:
-            # ── (a) Translate ──
+            # ── (a) Translate (OFFLINE only — the AI never translates) ──
             logger.info("[%s] Translate START: %s → %s (%d segments)",
                         job_id, source_name, target_name, len(_trans_input))
-            # On a 4 GB GPU, a local NMT engine (NLLB on CUDA) must not load on
-            # top of the reframer's Whisper engine. Whisper VRAM is already
-            # released during analysis (_release_whisper_vram at the post-reframer
-            # stage), but re-run it defensively + log when the resolved engine is
-            # a local NMT so the OOM-avoidance ordering is explicit in the log.
-            try:
-                from backend.services.translator import _resolve_translation_engine
-                _resolved_engine = _resolve_translation_engine(
-                    source_lang if source_lang else "auto", target_lang)
-                if _resolved_engine in ("nllb", "opus-mt"):
-                    logger.info("[%s] Local NMT engine '%s' selected — freeing "
-                                "Whisper VRAM before NMT load", job_id, _resolved_engine)
-                    await _release_whisper_vram(job_id)
-            except Exception as _nmt_pre_err:
-                logger.debug("[%s] NMT pre-release skipped: %s", job_id, _nmt_pre_err)
             orchestrator.reset_circuit_breaker()
 
             # Surface the one-time offline-model auto-download to the UI over
-            # the existing websocket channel (Task 1).
+            # the existing websocket channel.
             async def _nmt_status(msg: str):
                 logger.info("[%s] %s", job_id, msg)
                 await broadcast_ws(job_id, {
@@ -1537,23 +1574,80 @@ async def _background_post_processing(
                     "message": msg,
                 })
 
-            translated = await asyncio.wait_for(
-                translate_segments_with_fallback(
-                    _trans_input,
-                    source_language=source_lang if source_lang else "auto",
-                    target_language=target_lang,
-                    orchestrator=orchestrator,
-                    glossary=glossary,
-                    status_callback=_nmt_status,
-                ),
-                timeout=_trans_timeout,
-            )
-            # Compare against the coerced model list (``_trans_input``) so the
-            # count works whether the caller handed us dicts or models.
-            changed = sum(
-                1 for t, o in zip(translated, _trans_input)
-                if (getattr(t, "text", "") or "") != (getattr(o, "text", "") or "")
-            )
+            translated = None
+            _used_whisper_native = False
+            changed = 0
+
+            # ── (a1) Whisper native audio→English translate (offline, no LLM) ──
+            # For non-English → English this single-step ASR-translate pass is
+            # the preferred offline path (matches repo-60): it avoids the
+            # transcribe-then-translate double-error and never touches an LLM.
+            # It yields its own audio-aligned English cues, which we use as the
+            # translated transcript directly. Any failure / empty result falls
+            # through to the offline NMT router below.
+            if (getattr(settings, "WHISPER_TRANSLATE_TO_EN", True)
+                    and target_lang == "en"
+                    and source_lang not in ("en", "english")):
+                # Empty/unknown source is fine — Whisper auto-detects the
+                # language for its translate pass.
+                await _nmt_status("Translating audio directly to English (Whisper, offline)…")
+                try:
+                    _wt = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            _whisper_native_translate_segments,
+                            job.file_path, source_lang, glossary),
+                        timeout=_trans_timeout,
+                    )
+                except Exception as _wt_err:
+                    _wt = None
+                    logger.warning("[%s] Whisper native translate failed (%s) — "
+                                   "falling back to offline NMT", job_id, _wt_err)
+                if _wt:
+                    translated = _wt
+                    _used_whisper_native = True
+                    changed = len(translated)
+                    logger.info("[%s] Whisper native translate: %d English cues "
+                                "(offline, single-step, no LLM)", job_id, len(translated))
+                    # Release the Whisper engine we just (re)loaded so the
+                    # downstream clip stage / local VLM gets the GPU back.
+                    await _release_whisper_vram(job_id)
+
+            # ── (a2) Offline NMT text translation (every other case) ──
+            if not _used_whisper_native:
+                # On a 4 GB GPU, a local NMT engine (NLLB on CUDA) must not load
+                # on top of the reframer's Whisper engine. Whisper VRAM is already
+                # released during analysis; re-run it defensively + log when the
+                # resolved engine is a local NMT so the OOM-avoidance ordering is
+                # explicit in the log.
+                try:
+                    from backend.services.translator import _resolve_translation_engine
+                    _resolved_engine = _resolve_translation_engine(
+                        source_lang if source_lang else "auto", target_lang)
+                    if _resolved_engine in ("nllb", "opus-mt"):
+                        logger.info("[%s] Local NMT engine '%s' selected — freeing "
+                                    "Whisper VRAM before NMT load", job_id, _resolved_engine)
+                        await _release_whisper_vram(job_id)
+                except Exception as _nmt_pre_err:
+                    logger.debug("[%s] NMT pre-release skipped: %s", job_id, _nmt_pre_err)
+
+                translated = await asyncio.wait_for(
+                    translate_segments_with_fallback(
+                        _trans_input,
+                        source_language=source_lang if source_lang else "auto",
+                        target_language=target_lang,
+                        orchestrator=orchestrator,
+                        glossary=glossary,
+                        status_callback=_nmt_status,
+                    ),
+                    timeout=_trans_timeout,
+                )
+                # Compare against the coerced model list (``_trans_input``) so the
+                # count works whether the caller handed us dicts or models.
+                changed = sum(
+                    1 for t, o in zip(translated, _trans_input)
+                    if (getattr(t, "text", "") or "") != (getattr(o, "text", "") or "")
+                )
+
             logger.info("[%s] Translate DONE: %d/%d segments changed → %s",
                         job_id, changed, len(translated), target_lang)
             # Never relabel the source as translated: if NOTHING changed the
@@ -1712,10 +1806,12 @@ async def _background_post_processing(
                 "type": "background_task",
                 "task": "subtitle_translation",
                 "status": "complete",
-                "message": f"Subtitles translated to {target_name} ({changed}/{len(translated)} segments)",
+                "message": f"Subtitles translated to {target_name} ({len(_translated_out)} segments)",
             })
-            logger.info("[%s] Translate+polish complete: %d/%d segments to %s",
-                        job_id, changed, len(translated), target_lang)
+            logger.info("[%s] Translate+polish complete: %d %s segments persisted "
+                        "(via %s)",
+                        job_id, len(_translated_out), target_lang,
+                        "Whisper native translate" if _used_whisper_native else "offline NMT")
 
             # Visible, persisted success state (Task 3) + outcome contract.
             await _set_translation_status(job_id, "translated", None)

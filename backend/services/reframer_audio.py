@@ -1175,32 +1175,20 @@ class AudioIntelligence:
 
     def whisper_translate(self, video_path: str, source_lang: str = None,
                           on_progress=None) -> List[dict]:
-        """DEPRECATED: prefer ASR transcribe → NMT/LLM translate pipeline.
+        """Direct audio→English translation via Whisper's native translate task.
 
-        Whisper's built-in translate task produces lower quality than a
-        dedicated NMT pass on most benchmarks. This method is retained
-        for backward compatibility and as a fallback when no NMT engine
-        is available.
+        For non-English → English, this single-step pass (Whisper run with
+        ``task="translate"``) is the preferred OFFLINE path: it avoids the
+        transcribe-then-translate double-error, needs no separate NMT model
+        download, and never touches an LLM (the AI model only polishes the
+        result afterward). The pipeline calls this first for English targets
+        and falls back to the offline NMT engines in
+        ``backend/services/translator.py`` only when it returns ``[]``.
 
-        When ``TRANSLATION_ENGINE`` is set to anything other than
-        ``"whisper"`` / ``""``, this method returns an empty list so the
-        caller falls through to the ASR + NMT path defined in
-        ``backend/services/translator.py``.
+        Returns a list of ``{start, end, text}`` dicts (English, with Whisper's
+        own audio-aligned timing), or ``[]`` when the engine is unavailable.
         """
         log = get_logger()
-
-        try:
-            from backend.config import settings as _app_settings
-            _engine = (getattr(_app_settings, "TRANSLATION_ENGINE", "") or "").lower()
-        except Exception:
-            _engine = ""
-        if _engine and _engine not in ("whisper", ""):
-            log.log_stage(
-                'TRANSLATE',
-                f'Whisper native translate skipped (TRANSLATION_ENGINE={_engine}) '
-                f'— use ASR→NMT pipeline instead',
-            )
-            return []
 
         if not self.engine:
             log.log_stage('TRANSLATE',

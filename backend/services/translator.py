@@ -585,16 +585,20 @@ async def _translate_via_nmt(
 def _resolve_translation_engine(source: str, target: str) -> str:
     """Pick the translation engine to use based on settings + availability.
 
-    Returns one of: ``"deepl"``, ``"google"``, ``"nllb"``, ``"opus-mt"``,
-    ``"llm"``. The router in ``translate_segments_with_fallback`` consults
-    this when ``TRANSLATION_ENGINE=auto``.
+    Returns one of: ``"deepl"``, ``"google"``, ``"nllb"``, ``"opus-mt"``.
+    Translation is offline-only and never resolves to an LLM. The router in
+    ``translate_segments_with_fallback`` consults this when
+    ``TRANSLATION_ENGINE=auto``.
     """
     requested = (getattr(settings, "TRANSLATION_ENGINE", "auto") or "auto").lower()
-    if requested not in ("auto", "", "llm", "whisper"):
+    # Concrete engines bypass auto-selection. ``llm``/``whisper`` are no longer
+    # text-translation engines here — translation is offline-only and the AI
+    # model only polishes — so they fall through to AUTO, which always resolves
+    # to an offline NMT engine. (Whisper's native audio→English path is handled
+    # upstream in the pipeline before this text router is ever consulted.)
+    if requested in ("deepl", "google", "opus-mt", "nllb"):
         return requested
-    if requested in ("llm", "whisper"):
-        return "llm"
-    # AUTO selection.
+    # AUTO selection — offline-first, never an LLM.
     if (getattr(settings, "DEEPL_API_KEY", "") or "").strip():
         return "deepl"
     if (getattr(settings, "GOOGLE_TRANSLATE_API_KEY", "") or "").strip():
@@ -604,25 +608,30 @@ def _resolve_translation_engine(source: str, target: str) -> str:
         engine = pick_local_engine(source, target)
         if engine is not None:
             return "opus-mt" if engine.__class__.__name__ == "OpusMTTranslator" else "nllb"
-        # No local model on disk yet. Offline NMT is the real default: when
-        # auto-download is on, resolve to NLLB anyway — the NMT path will fetch
-        # + convert it on first use (one-time), then translate fully offline.
-        # The LLM is only a last resort if that download fails. (Task 1)
+        # No local model on disk yet. Offline NMT is the only translator, so
+        # resolve to the best NMT engine regardless of the auto-download flag:
+        # the NMT path fetches + converts it on first use when downloads are on,
+        # or fails with a clear NMT error when they're off (never an LLM).
+        engine_name = "nllb" if (iso_to_flores(source) and iso_to_flores(target)) else "opus-mt"
         if bool(getattr(settings, "NMT_AUTODOWNLOAD", True)):
-            engine_name = "nllb" if (iso_to_flores(source) and iso_to_flores(target)) else "opus-mt"
             logger.info(
                 "NMT: no local model for %s→%s yet — will auto-download %s "
-                "(offline default; LLM only if the download fails)",
+                "(one-time, then fully offline)",
                 source, target, engine_name,
             )
-            return engine_name
+        else:
+            logger.warning(
+                "NMT: no local model for %s→%s and auto-download is off — the NMT "
+                "engine will fail unless a model is already present "
+                "(translation is offline-only, no LLM fallback)",
+                source, target,
+            )
+        return engine_name
     except Exception as e:
         logger.warning("NMT: engine probe failed for %s→%s (%s)", source, target, e)
-    # No local NMT model and auto-download disabled — auto falls back to the
-    # LLM path. Log it clearly so it's obvious why the offline engine didn't run.
-    logger.info("NMT: no local model for %s→%s and auto-download off, falling back to LLM",
-                source, target)
-    return "llm"
+    # Probe failed entirely — still resolve to NLLB so the NMT path surfaces a
+    # concrete, actionable error rather than silently relabelling the source.
+    return "nllb"
 
 
 async def translate_segments_with_fallback(
@@ -635,26 +644,29 @@ async def translate_segments_with_fallback(
     glossary: dict | None = None,
     status_callback=None,
 ) -> list[TranscriptSegment]:
-    """Translate segments, falling back across engines.
+    """Translate segments with OFFLINE engines only — never an LLM.
+
+    This is the text-based router. For non-English → English, the pipeline
+    runs Whisper's native audio→English translate task *before* calling this
+    (see ``WHISPER_TRANSLATE_TO_EN``); this router handles every other case.
 
     Decision tree (driven by TRANSLATION_ENGINE):
-      - ``auto``    → DeepL → Google → Opus-MT/NLLB (auto-downloaded offline
-                      default) → LLM → Ollama
-      - ``deepl``   → DeepL API (if key set) else LLM
-      - ``google``  → Google Cloud Translation v3 (if key set) else LLM
-      - ``opus-mt`` → Opus-MT local (auto-downloaded if missing) else LLM
-      - ``nllb``    → NLLB-200 local (auto-downloaded if missing) else LLM
-      - ``llm``     → orchestrator chain (current behavior)
-      - ``whisper`` → caller is expected to have used Whisper's native
-                      translate task; this entry point still falls back
-                      to LLM as a safety net.
+      - ``auto``    → DeepL → Google (both key-gated) → Opus-MT / NLLB
+                      (auto-downloaded offline default)
+      - ``deepl``   → DeepL API (requires key)
+      - ``google``  → Google Cloud Translation v3 (requires key)
+      - ``opus-mt`` → Opus-MT local (auto-downloaded if missing)
+      - ``nllb``    → NLLB-200 local (auto-downloaded if missing)
+
+    The AI model never translates here; it only polishes the translated text
+    downstream. ``orchestrator``/``batch_size`` are accepted for call-site
+    compatibility but unused.
 
     ``status_callback(msg)`` (optional, sync or async) surfaces coarse status
     such as the one-time offline-model download to the websocket.
 
-    Raises ``TranslationRateLimitedError`` / ``TranslationFailedError`` when
-    the LLM path can't complete, so the caller never relabels the untranslated
-    source as a translation.
+    Raises ``TranslationFailedError`` when offline translation can't complete,
+    so the caller never relabels the untranslated source as a translation.
     """
     if source_language == target_language:
         return segments
@@ -663,37 +675,14 @@ async def translate_segments_with_fallback(
     logger.info("Translation engine resolved: %s (requested=%s)",
                 engine, getattr(settings, "TRANSLATION_ENGINE", "auto"))
 
-    # Dedicated OpenRouter translation model. Blank → orchestrator keeps using
-    # the editorial model (current behaviour). When set, the LLM batch calls
-    # route through it so subtitle translation can use a translation-strong
-    # model while transcript polishing stays on the editorial model.
-    _or_translation_model = (getattr(settings, "OPENROUTER_TRANSLATION_MODEL", "") or "").strip() or None
-    if _or_translation_model:
-        logger.info("Subtitle translation will use OpenRouter model override: %s",
-                    _or_translation_model)
-    # Free OpenRouter models are rate-limited upstream — attempting them only
-    # burns the job in 429s (the reported 10-minute stall). Detect whether the
-    # LLM path would actually call a :free model and, if so, SKIP the OpenRouter
-    # LLM entirely: fall through to the local Ollama model if one is configured,
-    # else fail fast with an actionable reason (Task 2). Offline NMT remains the
-    # real default; this only governs the LLM last-resort path.
-    _is_free, _free_model_label = _llm_translation_model_is_free(
-        orchestrator, _or_translation_model)
-    _skip_openrouter_llm = bool(_is_free)
-    if _skip_openrouter_llm:
-        _has_ollama = bool((getattr(settings, "OLLAMA_TRANSLATION_MODEL", "") or "").strip())
-        logger.warning(
-            "Translation LLM model '%s' is a FREE OpenRouter model (rate-limited "
-            "upstream) — skipping it to avoid a 429 storm; %s. For reliable "
-            "subtitles use offline NMT (TRANSLATION_ENGINE=auto/nllb) or a "
-            "paid/local model.",
-            _free_model_label,
-            ("falling back to the local Ollama translation model"
-             if _has_ollama else
-             "no local Ollama model is configured, so translation fails fast"),
-        )
+    # Translation is OFFLINE-ONLY and never uses an LLM: the AI model's sole
+    # job is to polish the already-translated text for readability. For
+    # non-English → English the pipeline runs Whisper's native translate task
+    # before reaching this router; everything else routes to the local NMT
+    # engines (Opus-MT / NLLB), with the key-gated cloud services (DeepL,
+    # Google) used only when the user has explicitly configured an API key.
 
-    # ── Cloud NMT engines (DeepL, Google) ──
+    # ── Cloud NMT engines (DeepL, Google) — key-gated, never the default ──
     if engine == "deepl":
         try:
             out = await _translate_via_deepl(segments, source_language, target_language, glossary)
@@ -710,6 +699,7 @@ async def translate_segments_with_fallback(
             logger.warning("Google Translate failed: %s — falling back", e)
 
     # ── Local NMT engines (Opus-MT, NLLB) — offline default, auto-downloaded ──
+    _nmt_error: Exception | None = None
     if engine in ("opus-mt", "nllb"):
         try:
             out = await _translate_via_nmt(
@@ -722,198 +712,21 @@ async def translate_segments_with_fallback(
             if out is not None:
                 return out
         except Exception as e:
-            logger.warning("NMT translation failed: %s — falling back to LLM", e)
+            _nmt_error = e
+            logger.error("NMT translation failed: %s", e)
 
-    # --- Attempt 1: Quick probe with orchestrator (small sample first) ---
-    # Don't waste time translating all 1441 segments if the model can't translate.
-    # Try a 10-segment sample first; only proceed with full translation if it works.
-    # ``translate_segments`` raises TranslationRateLimitedError on sustained 429s
-    # — catch it so we still try the local Ollama fallback, but remember it so a
-    # subsequent total failure surfaces the rate-limit reason (Task 2).
-    # When the LLM model is a :free OpenRouter endpoint we skip this block
-    # outright (see _skip_openrouter_llm) — no probe, no 429 grind.
-    _rate_limited_err: TranslationRateLimitedError | None = None
-    if _skip_openrouter_llm:
-        logger.info(
-            "Skipping the OpenRouter LLM translation attempt (free model '%s') "
-            "— going straight to the local fallback / fail-fast", _free_model_label)
-    else:
-        probe_size = min(10, len(segments))
-        probe_sample = segments[:probe_size]
-        try:
-            probe_result = await translate_segments(
-                probe_sample, source_language, target_language,
-                orchestrator, batch_size=probe_size, glossary=glossary,
-                model_override=_or_translation_model,
-            )
-            probe_changed = sum(1 for t, o in zip(probe_result, probe_sample) if t.text != o.text)
-        except TranslationRateLimitedError as e:
-            logger.error("Orchestrator probe rate-limited: %s — skipping LLM, trying Ollama", e)
-            _rate_limited_err = e
-            probe_changed = 0
-
-        if _rate_limited_err is None and probe_changed > 0:
-            logger.info("Orchestrator probe: %d/%d segments changed — proceeding with full translation",
-                         probe_changed, probe_size)
-            try:
-                result = await translate_segments(
-                    segments, source_language, target_language,
-                    orchestrator, batch_size, progress_callback,
-                    glossary=glossary,
-                    model_override=_or_translation_model,
-                )
-                changed = sum(1 for t, o in zip(result, segments) if t.text != o.text)
-                if changed > 0:
-                    logger.info("Translation via orchestrator succeeded: %d/%d segments changed", changed, len(segments))
-                    return result
-            except TranslationRateLimitedError as e:
-                logger.error("Full orchestrator translation rate-limited: %s — trying Ollama", e)
-                _rate_limited_err = e
-        elif _rate_limited_err is None:
-            logger.info("Orchestrator probe: 0/%d segments changed — skipping full orchestrator attempt",
-                         probe_size)
-
-    # --- Attempt 2: Direct Ollama with dedicated translation model ---
-    translation_model = settings.OLLAMA_TRANSLATION_MODEL
-    if not translation_model:
-        if _skip_openrouter_llm:
-            # The only LLM was a free, rate-limited model and there's no local
-            # model to fall back to — refuse fast with an actionable reason
-            # rather than relabelling the source as a translation (Task 2).
-            raise TranslationFailedError(
-                f"Translation model '{_free_model_label}' is a free, rate-limited "
-                "OpenRouter model and no offline NMT or local Ollama model is "
-                "available. Enable offline NMT (TRANSLATION_ENGINE=auto with "
-                "NMT_AUTODOWNLOAD on), or configure a paid OPENROUTER_TRANSLATION_MODEL "
-                "or an OLLAMA_TRANSLATION_MODEL."
-            )
-        if _rate_limited_err is not None:
-            raise _rate_limited_err
-        raise RuntimeError("Translation produced no changes and no OLLAMA_TRANSLATION_MODEL configured")
-
-    logger.warning(
-        "Primary translation produced no changes (model may not support translation). "
-        "Falling back to dedicated Ollama translation model: %s",
-        translation_model,
+    # Offline translation is the only path — there is NO LLM fallback. The AI
+    # model only polishes the translated text downstream; it never translates.
+    # Fail loudly with an actionable reason so the caller keeps the (labelled)
+    # source transcript instead of silently relabelling it as a translation.
+    raise TranslationFailedError(
+        f"Offline translation failed for {source_language}→{target_language} "
+        f"(engine={engine}"
+        + (f": {_nmt_error}" if _nmt_error else "")
+        + "). Translation is offline-only and never uses an LLM. Ensure the NMT "
+        "model can be downloaded/loaded (TRANSLATION_ENGINE=auto with "
+        "NMT_AUTODOWNLOAD on), or for X→English enable WHISPER_TRANSLATE_TO_EN."
     )
-
-    # Ensure the translation model is available (pull if needed)
-    model_ready = await _ensure_ollama_model(translation_model)
-    if not model_ready:
-        if _rate_limited_err is not None:
-            raise _rate_limited_err
-        raise RuntimeError(f"Translation fallback model {translation_model} is not available and could not be pulled")
-
-    source_name = SUPPORTED_LANGUAGES.get(source_language, source_language)
-    target_name = SUPPORTED_LANGUAGES.get(target_language, target_language)
-    if source_language in ("auto", "") and segments:
-        source_name = "the original language"
-
-    # Use smaller batches for the fallback model — small models handle
-    # fewer segments more reliably, especially for CJK→English translation
-    fallback_batch_size = 10
-    translated = []
-    total_batches = (len(segments) + fallback_batch_size - 1) // fallback_batch_size
-    consecutive_failures = 0
-    MAX_CONSECUTIVE_BATCH_FAILURES = 5  # more tolerance — don't abort early
-
-    extra_rules = _get_pair_rules(source_language, target_language)
-    fallback_context_window = max(0, min(20, int(getattr(settings, "TRANSLATION_CONTEXT_WINDOW", 5))))
-    fallback_use_glossary = bool(getattr(settings, "TRANSLATION_GLOSSARY_ENABLED", True))
-    fallback_glossary_block = (
-        _format_glossary_block(glossary) if fallback_use_glossary else ""
-    )
-
-    for batch_idx, batch_start in enumerate(range(0, len(segments), fallback_batch_size)):
-        batch = segments[batch_start : batch_start + fallback_batch_size]
-
-        # Include surrounding segments as context
-        context_before = segments[max(0, batch_start - fallback_context_window): batch_start]
-        ctx_after_start = batch_start + len(batch)
-        context_after = segments[ctx_after_start: ctx_after_start + fallback_context_window]
-
-        context_section = (
-            _format_context_block("PREVIOUS CONTEXT", context_before)
-            + _format_context_block("FOLLOWING CONTEXT", context_after)
-        )
-        if context_section:
-            context_section += "\n"
-
-        seg_texts = [{"index": i, "text": seg.text} for i, seg in enumerate(batch)]
-        prompt = fallback_glossary_block + TRANSLATION_PROMPT.format(
-            source_lang=source_name,
-            target_lang=target_name,
-            count=len(batch),
-            segments_json=json.dumps(seg_texts, ensure_ascii=False, indent=2),
-            extra_rules=extra_rules,
-            context_section=context_section,
-        )
-
-        batch_success = False
-        for attempt in range(3):  # 3 attempts per batch for fallback
-            try:
-                response = await _translate_batch_via_ollama(prompt, translation_model, timeout=180.0)
-                translations = _parse_translation_response(response)
-
-                if isinstance(translations, list):
-                    if len(translations) == len(batch):
-                        translated.extend(_apply_batch_translations(batch, translations))
-                        batch_success = True
-                        break
-                    elif len(translations) > 0 and len(translations) < len(batch):
-                        logger.warning(
-                            "Ollama fallback batch %d: got %d/%d translations — applying partial",
-                            batch_idx, len(translations), len(batch),
-                        )
-                        partial = _apply_batch_translations(batch[:len(translations)], translations)
-                        partial.extend(batch[len(translations):])
-                        translated.extend(partial)
-                        batch_success = True
-                        break
-                    else:
-                        logger.warning("Ollama fallback batch %d attempt %d: wrong count (got %d, expected %d)",
-                                       batch_idx, attempt + 1,
-                                       len(translations), len(batch))
-                else:
-                    logger.warning("Ollama fallback batch %d attempt %d: invalid response type",
-                                   batch_idx, attempt + 1)
-            except Exception as e:
-                logger.warning("Ollama fallback batch %d attempt %d failed: %s",
-                               batch_idx, attempt + 1, e)
-
-        if not batch_success:
-            translated.extend(batch)
-            consecutive_failures += 1
-            if consecutive_failures >= MAX_CONSECUTIVE_BATCH_FAILURES:
-                logger.error(
-                    "Ollama fallback translation: %d consecutive batch failures — aborting",
-                    consecutive_failures,
-                )
-                remaining_start = batch_start + fallback_batch_size
-                translated.extend(segments[remaining_start:])
-                break
-        else:
-            consecutive_failures = 0
-
-        if progress_callback:
-            pct = int(((batch_idx + 1) / total_batches) * 100)
-            await progress_callback(pct)
-
-    # Verify the fallback actually translated something
-    changed = sum(1 for t, o in zip(translated, segments) if t.text != o.text)
-    if changed == 0:
-        if _rate_limited_err is not None:
-            raise _rate_limited_err
-        raise RuntimeError(
-            f"Fallback model {translation_model} also produced no changes — "
-            "try a more capable model (e.g. qwen2.5:7b or llama3.1:8b-instruct-q4_0)"
-        )
-
-    logger.info(
-        "Translated %d/%d segments via Ollama fallback model %s",
-        changed, len(translated), translation_model,
-    )
-    return translated
 
 
 # ═══════════════════════════════════════════════════════════════════════════

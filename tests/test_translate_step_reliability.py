@@ -83,6 +83,10 @@ def _install_common(monkeypatch, db, *, engine="llm"):
     monkeypatch.setattr(pipeline.database, "load_job", db.load_job)
     monkeypatch.setattr(pipeline, "broadcast_ws", _bcast)
     monkeypatch.setattr(translator, "_resolve_translation_engine", lambda s, t: engine)
+    # The Whisper-native →English path now runs first for non-English → English
+    # jobs; disable it here so these tests deterministically exercise the
+    # text/NMT path they stub via ``translate_segments_with_fallback``.
+    monkeypatch.setattr(pipeline.settings, "WHISPER_TRANSLATE_TO_EN", False, raising=False)
     # Keep optional LLM/segmentation passes out of the unit under test.
     monkeypatch.setattr(pipeline.settings, "AI_TRANSCRIPT_CORRECTION", False, raising=False)
     monkeypatch.setattr(pipeline.settings, "SENTENCE_SEGMENTATION_ENABLED", False, raising=False)

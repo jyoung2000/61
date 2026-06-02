@@ -296,9 +296,19 @@ class Settings(BaseSettings):
     SUBTITLE_PLATFORM_PROFILE: str = ""         # "" | tiktok | reels | shorts | horizontal | square
 
     # ── Translation Engine ──
-    # ``auto`` picks the best available engine: DeepL > Google > Opus-MT > NLLB > LLM.
-    # Force a specific engine to bypass auto-selection.
-    TRANSLATION_ENGINE: str = "auto"            # auto | llm | nllb | opus-mt | google | deepl | whisper
+    # ``auto`` picks the best available OFFLINE engine. For non-English → English
+    # jobs the pipeline first tries Whisper's native translate task (see
+    # WHISPER_TRANSLATE_TO_EN); otherwise: DeepL > Google (both key-gated) >
+    # Opus-MT > NLLB. Translation NEVER uses an LLM — the AI model only polishes
+    # the already-translated text for readability.
+    TRANSLATION_ENGINE: str = "auto"            # auto | nllb | opus-mt | google | deepl | whisper
+    # Prefer Whisper's native audio→English translate task for non-English →
+    # English jobs (matches repo-60's offline approach). It is a single-step,
+    # fully-offline ASR-translate pass that avoids the transcribe-then-translate
+    # double-error and never touches an LLM. When it yields no output (or the
+    # target language is not English), translation falls back to the offline NMT
+    # engines below.
+    WHISPER_TRANSLATE_TO_EN: bool = True
     TRANSLATION_CONTEXT_WINDOW: int = 5         # segments before/after for context
     TRANSLATION_GLOSSARY_ENABLED: bool = True   # per-video KNP glossary support
     GOOGLE_TRANSLATE_API_KEY: str = ""          # for Google Cloud Translation v3

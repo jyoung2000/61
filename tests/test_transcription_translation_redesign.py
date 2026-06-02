@@ -315,41 +315,45 @@ def _segs(n=3):
                               speaker="Speaker 1") for i in range(n)]
 
 
-def test_free_model_skips_llm_and_fails_fast(monkeypatch):
-    """LLM engine + free OpenRouter model + no Ollama → fail FAST with an
-    actionable TranslationFailedError, and text_completion is never called
-    (no 429 storm)."""
+def test_translation_is_offline_only_and_never_calls_llm(monkeypatch):
+    """Translation is OFFLINE-ONLY: even with a legacy TRANSLATION_ENGINE=llm
+    and a free OpenRouter model configured, the router NEVER calls the LLM
+    (text_completion). When the offline NMT engine can't translate, it fails
+    loudly with an actionable TranslationFailedError — no LLM/Ollama fallback."""
     monkeypatch.setattr(translator.settings, "TRANSLATION_ENGINE", "llm", raising=False)
-    monkeypatch.setattr(translator.settings, "OPENROUTER_TRANSLATION_MODEL", "", raising=False)
-    monkeypatch.setattr(translator.settings, "OLLAMA_TRANSLATION_MODEL", "", raising=False)
-    orch = _FakeOrchestrator([_FakeProvider("openrouter", "qwen/qwen3:free")])
-
-    with pytest.raises(translator.TranslationFailedError) as ei:
-        _run(translator.translate_segments_with_fallback(
-            _segs(), "ja", "en", orch))
-    msg = str(ei.value).lower()
-    assert "free" in msg and ("nmt" in msg or "offline" in msg)
-    assert orch.text_completion_calls == 0  # never ground the free model
-
-
-def test_free_model_skips_openrouter_but_uses_ollama(monkeypatch):
-    """With a free OpenRouter model AND an Ollama model configured, the router
-    skips OpenRouter (no text_completion) and proceeds to the Ollama path."""
-    monkeypatch.setattr(translator.settings, "TRANSLATION_ENGINE", "llm", raising=False)
-    monkeypatch.setattr(translator.settings, "OPENROUTER_TRANSLATION_MODEL", "", raising=False)
+    monkeypatch.setattr(translator.settings, "NMT_AUTODOWNLOAD", False, raising=False)
+    # An Ollama model being configured must NOT pull translation into the LLM.
     monkeypatch.setattr(translator.settings, "OLLAMA_TRANSLATION_MODEL", "qwen2.5:3b", raising=False)
     orch = _FakeOrchestrator([_FakeProvider("openrouter", "qwen/qwen3:free")])
 
-    # Make the Ollama model "unavailable" so we get a distinct, Ollama-specific
-    # failure — proving control reached the Ollama path, not the OpenRouter LLM.
-    async def _no_ollama(_model):
-        return False
-    monkeypatch.setattr(translator, "_ensure_ollama_model", _no_ollama)
+    # Simulate "no offline NMT model available" so the offline path fails.
+    async def _no_nmt(*a, **k):
+        raise RuntimeError("no local NMT model on disk")
+    monkeypatch.setattr(translator, "_translate_via_nmt", _no_nmt)
 
-    with pytest.raises(RuntimeError) as ei:
+    with pytest.raises(translator.TranslationFailedError) as ei:
         _run(translator.translate_segments_with_fallback(_segs(), "ja", "en", orch))
-    assert "qwen2.5:3b" in str(ei.value)          # the Ollama model name
-    assert orch.text_completion_calls == 0         # OpenRouter LLM was skipped
+    msg = str(ei.value).lower()
+    assert "offline" in msg and ("nmt" in msg or "whisper" in msg)
+    assert orch.text_completion_calls == 0  # the AI never translates
+
+
+def test_offline_nmt_output_is_returned_without_any_llm(monkeypatch):
+    """When the offline NMT engine succeeds, its translation is returned and the
+    LLM is never consulted (the AI's only job is polishing, done elsewhere)."""
+    monkeypatch.setattr(translator.settings, "TRANSLATION_ENGINE", "nllb", raising=False)
+    orch = _FakeOrchestrator([_FakeProvider("openrouter", "qwen/qwen3:free")])
+
+    async def _fake_nmt(segments, src, tgt, **k):
+        return [TranscriptSegment(text=f"EN {s.text}", start=s.start, end=s.end,
+                                  speaker=s.speaker)
+                for s in segments]
+    monkeypatch.setattr(translator, "_translate_via_nmt", _fake_nmt)
+
+    result = _run(translator.translate_segments_with_fallback(_segs(3), "ja", "en", orch))
+    assert len(result) == 3
+    assert all(r.text.startswith("EN ") for r in result)
+    assert orch.text_completion_calls == 0         # offline NMT only, no LLM
 
 
 # ════════════════════════════════════════════════════════════════════════
