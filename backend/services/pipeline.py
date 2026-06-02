@@ -1483,6 +1483,22 @@ async def _background_post_processing(
                     _trans_input.append(_TS_for_translate(**t))
                 except Exception:
                     pass
+        # ── (a0) Resegment the SOURCE into one-utterance-per-cue units before
+        # translating (Task 5). NMT translates cleaner sentence units far more
+        # reliably than run-on blocks, and it keeps source↔target cue counts
+        # comparable. Markers were already held out into _music_markers, so this
+        # only touches dialogue. The target side resegments again post-translate.
+        if getattr(settings, "SENTENCE_SEGMENTATION_ENABLED", True) and _trans_input:
+            try:
+                from backend.services.sentence_segmenter import resegment_by_sentence
+                _pre_src_seg = len(_trans_input)
+                _trans_input = resegment_by_sentence(_trans_input)
+                if len(_trans_input) != _pre_src_seg:
+                    logger.info("[%s] Source resegmentation (pre-translate): %d → %d cues",
+                                job_id, _pre_src_seg, len(_trans_input))
+            except Exception as _src_seg_err:
+                logger.warning("[%s] Source resegmentation skipped (%s)",
+                               job_id, _src_seg_err)
         try:
             # ── (a) Translate ──
             logger.info("[%s] Translate START: %s → %s (%d segments)",
