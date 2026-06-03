@@ -804,7 +804,11 @@ export default function Analysis() {
   const fetchJob = useCallback(async () => {
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 15000);
+      // Completed jobs carry the full transcript + translated_transcript +
+      // scenes + clips, which over a tunnel/LAN can take well past 15s to
+      // arrive. Aborting early was leaving the UI on the pre-translation job
+      // (source-language transcript, status stuck pre-complete). Give it room.
+      const timeout = setTimeout(() => controller.abort(), 60000);
       const res = await fetch(`/api/jobs/${jobId}`, { signal: controller.signal });
       clearTimeout(timeout);
       if (res.ok) {
@@ -844,6 +848,20 @@ export default function Analysis() {
       setLoading(false);
     }
   }, [jobId]);
+
+  // Safety net: while the job is non-terminal, re-fetch periodically so the UI
+  // converges on the finished state even if a WebSocket update was missed — a
+  // reconnect, a tunnel hiccup, or a job that the server-side reconcile marked
+  // complete after the socket went quiet. Without this, a missed 'complete'
+  // left the page stuck mid-pipeline AND never pulled the translated transcript
+  // (fetchJob only runs on specific WS events). Stops once terminal.
+  useEffect(() => {
+    if (!jobId) return undefined;
+    const terminal = ['complete', 'failed', 'cancelled'];
+    if (job && terminal.includes(String(job.status))) return undefined;
+    const id = setInterval(() => { fetchJob(); }, 20000);
+    return () => clearInterval(id);
+  }, [jobId, job?.status, fetchJob]);
 
   const handleMarkKeyScene = useCallback(async () => {
     if (!markSceneDesc.trim() || markSceneSaving) return;
