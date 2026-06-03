@@ -1,0 +1,61 @@
+# Docker build context excludes.
+#
+# Without this file the build context is the ENTIRE repo directory, which is
+# shipped to the Docker daemon before the build starts. On a server install
+# (e.g. Unraid /mnt/user/appdata) people copy a multi-GB backup into ./data
+# before building — and since the Dockerfile never builds ./data into the image
+# (it's bind-mounted at runtime: ./data/uploads:/data/uploads etc.), shipping it
+# as build context just fills the Docker vDisk / cache and can hang the box.
+# Excluding it keeps the context to source only (a few MB).
+
+# Runtime data — bind-mounted at run time, NEVER part of the image.
+data/
+data
+*.bak
+*-backup
+clipai-data-backup/
+clipai-env-backup
+
+# Version history + local tooling state.
+.git/
+.gitignore
+.gitattributes
+.github/
+.clipai/
+.pytest_cache/
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+
+# Frontend deps + build output (installed/built inside the image).
+**/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Secrets / env (provided at runtime via compose env_file / bind mount).
+.env
+.env.*
+!.env.example
+
+# Logs, caches, scratch.
+*.log
+logs/
+**/.DS_Store
+*.tmp
+
+# Media + model weights — large, fetched on demand into /data at runtime,
+# never needed to build the image.
+*.mp4
+*.mkv
+*.mov
+*.webm
+*.wav
+*.pt
+*.onnx
+*.bin
+*.safetensors
+*.ckpt
+models/
+
+# Tests + reference material aren't needed to build/run the service image.
+reference/
