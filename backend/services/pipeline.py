@@ -348,6 +348,42 @@ def _whisper_engine_cached() -> bool:
         return False
 
 
+def _timeline_coverage_s(segments) -> float:
+    """Total seconds of timeline covered by the cues, merging overlaps.
+
+    Used to compare how much of the audio a translation actually covers. Whisper's
+    audio→English *translate* task skips/merges non-speech (especially singing),
+    so on music/lyric-heavy videos it can cover far less of the timeline than the
+    source transcription did — leaving big untranslated gaps. Comparing coverage
+    catches that so we can prefer dense offline NMT instead."""
+    spans = []
+    for s in (segments or []):
+        if isinstance(s, dict):
+            a = s.get("start", s.get("start_sec"))
+            b = s.get("end", s.get("end_sec"))
+        else:
+            a = getattr(s, "start", getattr(s, "start_sec", None))
+            b = getattr(s, "end", getattr(s, "end_sec", None))
+        if a is None or b is None:
+            continue
+        a, b = float(a), float(b)
+        if b > a:
+            spans.append((a, b))
+    if not spans:
+        return 0.0
+    spans.sort()
+    total = 0.0
+    cur_s, cur_e = spans[0]
+    for a, b in spans[1:]:
+        if a <= cur_e:
+            cur_e = max(cur_e, b)
+        else:
+            total += cur_e - cur_s
+            cur_s, cur_e = a, b
+    total += cur_e - cur_s
+    return total
+
+
 async def translate_offline(segments, source_lang, target_lang, *, video_path=None,
                             glossary=None, orchestrator=None, status_callback=None,
                             job_id=None, whisper_timeout=None, nmt_timeout=None):
@@ -416,6 +452,27 @@ async def translate_offline(segments, source_lang, target_lang, *, video_path=No
         except Exception as _e:
             _wt = None
             logger.warning("Whisper native translate failed (%s) — falling back to offline NMT", _e)
+        if _wt:
+            # Coverage guard: Whisper's TRANSLATE task skips/merges non-speech
+            # (especially singing), so on music/lyric-heavy videos it can emit far
+            # less timeline coverage than the source transcription captured —
+            # leaving long untranslated gaps that read as "still Japanese". When
+            # Whisper-native covers materially less of the audio than the source,
+            # discard its sparse output and use dense offline NMT on the full
+            # source so every source cue gets a translation.
+            _src_cov = _timeline_coverage_s(segments)
+            _wt_cov = _timeline_coverage_s(_wt)
+            _min_ratio = float(getattr(settings, "WHISPER_TRANSLATE_MIN_COVERAGE", 0.6))
+            if _src_cov > 0 and _wt_cov < _min_ratio * _src_cov:
+                logger.warning(
+                    "Whisper-native translate covered only %.0fs of %.0fs source "
+                    "speech (%.0f%% < %.0f%% floor) — discarding sparse output and "
+                    "using offline NMT on the full source for complete subtitles.",
+                    _wt_cov, _src_cov,
+                    (100.0 * _wt_cov / _src_cov) if _src_cov else 0.0,
+                    100.0 * _min_ratio,
+                )
+                _wt = None
         if _wt:
             if job_id:
                 await _release_whisper_vram(job_id)

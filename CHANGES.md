@@ -1,3 +1,22 @@
+# ClipAI — Coverage guard: don't let sparse Whisper-translate leave Japanese gaps
+
+Follow-up to the Whisper-translate reuse work. On a music/lyric-heavy video
+(e.g. an anime AMV), Whisper's audio→English *translate* task skips/merges the
+singing, so it emitted only ~35 cues where the source transcription had captured
+122 — leaving long stretches with no English subtitle (they read as "still
+Japanese"). Because the reuse change made Whisper-native run on the 4 GB card
+instead of NLLB, those gaps surfaced in real output.
+
+Fix: a **coverage guard**. After a Whisper-native pass, compare how much of the
+audio timeline it covers against the source transcript; when it covers less than
+`WHISPER_TRANSLATE_MIN_COVERAGE` (default 0.6) of the source, discard the sparse
+output and translate the **full source via offline NMT** instead — so every
+source cue gets an English line. Dialogue-heavy videos (where Whisper-native
+covers ~all the speech) are unaffected and still use the higher-accuracy
+single-pass translate. Threshold is configurable.
+
+---
+
 # ClipAI — Local audio diarization without a HF token + Whisper-translate reuse
 
 Two local-first quality wins that need no external API and no token.

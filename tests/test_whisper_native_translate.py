@@ -296,7 +296,9 @@ def test_pipeline_reuses_loaded_whisper_on_low_vram(monkeypatch):
     whisper_calls = {"n": 0}
     def _wn(*a, **k):
         whisper_calls["n"] += 1
-        return [TranscriptSegment(text="WN", start=0.0, end=1.0, speaker="Speaker 1")]
+        # Cover the full 0-2 s source so the coverage guard keeps this output
+        # (this test exercises reuse, not the sparse-coverage fallback).
+        return [TranscriptSegment(text="WN", start=0.0, end=2.0, speaker="Speaker 1")]
     monkeypatch.setattr(pipeline, "_whisper_native_translate_segments", _wn)
 
     nmt_calls = {"n": 0}
@@ -316,3 +318,45 @@ def test_pipeline_reuses_loaded_whisper_on_low_vram(monkeypatch):
     assert result["translated"] is True
     assert whisper_calls["n"] == 1   # reused the loaded model instead of skipping
     assert nmt_calls["n"] == 0
+
+
+def test_timeline_coverage_merges_overlaps():
+    segs = [
+        TranscriptSegment(text="a", start=0.0, end=10.0, speaker="S"),
+        TranscriptSegment(text="b", start=5.0, end=15.0, speaker="S"),   # overlap → union 0-15
+        TranscriptSegment(text="c", start=20.0, end=25.0, speaker="S"),
+    ]
+    assert pipeline._timeline_coverage_s(segs) == 20.0   # 15 + 5
+    assert pipeline._timeline_coverage_s([]) == 0.0
+
+
+def test_pipeline_rejects_sparse_whisper_native_and_uses_nmt(monkeypatch):
+    """Whisper's translate task skips singing, so on a lyric-heavy video it can
+    cover far less of the audio than the source transcript. The coverage guard
+    must discard that sparse output and translate the full source via NMT — this
+    is the regression that left long Japanese gaps in the subtitles."""
+    db = _FakeDB({"subtitle_language": "en", "language": "ja", "clips": [], "summary": None})
+    _install_pipeline(monkeypatch, db)   # capable GPU → the Whisper gate opens
+
+    # Whisper-native returns a single short cue (~2 s) for a 100 s source.
+    def _wn(*a, **k):
+        return [TranscriptSegment(text="WN", start=0.0, end=2.0, speaker="Speaker 1")]
+    monkeypatch.setattr(pipeline, "_whisper_native_translate_segments", _wn)
+
+    nmt_calls = {"n": 0}
+    async def _nmt(segs, **k):
+        nmt_calls["n"] += 1
+        return [TranscriptSegment(text="NMT " + s.text, start=s.start, end=s.end,
+                                  speaker=s.speaker) for s in segs]
+    monkeypatch.setattr(translator, "translate_segments_with_fallback", _nmt)
+
+    job = SimpleNamespace(subtitle_language="en", language="ja", clips=[],
+                          summary=None, file_path="/v.mp4")
+    transcript = [_src("こんにちは", i * 5.0, i * 5.0 + 5.0) for i in range(20)]  # dense 0-100s
+
+    result = _run(pipeline._background_post_processing(
+        "jobSparse", transcript, _fake_orchestrator(), job, polished_already=False))
+
+    assert result["translated"] is True
+    assert nmt_calls["n"] == 1                                  # NMT did the work
+    assert result["target_transcript"][0]["text"].startswith("NMT ")

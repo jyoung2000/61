@@ -314,6 +314,12 @@ class Settings(BaseSettings):
     # (~30 min for a 25-min video), so the pipeline skips it and uses offline NMT
     # (NLLB int8, which loads in the freed VRAM and finishes in seconds) instead.
     WHISPER_TRANSLATE_MIN_FREE_GB: float = 4.0
+    # Whisper's translate task skips/merges non-speech (esp. singing), so on
+    # music/lyric-heavy videos it can cover far less of the audio than the source
+    # transcription did. When the Whisper-native English track covers less than
+    # this fraction of the source-transcript timeline, discard it and use dense
+    # offline NMT on the full source instead (every source cue gets translated).
+    WHISPER_TRANSLATE_MIN_COVERAGE: float = 0.6
     TRANSLATION_CONTEXT_WINDOW: int = 5         # segments before/after for context
     TRANSLATION_GLOSSARY_ENABLED: bool = True   # per-video KNP glossary support
     GOOGLE_TRANSLATE_API_KEY: str = ""          # for Google Cloud Translation v3
