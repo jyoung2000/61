@@ -1,3 +1,29 @@
+# ClipAI — Fix: jobs stuck at "translating" forever (interrupted-run recovery)
+
+Root-caused from a real run: a job re-analysed after completing died at the
+translate stage and then **span at "translating" forever** in the UI — no clips,
+source-language subtitles. The first run had finished cleanly (clips + 348
+translated segments verified on disk); a second run re-entered, set status
+`translating` (the only place that status is written), and never finished.
+
+The bug: both recovery paths used a **hardcoded** in-progress set
+(`analyzing_scenes, extracting_frames, generating_summary, detecting_clips`) that
+**omitted `translating`** (and `transcribing`/`queued`). So a job stuck at those
+statuses was neither reconciled-to-complete (it has results) nor failed — it just
+spun.
+
+Fix:
+- Derive the non-terminal set from the `JobStatus` enum, so it can **never drift
+  out of sync** again (covers every running phase).
+- Staleness-guarded recovery (`_recover_stale_jobs`): a non-terminal job that no
+  live worker is advancing (old `updated_at`) is flipped to **COMPLETE** when it
+  has results, or **FAILED** when it doesn't. Startup runs it unconditionally
+  (workers are dead); the periodic self-heal (every 10 min) uses 30 min / 2 h
+  thresholds so it **never touches an in-flight run**. Stuck jobs now recover
+  without a restart.
+
+---
+
 # ClipAI — Coverage guard: don't let sparse Whisper-translate leave Japanese gaps
 
 Follow-up to the Whisper-translate reuse work. On a music/lyric-heavy video

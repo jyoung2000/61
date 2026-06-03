@@ -3,6 +3,9 @@ import logging
 import logging.handlers
 import subprocess
 import threading
+from typing import Optional
+
+from backend.models import JobStatus
 
 # ── Prevent PyTorch from eagerly initializing CUDA in the main process ──
 # PyTorch's torch.cuda.is_available() triggers full CUDA initialization which
@@ -668,31 +671,96 @@ async def restore_judge_specs():
         logger.warning("Judge spec restore failed (non-fatal): %s", exc)
 
 
-_RECONCILE_IN_PROGRESS = {
-    "analyzing_scenes", "extracting_frames", "generating_summary", "detecting_clips",
+# Every non-terminal JobStatus, derived from the enum so it can NEVER drift out
+# of sync again. The previous hardcoded subset omitted ``translating`` (and
+# ``transcribing`` / ``queued`` / ``extracting_frames``), so a run that died at
+# the translate stage was neither reconciled-to-complete nor failed — it span at
+# "translating" forever. Deriving the set guarantees every running phase is
+# covered.
+_TERMINAL_STATUSES = {"complete", "failed", "cancelled"}
+_NON_TERMINAL_STATUSES = {
+    s.value for s in JobStatus if s.value not in _TERMINAL_STATUSES
 }
 
 
-async def _reconcile_finished_jobs() -> int:
-    """Flip any non-terminal job that actually has results (clips / summary)
-    to COMPLETE. Runs at startup AND periodically so a job whose COMPLETE
-    save didn't persist recovers without a restart. Returns count fixed."""
+def _job_age_seconds(job) -> Optional[float]:
+    """Seconds since the job's ``updated_at``; ``None`` when unparseable.
+
+    A live run stamps ``updated_at`` on every progress write, so a large age
+    means no worker is advancing this job (the run died) — the signal that makes
+    periodic recovery safe to act without ever touching an in-flight run."""
+    ts = (getattr(job, "updated_at", "") or "").strip()
+    if not ts:
+        return None
+    try:
+        from datetime import datetime, timezone
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - dt).total_seconds()
+    except Exception:
+        return None
+
+
+def _is_stale(job, stale_after_s: float) -> bool:
+    """True when the job hasn't been written for ``stale_after_s`` (or has no
+    timestamp). ``stale_after_s <= 0`` means 'no staleness requirement' — used at
+    startup, where every worker thread is already dead."""
+    if stale_after_s <= 0:
+        return True
+    age = _job_age_seconds(job)
+    return age is None or age >= stale_after_s
+
+
+async def _recover_stale_jobs(*, complete_stale_s: float, fail_stale_s: float) -> tuple[int, int]:
+    """Recover non-terminal jobs that no live run is advancing.
+
+    - has results (clips / summary) + stale ≥ ``complete_stale_s`` → COMPLETE
+      (its COMPLETE save was lost / reverted, but the work is on disk).
+    - no results + stale ≥ ``fail_stale_s`` → FAILED (the run died mid-flight;
+      surface a clear, re-analysable error instead of an eternal spinner).
+
+    Staleness keeps this from ever completing/failing an in-flight run. Pass
+    ``0`` for both at startup. Returns ``(completed, failed)``."""
     import backend.database as _db
-    fixed = 0
+    completed = failed = 0
     for job in await _db.list_jobs(include_unowned=True):
-        if job.status not in _RECONCILE_IN_PROGRESS:
+        if job.status not in _NON_TERMINAL_STATUSES:
             continue
-        if bool(getattr(job, "clips", None)) or getattr(job, "summary", None) is not None:
+        has_results = bool(getattr(job, "clips", None)) or getattr(job, "summary", None) is not None
+        if has_results:
+            if _is_stale(job, complete_stale_s):
+                await _db.update_job_status(
+                    job.job_id, status="complete", progress=100,
+                    progress_message="Analysis complete",
+                )
+                logger.warning(
+                    "Recover: job %s was '%s' but has results — marked COMPLETE",
+                    job.job_id, job.status,
+                )
+                completed += 1
+        elif _is_stale(job, fail_stale_s):
             await _db.update_job_status(
-                job.job_id, status="complete", progress=100,
-                progress_message="Analysis complete",
+                job.job_id, status="failed", progress=0,
+                progress_message="Analysis interrupted — please re-analyse",
             )
             logger.warning(
-                "Reconcile: job %s was '%s' but has results — marked COMPLETE",
+                "Recover: job %s stuck in '%s' with no results — marked FAILED",
                 job.job_id, job.status,
             )
-            fixed += 1
-    return fixed
+            failed += 1
+    return completed, failed
+
+
+async def _reconcile_finished_jobs() -> int:
+    """Back-compat shim: periodic reconcile-to-complete, staleness-guarded so it
+    never completes an in-flight run. Also fails jobs stuck with no results for a
+    very long time. Returns the count marked COMPLETE."""
+    completed, _failed = await _recover_stale_jobs(
+        complete_stale_s=1800,   # 30 min: a live run writes progress well inside this
+        fail_stale_s=7200,       # 2 h: only a truly dead, result-less run
+    )
+    return completed
 
 
 @app.on_event("startup")
@@ -704,35 +772,14 @@ async def recover_orphaned_jobs():
     it failed immediately so the UI shows a clear error instead of an eternal
     spinner, and so re-analysis can be triggered straight away.
     """
-    import backend.database as _db
-
-    _IN_PROGRESS = {
-        "analyzing_scenes",
-        "extracting_frames",
-        "generating_summary",
-        "detecting_clips",
-    }
     try:
-        # First, complete any job that actually finished (has clips / summary)
-        # but was left non-terminal — must NOT be marked failed.
-        completed = await _reconcile_finished_jobs()
-        all_jobs = await _db.list_jobs(include_unowned=True)
-        recovered = 0
-        for job in all_jobs:
-            if job.status in _IN_PROGRESS:
-                await _db.update_job_status(
-                    job.job_id,
-                    status="failed",
-                    progress=0,
-                    progress_message=(
-                        "Analysis interrupted by server restart — please re-analyse"
-                    ),
-                )
-                logger.warning(
-                    "Startup recovery: job %s was stuck in '%s' — marked failed",
-                    job.job_id, job.status,
-                )
-                recovered += 1
+        # Every worker thread is already dead at startup, so there's no in-flight
+        # run to protect — recover unconditionally (stale_s=0). Jobs with results
+        # become COMPLETE; result-less ones become FAILED. This now covers EVERY
+        # non-terminal status (including ``translating``), which the old hardcoded
+        # set missed — the cause of jobs stuck spinning at "translating" forever.
+        completed, recovered = await _recover_stale_jobs(
+            complete_stale_s=0, fail_stale_s=0)
         if recovered or completed:
             logger.info(
                 "Startup recovery: %d orphaned job(s) marked failed, "
