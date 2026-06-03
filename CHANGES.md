@@ -1,3 +1,27 @@
+# ClipAI — Whisper subtitle cues land on the audio (word-timed resegmentation)
+
+Audit follow-up on the Whisper-native path. Whisper's translate task emits a few
+LONG, multi-sentence cues but with per-word timestamps. The pipeline split those
+into sentence cues only AFTER the MT post-edit — which clears word timestamps
+when it rewrites text — so the split always fell back to a char-length
+PROPORTIONAL guess. On a 40 s cue that puts internal sentence boundaries several
+seconds off the audio (a short sentence with long dictation gets a tiny slice; a
+long sentence spoken fast gets too much).
+
+Fix — carry the word timestamps through and split BEFORE polishing:
+- `_whisper_native_translate_segments` now passes Whisper's `words` through.
+- The Whisper-native path resegments by sentence **before** the post-edit, using
+  those word times for accurate boundaries (the glossary is re-applied to the
+  split cues, since the word-timed split rebuilds text from the pre-glossary
+  words). The post-edit then polishes the already-correctly-timed short cues
+  (it preserves start/end), and the post-edit-stage resegmentation is skipped for
+  this path. The NMT path (source-aligned 1:1) is unchanged.
+
+Tests: word-timed vs proportional split (boundary at 30 s vs <15 s), and a
+pipeline test that a long Whisper cue splits word-timed before polish.
+
+---
+
 # ClipAI — Stop dropping legitimately-repeated subtitle cues + steadier diarizer threshold
 
 Two tuning fixes from comparing against repo-60 (which never mangles translated

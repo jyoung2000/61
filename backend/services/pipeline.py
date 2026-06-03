@@ -319,8 +319,13 @@ def _whisper_native_translate_segments(video_path: str, source_lang: str,
                 pass
         start = float(seg.get("start_sec", seg.get("start", 0.0)) or 0.0)
         end = float(seg.get("end_sec", seg.get("end", 0.0)) or 0.0)
+        # Carry Whisper's WORD timestamps through. Whisper-native emits a few
+        # long, multi-sentence cues; the downstream sentence resegmentation uses
+        # these word times to split them at ACCURATE boundaries (instead of the
+        # char-length proportional guess it falls back to with no word timing).
         out.append(TranscriptSegment(
-            text=txt, start=start, end=end, speaker=_speaker_for(start, end)))
+            text=txt, start=start, end=end, speaker=_speaker_for(start, end),
+            words=seg.get("words") or None))
     return out
 
 
@@ -1827,6 +1832,40 @@ async def _background_post_processing(
                 raise RuntimeError(
                     "translation produced 0 changed segments — keeping source transcript")
 
+            # ── (b-pre) Word-timed resegmentation for the Whisper-native path ──
+            # Whisper-native emits a few long, multi-sentence cues but WITH word
+            # timestamps. Split them into sentence cues NOW, using that word
+            # timing for accurate boundaries, BEFORE the MT post-edit rewrites the
+            # text and discards the word timestamps (transcript_polisher clears
+            # ``words`` whenever it changes the text). Without this, the post-edit
+            # path always falls back to a char-length proportional split — cues
+            # land seconds off the audio. (The NMT path is source-aligned 1:1, so
+            # it must resegment AFTER its post-edit — step (c) below.)
+            _pre_resegmented = False
+            if _used_whisper_native and getattr(
+                    settings, "SENTENCE_SEGMENTATION_ENABLED", True):
+                try:
+                    from backend.services.sentence_segmenter import resegment_by_sentence
+                    _pre_rs = len(translated)
+                    translated = resegment_by_sentence(translated)
+                    # The word-timed split rebuilds cue text from the (pre-glossary)
+                    # words, so re-apply the glossary to the freshly-split cues.
+                    if glossary:
+                        try:
+                            from backend.services.nmt_translator import apply_glossary as _ag
+                            for _t in translated:
+                                _txt = getattr(_t, "text", "") or ""
+                                _t.text = _ag(_txt, _txt, glossary)
+                        except Exception:
+                            pass
+                    _pre_resegmented = True
+                    logger.info(
+                        "[%s] Whisper resegmentation (word-timed, pre-polish): %d → %d segments",
+                        job_id, _pre_rs, len(translated))
+                except Exception as _prs_err:
+                    logger.warning(
+                        "[%s] Whisper pre-polish resegmentation failed (%s)", job_id, _prs_err)
+
             # ── (b) AI post-edit on the TRANSLATED text (MT post-editing) ──
             # Offline NMT produced the base translation; the editorial LLM now
             # POLISHES that rough draft toward natural, professional subtitles —
@@ -1871,7 +1910,11 @@ async def _background_post_processing(
                                    job_id, _pol_err)
 
             # ── (c) Sentence resegmentation in the target language ──
-            if getattr(settings, "SENTENCE_SEGMENTATION_ENABLED", True):
+            # Skipped for Whisper-native — already done word-timed in (b-pre),
+            # before the post-edit dropped its word timestamps; re-running it on
+            # the now-wordless cues would only re-merge/re-split them with the
+            # inaccurate proportional fallback.
+            if getattr(settings, "SENTENCE_SEGMENTATION_ENABLED", True) and not _pre_resegmented:
                 try:
                     from backend.services.sentence_segmenter import resegment_by_sentence
                     _pre_seg = len(translated)

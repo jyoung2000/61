@@ -320,6 +320,41 @@ def test_pipeline_reuses_loaded_whisper_on_low_vram(monkeypatch):
     assert nmt_calls["n"] == 0
 
 
+def test_whisper_native_resegments_word_timed_before_polish(monkeypatch):
+    """Whisper-native long cues are split into sentence cues using the model's
+    OWN word timing, BEFORE the post-edit drops the word timestamps — so the
+    boundaries are accurate (not the char-proportional fallback)."""
+    db = _FakeDB({"subtitle_language": "en", "language": "ja", "clips": [], "summary": None})
+    _install_pipeline(monkeypatch, db)
+    monkeypatch.setattr(pipeline.settings, "SENTENCE_SEGMENTATION_ENABLED", True, raising=False)
+    monkeypatch.setattr(pipeline, "_whisper_engine_cached", lambda: True)
+
+    def _wn(*a, **k):
+        return [TranscriptSegment(
+            text="Hi. This is a much longer sentence here.",
+            start=0.0, end=40.0, speaker="Speaker 1",
+            words=[{"word": "Hi.", "start": 0.0, "end": 30.0},
+                   {"word": "This", "start": 30.0, "end": 31.0},
+                   {"word": "is", "start": 31.0, "end": 32.0},
+                   {"word": "a", "start": 32.0, "end": 33.0},
+                   {"word": "much", "start": 33.0, "end": 34.0},
+                   {"word": "longer", "start": 34.0, "end": 35.0},
+                   {"word": "sentence", "start": 35.0, "end": 37.0},
+                   {"word": "here.", "start": 37.0, "end": 40.0}])]
+    monkeypatch.setattr(pipeline, "_whisper_native_translate_segments", _wn)
+
+    job = SimpleNamespace(subtitle_language="en", language="ja", clips=[],
+                          summary=None, file_path="/v.mp4")
+    result = _run(pipeline._background_post_processing(
+        "jobReseg", [_src("おはよう", 0.0, 40.0)], _fake_orchestrator(), job,
+        polished_already=False))
+
+    assert result["translated"] is True
+    tt = result["target_transcript"]
+    assert len(tt) == 2                       # the long cue was split in two
+    assert tt[1]["start"] >= 29.0             # 2nd sentence at ~30s (word-timed)
+
+
 def test_timeline_coverage_merges_overlaps():
     segs = [
         TranscriptSegment(text="a", start=0.0, end=10.0, speaker="S"),
