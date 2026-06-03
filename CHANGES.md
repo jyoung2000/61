@@ -1,3 +1,23 @@
+# ClipAI — Stop dropping legitimately-repeated subtitle cues + steadier diarizer threshold
+
+Two tuning fixes from comparing against repo-60 (which never mangles translated
+transcripts because it does **no** post-translation processing — it saves the raw
+cues).
+
+**Don't loop-drop NMT output.** The translated transcript runs a
+`drop_repetition_loops` dedup that removes Whisper's hallucinated repetition loops
+(it loops on music/silence). But it drops **any** recurring long line across the
+whole timeline — which on a song/AMV deletes legitimately repeated chorus and
+narration lines (kept only the first of 6, in testing). Offline NMT translates the
+source 1:1 and never hallucinates loops, so its repeats are real: the loop-drop is
+now **gated to the Whisper-native path only**. NMT-translated choruses survive.
+
+**ECAPA diarizer threshold 0.55 → 0.70.** 0.55 over-split noisy / music-heavy
+audio straight into the 8-speaker cap. 0.70 is a steadier default for ECAPA
+agglomerative clustering (configurable via `LOCAL_DIARIZER_THRESHOLD`).
+
+---
+
 # ClipAI — Fix: jobs stuck at "translating" forever (interrupted-run recovery)
 
 Root-caused from a real run: a job re-analysed after completing died at the

@@ -57,7 +57,7 @@ def _relabel_first_appearance(labels: List[int]) -> List[int]:
 def _cluster_embeddings(
     embeddings,
     num_speakers: Optional[int] = None,
-    threshold: float = 0.55,
+    threshold: float = 0.70,
     max_speakers: int = _MAX_SPEAKERS,
 ) -> List[int]:
     """Cluster L2-normalised embeddings by cosine distance.
@@ -145,7 +145,7 @@ class LocalEmbeddingDiarizer:
         self.device = (device or getattr(_settings, "LOCAL_DIARIZER_DEVICE", "cpu") or "cpu").lower()
         self.threshold = float(
             threshold if threshold is not None
-            else getattr(_settings, "LOCAL_DIARIZER_THRESHOLD", 0.55))
+            else getattr(_settings, "LOCAL_DIARIZER_THRESHOLD", 0.70))
         self.model_id = getattr(
             _settings, "LOCAL_DIARIZER_MODEL", "speechbrain/spkrec-ecapa-voxceleb")
 

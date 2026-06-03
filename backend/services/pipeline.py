@@ -1935,7 +1935,16 @@ async def _background_post_processing(
                 _pre_dd = len(_tl)
                 _tl, _a = collapse_adjacent_duplicates(_tl)
                 _tl, _o = collapse_overlapping_duplicates(_tl)
-                _tl, _l = drop_repetition_loops(_tl)
+                # The global repetition-loop drop targets WHISPER hallucinations
+                # (its translate task loops on music/silence). Offline NMT
+                # translates the source 1:1 and never hallucinates loops, so any
+                # repeats in NMT output are LEGITIMATE — a song chorus or recurring
+                # narration that genuinely repeats across the timeline. Running the
+                # loop-drop on it would silently delete those real cues (the AMV
+                # case), so gate it to the Whisper-native path only.
+                _l = 0
+                if _used_whisper_native:
+                    _tl, _l = drop_repetition_loops(_tl)
                 translated = _tl
                 if _a or _o or _l:
                     logger.info(

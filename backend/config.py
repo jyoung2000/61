@@ -389,7 +389,11 @@ class Settings(BaseSettings):
     LOCAL_DIARIZATION_ENABLED: bool = True
     LOCAL_DIARIZER_MODEL: str = "speechbrain/spkrec-ecapa-voxceleb"
     LOCAL_DIARIZER_DEVICE: str = "cpu"   # tiny model; CPU avoids GPU contention
-    LOCAL_DIARIZER_THRESHOLD: float = 0.55  # cosine distance for speaker split
+    # Cosine-distance threshold for splitting speakers (agglomerative clustering).
+    # Higher = more merging = fewer speakers. 0.55 over-split music/noisy audio
+    # (an AMV clustered into the 8-speaker cap); 0.70 is a steadier default for
+    # ECAPA AHC. Raise toward 0.8 to merge more, lower to separate more.
+    LOCAL_DIARIZER_THRESHOLD: float = 0.70
 
     # Camera solver (per-shot AutoFlip-style crop planning)
     CLIPAI_CAMERA_SOLVER: str = "on"  # "on" | "off" — env CLIPAI_CAMERA_SOLVER

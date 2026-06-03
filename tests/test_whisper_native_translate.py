@@ -360,3 +360,43 @@ def test_pipeline_rejects_sparse_whisper_native_and_uses_nmt(monkeypatch):
     assert result["translated"] is True
     assert nmt_calls["n"] == 1                                  # NMT did the work
     assert result["target_transcript"][0]["text"].startswith("NMT ")
+
+
+def test_nmt_translation_keeps_legitimately_repeated_lines(monkeypatch):
+    """Offline NMT never hallucinates loops, so the global loop-drop (which
+    targets Whisper hallucinations) must NOT run on NMT output — a chorus /
+    recurring narration that genuinely repeats across the timeline must survive.
+    """
+    db = _FakeDB({"subtitle_language": "en", "language": "ja", "clips": [], "summary": None})
+    _install_pipeline(monkeypatch, db)
+    monkeypatch.setattr(pipeline.settings, "WHISPER_TRANSLATE_TO_EN", False, raising=False)
+
+    async def _nmt(segs, **k):
+        out = []
+        for s in segs:
+            txt = ("We must protect this colony until our dying breath"
+                   if "守る" in s.text else "Distinct dialogue line " + s.text)
+            out.append(TranscriptSegment(text=txt, start=s.start, end=s.end,
+                                         speaker=s.speaker))
+        return out
+    monkeypatch.setattr(translator, "translate_segments_with_fallback", _nmt)
+
+    job = SimpleNamespace(subtitle_language="en", language="ja", clips=[],
+                          summary=None, file_path="/v.mp4")
+    # A long chorus line that recurs 6× across the timeline, each time separated
+    # by distinct dialogue (so it is NON-adjacent — only the global loop-drop
+    # could remove it).
+    transcript = []
+    for i in range(6):
+        transcript.append(_src("コロニーを守る", i * 20.0, i * 20.0 + 5.0))
+        transcript.append(_src(f"べつのせりふ{i}", i * 20.0 + 5.0, i * 20.0 + 10.0))
+
+    result = _run(pipeline._background_post_processing(
+        "jobRepeat", transcript, _fake_orchestrator(), job, polished_already=False))
+
+    assert result["translated"] is True
+    kept = [s for s in result["target_transcript"]
+            if "protect this colony" in s["text"]]
+    # All 6 recurrences survive — the loop-drop (which would keep only 1) is
+    # gated off for the NMT path.
+    assert len(kept) == 6, f"expected 6 chorus cues, got {len(kept)}"
