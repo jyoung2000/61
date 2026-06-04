@@ -1,3 +1,27 @@
+# ClipAI — Stop stale saves from wiping the translation (the real "not translated" bug)
+
+Direct from a corrupted job on disk: `translated_transcript` was 0 (the pipeline
+had persisted 279 English segments), the source was a doubled 217-segment copy,
+and status had reverted to `detecting_clips` — all AFTER the run finished. A
+whole-object `save_job` (a transcript-segment edit / reverse-sync that loaded the
+job microseconds before the translation landed, then wrote its stale snapshot
+back) clobbered the good data. Every display-side fix was futile because the
+English was being destroyed on disk.
+
+Fix — an anti-clobber guard in the central write (`_save_job_unlocked`):
+- **Never wipe a non-empty `translated_transcript` with an empty one.** A real
+  re-translation writes a NEW non-empty value, which still wins; only the
+  empty-wipe (always a stale snapshot) is blocked. Applies to every write.
+- **Never revert a terminal status** (complete/failed/cancelled) to a
+  non-terminal one — but only on the `save_job` whole-object path, so a
+  deliberate re-analysis reset via `update_job_status` is still allowed.
+
+Both re-read the current on-disk copy under the per-job lock and refuse the
+downgrade. Tests cover wipe-protection, terminal-status protection, legit
+re-translation overwrite, and re-analysis still resetting status.
+
+---
+
 # ClipAI — Reliable translated-transcript loading (lightweight endpoint)
 
 Across incognito + multiple devices the Analysis page kept showing the SOURCE

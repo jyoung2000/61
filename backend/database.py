@@ -47,17 +47,62 @@ def _job_path(job_id: str) -> str:
     return os.path.join(_job_dir(job_id), "job.json")
 
 
-async def _save_job_unlocked(job: JobResult) -> None:
+async def _save_job_unlocked(job: JobResult, *, _preserve_terminal_status: bool = False) -> None:
     """Write a job to disk WITHOUT acquiring the per-job lock.
 
     Callers that already hold ``_get_lock(job_id)`` use this so the whole
     read-modify-write cycle in :func:`update_job_status` is atomic. Public
     :func:`save_job` wraps this with the lock.
+
+    ``_preserve_terminal_status`` (set by :func:`save_job`, the whole-object
+    write path used by transcript edits etc.) additionally refuses to revert a
+    terminal status — guarding against a stale-snapshot save reverting a finished
+    job. ``update_job_status`` leaves it False because its own ``protect_terminal``
+    logic already decided the status, and a deliberate re-analysis reset there
+    must be allowed through.
     """
     directory = _job_dir(job.job_id)
     os.makedirs(directory, exist_ok=True)
     path = _job_path(job.job_id)
     data = job.model_dump(mode="json")
+
+    # ── Anti-clobber guard ──────────────────────────────────────────────
+    # A load → modify → save with a job captured just before a newer write
+    # (e.g. a transcript-segment edit / reverse-sync that loaded the job
+    # microseconds before the pipeline persisted the translation) would
+    # otherwise WIPE the newer ``translated_transcript`` and revert a finished
+    # status — exactly the corruption seen in production (translated_transcript
+    # back to 0, status reverted to detecting_clips). Re-read the current
+    # on-disk copy (we're under the per-job lock) and refuse to DOWNGRADE:
+    #   • never replace a non-empty translated_transcript with an empty one
+    #     (a real re-translation writes a NEW non-empty value, which still wins);
+    #   • never revert a terminal status (complete/failed/cancelled) to a
+    #     non-terminal one.
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as _cf:
+                _cur = json.load(_cf)
+            _cur_tt = _cur.get("translated_transcript") or []
+            if _cur_tt and not (data.get("translated_transcript") or []):
+                data["translated_transcript"] = _cur_tt
+                logger.warning(
+                    "Save guard [%s]: kept %d existing translated_transcript "
+                    "segment(s) — incoming save had none (stale snapshot).",
+                    job.job_id, len(_cur_tt))
+            if _preserve_terminal_status:
+                _cur_status = str(_cur.get("status", "") or "").lower()
+                _new_status = str(data.get("status", "") or "").lower()
+                if _cur_status in _TERMINAL_STATUSES and _new_status not in _TERMINAL_STATUSES:
+                    data["status"] = _cur.get("status")
+                    if "progress" in _cur:
+                        data["progress"] = _cur.get("progress")
+                    logger.warning(
+                        "Save guard [%s]: kept terminal status '%s' — incoming save "
+                        "tried to revert it to '%s' (stale snapshot).",
+                        job.job_id, _cur_status, _new_status)
+    except Exception:
+        pass
+
     content = json.dumps(data, indent=2, default=_numpy_safe_default)
     # Atomic write: write to temp file then rename to prevent readers
     # from seeing a truncated/empty file during concurrent access.
@@ -98,8 +143,12 @@ async def _load_job_unlocked(job_id: str) -> Optional[JobResult]:
 
 
 async def save_job(job: JobResult) -> None:
+    # Whole-object write (callers pass a job they loaded earlier and mutated),
+    # so guard against a stale snapshot reverting a terminal status. The
+    # translated_transcript anti-wipe guard in _save_job_unlocked applies to
+    # every write regardless.
     async with _get_lock(job.job_id):
-        await _save_job_unlocked(job)
+        await _save_job_unlocked(job, _preserve_terminal_status=True)
 
 
 async def load_job(job_id: str) -> Optional[JobResult]:
