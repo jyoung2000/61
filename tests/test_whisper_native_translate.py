@@ -355,6 +355,47 @@ def test_whisper_native_resegments_word_timed_before_polish(monkeypatch):
     assert tt[1]["start"] >= 29.0             # 2nd sentence at ~30s (word-timed)
 
 
+def test_llm_translation_skips_post_edit(monkeypatch):
+    """The editorial LLM translates the source directly → its output is final.
+    The MT post-edit (which compares each line to the SOURCE) must be SKIPPED for
+    the LLM path; running it reverted good English back to Japanese in production.
+    """
+    import json as _json
+    import re as _re
+
+    db = _FakeDB({"subtitle_language": "en", "language": "ja", "clips": [], "summary": None})
+    _install_pipeline(monkeypatch, db)
+    monkeypatch.setattr(pipeline.settings, "AI_TRANSCRIPT_CORRECTION", True, raising=False)
+    monkeypatch.setattr(pipeline.settings, "TRANSLATION_PREFER_LLM", True, raising=False)
+
+    class _Orch(SimpleNamespace):
+        async def text_completion(self, prompt, **k):
+            n = len(_re.findall(r"^\d+\. ", prompt, _re.M))
+            return _json.dumps([f"English {i + 1}" for i in range(n)])
+
+    mtpe_calls = {"n": 0}
+
+    async def _spy_mtpe(segments, *a, **k):
+        mtpe_calls["n"] += 1
+        return list(segments)
+
+    monkeypatch.setattr("backend.services.transcript_polisher.correct_transcript", _spy_mtpe)
+
+    orch = _Orch(reset_circuit_breaker=lambda: None,
+                 get_editorial_model_info=lambda: {"is_thinking": False})
+    job = SimpleNamespace(subtitle_language="en", language="ja", clips=[],
+                          summary=None, file_path="/v.mp4")
+    transcript = [_src("日本語の文" + str(i), i * 1.0, i * 1.0 + 1.0) for i in range(6)]
+
+    result = _run(pipeline._background_post_processing(
+        "jobLLM", transcript, orch, job, polished_already=False))
+
+    assert result["translated"] is True
+    assert mtpe_calls["n"] == 0                                      # post-edit skipped
+    tt = result["target_transcript"]
+    assert tt and all(s["text"].startswith("English") for s in tt)  # all English, intact
+
+
 def test_timeline_coverage_merges_overlaps():
     segs = [
         TranscriptSegment(text="a", start=0.0, end=10.0, speaker="S"),

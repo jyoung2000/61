@@ -1,3 +1,23 @@
+# ClipAI — Stop the post-edit from reverting LLM translations back to Japanese
+
+The LLM translation (previous change) works: logs show `LLM translation: 116/116
+segments -> en (0% still source-script)` — a perfect, complete English draft. But
+the persisted track came back ~40% Japanese. Cause: the MT post-edit ran on it
+"source-aligned" — comparing each English line against the Japanese SOURCE — and
+reverted chunks (long narration, song lyrics) back to the source language.
+
+Fix:
+- Skip the post-edit entirely when the engine is the LLM (_used_llm): the LLM
+  translated the source directly, so its output is already final, clean target
+  text — there is nothing to "post-edit toward the source".
+- For the NMT / Whisper paths that still post-edit, add a safety net: if the
+  post-edit RAISES the source-script fraction (i.e. it reintroduced the source
+  language), discard it and keep the pre-edit translation.
+
+Net: the perfect LLM translation is persisted intact — fully English, every cue.
+
+---
+
 # ClipAI — Fundamental rethink: translate with the LLM, not Whisper's translate task
 
 The translated track kept coming back HALF JAPANESE — dialogue in English, but

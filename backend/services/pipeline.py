@@ -1866,6 +1866,7 @@ async def _background_post_processing(
                 nmt_timeout=_trans_timeout,
             )
             _used_whisper_native = (_engine_used == "whisper")
+            _used_llm = (_engine_used == "llm")
             if _used_whisper_native:
                 changed = len(translated)
                 logger.info("[%s] Whisper native translate: %d English cues "
@@ -1940,6 +1941,15 @@ async def _background_post_processing(
             if not getattr(settings, "AI_TRANSCRIPT_CORRECTION", True):
                 logger.info("[%s] AI post-edit skipped (AI_TRANSCRIPT_CORRECTION off) — "
                             "keeping NMT draft", job_id)
+            elif _used_llm:
+                # The editorial LLM TRANSLATED the source directly — its output is
+                # already clean, complete target-language text. Re-running the
+                # post-edit (which compares each line against the SOURCE) was
+                # reverting good translations back to the source language (a perfect
+                # 0%-Japanese LLM result came back ~40% Japanese). The LLM
+                # translation is final; skip the post-edit.
+                logger.info("[%s] AI post-edit skipped — the LLM produced the "
+                            "translation directly (no post-edit needed)", job_id)
             else:
                 logger.info(
                     "[%s] AI post-edit START on translated text (lang=%s, %d segments, "
@@ -1958,7 +1968,19 @@ async def _background_post_processing(
                         timeout=max(600, len(translated) * 8),
                     )
                     if _pol:
-                        translated = _pol
+                        # Safety: a post-edit must never REINTRODUCE the source
+                        # language. If it raised the source-script fraction it
+                        # corrupted the draft — keep the pre-edit translation.
+                        from backend.services.translator import fraction_source_script
+                        _before = fraction_source_script(translated, source_lang)
+                        _after = fraction_source_script(_pol, source_lang)
+                        if _after > _before + 0.02:
+                            logger.warning(
+                                "[%s] AI post-edit reintroduced source language "
+                                "(%.0f%% → %.0f%% source-script) — keeping the pre-edit "
+                                "translation", job_id, 100 * _before, 100 * _after)
+                        else:
+                            translated = _pol
                     logger.info("[%s] AI post-edit DONE on translated text: %d segments",
                                 job_id, len(translated))
                 except Exception as _pol_err:
