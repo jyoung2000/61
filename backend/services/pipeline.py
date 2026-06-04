@@ -411,6 +411,49 @@ async def translate_offline(segments, source_lang, target_lang, *, video_path=No
 
     src = (source_lang or "").lower()
     tgt = (target_lang or "").lower()
+
+    # ── PRIMARY: editorial-LLM translation of the SOURCE transcript ──────────
+    # Translate the source text-to-text, 1:1 (every segment keeps its timing +
+    # speaker). When a capable LLM is configured — the same orchestrator that
+    # already writes the summary / SEO / polish — this is the reliable, COMPLETE
+    # path: it translates dialogue, lyrics AND narration and never leaves the
+    # source language behind. Whisper's translate task does the opposite (it
+    # silently transcribes hard/music segments in the source), which is what
+    # produced the half-Japanese "translated" track. Falls through to Whisper-
+    # native / offline NMT when no LLM is available or it returns still
+    # source-language. ``TRANSLATION_PREFER_LLM`` (default on) gates it.
+    if (orchestrator is not None
+            and getattr(settings, "TRANSLATION_PREFER_LLM", True)
+            and segments and tgt and tgt != src):
+        try:
+            from backend.services.translator import (
+                translate_via_llm, fraction_source_script,
+            )
+            if job_id:
+                # The LLM runs via API/Ollama — free the reframer's Whisper VRAM now.
+                await _release_whisper_vram(job_id)
+            if status_callback:
+                try:
+                    await status_callback("Translating subtitles with the editorial model…")
+                except Exception:
+                    pass
+            _llm = await asyncio.wait_for(
+                translate_via_llm(segments, source_lang, target_lang, orchestrator,
+                                  glossary=glossary, job_id=job_id or "",
+                                  status_callback=status_callback),
+                timeout=(nmt_timeout or 1800),
+            )
+            if _llm:
+                _resid = fraction_source_script(_llm, source_lang)
+                if _resid < 0.20:
+                    logger.info("Translate via editorial LLM: %d segments → %s (complete)",
+                                len(_llm), target_lang)
+                    return _llm, "llm"
+                logger.warning("LLM translation left %.0f%% in the source language "
+                               "— trying other engines.", 100 * _resid)
+        except Exception as _le:
+            logger.warning("LLM translation unavailable (%s) — falling back", _le)
+
     _want_whisper = (
         bool(video_path)
         and getattr(settings, "WHISPER_TRANSLATE_TO_EN", True)
@@ -477,6 +520,19 @@ async def translate_offline(segments, source_lang, target_lang, *, video_path=No
                     (100.0 * _wt_cov / _src_cov) if _src_cov else 0.0,
                     100.0 * _min_ratio,
                 )
+                _wt = None
+        if _wt:
+            # Language-purity gate: Whisper's translate task leaves music /
+            # narration / hard segments in the SOURCE language on mixed content
+            # (a half-Japanese "translated" track). Reject that and use offline
+            # NMT on the full source, which translates every cue.
+            from backend.services.translator import fraction_source_script
+            _resid = fraction_source_script(_wt, source_lang)
+            if _resid >= 0.20:
+                logger.warning(
+                    "Whisper-native translate left %.0f%% of cues in the source "
+                    "language (mixed output) — using offline NMT instead.",
+                    100 * _resid)
                 _wt = None
         if _wt:
             if job_id:

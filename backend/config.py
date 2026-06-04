@@ -308,6 +308,14 @@ class Settings(BaseSettings):
     # double-error and never touches an LLM. When it yields no output (or the
     # target language is not English), translation falls back to the offline NMT
     # engines below.
+    # Translate the SOURCE transcript text-to-text with the editorial LLM (the
+    # same orchestrator used for summary/SEO/polish) as the PRIMARY path. It's
+    # the reliable, complete translation — it renders every cue (dialogue,
+    # lyrics, narration) and never leaves the source language, unlike Whisper's
+    # translate task which transcribes hard/music segments in the source and
+    # produced half-translated tracks. Falls back to Whisper-native / offline NMT
+    # when no LLM is configured or it comes back still source-language.
+    TRANSLATION_PREFER_LLM: bool = True
     WHISPER_TRANSLATE_TO_EN: bool = True
     # Whisper-native translate is a second full ASR pass; it's only worth it when
     # it can run on the GPU. Below this much FREE VRAM it would fall back to CPU

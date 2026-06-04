@@ -1,3 +1,32 @@
+# ClipAI — Fundamental rethink: translate with the LLM, not Whisper's translate task
+
+The translated track kept coming back HALF JAPANESE — dialogue in English, but
+song lyrics, narration and hard segments left in the source language. Root cause
+is architectural: translation was hardcoded "offline-only, never an LLM", forcing
+Whisper's task='translate' as the primary path. On mixed/music content Whisper's
+translate task silently TRANSCRIBES (source language) instead of translating, so
+the output is a JP/EN mix. The coverage guard only checked timeline coverage, not
+whether the result was actually English, so it passed the mix through.
+
+Rethink — translate the SOURCE transcript text-to-text with the editorial LLM
+(the same orchestrator already used for summary / SEO / polish):
+- New translate_via_llm(): batches the source cues, asks the model to translate
+  EVERY numbered line (lyrics + narration included) into a JSON array, maps the
+  result 1:1 back onto the cues (timing + speaker preserved), applies the
+  glossary, and splits-and-retries on any batch the model mangles. It bails
+  cleanly (returns None) if the model is unusable, so offline users fall back.
+- translate_offline now tries the LLM FIRST (TRANSLATION_PREFER_LLM, default on),
+  then Whisper-native, then offline NMT.
+- Language-purity gate (fraction_source_script): any "translation" still >20%
+  source-script (CJK) is REJECTED — applied to both the LLM result and the
+  Whisper-native result — so a half-translated track is never persisted; it
+  falls through to a complete engine instead.
+
+Net: every cue is translated, 1:1, with the high-quality model you already have
+configured — no more Japanese left in the English track.
+
+---
+
 # ClipAI — Stop stale saves from wiping the translation (the real "not translated" bug)
 
 Direct from a corrupted job on disk: `translated_transcript` was 0 (the pipeline

@@ -28,6 +28,183 @@ class TranslationFailedError(RuntimeError):
     relabelled as translated). Carries a user-facing message."""
 
 
+# ── Language-purity detection ────────────────────────────────────────────────
+# Whisper's task='translate' silently leaves music / narration / hard segments
+# in the SOURCE language on mixed content (the "translated" track comes back half
+# Japanese). We detect that by measuring how much of the output is still in the
+# source SCRIPT, and reject it — so a broken translation falls through to a
+# complete one instead of being persisted as-is.
+
+_CJK_SOURCES = {"ja", "japanese", "zh", "chinese", "zh-cn", "zh-tw", "ko", "korean", "yue"}
+
+
+def _cjk_ratio(text: str) -> float:
+    """Share of a line's letters that are Hiragana / Katakana / Han / Hangul."""
+    t = text or ""
+    cjk = 0
+    base = 0
+    for c in t:
+        is_cjk = (
+            "぀" <= c <= "ヿ"     # hiragana + katakana
+            or "㐀" <= c <= "鿿"  # CJK ideographs
+            or "가" <= c <= "힣"  # hangul
+            or "ｦ" <= c <= "ﾟ"  # half-width katakana
+        )
+        if is_cjk:
+            cjk += 1
+            base += 1
+        elif c.isalpha():
+            base += 1
+    return (cjk / base) if base else 0.0
+
+
+def fraction_source_script(segments, source_language: str) -> float:
+    """Fraction of segments still written in the SOURCE script — only meaningful
+    for CJK sources, where a successful →English translation should be ~0."""
+    if (source_language or "").lower() not in _CJK_SOURCES:
+        return 0.0
+    rows = list(segments or [])
+    if not rows:
+        return 0.0
+    def _txt(s):
+        return (s.get("text", "") if isinstance(s, dict) else getattr(s, "text", "")) or ""
+    n = sum(1 for s in rows if _cjk_ratio(_txt(s)) > 0.30)
+    return n / len(rows)
+
+
+# ── LLM (editorial-model) translation ────────────────────────────────────────
+
+_LLM_LANG_NAMES = {
+    "ja": "Japanese", "en": "English", "ko": "Korean", "zh": "Chinese",
+    "es": "Spanish", "fr": "French", "de": "German", "it": "Italian",
+    "pt": "Portuguese", "ru": "Russian", "ar": "Arabic", "hi": "Hindi",
+    "nl": "Dutch", "tr": "Turkish", "pl": "Polish", "th": "Thai",
+    "vi": "Vietnamese", "id": "Indonesian",
+}
+
+
+def _parse_json_array(response: str, expected: int) -> Optional[list[str]]:
+    """Parse the LLM's ``["...", "..."]`` reply into exactly ``expected`` strings."""
+    import re
+    text = (response or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z0-9]*\s*\n?", "", text)
+        if text.endswith("```"):
+            text = text[:-3]
+        text = text.strip()
+    if not text.startswith("["):
+        m = re.search(r"\[.*\]", text, re.DOTALL)
+        if not m:
+            return None
+        text = m.group()
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, list) or len(data) != expected:
+        return None
+    return [str(x) if x is not None else "" for x in data]
+
+
+async def translate_via_llm(
+    segments: list,
+    source_language: str,
+    target_language: str,
+    orchestrator: AIOrchestrator,
+    glossary: dict | None = None,
+    job_id: str = "",
+    status_callback=None,
+) -> Optional[list[TranscriptSegment]]:
+    """Translate the SOURCE transcript text-to-text with the editorial LLM,
+    1:1 — every segment, same timing + speaker. The reliable, COMPLETE path:
+    unlike Whisper's translate task it never leaves lyrics / narration in the
+    source language. Returns ``None`` when no orchestrator is available."""
+    if not orchestrator or not segments:
+        return None
+
+    src_name = _LLM_LANG_NAMES.get((source_language or "").lower(), source_language or "the source language")
+    tgt_name = _LLM_LANG_NAMES.get((target_language or "").lower(), target_language or "English")
+
+    def _txt(s):
+        return (s.get("text", "") if isinstance(s, dict) else getattr(s, "text", "")) or ""
+
+    async def _call(batch) -> Optional[list[str]]:
+        lines = [_txt(s) for s in batch]
+        numbered = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(lines))
+        prompt = (
+            f"You are a professional {src_name}->{tgt_name} subtitle translator.\n"
+            f"Translate EVERY one of the {len(lines)} numbered subtitle lines below into "
+            f"natural, fluent {tgt_name}.\n"
+            "Rules:\n"
+            f"- Translate ALL lines, including song lyrics, narration and exclamations. "
+            f"NEVER leave a line in {src_name}.\n"
+            "- Preserve honorifics (-san, -kun, -chan, -sama) and proper nouns "
+            "(character and mecha names).\n"
+            "- Exactly one output per input line; never merge, split, add or drop lines.\n"
+            f"- Output ONLY a JSON array of exactly {len(lines)} {tgt_name} strings, in order. "
+            "No commentary, no numbering.\n\n"
+            f"Lines:\n{numbered}"
+        )
+        try:
+            resp = await orchestrator.text_completion(
+                prompt, timeout=max(60.0, len(batch) * 5.0), job_id=job_id)
+        except Exception as e:
+            logger.warning("LLM translate: call failed (%s)", e)
+            return None
+        return _parse_json_array(resp, expected=len(batch))
+
+    async def _translate_batch(batch) -> list[str]:
+        out = await _call(batch)
+        if out is not None:
+            return out
+        if len(batch) <= 1:                       # keep the source rather than drop it
+            return [_txt(s) for s in batch]
+        mid = len(batch) // 2                      # split on failure and recurse
+        return (await _translate_batch(batch[:mid])) + (await _translate_batch(batch[mid:]))
+
+    BATCH = 18
+    total = len(segments)
+    out_segs: list[TranscriptSegment] = []
+    _any_ok = False
+    for i in range(0, total, BATCH):
+        batch = segments[i: i + BATCH]
+        direct = await _call(batch)
+        if direct is not None:
+            translations = direct
+            _any_ok = True
+        elif not _any_ok and i == 0:
+            # The very first batch failing outright means the editorial model
+            # isn't usable here — bail so the caller falls back cleanly instead
+            # of "translating" every line to itself.
+            logger.info("LLM translate: editorial model returned no usable output "
+                        "— deferring to other translation engines.")
+            return None
+        else:
+            translations = await _translate_batch(batch)
+        for seg, tr in zip(batch, translations):
+            txt = (tr or "").strip() or _txt(seg)
+            if glossary:
+                for k, v in glossary.items():
+                    ks, vs = (k or "").strip(), (v or "").strip()
+                    if ks and vs and ks in txt:
+                        txt = txt.replace(ks, vs)
+            start = float(seg.get("start", 0.0) if isinstance(seg, dict) else getattr(seg, "start", 0.0) or 0.0)
+            end = float(seg.get("end", 0.0) if isinstance(seg, dict) else getattr(seg, "end", 0.0) or 0.0)
+            spk = (seg.get("speaker") if isinstance(seg, dict) else getattr(seg, "speaker", None)) or "Speaker 1"
+            out_segs.append(TranscriptSegment(text=txt, start=start, end=end, speaker=spk))
+        if status_callback:
+            try:
+                r = status_callback(f"Translating subtitles… ({min(i + BATCH, total)}/{total})")
+                if asyncio.iscoroutine(r):
+                    await r
+            except Exception:
+                pass
+    logger.info("LLM translation: %d/%d segments → %s (%.0f%% still source-script)",
+                len(out_segs), total, target_language,
+                100 * fraction_source_script(out_segs, source_language))
+    return out_segs
+
+
 class TranslationRateLimitedError(TranslationFailedError):
     """The LLM translation model is being rate-limited upstream (sustained
     HTTP 429 / "add your own key"). We stop early instead of crawling through
