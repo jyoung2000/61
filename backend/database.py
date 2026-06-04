@@ -66,30 +66,31 @@ async def _save_job_unlocked(job: JobResult, *, _preserve_terminal_status: bool 
     path = _job_path(job.job_id)
     data = job.model_dump(mode="json")
 
-    # ── Anti-clobber guard ──────────────────────────────────────────────
-    # A load → modify → save with a job captured just before a newer write
+    # ── Anti-clobber guard (whole-object save_job path only) ────────────
+    # A load → modify → save_job with a job captured just before a newer write
     # (e.g. a transcript-segment edit / reverse-sync that loaded the job
     # microseconds before the pipeline persisted the translation) would
     # otherwise WIPE the newer ``translated_transcript`` and revert a finished
     # status — exactly the corruption seen in production (translated_transcript
-    # back to 0, status reverted to detecting_clips). Re-read the current
-    # on-disk copy (we're under the per-job lock) and refuse to DOWNGRADE:
+    # back to 0, status reverted to detecting_clips). Re-read the current on-disk
+    # copy (we're under the per-job lock) and refuse to DOWNGRADE:
     #   • never replace a non-empty translated_transcript with an empty one
     #     (a real re-translation writes a NEW non-empty value, which still wins);
-    #   • never revert a terminal status (complete/failed/cancelled) to a
-    #     non-terminal one.
-    try:
-        if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as _cf:
-                _cur = json.load(_cf)
-            _cur_tt = _cur.get("translated_transcript") or []
-            if _cur_tt and not (data.get("translated_transcript") or []):
-                data["translated_transcript"] = _cur_tt
-                logger.warning(
-                    "Save guard [%s]: kept %d existing translated_transcript "
-                    "segment(s) — incoming save had none (stale snapshot).",
-                    job.job_id, len(_cur_tt))
-            if _preserve_terminal_status:
+    #   • never revert a terminal status (complete/failed/cancelled).
+    # ``update_job_status`` skips this — it loads fresh under the lock (so it
+    # never carries a stale translation) and its protect_terminal logic already
+    # governs status — which also avoids a re-read on every progress write.
+    if _preserve_terminal_status:
+        try:
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as _cf:
+                    _cur = json.load(_cf)
+                if (_cur.get("translated_transcript") or []) and not (data.get("translated_transcript") or []):
+                    data["translated_transcript"] = _cur["translated_transcript"]
+                    logger.warning(
+                        "Save guard [%s]: kept %d existing translated_transcript "
+                        "segment(s) — incoming save had none (stale snapshot).",
+                        job.job_id, len(_cur["translated_transcript"]))
                 _cur_status = str(_cur.get("status", "") or "").lower()
                 _new_status = str(data.get("status", "") or "").lower()
                 if _cur_status in _TERMINAL_STATUSES and _new_status not in _TERMINAL_STATUSES:
@@ -100,8 +101,8 @@ async def _save_job_unlocked(job: JobResult, *, _preserve_terminal_status: bool 
                         "Save guard [%s]: kept terminal status '%s' — incoming save "
                         "tried to revert it to '%s' (stale snapshot).",
                         job.job_id, _cur_status, _new_status)
-    except Exception:
-        pass
+        except Exception:
+            pass
 
     content = json.dumps(data, indent=2, default=_numpy_safe_default)
     # Atomic write: write to temp file then rename to prevent readers
