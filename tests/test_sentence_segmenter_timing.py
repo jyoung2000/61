@@ -49,3 +49,41 @@ def test_resegment_without_words_is_proportional():
     assert len(out) == 2
     assert out[1].start < 15.0, (
         f"proportional split should cut early, got {out[1].start}")
+
+
+def test_resegment_scrambles_wordless_1to1_cues():
+    """Why ``_background_post_processing`` skips resegment on the LLM path.
+
+    The editorial-LLM translator emits clean, one-utterance-per-cue segments
+    that inherit the source's accurate (word-timed) start/end — but carry NO
+    word timestamps of their own. ``resegment_by_sentence`` MERGES same-speaker
+    neighbours into one block then re-splits by sentence; with no words to time
+    the cut it falls back to a GLOBAL char-proportional split across the whole
+    merged span, erasing the real per-cue timing and the silence between cues.
+
+    Here three equal-length, same-speaker cues have a 56 s silent gap before the
+    last one (a scene change at 60 s). Resegmenting destroys both the gap and
+    the third cue's true 60 s start — the "scrambled timing" the LLM track
+    showed before the pipeline started bypassing this step.
+    """
+    segs = [
+        TranscriptSegment(text="AAAA.", start=0.0, end=2.0, speaker="S", words=None),
+        TranscriptSegment(text="BBBB.", start=2.0, end=4.0, speaker="S", words=None),
+        TranscriptSegment(text="CCCC.", start=60.0, end=62.0, speaker="S", words=None),
+    ]
+    # Original timeline has a 56 s gap (4 s → 60 s) before the last cue.
+    assert (segs[2].start - segs[1].end) == 56.0
+
+    out = resegment_by_sentence(segs)
+
+    # The same-speaker run is merged into one [0, 62] block and re-split by
+    # character count, so the cues come back CONTIGUOUS — the 56 s gap is gone.
+    gaps = [out[i + 1].start - out[i].end for i in range(len(out) - 1)]
+    assert max(gaps) < 1.0, f"resegment erased the 56 s inter-cue gap: {gaps}"
+
+    # And the third utterance, which truly starts at 60 s, is pulled forward to
+    # ~41 s (2/3 through 62 s by character count) — far from its real time.
+    third = next(s for s in out if "CCCC" in s.text)
+    assert third.start < 50.0, (
+        f"resegment moved the 60 s cue to {third.start:.1f}s — confirms the "
+        "timing scramble the LLM path now avoids by skipping this step")

@@ -1996,7 +1996,25 @@ async def _background_post_processing(
             # before the post-edit dropped its word timestamps; re-running it on
             # the now-wordless cues would only re-merge/re-split them with the
             # inaccurate proportional fallback.
-            if getattr(settings, "SENTENCE_SEGMENTATION_ENABLED", True) and not _pre_resegmented:
+            #
+            # Skipped for the LLM path too. translate_via_llm emits clean,
+            # one-utterance-per-cue output that already inherits the SOURCE's
+            # word-timed boundaries (the source was sentence-resegmented with
+            # Whisper words before translation), but the translated cues carry
+            # NO words of their own. resegment_by_sentence would MERGE the
+            # same-speaker run into one block then re-split it — and with no
+            # words to time the split it falls back to a GLOBAL char-proportional
+            # cut across the whole merged span, erasing the real per-cue timing
+            # and the silences between cues. That is the "scrambled timing" the
+            # LLM track otherwise showed. Its 1:1 cues are final here; the
+            # per-cue readability reflow + dedup below still run.
+            if _used_llm:
+                logger.info(
+                    "[%s] Translated resegmentation skipped — LLM cues are already "
+                    "1:1 and inherit the source's word-timed boundaries; re-segmenting "
+                    "word-less cues would char-proportionally re-time (scramble) them",
+                    job_id)
+            elif getattr(settings, "SENTENCE_SEGMENTATION_ENABLED", True) and not _pre_resegmented:
                 try:
                     from backend.services.sentence_segmenter import resegment_by_sentence
                     _pre_seg = len(translated)
