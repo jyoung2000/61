@@ -1,3 +1,20 @@
+# ClipAI — Reliable translated-transcript loading (lightweight endpoint)
+
+Across incognito + multiple devices the Analysis page kept showing the SOURCE
+(Japanese) transcript even though the backend had persisted the English
+(`translated_transcript`). Root cause: the UI reads the FULL job over the network
+to get the translation, and that payload is large enough that over a tunnel the
+fetch didn't reliably complete — so `translated_transcript` never reached any
+client and `activeTranscript` fell back to the source.
+
+Fix: a dedicated `GET /jobs/{id}/transcripts` endpoint that returns ONLY the
+source + translated transcripts (+ status) — a tiny response that always lands.
+The Analysis page pulls it on load, on every pipeline status change, and on a
+short timer while running, and merges the result in. The English now appears as
+soon as it's persisted, regardless of how big the rest of the job is.
+
+---
+
 # ClipAI — Whisper subtitle cues land on the audio (word-timed resegmentation)
 
 Audit follow-up on the Whisper-native path. Whisper's translate task emits a few

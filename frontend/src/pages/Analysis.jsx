@@ -863,6 +863,43 @@ export default function Analysis() {
     return () => clearInterval(id);
   }, [jobId, job?.status, fetchJob]);
 
+  // Reliable transcript loader. The full job GET can be too large/slow over a
+  // tunnel to deliver translated_transcript — which left the on-screen
+  // transcript (and the subtitle elements / .txt export built from it) stuck on
+  // the source language across EVERY client. This pulls JUST the transcripts
+  // from a lightweight endpoint and merges them in, so the English appears as
+  // soon as it's persisted, regardless of how big the rest of the job is. Runs
+  // on load, whenever the pipeline status changes, and on a short timer while
+  // the job is still running.
+  useEffect(() => {
+    if (!jobId) return undefined;
+    let cancelled = false;
+    const pull = async () => {
+      try {
+        const res = await fetch(`/api/jobs/${jobId}/transcripts`);
+        if (!res.ok || cancelled) return;
+        const t = await res.json();
+        const tt = Array.isArray(t.translated_transcript) ? t.translated_transcript : [];
+        const tr = Array.isArray(t.transcript) ? t.transcript : [];
+        setJob((prev) => {
+          if (!prev) return prev;
+          const sameTT = (tt.length || 0) === (prev.translated_transcript?.length || 0);
+          const sameTR = (tr.length || 0) === (prev.transcript?.length || 0);
+          if (sameTT && sameTR) return prev;
+          return {
+            ...prev,
+            transcript: tr.length ? tr : prev.transcript,
+            translated_transcript: tt.length ? tt : (prev.translated_transcript || []),
+          };
+        });
+      } catch { /* best-effort — fetchJob remains the full-payload path */ }
+    };
+    pull();
+    const terminal = ['complete', 'failed', 'cancelled'].includes(String(job?.status));
+    const id = terminal ? null : setInterval(pull, 15000);
+    return () => { cancelled = true; if (id) clearInterval(id); };
+  }, [jobId, job?.status, job?.translation_status]);
+
   const handleMarkKeyScene = useCallback(async () => {
     if (!markSceneDesc.trim() || markSceneSaving) return;
     setMarkSceneSaving(true);

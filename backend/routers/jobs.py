@@ -104,6 +104,35 @@ async def get_job(job_id: str, user: User = Depends(get_current_user)):
     return data
 
 
+@router.get("/jobs/{job_id}/transcripts")
+async def get_transcripts(job_id: str, user: User = Depends(get_current_user)):
+    """Lightweight transcript fetch — the source + translated transcripts and the
+    translation status ONLY, not the full (often multi-MB) job payload.
+
+    The Analysis page polls this so the translated subtitles load reliably even
+    when the full ``GET /jobs/{id}`` is too large/slow to complete over a tunnel
+    — the failure that left the UI stuck on the source-language transcript across
+    every client (incognito / multiple devices ruled out caching). Small response
+    => it always lands."""
+    job = await _require_job_access(job_id, user)
+
+    def _dump(rows):
+        return [r.model_dump(mode="json") if hasattr(r, "model_dump") else dict(r)
+                for r in (rows or [])]
+
+    return {
+        "job_id": job_id,
+        "status": str(getattr(job, "status", "") or ""),
+        "translation_status": getattr(job, "translation_status", None),
+        "subtitle_language": getattr(job, "subtitle_language", "") or "",
+        "language": getattr(job, "language", "") or "",
+        "transcript": _dump(getattr(job, "transcript", [])),
+        "translated_transcript": _dump(getattr(job, "translated_transcript", [])),
+        "speaker_names": getattr(job, "speaker_names", {}) or {},
+        "speaker_colors": getattr(job, "speaker_colors", {}) or {},
+    }
+
+
 # Per-job single-flight lock so a user can't fire ten concurrent
 # retranscribe jobs on the same video and blow the GPU budget. The
 # lock is keyed by job_id and lives as long as the process — releases
