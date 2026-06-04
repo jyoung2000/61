@@ -1,3 +1,28 @@
+# ClipAI — Fix the real reason translations were half-Japanese: source="auto"
+
+The LLM translation logged "0% still source-script" yet the track was ~40%
+Japanese. Root cause: the job's source language is "auto", and the language-
+purity check only counted CJK for KNOWN CJK source codes — so for "auto" it
+returned 0, the gate was effectively OFF, and the LLM (told to translate from
+"the source language") left long narration / lyrics untranslated, which then
+sailed through.
+
+Fixes:
+- The purity check is now CONTENT-based and TARGET-aware (`fraction_untranslated`):
+  any CJK in the output of a non-CJK-target translation counts as untranslated,
+  regardless of how the source was declared. So it works for "auto".
+- `translate_via_llm` runs a completeness cleanup: after the main pass it
+  re-translates any cue still in CJK script (up to 3 passes), so nothing is left
+  in the source language.
+- Resolve source "auto" → the language Whisper detected, so the LLM prompt is
+  precise ("Japanese → English") and the gate has a concrete target.
+
+Net: the translated track is fully target-language — the gate can no longer be
+silently disabled by an "auto" source, and any stray untranslated cue is caught
+and re-translated.
+
+---
+
 # ClipAI — Stop the post-edit from reverting LLM translations back to Japanese
 
 The LLM translation (previous change) works: logs show `LLM translation: 116/116

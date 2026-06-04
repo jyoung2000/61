@@ -16,7 +16,7 @@ import pytest
 
 from backend.models import TranscriptSegment
 from backend.services.translator import (
-    _cjk_ratio, _parse_json_array, fraction_source_script, translate_via_llm,
+    _cjk_ratio, _parse_json_array, fraction_untranslated, translate_via_llm,
 )
 
 
@@ -49,8 +49,10 @@ def test_cjk_and_fraction_detectors():
     assert _cjk_ratio("The opponent was a mobile suit") == 0.0
     mixed = [TranscriptSegment(text="宇宙コロニー", start=0, end=1, speaker="S"),
              TranscriptSegment(text="Hello there", start=1, end=2, speaker="S")]
-    assert fraction_source_script(mixed, "ja") == 0.5          # half still Japanese
-    assert fraction_source_script(mixed, "es") == 0.0          # not a CJK source
+    # Content-based: detects CJK in the output regardless of declared source
+    # (this is what makes it work when the source was detected as "auto").
+    assert fraction_untranslated(mixed, "en") == 0.5           # half still CJK → English target
+    assert fraction_untranslated(mixed, "ja") == 0.0           # CJK target → CJK is correct
 
 
 def test_parse_json_array():
@@ -66,8 +68,36 @@ def test_llm_translates_every_segment_1to1():
     out = _run(translate_via_llm(segs, "ja", "en", _Orch()))
     assert len(out) == 40                                      # 1:1, nothing dropped
     assert all("English line" in s.text for s in out)         # every cue translated
-    assert fraction_source_script(out, "ja") == 0.0           # none left Japanese
+    assert fraction_untranslated(out, "en") == 0.0            # none left Japanese
     assert out[5].start == 5.0 and out[5].speaker == "Speaker 1"  # timing/speaker kept
+
+
+def test_llm_cleanup_retranslates_leftover_cjk():
+    """The model sometimes echoes a hard line untranslated inside a valid array.
+    The completeness pass must re-translate any cue still in CJK script so the
+    final output has NONE of the source language left — even when the source was
+    'auto'."""
+    class _Leftover:
+        def __init__(self):
+            self.seen = set()
+
+        async def text_completion(self, prompt, **kwargs):
+            lines = re.findall(r"^\d+\.\s(.+)$", prompt, re.M)
+            out = []
+            for ln in lines:
+                # Leave one specific Japanese line untranslated the FIRST time,
+                # then translate it (pure English) on the cleanup retry.
+                if ln == "日本語の文2" and ln not in self.seen:
+                    self.seen.add(ln)
+                    out.append(ln)                # echo → still CJK
+                else:
+                    out.append("Translated text")  # pure English
+            return json.dumps(out)
+
+    out = _run(translate_via_llm(_segs(5), "auto", "en", _Leftover()))
+    assert len(out) == 5
+    assert fraction_untranslated(out, "en") == 0.0            # cleanup fixed the leftover
+    assert all(_cjk_ratio(s.text) == 0.0 for s in out)
 
 
 def test_llm_applies_glossary():

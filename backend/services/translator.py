@@ -58,18 +58,32 @@ def _cjk_ratio(text: str) -> float:
     return (cjk / base) if base else 0.0
 
 
-def fraction_source_script(segments, source_language: str) -> float:
-    """Fraction of segments still written in the SOURCE script — only meaningful
-    for CJK sources, where a successful →English translation should be ~0."""
-    if (source_language or "").lower() not in _CJK_SOURCES:
+def _seg_text(s):
+    return (s.get("text", "") if isinstance(s, dict) else getattr(s, "text", "")) or ""
+
+
+def fraction_untranslated(segments, target_language: str) -> float:
+    """Fraction of cues still written in CJK script.
+
+    Meaningful only when translating TO a non-CJK target (English etc.), where
+    any CJK left in the output is untranslated source — and crucially this is
+    judged from the OUTPUT TEXT, not the declared source language, so it still
+    works when the source was detected as ``auto`` (which previously disabled the
+    check and let half-Japanese tracks through). For CJK targets, CJK output is
+    correct, so it returns 0."""
+    if (target_language or "").lower() in _CJK_LANGS:
         return 0.0
     rows = list(segments or [])
     if not rows:
         return 0.0
-    def _txt(s):
-        return (s.get("text", "") if isinstance(s, dict) else getattr(s, "text", "")) or ""
-    n = sum(1 for s in rows if _cjk_ratio(_txt(s)) > 0.30)
+    n = sum(1 for s in rows if _cjk_ratio(_seg_text(s)) > 0.30)
     return n / len(rows)
+
+
+# Back-compat alias (some call sites pass the source language; the check is
+# content-based now, so the language argument is only used to skip CJK targets).
+def fraction_source_script(segments, language: str) -> float:
+    return fraction_untranslated(segments, "en")
 
 
 # ── LLM (editorial-model) translation ────────────────────────────────────────
@@ -122,7 +136,9 @@ async def translate_via_llm(
     if not orchestrator or not segments:
         return None
 
-    src_name = _LLM_LANG_NAMES.get((source_language or "").lower(), source_language or "the source language")
+    _sl = (source_language or "").strip().lower()
+    src_name = (_LLM_LANG_NAMES.get(_sl)
+                or ("the source language" if _sl in ("", "auto") else source_language))
     tgt_name = _LLM_LANG_NAMES.get((target_language or "").lower(), target_language or "English")
 
     def _txt(s):
@@ -199,9 +215,36 @@ async def translate_via_llm(
                     await r
             except Exception:
                 pass
+
+    # ── Completeness cleanup ────────────────────────────────────────────────
+    # The model occasionally echoes a hard line (long narration, song lyrics)
+    # untranslated inside an otherwise-valid array — and with a vague/auto source
+    # it does so more often. Re-translate any cue still in CJK script (only when
+    # the target is non-CJK), up to a couple of passes, so NOTHING is left in the
+    # source language.
+    if (target_language or "").lower() not in _CJK_LANGS:
+        for _pass in range(3):
+            idxs = [i for i, s in enumerate(out_segs) if _cjk_ratio(s.text or "") > 0.30]
+            if not idxs:
+                break
+            logger.info("LLM translate: re-translating %d cue(s) still in source "
+                        "script (pass %d)", len(idxs), _pass + 1)
+            redo = await _translate_batch([out_segs[i] for i in idxs])
+            for i, tr in zip(idxs, redo):
+                t = (tr or "").strip()
+                if t and _cjk_ratio(t) <= 0.30:
+                    if glossary:
+                        for k, v in glossary.items():
+                            ks, vs = (k or "").strip(), (v or "").strip()
+                            if ks and vs and ks in t:
+                                t = t.replace(ks, vs)
+                    cur = out_segs[i]
+                    out_segs[i] = TranscriptSegment(
+                        text=t, start=cur.start, end=cur.end, speaker=cur.speaker)
+
     logger.info("LLM translation: %d/%d segments → %s (%.0f%% still source-script)",
                 len(out_segs), total, target_language,
-                100 * fraction_source_script(out_segs, source_language))
+                100 * fraction_untranslated(out_segs, target_language))
     return out_segs
 
 

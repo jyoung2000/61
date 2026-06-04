@@ -427,7 +427,7 @@ async def translate_offline(segments, source_lang, target_lang, *, video_path=No
             and segments and tgt and tgt != src):
         try:
             from backend.services.translator import (
-                translate_via_llm, fraction_source_script,
+                translate_via_llm, fraction_untranslated,
             )
             if job_id:
                 # The LLM runs via API/Ollama — free the reframer's Whisper VRAM now.
@@ -444,7 +444,7 @@ async def translate_offline(segments, source_lang, target_lang, *, video_path=No
                 timeout=(nmt_timeout or 1800),
             )
             if _llm:
-                _resid = fraction_source_script(_llm, source_lang)
+                _resid = fraction_untranslated(_llm, target_lang)
                 if _resid < 0.20:
                     logger.info("Translate via editorial LLM: %d segments → %s (complete)",
                                 len(_llm), target_lang)
@@ -526,8 +526,8 @@ async def translate_offline(segments, source_lang, target_lang, *, video_path=No
             # narration / hard segments in the SOURCE language on mixed content
             # (a half-Japanese "translated" track). Reject that and use offline
             # NMT on the full source, which translates every cue.
-            from backend.services.translator import fraction_source_script
-            _resid = fraction_source_script(_wt, source_lang)
+            from backend.services.translator import fraction_untranslated
+            _resid = fraction_untranslated(_wt, target_lang)
             if _resid >= 0.20:
                 logger.warning(
                     "Whisper-native translate left %.0f%% of cues in the source "
@@ -1648,7 +1648,11 @@ async def _background_post_processing(
     from backend.services.compat_stubs import _last_detected_language
     target_lang = (job.subtitle_language or "").strip().lower()
     source_lang = (job.language or "").strip().lower()
-    if not source_lang:
+    if source_lang in ("", "auto"):
+        # "auto" must resolve to the language Whisper actually detected — otherwise
+        # the LLM gets a vague "translate from the source language" prompt and the
+        # CJK purity check can't run, which is how half-Japanese tracks slipped
+        # through.
         source_lang = (_last_detected_language.get("lang", "") or "").strip().lower()
     if not target_lang and source_lang and source_lang not in ("en", "english"):
         target_lang = "en"
@@ -1971,9 +1975,9 @@ async def _background_post_processing(
                         # Safety: a post-edit must never REINTRODUCE the source
                         # language. If it raised the source-script fraction it
                         # corrupted the draft — keep the pre-edit translation.
-                        from backend.services.translator import fraction_source_script
-                        _before = fraction_source_script(translated, source_lang)
-                        _after = fraction_source_script(_pol, source_lang)
+                        from backend.services.translator import fraction_untranslated
+                        _before = fraction_untranslated(translated, target_lang)
+                        _after = fraction_untranslated(_pol, target_lang)
                         if _after > _before + 0.02:
                             logger.warning(
                                 "[%s] AI post-edit reintroduced source language "
