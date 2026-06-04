@@ -272,3 +272,55 @@ def collapse_overlapping_duplicates(
         return segments, 0
     out = [seg for i, seg in enumerate(segments) if i not in dropped_orig]
     return out, len(dropped_orig)
+
+
+def clamp_segments_to_duration(
+    segments: list,
+    duration_sec: float,
+    start_key: str = "start",
+    end_key: str = "end",
+    words_key: str = "words",
+) -> tuple[list, int]:
+    """Drop cues stamped past the end of the audio; clamp cues that overrun it.
+
+    faster-whisper can DRIFT/LOOP on repetitive music and emit segment
+    timestamps BEYOND the real audio duration — e.g. cues at 35:51 on a 24:27
+    video — which then mis-times the back third of the subtitle track. There is
+    no audio past ``duration_sec``, so a cue that STARTS at/after it is a
+    hallucination / timestamp-drift artefact and is dropped; a cue that merely
+    RUNS PAST the end is clamped back to it (with its word timings). On this AMV
+    the past-the-end cues were verified to be loop-repeats of earlier lines, not
+    unique tail dialogue, so dropping them loses no real content.
+
+    Order-preserving. Schema-flexible like the other helpers here (pass
+    ``start_key="start_sec"`` / ``end_key="end_sec"`` for the reframer's dicts).
+    Returns ``(kept_segments, dropped_or_clamped_count)``.
+    """
+    if not segments or not duration_sec or duration_sec <= 0:
+        return segments, 0
+    limit = float(duration_sec)
+    out: list = []
+    changed = 0
+    for seg in segments:
+        st = float(_seg_get(seg, start_key, 0.0) or 0.0)
+        en = float(_seg_get(seg, end_key, st) or st)
+        if st >= limit:
+            # Starts at/after the audio end → nothing real here; drop it.
+            changed += 1
+            continue
+        if en > limit:
+            # Straddles the end → clamp the cue (and any words) back to it.
+            _seg_set(seg, end_key, round(limit, 3))
+            words = _seg_get(seg, words_key, None)
+            if words:
+                kept_w = []
+                for w in words:
+                    if float(_seg_get(w, "start", st) or st) >= limit:
+                        continue
+                    if float(_seg_get(w, "end", st) or st) > limit:
+                        _seg_set(w, "end", round(limit, 3))
+                    kept_w.append(w)
+                _seg_set(seg, words_key, kept_w)
+            changed += 1
+        out.append(seg)
+    return out, changed

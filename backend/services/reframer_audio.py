@@ -761,6 +761,28 @@ class AudioIntelligence:
                     log.log_stage('AUDIO',
                         f'Gap-fill pass failed (non-fatal): {gf_err}')
 
+            # ── Clamp timestamp drift to the real audio end ──
+            # faster-whisper drifts/loops on repetitive music and can stamp cues
+            # PAST the audio (e.g. cues at 35:51 on a 24:27 video), mis-timing
+            # the back third of the subtitles. Those past-the-end cues are
+            # loop-repeats of earlier lines, not real tail dialogue, so drop them
+            # (and clamp any cue that merely overruns the end). Clamp to the
+            # larger of info.duration and the caller's media duration so a short
+            # info.duration can never truncate legitimate tail speech; a clean
+            # run with no drift is a no-op.
+            try:
+                from backend.services.transcript_dedup import clamp_segments_to_duration
+                _clamp_limit = max(float(duration_sec), (duration_ms or 0) / 1000.0)
+                segments, _drifted = clamp_segments_to_duration(
+                    segments, _clamp_limit, start_key='start_sec', end_key='end_sec')
+                if _drifted:
+                    log.log_stage('AUDIO',
+                        f'Timestamp-drift clamp @ {_clamp_limit:.0f}s audio end: '
+                        f'dropped/clamped {_drifted} cue(s) past the end')
+            except Exception as _clamp_err:
+                log.log_stage('AUDIO',
+                    f'Timestamp-drift clamp skipped (non-fatal): {_clamp_err}')
+
             # ── TACT: Build Coverage Ledger ──
             ledger = CoverageLedger(bin_width_ms=20, duration_ms=int(duration_sec * 1000))
 
@@ -1294,6 +1316,21 @@ class AudioIntelligence:
 
                 if on_progress and info.duration > 0:
                     on_progress(min(1.0, seg.end / info.duration))
+
+            # Clamp drift to the real audio end (task='translate' loops on music
+            # too) so the English cues never run past the video.
+            try:
+                from backend.services.transcript_dedup import clamp_segments_to_duration
+                if getattr(info, 'duration', 0):
+                    segments, _drifted = clamp_segments_to_duration(
+                        segments, float(info.duration),
+                        start_key='start_sec', end_key='end_sec')
+                    if _drifted:
+                        log.log_stage('TRANSLATE',
+                            f'Timestamp-drift clamp @ {info.duration:.0f}s: '
+                            f'dropped/clamped {_drifted} cue(s)')
+            except Exception:
+                pass
 
             log.log_stage('TRANSLATE',
                 f'Whisper translate complete: {len(segments)} segments '
