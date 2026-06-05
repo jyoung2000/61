@@ -74,3 +74,46 @@ def test_update_job_status_still_allows_reanalysis_reset(tmp_jobs):
                               protect_terminal=False))
     reloaded = _run(db.load_job("j1"))
     assert db._status_value(reloaded.status) == "queued"
+
+
+def _dumps(segs):
+    return [s.model_dump() for s in segs]
+
+
+def test_purity_guard_refuses_half_source_overwrite(tmp_jobs):
+    # The recurring bug: a clean English translation (0% source-script) gets
+    # clobbered by a half-Japanese re-analyze / Whisper-native fallback. The
+    # purity guard in update_job_status must refuse that regression.
+    clean = [_seg("Hello there"), _seg("How are you", 1, 2)]
+    _run(db.save_job(_job(status="complete", translated=clean)))
+    _run(db.update_job_status("j1", subtitle_language="en"))   # non-CJK target
+    half_jp = [_seg("宇宙コロニーでの生活に新たな希望を"), _seg("Hello there", 1, 2)]  # 50% CJK
+    _run(db.update_job_status("j1", translated_transcript=_dumps(half_jp)))
+    reloaded = _run(db.load_job("j1"))
+    assert len(reloaded.translated_transcript) == 2
+    assert all("宇宙" not in (s.text or "") for s in reloaded.translated_transcript)
+    assert reloaded.translated_transcript[0].text == "Hello there"   # clean kept
+
+
+def test_purity_guard_allows_clean_retranslation_over_dirty(tmp_jobs):
+    # The inverse must NOT be blocked: a clean English result replacing an
+    # earlier half-Japanese one is an improvement and has to win.
+    dirty = [_seg("宇宙コロニー"), _seg("Hi", 1, 2)]
+    _run(db.save_job(_job(status="complete", translated=dirty)))
+    _run(db.update_job_status("j1", subtitle_language="en"))
+    clean = [_seg("In the space colony"), _seg("Hi", 1, 2)]
+    _run(db.update_job_status("j1", translated_transcript=_dumps(clean)))
+    reloaded = _run(db.load_job("j1"))
+    assert reloaded.translated_transcript[0].text == "In the space colony"
+
+
+def test_purity_guard_allows_cjk_target(tmp_jobs):
+    # A →ja translation legitimately contains CJK; the guard must not fire when
+    # the TARGET language is itself CJK.
+    clean_en = [_seg("Hello"), _seg("World", 1, 2)]
+    _run(db.save_job(_job(status="complete", translated=clean_en)))
+    _run(db.update_job_status("j1", subtitle_language="ja"))   # CJK target
+    ja = [_seg("こんにちは"), _seg("世界", 1, 2)]
+    _run(db.update_job_status("j1", translated_transcript=_dumps(ja)))
+    reloaded = _run(db.load_job("j1"))
+    assert reloaded.translated_transcript[0].text == "こんにちは"

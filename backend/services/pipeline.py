@@ -2128,6 +2128,22 @@ async def _background_post_processing(
                 from backend.services.audio_analyzer import merge_markers
                 _translated_out = merge_markers(_translated_out, _music_markers)
 
+            # ── Final purity gate (the invariant this whole effort enforces) ──
+            # A "translation" must NEVER be shipped half-source-language. If the
+            # finished track is substantially source-script — a bad NMT/Whisper-
+            # native draft slipping through, or a corrupted merge — refuse to
+            # persist it: raise so the except below records translation_failed
+            # and the (labelled) source transcript is kept, instead of saving
+            # Japanese under translated_transcript. Skipped for CJK targets,
+            # where CJK output is correct (fraction_untranslated returns 0).
+            from backend.services.translator import fraction_untranslated as _frac_unt
+            _final_resid = _frac_unt(_translated_out, target_lang)
+            if _final_resid > 0.20:
+                raise RuntimeError(
+                    f"refusing to persist a {100 * _final_resid:.0f}%-source-script "
+                    f"translated_transcript (target={target_lang}) — the translation "
+                    "did not complete cleanly")
+
             # ── Persist the translated, polished transcript ──
             # No status pin here: translation now runs BEFORE clip extraction,
             # so the job is NOT terminal yet — the COMPLETE save happens in

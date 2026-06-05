@@ -313,6 +313,34 @@ def _status_value(status) -> str:
     return (status.value if hasattr(status, "value") else str(status)).lower()
 
 
+def _cjk_heavy_text(text: str) -> bool:
+    """True when a cue is predominantly CJK script (i.e. untranslated source).
+
+    Mirrors ``translator._cjk_ratio > 0.30`` but dependency-free, so the DB
+    layer can judge translation purity without importing the heavy
+    translator/orchestrator chain (openai/genai/…)."""
+    t = text or ""
+    cjk = base = 0
+    for c in t:
+        if ("぀" <= c <= "ヿ" or "㐀" <= c <= "鿿"
+                or "가" <= c <= "힣" or "ｦ" <= c <= "ﾟ"):
+            cjk += 1
+            base += 1
+        elif c.isalpha():
+            base += 1
+    return base > 0 and (cjk / base) > 0.30
+
+
+def _source_script_fraction(rows) -> float:
+    """Fraction of cues still written predominantly in CJK source script."""
+    rows = list(rows or [])
+    if not rows:
+        return 0.0
+    n = sum(1 for s in rows if _cjk_heavy_text(
+        (s.get("text", "") if isinstance(s, dict) else getattr(s, "text", "")) or ""))
+    return n / len(rows)
+
+
 async def update_job_status(
     job_id: str,
     status: Optional[str] = None,
@@ -368,6 +396,37 @@ async def update_job_status(
             job.progress_message = progress_message
         from datetime import datetime, timezone
         job.updated_at = datetime.now(timezone.utc).isoformat()
+
+        # ── Translation purity guard ───────────────────────────────────────
+        # Never let a re-analyze / orphan-recovery pass that fell back to
+        # Whisper-native translate (which leaves music/narration in the source
+        # language) CLOBBER a clean editorial-LLM translation with a half-source
+        # one. Seen in production: the LLM wrote 0%-source English, then a second
+        # pass overwrote translated_transcript with ~60% Japanese — the recurring
+        # "translated track came back half source-language" bug. A genuinely
+        # better/equal translation still wins; only a REGRESSION to materially
+        # more source-script is refused, and only when the target is non-CJK
+        # (a →ja/zh/ko translation legitimately contains CJK).
+        if "translated_transcript" in kwargs:
+            _incoming_tt = kwargs.get("translated_transcript") or []
+            _existing_tt = getattr(job, "translated_transcript", None) or []
+            _tgt = (kwargs.get("subtitle_language")
+                    or getattr(job, "subtitle_language", "") or "").lower().split("-")[0]
+            if _incoming_tt and _existing_tt and _tgt not in ("ja", "ko", "zh", "yue"):
+                try:
+                    _ein = _source_script_fraction(_incoming_tt)
+                    _eex = _source_script_fraction(_existing_tt)
+                    if _eex <= 0.15 and _ein >= _eex + 0.15:
+                        logger.warning(
+                            "[%s] Translation purity guard: refused to overwrite a clean "
+                            "translated_transcript (%.0f%% source-script, %d cues) with a "
+                            "half-source one (%.0f%% source-script, %d cues) — kept the clean "
+                            "translation.",
+                            job_id, 100 * _eex, len(_existing_tt), 100 * _ein, len(_incoming_tt))
+                        kwargs.pop("translated_transcript", None)
+                except Exception:
+                    pass
+
         for key, value in kwargs.items():
             if hasattr(job, key):
                 setattr(job, key, value)
