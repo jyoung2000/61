@@ -429,6 +429,14 @@ export default function VideoEditor({
   // ── Subtitle sync refs (shared by forward and reverse sync effects) ──
   const subtitleSyncTimerRef = useRef(null);
   const lastSyncedSubtitlesRef = useRef(new Map());
+  // Content signature of the transcript we last re-synced INTO the timeline.
+  // A new array reference with the SAME cues (every 15 s poll, the persist-time
+  // re-sort, or the drag→transcript echo) must NOT re-run the add/remove churn
+  // below — that churn removed then re-added items at slightly different times,
+  // which is exactly the "subtitle elements move/reposition on their own"
+  // symptom. Only a genuine content change (text / speaker / timing / count)
+  // bumps the signature and re-syncs.
+  const lastForwardSyncSigRef = useRef('');
 
   // ── Reverse sync: when transcript prop changes (e.g. from TranscriptViewer edits),
   //    update matching subtitle items in the timeline store.
@@ -438,6 +446,19 @@ export default function VideoEditor({
     if (!transcript || !multiTrackInitialized.current) return;
     if (prevTranscriptRef.current === transcript) return;
     prevTranscriptRef.current = transcript;
+
+    // Skip when only the array REFERENCE changed but the cues are identical
+    // (poll churn / persist-time re-sort / sync echo). Order-independent so a
+    // pure re-sort never counts as a change. Without this gate the add/remove
+    // branches below churned and visibly repositioned subtitle elements on the
+    // timeline with no user interaction. A real TranscriptViewer edit / add /
+    // delete (or a translation finishing) changes the signature and still syncs.
+    const sig = (transcript || [])
+      .map((s) => `${Math.round((s.start || 0) * 100)}:${Math.round((s.end || 0) * 100)}:${s.speaker || ''}:${s.text || ''}`)
+      .sort()
+      .join('|');
+    if (sig === lastForwardSyncSigRef.current) return;
+    lastForwardSyncSigRef.current = sig;
 
     const effectiveEnd = clipEnd || clipStart;
     const subtitleItems = timelineStoreItems.filter((it) => it.type === 'subtitle');
