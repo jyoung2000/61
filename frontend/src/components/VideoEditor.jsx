@@ -441,7 +441,16 @@ export default function VideoEditor({
   // ── Reverse sync: when transcript prop changes (e.g. from TranscriptViewer edits),
   //    update matching subtitle items in the timeline store.
   //    Handles: text changes, speaker changes, added segments, deleted segments ──
-  const prevTranscriptRef = useRef(transcript);
+  // Initialise to null (not ``transcript``) so the very first run of the sync
+  // below ACTUALLY executes. With ``useRef(transcript)`` the first run early
+  // -returned (prev === current), so a timeline restored from a STALE IndexedDB
+  // cache — e.g. Japanese subtitle elements left by an earlier source-language
+  // run of the same video — was never reconciled against the now-English
+  // transcript, leaving the NLE subtitle track in Japanese while the transcript
+  // panel showed English. Running once on load reconciles it; the signature
+  // gate below still stops any later poll-churn from repositioning elements, and
+  // a freshly-built timeline is a no-op (every item already matches by index).
+  const prevTranscriptRef = useRef(null);
   useEffect(() => {
     if (!transcript || !multiTrackInitialized.current) return;
     if (prevTranscriptRef.current === transcript) return;
