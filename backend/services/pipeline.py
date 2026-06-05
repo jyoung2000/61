@@ -2128,6 +2128,22 @@ async def _background_post_processing(
                 from backend.services.audio_analyzer import merge_markers
                 _translated_out = merge_markers(_translated_out, _music_markers)
 
+            # Persist in CHRONOLOGICAL order. Readability splits + re-merged
+            # ``[♪ music ♪]`` markers can leave cues out of strict time order,
+            # which made the transcript PANEL (it renders the saved order)
+            # reshuffle between polls even though the SRT/TXT exports re-sort.
+            # Sorting here fixes the data at the source so every consumer — the
+            # panel, the exports, and clip subtitle slicing — sees one stable
+            # timeline order.
+            try:
+                _translated_out.sort(key=lambda s: (
+                    float((s.get("start") if isinstance(s, dict)
+                           else getattr(s, "start", 0)) or 0),
+                    float((s.get("end") if isinstance(s, dict)
+                           else getattr(s, "end", 0)) or 0)))
+            except Exception:
+                pass
+
             # ── Final purity gate (the invariant this whole effort enforces) ──
             # A "translation" must NEVER be shipped half-source-language. If the
             # finished track is substantially source-script — a bad NMT/Whisper-

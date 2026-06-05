@@ -151,9 +151,22 @@ export default function TranscriptViewer({ transcript, onSeek, jobId, onSpeakerR
   }, [transcript, timeRange]);
 
   const filtered = useMemo(() => {
-    if (!search.trim()) return timeFiltered;
-    const q = search.toLowerCase();
-    return timeFiltered.filter((seg) => seg.text.toLowerCase().includes(q) || seg.speaker.toLowerCase().includes(q));
+    const base = !search.trim()
+      ? timeFiltered
+      : timeFiltered.filter((seg) =>
+          (seg.text || '').toLowerCase().includes(search.toLowerCase())
+          || (seg.speaker || '').toLowerCase().includes(search.toLowerCase()));
+    // Render in CHRONOLOGICAL order, independent of the upstream array order.
+    // ``translated_transcript`` can come back not-strictly-time-ordered
+    // (readability splits + re-merged ``[♪ music ♪]`` markers + re-analyze
+    // writes interleave it), and the 15 s poll swaps the array in during
+    // processing — so without this sort the panel rendered raw order and
+    // visibly reshuffled between polls. The SRT/TXT exports already sort; this
+    // makes the on-screen list match them and stay put, ordered by timestamp.
+    // (Editing still maps via ``transcript.indexOf(seg)`` to the backend index,
+    // so a sorted DISPLAY copy doesn't affect edit/delete/speaker targeting.)
+    return base.slice().sort(
+      (a, b) => ((a.start ?? 0) - (b.start ?? 0)) || ((a.end ?? 0) - (b.end ?? 0)));
   }, [timeFiltered, search]);
 
   // Determine which segment is currently playing (by original transcript index).
