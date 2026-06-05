@@ -845,7 +845,23 @@ export default function Analysis() {
           const denseCount = data.scenes.filter(s => s.description === '[dense face tracking]').length;
           console.log(`[Analysis] fetchJob: ${data.scenes.length} scenes (${denseCount} dense face tracking, ${data.scenes.length - denseCount} AI), status=${data.status}`);
         }
-        setJob(data);
+        setJob((prev) => {
+          if (!prev) return data;
+          // The lightweight /transcripts poll delivers summary +
+          // translated_transcript reliably even when THIS full fetch is slow or
+          // partial over a tunnel. Don't let a full payload that came back
+          // WITHOUT them null out what the poll already delivered — keep the
+          // existing value whenever the full fetch lacks it. (summary is set
+          // once and never cleared; translated_transcript only grows.)
+          return {
+            ...data,
+            summary: data.summary || prev.summary,
+            translated_transcript:
+              (Array.isArray(data.translated_transcript) && data.translated_transcript.length)
+                ? data.translated_transcript
+                : (prev.translated_transcript || data.translated_transcript),
+          };
+        });
         fetchJobRetryRef.current = 0;
         // Sync generating state from job status (handles page refresh mid-generation)
         if (data.status === 'detecting_clips') {
