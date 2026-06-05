@@ -1118,12 +1118,22 @@ export default function Settings() {
         const textPick   = s.OPENROUTER_TEXT_MODEL   || s.OLLAMA_TEXT_MODEL   || '';
         const transPick  = s.WHISPER_MODEL || '';
         if (visionPick || textPick || transPick) {
+          // Spread ...prev FIRST. This overlay only carries the per-user
+          // vision/text/whisper picks; rebuilding the object from just those
+          // three keys dropped ``editorial_model_fallback`` (which is loaded
+          // from /clipper/judge-config, not this per-user overlay). Because
+          // this runs right after loadModels — and only when a primary/editorial
+          // pick exists — it silently wiped the just-loaded Editorial AI
+          // Fallback every time, which is why it "never persisted" while the
+          // primary/editorial dropdowns did.
           setPendingModels((prev) => ({
+            ...prev,
             transcript_model: transPick || prev.transcript_model,
             primary_model:     visionPick || prev.primary_model,
             editorial_model:       textPick   || prev.editorial_model,
           }));
           setCurrentModels((prev) => ({
+            ...prev,
             transcript_model: transPick || prev.transcript_model,
             primary_model:     visionPick || prev.primary_model,
             editorial_model:       textPick   || prev.editorial_model,
