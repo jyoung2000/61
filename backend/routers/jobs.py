@@ -128,6 +128,15 @@ async def get_transcripts(job_id: str, user: User = Depends(get_current_user)):
         "language": getattr(job, "language", "") or "",
         "transcript": _dump(getattr(job, "transcript", [])),
         "translated_transcript": _dump(getattr(job, "translated_transcript", [])),
+        # The video summary rides this lightweight poll too. It is persisted
+        # mid-pipeline but otherwise only reaches the UI via the full (often
+        # multi-MB) GET /jobs/{id} — the very request too large/slow to land over
+        # a tunnel — leaving the Summary tab stuck on "Generating summary…" even
+        # though the summary exists on disk. Small payload => it always lands.
+        "summary": (job.summary.model_dump(mode="json")
+                    if getattr(job, "summary", None) is not None
+                    and hasattr(job.summary, "model_dump")
+                    else getattr(job, "summary", None)),
         "speaker_names": getattr(job, "speaker_names", {}) or {},
         "speaker_colors": getattr(job, "speaker_colors", {}) or {},
     }

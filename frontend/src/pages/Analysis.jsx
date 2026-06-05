@@ -577,6 +577,33 @@ export default function Analysis() {
         : (job?.transcript || []);
       // No real change → skip the write (and break the echo loop).
       if (subtitleListsEqual(derived, current)) return;
+      // Stale-cache guard: a previous corrupted run can leave a half-source
+      // (Japanese) timeline in IndexedDB; re-deriving it here would PUT it over
+      // the clean translation on every change. The backend purity guard then
+      // rejects it — but the frontend was flooding the endpoint (100+ times a
+      // run). Mirror that guard here: never push a transcript that is materially
+      // MORE source-script than the clean one we already have.
+      if (usingTranslated) {
+        const cjkFrac = (rows) => {
+          const arr = rows || [];
+          if (!arr.length) return 0;
+          let n = 0;
+          for (const s of arr) {
+            const str = String((s && (s.text ?? s.subtitleText)) || '');
+            let c = 0, b = 0;
+            for (const ch of str) {
+              const o = ch.codePointAt(0);
+              if ((o >= 0x3040 && o <= 0x30ff) || (o >= 0x3400 && o <= 0x9fff) || (o >= 0xac00 && o <= 0xd7a3)) { c++; b++; }
+              else if (/[a-z]/i.test(ch)) { b++; }
+            }
+            if (b > 0 && c / b > 0.3) n++;
+          }
+          return n / arr.length;
+        };
+        const cF = cjkFrac(current);
+        const dF = cjkFrac(derived);
+        if (cF <= 0.15 && dF >= cF + 0.15) return;  // stale/corrupted timeline — don't write it back
+      }
       const target = usingTranslated ? 'translated' : 'original';
       try {
         const res = await fetch(`/api/jobs/${jobId}/transcript`, {
@@ -881,15 +908,22 @@ export default function Analysis() {
         const t = await res.json();
         const tt = Array.isArray(t.translated_transcript) ? t.translated_transcript : [];
         const tr = Array.isArray(t.transcript) ? t.transcript : [];
+        const summary = t.summary || null;
         setJob((prev) => {
           if (!prev) return prev;
           const sameTT = (tt.length || 0) === (prev.translated_transcript?.length || 0);
           const sameTR = (tr.length || 0) === (prev.transcript?.length || 0);
-          if (sameTT && sameTR) return prev;
+          // The summary is persisted mid-pipeline but only reaches the UI
+          // reliably through THIS lightweight poll (the full job fetch is too
+          // big to land over a tunnel). Adopt it the moment it arrives so the
+          // Summary tab stops sitting on "Generating summary…" forever.
+          const gotSummary = !!summary && !prev.summary;
+          if (sameTT && sameTR && !gotSummary) return prev;
           return {
             ...prev,
             transcript: tr.length ? tr : prev.transcript,
             translated_transcript: tt.length ? tt : (prev.translated_transcript || []),
+            summary: summary || prev.summary,
           };
         });
       } catch { /* best-effort — fetchJob remains the full-payload path */ }
