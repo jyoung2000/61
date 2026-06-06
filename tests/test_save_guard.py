@@ -13,7 +13,7 @@ import asyncio
 import pytest
 
 import backend.database as db
-from backend.models import JobResult, TranscriptSegment
+from backend.models import JobResult, TranscriptSegment, VideoSummary
 
 
 def _run(coro):
@@ -47,6 +47,40 @@ def test_save_job_does_not_wipe_translated(tmp_jobs):
     reloaded = _run(db.load_job("j1"))
     assert len(reloaded.translated_transcript) == 1   # kept
     assert reloaded.translated_transcript[0].text == "Hello"
+
+
+def _summary(overview="A clear overview of the video."):
+    return VideoSummary(overview=overview, key_topics=["mecha", "war"],
+                        tone="serious", estimated_audience="anime fans",
+                        content_category="entertainment")
+
+
+def test_save_job_does_not_wipe_summary(tmp_jobs):
+    # The summary stage persists via update_job_status(summary=...) — a separate DB
+    # write that does NOT update the in-memory pipeline job. A later whole-object
+    # save_job() of that stale job (summary=None) must NOT clobber the persisted
+    # summary, or the Summary tab shows "No summary available" despite generation
+    # succeeding (the production symptom).
+    j = _job(translated=[_seg("Hello")])
+    j.summary = _summary("The real generated summary.")
+    _run(db.save_job(j))
+    _run(db.save_job(_job(translated=[_seg("Hello")])))   # stale snapshot: summary=None
+    reloaded = _run(db.load_job("j1"))
+    assert reloaded.summary is not None                   # kept
+    assert reloaded.summary.overview == "The real generated summary."
+
+
+def test_legit_summary_regeneration_overwrites(tmp_jobs):
+    # The inverse must NOT be blocked: a re-analysis producing a NEW non-empty
+    # summary has to win, exactly like the translated_transcript guard.
+    j = _job(translated=[_seg("Hi")])
+    j.summary = _summary("Old summary.")
+    _run(db.save_job(j))
+    j2 = _job(translated=[_seg("Hi")])
+    j2.summary = _summary("New, better summary.")
+    _run(db.save_job(j2))
+    reloaded = _run(db.load_job("j1"))
+    assert reloaded.summary.overview == "New, better summary."   # non-empty write wins
 
 
 def test_save_job_does_not_revert_terminal_status(tmp_jobs):

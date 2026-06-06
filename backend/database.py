@@ -91,6 +91,20 @@ async def _save_job_unlocked(job: JobResult, *, _preserve_terminal_status: bool 
                         "Save guard [%s]: kept %d existing translated_transcript "
                         "segment(s) — incoming save had none (stale snapshot).",
                         job.job_id, len(_cur["translated_transcript"]))
+                # Same anti-wipe for the video summary. It is written ONCE by the
+                # summary stage via ``update_job_status(job_id, summary=...)`` — a
+                # separate DB write that does NOT update the in-memory pipeline job.
+                # A later whole-object ``save_job()`` of that still-stale in-memory
+                # job (summary=None) would otherwise clobber the persisted summary,
+                # leaving the Summary tab on "No summary available" even though
+                # generation succeeded (Stage 'summary' finished in the log). Keep
+                # the existing summary whenever the incoming save lacks one; a real
+                # re-analysis writes a NEW non-empty summary, which still wins.
+                if _cur.get("summary") and not data.get("summary"):
+                    data["summary"] = _cur["summary"]
+                    logger.warning(
+                        "Save guard [%s]: kept existing summary — incoming save had "
+                        "none (stale snapshot).", job.job_id)
                 _cur_status = str(_cur.get("status", "") or "").lower()
                 _new_status = str(data.get("status", "") or "").lower()
                 if _cur_status in _TERMINAL_STATUSES and _new_status not in _TERMINAL_STATUSES:
