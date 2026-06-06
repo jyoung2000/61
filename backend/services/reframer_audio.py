@@ -361,6 +361,12 @@ class AudioIntelligence:
             ('large-v2',      'int8_float16'):  1.6,
             ('large-v3',      'float16'):       3.0,
             ('large-v3',      'int8_float16'):  1.6,
+            # large-v3-turbo = large-v3's full encoder + a pruned 4-layer decoder
+            # (~809M params), so its footprint sits between medium and large-v3.
+            # int8_float16 (~1.0 GB load) fits a 4 GB GTX 1650 alongside the
+            # batched-inference workspace; a runtime OOM still falls back to CPU.
+            ('large-v3-turbo','float16'):       1.8,
+            ('large-v3-turbo','int8_float16'):  1.0,
             ('medium',        'float16'):       1.6,
             ('medium',        'int8_float16'):  0.85,
             ('small',         'float16'):       1.0,
@@ -545,6 +551,8 @@ class AudioIntelligence:
                             ('large-v2', 'int8_float16'): 1.6,
                             ('large-v3', 'float16'):      3.0,
                             ('large-v3', 'int8_float16'): 1.6,
+                            ('large-v3-turbo', 'float16'):      1.8,
+                            ('large-v3-turbo', 'int8_float16'): 1.0,
                             ('medium',   'float16'):      1.6,
                             ('medium',   'int8_float16'): 0.85,
                             ('small',    'float16'):      1.0,
