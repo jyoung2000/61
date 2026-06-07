@@ -265,7 +265,15 @@ class SpeakerEmbedder:
 
     def try_load(self) -> bool:
         try:
-            hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
+            # Also honor the Settings/config field (HF_AUTH_TOKEN) — the UI and
+            # overlay use it, while this read historically only checked the env.
+            try:
+                from backend.config import settings as _settings
+                _cfg_token = (getattr(_settings, "HF_AUTH_TOKEN", "") or "").strip()
+            except Exception:
+                _cfg_token = ""
+            hf_token = (os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
+                        or _cfg_token)
             if not hf_token:
                 return False
             from pyannote.audio import Inference, Model  # type: ignore

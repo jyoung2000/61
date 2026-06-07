@@ -53,7 +53,18 @@ class SpeakerDiarizer:
 
             # Use the pretrained pipeline (requires accepting HF terms)
             # Falls back to a simpler approach if HF token isn't set
-            hf_token = os.environ.get('HF_TOKEN') or os.environ.get('HUGGINGFACE_TOKEN')
+            # Honor the token from env (HF_TOKEN / HUGGINGFACE_TOKEN) OR the
+            # Settings/config field (HF_AUTH_TOKEN). The UI, .env.example, and the
+            # per-user overlay all use HF_AUTH_TOKEN, so without this fallback a
+            # token pasted into Settings never reaches pyannote and diarization
+            # silently stays on the (over-segmenting) ECAPA/visual fallback.
+            try:
+                from backend.config import settings as _settings
+                _cfg_token = (getattr(_settings, 'HF_AUTH_TOKEN', '') or '').strip()
+            except Exception:
+                _cfg_token = ''
+            hf_token = (os.environ.get('HF_TOKEN') or os.environ.get('HUGGINGFACE_TOKEN')
+                        or _cfg_token or None)
             if hf_token:
                 self.pipeline = PyannotePipeline.from_pretrained(
                     "pyannote/speaker-diarization-3.1",
