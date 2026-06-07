@@ -37,8 +37,8 @@ def test_is_rate_limited_error_detects_429_and_throttle():
 
 
 def test_coarse_pass_chunk_short_circuits_when_rate_limited():
-    """Once the breaker is tripped, a chunk returns [] immediately without
-    touching Replicate / the video (all args can be dummies)."""
+    """Once the breaker is tripped, a chunk returns None (retryable — it will be
+    resumed) immediately, without touching Replicate / the video."""
     disc = ReplicateDiscoveryV3(api_key="x")
     disc._rate_limited = threading.Event()
     disc._rate_limited.set()
@@ -56,5 +56,49 @@ def test_coarse_pass_chunk_short_circuits_when_rate_limited():
         15, 60, 30, "",                  # min/max/ideal dur, discovery_prompt
         chunk_idx=2, n_total=6,
     )
-    assert out == []
+    assert out is None  # retryable skip — distinguishable from a ran-but-empty []
     assert called["n"] == 0  # Replicate never invoked — short-circuited at the top
+
+
+def test_coarse_pass_with_resume_recovers_rate_limited_chunks():
+    """A chunk that 429s on the first (concurrent) wave is resumed sequentially
+    and succeeds, so no video span is silently dropped."""
+    disc = ReplicateDiscoveryV3(api_key="x")
+    disc._rate_limited = threading.Event()
+    disc.rate_limit_backoff_s = 0.0   # don't actually sleep in the test
+    disc.rate_limit_retries = 2
+    disc.chunk_workers = 3
+
+    seen = {}
+    _lock = threading.Lock()
+    def fake_run(args):
+        with _lock:
+            seen[args] = seen.get(args, 0) + 1
+            n = seen[args]
+        return None if n == 1 else [f"cand-{args}"]   # rate-limited once, then succeeds
+
+    out = disc._coarse_pass_with_resume(["a", "b", "c"], fake_run, n_to_process=3)
+    assert sorted(out) == ["cand-a", "cand-b", "cand-c"]   # every span recovered
+    assert all(v == 2 for v in seen.values())              # each tried twice (wave0 + resume)
+    assert not disc._rate_limited.is_set()                 # breaker cleared after full recovery
+
+
+def test_coarse_pass_with_resume_gives_up_after_max_retries():
+    """If chunks keep getting rate-limited, the resume loop is bounded and leaves
+    the breaker tripped so the refine/keyframe passes skip too."""
+    disc = ReplicateDiscoveryV3(api_key="x")
+    disc._rate_limited = threading.Event()
+    disc.rate_limit_backoff_s = 0.0
+    disc.rate_limit_retries = 2
+
+    attempts = {"n": 0}
+    _lock = threading.Lock()
+    def always_limited(args):
+        with _lock:
+            attempts["n"] += 1
+        return None
+
+    out = disc._coarse_pass_with_resume(["a", "b"], always_limited, n_to_process=2)
+    assert out == []                       # nothing recovered
+    assert disc._rate_limited.is_set()     # left tripped → downstream passes skip
+    assert attempts["n"] == 6              # wave0 (2) + 2 resume waves (2 each), then stop

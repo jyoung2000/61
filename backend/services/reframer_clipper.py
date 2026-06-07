@@ -109,6 +109,13 @@ class ClipperConfig:
     replicate_api_key: str = ""
     replicate_model: str = "lucataco/videollama3-7b"
     replicate_enabled: bool = True
+    # Coarse-pass rate-limit resilience (see ReplicateDiscoveryV3): on a 429 the
+    # tripped chunks resume SEQUENTIALLY after a backoff instead of abandoning the
+    # rest of the video. retries=0 restores the old give-up behavior; workers=1
+    # goes sequential from the start (gentlest on a low Replicate tier).
+    replicate_chunk_workers: int = 3
+    replicate_rate_limit_retries: int = 2
+    replicate_rate_limit_backoff_s: float = 20.0
 
     def save(self, path: str):
         with open(path, 'w') as f:
@@ -998,6 +1005,9 @@ class ReplicateDiscoveryV3:
         adaptive_chunks: bool = True,
         chunk_min_s: int = 120,
         chunk_max_s: int = 900,
+        chunk_workers: int = 3,
+        rate_limit_retries: int = 2,
+        rate_limit_backoff_s: float = 20.0,
     ):
         self.api_key = api_key
         self.model_id = model_id
@@ -1010,6 +1020,13 @@ class ReplicateDiscoveryV3:
         self.adaptive_chunks = bool(adaptive_chunks)
         self.chunk_min_s = max(30, int(chunk_min_s))
         self.chunk_max_s = max(self.chunk_min_s, int(chunk_max_s))
+        # Coarse-pass rate-limit resilience: the first wave runs at
+        # ``chunk_workers`` concurrency, then any chunk Replicate 429'd is resumed
+        # SEQUENTIALLY after a growing backoff, up to ``rate_limit_retries`` times
+        # (retries=0 restores the old give-up-immediately behavior).
+        self.chunk_workers = max(1, int(chunk_workers))
+        self.rate_limit_retries = max(0, int(rate_limit_retries))
+        self.rate_limit_backoff_s = max(0.0, float(rate_limit_backoff_s))
 
     def is_available(self) -> bool:
         return bool(self.api_key and self.api_key.strip())
@@ -1072,14 +1089,12 @@ class ReplicateDiscoveryV3:
             n_to_process, len(chunks), self.model_id,
         )
 
-        # ── Step 3: coarse pass (parallel — chunks are independent) ──
-        # Cap at 3 workers: Replicate queues requests server-side, so more
-        # than 3 simultaneous uploads rarely helps and risks rate-limiting.
-        _MAX_CHUNK_WORKERS = 3
-        all_candidates: List[ClipCandidate] = []
-        _coarse_lock = threading.Lock()
-        _coarse_done = [0]
-
+        # ── Step 3: coarse pass ──
+        # The first wave runs chunks concurrently (fast on healthy accounts). On
+        # a Replicate 429 the tripped chunks are RESUMED sequentially after a
+        # backoff (see _coarse_pass_with_resume) instead of abandoning the rest
+        # of the video — so a low-tier / rate-limited account still gets
+        # full-video VLM coverage rather than only the first chunk or two.
         def _dispatch_chunk(args):
             idx, chunk_idx, start_s, end_s, sig_score = args
             return self._coarse_pass_chunk(
@@ -1099,19 +1114,8 @@ class ReplicateDiscoveryV3:
         if on_progress:
             on_progress(0.0)
 
-        with _cf.ThreadPoolExecutor(max_workers=min(n_to_process, _MAX_CHUNK_WORKERS)) as _executor:
-            _futures = {_executor.submit(_dispatch_chunk, args): args for args in chunk_args}
-            for _fut in _cf.as_completed(_futures):
-                try:
-                    _chunk_candidates = _fut.result()
-                    all_candidates.extend(_chunk_candidates)
-                except Exception as _e:
-                    logger.warning("VideoLLaMA3-V3: chunk dispatch raised: %s", _e)
-                with _coarse_lock:
-                    _coarse_done[0] += 1
-                    _done = _coarse_done[0]
-                if on_progress:
-                    on_progress((_done / max(1, n_to_process)) * 0.75)
+        all_candidates: List[ClipCandidate] = self._coarse_pass_with_resume(
+            chunk_args, _dispatch_chunk, n_to_process, on_progress)
 
         coarse_count = len(all_candidates)
 
@@ -1378,10 +1382,11 @@ class ReplicateDiscoveryV3:
         # (no fps probe, no upload, no Replicate call) and fall back to signals.
         if getattr(self, "_rate_limited", None) is not None and self._rate_limited.is_set():
             logger.info(
-                "VideoLLaMA3-V3: coarse pass chunk %d/%d skipped (Replicate rate-limited)",
+                "VideoLLaMA3-V3: coarse pass chunk %d/%d skipped (Replicate rate-limited) "
+                "— will resume after a backoff",
                 chunk_idx, n_total,
             )
-            return []
+            return None
         chunk_path = None
         chunk_fps = self._compute_chunk_fps(signal_timeline, start_s, end_s)
         t_start = _time.time()
@@ -1444,15 +1449,14 @@ class ReplicateDiscoveryV3:
                     self._rate_limited.set()
                     logger.warning(
                         "VideoLLaMA3-V3: Replicate rate-limited (429) on chunk %d/%d%s — "
-                        "skipping remaining chunks and the refine/keyframe passes; "
-                        "falling back to signal-based clips.",
+                        "remaining chunks will resume sequentially after a backoff.",
                         chunk_idx, n_total, timeline_suffix,
                     )
-            else:
-                logger.warning(
-                    "VideoLLaMA3-V3: coarse pass chunk %d/%d%s failed: %s",
-                    chunk_idx, n_total, timeline_suffix, e,
-                )
+                return None  # retryable — resumed by _coarse_pass_with_resume
+            logger.warning(
+                "VideoLLaMA3-V3: coarse pass chunk %d/%d%s failed: %s",
+                chunk_idx, n_total, timeline_suffix, e,
+            )
             return []
         finally:
             if chunk_path and os.path.exists(chunk_path):
@@ -1460,6 +1464,80 @@ class ReplicateDiscoveryV3:
                     os.remove(chunk_path)
                 except OSError:
                     pass
+
+    def _coarse_pass_with_resume(self, chunk_args, run_chunk, n_to_process,
+                                 on_progress=None):
+        """Run coarse-pass chunks with Replicate rate-limit resilience.
+
+        ``run_chunk(args)`` returns a list of candidates, or ``None`` when the
+        chunk was rate-limited / skipped (retryable). The first wave runs
+        concurrently (``self.chunk_workers``); any chunk that comes back ``None``
+        is RESUMED in up to ``self.rate_limit_retries`` follow-up waves that run
+        SEQUENTIALLY (1 worker) after a growing backoff, clearing the circuit
+        breaker each round — so a low-tier account still covers the whole video
+        instead of abandoning most of it on the first 429. Returns the flat
+        candidate list. Pure orchestration (no Replicate/video I/O of its own),
+        so it's unit-testable with a fake ``run_chunk``."""
+        all_candidates: list = []
+        _done = [0]
+        _lock = threading.Lock()
+
+        def _wave(args_list, workers):
+            skipped = []
+            if not args_list:
+                return skipped
+            with _cf.ThreadPoolExecutor(
+                    max_workers=max(1, min(len(args_list), workers))) as _ex:
+                _futs = {_ex.submit(run_chunk, a): a for a in args_list}
+                for _fut in _cf.as_completed(_futs):
+                    try:
+                        _res = _fut.result()
+                    except Exception as _e:
+                        logger.warning("VideoLLaMA3-V3: chunk dispatch raised: %s", _e)
+                        _res = []
+                    if _res is None:           # rate-limited / skipped → retry later
+                        skipped.append(_futs[_fut])
+                        continue
+                    all_candidates.extend(_res)
+                    with _lock:
+                        _done[0] += 1
+                        _d = _done[0]
+                    if on_progress:
+                        on_progress((min(_d, n_to_process) / max(1, n_to_process)) * 0.75)
+            return skipped
+
+        pending = _wave(chunk_args, max(1, int(getattr(self, "chunk_workers", 3))))
+        _retries = max(0, int(getattr(self, "rate_limit_retries", 0)))
+        _backoff_base = max(0.0, float(getattr(self, "rate_limit_backoff_s", 0.0)))
+        _attempt = 0
+        while pending and _attempt < _retries:
+            _attempt += 1
+            _backoff = _backoff_base * _attempt
+            logger.info(
+                "VideoLLaMA3-V3: Replicate rate-limited — backing off %.0fs, then "
+                "resuming %d chunk(s) sequentially (resume %d/%d).",
+                _backoff, len(pending), _attempt, _retries,
+            )
+            if getattr(self, "_rate_limited", None) is not None:
+                self._rate_limited.clear()      # let the resumed chunks actually run
+            if _backoff > 0:
+                _time.sleep(_backoff)
+            pending = _wave(pending, 1)          # sequential resume avoids re-tripping
+
+        if getattr(self, "_rate_limited", None) is not None:
+            # Leave the breaker tripped only if we truly gave up (so the
+            # refine/keyframe passes still skip); otherwise clear it.
+            if pending:
+                self._rate_limited.set()
+            else:
+                self._rate_limited.clear()
+        if pending:
+            logger.warning(
+                "VideoLLaMA3-V3: %d chunk(s) still rate-limited after %d resume "
+                "attempt(s) — those spans fall back to signal-based clips.",
+                len(pending), _retries,
+            )
+        return all_candidates
 
     def _build_segment_prompt(
         self, start_s, end_s, transcript_slice, audio_annotation,
@@ -3106,6 +3184,9 @@ class ClipExtractor:
                     adaptive_chunks=getattr(_app_settings, "VIDEOLLAMA3_ADAPTIVE_CHUNKS", True),
                     chunk_min_s=getattr(_app_settings, "VIDEOLLAMA3_CHUNK_MIN_S", 120),
                     chunk_max_s=getattr(_app_settings, "VIDEOLLAMA3_CHUNK_MAX_S", 900),
+                    chunk_workers=getattr(self.config, "replicate_chunk_workers", 3),
+                    rate_limit_retries=getattr(self.config, "replicate_rate_limit_retries", 2),
+                    rate_limit_backoff_s=getattr(self.config, "replicate_rate_limit_backoff_s", 20.0),
                 )
             else:
                 rep = ReplicateDiscovery(
