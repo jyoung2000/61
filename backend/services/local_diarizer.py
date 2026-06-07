@@ -38,6 +38,16 @@ logger = logging.getLogger("clipai.local_diarizer")
 _MIN_EMBED_SEC = 0.5
 _RESOLUTION_MS = 200
 _MAX_SPEAKERS = 8
+# Cues whose Whisper ``no_speech_prob`` exceeds this are almost certainly music /
+# singing, not speech (reuses the audio-event convention used elsewhere in the
+# perceiver). They carry no clean speaker identity, so they're excluded from
+# diarization — otherwise OP/ED vocals and instrumental beds embed as their own
+# "speakers" and inflate the count. Cues without the field are kept.
+_DIARIZE_MAX_NO_SPEECH = 0.6
+# A lone-cue cluster is almost always a noise/music outlier rather than a real
+# speaker; clusters smaller than this are folded into the nearest real one.
+_MIN_CLUSTER_CUES = 2
+_MUSIC_MARK = "♪"  # ♪ — text marker for music-only spans
 
 
 # ── Pure helpers (unit-testable without speechbrain / torch) ───────────────
@@ -54,11 +64,42 @@ def _relabel_first_appearance(labels: List[int]) -> List[int]:
     return out
 
 
+def _absorb_singleton_clusters(X, labels: List[int],
+                               min_cues: int = _MIN_CLUSTER_CUES) -> List[int]:
+    """Reassign cues in clusters smaller than ``min_cues`` to the nearest larger
+    cluster (by centroid cosine similarity). A music/noise outlier that lands in
+    its own one-cue cluster is almost never a real speaker; folding it in keeps
+    the speaker count honest. ``X`` is the L2-normalised embedding matrix. Pure
+    numpy — directly testable."""
+    import numpy as np
+    from collections import Counter
+
+    labels = list(labels)
+    counts = Counter(labels)
+    small = {lab for lab, c in counts.items() if c < min_cues}
+    big = [lab for lab, c in counts.items() if c >= min_cues]
+    if not small or not big:
+        return labels  # nothing to fold, or no larger cluster to fold into
+
+    Xn = np.asarray(X, dtype=np.float64)
+    centroids = {}
+    for lab in big:
+        idx = [i for i, l in enumerate(labels) if l == lab]
+        c = Xn[idx].mean(axis=0)
+        centroids[lab] = c / (np.linalg.norm(c) or 1.0)
+    for i, lab in enumerate(labels):
+        if lab in small:
+            xn = Xn[i] / (np.linalg.norm(Xn[i]) or 1.0)
+            labels[i] = max(big, key=lambda L: float(xn @ centroids[L]))
+    return labels
+
+
 def _cluster_embeddings(
     embeddings,
     num_speakers: Optional[int] = None,
     threshold: float = 0.70,
     max_speakers: int = _MAX_SPEAKERS,
+    min_cues: int = _MIN_CLUSTER_CUES,
 ) -> List[int]:
     """Cluster L2-normalised embeddings by cosine distance.
 
@@ -92,6 +133,9 @@ def _cluster_embeddings(
         labels = fcluster(Z, t=float(threshold), criterion="distance")
         if int(labels.max()) > max_speakers:
             labels = fcluster(Z, t=max_speakers, criterion="maxclust")
+        # Fold lone-cue clusters (noise / music outliers) into the nearest real
+        # speaker so they don't surface as phantom speakers.
+        labels = _absorb_singleton_clusters(X, [int(x) for x in labels], min_cues)
     return _relabel_first_appearance([int(x) for x in labels])
 
 
@@ -111,19 +155,39 @@ def _build_timeline(spans: List[tuple], labels: List[int],
     return timeline
 
 
-def _coerce_spans(speech_segments) -> List[tuple]:
+def _coerce_spans(speech_segments, max_no_speech: float = 1.0) -> List[tuple]:
     """Pull ``(start_s, end_s)`` from reframer/transcript segments (dict or
-    object), dropping zero/negative-length cues."""
+    object), dropping zero/negative-length cues.
+
+    Also drops cues that aren't clean speech so they never pollute speaker
+    clustering: known hallucinations, music markers / empty text, and (when
+    ``max_no_speech`` < 1.0) cues whose ``no_speech_prob`` exceeds it — the
+    sung/instrumental cues that otherwise embed as phantom "speakers". Cues
+    missing a given field are kept (backward-compatible)."""
     spans: List[tuple] = []
     for s in (speech_segments or []):
         if isinstance(s, dict):
             a = s.get("start", s.get("start_sec"))
             b = s.get("end", s.get("end_sec"))
+            text = s.get("text")
+            is_hall = s.get("is_hallucination")
+            nsp = s.get("no_speech_prob")
         else:
             a = getattr(s, "start", getattr(s, "start_sec", None))
             b = getattr(s, "end", getattr(s, "end_sec", None))
+            text = getattr(s, "text", None)
+            is_hall = getattr(s, "is_hallucination", None)
+            nsp = getattr(s, "no_speech_prob", None)
         if a is None or b is None:
             continue
+        if is_hall:
+            continue
+        if nsp is not None and float(nsp) > max_no_speech:
+            continue  # likely music / singing — no clean speaker identity
+        if text is not None:
+            t = str(text).strip()
+            if not t or _MUSIC_MARK in t:
+                continue
         a, b = float(a), float(b)
         if b > a:
             spans.append((a, b))
@@ -213,7 +277,7 @@ class LocalEmbeddingDiarizer:
                 duration_ms: int = 0, num_speakers: Optional[int] = None) -> Dict[int, str]:
         """Return a ``{time_ms: "SPEAKER_xx"}`` timeline (200 ms bins), or ``{}``
         when diarization can't run (caller falls back to the visual heuristic)."""
-        spans = _coerce_spans(speech_segments)
+        spans = _coerce_spans(speech_segments, max_no_speech=_DIARIZE_MAX_NO_SPEECH)
         if len(spans) < 2:
             # 0/1 speech cue → nothing to separate; let the caller's fallback
             # (or the single-speaker default) handle it.

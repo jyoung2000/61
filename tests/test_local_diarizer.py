@@ -76,3 +76,37 @@ def test_coerce_spans_handles_dicts_objects_and_drops_invalid():
     ]
     spans = ld._coerce_spans(segs)
     assert spans == [(0.0, 1.0), (1.0, 2.0), (2.0, 3.0)]
+
+
+def test_coerce_spans_drops_non_speech_cues():
+    # Sung / music / hallucination / empty cues must not reach the clusterer,
+    # or each becomes a phantom "speaker". Cues missing a field are kept.
+    segs = [
+        {"start": 0.0, "end": 1.0, "text": "Hello", "no_speech_prob": 0.05},
+        {"start": 1.0, "end": 2.0, "text": "la la la", "no_speech_prob": 0.85},   # sung → drop
+        {"start": 2.0, "end": 3.0, "text": "[♪ music ♪]", "no_speech_prob": 0.1},  # marker → drop
+        {"start": 3.0, "end": 4.0, "text": "   ", "no_speech_prob": 0.0},          # empty → drop
+        {"start": 4.0, "end": 5.0, "text": "World", "is_hallucination": True},     # hallu → drop
+        {"start": 5.0, "end": 6.0, "text": "Keep me", "no_speech_prob": 0.2},
+    ]
+    spans = ld._coerce_spans(segs, max_no_speech=0.6)
+    assert spans == [(0.0, 1.0), (5.0, 6.0)]
+    # Default (1.0) keeps everything no_speech-wise (back-compat), but still
+    # drops the unambiguous non-speech (marker / empty / hallucination).
+    assert ld._coerce_spans(segs) == [(0.0, 1.0), (1.0, 2.0), (5.0, 6.0)]
+
+
+def test_cluster_absorbs_singleton_outlier():
+    # 3 'a' cues + 3 'b' cues + 1 off-axis singleton nearer 'a'. The singleton
+    # is a noise/music outlier, not a 9th-speaker — it must fold into 'a'.
+    a = np.array([1.0, 0.0, 0.0])
+    b = np.array([0.0, 1.0, 0.0])
+    c = np.array([0.3, 0.2, 0.93])   # its own cluster at t=0.4, closer to a than b
+    embs = [a, a, a, b, b, b, c]
+    labels = ld._cluster_embeddings(embs, threshold=0.4)
+    assert len(labels) == 7
+    assert len(set(labels)) == 2          # singleton absorbed, not a phantom speaker
+    assert labels[6] == labels[0]         # c folded into the 'a' cluster (nearest)
+    assert labels[0] != labels[3]         # a and b stay distinct
+    # An explicit speaker-count hint bypasses absorption (honor the request).
+    assert len(set(ld._cluster_embeddings(embs, num_speakers=3))) == 3
