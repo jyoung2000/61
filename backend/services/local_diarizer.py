@@ -250,15 +250,32 @@ class LocalEmbeddingDiarizer:
             from speechbrain.pretrained import EncoderClassifier  # type: ignore
         savedir = self._savedir()
         os.makedirs(savedir, exist_ok=True)
-        logger.info("Local diarizer: loading SpeechBrain ECAPA (%s) on %s (one-time fetch → %s)",
-                    self.model_id, self.device, savedir)
-        model = EncoderClassifier.from_hparams(
-            source=self.model_id,
-            savedir=savedir,
-            run_opts={"device": self.device},
-        )
-        LocalEmbeddingDiarizer._model = model
-        return model
+        # Try the requested device first; on a CUDA failure (OOM / contention /
+        # no driver) fall back to CPU. This makes LOCAL_DIARIZER_DEVICE=cuda
+        # risk-free: ECAPA is tiny (~80 MB) and the GPU is free once Whisper has
+        # released it, so on GPU it embeds the cues in seconds instead of the
+        # minutes CPU takes — and if the GPU is unavailable it runs on CPU
+        # exactly as before, never losing diarization.
+        _devices = [self.device] + (["cpu"] if self.device != "cpu" else [])
+        _last_err = None
+        for _dev in _devices:
+            try:
+                logger.info(
+                    "Local diarizer: loading SpeechBrain ECAPA (%s) on %s "
+                    "(one-time fetch → %s)", self.model_id, _dev, savedir)
+                model = EncoderClassifier.from_hparams(
+                    source=self.model_id, savedir=savedir,
+                    run_opts={"device": _dev},
+                )
+                self.device = _dev
+                LocalEmbeddingDiarizer._model = model
+                return model
+            except Exception as e:
+                _last_err = e
+                logger.warning(
+                    "Local diarizer: load on %s failed (%s)%s", _dev, e,
+                    " — falling back to CPU" if _dev != "cpu" else "")
+        raise _last_err
 
     def _extract_audio(self, media_path: str) -> Optional[str]:
         audio_path = os.path.join(tempfile.gettempdir(), "clipai_diarize_audio.wav")
