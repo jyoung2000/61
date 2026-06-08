@@ -13,7 +13,7 @@ import asyncio
 import pytest
 
 import backend.database as db
-from backend.models import JobResult, TranscriptSegment, VideoSummary
+from backend.models import ClipCandidate, JobResult, TranscriptSegment, VideoSummary
 
 
 def _run(coro):
@@ -36,9 +36,19 @@ def _seg(text, a=0.0, b=1.0):
     return TranscriptSegment(text=text, start=a, end=b, speaker="Speaker 1")
 
 
-def _job(job_id="j1", status="complete", translated=None):
+def _clip(cid=1):
+    return ClipCandidate(
+        id=cid, title="Clip", start_time=0.0, end_time=5.0, duration=5.0,
+        viral_score=80, viral_score_reasoning="r", clip_type="moment",
+        platform="tiktok", suggested_caption="cap", hook_text="hook",
+        why_this_works="why",
+    )
+
+
+def _job(job_id="j1", status="complete", translated=None, clips=None):
     return JobResult(job_id=job_id, filename="video.mp4", file_path="/v.mp4",
-                     status=status, translated_transcript=translated or [])
+                     status=status, translated_transcript=translated or [],
+                     clips=clips or [])
 
 
 def test_save_job_does_not_wipe_translated(tmp_jobs):
@@ -89,6 +99,27 @@ def test_save_job_does_not_revert_terminal_status(tmp_jobs):
     reloaded = _run(db.load_job("j1"))
     assert db._status_value(reloaded.status) == "complete"
     assert len(reloaded.translated_transcript) == 1
+
+
+def test_save_job_does_not_wipe_clips_on_terminal_revert(tmp_jobs):
+    # Production bug: finalize persists clips, then a late 'detecting_clips' relay
+    # save (a stale pre-clip-extraction snapshot, clips=[]) reverts toward a
+    # non-terminal status and wipes clips 5->0, so the UI shows "No clips
+    # detected". The terminal-revert guard must also restore the clips.
+    _run(db.save_job(_job(status="complete", clips=[_clip(1), _clip(2)])))
+    _run(db.save_job(_job(status="detecting_clips", clips=[])))   # stale relay snapshot
+    reloaded = _run(db.load_job("j1"))
+    assert db._status_value(reloaded.status) == "complete"        # status kept
+    assert len(reloaded.clips) == 2                               # clips kept
+
+
+def test_clip_delete_on_complete_job_is_allowed(tmp_jobs):
+    # A real clip delete keeps the status terminal and reduces clips (possibly to
+    # 0). That is NOT a stale revert, so the guard must not block it.
+    _run(db.save_job(_job(status="complete", clips=[_clip(1)])))
+    _run(db.save_job(_job(status="complete", clips=[])))          # delete the last clip
+    reloaded = _run(db.load_job("j1"))
+    assert len(reloaded.clips) == 0                               # delete honored
 
 
 def test_legit_retranslation_overwrites(tmp_jobs):

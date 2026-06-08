@@ -111,6 +111,18 @@ async def _save_job_unlocked(job: JobResult, *, _preserve_terminal_status: bool 
                     data["status"] = _cur.get("status")
                     if "progress" in _cur:
                         data["progress"] = _cur.get("progress")
+                    # A stale pre-terminal snapshot also carries stale ``clips``
+                    # (often 0 — captured before clip extraction finished). The
+                    # finalize already persisted the real clips, so a late
+                    # ``detecting_clips`` relay save must not wipe them back to 0.
+                    # Tied to the terminal-revert signal so a legitimate clip
+                    # delete (which keeps the status terminal) is unaffected.
+                    if (_cur.get("clips") or []) and not (data.get("clips") or []):
+                        data["clips"] = _cur["clips"]
+                        logger.warning(
+                            "Save guard [%s]: kept %d existing clip(s) — incoming save "
+                            "reverted a terminal status (stale snapshot).",
+                            job.job_id, len(_cur["clips"]))
                     logger.warning(
                         "Save guard [%s]: kept terminal status '%s' — incoming save "
                         "tried to revert it to '%s' (stale snapshot).",
