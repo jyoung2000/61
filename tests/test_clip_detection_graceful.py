@@ -9,10 +9,43 @@ reframer_clipper imports cleanly (its heavy deps are lazy), so no stubbing.
 """
 import threading
 
+from types import SimpleNamespace
+
 from backend.services.reframer_clipper import (
     _is_rate_limited_error,
+    _select_clip_pool,
     ReplicateDiscoveryV3,
 )
+
+
+def _cand(i, verdict, score):
+    return SimpleNamespace(id=i, judge_verdict=verdict, composite_score=score)
+
+
+def test_clip_pool_backfills_when_judge_keeps_few():
+    # The judge over-skips (2 keep, 3 skip) but we target 4 → backfill with the
+    # best-scored skipped moments so the diversity pass has spread to work with.
+    cands = [_cand(1, "keep", 0.9), _cand(2, "keep", 0.8),
+             _cand(3, "skip", 0.7), _cand(4, "skip", 0.6), _cand(5, "skip", 0.5)]
+    pool = _select_clip_pool(cands, eff_max=4)
+    ids = [c.id for c in pool]
+    assert 1 in ids and 2 in ids                 # judge-approved always kept
+    assert 3 in ids and 4 in ids and 5 in ids    # skipped backfilled toward target
+    assert ids[0] in (1, 2) and ids[1] in (1, 2)  # keepers come first
+
+
+def test_clip_pool_no_backfill_when_enough_keepers():
+    # 5 keepers >= target → don't pull in a high-scoring skip (respect the judge).
+    cands = [_cand(i, "keep", 1.0 / i) for i in range(1, 6)] + [_cand(9, "skip", 0.99)]
+    pool = _select_clip_pool(cands, eff_max=3)
+    assert all(c.judge_verdict == "keep" for c in pool)
+    assert 9 not in [c.id for c in pool]
+
+
+def test_clip_pool_all_skipped_falls_back_to_all():
+    cands = [_cand(i, "skip", 0.5) for i in range(1, 4)]
+    pool = _select_clip_pool(cands, eff_max=12)
+    assert len(pool) == 3
 
 
 def test_is_rate_limited_error_detects_429_and_throttle():

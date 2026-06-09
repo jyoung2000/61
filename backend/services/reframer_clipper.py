@@ -2883,6 +2883,28 @@ Respond ONLY with JSON:
 {{"hook":N,"payoff":N,"retention":N,"shareability":N,"standalone":N,"verdict":"...","trim_suggestion":"...","title":"...","explanation":"..."}}"""
 
 
+def _select_clip_pool(candidates, eff_max):
+    """Build the candidate pool for the final diversity selection.
+
+    Judge-approved clips (verdict != 'skip') come first. When the judge keeps
+    fewer than ``eff_max``, backfill the pool with the best-scored *skipped*
+    candidates so the diversity pass can still spread real moments across the
+    whole video instead of returning a few bunched in one region. The judge
+    blends its verdict into ``composite_score`` (keepers score higher), so the
+    score-sorted selection downstream keeps the strongest clips on top — this
+    only fills the remaining slots. If the judge skipped everything, fall back
+    to all candidates. Pure (no video / FFmpeg) so it's unit-testable."""
+    keepers = [c for c in candidates if getattr(c, "judge_verdict", "") != "skip"]
+    if not keepers:
+        return list(candidates)
+    if len(keepers) < eff_max:
+        _skipped = sorted(
+            (c for c in candidates if getattr(c, "judge_verdict", "") == "skip"),
+            key=lambda c: getattr(c, "composite_score", 0.0), reverse=True)
+        keepers = keepers + _skipped[: max(0, eff_max * 3 - len(keepers))]
+    return keepers
+
+
 def _parse_judge_response(text: str) -> dict:
     """Parse cloud judge JSON response."""
     text = text.strip()
@@ -3530,13 +3552,14 @@ class ClipExtractor:
     def _final_rank_and_export(self, candidates: List[ClipCandidate],
                                on_progress: Callable = None) -> List[ClipCandidate]:
         """Final ranking and FFmpeg clip extraction."""
-        # Remove judge-skipped candidates
-        keepers = [c for c in candidates if c.judge_verdict != 'skip']
-        if not keepers:
-            keepers = candidates
-
         video_dur = _get_video_duration(self.video_path)
         eff_max = self.config.effective_max_clips(video_dur)
+
+        # Judge-approved clips first, backfilled toward the target with the
+        # best-scored skipped moments when the judge kept too few (it's often
+        # over-strict on visual/action beats), so we get MORE clips spread
+        # across the episode rather than a handful bunched together.
+        keepers = _select_clip_pool(candidates, eff_max)
 
         # Final diversity selection — spread clips across timeline
         keepers.sort(key=lambda c: c.composite_score, reverse=True)
