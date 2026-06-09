@@ -2404,6 +2404,14 @@ async def _run_analysis_inner(job_id: str):
     # Record pipeline start time for ETA and total duration tracking
     _pipeline_start = _time.monotonic()
     _pipeline_start_iso = datetime.now(timezone.utc).isoformat()
+    # Scope the process-wide OpenRouter token tally to THIS job so the cost
+    # estimate captures every LLM call (translation, summary, SEO, clip judge),
+    # not just the orchestrator's own providers. Jobs run sequentially here.
+    try:
+        from backend.services.providers.openrouter_provider import OpenRouterProvider
+        OpenRouterProvider.reset_session()
+    except Exception:
+        pass
     await database.update_job_status(job_id, analysis_started_at=_pipeline_start_iso)
 
     # Create a cancel checker bound to this job
@@ -3897,10 +3905,18 @@ async def _run_analysis_inner(job_id: str):
     _total_cost_usd = 0.0
     _cost_breakdown = {}
     try:
-        _orch_cost = float(orchestrator.estimate_cost() or 0.0)
-        _total_cost_usd += _orch_cost
-        if _orch_cost > 0:
-            _cost_breakdown["llm"] = round(_orch_cost, 4)
+        # Prefer the process-wide OpenRouter session tally for THIS job — it
+        # covers translation + summary + SEO + the clip judge, which the
+        # orchestrator's own per-provider estimate misses (that's why the cost
+        # used to read as Replicate-only). Fall back to the orchestrator estimate
+        # for non-OpenRouter setups.
+        from backend.services.providers.openrouter_provider import OpenRouterProvider
+        _llm_cost = float(OpenRouterProvider.session_cost() or 0.0)
+        if _llm_cost <= 0:
+            _llm_cost = float(orchestrator.estimate_cost() or 0.0)
+        _total_cost_usd += _llm_cost
+        if _llm_cost > 0:
+            _cost_breakdown["llm"] = round(_llm_cost, 4)
     except Exception:
         pass
     try:

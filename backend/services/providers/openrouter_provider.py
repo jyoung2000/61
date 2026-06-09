@@ -364,6 +364,27 @@ class _RateLimiter:
 class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
     """Proxies to various models via OpenRouter's unified API."""
 
+    # Process-wide token tally so a job's reported cost can include EVERY
+    # OpenRouter call (translation, summary, SEO, the clip judge) — not just the
+    # orchestrator's own providers, which is why estimated_cost_usd previously
+    # showed only the Replicate figure. Reset at pipeline start; the box runs
+    # jobs sequentially, so this scopes cleanly to one job.
+    _session_tokens = 0
+    _SESSION_RATE_PER_1K = 0.0002   # flash-lite blended input+output ≈ $0.20/M
+
+    @classmethod
+    def reset_session(cls):
+        cls._session_tokens = 0
+
+    @classmethod
+    def session_tokens(cls) -> int:
+        return cls._session_tokens
+
+    @classmethod
+    def session_cost(cls) -> float:
+        """Rough USD for all OpenRouter tokens since the last reset."""
+        return round((cls._session_tokens / 1000.0) * cls._SESSION_RATE_PER_1K, 6)
+
     # Fallback context budgets (in chars, ~4 chars/token) when the model
     # is not found in the OpenRouter cache.  Pattern-matched against model ID.
     _FALLBACK_CONTEXT_BUDGET = {
@@ -709,6 +730,7 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
             logger.info("OpenRouter call to %s completed in %.1fs", model, elapsed)
             if response.usage:
                 self._total_tokens += response.usage.total_tokens
+                OpenRouterProvider._session_tokens += response.usage.total_tokens
             if not response.choices:
                 logger.warning("OpenRouter %s returned empty/null choices", model)
                 raise ProviderError(f"OpenRouter empty response ({model}): no choices returned")
@@ -743,6 +765,7 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                     )
                     if response.usage:
                         self._total_tokens += response.usage.total_tokens
+                        OpenRouterProvider._session_tokens += response.usage.total_tokens
                     if not response.choices:
                         raise ProviderError(f"OpenRouter empty response after retry ({model})")
                     return response.choices[0].message.content or ""
