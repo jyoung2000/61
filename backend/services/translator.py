@@ -543,6 +543,25 @@ def _apply_batch_translations(
     return result
 
 
+def _idiomatic_rule() -> str:
+    """Extra directive pushing the model toward natural, idiomatic target-language
+    phrasing (toggle: ``TRANSLATION_IDIOMATIC``). Returns '' when disabled.
+
+    Kept placeholder-free so it survives ``TRANSLATION_PROMPT.format()`` as a
+    literal value, and pairs with the existing 'preserve meaning / no additions'
+    rules so 'idiomatic' never licenses embellishment."""
+    if not bool(getattr(settings, "TRANSLATION_IDIOMATIC", True)):
+        return ""
+    return (
+        "\nIDIOMATIC PHRASING (top priority on wording): render each line the way "
+        "a professional dub / localization writer would actually say it in the "
+        "target language. Recast the source sentence structure into natural, "
+        "idiomatic phrasing — never a word-order calque of the source. Preserve "
+        "the exact meaning and every piece of information; do NOT add, omit, "
+        "soften, or embellish content. Natural wording, faithful substance."
+    )
+
+
 def _format_glossary_block(glossary: dict | None) -> str:
     """Format a per-video glossary as a prompt block."""
     if not glossary or not isinstance(glossary, dict):
@@ -603,7 +622,7 @@ async def translate_segments(
         batch_size = min(batch_size, 10)
         logger.info("Using smaller batch size (%d) for CJK translation", batch_size)
 
-    extra_rules = _get_pair_rules(source_language, target_language)
+    extra_rules = _get_pair_rules(source_language, target_language) + _idiomatic_rule()
     if context_window is None:
         context_window = int(getattr(settings, "TRANSLATION_CONTEXT_WINDOW", 5))
     context_window = max(0, min(20, int(context_window)))

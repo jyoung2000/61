@@ -330,6 +330,10 @@ class Settings(BaseSettings):
     WHISPER_TRANSLATE_MIN_COVERAGE: float = 0.6
     TRANSLATION_CONTEXT_WINDOW: int = 5         # segments before/after for context
     TRANSLATION_GLOSSARY_ENABLED: bool = True   # per-video KNP glossary support
+    # Push the LLM translator toward natural, idiomatic English (dub/localization
+    # phrasing) instead of a structurally-literal rendering — while preserving
+    # the exact meaning. Set False to revert to the plain faithful style.
+    TRANSLATION_IDIOMATIC: bool = True
     GOOGLE_TRANSLATE_API_KEY: str = ""          # for Google Cloud Translation v3
     DEEPL_API_KEY: str = ""                     # for DeepL API
     # NMT model identifiers — downloaded on demand (NOT at startup).

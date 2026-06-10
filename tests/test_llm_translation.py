@@ -24,6 +24,16 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+def test_idiomatic_rule_toggle(monkeypatch):
+    from backend.services import translator
+    monkeypatch.setattr(translator.settings, "TRANSLATION_IDIOMATIC", True)
+    rule = translator._idiomatic_rule()
+    assert "idiomatic" in rule.lower()
+    assert "{" not in rule          # placeholder-free → survives TRANSLATION_PROMPT.format()
+    monkeypatch.setattr(translator.settings, "TRANSLATION_IDIOMATIC", False)
+    assert translator._idiomatic_rule() == ""
+
+
 class _Orch:
     """Minimal orchestrator stub: echoes back N English lines as a JSON array."""
 
