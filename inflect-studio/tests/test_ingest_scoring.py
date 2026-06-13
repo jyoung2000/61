@@ -128,3 +128,19 @@ def test_should_suggest_isolation():
     assert should_suggest_isolation(0.9, 0.5) is True
     # Clean, speech-heavy -> don't suggest.
     assert should_suggest_isolation(0.9, 0.05) is False
+
+
+# --------------------------------------------------------------------------- #
+# slice_seconds (pure clip extraction)
+# --------------------------------------------------------------------------- #
+def test_slice_seconds():
+    from inflect.ingest.source import slice_seconds
+
+    audio = _sine(200, 4.0)  # 4 s @ 24k
+    clip = slice_seconds(audio, SR, 1.0, 3.0)
+    assert len(clip) == 2 * SR
+    # Clamped to available range.
+    assert len(slice_seconds(audio, SR, 3.5, 99.0)) == int(0.5 * SR)
+    # Inverted / empty ranges return empty.
+    assert slice_seconds(audio, SR, 2.0, 1.0).size == 0
+    assert slice_seconds(audio, SR, 5.0, 6.0).size == 0
