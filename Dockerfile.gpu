@@ -36,7 +36,7 @@ ENV PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
 
 # Install system dependencies + VA-API support for Intel/AMD
 RUN apt-get update && apt-get install -y \
-    python3.11 python3.11-dev python3-pip python3.11-venv \
+    python3-pip \
     curl git build-essential pkg-config ca-certificates \
     fontconfig fonts-dejavu-core fonts-freefont-ttf fonts-liberation2 \
     unzip wget software-properties-common \

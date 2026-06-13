@@ -174,6 +174,13 @@ def _src(text, start, end, speaker="Speaker 1"):
     return {"text": text, "start": start, "end": end, "speaker": speaker}
 
 
+def _en(text):
+    """Map a known Japanese source cue to fixed English (non-CJK) text so a mock
+    translator's output passes the pipeline's final language-purity gate, which
+    rejects source-script output (prefixing the Japanese source would not)."""
+    return {"こんにちは": "Hello", "世界": "World"}.get(text, "line")
+
+
 def _install_pipeline(monkeypatch, db, *, engine="nllb"):
     async def _bcast(job_id, message):
         return None
@@ -225,11 +232,15 @@ def test_pipeline_uses_whisper_native_for_ja_en_and_skips_nmt(monkeypatch):
 def test_pipeline_falls_back_to_nmt_when_whisper_native_empty(monkeypatch):
     db = _FakeDB({"subtitle_language": "en", "language": "ja", "clips": [], "summary": None})
     _install_pipeline(monkeypatch, db)
+    # Skip the LLM branch so this test deterministically exercises the
+    # Whisper-native-vs-offline-NMT ordering it asserts.
+    monkeypatch.setattr(pipeline.settings, "TRANSLATION_PREFER_LLM", False, raising=False)
 
     nmt_calls = {"n": 0}
     async def _nmt(segs, **k):
         nmt_calls["n"] += 1
-        return [TranscriptSegment(text="NMT " + s.text, start=s.start, end=s.end,
+        # Non-CJK English so the pipeline's final purity gate accepts it.
+        return [TranscriptSegment(text="NMT " + _en(s.text), start=s.start, end=s.end,
                                   speaker=s.speaker) for s in segs]
     monkeypatch.setattr(translator, "translate_segments_with_fallback", _nmt)
     # Whisper-native unavailable → empty → must fall back to offline NMT.
@@ -257,6 +268,9 @@ def test_pipeline_skips_whisper_native_on_low_vram_and_uses_nmt(monkeypatch):
     _install_pipeline(monkeypatch, db)
     # Only ~2.6 GB free (the 4 GB-card case) — below the 4 GB gate.
     monkeypatch.setattr(pipeline, "_gpu_free_vram_gb", lambda: 2.6)
+    # Skip the LLM branch so this test deterministically exercises the low-VRAM
+    # Whisper-native skip → offline-NMT ordering it asserts.
+    monkeypatch.setattr(pipeline.settings, "TRANSLATION_PREFER_LLM", False, raising=False)
 
     whisper_calls = {"n": 0}
     def _wn(*a, **k):
@@ -267,7 +281,8 @@ def test_pipeline_skips_whisper_native_on_low_vram_and_uses_nmt(monkeypatch):
     nmt_calls = {"n": 0}
     async def _nmt(segs, **k):
         nmt_calls["n"] += 1
-        return [TranscriptSegment(text="NMT " + s.text, start=s.start, end=s.end,
+        # Non-CJK English so the pipeline's final purity gate accepts it.
+        return [TranscriptSegment(text="NMT " + _en(s.text), start=s.start, end=s.end,
                                   speaker=s.speaker) for s in segs]
     monkeypatch.setattr(translator, "translate_segments_with_fallback", _nmt)
 
@@ -422,7 +437,8 @@ def test_pipeline_rejects_sparse_whisper_native_and_uses_nmt(monkeypatch):
     nmt_calls = {"n": 0}
     async def _nmt(segs, **k):
         nmt_calls["n"] += 1
-        return [TranscriptSegment(text="NMT " + s.text, start=s.start, end=s.end,
+        # Non-CJK English so the pipeline's final purity gate accepts it.
+        return [TranscriptSegment(text="NMT " + _en(s.text), start=s.start, end=s.end,
                                   speaker=s.speaker) for s in segs]
     monkeypatch.setattr(translator, "translate_segments_with_fallback", _nmt)
 

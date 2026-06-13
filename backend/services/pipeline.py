@@ -389,16 +389,22 @@ def _timeline_coverage_s(segments) -> float:
     return total
 
 
-async def translate_offline(segments, source_lang, target_lang, *, video_path=None,
-                            glossary=None, orchestrator=None, status_callback=None,
-                            job_id=None, whisper_timeout=None, nmt_timeout=None):
-    """Offline-only translation — the AI never translates here.
+async def translate_subtitles(segments, source_lang, target_lang, *, video_path=None,
+                              glossary=None, orchestrator=None, status_callback=None,
+                              job_id=None, whisper_timeout=None, nmt_timeout=None):
+    """Translate subtitle segments — the shared translation entry point.
 
-    For non-English → English, prefer Whisper's native audio→English pass (when
-    ``video_path`` is available); otherwise, or when it yields nothing, use the
-    offline NMT engines (Opus-MT / NLLB). Returns ``(segments, engine)`` with
-    ``engine`` in ``{"whisper", "nmt"}``. Raises ``TranslationFailedError`` (from
-    the NMT layer) when offline translation can't complete.
+    Tries the editorial LLM first when one is configured and
+    ``TRANSLATION_PREFER_LLM`` is set (the default): it translates the source
+    text-to-text, 1:1 (every segment keeps its timing + speaker), rendering
+    every cue so it never leaves the source language behind. Then, for
+    non-English → English, Whisper's native audio→English pass (when
+    ``video_path`` is available); otherwise — or when an engine yields nothing /
+    still-source-language output — the offline NMT engines (Opus-MT / NLLB). Set
+    ``TRANSLATION_PREFER_LLM=False`` for a genuinely offline-only run
+    (Whisper-native / NMT only). Returns ``(segments, engine)`` with ``engine``
+    in ``{"llm", "whisper", "nmt"}``. Raises ``TranslationFailedError`` (from the
+    NMT layer) when the offline fallback can't complete.
 
     Single source of truth shared by the pipeline and the manual re-translate
     endpoint so they can't drift. When ``job_id`` is given, Whisper VRAM is
@@ -558,6 +564,11 @@ async def translate_offline(segments, source_lang, target_lang, *, video_path=No
     out = (await asyncio.wait_for(_nmt_coro, timeout=nmt_timeout)
            if nmt_timeout else await _nmt_coro)
     return out, "nmt"
+
+
+# Back-compat alias — historical name. This path is LLM-first now, not
+# offline-only.
+translate_offline = translate_subtitles
 
 
 def release_torch_gpu_memory():
@@ -1758,7 +1769,7 @@ async def _background_post_processing(
     # ── Subtitle translation, then polish in the target language ──
     if _will_translate:
         from backend.services.translator import (
-            translate_segments_with_fallback, SUPPORTED_LANGUAGES,
+            SUPPORTED_LANGUAGES,
             TranslationFailedError, TranslationRateLimitedError,
         )
         target_name = SUPPORTED_LANGUAGES.get(target_lang, target_lang)
@@ -1835,7 +1846,7 @@ async def _background_post_processing(
                 logger.warning("[%s] Source resegmentation skipped (%s)",
                                job_id, _src_seg_err)
         try:
-            # ── (a) Translate (OFFLINE only — the AI never translates) ──
+            # ── (a) Translate (LLM-first, then Whisper-native / offline NMT) ──
             logger.info("[%s] Translate START: %s → %s (%d segments)",
                         job_id, source_name, target_name, len(_trans_input))
             orchestrator.reset_circuit_breaker()
@@ -1851,15 +1862,17 @@ async def _background_post_processing(
                     "message": msg,
                 })
 
-            # ── (a) Translate via the shared OFFLINE router ──
-            # Whisper-native audio→English for →en (single-step, avoids the
-            # transcribe-then-translate double-error), offline NMT for every
-            # other pair, and offline NMT as the fallback when Whisper-native
-            # yields nothing. The AI never translates here — it only polishes
-            # below. Whisper-native gets generous headroom (full ASR pass, may
+            # ── (a) Translate via the shared translation router ──
+            # LLM-first when an editorial model is configured and
+            # TRANSLATION_PREFER_LLM is on (the default) — it renders every cue
+            # 1:1; then Whisper-native audio→English for →en (single-step, avoids
+            # the transcribe-then-translate double-error); then offline NMT as
+            # the fallback for other pairs or when the prior engines come back
+            # empty / still source-language. The post-edit below polishes the
+            # result. Whisper-native gets generous headroom (full ASR pass, may
             # run on CPU); the NMT path keeps the scaled timeout. See
-            # translate_offline for the VRAM-release ordering on low-VRAM cards.
-            translated, _engine_used = await translate_offline(
+            # translate_subtitles for the VRAM-release ordering on low-VRAM cards.
+            translated, _engine_used = await translate_subtitles(
                 _trans_input, source_lang, target_lang,
                 video_path=getattr(job, "file_path", None),
                 glossary=glossary,

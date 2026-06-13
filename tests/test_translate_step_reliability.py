@@ -83,9 +83,11 @@ def _install_common(monkeypatch, db, *, engine="llm"):
     monkeypatch.setattr(pipeline.database, "load_job", db.load_job)
     monkeypatch.setattr(pipeline, "broadcast_ws", _bcast)
     monkeypatch.setattr(translator, "_resolve_translation_engine", lambda s, t: engine)
-    # The Whisper-native →English path now runs first for non-English → English
-    # jobs; disable it here so these tests deterministically exercise the
-    # text/NMT path they stub via ``translate_segments_with_fallback``.
+    # The editorial-LLM and Whisper-native →English paths now run BEFORE offline
+    # NMT for non-English → English jobs; disable both here so these tests
+    # deterministically exercise the text/NMT path they stub via
+    # ``translate_segments_with_fallback``.
+    monkeypatch.setattr(pipeline.settings, "TRANSLATION_PREFER_LLM", False, raising=False)
     monkeypatch.setattr(pipeline.settings, "WHISPER_TRANSLATE_TO_EN", False, raising=False)
     # Keep optional LLM/segmentation passes out of the unit under test.
     monkeypatch.setattr(pipeline.settings, "AI_TRANSCRIPT_CORRECTION", False, raising=False)
@@ -110,9 +112,12 @@ def test_translation_success_sets_status_and_no_complete_pin(monkeypatch):
     broadcasts = _install_common(monkeypatch, db)
 
     async def _fake_translate(segments, **kwargs):
-        # Return target-language text so changed>0 and translation "succeeds".
+        # Return genuine target-language (non-CJK) text so changed>0, translation
+        # "succeeds", AND the final purity gate (which rejects source-script
+        # output) passes. Prefixing the Japanese source would leave CJK behind.
+        _EN = {"こんにちは": "Hello", "世界": "World"}
         return [
-            TranscriptSegment(text="EN: " + s.text, start=s.start, end=s.end, speaker=s.speaker)
+            TranscriptSegment(text=_EN.get(s.text, "Text"), start=s.start, end=s.end, speaker=s.speaker)
             for s in segments
         ]
 
@@ -129,7 +134,7 @@ def test_translation_success_sets_status_and_no_complete_pin(monkeypatch):
 
     assert result["will_translate"] is True
     assert result["translated"] is True
-    assert result["target_transcript"] and result["target_transcript"][0]["text"].startswith("EN: ")
+    assert result["target_transcript"] and result["target_transcript"][0]["text"] == "Hello"
     assert result["seo_transcript"] == result["target_transcript"]
     # The source transcript is preserved (untouched) for the `transcript` field.
     assert result["source_transcript"][0]["text"] == "こんにちは"

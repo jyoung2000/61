@@ -1362,7 +1362,7 @@ async def translate_subtitles(job_id: str, req: TranslateRequest):
     from backend.services.translator import SUPPORTED_LANGUAGES, TranslationFailedError
     from backend.services.nmt_translator import iso_to_flores
     from backend.services.ai_orchestrator import AIOrchestrator
-    from backend.services.pipeline import translate_offline
+    from backend.services.pipeline import translate_subtitles as _translate_subtitles
 
     job = await database.load_job(job_id)
     if not job or not job.transcript:
@@ -1378,10 +1378,12 @@ async def translate_subtitles(job_id: str, req: TranslateRequest):
     segments = [TranscriptSegment(**s) if isinstance(s, dict) else s for s in job.transcript]
 
     try:
-        # Same offline router the pipeline uses: Whisper-native audio→English for
-        # →en (re-runs ASR on the source video), offline NMT otherwise. Never an
-        # LLM. (Bilingual SRT export stays on NMT — it needs 1:1 cue alignment.)
-        translated, _engine = await translate_offline(
+        # Same shared router the pipeline uses: editorial-LLM first (when one is
+        # configured and TRANSLATION_PREFER_LLM is on, the default), then
+        # Whisper-native audio→English for →en (re-runs ASR on the source video),
+        # then offline NMT. (Bilingual SRT export stays on NMT — it needs 1:1 cue
+        # alignment.)
+        translated, _engine = await _translate_subtitles(
             segments,
             req.source_language or job.language or "en",
             req.target_language,
@@ -1389,8 +1391,8 @@ async def translate_subtitles(job_id: str, req: TranslateRequest):
             orchestrator=orchestrator,
         )
     except TranslationFailedError as e:
-        # Translation is offline-only (no LLM fallback). Surface an actionable
-        # 503 rather than a generic 500 when the NMT engine can't run.
+        # The offline NMT fallback couldn't run. Surface an actionable 503
+        # rather than a generic 500.
         raise HTTPException(status_code=503, detail=str(e))
 
     # Store translated transcript and update subtitle_language
@@ -1404,7 +1406,7 @@ async def translate_subtitles(job_id: str, req: TranslateRequest):
         "status": "ok",
         "target_language": req.target_language,
         "segments": len(translated),
-        "engine": _engine,  # "whisper" (native audio→en) or "nmt"
+        "engine": _engine,  # "llm", "whisper" (native audio→en), or "nmt"
     }
 
 
