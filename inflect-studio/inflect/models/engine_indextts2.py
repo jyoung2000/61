@@ -112,7 +112,7 @@ class IndexTTS2Engine(TTSEngine):
             cfg_path=str(cfg_path),
             model_dir=str(self.model_dir),
             use_fp16=bool(self.config.settings.use_fp16 and use_cuda),
-            use_cuda_kernel=use_cuda,
+            use_cuda_kernel=bool(self.config.settings.use_cuda_kernel and use_cuda),
         )
         self._loaded = True
 

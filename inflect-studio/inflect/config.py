@@ -130,6 +130,9 @@ class Settings:
     theme: str = "dark"
     use_cuda: bool = True
     use_fp16: bool = True
+    # IndexTTS-2's custom BigVGAN CUDA kernel is faster but requires a separate
+    # compile step; off by default so a fresh install never crashes on load.
+    use_cuda_kernel: bool = False
     crossfade_ms: int = 15
     target_lufs: float = -16.0
     true_peak_dbtp: float = -1.0

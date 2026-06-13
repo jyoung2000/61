@@ -96,8 +96,14 @@ class TTSEngine(ABC):
         self.unload()
 
 
-def to_mono_float32(audio: np.ndarray) -> np.ndarray:
-    """Coerce arbitrary engine output to a contiguous mono float32 vector."""
+def to_mono_float32(audio) -> np.ndarray:
+    """Coerce arbitrary engine output to a contiguous mono float32 vector.
+
+    Accepts numpy arrays and torch tensors (on CPU or GPU); a CUDA tensor is
+    detached and moved to host first so this never raises on GPU output.
+    """
+    if hasattr(audio, "detach"):  # torch.Tensor
+        audio = audio.detach().to("cpu").float().numpy()
     arr = np.asarray(audio, dtype=np.float32)
     if arr.ndim == 2:
         # (channels, n) or (n, channels) -> average to mono.

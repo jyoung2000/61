@@ -77,6 +77,9 @@ class SettingsDialog(QDialog):
         self._fp16 = QCheckBox("Use fp16 (recommended on 12 GB cards)")
         self._fp16.setChecked(s.use_fp16)
         form.addRow("", self._fp16)
+        self._cuda_kernel = QCheckBox("IndexTTS-2 CUDA kernel (faster; needs a compiled kernel)")
+        self._cuda_kernel.setChecked(s.use_cuda_kernel)
+        form.addRow("", self._cuda_kernel)
 
         self._cfg_weight = QDoubleSpinBox()
         self._cfg_weight.setRange(0.0, 1.0)
@@ -124,6 +127,7 @@ class SettingsDialog(QDialog):
         s.default_engine = self._engine.currentData()
         s.use_cuda = self._cuda.isChecked()
         s.use_fp16 = self._fp16.isChecked()
+        s.use_cuda_kernel = self._cuda_kernel.isChecked()
         s.chatterbox_cfg_weight = float(self._cfg_weight.value())
         s.crossfade_ms = int(self._crossfade.value())
         s.target_lufs = float(self._lufs.value())
