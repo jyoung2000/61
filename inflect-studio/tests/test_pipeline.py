@@ -204,3 +204,91 @@ def test_render_one_uses_cache(env):
     # force=True re-renders even though cached.
     seg3 = pipe.render_one(doc, job, force=True)
     assert not seg3.from_cache
+
+
+# --------------------------------------------------------------------------- #
+# Phase 6: Fish direct + hybrid Performance Transfer
+# --------------------------------------------------------------------------- #
+def test_fish_tag_change_invalidates_cache(env):
+    _, _, mm, pipe, pid = env
+    doc = _doc("A whole fish sentence.", pid)
+    doc.apply_inflection(0, len(doc.text), Inflection(engine="fish"))
+    pipe.render(doc, engine="indextts2")
+    base = mm.engines["fish"].calls
+    # Change emotion -> tag string changes -> fish segment re-renders.
+    doc.apply_inflection(0, len(doc.text), Inflection(emotion_vector=[0, 0.9] + [0] * 6, engine="fish"))
+    pipe.render(doc, engine="indextts2")
+    assert mm.engines["fish"].calls == base + 1
+
+
+def test_hybrid_two_stage_and_swap_budget(env):
+    _, _, mm, pipe, pid = env
+    doc = _doc("Calm narration here. PERFORM THIS LINE. More calm narration.", pid)
+    # A hybrid span in the middle; the rest is plain (toolbar engine).
+    doc.apply_inflection(20, 38, Inflection(emotion_vector=[0, 0.9] + [0] * 6, engine="hybrid"))
+    result = pipe.render(doc, engine="chatterbox")
+    # Fish renders stage 1, IndexTTS-2 stage 2, Chatterbox the plain parts.
+    assert mm.engines["fish"].calls == 1
+    assert mm.engines["indextts2"].calls == 1
+    assert mm.engines["chatterbox"].calls >= 1
+    # At most three swaps, in dependency order (fish before indextts2).
+    assert mm.load_events == ["fish", "indextts2", "chatterbox"]
+    # The hybrid segment's final audio comes from IndexTTS-2.
+    hybrid_seg = next(s for s in result.segments if s.char_start == 20)
+    assert hybrid_seg.engine == "indextts2"
+
+
+def test_hybrid_writes_performance_wav(env):
+    cfg, _, _, pipe, pid = env
+    doc = _doc("PERFORM THIS.", pid)
+    doc.apply_inflection(0, len(doc.text), Inflection(emo_text="furious", engine="hybrid"))
+    pipe.render(doc, engine="indextts2")
+    perf_files = list(cfg.paths.cache.glob("perf_*.wav"))
+    assert len(perf_files) == 1
+
+
+def test_pure_hybrid_doc_costs_two_swaps(env):
+    _, _, mm, pipe, pid = env
+    doc = _doc("One line here. Two line here.", pid)
+    doc.apply_inflection(0, 14, Inflection(emo_text="excited", engine="hybrid"))
+    doc.apply_inflection(15, len(doc.text), Inflection(emo_text="sad", engine="hybrid"))
+    pipe.render(doc, engine="indextts2")
+    # Exactly two model loads: all Fish stage-1, then all IndexTTS-2 stage-2.
+    assert mm.load_events == ["fish", "indextts2"]
+    assert mm.engines["fish"].calls == 2
+    assert mm.engines["indextts2"].calls == 2
+
+
+def test_render_performance_stage1_only(env):
+    from inflect.document.segmenter import SegmentJob
+
+    _, _, mm, pipe, pid = env
+    doc = _doc("Audition this performance.", pid)
+    job = SegmentJob(
+        seg_id=0,
+        text="Audition this performance.",
+        inflection=Inflection(emo_text="furious"),
+        voice_profile_id=pid,
+        engine="hybrid",
+        char_start=0,
+        char_end=26,
+    )
+    seg = pipe.render_performance(doc, job)
+    assert seg.engine == "fish"
+    assert mm.engines["fish"].calls == 1
+    assert mm.engines["indextts2"].calls == 0  # stage 2 not run
+    assert seg.audio.size > 0
+
+
+def test_hybrid_caching_no_reload(env):
+    _, _, mm, pipe, pid = env
+    doc = _doc("Perform this line.", pid)
+    doc.apply_inflection(0, len(doc.text), Inflection(emo_text="furious", engine="hybrid"))
+    pipe.render(doc, engine="indextts2")
+    mm.load_events.clear()
+    fish_calls = mm.engines["fish"].calls
+    idx_calls = mm.engines["indextts2"].calls
+    pipe.render(doc, engine="indextts2")  # fully cached now
+    assert mm.load_events == []
+    assert mm.engines["fish"].calls == fish_calls
+    assert mm.engines["indextts2"].calls == idx_calls

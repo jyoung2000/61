@@ -47,6 +47,11 @@ def _render_segment_task(pipeline, document, job, force=False, progress=None):
     return pipeline.render_one(document, job, force=force)
 
 
+def _render_performance_task(pipeline, document, job, progress=None):
+    """Worker entry point for the hybrid stage-1 'audition performance' button."""
+    return pipeline.render_performance(document, job)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, config: Config) -> None:
         super().__init__()
@@ -209,6 +214,7 @@ class MainWindow(QMainWindow):
         self.inspector.applyRequested.connect(self.editor.apply_inflection_to_selection)
         self.inspector.setDefaultRequested.connect(self.editor.set_default_inflection)
         self.inspector.previewRequested.connect(self._preview_selection)
+        self.inspector.auditionPerformanceRequested.connect(self._audition_performance)
 
         # Timeline + player
         self.timeline.seekRequested.connect(self.player.seek)
@@ -375,6 +381,39 @@ class MainWindow(QMainWindow):
             char_end=end,
         )
         self._run_segment_task(job, then_play=True)
+
+    def _audition_performance(self) -> None:
+        """Render and play only the Fish stage-1 performance for the selection."""
+        if not self.editor.model.voice_profile_id:
+            QMessageBox.warning(self, "No voice", "Select or import a voice profile first.")
+            return
+        start, end = self.editor.selection_range()
+        if end <= start:
+            span = self.editor.current_span()
+            if span is None:
+                self.status_label.setText("Select some text to audition.")
+                return
+            start, end = span.start, span.end
+        text = self.editor.model.text[start:end].strip()
+        if not text:
+            return
+        inflection = self.inspector.current_inflection()
+        job = SegmentJob(
+            seg_id=0,
+            text=text,
+            inflection=inflection,
+            voice_profile_id=self.editor.model.voice_profile_id,
+            engine="hybrid",
+            char_start=start,
+            char_end=end,
+        )
+        document = copy.deepcopy(self.editor.model)
+        worker = TaskWorker(_render_performance_task, self.pipeline, document, job)
+        worker.progress.connect(lambda m, _f: self.status_label.setText(m))
+        worker.finished.connect(self._on_segment_preview_ready)
+        worker.failed.connect(self._on_task_failed)
+        self.status_label.setText("Rendering Fish performance (stage 1)…")
+        self._task_thread = start_worker(worker)
 
     def _rerender_segment(self, seg_id: int) -> None:
         jobs = segment_document(self.editor.model, self.current_engine, self._engine_params())
