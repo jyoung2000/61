@@ -175,3 +175,23 @@ def resample(audio: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
 def ensure_rate(audio: np.ndarray, src_sr: int, target_sr: int) -> np.ndarray:
     """Convenience wrapper used by the pipeline to unify segment rates."""
     return resample(audio, src_sr, target_sr) if src_sr != target_sr else audio
+
+
+def time_stretch(audio: np.ndarray, speed: float) -> np.ndarray:
+    """Change tempo by ``speed`` WITHOUT changing pitch (phase vocoder).
+
+    ``speed > 1`` is faster/shorter. Used as the universal fallback for engines
+    whose inference API exposes no native duration control. Requires librosa for
+    a pitch-preserving result; if librosa is unavailable the audio is returned
+    unchanged (we never silently pitch-shift the cloned voice).
+    """
+    audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+    if abs(speed - 1.0) < 1e-3 or audio.size == 0:
+        return audio
+    try:
+        import librosa
+
+        out = librosa.effects.time_stretch(audio.astype(np.float32), rate=float(speed))
+        return np.ascontiguousarray(out, dtype=np.float32)
+    except Exception:  # pragma: no cover - librosa missing / edge input
+        return audio
