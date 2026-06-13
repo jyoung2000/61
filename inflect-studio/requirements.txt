@@ -1,0 +1,52 @@
+# Inflect Studio — Python 3.10–3.11
+#
+# GPU NOTE (Windows / RTX 4070, CUDA): install a CUDA build of PyTorch FIRST,
+# before the rest of this file, e.g.:
+#
+#   pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
+#
+# then:  pip install -r requirements.txt
+# The plain "torch" line below is a fallback for CPU-only / non-Windows setups.
+
+# --- GUI ---------------------------------------------------------------------
+PySide6>=6.6
+pyqtgraph>=0.13
+
+# --- Core audio / math -------------------------------------------------------
+numpy>=1.24,<2.2
+scipy>=1.10
+soundfile>=0.12
+pyloudnorm>=0.1.1
+librosa>=0.10
+sounddevice>=0.4.6
+
+# --- Torch (install the CUDA build separately — see note above) --------------
+torch>=2.1
+torchaudio>=2.1
+
+# --- Model download / hub ----------------------------------------------------
+huggingface_hub>=0.23
+
+# --- TTS engines -------------------------------------------------------------
+# Chatterbox (Draft / fast-preview engine)
+chatterbox-tts>=0.1.1
+
+# IndexTTS-2 (Final engine). Published as the "indextts" package; if a release
+# is not available for your platform, install from source instead:
+#   pip install git+https://github.com/index-tts/index-tts.git
+indextts>=0.1 ; platform_system != "Never"
+
+# --- Ingest helpers ----------------------------------------------------------
+# Voice activity detection for auto clip selection.
+silero-vad>=5.1
+# Vocal isolation (optional step; large download). Comment out to skip.
+demucs>=4.0
+
+# --- Phase 6 (optional): Fish Speech / S2 hybrid -----------------------------
+# Fish has no stable PyPI wheel for the S2 weights; install from source when
+# you enable Phase 6:
+#   pip install git+https://github.com/fishaudio/fish-speech.git
+# fish-speech
+
+# ffmpeg / ffprobe are EXTERNAL binaries and are NOT pip-installable. Install
+# them and put them on PATH (https://ffmpeg.org/download.html).

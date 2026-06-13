@@ -1,0 +1,31 @@
+# Virtual environments
+.venv*/
+venv/
+env/
+
+# Python caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Runtime data (models, voice library, caches, logs) — never commit these.
+# Anchored to the repo root so they do NOT match the source package
+# `inflect/models`. Runtime data normally lives in $INFLECT_HOME (outside the
+# repo); these guard against INFLECT_HOME being pointed at the repo root.
+/data/
+/models/
+/voices/
+/project_cache/
+/logs/
+/tmp/
+*.inflect
+*.mp3
+*.wav
+!tests/**/*.wav
+
+# OS noise
+.DS_Store
+Thumbs.db
