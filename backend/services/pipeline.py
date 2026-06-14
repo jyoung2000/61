@@ -90,6 +90,30 @@ def _canonical_clipper_config_path() -> str:
     return os.path.join(local_dir, "clipper_config.json")
 
 
+def _gpu_status_message() -> str:
+    """Human-readable GPU status line for the live Processing Log.
+
+    The backend logs GPU availability at startup, but the per-job log only ever
+    mentioned the GPU on a CPU FALLBACK — so a healthy GPU run looked CPU-silent.
+    Broadcast this positively at the stages the user actually watches.
+    """
+    enabled = bool(getattr(settings, "GPU_ACCELERATION_ENABLED", False))
+    name = ""
+    try:
+        import torch as _torch
+        if _torch.cuda.is_available():
+            name = _torch.cuda.get_device_name(0)
+    except Exception:
+        name = ""
+    if enabled and name:
+        return (f"GPU acceleration active: {name} — video decode, subject detection, "
+                "and Whisper transcription run on the GPU.")
+    if enabled:
+        return ("GPU acceleration is enabled, but no CUDA device is visible — "
+                "stages will run on CPU (much slower).")
+    return "GPU acceleration is OFF — all stages run on CPU."
+
+
 def _build_compute_summary(engine, perception) -> dict:
     """Snapshot which device each pipeline stage actually used.
 
@@ -2708,28 +2732,13 @@ async def _run_analysis_inner(job_id: str):
     logger.info("[%s] Pipeline started — video: %s", job_id, video_path)
     _log_gpu_memory(job_id, "pipeline start")
 
-    # Surface GPU status to the live Processing Log. The backend logs this at
-    # startup, but the per-job log only ever mentioned the GPU when a stage FELL
-    # BACK to CPU — so a healthy GPU run looked CPU-silent. State it positively
-    # up front (a final "Ran on GPU" confirmation is broadcast after analysis).
+    # Surface GPU status to the live Processing Log (positive confirmation, not
+    # just the CPU-fallback warning). This early broadcast can race the client's
+    # WebSocket connect, so it's re-stated at the reframer stage below where the
+    # page is reliably subscribed. A final "Ran on GPU" confirmation also follows
+    # after analysis.
     try:
-        _gpu_enabled = bool(getattr(settings, "GPU_ACCELERATION_ENABLED", False))
-        _gpu_name = ""
-        try:
-            import torch as _torch
-            if _torch.cuda.is_available():
-                _gpu_name = _torch.cuda.get_device_name(0)
-        except Exception:
-            _gpu_name = ""
-        if _gpu_enabled and _gpu_name:
-            _gpu_msg = (f"GPU acceleration active: {_gpu_name} — video decode, subject "
-                        "detection, and Whisper transcription run on the GPU.")
-        elif _gpu_enabled:
-            _gpu_msg = ("GPU acceleration is enabled, but no CUDA device is visible — "
-                        "stages will run on CPU (much slower).")
-        else:
-            _gpu_msg = "GPU acceleration is OFF — all stages run on CPU."
-        await broadcast_ws(job_id, {"type": "compute_info", "message": _gpu_msg})
+        await broadcast_ws(job_id, {"type": "compute_info", "message": _gpu_status_message()})
     except Exception:
         pass
 
@@ -3157,6 +3166,14 @@ async def _run_analysis_inner(job_id: str):
         job_id, JobStatus.ANALYZING_SCENES, 15,
         "Starting reframer analysis (faces, transcription, motion)...",
     )
+
+    # Re-state GPU status now that the page is reliably subscribed (the
+    # pipeline-start broadcast can fire before the client's WebSocket connects,
+    # dropping it). The reframer + Whisper are the long GPU stages just ahead.
+    try:
+        await broadcast_ws(job_id, {"type": "compute_info", "message": _gpu_status_message()})
+    except Exception:
+        pass
 
     # Second GPU preflight right before reframer/Whisper kicks in. The
     # analysis-start preflight already evicted Ollama; this catches

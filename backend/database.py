@@ -91,6 +91,21 @@ async def _save_job_unlocked(job: JobResult, *, _preserve_terminal_status: bool 
                         "Save guard [%s]: kept %d existing translated_transcript "
                         "segment(s) — incoming save had none (stale snapshot).",
                         job.job_id, len(_cur["translated_transcript"]))
+                    # The readability card scores the TRANSLATED transcript. A
+                    # stale snapshot that lost the translated cues also carries
+                    # the PRELIMINARY source-language readability (the raw source
+                    # transcript, scored with CJK limits → a lower grade), which
+                    # would revert the card from the shipped-subtitle score (e.g.
+                    # A) back to the source score (e.g. C). Keep the persisted
+                    # readability alongside the translated cues it describes.
+                    if (_cur.get("transcript_readability")
+                            and _cur.get("transcript_readability")
+                            != data.get("transcript_readability")):
+                        data["transcript_readability"] = _cur["transcript_readability"]
+                        logger.warning(
+                            "Save guard [%s]: kept existing transcript_readability — "
+                            "incoming save carried the stale source-language score.",
+                            job.job_id)
                 # Same anti-wipe for the video summary. It is written ONCE by the
                 # summary stage via ``update_job_status(job_id, summary=...)`` — a
                 # separate DB write that does NOT update the in-memory pipeline job.
