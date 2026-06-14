@@ -2187,6 +2187,25 @@ async def _background_post_processing(
                 _update_kwargs["transcript_readability"] = _tr_readability
             await database.update_job_status(job_id, **_update_kwargs)
 
+            # Push the FINAL (translated) readability to any open Analysis page
+            # right away. The readability card reads ``job.transcript_readability``,
+            # which is first written with the PRELIMINARY source-language pass
+            # (the raw JA transcript, scored with CJK limits → a low grade); the
+            # English re-score above is the score of what viewers actually read,
+            # but without this live event the open page can keep showing the
+            # stale source grade. Trim the per-cue ``violations`` so the socket
+            # frame stays small — the card only reads the summary fields.
+            if _tr_readability is not None:
+                try:
+                    _rd_summary = {k: v for k, v in _tr_readability.items()
+                                   if k != "violations"}
+                    await broadcast_ws(job_id, {
+                        "type": "readability",
+                        "transcript_readability": _rd_summary,
+                    })
+                except Exception:
+                    pass
+
             await broadcast_ws(job_id, {
                 "type": "background_task",
                 "task": "subtitle_translation",
@@ -2688,6 +2707,31 @@ async def _run_analysis_inner(job_id: str):
     await _update_progress(job_id, JobStatus.EXTRACTING_FRAMES, 2, "Extracting video metadata...")
     logger.info("[%s] Pipeline started — video: %s", job_id, video_path)
     _log_gpu_memory(job_id, "pipeline start")
+
+    # Surface GPU status to the live Processing Log. The backend logs this at
+    # startup, but the per-job log only ever mentioned the GPU when a stage FELL
+    # BACK to CPU — so a healthy GPU run looked CPU-silent. State it positively
+    # up front (a final "Ran on GPU" confirmation is broadcast after analysis).
+    try:
+        _gpu_enabled = bool(getattr(settings, "GPU_ACCELERATION_ENABLED", False))
+        _gpu_name = ""
+        try:
+            import torch as _torch
+            if _torch.cuda.is_available():
+                _gpu_name = _torch.cuda.get_device_name(0)
+        except Exception:
+            _gpu_name = ""
+        if _gpu_enabled and _gpu_name:
+            _gpu_msg = (f"GPU acceleration active: {_gpu_name} — video decode, subject "
+                        "detection, and Whisper transcription run on the GPU.")
+        elif _gpu_enabled:
+            _gpu_msg = ("GPU acceleration is enabled, but no CUDA device is visible — "
+                        "stages will run on CPU (much slower).")
+        else:
+            _gpu_msg = "GPU acceleration is OFF — all stages run on CPU."
+        await broadcast_ws(job_id, {"type": "compute_info", "message": _gpu_msg})
+    except Exception:
+        pass
 
     # ── GPU preflight: evict any Ollama models still resident in VRAM ──
     # On a low-VRAM card (GTX 1650 4 GB and similar) a stray Ollama
@@ -3600,6 +3644,19 @@ async def _run_analysis_inner(job_id: str):
         job_id,
         ", ".join(f"{k}={v.get('device')}" for k, v in compute_summary.items()),
     )
+
+    # Positive confirmation of GPU usage in the live log (the cpu_fallback
+    # warning below only fires on a FALLBACK, so a healthy GPU run was silent).
+    try:
+        _gpu_stages = [k for k, v in compute_summary.items()
+                       if str(v.get("device", "")).startswith("cuda")]
+        if _gpu_stages:
+            await broadcast_ws(job_id, {
+                "type": "compute_info",
+                "message": f"Ran on GPU (cuda): {', '.join(_gpu_stages)}.",
+            })
+    except Exception:
+        pass
 
     # ── CPU-fallback warning ──
     # When GPU acceleration is enabled the user EXPECTS the GPU. If any heavy

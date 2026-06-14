@@ -1209,6 +1209,13 @@ export default function Analysis() {
             // long-running stages.  Log it and reset the stuck timer.
             pushLog('info', String(msg.message || 'Still processing...'),
               { stage_id: currentStageIdRef.current || '' });
+          } else if (msg.type === 'readability' && msg.transcript_readability) {
+            // Live update of the readability card with the FINAL (translated)
+            // transcript's score, so it reflects the shipped subtitles instead
+            // of the preliminary source-language pass the card first showed.
+            setJob((prev) => (prev
+              ? { ...prev, transcript_readability: msg.transcript_readability }
+              : prev));
           } else {
             // Unknown message type — log but don't crash.  Coerce all fields.
             const safeType = String(msg.type || 'unknown');
