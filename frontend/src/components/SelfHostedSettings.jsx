@@ -96,7 +96,7 @@ function EngineRow({ label, desc, value, resolved, onChange }) {
   );
 }
 
-export default function SelfHostedSettings() {
+export default function SelfHostedSettings({ onSaved } = {}) {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [savedAt, setSavedAt] = useState(0);
@@ -157,6 +157,9 @@ export default function SelfHostedSettings() {
       const d = await res.json();
       applyState(d);
       setSavedAt(Date.now());
+      // Let the parent refresh the Active-Models banner + header chips so the
+      // Primary / Editorial AI immediately reflect the local engines.
+      onSaved?.(d);
     } catch {
       setError('Could not save — check the server logs.');
     } finally {

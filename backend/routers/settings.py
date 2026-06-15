@@ -705,6 +705,17 @@ async def provider_status():
             break
 
     _videollama2_ok = _check_videollama2_available()
+    # Offline Mode (or a per-engine "local" override) routes clip detection to
+    # the local Ollama vision model — the pipeline disables Replicate in that
+    # case (reframer_clipper.replicate_enabled = … and resolve_ai_source("clip")
+    # == "cloud"). Mirror that here so the Active-Models banner + header chips
+    # show the LOCAL primary engine instead of the now-inactive cloud one.
+    _clip_local = settings.resolve_ai_source("clip") == "local"
+    _replicate_on = (
+        _key_is_set(settings.REPLICATE_API_KEY)
+        and settings.REPLICATE_ENABLED
+        and not _clip_local
+    )
     statuses["_active"] = {
         "provider": active_provider or "none",
         "transcript_model": settings.WHISPER_MODEL,
@@ -714,11 +725,17 @@ async def provider_status():
         "primary_model": active_primary_model or "",
         "editorial_model": active_editorial_model or "",
         "videollama2_available": _videollama2_ok,
-        "replicate_available": _key_is_set(settings.REPLICATE_API_KEY) and settings.REPLICATE_ENABLED,
-        "replicate_model": settings.REPLICATE_MODEL if _key_is_set(settings.REPLICATE_API_KEY) else "",
+        "replicate_available": _replicate_on,
+        "replicate_model": (settings.REPLICATE_MODEL
+                            if (_key_is_set(settings.REPLICATE_API_KEY) and not _clip_local)
+                            else ""),
         "videollama3_enhanced": bool(getattr(settings, "VIDEOLLAMA3_ENHANCED", False)),
+        # Resolved clip/editorial sources so the UI can label Offline Mode.
+        "clip_source": settings.resolve_ai_source("clip"),
+        "editorial_source": settings.resolve_ai_source("editorial"),
+        "self_hosted_mode": bool(getattr(settings, "SELF_HOSTED_MODE", False)),
         "primary_type": (
-            "replicate" if (_key_is_set(settings.REPLICATE_API_KEY) and settings.REPLICATE_ENABLED)
+            "replicate" if _replicate_on
             else "videollama2" if _videollama2_ok
             else ("ollama" if active_provider == "ollama" else "cloud")
         ),

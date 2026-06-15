@@ -1618,7 +1618,17 @@ export default function Settings() {
           </div>
 
           {/* ── Offline Mode (run the whole pipeline on the local GPU) ── */}
-          <SelfHostedSettings />
+          <SelfHostedSettings
+            onSaved={async () => {
+              // Refresh the Active-Models banner + header chips so Primary /
+              // Editorial AI reflect the local engines the moment it's toggled.
+              try {
+                const r = await fetch('/api/providers/status');
+                if (r.ok) setStatuses(await r.json());
+              } catch { /* best-effort */ }
+              loadAvailableModels();
+            }}
+          />
 
           {/* ── Model Selection Section ── */}
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
@@ -1973,28 +1983,38 @@ export default function Settings() {
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
                   <div>
                     <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 2 }}>
-                      {active.replicate_available ? 'Replicate Cloud GPU (Primary AI)' : 'VideoLLaMA2 (Primary AI)'}
+                      {active.replicate_available
+                        ? 'Replicate Cloud GPU (Primary AI)'
+                        : active.videollama2_available
+                          ? 'VideoLLaMA2 (Primary AI)'
+                          : active.clip_source === 'local'
+                            ? 'Ollama Vision (Primary AI)'
+                            : 'VideoLLaMA2 (Primary AI)'}
                     </div>
                     <div style={{ fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.4 }}>
                       {active.replicate_available
                         ? `Using ${(active.replicate_model || 'videollama3-7b').replace(/^.*\//, '')} on Replicate cloud GPU — no local VRAM needed. Mode: ${active.videollama3_enhanced ? 'Enhanced (multi-pass)' : 'Classic (single-pass)'}.`
-                        : 'Audio-visual AI that watches and listens to your video. Requires ≥10GB VRAM (RTX 4070+); add a Replicate API key above to use cloud GPU instead.'
+                        : active.videollama2_available
+                          ? 'Audio-visual AI that watches and listens to your video, running locally on your GPU.'
+                          : active.clip_source === 'local'
+                            ? `Offline Mode — clip detection runs on the local Ollama vision model${active.primary_model ? ` (${active.primary_model})` : ''} on your GPU. No cloud calls.`
+                            : 'Audio-visual AI that watches and listens to your video. Requires ≥10GB VRAM (RTX 4070+); add a Replicate API key above to use cloud GPU instead.'
                       }
                     </div>
                   </div>
                   <div style={{
                     padding: '4px 10px', borderRadius: 'var(--radius-sm)', fontSize: 10,
                     fontWeight: 600, fontFamily: 'var(--font-mono)', whiteSpace: 'nowrap',
-                    background: (active.replicate_available || active.videollama2_available)
+                    background: (active.replicate_available || active.videollama2_available || active.clip_source === 'local')
                       ? 'rgba(34,197,94,0.15)' : 'rgba(239,68,68,0.15)',
-                    color: (active.replicate_available || active.videollama2_available)
+                    color: (active.replicate_available || active.videollama2_available || active.clip_source === 'local')
                       ? 'var(--success)' : 'var(--danger)',
-                    border: `1px solid ${(active.replicate_available || active.videollama2_available)
+                    border: `1px solid ${(active.replicate_available || active.videollama2_available || active.clip_source === 'local')
                       ? 'rgba(34,197,94,0.3)' : 'rgba(239,68,68,0.3)'}`,
                   }}>
                     {active.replicate_available
                       ? '● Cloud GPU'
-                      : active.videollama2_available
+                      : (active.videollama2_available || active.clip_source === 'local')
                         ? '● Local GPU'
                         : '○ Using fallback'}
                   </div>
