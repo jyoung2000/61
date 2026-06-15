@@ -453,6 +453,30 @@ class Settings(BaseSettings):
             return override
         return "local" if self.SELF_HOSTED_MODE else "cloud"
 
+    def resolve_stage_source(self, stage: str) -> str:
+        """Return 'local' or 'cloud' for a USER-FACING pipeline stage.
+
+        The Offline-Mode toggle in Settings → AI Provider speaks in terms of
+        the four stages a user recognises; this maps each onto the two
+        underlying engine knobs ``resolve_ai_source`` already drives:
+
+          * ``transcription`` — always local. Whisper is the only transcriber
+            (cloud LLM providers don't do speech-to-text); it runs on the GPU
+            when VRAM is free, CPU otherwise.
+          * ``clip_detection`` — the clip engine (Primary AI): local Ollama
+            vision vs cloud VideoLLaMA3 on Replicate.
+          * ``translation`` / ``polishing`` — the editorial AI. In self-hosted
+            mode the editorial chain is local Ollama, so both run on the GPU
+            (translation is LLM-first locally, then offline Whisper/NMT).
+        """
+        if stage == "transcription":
+            return "local"
+        if stage in ("clip", "clip_detection"):
+            return self.resolve_ai_source("clip")
+        if stage in ("translation", "polishing"):
+            return self.resolve_ai_source("editorial")
+        return self.resolve_ai_source(stage)
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"

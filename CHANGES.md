@@ -1,3 +1,33 @@
+# ClipAI — Offline Mode: one switch runs the whole pipeline on the local GPU
+
+Settings → AI Provider now has an **Offline Mode (Local GPU)** toggle. One
+switch routes all four stages a user thinks about — clip detection,
+transcription, translation, and polishing — onto the local GPU (the GTX 1650)
+with no cloud calls, and a four-stage status grid shows where each stage
+actually runs (LOCAL / CLOUD), updated live from the backend.
+
+It drives the existing self-hosted machinery rather than a parallel knob:
+turning it on sets `SELF_HOSTED_MODE` and resets the per-engine overrides to
+Auto, so clip detection runs on the local Ollama vision model (Replicate
+disabled), the editorial chain collapses to `["ollama"]` (polishing +
+LLM-first translation, then offline Whisper/NMT), and Whisper transcription
+stays local as always. A collapsible "Advanced overrides" block keeps the
+per-engine Local/Cloud/Auto dropdowns for power users. The control moved out
+of the Prompts tab into AI Provider where the user asked for it.
+
+Sequencing for a 4 GB card: the pipeline already evicts Ollama before
+Whisper and releases Whisper VRAM before the editorial LLM. Added the missing
+hand-off — `_free_editorial_vram_before_local_clips` unloads the editorial
+Ollama model (keep_alive=0) and flushes the torch allocator right before
+local clip detection loads its vision model, so the editorial LLM and the
+vision model never have to share the GPU. No-op in the cloud.
+
+New: `Settings.resolve_stage_source(stage)` maps the four user-facing stages
+onto the two engine knobs; `/api/self-hosted/settings` now returns a `stages`
+block. Covered by `tests/test_offline_mode_settings.py`.
+
+---
+
 # ClipAI — Fix the real reason translations were half-Japanese: source="auto"
 
 The LLM translation logged "0% still source-script" yet the track was ~40%

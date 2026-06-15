@@ -2615,7 +2615,12 @@ class SaveSelfHostedRequest(BaseModel):
 
 
 def _self_hosted_state() -> dict:
-    """Current self-hosted settings plus each engine's resolved source."""
+    """Current self-hosted settings plus each engine's resolved source.
+
+    ``stages`` resolves the four user-facing pipeline stages the Offline-Mode
+    toggle controls (clip detection, transcription, translation, polishing) so
+    the Settings UI can show an accurate Local/Cloud badge per stage.
+    """
     return {
         "self_hosted_mode": settings.SELF_HOSTED_MODE,
         "clip_engine_source": settings.CLIP_ENGINE_SOURCE,
@@ -2623,6 +2628,12 @@ def _self_hosted_state() -> dict:
         "resolved": {
             "clip_engine": settings.resolve_ai_source("clip"),
             "editorial_ai": settings.resolve_ai_source("editorial"),
+        },
+        "stages": {
+            "clip_detection": settings.resolve_stage_source("clip_detection"),
+            "transcription": settings.resolve_stage_source("transcription"),
+            "translation": settings.resolve_stage_source("translation"),
+            "polishing": settings.resolve_stage_source("polishing"),
         },
         "ollama_host": getattr(settings, "OLLAMA_HOST", "") or "",
     }

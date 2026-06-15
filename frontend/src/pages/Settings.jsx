@@ -1617,6 +1617,9 @@ export default function Settings() {
             })()}
           </div>
 
+          {/* ── Offline Mode (run the whole pipeline on the local GPU) ── */}
+          <SelfHostedSettings />
+
           {/* ── Model Selection Section ── */}
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
             <h3 style={{ fontSize: 14, margin: 0, color: 'var(--text-secondary)' }}>
@@ -2193,8 +2196,6 @@ export default function Settings() {
                   )}
                 </div>
               </div>
-
-              <SelfHostedSettings />
 
               <ClipGenerationSettings />
 

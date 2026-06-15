@@ -267,6 +267,53 @@ async def _release_whisper_vram(job_id: str):
         logger.warning("[%s] VRAM release error: %s", job_id, e)
 
 
+async def _free_editorial_vram_before_local_clips(job_id: str, orchestrator) -> None:
+    """Evict the editorial Ollama LLM before LOCAL clip detection loads its
+    vision model, so the two never share a 4 GB GPU.
+
+    In Offline Mode the pipeline runs the editorial AI (polish → translate →
+    summary) on a local Ollama LLM (qwen2.5:3b ≈ 2.3 GB) and then detects clips
+    with a local Ollama vision model (moondream ≈ 1.7 GB). On a GTX 1650 4 GB
+    both can't be resident at once. The editorial stages are finished by the
+    time clip detection starts, so unload the editorial model now (keep_alive=0)
+    and flush the torch allocator — the vision model then loads into a clean GPU
+    instead of racing Ollama's lazy LRU eviction (which can spill to CPU/OOM).
+
+    No-op when clip detection is running in the cloud, or when there's no local
+    Ollama model loaded. Best-effort: never blocks the pipeline.
+    """
+    if settings.resolve_ai_source("clip") != "local":
+        return
+    try:
+        if orchestrator is not None and hasattr(orchestrator, "unload_local_models"):
+            await asyncio.wait_for(orchestrator.unload_local_models(), timeout=15)
+            logger.info(
+                "[%s] Editorial Ollama model unloaded — GPU freed for the local "
+                "clip-detection vision model", job_id,
+            )
+    except asyncio.TimeoutError:
+        logger.warning("[%s] Editorial model unload timed out — proceeding", job_id)
+    except Exception as e:
+        logger.debug("[%s] Editorial model unload skipped: %s", job_id, e)
+
+    try:
+        import gc
+
+        import torch
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+    except ImportError:
+        pass
+    except Exception as e:
+        logger.debug("[%s] pre-clip torch cleanup skipped: %s", job_id, e)
+
+    # Let the CUDA driver reclaim the freed VRAM across containers (the app and
+    # Ollama share one GPU) before the vision model asks for it.
+    await asyncio.sleep(1)
+
+
 def _whisper_native_translate_segments(video_path: str, source_lang: str,
                                        glossary: dict | None = None,
                                        source_segments: list | None = None) -> list:
@@ -3836,6 +3883,10 @@ async def _run_analysis_inner(job_id: str):
 
     # ── Clip detection (reframer clipper) ──
     cancel_check()
+    # Offline Mode: hand the GPU from the editorial Ollama LLM (just used for
+    # polish/translate/summary) to the local clip-detection vision model. No-op
+    # in the cloud. Keeps the 4 GB GTX 1650 from trying to hold both at once.
+    await _free_editorial_vram_before_local_clips(job_id, orchestrator)
     await _update_progress(
         job_id, JobStatus.DETECTING_CLIPS, 80, "Detecting viral clip candidates...",
     )

@@ -2,6 +2,9 @@ __pycache__/
 node_modules/
 frontend/dist/
 data/
+# Local persisted user settings dir (written by the settings router /
+# pipeline when running outside the Docker data mount, e.g. tests).
+.clipai/
 # Downloaded model weights (YuNet face detector, YOLO-World, etc.)
 backend/models/*.onnx
 backend/models/*.pt
