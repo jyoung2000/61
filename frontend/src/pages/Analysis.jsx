@@ -1213,6 +1213,10 @@ export default function Analysis() {
               // looking like it's waiting on clip detection to finish.
               fetchTranscripts();
               fetchJob();
+            } else if (taskStatus === 'failed') {
+              // Pick up translation_status='translation_failed' promptly so the
+              // "translating…" hint clears instead of lingering until the next poll.
+              fetchJob();
             }
           } else if (msg.type === 'heartbeat') {
             // Pipeline heartbeat — shows the pipeline is still alive during
@@ -3393,29 +3397,51 @@ export default function Analysis() {
 
       {tab === 2 && (
         <div>
-          {/* The transcript + translation finish BEFORE clip detection. Make
-              that explicit so it's clear the transcript is final and usable
-              while clips are still being generated in the background. */}
-          {job.transcript?.length > 0 && isProcessing && (
-            <div style={{
-              display: 'flex', alignItems: 'center', gap: 8,
-              padding: '8px 14px', marginBottom: 12,
-              background: 'var(--success-dim, rgba(48,209,88,0.12))',
-              border: '1px solid var(--success, #30D158)',
-              borderRadius: 'var(--radius-sm)',
-              fontSize: 12, color: 'var(--success, #30D158)', lineHeight: 1.4,
-            }}>
-              <span style={{ fontWeight: 700 }}>✓</span>
-              <span>
-                {hasTranslation
-                  ? 'Transcript complete and translated.'
-                  : 'Transcript complete.'}{' '}
-                <span style={{ color: 'var(--text-secondary)' }}>
-                  Clip detection is still running in the background — it won't change this transcript.
+          {/* The transcript + translation finish BEFORE clip detection. Surface
+              that clearly: a subtle "translating…" hint in the gap after Whisper
+              finishes, then a "complete (and translated)" confirmation — all
+              while clips keep generating in the background. */}
+          {job.transcript?.length > 0 && isProcessing && (() => {
+            const target = job.subtitle_language || '';
+            const source = job.language || '';
+            const translationExpected = !!target && target !== source;
+            const translationFailed = job.translation_status === 'translation_failed';
+            // Source transcript is in, but a requested translation hasn't landed
+            // yet (the short window between Whisper and the translate stage).
+            const translating = translationExpected && !hasTranslation && !translationFailed;
+            let targetLabel = '';
+            if (target) {
+              try {
+                targetLabel = new Intl.DisplayNames([navigator.language || 'en'], { type: 'language' }).of(target) || target.toUpperCase();
+              } catch { targetLabel = target.toUpperCase(); }
+            }
+            const accent = translating ? 'var(--accent-cyan)' : 'var(--success, #30D158)';
+            const bg = translating
+              ? 'var(--accent-cyan-dim, rgba(34,211,238,0.12))'
+              : 'var(--success-dim, rgba(48,209,88,0.12))';
+            return (
+              <div style={{
+                display: 'flex', alignItems: 'center', gap: 8,
+                padding: '8px 14px', marginBottom: 12,
+                background: bg, border: `1px solid ${accent}`,
+                borderRadius: 'var(--radius-sm)', fontSize: 12, color: accent, lineHeight: 1.4,
+              }}>
+                <span className={translating ? 'pulse' : undefined} style={{ fontWeight: 700 }}>
+                  {translating ? '⟳' : '✓'}
                 </span>
-              </span>
-            </div>
-          )}
+                <span>
+                  {translating
+                    ? <>Transcript ready{targetLabel ? <> — translating subtitles to {targetLabel}…</> : ' — translating subtitles…'}</>
+                    : hasTranslation
+                      ? 'Transcript complete and translated.'
+                      : 'Transcript complete.'}{' '}
+                  <span style={{ color: 'var(--text-secondary)' }}>
+                    Clip detection is still running in the background — it won't change this transcript.
+                  </span>
+                </span>
+              </div>
+            );
+          })()}
           {job.transcript?.length > 0 ? (
             <div style={{
               display: 'flex',
