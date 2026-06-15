@@ -1344,7 +1344,7 @@ export default function Settings() {
             </div>
             <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : '1fr 1fr 1fr', gap: 12 }}>
               {[
-                { label: 'Transcript', model: active.transcript_model || currentModels.transcript_model || 'small', color: 'var(--accent-amber)' },
+                { label: 'Transcript', model: active.transcript_model || currentModels.transcript_model || 'small', color: 'var(--accent-amber)', source: 'local' },
                 {
                   label: 'Primary AI',
                   model: active.replicate_available
@@ -1353,11 +1353,37 @@ export default function Settings() {
                       ? 'VideoLLaMA2.1-7B-AV'
                       : (active.primary_model || currentModels.primary_model),
                   color: 'var(--accent-cyan)',
+                  // Local clip engine = Ollama vision or local VideoLLaMA2; cloud = Replicate.
+                  source: active.primary_type
+                    ? (['ollama', 'videollama2'].includes(active.primary_type) ? 'local' : 'cloud')
+                    : null,
                 },
-                { label: 'Editorial AI', model: active.editorial_model || currentModels.editorial_model, color: 'var(--success)' },
-              ].map(({ label, model, color }) => (
+                {
+                  label: 'Editorial AI',
+                  model: active.editorial_model || currentModels.editorial_model,
+                  color: 'var(--success)',
+                  // Editorial runs on whichever provider is first in the chain —
+                  // local when that's Ollama (the "Ollama (Local)" toggle or Offline Mode).
+                  source: (active.provider && active.provider !== 'none')
+                    ? (active.provider === 'ollama' ? 'local' : 'cloud')
+                    : null,
+                },
+              ].map(({ label, model, color, source }) => (
                 <div key={label}>
-                  <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 2 }}>{label}</div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 2 }}>
+                    <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>{label}</span>
+                    {source && (
+                      <span style={{
+                        fontSize: 8, fontWeight: 700, fontFamily: 'var(--font-mono)', letterSpacing: '0.05em',
+                        padding: '1px 4px', borderRadius: 'var(--radius-sm)',
+                        color: source === 'local' ? 'var(--success, #30D158)' : 'var(--accent-cyan)',
+                        background: source === 'local' ? 'rgba(48,209,88,0.12)' : 'rgba(34,211,238,0.12)',
+                        border: `1px solid ${source === 'local' ? 'rgba(48,209,88,0.3)' : 'rgba(34,211,238,0.3)'}`,
+                      }}>
+                        {source === 'local' ? 'LOCAL' : 'CLOUD'}
+                      </span>
+                    )}
+                  </div>
                   <div style={{ fontSize: 12, fontFamily: 'var(--font-mono)', color, fontWeight: 600, wordBreak: 'break-all' }}>
                     {model ? model.replace(/^.*\//, '') : 'Not set'}
                   </div>
