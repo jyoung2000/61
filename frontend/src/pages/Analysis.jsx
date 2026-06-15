@@ -911,44 +911,48 @@ export default function Analysis() {
   // transcript (and the subtitle elements / .txt export built from it) stuck on
   // the source language across EVERY client. This pulls JUST the transcripts
   // from a lightweight endpoint and merges them in, so the English appears as
-  // soon as it's persisted, regardless of how big the rest of the job is. Runs
-  // on load, whenever the pipeline status changes, and on a short timer while
-  // the job is still running.
+  // soon as it's persisted, regardless of how big the rest of the job is.
+  // Reused by the poll below AND fired immediately on the translation / polish
+  // WS "complete" events, so the finished transcript shows within ~1s —
+  // decoupled from the clip-detection stage that keeps running after it.
+  const fetchTranscripts = useCallback(async () => {
+    if (!jobId) return;
+    try {
+      const res = await fetch(`/api/jobs/${jobId}/transcripts`);
+      if (!res.ok) return;
+      const t = await res.json();
+      const tt = Array.isArray(t.translated_transcript) ? t.translated_transcript : [];
+      const tr = Array.isArray(t.transcript) ? t.transcript : [];
+      const summary = t.summary || null;
+      setJob((prev) => {
+        if (!prev) return prev;
+        const sameTT = (tt.length || 0) === (prev.translated_transcript?.length || 0);
+        const sameTR = (tr.length || 0) === (prev.transcript?.length || 0);
+        // The summary is persisted mid-pipeline but only reaches the UI
+        // reliably through THIS lightweight poll (the full job fetch is too
+        // big to land over a tunnel). Adopt it the moment it arrives so the
+        // Summary tab stops sitting on "Generating summary…" forever.
+        const gotSummary = !!summary && !prev.summary;
+        if (sameTT && sameTR && !gotSummary) return prev;
+        return {
+          ...prev,
+          transcript: tr.length ? tr : prev.transcript,
+          translated_transcript: tt.length ? tt : (prev.translated_transcript || []),
+          summary: summary || prev.summary,
+        };
+      });
+    } catch { /* best-effort — fetchJob remains the full-payload path */ }
+  }, [jobId]);
+
+  // Runs on load, whenever the pipeline status changes, and on a short timer
+  // while the job is still running.
   useEffect(() => {
     if (!jobId) return undefined;
-    let cancelled = false;
-    const pull = async () => {
-      try {
-        const res = await fetch(`/api/jobs/${jobId}/transcripts`);
-        if (!res.ok || cancelled) return;
-        const t = await res.json();
-        const tt = Array.isArray(t.translated_transcript) ? t.translated_transcript : [];
-        const tr = Array.isArray(t.transcript) ? t.transcript : [];
-        const summary = t.summary || null;
-        setJob((prev) => {
-          if (!prev) return prev;
-          const sameTT = (tt.length || 0) === (prev.translated_transcript?.length || 0);
-          const sameTR = (tr.length || 0) === (prev.transcript?.length || 0);
-          // The summary is persisted mid-pipeline but only reaches the UI
-          // reliably through THIS lightweight poll (the full job fetch is too
-          // big to land over a tunnel). Adopt it the moment it arrives so the
-          // Summary tab stops sitting on "Generating summary…" forever.
-          const gotSummary = !!summary && !prev.summary;
-          if (sameTT && sameTR && !gotSummary) return prev;
-          return {
-            ...prev,
-            transcript: tr.length ? tr : prev.transcript,
-            translated_transcript: tt.length ? tt : (prev.translated_transcript || []),
-            summary: summary || prev.summary,
-          };
-        });
-      } catch { /* best-effort — fetchJob remains the full-payload path */ }
-    };
-    pull();
+    fetchTranscripts();
     const terminal = ['complete', 'failed', 'cancelled'].includes(String(job?.status));
-    const id = terminal ? null : setInterval(pull, 15000);
-    return () => { cancelled = true; if (id) clearInterval(id); };
-  }, [jobId, job?.status, job?.translation_status]);
+    const id = terminal ? null : setInterval(fetchTranscripts, 15000);
+    return () => { if (id) clearInterval(id); };
+  }, [jobId, job?.status, job?.translation_status, fetchTranscripts]);
 
   const handleMarkKeyScene = useCallback(async () => {
     if (!markSceneDesc.trim() || markSceneSaving) return;
@@ -1202,6 +1206,12 @@ export default function Analysis() {
             );
             // Refresh job data when background task completes (e.g., polished transcript)
             if (taskStatus === 'complete') {
+              // Pull the finished transcript over the lightweight endpoint right
+              // away (translation / polishing complete BEFORE clip detection).
+              // The full job GET can be slow or abort over a tunnel, so this is
+              // what makes the translated transcript appear within ~1s instead of
+              // looking like it's waiting on clip detection to finish.
+              fetchTranscripts();
               fetchJob();
             }
           } else if (msg.type === 'heartbeat') {
@@ -1246,7 +1256,7 @@ export default function Analysis() {
         wsRef.current = null;
       }
     };
-  }, [jobId, fetchJob, pushLog]);
+  }, [jobId, fetchJob, fetchTranscripts, pushLog]);
 
   // Periodic refresh for active jobs
   useEffect(() => {
@@ -3383,6 +3393,29 @@ export default function Analysis() {
 
       {tab === 2 && (
         <div>
+          {/* The transcript + translation finish BEFORE clip detection. Make
+              that explicit so it's clear the transcript is final and usable
+              while clips are still being generated in the background. */}
+          {job.transcript?.length > 0 && isProcessing && (
+            <div style={{
+              display: 'flex', alignItems: 'center', gap: 8,
+              padding: '8px 14px', marginBottom: 12,
+              background: 'var(--success-dim, rgba(48,209,88,0.12))',
+              border: '1px solid var(--success, #30D158)',
+              borderRadius: 'var(--radius-sm)',
+              fontSize: 12, color: 'var(--success, #30D158)', lineHeight: 1.4,
+            }}>
+              <span style={{ fontWeight: 700 }}>✓</span>
+              <span>
+                {hasTranslation
+                  ? 'Transcript complete and translated.'
+                  : 'Transcript complete.'}{' '}
+                <span style={{ color: 'var(--text-secondary)' }}>
+                  Clip detection is still running in the background — it won't change this transcript.
+                </span>
+              </span>
+            </div>
+          )}
           {job.transcript?.length > 0 ? (
             <div style={{
               display: 'flex',
