@@ -705,6 +705,20 @@ async def provider_status():
             break
 
     _videollama2_ok = _check_videollama2_available()
+    # Offline Mode auto-selects the best installed LOCAL editorial model (it
+    # overrides the configured/cloud pick at runtime — see the pipeline + the
+    # clipper judge). Reflect that here, reusing the Ollama model list already
+    # fetched above so the banner/chips show the model that will actually run.
+    if settings.resolve_ai_source("editorial") == "local":
+        try:
+            from backend.services.local_models import rank_local_editorial_models
+            _ollama_models = (statuses.get("ollama", {}) or {}).get("models_loaded", []) or []
+            _ranked = rank_local_editorial_models(_ollama_models)
+            if _ranked:
+                active_editorial_model = _ranked[0]
+                active_summary_model = _ranked[0]
+        except Exception:
+            pass
     # Offline Mode (or a per-engine "local" override) routes clip detection to
     # the local Ollama vision model — the pipeline disables Replicate in that
     # case (reframer_clipper.replicate_enabled = … and resolve_ai_source("clip")

@@ -187,6 +187,12 @@ class Settings(BaseSettings):
     SELF_HOSTED_MODE: bool = False
     CLIP_ENGINE_SOURCE: str = "auto"    # auto | local | cloud
     EDITORIAL_AI_SOURCE: str = "auto"   # auto | local | cloud
+    # Offline Mode auto-selects the best installed local (Ollama) text model for
+    # the editorial AI instead of using the configured cloud model / cloud judge
+    # fallback. Models larger than this many billion params are skipped so we
+    # never pick one that would spill off the 4 GB 1650 onto the CPU. The dropdown
+    # picks still apply when Offline Mode is off.
+    OFFLINE_EDITORIAL_MAX_PARAMS_B: float = 4.0
 
     # ── Editorial Judge specs ("<backend>:<model>") ──
     # The Editorial AI + Editorial AI Fallback dropdowns. Persisted here in

@@ -2061,7 +2061,7 @@ export default function Settings() {
                 pendingValue={pendingModels.editorial_model}
                 savedValue={currentModels.editorial_model}
                 label="Editorial AI (transcript polishing)"
-                desc="Used to polish and clean up transcript text (punctuation, proper nouns), score clips, and generate summaries/tags. It also polishes the offline-translated subtitles for readability — it never translates (translation runs fully offline via Whisper/NMT)."
+                desc="Used to polish and clean up transcript text (punctuation, proper nouns), score clips, and generate summaries/tags, and translate subtitles. Applies when Offline Mode is OFF — in Offline Mode the editorial AI is auto-set to the best installed local model that fits your GPU."
               />
               <ModelDropdown
                 task="editorial_fallback"
@@ -2069,7 +2069,7 @@ export default function Settings() {
                 pendingValue={pendingModels.editorial_model_fallback}
                 savedValue={currentModels.editorial_model_fallback}
                 label="Editorial AI Fallback"
-                desc="Used automatically when the primary Editorial AI is rate-limited or unreachable. Leave blank to disable the fallback."
+                desc="Used automatically when the primary Editorial AI is rate-limited or unreachable. Leave blank to disable. Applies when Offline Mode is OFF — in Offline Mode the fallback is the second-best installed local model (never the cloud)."
               />
 
               {/* ── Save Button ── */}

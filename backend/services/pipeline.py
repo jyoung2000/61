@@ -2528,6 +2528,31 @@ async def _run_analysis_inner(job_id: str):
         cancel_check=cancel_check,
     )
 
+    # ── Offline Mode: auto-select the best LOCAL editorial model ──
+    # In Offline Mode the editorial AI (summary/SEO/polish/translation + the
+    # clip-scoring judge) must run locally. Pick the best installed Ollama text
+    # model that fits the GPU and point the editorial provider at it, instead of
+    # the configured cloud model / cloud judge fallback. Computed once and reused
+    # for the judge specs at the clip-detection stage. Non-offline runs keep the
+    # user's dropdown picks untouched.
+    _offline_editorial_models: list[str] = []
+    if settings.resolve_ai_source("editorial") == "local":
+        try:
+            from backend.services.local_models import select_local_editorial_models
+            _offline_editorial_models = await select_local_editorial_models(limit=2)
+            if _offline_editorial_models:
+                _oll = orchestrator._providers.get("ollama")
+                if _oll is not None and getattr(_oll, "_editorial_model", None) is not None:
+                    _oll._editorial_model = _offline_editorial_models[0]
+                    _oll._summary_model = _offline_editorial_models[0]
+                logger.info(
+                    "[%s] Offline Mode editorial AI → best local model '%s' "
+                    "(fallback '%s')", job_id, _offline_editorial_models[0],
+                    _offline_editorial_models[1] if len(_offline_editorial_models) > 1 else "none",
+                )
+        except Exception as _ed_e:
+            logger.debug("[%s] offline editorial model select skipped: %s", job_id, _ed_e)
+
     # ── Pre-flight: validate AI models are reachable ──
     try:
         model_warnings = await orchestrator.validate_models(job_id)
@@ -3903,6 +3928,20 @@ async def _run_analysis_inner(job_id: str):
             clipper_config.replicate_enabled = (
                 settings.REPLICATE_ENABLED
                 and settings.resolve_ai_source("clip") == "cloud")
+            # Offline Mode: run the clip-scoring editorial judge on the local
+            # model(s) selected above — best as primary, second-best as fallback
+            # — instead of the configured judge specs, whose fallback is a cloud
+            # model (a cloud call that would otherwise break "no cloud calls").
+            if _offline_editorial_models:
+                clipper_config.judge_primary = f"ollama:{_offline_editorial_models[0]}"
+                clipper_config.judge_fallback = (
+                    f"ollama:{_offline_editorial_models[1]}"
+                    if len(_offline_editorial_models) > 1 else "")
+                logger.info(
+                    "[%s] Offline Mode clip judge → %s%s", job_id,
+                    clipper_config.judge_primary,
+                    f" → {clipper_config.judge_fallback}" if clipper_config.judge_fallback else " (no cloud fallback)",
+                )
             # Clip-generation defaults from Settings > Clip Generation.
             if settings.CLIP_MIN_DURATION:
                 clipper_config.min_duration_s = settings.CLIP_MIN_DURATION
