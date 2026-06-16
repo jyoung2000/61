@@ -401,6 +401,20 @@ class Settings(BaseSettings):
     # longer videos keep real surrounding context (qwen2.5 supports it).
     OFFLINE_TRANSLATION_MTPE_NUM_CTX: int = 8192
 
+    # ── Translation quality mode (Task 5) ──
+    # ``speed`` (default): the offline NLLB-draft → MTPE chain above — fast and
+    # GPU-friendly on a 4 GB card. ``quality``: route the offline PRIMARY
+    # translation through a larger Ollama model on CPU. You can't fit a 7-8B at
+    # GPU speed on a GTX 1650, but it runs on CPU (slow, higher quality); NLLB
+    # is the completeness backstop for any cue the big model leaves in the
+    # source language. ``quality`` only takes effect when an Ollama host +
+    # ``TRANSLATION_QUALITY_MODEL`` are configured; otherwise it transparently
+    # uses the speed chain. When ``quality`` is set, the pipeline also skips its
+    # LLM-first / Whisper-native preemptions so this CPU path is the one that
+    # runs. ``speed`` mode timing is unchanged.
+    TRANSLATION_QUALITY_MODE: str = "speed"          # speed | quality
+    TRANSLATION_QUALITY_MODEL: str = "qwen2.5:7b-instruct"
+
     # ── Music marking ──
     # Insert a "[♪ music ♪]" marker cue over sustained music regions (OP/ED
     # themes, insert songs) instead of letting Whisper hallucinate lyrics or

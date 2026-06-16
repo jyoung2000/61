@@ -558,6 +558,99 @@ class _OllamaMTPEClient:
             prompt, self._model, timeout=timeout, num_ctx=self._num_ctx)
 
 
+def translation_quality_mode_active() -> bool:
+    """True when ``TRANSLATION_QUALITY_MODE=quality`` AND an Ollama host +
+    quality model are configured (so the CPU quality path can actually run).
+
+    Imported by the pipeline so it can skip its LLM-first / Whisper-native
+    preemptions and let the offline router's quality path be the one that runs.
+    """
+    if (getattr(settings, "TRANSLATION_QUALITY_MODE", "speed") or "speed").lower() != "quality":
+        return False
+    host = (getattr(settings, "OLLAMA_HOST", "") or "").strip()
+    model = (getattr(settings, "TRANSLATION_QUALITY_MODEL", "") or "").strip()
+    return bool(host and model)
+
+
+async def _translate_quality_mode(
+    segments: list[TranscriptSegment],
+    source_language: str,
+    target_language: str,
+    glossary: dict | None,
+    status_callback=None,
+) -> list[TranscriptSegment] | None:
+    """Task 5 'quality' mode: translate the source with a larger Ollama model
+    on CPU (``TRANSLATION_QUALITY_MODEL``, e.g. qwen2.5:7b-instruct) via
+    ``translate_via_llm``, then backstop any cue it left in the source language
+    with offline NLLB.
+
+    Returns ``None`` when the quality model isn't configured or produced nothing
+    usable, so the caller falls back to the speed NMT→MTPE chain. ``speed`` mode
+    never calls this, so its timing is unchanged.
+    """
+    host = (getattr(settings, "OLLAMA_HOST", "") or "").strip()
+    model = (getattr(settings, "TRANSLATION_QUALITY_MODEL", "") or "").strip()
+    if not host or not model:
+        logger.info("Translation quality mode requested but no Ollama host / "
+                    "quality model configured — using the speed (NMT→MTPE) chain")
+        return None
+    # Honest about the cost: a 7-8B model can't run at GPU speed on a 4 GB card,
+    # so Ollama places it largely on CPU.
+    logger.warning(
+        "Translation QUALITY mode: translating via %s. A 7-8B model can't fit at "
+        "GPU speed on a 4 GB card, so Ollama runs it largely on CPU — expect this "
+        "to be SUBSTANTIALLY slower than speed mode (minutes to tens of minutes on "
+        "long videos) in exchange for higher quality.", model)
+    if status_callback:
+        try:
+            r = status_callback(f"Translating with the CPU quality model {model} (slow)…")
+            if hasattr(r, "__await__"):
+                await r
+        except Exception:
+            pass
+    num_ctx = int(getattr(settings, "OFFLINE_TRANSLATION_MTPE_NUM_CTX", 8192))
+    client = _OllamaMTPEClient(model, num_ctx)
+    try:
+        llm_out = await translate_via_llm(
+            segments, source_language, target_language, client,
+            glossary=glossary, status_callback=status_callback)
+    except Exception as e:
+        logger.warning("Translation quality mode: LLM call failed (%s) — falling "
+                       "back to the NMT→MTPE chain", e)
+        return None
+    if not llm_out:
+        logger.warning("Translation quality mode: %s produced no usable output — "
+                       "falling back to the NMT→MTPE chain", model)
+        return None
+
+    # ── NLLB completeness backstop ──────────────────────────────────────────
+    # Fill any cue the big LLM left in the source script with offline NLLB so
+    # quality mode is never LESS complete than the speed chain.
+    if (target_language or "").lower() not in _CJK_LANGS:
+        leftover = [i for i, s in enumerate(llm_out)
+                    if _cjk_ratio(_seg_text(s)) > 0.30]
+        if leftover:
+            logger.info(
+                "Translation quality mode: NLLB backstop filling %d/%d cue(s) the "
+                "quality LLM left in the source language", len(leftover), len(llm_out))
+            sub = [segments[i] for i in leftover]
+            try:
+                nllb_out = await _translate_via_nmt(
+                    sub, source_language, target_language, glossary=glossary,
+                    autodownload=bool(getattr(settings, "NMT_AUTODOWNLOAD", True)),
+                    engine_pref="nllb",
+                )
+            except Exception as e:
+                logger.warning("Translation quality mode: NLLB backstop failed (%s)", e)
+                nllb_out = None
+            if nllb_out and len(nllb_out) == len(sub):
+                for k, i in enumerate(leftover):
+                    llm_out[i] = nllb_out[k]
+    logger.info("Translation quality mode: %d cue(s) translated via %s (+ NLLB "
+                "backstop)", len(llm_out), model)
+    return llm_out
+
+
 async def mtpe_postedit_offline(
     nmt_segments: list[TranscriptSegment],
     source_segments: list | None,
@@ -1203,6 +1296,19 @@ async def translate_segments_with_fallback(
     # ── Local NMT engines (Opus-MT, NLLB) — offline default, auto-downloaded ──
     _nmt_error: Exception | None = None
     if engine in ("opus-mt", "nllb"):
+        # Quality mode (Task 5): try the larger CPU LLM + NLLB backstop first.
+        # If it's not configured / produced nothing, fall through to the speed
+        # NMT→MTPE chain below. Speed mode never enters this branch.
+        if translation_quality_mode_active():
+            try:
+                q = await _translate_quality_mode(
+                    segments, source_language, target_language,
+                    glossary, status_callback)
+                if q is not None:
+                    return q
+            except Exception as e:
+                logger.warning("Translation quality mode errored (%s) — using the "
+                               "speed NMT→MTPE chain", e)
         try:
             out = await _translate_via_nmt(
                 segments, source_language, target_language,

@@ -499,7 +499,17 @@ async def translate_subtitles(segments, source_lang, target_lang, *, video_path=
     # produced the half-Japanese "translated" track. Falls through to Whisper-
     # native / offline NMT when no LLM is available or it returns still
     # source-language. ``TRANSLATION_PREFER_LLM`` (default on) gates it.
+    #
+    # Quality mode (Task 5) routes translation through the offline NMT router's
+    # CPU quality path instead, so skip this orchestrator-LLM preemption (and
+    # the Whisper-native one below) when it is active.
+    from backend.services.translator import translation_quality_mode_active
+    _quality_mode = translation_quality_mode_active()
+    if _quality_mode:
+        logger.info("Translation quality mode active — skipping the LLM-first / "
+                    "Whisper-native paths; using the offline CPU quality path")
     if (orchestrator is not None
+            and not _quality_mode
             and getattr(settings, "TRANSLATION_PREFER_LLM", True)
             and segments and tgt and tgt != src):
         try:
@@ -533,6 +543,7 @@ async def translate_subtitles(segments, source_lang, target_lang, *, video_path=
 
     _want_whisper = (
         bool(video_path)
+        and not _quality_mode
         and getattr(settings, "WHISPER_TRANSLATE_TO_EN", True)
         and tgt == "en" and src not in ("en", "english")
     )
