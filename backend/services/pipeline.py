@@ -1216,7 +1216,12 @@ async def _refresh_clips_with_translation(
 
         new_title = judge_title or vlm_hook[:80] or (
             " ".join(new_slice.split()[:8]) or f"Clip {idx}")
-        new_hook = vlm_hook or (new_slice[:120] if new_slice else new_title)
+        # Prefer the TRANSLATED slice for the hook — vlm_hook is the VLM's
+        # source-language line, so keeping it (as before) left every hook in the
+        # source language even after translation. Use the first translated cue;
+        # fall back to vlm_hook only when the slice is empty.
+        _first_cue = new_slice.split("\n", 1)[0].strip() if new_slice else ""
+        new_hook = _first_cue[:120] or vlm_hook or new_title
         new_caption = new_slice[:150] if new_slice else new_title
         new_why = vlm_reason or (
             "Strong audio/visual engagement signals across this window.")
@@ -2528,30 +2533,35 @@ async def _run_analysis_inner(job_id: str):
         cancel_check=cancel_check,
     )
 
-    # ── Offline Mode: auto-select the best LOCAL editorial model ──
-    # In Offline Mode the editorial AI (summary/SEO/polish/translation + the
-    # clip-scoring judge) must run locally. Pick the best installed Ollama text
-    # model that fits the GPU and point the editorial provider at it, instead of
-    # the configured cloud model / cloud judge fallback. Computed once and reused
-    # for the judge specs at the clip-detection stage. Non-offline runs keep the
-    # user's dropdown picks untouched.
-    _offline_editorial_models: list[str] = []
-    if settings.resolve_ai_source("editorial") == "local":
+    # ── Local editorial model (Offline primary + cloud key-limit fallback) ──
+    # Point the Ollama provider at the best installed model that fits the GPU.
+    # In Offline Mode it's the PRIMARY editorial AI; in cloud mode it's the
+    # EDITORIAL_LOCAL_FALLBACK safety net (appended to editorial_provider_chain)
+    # that finishes summary/SEO/polish/translation + the clip judge locally when
+    # the cloud key is exhausted (the OpenRouter "Key limit exceeded" case),
+    # instead of failing. Computed once and reused for the judge specs at clip
+    # detection. Non-offline runs keep the user's dropdown picks as the primary.
+    _local_editorial_models: list[str] = []
+    _editorial_is_local = settings.resolve_ai_source("editorial") == "local"
+    _editorial_local_fallback = bool(
+        settings.EDITORIAL_LOCAL_FALLBACK and (settings.OLLAMA_HOST or "").strip())
+    if _editorial_is_local or _editorial_local_fallback:
         try:
             from backend.services.local_models import select_local_editorial_models
-            _offline_editorial_models = await select_local_editorial_models(limit=2)
-            if _offline_editorial_models:
+            _local_editorial_models = await select_local_editorial_models(limit=2)
+            if _local_editorial_models:
                 _oll = orchestrator._providers.get("ollama")
                 if _oll is not None and getattr(_oll, "_editorial_model", None) is not None:
-                    _oll._editorial_model = _offline_editorial_models[0]
-                    _oll._summary_model = _offline_editorial_models[0]
+                    _oll._editorial_model = _local_editorial_models[0]
+                    _oll._summary_model = _local_editorial_models[0]
                 logger.info(
-                    "[%s] Offline Mode editorial AI → best local model '%s' "
-                    "(fallback '%s')", job_id, _offline_editorial_models[0],
-                    _offline_editorial_models[1] if len(_offline_editorial_models) > 1 else "none",
+                    "[%s] Local editorial model '%s' wired as %s (secondary '%s')",
+                    job_id, _local_editorial_models[0],
+                    "Offline primary" if _editorial_is_local else "cloud key-limit fallback",
+                    _local_editorial_models[1] if len(_local_editorial_models) > 1 else "none",
                 )
         except Exception as _ed_e:
-            logger.debug("[%s] offline editorial model select skipped: %s", job_id, _ed_e)
+            logger.debug("[%s] local editorial model select skipped: %s", job_id, _ed_e)
 
     # ── Pre-flight: validate AI models are reachable ──
     try:
@@ -3928,19 +3938,27 @@ async def _run_analysis_inner(job_id: str):
             clipper_config.replicate_enabled = (
                 settings.REPLICATE_ENABLED
                 and settings.resolve_ai_source("clip") == "cloud")
-            # Offline Mode: run the clip-scoring editorial judge on the local
-            # model(s) selected above — best as primary, second-best as fallback
-            # — instead of the configured judge specs, whose fallback is a cloud
-            # model (a cloud call that would otherwise break "no cloud calls").
-            if _offline_editorial_models:
-                clipper_config.judge_primary = f"ollama:{_offline_editorial_models[0]}"
-                clipper_config.judge_fallback = (
-                    f"ollama:{_offline_editorial_models[1]}"
-                    if len(_offline_editorial_models) > 1 else "")
+            # Clip-scoring editorial judge → local model.
+            #  • Offline Mode: local best as primary, second-best as fallback —
+            #    instead of the configured judge specs, whose fallback is a cloud
+            #    model (a cloud call that would break "no cloud calls").
+            #  • Cloud + EDITORIAL_LOCAL_FALLBACK: keep the cloud judge primary but
+            #    set the FALLBACK to the local model, so when the cloud key is
+            #    exhausted the judge still scores clips locally (otherwise scoring
+            #    silently degrades to signal-only and ranks clips 1–100 by audio
+            #    /visual heuristics, the symptom on the key-limited run).
+            if _local_editorial_models:
+                if _editorial_is_local:
+                    clipper_config.judge_primary = f"ollama:{_local_editorial_models[0]}"
+                    clipper_config.judge_fallback = (
+                        f"ollama:{_local_editorial_models[1]}"
+                        if len(_local_editorial_models) > 1 else "")
+                elif not (clipper_config.judge_fallback or "").startswith("ollama:"):
+                    clipper_config.judge_fallback = f"ollama:{_local_editorial_models[0]}"
                 logger.info(
-                    "[%s] Offline Mode clip judge → %s%s", job_id,
-                    clipper_config.judge_primary,
-                    f" → {clipper_config.judge_fallback}" if clipper_config.judge_fallback else " (no cloud fallback)",
+                    "[%s] Clip judge → %s%s", job_id,
+                    clipper_config.judge_primary or "(configured)",
+                    f" → {clipper_config.judge_fallback}" if clipper_config.judge_fallback else " (no fallback)",
                 )
             # Clip-generation defaults from Settings > Clip Generation.
             if settings.CLIP_MIN_DURATION:

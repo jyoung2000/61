@@ -193,6 +193,12 @@ class Settings(BaseSettings):
     # never pick one that would spill off the 4 GB 1650 onto the CPU. The dropdown
     # picks still apply when Offline Mode is off.
     OFFLINE_EDITORIAL_MAX_PARAMS_B: float = 4.0
+    # When the cloud editorial chain is exhausted (e.g. an OpenRouter "Key limit
+    # exceeded" 403), fall back to the local Ollama model for editorial tasks
+    # (summary/SEO/polish/translation + the clip-scoring judge) so a run still
+    # finishes on the GPU instead of failing. Only adds the fallback when an
+    # Ollama host is configured; set False to keep cloud-only behavior.
+    EDITORIAL_LOCAL_FALLBACK: bool = True
 
     # ── Editorial Judge specs ("<backend>:<model>") ──
     # The Editorial AI + Editorial AI Fallback dropdowns. Persisted here in
@@ -459,6 +465,24 @@ class Settings(BaseSettings):
             cloud = [p for p in chain if p != "ollama"]
             if cloud:
                 return cloud + ["ollama"]
+        return chain
+
+    @property
+    def editorial_provider_chain(self) -> list[str]:
+        """Chain the AI orchestrator actually executes for editorial tasks.
+
+        Same as ``active_provider_chain`` but, in cloud mode with
+        ``EDITORIAL_LOCAL_FALLBACK`` on and an Ollama host configured, appends a
+        local Ollama last-resort fallback so summary / SEO / polish / translation
+        survive a cloud key-limit by finishing on the GPU. The displayed
+        ``active_provider_chain`` stays cloud-only so the status banner and the
+        "Ollama (Local)" toggle aren't muddied by the safety-net entry."""
+        chain = self.active_provider_chain
+        if (self.EDITORIAL_LOCAL_FALLBACK
+                and self.resolve_ai_source("editorial") == "cloud"
+                and (self.OLLAMA_HOST or "").strip()
+                and "ollama" not in chain):
+            return chain + ["ollama"]
         return chain
 
     def resolve_ai_source(self, engine: str) -> str:

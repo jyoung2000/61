@@ -872,8 +872,19 @@ async def generate_clips_endpoint(
     cancel_event = asyncio.Event()
     _clip_cancel_events[job_id] = cancel_event
 
-    # Capture job data at request time so background task uses fresh data
-    transcript = job.transcript
+    # Capture job data at request time so background task uses fresh data.
+    # Prefer the TRANSLATED transcript when the job was translated, so
+    # regenerated clips get their caption / hook / title in the target language
+    # (the clipper builds those from this transcript). Without this, on-demand
+    # "Generate Clips" rebuilt them from the source-language transcript and the
+    # cards came back in the original language even though subtitles were
+    # translated. The main pipeline's post-translation refresh does not run for
+    # this endpoint, so the transcript choice here is what the cards inherit.
+    transcript = (
+        job.translated_transcript
+        if getattr(job, "translated_transcript", None)
+        else job.transcript
+    )
     scenes = job.scenes
     duration = job.duration
 

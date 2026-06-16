@@ -146,7 +146,11 @@ class TestOrchestratorActiveChain(unittest.TestCase):
     @patch("backend.services.ai_orchestrator.settings")
     @patch("backend.services.ai_orchestrator._build_provider")
     def test_active_chain_skips_degraded(self, mock_build, mock_settings):
+        # The orchestrator builds + walks its chain via editorial_provider_chain
+        # (active_provider_chain + a local fallback in cloud mode); set both so
+        # the MagicMock doesn't hand back an auto-attribute for the real read.
         mock_settings.active_provider_chain = ["openrouter", "gemini"]
+        mock_settings.editorial_provider_chain = ["openrouter", "gemini"]
 
         mock_provider_or = MagicMock()
         mock_provider_or.provider_name = "openrouter"

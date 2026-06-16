@@ -172,7 +172,7 @@ class AIOrchestrator:
         # so we don't burn 30s on every job trying to hit a dead daemon
         # before falling back to OpenRouter.
         self._unreachable: set[str] = set()
-        for name in settings.active_provider_chain:
+        for name in settings.editorial_provider_chain:
             p = _build_provider(name)
             if p:
                 self._providers[name] = p
@@ -439,7 +439,7 @@ class AIOrchestrator:
         chain = []
         skipped = []
         unreachable = []
-        for name in settings.active_provider_chain:
+        for name in settings.editorial_provider_chain:
             if name in self._unreachable:
                 unreachable.append(name)
                 continue
