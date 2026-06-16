@@ -2681,12 +2681,34 @@ async def save_self_hosted_settings(req: SaveSelfHostedRequest):
     """Save self-hosted-mode settings. Routing is read live via
     settings.resolve_ai_source(), so no restart is needed."""
     _allowed = {"auto", "local", "cloud"}
+    was_self_hosted = bool(settings.SELF_HOSTED_MODE)
     if req.self_hosted_mode is not None:
         settings.SELF_HOSTED_MODE = bool(req.self_hosted_mode)
     if req.clip_engine_source in _allowed:
         settings.CLIP_ENGINE_SOURCE = req.clip_engine_source
     if req.editorial_ai_source in _allowed:
         settings.EDITORIAL_AI_SOURCE = req.editorial_ai_source
+
+    # Turning Offline Mode OFF must genuinely hand primary/editorial back to the
+    # cloud. Selecting Ollama models (Save Models) or the "Ollama (Local)" toggle
+    # pins ``ollama`` at the FRONT of AI_FALLBACK_CHAIN, and provider_status picks
+    # the first reachable provider in that chain — so Ollama would stay the active
+    # provider even though editorial now resolves to "cloud", and the cloud /
+    # Replicate engines would never reappear in the UI. On the on→off transition,
+    # demote Ollama to the END of the chain: configured cloud providers lead again
+    # while Ollama remains a last-resort fallback. (Turning it back ON re-routes to
+    # Ollama via active_provider_chain, which forces ["ollama"].)
+    if was_self_hosted and not settings.SELF_HOSTED_MODE:
+        chain = [p.strip() for p in settings.AI_FALLBACK_CHAIN.split(",") if p.strip()]
+        if len(chain) > 1 and chain[0] == "ollama":
+            chain = [p for p in chain if p != "ollama"] + ["ollama"]
+            settings.AI_FALLBACK_CHAIN = ",".join(chain)
+            env_path = _find_env_file()
+            if env_path:
+                _upsert_env_var(env_path, "AI_FALLBACK_CHAIN", settings.AI_FALLBACK_CHAIN)
+            logger.info("Offline Mode off — demoted Ollama to end of fallback chain: %s",
+                        settings.AI_FALLBACK_CHAIN)
+
     _invalidate_status_cache()
     _persist_user_settings()
     return {"status": "saved", **_self_hosted_state()}

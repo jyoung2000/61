@@ -443,10 +443,23 @@ class Settings(BaseSettings):
 
     @property
     def active_provider_chain(self) -> list[str]:
-        # Self-hosted mode routes every editorial LLM task to local Ollama.
+        # Self-hosted / local editorial routes every editorial LLM task to local
+        # Ollama ONLY — no cloud fallback (Offline Mode must make no cloud calls).
         if self.resolve_ai_source("editorial") == "local":
             return ["ollama"]
-        return [p.strip() for p in self.AI_FALLBACK_CHAIN.split(",") if p.strip()]
+        chain = [p.strip() for p in self.AI_FALLBACK_CHAIN.split(",") if p.strip()]
+        # An explicit "Editorial AI → Cloud" override must put a cloud provider
+        # first even if a local Ollama is pinned at the front of the chain (from
+        # selecting Ollama models or the Ollama-Local toggle). Otherwise
+        # provider_status keeps Ollama as the active editorial provider and the
+        # cloud / Replicate engines never reappear. Demote Ollama to a trailing
+        # fallback. (A plain "auto" chain is left as-is so the Ollama-Local toggle
+        # keeps its intended local-primary-with-cloud-fallback behavior.)
+        if self.EDITORIAL_AI_SOURCE == "cloud" and "ollama" in chain:
+            cloud = [p for p in chain if p != "ollama"]
+            if cloud:
+                return cloud + ["ollama"]
+        return chain
 
     def resolve_ai_source(self, engine: str) -> str:
         """Return 'local' or 'cloud' for an engine ('clip' | 'editorial'),
