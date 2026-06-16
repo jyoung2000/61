@@ -355,13 +355,20 @@ class Settings(BaseSettings):
     GOOGLE_TRANSLATE_API_KEY: str = ""          # for Google Cloud Translation v3
     DEEPL_API_KEY: str = ""                     # for DeepL API
     # NMT model identifiers — downloaded on demand (NOT at startup).
-    NMT_NLLB_MODEL: str = "facebook/nllb-200-distilled-600M"
+    # Default to NLLB-200-distilled-1.3B: markedly more fluent than the 600M
+    # and the int8 CT2 copy (~1.3-1.5 GB) still fits the freed VRAM on a 4 GB
+    # GTX 1650 (translation runs AFTER analysis releases Whisper's VRAM); it
+    # falls back to CPU int8 if VRAM is short. On an even smaller card, pin back
+    # to the lighter model with the env override
+    # ``NMT_NLLB_MODEL=facebook/nllb-200-distilled-600M``.
+    NMT_NLLB_MODEL: str = "facebook/nllb-200-distilled-1.3B"
     NMT_OPUS_MT_TEMPLATE: str = "Helsinki-NLP/opus-mt-{src}-{tgt}"
     # Auto-download the offline NMT model the first time a translation needs
     # it (no manual Settings step). When ``auto`` resolves to a local engine
     # but nothing is on disk yet, the translator fetches + converts NLLB-200
-    # (a one-time ~600 MB int8 download), then translates fully offline. The
-    # LLM path is only used as a last resort if the download itself fails.
+    # (a one-time int8 download: ~1.3-1.5 GB for the 1.3B default, ~600 MB for
+    # the 600M), then translates fully offline. The LLM path is only used as a
+    # last resort if the download itself fails.
     NMT_AUTODOWNLOAD: bool = True
     # Each Opus-MT language pair is a separate model dir. Cap how many pairs
     # we keep on disk; least-recently-used pair dirs beyond the cap are pruned

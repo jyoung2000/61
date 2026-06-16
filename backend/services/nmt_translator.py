@@ -5,7 +5,9 @@ Models are downloaded on demand (NEVER at startup) — call
 ``ensure_nllb_downloaded()`` from a UI button or CLI before first use.
 
 Two engines:
-  - NLLB-200-distilled-600M: 200 languages, ~600 MB int8, broadest coverage.
+  - NLLB-200-distilled: 200 languages, broadest coverage. Default is the
+    1.3B distilled (~1.3-1.5 GB int8, markedly more fluent); the 600M
+    (~600 MB int8) is a lighter env-pinned fallback for smaller cards.
   - Opus-MT (Helsinki-NLP/opus-mt-{src}-{tgt}): per-pair, 250-350 MB, fastest.
 
 Both implementations are guarded by ``is_available()`` so callers can
@@ -28,15 +30,35 @@ logger = logging.getLogger(__name__)
 
 # Rough free-disk floors required before a download/convert starts. The HF
 # converter pulls the full-precision model into a cache, then writes the
-# smaller int8 CTranslate2 copy — so we need headroom for BOTH transiently.
-# NLLB-200-distilled-600M is ~2.4 GB fp32 on the Hub + ~0.6 GB int8 out.
-_NLLB_MIN_FREE_BYTES = 6 * 1024 ** 3   # 6 GB headroom for HF cache + int8 out
-_OPUS_MIN_FREE_BYTES = 3 * 1024 ** 3   # 3 GB headroom per Opus-MT pair
+# smaller int8 CTranslate2 copy — so we need headroom for BOTH transiently
+# (the fp32 cache is deleted by ``_hf_cache_redirect`` once the int8 is out).
+#   * NLLB-200-distilled-600M: ~2.4 GB fp32 on the Hub + ~0.6 GB int8 out.
+#   * NLLB-200-distilled-1.3B: ~5.5 GB fp32 on the Hub + ~1.3-1.5 GB int8 out.
+_NLLB_MIN_FREE_BYTES = 8 * 1024 ** 3        # 1.3B (default): fp32 cache + int8 out
+_NLLB_600M_MIN_FREE_BYTES = 6 * 1024 ** 3   # 600M (env-pinned fallback)
+_OPUS_MIN_FREE_BYTES = 3 * 1024 ** 3        # 3 GB headroom per Opus-MT pair
 
-# Free VRAM (GB) needed to load NLLB-600M int8 on CUDA: ~1 GB weights + CT2
-# activation workspace + margin. Above this, NMT_DEVICE=auto uses the GPU even
-# on a 4 GB card (Whisper VRAM is released before translation); below it, CPU.
-_NLLB_CUDA_MIN_FREE_GB = 1.8
+# Free VRAM (GB) needed to load NLLB int8 on CUDA: weights + CT2 activation
+# workspace + margin. Above this, NMT_DEVICE=auto uses the GPU even on a 4 GB
+# card (Whisper VRAM is released before translation); below it, CPU. Scaled by
+# model size — the 1.3B int8 (~1.3-1.5 GB) needs more headroom than the 600M.
+_NLLB_CUDA_MIN_FREE_GB = 1.8           # 600M: ~1 GB weights + workspace + margin
+_NLLB_1P3B_CUDA_MIN_FREE_GB = 2.4      # 1.3B: ~1.5 GB weights + workspace + margin
+
+
+def _is_nllb_1p3b(model_id: Optional[str]) -> bool:
+    """True for the 1.3B-distilled checkpoint (larger disk + VRAM footprint)."""
+    return "1.3b" in (model_id or "").lower()
+
+
+def _nllb_min_free_bytes(model_id: Optional[str]) -> int:
+    """Disk-headroom floor for downloading/converting ``model_id``."""
+    return _NLLB_MIN_FREE_BYTES if _is_nllb_1p3b(model_id) else _NLLB_600M_MIN_FREE_BYTES
+
+
+def _nllb_cuda_min_free_gb(model_id: Optional[str]) -> float:
+    """Free-VRAM floor for loading ``model_id`` int8 on CUDA."""
+    return _NLLB_1P3B_CUDA_MIN_FREE_GB if _is_nllb_1p3b(model_id) else _NLLB_CUDA_MIN_FREE_GB
 
 
 # ── ISO 639-1 → Flores-200 mapping for NLLB ──────────────────────────────
@@ -543,31 +565,33 @@ class NMTTranslator:
         import sentencepiece as spm
 
         device = self.device
+        min_free_gb = _nllb_cuda_min_free_gb(self.model_id)
         if device == "auto":
             try:
                 import torch
                 if torch.cuda.is_available():
-                    # NLLB-600M int8 is small (~1 GB). Translation runs AFTER the
-                    # reframer releases Whisper's VRAM, so the GPU is usually free
-                    # by now — decide on FREE VRAM, not total card size, and use
-                    # the GPU whenever the model + workspace genuinely fit (the
-                    # GTX 1650's CPU path is many times slower). A CUDA OOM at
-                    # load time still retries on CPU below, so cuda is never fatal.
+                    # NLLB int8 is small (600M ~1 GB, 1.3B ~1.3-1.5 GB).
+                    # Translation runs AFTER the reframer releases Whisper's VRAM,
+                    # so the GPU is usually free by now — decide on FREE VRAM, not
+                    # total card size, against THIS model's footprint, and use the
+                    # GPU whenever the model + workspace genuinely fit (the GTX
+                    # 1650's CPU path is many times slower). A CUDA OOM at load
+                    # time still retries on CPU below, so cuda is never fatal.
                     torch.cuda.empty_cache()
                     free_gb = torch.cuda.mem_get_info()[0] / 1_073_741_824
-                    if free_gb >= _NLLB_CUDA_MIN_FREE_GB:
+                    if free_gb >= min_free_gb:
                         device = "cuda"
                         logger.info(
                             "NMT: NMT_DEVICE=auto → cuda (%.1f GB VRAM free ≥ %.1f GB "
-                            "needed for NLLB int8; GPU is much faster than CPU)",
-                            free_gb, _NLLB_CUDA_MIN_FREE_GB,
+                            "needed for %s int8; GPU is much faster than CPU)",
+                            free_gb, min_free_gb, self.model_id,
                         )
                     else:
                         device = "cpu"
                         logger.info(
                             "NMT: NMT_DEVICE=auto → cpu (only %.1f GB VRAM free < %.1f GB "
-                            "needed for NLLB int8 — CPU is the OOM-safe choice)",
-                            free_gb, _NLLB_CUDA_MIN_FREE_GB,
+                            "needed for %s int8 — CPU is the OOM-safe choice)",
+                            free_gb, min_free_gb, self.model_id,
                         )
                 else:
                     device = "cpu"
@@ -954,10 +978,10 @@ def _convert_with_cleanup(
     """Convert ``model_id`` to an int8 CTranslate2 model at ``target_dir``.
 
     Network: the converter pulls the source weights from Hugging Face, so
-    ``huggingface.co`` must be reachable. For NLLB-200 that is a ~2.5 GB
-    transient full-precision download into a redirected HF cache; only the
-    ~600 MB int8 CT2 model is kept (the cache is deleted by
-    ``_hf_cache_redirect``).
+    ``huggingface.co`` must be reachable. For NLLB-200 that is a transient
+    full-precision download into a redirected HF cache (~2.5 GB for the 600M,
+    ~5.5 GB for the 1.3B); only the int8 CT2 model is kept (~600 MB / ~1.3-1.5
+    GB respectively — the fp32 cache is deleted by ``_hf_cache_redirect``).
 
     The convert is done into a **fresh temp dir** on the same volume and then
     promoted onto ``target_dir`` with an atomic ``os.replace``. This is
@@ -1050,8 +1074,8 @@ def ensure_nllb_downloaded(
     ``RuntimeError`` if dependencies are missing or ``OSError`` when the
     models volume is out of space. Safe to call repeatedly — does nothing
     when the converted model already exists. The multi-GB full-precision HF
-    model pulled during conversion is removed afterwards; only the ~600 MB
-    int8 CT2 model is kept.
+    model pulled during conversion is removed afterwards; only the int8 CT2
+    model is kept (~600 MB for the 600M, ~1.3-1.5 GB for the 1.3B default).
     """
     from backend.config import settings as _settings
     model_id = model_id or _settings.NMT_NLLB_MODEL
@@ -1075,10 +1099,11 @@ def ensure_nllb_downloaded(
             logger.info("NLLB %s repaired (tokenizer added) at %s", model_id, target_dir)
             return target_dir
         logger.warning("NLLB %s tokenizer repair did not complete — re-converting", model_id)
-    _require_free_space(target_dir, _NLLB_MIN_FREE_BYTES, f"NLLB ({model_id})")
+    _require_free_space(target_dir, _nllb_min_free_bytes(model_id), f"NLLB ({model_id})")
+    _int8_hint = "~1.3-1.5 GB" if _is_nllb_1p3b(model_id) else "~600 MB"
     logger.info(
-        "NMT: downloading + converting NLLB %s (one-time, ~600 MB int8) → %s",
-        model_id, target_dir,
+        "NMT: downloading + converting NLLB %s (one-time, %s int8) → %s",
+        model_id, _int8_hint, target_dir,
     )
     _convert_with_cleanup(
         model_id, target_dir, f"NLLB {model_id}",
