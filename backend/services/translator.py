@@ -144,6 +144,20 @@ async def translate_via_llm(
     def _txt(s):
         return (s.get("text", "") if isinstance(s, dict) else getattr(s, "text", "")) or ""
 
+    # Auto-derive a glossary of recurring proper nouns from the WHOLE transcript
+    # (not per-batch) so names render consistently and coined nouns are
+    # transliterated, not translated into ordinary words. Content-agnostic.
+    _auto_terms = ""
+    if getattr(settings, "TRANSLATION_AUTO_GLOSSARY", True):
+        try:
+            from backend.services.glossary import build_translation_glossary_block
+            _auto_terms = build_translation_glossary_block(segments, source_language, tgt_name)
+            if _auto_terms:
+                logger.info("LLM translate: attached recurring-terms glossary "
+                            "(%d term chars) for consistency", len(_auto_terms))
+        except Exception as _g_e:
+            logger.debug("auto-glossary skipped: %s", _g_e)
+
     async def _call(batch) -> Optional[list[str]]:
         lines = [_txt(s) for s in batch]
         numbered = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(lines))
@@ -155,10 +169,14 @@ async def translate_via_llm(
             f"- Translate ALL lines, including song lyrics, narration and exclamations. "
             f"NEVER leave a line in {src_name}.\n"
             "- Preserve honorifics (-san, -kun, -chan, -sama) and proper nouns "
-            "(character and mecha names).\n"
+            "(names of people, places, organizations, products); transliterate "
+            "names rather than translating them into ordinary words.\n"
+            "- Translate faithfully: never summarise, merge meaning, or invent "
+            "words to fill a gap. If unsure, translate as literally as possible.\n"
             "- Exactly one output per input line; never merge, split, add or drop lines.\n"
             f"- Output ONLY a JSON array of exactly {len(lines)} {tgt_name} strings, in order. "
             "No commentary, no numbering.\n\n"
+            f"{_auto_terms}"
             f"Lines:\n{numbered}"
         )
         try:
@@ -628,6 +646,16 @@ async def translate_segments(
     context_window = max(0, min(20, int(context_window)))
     use_glossary = bool(getattr(settings, "TRANSLATION_GLOSSARY_ENABLED", True))
     glossary_block = _format_glossary_block(glossary) if use_glossary else ""
+    # Auto-derived recurring proper-noun glossary (content-agnostic, built once
+    # from all segments) — keeps names consistent across batches.
+    auto_terms_block = ""
+    if bool(getattr(settings, "TRANSLATION_AUTO_GLOSSARY", True)):
+        try:
+            from backend.services.glossary import build_translation_glossary_block
+            auto_terms_block = build_translation_glossary_block(
+                segments, source_language, target_name)
+        except Exception:
+            auto_terms_block = ""
 
     translated = []
     total_batches = (len(segments) + batch_size - 1) // batch_size
@@ -655,7 +683,7 @@ async def translate_segments(
             context_section += "\n"
 
         seg_texts = [{"index": i, "text": seg.text} for i, seg in enumerate(batch)]
-        prompt = glossary_block + TRANSLATION_PROMPT.format(
+        prompt = glossary_block + auto_terms_block + TRANSLATION_PROMPT.format(
             source_lang=source_name,
             target_lang=target_name,
             count=len(batch),

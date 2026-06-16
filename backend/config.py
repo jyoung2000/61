@@ -342,6 +342,12 @@ class Settings(BaseSettings):
     WHISPER_TRANSLATE_MIN_COVERAGE: float = 0.6
     TRANSLATION_CONTEXT_WINDOW: int = 5         # segments before/after for context
     TRANSLATION_GLOSSARY_ENABLED: bool = True   # per-video KNP glossary support
+    # Auto-derive a per-video glossary of recurring proper nouns from the source
+    # transcript and feed it to the translator so recurring names render
+    # consistently (no "Relena/Lillian/Liliana" drift) and coined nouns are
+    # transliterated, not translated into ordinary words. Content-agnostic; works
+    # in any source language. Set False to disable the auto glossary.
+    TRANSLATION_AUTO_GLOSSARY: bool = True
     # Push the LLM translator toward natural, idiomatic English (dub/localization
     # phrasing) instead of a structurally-literal rendering — while preserving
     # the exact meaning. Set False to revert to the plain faithful style.
