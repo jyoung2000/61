@@ -185,6 +185,83 @@ def _split_for_nmt(text: str, max_chars: int, cjk: bool) -> list[str]:
     return [p.strip() for p in pieces if p.strip()]
 
 
+# ── Anti-repetition decode kwargs (NLLB / Opus-MT) ───────────────────────
+# NLLB-distilled + Opus-MT loop on run-on cues (the same degenerate-repeat
+# failure the Whisper path already guards via reframer_audio._decoding_kwargs).
+# These CTranslate2 kwargs make the decoder reject verbatim n-gram loops and
+# penalise token-level repetition. CTranslate2 >= 4.0 (pinned in requirements)
+# supports both.
+_CT2_ANTI_REPEAT = {
+    "repetition_penalty": 1.1,
+    "no_repeat_ngram_size": 3,
+}
+# Cached subset of the above the installed build accepts. ``None`` until first
+# detected; set to ``{}`` if a call ever proves them unsupported (self-heal).
+_CT2_DECODE_KWARGS: Optional[dict] = None
+
+
+def _ct2_decode_kwargs() -> dict:
+    """Anti-repetition decode kwargs to pass to CTranslate2's
+    ``Translator.translate_batch``, feature-detected once (mirrors
+    ``reframer_audio._decoding_kwargs``' intent so an unexpectedly-old build
+    never raises on an unknown kwarg).
+
+    ``translate_batch`` is a pybind11 binding whose signature
+    ``inspect.signature`` usually CANNOT read, so we also scan the docstring
+    (pybind11 embeds the call signature there). On the pinned >= 4.0 build both
+    kwargs are present; when neither source is readable (e.g. ``python -OO``
+    strips docstrings) we still pass them — ``_ct2_translate_batch`` self-heals
+    by dropping them if a call ever rejects them.
+    """
+    global _CT2_DECODE_KWARGS
+    if _CT2_DECODE_KWARGS is not None:
+        return dict(_CT2_DECODE_KWARGS)
+    try:
+        import inspect
+        import ctranslate2
+        fn = ctranslate2.Translator.translate_batch
+        try:
+            names = set(inspect.signature(fn).parameters)
+        except (TypeError, ValueError):
+            names = set()
+        doc = fn.__doc__ or ""
+        detected = {k: v for k, v in _CT2_ANTI_REPEAT.items()
+                    if k in names or k in doc}
+        if detected:
+            _CT2_DECODE_KWARGS = dict(detected)
+            return dict(detected)
+    except Exception:
+        # ctranslate2 not importable here; the real call path imports it first.
+        return dict(_CT2_ANTI_REPEAT)
+    # Signature + docstring both unreadable — pass anyway (build is >= 4.0) and
+    # let the call-site self-heal demote to {} if it's genuinely unsupported.
+    return dict(_CT2_ANTI_REPEAT)
+
+
+def _ct2_translate_batch(translator, source_list, **kwargs):
+    """``translator.translate_batch`` with anti-repetition kwargs injected.
+
+    Self-heals on an unexpectedly-old CTranslate2 build: if the call raises a
+    ``TypeError`` about an unexpected keyword, the anti-repeat kwargs are
+    dropped (cached as unsupported) and the call is retried once — so the
+    decode still runs, just without the loop guard, instead of failing.
+    """
+    global _CT2_DECODE_KWARGS
+    extra = _ct2_decode_kwargs()
+    try:
+        return translator.translate_batch(source_list, **kwargs, **extra)
+    except TypeError as e:
+        msg = str(e)
+        if extra and ("repetition_penalty" in msg or "no_repeat_ngram_size" in msg
+                      or "unexpected keyword" in msg):
+            logger.warning(
+                "NMT: CTranslate2 rejected anti-repetition kwargs (%s) — retrying "
+                "without them (older build); loop guard disabled", e)
+            _CT2_DECODE_KWARGS = {}
+            return translator.translate_batch(source_list, **kwargs)
+        raise
+
+
 # ── Disk locations ────────────────────────────────────────────────────────
 
 def _models_dir() -> str:
@@ -638,10 +715,11 @@ class NMTTranslator:
         # truncated long cues) — but keep a ceiling so a degenerate input can't
         # run away.
         max_dec = min(512, max(128, len(tokens) * 3))
-        output = self._translator.translate_batch(
+        output = _ct2_translate_batch(
+            self._translator,
             [source],
             target_prefix=[[flores_tgt]],
-            beam_size=4,
+            beam_size=5,
             max_decoding_length=max_dec,
         )
         pieces = output[0].hypotheses[0]
@@ -789,9 +867,10 @@ class OpusMTTranslator:
                 for ch in chunks:
                     tokens = self._tokenizer.encode_as_pieces(ch)
                     max_dec = min(512, max(128, len(tokens) * 3))
-                    output = self._translator.translate_batch(
+                    output = _ct2_translate_batch(
+                        self._translator,
                         [tokens + ["</s>"]],
-                        beam_size=4,
+                        beam_size=5,
                         max_decoding_length=max_dec,
                     )
                     parts.append(self._tokenizer.decode(output[0].hypotheses[0]))
