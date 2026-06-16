@@ -2043,6 +2043,16 @@ async def _background_post_processing(
                 # translation is final; skip the post-edit.
                 logger.info("[%s] AI post-edit skipped — the LLM produced the "
                             "translation directly (no post-edit needed)", job_id)
+            elif (not _used_whisper_native
+                  and bool(getattr(settings, "OFFLINE_TRANSLATION_MTPE_ENABLED", True))
+                  and (getattr(settings, "OLLAMA_HOST", "") or "").strip()
+                  and (getattr(settings, "OLLAMA_TRANSLATION_MODEL", "") or "").strip()):
+                # The offline NMT path already ran a dedicated MTPE post-edit
+                # (NLLB/Opus draft → OLLAMA_TRANSLATION_MODEL) inside
+                # translate_segments_with_fallback; don't double-edit it here
+                # with the orchestrator's (possibly different) editorial model.
+                logger.info("[%s] AI post-edit skipped — offline NMT path already "
+                            "MTPE-polished the draft (OLLAMA_TRANSLATION_MODEL)", job_id)
             else:
                 logger.info(
                     "[%s] AI post-edit START on translated text (lang=%s, %d segments, "

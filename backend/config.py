@@ -384,6 +384,23 @@ class Settings(BaseSettings):
     # ``cpu`` to force CPU everywhere. Opus-MT always runs on CPU.
     NMT_DEVICE: str = "auto"                    # auto | cpu | cuda
 
+    # ── Offline translation MTPE (machine-translation post-editing) ──
+    # After the offline NMT engine (NLLB / Opus-MT) produces a fluent DRAFT,
+    # post-edit it with the dedicated local translation model
+    # (``OLLAMA_TRANSLATION_MODEL``, e.g. qwen2.5:3b) acting as an MT
+    # post-editor: fix fluency / honorifics / idioms / glossary consistency
+    # against the source — NOT a cold re-translation. Small models post-edit
+    # far better than they translate from scratch, so NLLB-draft → MTPE is the
+    # offline parity move. Cue count + timing are preserved; a bad/short
+    # response falls back to the raw NLLB draft (fail-soft). Only runs when an
+    # Ollama host + translation model are configured. Set False to ship the raw
+    # NMT draft. (Also respects TRANSCRIPT_POLISHING_ENABLED, the master LLM-
+    # polish switch.)
+    OFFLINE_TRANSLATION_MTPE_ENABLED: bool = True
+    # Context window for the MTPE pass. Raised from the old 4096 toward 8192 so
+    # longer videos keep real surrounding context (qwen2.5 supports it).
+    OFFLINE_TRANSLATION_MTPE_NUM_CTX: int = 8192
+
     # ── Music marking ──
     # Insert a "[♪ music ♪]" marker cue over sustained music regions (OP/ED
     # themes, insert songs) instead of letting Whisper hallucinate lyrics or

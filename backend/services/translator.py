@@ -514,8 +514,13 @@ async def _translate_batch_via_ollama(
     prompt: str,
     model: str,
     timeout: float = 180.0,
+    num_ctx: int = 4096,
 ) -> str:
-    """Call Ollama chat API directly with a dedicated translation model."""
+    """Call Ollama chat API directly with a dedicated translation model.
+
+    ``num_ctx`` is configurable so the MTPE post-edit pass can use a larger
+    context window (8192) and keep real surrounding context on long videos.
+    """
     host = settings.OLLAMA_HOST
     async with httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=15.0)) as client:
         resp = await client.post(
@@ -525,7 +530,7 @@ async def _translate_batch_via_ollama(
                 "messages": [{"role": "user", "content": prompt}],
                 "stream": False,
                 "options": {
-                    "num_ctx": 4096,
+                    "num_ctx": int(num_ctx),
                     "temperature": 0.3,
                     "num_predict": 4096,
                 },
@@ -534,6 +539,127 @@ async def _translate_batch_via_ollama(
         resp.raise_for_status()
         data = resp.json()
         return data.get("message", {}).get("content", "")
+
+
+class _OllamaMTPEClient:
+    """Minimal orchestrator-shaped client so ``transcript_polisher.
+    correct_transcript`` can post-edit the offline NMT draft with the DEDICATED
+    local translation model (``OLLAMA_TRANSLATION_MODEL``) at a larger context
+    window — reusing the polisher's MTPE persona, batching, strict JSON-array +
+    count check, and timing-preserving round-trip without the full
+    ``AIOrchestrator`` / its (possibly cloud) editorial model."""
+
+    def __init__(self, model: str, num_ctx: int):
+        self._model = model
+        self._num_ctx = int(num_ctx)
+
+    async def text_completion(self, prompt: str, timeout: float = 90.0, **_kwargs) -> str:
+        return await _translate_batch_via_ollama(
+            prompt, self._model, timeout=timeout, num_ctx=self._num_ctx)
+
+
+async def mtpe_postedit_offline(
+    nmt_segments: list[TranscriptSegment],
+    source_segments: list | None,
+    source_language: str,
+    target_language: str,
+    glossary: dict | None = None,
+    status_callback=None,
+) -> list[TranscriptSegment]:
+    """MTPE post-edit of the offline NLLB / Opus-MT draft (Task 4).
+
+    Feeds (source cue, NMT draft, surrounding context, glossary) to the local
+    editorial model via the existing MTPE persona in ``transcript_polisher``,
+    asking it to fix fluency / honorifics / idioms / glossary consistency —
+    explicitly NOT to re-translate from scratch and NOT to alter timing or cue
+    count. Small models post-edit far better than they translate cold, so this
+    is the offline-quality parity move over the raw NLLB draft.
+
+    Gated by ``OFFLINE_TRANSLATION_MTPE_ENABLED`` (default on) and only runs
+    when an Ollama host + ``OLLAMA_TRANSLATION_MODEL`` are configured. Fail-soft:
+    returns the raw NMT draft unchanged on any error, a bad/short response, a
+    count mismatch, or if the post-edit would reintroduce the source language.
+    """
+    if not nmt_segments:
+        return nmt_segments
+    if not bool(getattr(settings, "OFFLINE_TRANSLATION_MTPE_ENABLED", True)):
+        return nmt_segments
+    host = (getattr(settings, "OLLAMA_HOST", "") or "").strip()
+    model = (getattr(settings, "OLLAMA_TRANSLATION_MODEL", "") or "").strip()
+    if not host or not model:
+        logger.info("Offline MTPE skipped — no Ollama host/translation model "
+                    "configured (keeping raw NMT draft)")
+        return nmt_segments
+    try:
+        from backend.services.transcript_polisher import correct_transcript
+    except Exception as e:
+        logger.warning("Offline MTPE unavailable (%s) — keeping raw NMT draft", e)
+        return nmt_segments
+
+    num_ctx = int(getattr(settings, "OFFLINE_TRANSLATION_MTPE_NUM_CTX", 8192))
+    # Source↔draft 1:1 alignment lets the model repair mistranslations against
+    # the source; the offline NMT path is 1:1, so this normally holds.
+    src_texts = [
+        (s.get("text", "") if isinstance(s, dict) else getattr(s, "text", "")) or ""
+        for s in (source_segments or [])
+    ]
+    if len(src_texts) != len(nmt_segments):
+        src_texts = None
+    # Per-video glossary target terms become canonical spellings the MTPE keeps.
+    glossary_terms = sorted({
+        (v or "").strip() for v in (glossary or {}).values() if (v or "").strip()
+    }) or None
+
+    if status_callback:
+        try:
+            r = status_callback("Post-editing the translation (offline MTPE)…")
+            if hasattr(r, "__await__"):
+                await r
+        except Exception:
+            pass
+
+    logger.info(
+        "Offline MTPE: post-editing %d cue(s) with %s (num_ctx=%d%s)",
+        len(nmt_segments), model, num_ctx,
+        ", source-aligned" if src_texts is not None else "",
+    )
+    client = _OllamaMTPEClient(model, num_ctx)
+    try:
+        polished = await correct_transcript(
+            nmt_segments, client,
+            language=target_language,
+            source_texts=src_texts,
+            source_language=source_language,
+            glossary_terms=glossary_terms,
+            mode="translation",
+        )
+    except Exception as e:
+        logger.warning("Offline MTPE failed (%s) — keeping raw NMT draft", e)
+        return nmt_segments
+
+    # Strict shape: count must be preserved or we keep the raw draft (fail-soft).
+    if not polished or len(polished) != len(nmt_segments):
+        logger.warning(
+            "Offline MTPE returned %d cue(s) (expected %d) — keeping raw NMT draft",
+            len(polished) if polished else 0, len(nmt_segments))
+        return nmt_segments
+    # Safety: a post-edit must never REINTRODUCE the source language.
+    try:
+        before = fraction_untranslated(nmt_segments, target_language)
+        after = fraction_untranslated(polished, target_language)
+        if after > before + 0.02:
+            logger.warning(
+                "Offline MTPE reintroduced source language (%.0f%% → %.0f%% "
+                "source-script) — keeping raw NMT draft", 100 * before, 100 * after)
+            return nmt_segments
+    except Exception:
+        pass
+    _changed = sum(
+        1 for a, b in zip(nmt_segments, polished)
+        if (getattr(a, "text", "") or "") != (getattr(b, "text", "") or ""))
+    logger.info("Offline MTPE: refined %d/%d cue(s) (count + timing preserved)",
+                _changed, len(polished))
+    return polished
 
 
 def _apply_batch_translations(
@@ -1086,6 +1212,19 @@ async def translate_segments_with_fallback(
                 status_callback=status_callback,
             )
             if out is not None:
+                # MTPE post-edit (Task 4): the NLLB / Opus-MT draft is fluent but
+                # rough — polish it with the dedicated local translation model
+                # (OLLAMA_TRANSLATION_MODEL) as an MT post-editor. Fully fail-soft
+                # (returns the raw draft on any error), so a MTPE blow-up can
+                # never turn a successful NMT translation into a hard failure.
+                try:
+                    out = await mtpe_postedit_offline(
+                        out, segments, source_language, target_language,
+                        glossary=glossary, status_callback=status_callback,
+                    )
+                except Exception as _mt_e:
+                    logger.warning(
+                        "Offline MTPE pass errored (%s) — keeping raw NMT draft", _mt_e)
                 return out
         except Exception as e:
             _nmt_error = e
