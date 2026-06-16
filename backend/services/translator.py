@@ -929,6 +929,22 @@ async def _translate_via_nmt(
                         recovered += 1
                 logger.info("NMT: completeness pass recovered %d/%d cue(s)",
                             recovered, len(leftover))
+        # Context-join telemetry (Task 3): how the numbered-tag context join
+        # fared across the job — clean tag re-alignment vs. the per-cue-with-
+        # context fallback (tag loss or block-too-long). Tag failure should be
+        # the exception; even when it falls to per-cue, context is retained.
+        if isinstance(engine, NMTTranslator):
+            _ok = getattr(engine, "_ctx_join_ok", 0)
+            _tf = getattr(engine, "_ctx_join_tag_fail", 0)
+            _tl = getattr(engine, "_ctx_join_too_long", 0)
+            _attempted = _ok + _tf
+            if _ok or _tf or _tl:
+                _rate = (100.0 * _ok / _attempted) if _attempted else 0.0
+                logger.info(
+                    "NMT: context-join — %d ok / %d tag-fail (%.0f%% success when "
+                    "attempted), %d too-long → per-cue-with-context",
+                    _ok, _tf, _rate, _tl,
+                )
     finally:
         try:
             engine.unload()

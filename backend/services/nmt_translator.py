@@ -284,6 +284,61 @@ def _ct2_translate_batch(translator, source_list, **kwargs):
         raise
 
 
+# ── Numbered-tag context join (survives NMT mangling) ────────────────────
+# Each cue in a context block is wrapped ⟦i⟧…⟦/i⟧. Numbered tags are far more
+# robust to NMT mangling than a single bare separator: every cue is recoverable
+# independently by index, and the parser tolerates bracket substitution
+# (⟦→[ /【/〔) and stray whitespace the model introduces.
+_NMT_TAG_RE = re.compile(r"[⟦\[【〔]\s*(/?)\s*(\d{1,3})\s*[⟧\]】〕]")
+
+
+def _wrap_numbered_tag(n: int, text: str) -> str:
+    """Wrap ``text`` in the numbered cue tag ``⟦n⟧…⟦/n⟧``."""
+    return f"⟦{n}⟧{text}⟦/{n}⟧"
+
+
+def _parse_numbered_tags(
+    text: str, lo: int, hi: int, n_total: int,
+) -> Optional[list[str]]:
+    """Recover the cue texts for 1-based indices ``lo..hi-1`` from a translated
+    block wrapped in numbered tags.
+
+    Returns ``None`` (caller falls back to the per-cue path) if any requested
+    index is missing or came back empty. Only tags numbered ``1..n_total`` are
+    treated as delimiters, so a stray bracketed number inside a cue's own text
+    (e.g. "[12]") can't masquerade as a tag.
+    """
+    tokens = [
+        (m.start(), m.end(), bool(m.group(1)), int(m.group(2)))
+        for m in _NMT_TAG_RE.finditer(text)
+        if 1 <= int(m.group(2)) <= n_total
+    ]
+    if not tokens:
+        return None
+    result: dict[int, str] = {}
+    for ti, (_s, e, is_close, num) in enumerate(tokens):
+        if is_close or num in result:
+            continue
+        seg_start = e
+        seg_end = len(text)
+        for (s2, _e2, is_close2, num2) in tokens[ti + 1:]:
+            if not is_close2:        # the next OPENING tag bounds this cue
+                seg_end = s2
+                break
+            if num2 == num:          # matching CLOSING tag bounds this cue
+                seg_end = s2
+                break
+            # a stray closing tag for another index → keep scanning
+        result[num] = text[seg_start:seg_end].strip()
+    out: list[str] = []
+    for i in range(lo, hi):
+        v = result.get(i, "")
+        if not v:
+            return None
+        out.append(v)
+    return out
+
+
 # ── Disk locations ────────────────────────────────────────────────────────
 
 def _models_dir() -> str:
@@ -512,6 +567,11 @@ class NMTTranslator:
         self._translator = None
         self._tokenizer = None
         self._loaded = False
+        # Context-join telemetry (Task 3): how often the numbered-tag join
+        # re-aligned cleanly vs. fell to the per-cue-with-context path.
+        self._ctx_join_ok = 0
+        self._ctx_join_tag_fail = 0
+        self._ctx_join_too_long = 0
 
     # ── Availability ─────────────────────────────────────────────────────
 
@@ -764,36 +824,108 @@ class NMTTranslator:
         """Translate ``batch`` with surrounding context for pronoun /
         gender / idiom resolution.
 
-        We concatenate the segments with a sentinel separator and ask NLLB
-        to translate the whole string in one shot, then split the result
-        back. NLLB doesn't accept a system prompt the way an LLM does, so
-        the context is included inline and we keep only the translations
-        for the in-batch segments.
+        NLLB doesn't accept a system prompt the way an LLM does, so the context
+        cues are translated inline alongside the batch and only the in-batch
+        translations are kept. Each cue is wrapped in a numbered tag
+        (``⟦i⟧…⟦/i⟧``) and the joined block is translated in one shot, then the
+        batch cues are recovered by tag index — far more robust to NMT mangling
+        than the old single ``¶`` separator (which NLLB routinely dropped,
+        collapsing the whole batch back to context-free per-segment).
+
+        When the tagged block is too long for one safe decode chunk, or tag
+        re-alignment fails, we DON'T drop context: each cue is retried
+        individually with 1-2 prior cues prepended (translated, then discarded)
+        so isolated retries keep their referential context.
         """
         if not batch:
             return []
-        sep = " ¶ "
-        joined = sep.join(context_before + batch + context_after).strip()
-        if not joined:
+        if not any((c or "").strip() for c in batch):
             return list(batch)
-        # A long joined string would itself be chunked (losing the ¶ markers, so
-        # the split below misaligns) or truncated by the decoder. When it exceeds
-        # one safe chunk, skip the context-join trick and translate per-segment —
-        # ``translate_batch`` chunks each long cue, guaranteeing completeness.
-        cap = _MAX_SRC_CHARS_CJK if _looks_cjk(joined) else _MAX_SRC_CHARS_LATIN
-        if len(joined) > cap:
-            return self.translate_batch(batch, source_lang, target_lang, glossary=glossary)
-        translated_joined = self.translate_batch(
-            [joined], source_lang, target_lang, glossary=glossary,
-        )[0]
-        parts = [p.strip() for p in re.split(r"\s*¶\s*", translated_joined)]
-        start = len(context_before)
-        end = start + len(batch)
-        out = parts[start:end]
-        if len(out) != len(batch):
-            # The model lost the separators; fall back to per-segment.
-            return self.translate_batch(batch, source_lang, target_lang, glossary=glossary)
+
+        all_cues = list(context_before) + list(batch) + list(context_after)
+        n_total = len(all_cues)
+        start = len(context_before)            # 0-based offset of batch
+        lo = start + 1                         # 1-based tag index of first batch cue
+        hi = start + len(batch) + 1            # exclusive upper bound
+
+        tagged = " ".join(
+            _wrap_numbered_tag(i + 1, (c or "").strip())
+            for i, c in enumerate(all_cues)
+        )
+        # Only context-join when the tagged block fits one safe decode chunk —
+        # otherwise it would itself be chunked/truncated (losing tags). The tags
+        # are part of the decoded source, so they count against the cap.
+        cap = _MAX_SRC_CHARS_CJK if _looks_cjk(tagged) else _MAX_SRC_CHARS_LATIN
+        if len(tagged) <= cap:
+            try:
+                translated_joined = self.translate_batch(
+                    [tagged], source_lang, target_lang, glossary=glossary,
+                )[0]
+                recovered = _parse_numbered_tags(translated_joined, lo, hi, n_total)
+            except Exception as e:
+                logger.debug("NMT context-join: translate/parse error (%s)", e)
+                recovered = None
+            if recovered is not None and len(recovered) == len(batch):
+                self._ctx_join_ok += 1
+                logger.debug(
+                    "NMT context-join: tag re-alignment OK (%d cues; ok=%d)",
+                    len(batch), self._ctx_join_ok)
+                return recovered
+            self._ctx_join_tag_fail += 1
+            logger.info(
+                "NMT context-join: tag re-alignment FAILED (%d cues) — retrying "
+                "per-cue with context (tag-fail=%d, ok=%d)",
+                len(batch), self._ctx_join_tag_fail, self._ctx_join_ok)
+        else:
+            self._ctx_join_too_long += 1
+            logger.debug(
+                "NMT context-join: block too long for one safe chunk (%d chars > "
+                "%d) — per-cue with context (too-long=%d)",
+                len(tagged), cap, self._ctx_join_too_long)
+        return self._translate_batch_with_per_cue_context(
+            batch, context_before, source_lang, target_lang, glossary)
+
+    def _translate_batch_with_per_cue_context(
+        self, batch, context_before, source_lang, target_lang, glossary,
+    ) -> list[str]:
+        """Translate each cue individually, prepending 1-2 prior SOURCE cues as
+        referential context (translated, then discarded). Guarantees one output
+        per input cue and never drops context the way the old context-free
+        fallback did."""
+        out: list[str] = []
+        prior = list(context_before)
+        for cue in batch:
+            out.append(self._translate_one_with_context(
+                cue, prior, source_lang, target_lang, glossary))
+            prior.append(cue)
         return out
+
+    def _translate_one_with_context(
+        self, cue, prior_cues, source_lang, target_lang, glossary,
+    ) -> str:
+        """Translate a single cue with up to 2 prior cues prepended for
+        pronoun/gender/subject resolution. The context is translated but
+        DISCARDED — only the tagged target cue is kept. Falls back to a plain
+        chunked single-cue translation (always complete) if the tag is lost."""
+        cue_s = (cue or "").strip()
+        if not cue_s:
+            return cue
+        ctx = [c for c in prior_cues if (c or "").strip()][-2:]
+        if ctx:
+            mini = f"{' '.join(ctx)} {_wrap_numbered_tag(1, cue_s)}"
+            cap = _MAX_SRC_CHARS_CJK if _looks_cjk(mini) else _MAX_SRC_CHARS_LATIN
+            if len(mini) <= cap:
+                try:
+                    tj = self.translate_batch(
+                        [mini], source_lang, target_lang, glossary=glossary)[0]
+                    rec = _parse_numbered_tags(tj, 1, 2, 1)
+                    if rec and rec[0].strip():
+                        return rec[0]
+                except Exception as e:
+                    logger.debug("NMT per-cue context retry failed (%s)", e)
+        tb = self.translate_batch(
+            [cue_s], source_lang, target_lang, glossary=glossary)
+        return tb[0] if (tb and (tb[0] or "").strip()) else cue
 
 
 # ── Opus-MT wrapper (one model per pair) ─────────────────────────────────
