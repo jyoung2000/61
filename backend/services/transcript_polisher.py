@@ -474,6 +474,55 @@ async def _polish_batch(
     return polished
 
 
+async def polish_source_before_translation(
+    segments: Iterable,
+    orchestrator=None,
+    source_language: str = "",
+    job_id: str = "",
+) -> list:
+    """Light SOURCE-language cleanup (punctuation / casing / filler) applied
+    BEFORE translation — the offline transcription-polish parity move (Task 6).
+
+    Cloud transcripts read cleaner partly because the source is effectively
+    polished first; offline left the source raw before translation (the heavy
+    readability polish only ran on the TARGET text afterward). A single
+    ``mode='asr'`` pass here means the translator works from clean input AND the
+    shipped source transcript reads cleanly. Uses the orchestrator's editorial
+    model — the local model when offline.
+
+    Gated by ``TRANSLATION_POLISH_SOURCE_FIRST`` (and the master
+    ``TRANSCRIPT_POLISHING_ENABLED`` / ``AI_TRANSCRIPT_CORRECTION`` switches).
+    Fail-soft: returns the segments unchanged on any error or when disabled, so
+    it can never break the translate path. Cue count + timing are preserved by
+    ``correct_transcript``'s round-trip.
+    """
+    seg_list = list(segments) if segments else []
+    if not seg_list:
+        return seg_list
+    if not bool(getattr(settings, "TRANSLATION_POLISH_SOURCE_FIRST", True)):
+        return seg_list
+    if (orchestrator is None
+            or not getattr(settings, "TRANSCRIPT_POLISHING_ENABLED", True)
+            or not getattr(settings, "AI_TRANSCRIPT_CORRECTION", True)):
+        return seg_list
+    try:
+        polished = await correct_transcript(
+            seg_list, orchestrator, job_id=job_id,
+            language=(source_language or ""), mode="asr",
+        )
+    except Exception as e:
+        logger.warning(
+            "source-before-translation polish failed (%s) — keeping raw source", e)
+        return seg_list
+    # Defensive: never change the cue count on this path (translation aligns 1:1).
+    if not polished or len(polished) != len(seg_list):
+        logger.warning(
+            "source-before-translation polish changed cue count (%s≠%d) — keeping "
+            "raw source", len(polished) if polished else 0, len(seg_list))
+        return seg_list
+    return polished
+
+
 async def correct_transcript(
     segments: Iterable,
     orchestrator=None,

@@ -3452,14 +3452,48 @@ async def _run_analysis_inner(job_id: str):
     # is the single biggest lever on transcript readability.
     _polished_in_critical_path = False
     if _will_translate:
-        # Translate-then-polish: skip the source-language LLM polish here.
-        # The heavy polish runs in the TARGET language after translation (see
-        # _background_post_processing), so we don't spend an LLM pass
-        # punctuating Japanese we're about to replace with English. The light
-        # final dedup below still cleans the source transcript.
+        # Translate-then-polish: the heavy readability reflow runs in the TARGET
+        # language after translation, so we don't spend an LLM pass punctuating
+        # Japanese we're about to replace with English. BUT (Task 6) apply a
+        # single light SOURCE cleanup (punctuation / casing / filler) first so
+        # the translator works from clean input AND the shipped source
+        # transcript reads cleanly — both benefit. Fail-soft + gated by
+        # TRANSLATION_POLISH_SOURCE_FIRST; the full reflow still runs on the
+        # translated text. (_polished_in_critical_path stays False so a
+        # translation FAILURE still triggers the full source polish fallback.)
+        if (settings.AI_TRANSCRIPT_CORRECTION
+                and getattr(settings, "TRANSCRIPT_POLISHING_ENABLED", True)
+                and getattr(settings, "TRANSLATION_POLISH_SOURCE_FIRST", True)
+                and transcript):
+            try:
+                cancel_check()
+                from backend.services.transcript_polisher import (
+                    polish_source_before_translation,
+                )
+                _src_polished = await polish_source_before_translation(
+                    transcript, orchestrator,
+                    source_language=(_detected_lang or "").lower(), job_id=job_id,
+                )
+                if _src_polished and len(_src_polished) == len(transcript):
+                    transcript = [
+                        p.model_dump() if hasattr(p, "model_dump") else dict(p)
+                        for p in _src_polished
+                    ]
+                    logger.info(
+                        "[%s] Light source-language polish applied before translation "
+                        "(%d segments) — translator + shipped source both benefit",
+                        job_id, len(transcript))
+            except Exception as _sp_err:
+                logger.warning(
+                    "[%s] Pre-translation source polish skipped (%s) — keeping raw "
+                    "source", job_id, _sp_err)
+        else:
+            logger.info(
+                "[%s] Skipping source-language polish before translation "
+                "(disabled) — heavy polish runs on the translated text", job_id)
         logger.info(
-            "[%s] Skipping source-language polish + resegment + reflow "
-            "(translation pending — heavy polish runs on the translated text)",
+            "[%s] Skipping source-language resegment + reflow "
+            "(translation pending — heavy reflow runs on the translated text)",
             job_id,
         )
     elif (

@@ -264,6 +264,17 @@ class Settings(BaseSettings):
     # pass-through is used (the legacy behavior).
     TRANSCRIPT_POLISHING_ENABLED: bool = True
     TRANSCRIPT_POLISHING_BATCH_SIZE: int = 15   # segments per LLM call
+    # Task 6 — transcription polish parity. When a job translates, the heavy
+    # readability polish runs on the TARGET text after translation; by default
+    # the SOURCE transcript was left raw before translation. Cloud transcripts
+    # read cleaner partly because the source is effectively polished first, so
+    # apply a single light source-language cleanup (punctuation / casing /
+    # filler) BEFORE translation: the translator then works from clean input AND
+    # the shipped source transcript reads cleanly. One extra LLM pass per
+    # translate job (uses the local editorial model when offline); set False to
+    # restore the pure translate-then-polish behavior. The full readability
+    # reflow still runs on the translated text.
+    TRANSLATION_POLISH_SOURCE_FIRST: bool = True
     TRANSCRIPT_FILLER_REMOVAL: bool = False     # remove um, uh, like, you know
     TRANSCRIPT_SENTENCE_REPAIR: bool = True     # fix run-on/fragmented sentences
     # Default ON: tells the polisher to keep every spoken word and only
