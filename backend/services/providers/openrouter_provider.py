@@ -520,6 +520,35 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                 return min(max_comp, 8192)
         return 4096
 
+    def _build_client(self, api_key: str) -> AsyncOpenAI:
+        """Construct the OpenRouter SDK client bound to ``api_key``."""
+        return AsyncOpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=api_key or "",
+            default_headers={
+                "HTTP-Referer": "http://localhost:1353",
+                "X-Title": "ClipAI",
+            },
+        )
+
+    @property
+    def client(self) -> AsyncOpenAI:
+        """The OpenRouter client bound to the CURRENT ``OPENROUTER_API_KEY``.
+
+        The SDK client caches the key at construction, so if a freshly-saved key
+        differs from the one this client was built with, rebuild it. This means
+        an updated key takes effect immediately (no restart) and a stale/old key
+        is never cached for the life of the provider instance.
+        """
+        cur = settings.OPENROUTER_API_KEY or ""
+        if cur != self._client_key:
+            logger.info(
+                "OpenRouter API key changed since client build — rebuilding "
+                "client so the latest key is used (no stale key cached)")
+            self._client_key = cur
+            self._client = self._build_client(cur)
+        return self._client
+
     def __init__(self):
         # Load model capabilities from OpenRouter cache (context_length,
         # max_completion_tokens) so we can respect each model's actual limits
@@ -528,14 +557,8 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
         self._ws_broadcast = None  # Set by orchestrator via set_ws_broadcast()
         self._job_id = None        # Set per-job for WS messages
 
-        self._client = AsyncOpenAI(
-            base_url="https://openrouter.ai/api/v1",
-            api_key=settings.OPENROUTER_API_KEY,
-            default_headers={
-                "HTTP-Referer": "http://localhost:1353",
-                "X-Title": "ClipAI",
-            },
-        )
+        self._client_key = settings.OPENROUTER_API_KEY or ""
+        self._client = self._build_client(self._client_key)
         self._preset_name = settings.OPENROUTER_PRESET
         # When preset is "custom" (user picked specific models), there's no
         # entry in PRESETS — fall back to "balanced" for sensible fallback
@@ -718,7 +741,7 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
         t0 = time.monotonic()
         try:
             response = await asyncio.wait_for(
-                self._client.chat.completions.create(
+                self.client.chat.completions.create(
                     model=model,
                     messages=messages,
                     max_tokens=max_tokens,
@@ -755,7 +778,7 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                 await asyncio.sleep(wait_s)
                 try:
                     response = await asyncio.wait_for(
-                        self._client.chat.completions.create(
+                        self.client.chat.completions.create(
                             model=model,
                             messages=messages,
                             max_tokens=max_tokens,
