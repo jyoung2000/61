@@ -1526,7 +1526,15 @@ async def _generate_seo_for_platform(
         _trend_brief = await get_trend_brief("both", "")
     except Exception:
         pass
-    platform_prompt = build_platform_seo_prompt(canonical, trend_brief=_trend_brief)
+    # SEO must come out in the clip's subtitle language (target if translated,
+    # else source) so the title/caption/tags/hook match the clip — not the raw
+    # transcript language.
+    _out_lang = (getattr(job, "subtitle_language", "") or "").strip().lower()
+    if not _out_lang:
+        _src = (getattr(job, "language", "") or "").strip().lower()
+        _out_lang = "en" if (_src and _src not in ("en", "english")) else _src
+    platform_prompt = build_platform_seo_prompt(
+        canonical, trend_brief=_trend_brief, output_language=_out_lang)
     custom_prompts = custom_prompts.model_copy(update={"seo": platform_prompt})
 
     orchestrator = AIOrchestrator(ws_broadcast=ws_broadcast, custom_prompts=custom_prompts)

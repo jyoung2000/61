@@ -610,6 +610,7 @@ class AIOrchestrator:
         scenes: list[SceneDescription],
         job_id: str,
         tier=None,
+        output_language: str = "",
     ) -> tuple[VideoSummary, str]:
         """Returns (summary, provider_name_used).
 
@@ -623,9 +624,18 @@ class AIOrchestrator:
         transcript = [TranscriptSegment(**s) if isinstance(s, dict) else s for s in transcript]
         scenes = [SceneDescription(**s) if isinstance(s, dict) else s for s in scenes]
         if tier and tier.summary_strategy == "map_reduce" and tier.summary_chunk_minutes > 0:
-            return await self._map_reduce_summary(transcript, scenes, job_id, tier)
+            return await self._map_reduce_summary(
+                transcript, scenes, job_id, tier, output_language=output_language)
 
-        summary_prompt = self._custom_prompts.summary if self._custom_prompts else None
+        # Force the summary into the user's subtitle language (so it matches the
+        # clips), translating the source transcript's understanding as needed —
+        # instead of the old hardcoded-English default.
+        from backend.services.prompts import (
+            summary_language_directive, DEFAULT_SUMMARY_PROMPT,
+        )
+        _base = (self._custom_prompts.summary if self._custom_prompts else None) \
+            or DEFAULT_SUMMARY_PROMPT
+        summary_prompt = summary_language_directive(output_language) + _base
         for provider in self._get_active_chain():
             try:
                 await self._notify_attempt(job_id, provider, "summary generation")
@@ -648,6 +658,7 @@ class AIOrchestrator:
         scenes: list[SceneDescription],
         job_id: str,
         tier,
+        output_language: str = "",
     ) -> tuple[VideoSummary, str]:
         """Hierarchical map-reduce summary for long videos.
 
@@ -655,6 +666,8 @@ class AIOrchestrator:
         Reduce: Feed all mini-summaries into a final summary call.
         """
         from backend.services.providers.base import extract_json, has_real_summary_content
+        from backend.services.prompts import summary_language_directive
+        _lang_dir = summary_language_directive(output_language)
 
         chunk_seconds = tier.summary_chunk_minutes * 60
         if not transcript:
@@ -699,6 +712,7 @@ class AIOrchestrator:
                     for s in scns[:5 if is_ollama else 10]
                 )
                 prompt = (
+                    _lang_dir +
                     f"Summarize this {time_label} segment in 2-3 sentences. "
                     f"Include: main topic, key content, notable moments. "
                     f"Do not reference or speculate about speakers.\n\n"
@@ -737,6 +751,7 @@ class AIOrchestrator:
             combined = combined[:2500]
 
         reduce_prompt = (
+            _lang_dir +
             f"You have segment-by-segment summaries of a video. "
             f"Combine them into a cohesive summary. "
             f"Do not reference or speculate about speakers unless names are explicitly mentioned. "

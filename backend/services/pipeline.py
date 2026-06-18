@@ -1275,6 +1275,7 @@ async def _refresh_clips_with_translation(
 async def _auto_generate_clip_seo(
     job_id: str, transcript: list, orchestrator,
     fallback_clips: Optional[list] = None,
+    output_language: str = "",
 ) -> tuple[int, int]:
     """Generate SEO (title / description / tags / platform_tips) for every
     clip in the background after analysis completes.
@@ -1418,7 +1419,7 @@ async def _auto_generate_clip_seo(
 
         if platform not in prompt_cache:
             prompt_cache[platform] = build_platform_seo_prompt(
-                platform, trend_brief=_trend_brief)
+                platform, trend_brief=_trend_brief, output_language=output_language)
         custom_prompts = base_prompts.model_copy(
             update={"seo": prompt_cache[platform]})
 
@@ -1679,6 +1680,7 @@ async def _run_post_clip_followups(job_id: str, orchestrator, pp_result: Optiona
         _g, _f = await _auto_generate_clip_seo(
             job_id, list(seo_segments or []), orchestrator,
             fallback_clips=fallback_clips,
+            output_language=pp.get("output_lang", ""),
         )
         await broadcast_ws(job_id, {
             "type": "background_task", "task": "auto_seo", "status": "complete",
@@ -1777,6 +1779,10 @@ async def _background_post_processing(
     )
     _will_translate = bool(target_lang and target_lang != source_lang and transcript)
     _result["will_translate"] = _will_translate
+    # The language the SHIPPED subtitles/clips end up in: the target when we
+    # translate, else the source. The summary + Auto-SEO are written in THIS
+    # language so everything (transcript, clips, summary, SEO) matches.
+    _result["output_lang"] = (target_lang if _will_translate else source_lang) or ""
 
     # ── Transcript polishing — SOURCE language, fallback only ──
     # Runs only when NO translation was applied (when a translation follows,
@@ -3958,7 +3964,9 @@ async def _run_analysis_inner(job_id: str):
     summary = None
     async with _stage_timer(job_id, "summary"):
         try:
-            _sr = await orchestrator.generate_summary(transcript, scenes, job_id, tier=tier)
+            _sr = await orchestrator.generate_summary(
+                transcript, scenes, job_id, tier=tier,
+                output_language=(_pp_result or {}).get("output_lang", ""))
             summary = _sr[0] if isinstance(_sr, tuple) else _sr
         except Exception as _se:
             logger.warning(

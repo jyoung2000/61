@@ -294,10 +294,42 @@ def get_genre_prompt(content_type) -> str:
     return mapping.get(key, VIRAL_PROMPT_GENERIC)
 
 
+# ── Output-language helpers ────────────────────────────────────────────────
+# The summary + SEO must come out in the SAME language as the clips/subtitles
+# (the user-selected subtitle language) — not always English, and not the raw
+# source language. These build a "write in <language>" directive injected into
+# the summary and SEO prompts at generation time.
+_OUTPUT_LANG_NAMES = {
+    "en": "English", "es": "Spanish", "fr": "French", "de": "German",
+    "it": "Italian", "pt": "Portuguese", "ru": "Russian", "ja": "Japanese",
+    "ko": "Korean", "zh": "Chinese", "ar": "Arabic", "hi": "Hindi",
+    "nl": "Dutch", "pl": "Polish", "tr": "Turkish", "vi": "Vietnamese",
+    "th": "Thai", "uk": "Ukrainian", "sv": "Swedish", "id": "Indonesian",
+    "ms": "Malay", "tl": "Filipino", "fa": "Persian", "he": "Hebrew",
+    "el": "Greek", "cs": "Czech", "ro": "Romanian", "hu": "Hungarian",
+    "fi": "Finnish", "da": "Danish", "no": "Norwegian", "nb": "Norwegian",
+}
+
+
+def output_language_name(code: str) -> str:
+    """Human language name for an ISO code ('en' → 'English'); '' if unknown."""
+    c = (code or "").strip().lower().split("-")[0]
+    return _OUTPUT_LANG_NAMES.get(c, "")
+
+
+def summary_language_directive(code: str) -> str:
+    """'Write the summary in <language>' instruction for the resolved subtitle
+    language. Empty/unknown defaults to English (the historical behavior)."""
+    name = output_language_name(code) or "English"
+    return (
+        f"OUTPUT LANGUAGE — write your ENTIRE response in {name}. The transcript "
+        f"and scene notes may be in a different language; translate your "
+        f"understanding and write ONLY in {name} (keep proper nouns in their "
+        f"standard {name} spelling). Do not mix languages.\n\n")
+
+
 DEFAULT_SUMMARY_PROMPT = (
-    "You are writing a substantive video summary for a human audience. "
-    "ALWAYS write your entire response in English, regardless of the "
-    "language of the transcript or scene descriptions.\n\n"
+    "You are writing a substantive video summary for a human audience.\n\n"
     "Write like a real person walking a friend through what they just "
     "watched — but be GENEROUS with detail. We want the reader to walk "
     "away feeling like they have a real sense of how the video unfolds, "
@@ -584,7 +616,8 @@ PLATFORM_PROFILES["both"] = PLATFORM_PROFILES["tiktok"]
 PLATFORM_PROFILES["default"] = PLATFORM_PROFILES["tiktok"]
 
 
-def build_platform_seo_prompt(platform: str, trend_brief: str = "") -> str:
+def build_platform_seo_prompt(platform: str, trend_brief: str = "",
+                              output_language: str = "") -> str:
     """Return the platform-specific SEO prompt for the given platform slug.
 
     Falls back to ``PLATFORM_PROFILES['default']`` (TikTok-style) when the
@@ -593,8 +626,22 @@ def build_platform_seo_prompt(platform: str, trend_brief: str = "") -> str:
     hashtags / sounds / hook formats / topics) it is injected so the title,
     caption, tags and hook reflect what's working on the platform RIGHT NOW —
     not evergreen guesses from the model's stale training data.
+
+    ``output_language`` (the user's subtitle language) forces the title,
+    caption, hook and tips to come out in the SAME language as the clip —
+    so a Japanese-source / English-subtitle clip gets English SEO, and vice
+    versa — instead of defaulting to the transcript's language.
     """
     profile = PLATFORM_PROFILES.get(platform) or PLATFORM_PROFILES["default"]
+    lang_block = ""
+    _lang_name = output_language_name(output_language) or "English"
+    lang_block = (
+        f"OUTPUT LANGUAGE — write the TITLE, DESCRIPTION/caption, hook and "
+        f"PLATFORM_TIPS in {_lang_name} (the language of this clip's subtitles), "
+        f"even if the transcript below is in another language. For TAGS, use "
+        f"{_lang_name} hashtags relevant to the clip; standard cross-language "
+        f"discovery tags (#fyp, #shorts) are fine. Never mix languages in the "
+        f"title or caption.\n\n")
     trend_block = ""
     if (trend_brief or "").strip():
         trend_block = (
@@ -610,6 +657,7 @@ def build_platform_seo_prompt(platform: str, trend_brief: str = "") -> str:
         "You write social media captions and tags like a real creator on the "
         "specific platform you're targeting — not a marketer, not a robot. "
         "The text should feel native to that platform's culture.\n\n"
+        f"{lang_block}"
         f"{profile['guidance']}\n\n"
         f"{trend_block}"
         "HARD CONSTRAINTS (the validator WILL truncate / reject if you miss):\n"
