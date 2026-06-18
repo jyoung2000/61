@@ -2416,11 +2416,12 @@ class FallbackJudge:
     Behaviour:
     * Calls primary first; on success, returns its result and resets
       the failure counter.
-    * On a *transient* primary failure (timeout, 429, 5xx, network),
-      falls through to the fallback and returns whatever it produces.
-    * On a *permanent* primary failure (auth, 4xx other than 429,
-      JSON parse), returns the primary error unchanged — there is no
-      point burning fallback budget on a misconfiguration.
+    * On a *transient* primary failure (timeout, 429, 5xx, network) OR a
+      cloud key-limit / billing / quota error, falls through to the fallback
+      (a local judge has no key limit) and returns whatever it produces.
+    * On a *permanent* primary failure (auth, model-not-found, JSON parse),
+      returns the primary error unchanged — there is no point burning
+      fallback budget on a genuine misconfiguration.
     * If the primary has failed transiently ``STICKY_AFTER`` times in
       a row, subsequent candidates skip the primary entirely and call
       the fallback directly for the rest of the batch. This keeps
@@ -2436,6 +2437,15 @@ class FallbackJudge:
         "timeout", "timed out",
         "connection", "remote disconnected",
         "rate limit", "overloaded", "unavailable",
+        # A cloud key-limit / billing / quota / out-of-credits error means the
+        # CLOUD primary is exhausted for the run — fall through to the (usually
+        # LOCAL) fallback judge, which has no such limit. Without these, a
+        # `403 Key limit exceeded` was misclassified as a permanent
+        # misconfiguration, the local fallback never ran, the judge scored ZERO
+        # candidates, and clip selection collapsed to a couple of raw-signal
+        # picks instead of a judged spread across the episode.
+        "key limit", "quota", "insufficient", "billing",
+        "out of credit", "credits", "402", "payment required",
     )
 
     def __init__(self, primary, fallback):
