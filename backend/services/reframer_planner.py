@@ -25,8 +25,24 @@ from backend.services.reframer_models import (
     LedgerBin, CoverageLedger, PerceptionResult, SceneSignals, AdaptiveParams,
     ReframeTracer, null_tracer,
 )
+from backend.config import settings
 
 logger = logging.getLogger("clipai.reframer_planner")
+
+
+def _saliency_or_static_center_x(sal_cx, has_motion, crop_w, max_x,
+                                 center_static=True):
+    """Horizontal crop-x for a no-face / no-person frame whose only signal is a
+    single spectral-saliency peak.
+
+    On a motion-less STATIC GRAPHIC (title card / logo / credits) the spectral
+    peak latches onto the highest-contrast EDGE (e.g. a centered logo's wing-
+    tip), so following it mis-frames the crop off to the side — center instead.
+    With motion present (dynamic content) the peak is meaningful, so follow it.
+    Gated by ``center_static`` (REFRAMER_CENTER_STATIC_GRAPHICS)."""
+    if center_static and not has_motion:
+        return clamp_x(max_x // 2, max_x)
+    return clamp_x(sal_cx - crop_w // 2, max_x)
 
 
 class Planner:
@@ -1545,9 +1561,23 @@ class Planner:
                 if subject_x is None:
                     sal = self.p.saliency_hotspot.get(t)
                     if sal and sal['intensity'] > 0.10:
-                        subject_x = clamp_x(sal['cx'] - self.crop_w // 2, self.max_x)
-                        subject_source = 'saliency'
-                        subject_cx = sal['cx']
+                        _mhs = self.p.motion_hotspot.get(t)
+                        _has_motion = bool(_mhs and _mhs.get('intensity', 0) > 0.01)
+                        _center_static = bool(getattr(
+                            settings, "REFRAMER_CENTER_STATIC_GRAPHICS", True))
+                        subject_x = _saliency_or_static_center_x(
+                            sal['cx'], _has_motion, self.crop_w, self.max_x,
+                            center_static=_center_static)
+                        if _center_static and not _has_motion:
+                            # Centered a static graphic (no face/person/motion):
+                            # a title card / logo, framed center not on the
+                            # saliency edge. A face here is overridden by
+                            # FACE-ALWAYS-WINS below.
+                            subject_cx = self.max_x // 2 + self.crop_w // 2
+                            subject_source = 'static_center'
+                        else:
+                            subject_cx = sal['cx']
+                            subject_source = 'saliency'
 
                 # 3. Motion centroid — follows where the action is.
                 #    Handles: racing, sports wide shots, anime fights,

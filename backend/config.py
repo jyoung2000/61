@@ -170,6 +170,13 @@ class Settings(BaseSettings):
     REFRAMER_MAX_SAMPLES: int = 1800       # total face/motion samples cap
     REFRAMER_SAMPLE_FPS: float = 5.0       # ceiling fps (short videos)
     REFRAMER_MIN_SAMPLE_FPS: float = 1.2   # floor fps (very long videos)
+    # On a STATIC frame with no face, no person, AND no motion (a title card /
+    # logo / credits), spectral saliency latches onto the highest-contrast EDGE
+    # (e.g. a centered logo's wing-tip) and mis-frames the crop off to the side.
+    # When True, center the crop on such static graphics instead of chasing the
+    # saliency edge. Frames with motion or a person/face are unaffected (they
+    # still track the subject). Set False to restore pure saliency framing.
+    REFRAMER_CENTER_STATIC_GRAPHICS: bool = True
 
     # ── Clip generation (Primary AI / VideoLLaMA3) defaults ──
     # Exposed in Settings > Clip Generation and overlaid onto the clipper
