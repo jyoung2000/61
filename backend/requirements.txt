@@ -66,3 +66,8 @@ ctranslate2>=4.0,<5
 transformers>=4.40,<5
 # SentencePiece tokenizer for NLLB-200 / Opus-MT NMT translation.
 sentencepiece>=0.1.99
+
+# Google Trends fallback tier for the live trend brief (free, no API key). The
+# web-search tier (OpenRouter) is primary; pytrends is the fail-soft fallback.
+# Optional — trend_brief.py degrades to the static lexicon if it's absent.
+pytrends>=4.9,<5
