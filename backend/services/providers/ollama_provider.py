@@ -86,6 +86,22 @@ def _normalize_ollama_model(model: Optional[str]) -> str:
     return m
 
 
+def _ollama_names_match(a: Optional[str], b: Optional[str]) -> bool:
+    """True when two Ollama model ids refer to the same model, tolerating the
+    ``ollama/`` prefix and a missing ``:latest`` tag (so "qwen2.5:3b-instruct"
+    matches the ``/api/ps`` report of the same model). Different sizes/tags
+    (``qwen2.5:3b`` vs ``qwen2.5:7b``) do NOT match."""
+    a = _normalize_ollama_model(a or "")
+    b = _normalize_ollama_model(b or "")
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    a_base = a[:-7] if a.endswith(":latest") else a
+    b_base = b[:-7] if b.endswith(":latest") else b
+    return a_base == b_base
+
+
 # ── Phase 2 parity — content-type vision routing for Ollama ──
 # Maps content type → Ollama model id. All entries must be quantized
 # 4-bit variants that fit in <3GB VRAM (GTX 1650 has 4GB total and
@@ -316,31 +332,49 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
             self._gpu_available = await self._detect_gpu_available()
         return self._gpu_available
 
-    async def clear_vram(self) -> None:
-        """Unload all models from Ollama to free VRAM before loading a new model."""
+    async def clear_vram(self, except_model: Optional[str] = None) -> None:
+        """Unload Ollama models to free VRAM.
+
+        When ``except_model`` is given, that model is LEFT resident and every
+        OTHER model is evicted — so consecutive text calls in a stage (summary,
+        SEO, render-plan conversion, MTPE) keep the model loaded instead of
+        paying a multi-GB reload before each one, while a leftover vision model
+        is still evicted to make room. Pass ``None`` to evict everything (before
+        handing the GPU to a non-Ollama engine like Whisper / NLLB)."""
+        keep = _normalize_ollama_model(except_model) if except_model else None
         try:
             resp = await self._client.get(f"{self._host}/api/ps", timeout=10.0)
-            if resp.status_code == 200:
-                ps_data = resp.json()
-                models = ps_data.get("models", [])
-                if not models:
-                    logger.debug("Ollama: no models currently loaded — VRAM already free")
-                    return
-                for model in models:
-                    model_name = model.get("name", "")
-                    size_vram = model.get("size_vram", 0)
-                    size = model.get("size", 0)
-                    if model_name:
-                        logger.info(
-                            "Unloading '%s' (VRAM: %.0fMB, Total: %.0fMB) to free GPU memory",
-                            model_name, size_vram / 1024 / 1024, size / 1024 / 1024,
-                        )
-                        await self._client.post(
-                            f"{self._host}/api/generate",
-                            json={"model": model_name, "keep_alive": 0},
-                            timeout=10.0,
-                        )
-                logger.info("Unloaded %d model(s) from Ollama", len(models))
+            if resp.status_code != 200:
+                return
+            models = resp.json().get("models", [])
+            if not models:
+                logger.debug("Ollama: no models currently loaded — VRAM already free")
+                return
+            unloaded = 0
+            for model in models:
+                model_name = model.get("name", "")
+                if not model_name:
+                    continue
+                if keep and _ollama_names_match(model_name, keep):
+                    logger.debug(
+                        "Ollama: keeping '%s' resident (still in use this step)", model_name)
+                    continue
+                size_vram = model.get("size_vram", 0)
+                size = model.get("size", 0)
+                logger.info(
+                    "Unloading '%s' (VRAM: %.0fMB, Total: %.0fMB) to free GPU memory",
+                    model_name, size_vram / 1024 / 1024, size / 1024 / 1024,
+                )
+                await self._client.post(
+                    f"{self._host}/api/generate",
+                    json={"model": model_name, "keep_alive": 0},
+                    timeout=10.0,
+                )
+                unloaded += 1
+            if unloaded:
+                logger.info(
+                    "Unloaded %d model(s) from Ollama%s", unloaded,
+                    f" (kept '{keep}' resident)" if keep else "")
         except Exception as e:
             logger.warning("Failed to clear VRAM: %s", e)
 

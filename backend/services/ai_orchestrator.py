@@ -1081,9 +1081,13 @@ class AIOrchestrator:
                 original_model = provider._editorial_model
                 provider._editorial_model = model_override
             try:
-                # Clear VRAM before first Ollama call in a job
+                # Evict a leftover model (e.g. the vision model) before the text
+                # call, but KEEP the text model resident so consecutive text
+                # calls in a stage (summary, SEO, render-plan conversion, MTPE)
+                # don't each pay a multi-GB reload — the load/unload churn that
+                # slowed analysis and showed in the pipeline visualization.
                 if pname == "ollama" and hasattr(provider, 'clear_vram') and self._consecutive_ollama_failures == 0 and not self._current_model_override:
-                    await provider.clear_vram()
+                    await provider.clear_vram(except_model=model_name)
                 logger.info("text_completion attempting via %s model=%s (%d chars prompt)", pname, model_name, len(prompt))
                 t0 = time.monotonic()
                 result = await asyncio.wait_for(
