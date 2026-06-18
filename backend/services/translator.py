@@ -117,7 +117,29 @@ def _parse_json_array(response: str, expected: int) -> Optional[list[str]]:
         return None
     if not isinstance(data, list) or len(data) != expected:
         return None
-    return [str(x) if x is not None else "" for x in data]
+    # A small model sometimes ECHOES the prompt's input objects
+    # (``{"index": i, "text": ...}``) instead of a flat string array. Extract
+    # their ``text`` rather than ``str()``-ing the dict (which leaks
+    # ``{'index': 0, 'text': ...}`` into the subtitles); reject anything that
+    # still can't be reduced to a clean string so the caller keeps the source.
+    _LEAK = re.compile(r"\{\s*['\"]index['\"]|['\"]text['\"]\s*:\s*['\"]")
+    out: list[str] = []
+    for x in data:
+        if x is None:
+            out.append("")
+        elif isinstance(x, str):
+            out.append(x)
+        elif isinstance(x, dict):
+            v = next((x[k] for k in ("text", "translation", "line", "output")
+                      if isinstance(x.get(k), str)), None)
+            if v is None:
+                return None
+            out.append(v)
+        else:
+            return None
+    if any(_LEAK.search(s) for s in out):
+        return None
+    return out
 
 
 async def translate_via_llm(

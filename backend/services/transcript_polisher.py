@@ -415,9 +415,45 @@ def _build_user_prompt(
     return prompt
 
 
+# A leaked-structure signature: the model echoed the prompt's input objects
+# (``{"index": i, "text": ..., "source": ...}``) instead of a flat string array.
+# Used to reject any "polished" line that is really a stringified dict so it can
+# never reach the subtitles (the '{'index': 0, 'text': ...}' + Japanese 'source'
+# leak).
+_LEAKED_STRUCT_RE = re.compile(
+    r"\{\s*['\"]index['\"]|['\"]text['\"]\s*:\s*['\"]|['\"]source['\"]\s*:\s*['\"]")
+
+
+def _coerce_polished_item(x) -> Optional[str]:
+    """One response element → a clean polished string, or ``None`` if it can't
+    be recovered.
+
+    Small models sometimes ECHO the prompt's input objects
+    (``{"index": i, "text": ..., "source": ...}``) instead of returning a flat
+    array of strings. Extract the ``text`` field rather than ``str()``-ing the
+    whole dict — which dumped ``{'index': 0, 'text': ...}`` and the source
+    language straight into the subtitles."""
+    if x is None:
+        return ""
+    if isinstance(x, str):
+        return x
+    if isinstance(x, dict):
+        for key in ("text", "polished", "line", "translation", "output"):
+            v = x.get(key)
+            if isinstance(v, str):
+                return v
+        return None
+    return None
+
+
 def _parse_polished_response(response: str, expected: int) -> Optional[list[str]]:
-    """Parse the LLM's JSON array response. Returns None on parse failure
-    or on length mismatch."""
+    """Parse the LLM's JSON array response into ``expected`` clean strings.
+
+    Returns ``None`` on parse failure, length mismatch, or any element that
+    can't be reduced to a clean string (so the caller keeps the draft —
+    fail-soft). Tolerates a model that echoes the input objects instead of a
+    flat string array by extracting their ``text``, and rejects any line that
+    still looks like a leaked input object."""
     text = (response or "").strip()
     # Strip markdown fences if the model added them.
     if text.startswith("```"):
@@ -435,11 +471,19 @@ def _parse_polished_response(response: str, expected: int) -> Optional[list[str]
         data = json.loads(text)
     except json.JSONDecodeError:
         return None
-    if not isinstance(data, list):
+    if not isinstance(data, list) or len(data) != expected:
         return None
-    if len(data) != expected:
+    out: list[str] = []
+    for x in data:
+        s = _coerce_polished_item(x)
+        if s is None:
+            return None  # unrecoverable element → keep the draft
+        out.append(s)
+    # Final guard: a line that still looks like a stringified input object (the
+    # model returned the dict as a string) must never ship — keep the draft.
+    if any(_LEAKED_STRUCT_RE.search(s) for s in out):
         return None
-    return [str(x) if x is not None else "" for x in data]
+    return out
 
 
 async def _polish_batch(
