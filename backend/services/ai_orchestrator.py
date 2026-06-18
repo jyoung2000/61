@@ -23,6 +23,22 @@ logger = logging.getLogger(__name__)
 WsBroadcastCallback = Optional[object]  # Will be a callable
 
 
+def _is_key_limit_error(exc) -> bool:
+    """True for a HARD, non-retryable provider billing error — an OpenRouter
+    "Key limit exceeded" 403, out-of-credits, or a quota/billing 403. These do
+    NOT recover within a job, so the provider should be abandoned for the rest
+    of the run instead of re-tried every stage."""
+    s = str(exc).lower()
+    if "key limit exceeded" in s:
+        return True
+    if "insufficient" in s and "credit" in s:
+        return True
+    if "403" in s and ("limit" in s or "quota" in s or "billing" in s
+                       or "credit" in s or "exceeded" in s):
+        return True
+    return False
+
+
 class _CircuitBreaker:
     """Marks a provider degraded for 15 min after 3 failures in 10 min."""
 
@@ -172,6 +188,14 @@ class AIOrchestrator:
         # so we don't burn 30s on every job trying to hit a dead daemon
         # before falling back to OpenRouter.
         self._unreachable: set[str] = set()
+        # Providers that returned a HARD, non-retryable billing error this job
+        # (OpenRouter "Key limit exceeded" 403 / out-of-credits). Unlike the
+        # circuit breaker (3-strikes, reset between stages) this is sticky for
+        # the whole job — a dead key WON'T recover mid-run, so re-attempting it
+        # every stage just wastes minutes on 403s before the local fallback.
+        # Skipped in ``_get_active_chain`` and NOT cleared by
+        # ``reset_circuit_breaker`` (it resets next job — new orchestrator).
+        self._billing_dead: set[str] = set()
         for name in settings.editorial_provider_chain:
             p = _build_provider(name)
             if p:
@@ -418,6 +442,19 @@ class AIOrchestrator:
         """
         self._circuit_breaker.force_reset_all()
 
+    def _mark_if_key_limited(self, name: str, exc) -> None:
+        """Disable ``name`` for the rest of the job when ``exc`` is a hard
+        billing/key-limit error, so we stop re-trying a dead key every stage
+        (one warning per provider)."""
+        if name not in self._billing_dead and _is_key_limit_error(exc):
+            self._billing_dead.add(name)
+            logger.warning(
+                "Provider '%s' hit a hard key/billing limit (403 'Key limit "
+                "exceeded') — disabling it for the rest of this job to stop "
+                "re-trying a dead key every stage. Fix the key's credit limit / "
+                "add credits, or run local (SELF_HOSTED_MODE / "
+                "EDITORIAL_AI_SOURCE=local).", name)
+
     def get_editorial_model_info(self) -> dict:
         """Return info about the text model that will handle the next text_completion call.
 
@@ -442,6 +479,9 @@ class AIOrchestrator:
         for name in settings.editorial_provider_chain:
             if name in self._unreachable:
                 unreachable.append(name)
+                continue
+            if name in self._billing_dead:
+                skipped.append(f"{name} (key-limited)")
                 continue
             if name in self._providers and not self._circuit_breaker.is_degraded(name):
                 chain.append(self._providers[name])
@@ -548,6 +588,7 @@ class AIOrchestrator:
                 return result, self._get_task_model(provider, "scenes")
             except (ProviderRateLimitError, ProviderError) as e:
                 self._circuit_breaker.record_failure(provider.provider_name)
+                self._mark_if_key_limited(provider.provider_name, e)
                 await self._notify_fallback(job_id, provider.provider_name, str(e))
                 continue
         raise AllProvidersFailedError("All vision providers failed")
@@ -585,6 +626,7 @@ class AIOrchestrator:
                 return result, self._get_task_model(provider, "summary")
             except (ProviderRateLimitError, ProviderError) as e:
                 self._circuit_breaker.record_failure(provider.provider_name)
+                self._mark_if_key_limited(provider.provider_name, e)
                 await self._notify_fallback(job_id, provider.provider_name, str(e))
                 continue
         raise AllProvidersFailedError("All providers failed for summary generation")
@@ -1113,6 +1155,10 @@ class AIOrchestrator:
             except Exception as e:
                 if not skip_circuit_breaker:
                     self._circuit_breaker.record_failure(pname)
+                # A hard billing/key-limit 403 won't recover this job — abandon
+                # the provider so later batches/stages skip it instead of eating
+                # a 403 round-trip each (the recurring OpenRouter retry waste).
+                self._mark_if_key_limited(pname, e)
                 if isinstance(e, ProviderRateLimitError) or "429" in str(e) or "rate limit" in str(e).lower():
                     saw_rate_limit = True
                 logger.warning("text_completion via %s model=%s failed: %s — trying next provider", pname, model_name, e)
@@ -1154,6 +1200,7 @@ class AIOrchestrator:
                 return result, self._get_task_model(provider, "seo")
             except (ProviderRateLimitError, ProviderError) as e:
                 self._circuit_breaker.record_failure(provider.provider_name)
+                self._mark_if_key_limited(provider.provider_name, e)
                 await self._notify_fallback(job_id, provider.provider_name, str(e))
                 continue
         raise AllProvidersFailedError("All providers failed for SEO generation")
