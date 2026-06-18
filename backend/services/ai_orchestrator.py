@@ -215,6 +215,17 @@ class AIOrchestrator:
             except Exception as e:
                 logger.debug("Ollama reachability probe failed: %s", e)
 
+        # Masked fingerprint (last-4 + length) of every API key, so the active
+        # key is confirmable at a glance — that a freshly-saved key, not a
+        # cached old one, is in play. Reflects the per-user overlay for this
+        # job; the full secret is never logged.
+        try:
+            _fps = settings.api_key_fingerprints()
+            logger.info("Active API keys (last-4): %s",
+                        " · ".join(f"{k}={v}" for k, v in _fps.items()))
+        except Exception:
+            pass
+
     def _wire_ws_to_providers(self, job_id: str):
         """Pass WebSocket broadcast to providers that support model-level notifications."""
         if not self._ws_broadcast:

@@ -509,6 +509,28 @@ class Settings(BaseSettings):
     BOX_CLIENT_SECRET: str = ""
     BOX_REDIRECT_URI: str = "http://localhost:8000/api/cloud/box/callback"
 
+    def api_key_fingerprints(self) -> dict:
+        """Last-4 fingerprint (+ length) of every external API key, for
+        at-a-glance confirmation of WHICH key is active — e.g. that a freshly
+        saved key, not a cached old one, is in play. NEVER returns the full
+        secret. Reads the live settings, so when logged per-job (after the
+        per-user overlay) it reflects the key actually used for that job."""
+        def _fp(v: str) -> str:
+            v = (v or "").strip()
+            if not v:
+                return "(unset)"
+            return f"…{v[-4:]} ({len(v)} chars)" if len(v) > 4 else "**** (set)"
+        return {
+            "OpenRouter":      _fp(self.OPENROUTER_API_KEY),
+            "Anthropic":       _fp(self.ANTHROPIC_API_KEY),
+            "Gemini":          _fp(self.GEMINI_API_KEY),
+            "Groq":            _fp(self.GROQ_API_KEY),
+            "Replicate":       _fp(self.REPLICATE_API_KEY),
+            "GoogleTranslate": _fp(self.GOOGLE_TRANSLATE_API_KEY),
+            "DeepL":           _fp(self.DEEPL_API_KEY),
+            "HuggingFace":     _fp(self.HF_AUTH_TOKEN),
+        }
+
     @property
     def active_provider_chain(self) -> list[str]:
         # Self-hosted / local editorial routes every editorial LLM task to local

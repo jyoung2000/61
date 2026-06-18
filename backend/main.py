@@ -179,6 +179,18 @@ async def _startup_build_stamp():
             pass
     logger.info("ClipAI build: %s — %s", sha or "unknown", subject or "(no subject)")
 
+    # Masked fingerprint (last-4 + length) of every API key loaded from the
+    # environment, so the active key is confirmable at boot without exposing
+    # the secret. (Per-job, the orchestrator logs the same after the per-user
+    # settings overlay, which can override these.)
+    try:
+        from backend.config import settings as _settings
+        _fps = _settings.api_key_fingerprints()
+        logger.info("API keys at startup (last-4): %s",
+                    " · ".join(f"{k}={v}" for k, v in _fps.items()))
+    except Exception:
+        pass
+
     # Torch/CUDA readiness — the single biggest analysis-speed factor. A
     # CPU-only torch build (or a GPU the container can't see) forces YOLO-World
     # subject detection + face/embedding work onto the CPU, making analysis
