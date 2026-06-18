@@ -21,6 +21,78 @@ logger = logging.getLogger(__name__)
 # ── GPU info cache (doesn't change at runtime) ──────────────────────────
 _gpu_info_cache: dict | None = None
 
+# Real-time device VRAM-used probe. The static info above is cached; THIS must
+# stay fresh per poll, so it has its own short cache + runs off the event loop.
+_smi_used_cache: dict = {"ts": 0.0, "bytes": None}
+
+# Thresholds (bytes) for deciding the GPU is genuinely in use by the pipeline.
+_TORCH_INUSE_FLOOR = 64 * 1024 * 1024      # torch holding VRAM (YOLO, etc.)
+_DEVICE_INUSE_FLOOR = 300 * 1024 * 1024    # non-Ollama device residency (Whisper int8 is ~1.5-2 GB)
+
+
+async def _device_vram_used_bytes() -> int | None:
+    """Total GPU memory in use across ALL processes, via nvidia-smi.
+
+    Unlike the Ollama ``/api/ps`` sum or torch's allocator, this also captures
+    the pipeline's CTranslate2 / Whisper VRAM (which torch can't see), so the
+    live gauge is truthful during analysis — not just for Ollama models.
+    Returns ``None`` when nvidia-smi isn't reachable from this container (the
+    caller then keeps the Ollama+torch estimate). Short-cached (1.5s) and run
+    off the event loop so the 2s poll never blocks.
+    """
+    now = time.monotonic()
+    if (now - _smi_used_cache["ts"]) < 1.5:
+        return _smi_used_cache["bytes"]
+
+    def _run() -> int | None:
+        try:
+            import subprocess
+            r = subprocess.run(
+                ["nvidia-smi", "--query-gpu=memory.used",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=3,
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                mb = int(r.stdout.strip().splitlines()[0].strip())
+                return mb * 1024 * 1024
+        except Exception:
+            return None
+        return None
+
+    val = await asyncio.to_thread(_run)
+    _smi_used_cache["ts"] = now
+    _smi_used_cache["bytes"] = val
+    return val
+
+
+def _compute_gpu_usage(
+    vram_used_ollama: int,
+    ollama_in_use: bool,
+    torch_reserved: int,
+    device_used: int | None,
+    has_loaded_models: bool,
+    gpu_available: bool,
+) -> tuple[int, bool, bool]:
+    """Derive ``(vram_used_bytes, gpu_in_use, gpu_poisoned)`` from the raw
+    signals — truthful about the WHOLE pipeline (Ollama + torch + real device),
+    not just Ollama models. Pure + unit-tested.
+
+    ``gpu_in_use`` lights for an Ollama model on GPU, OR torch holding VRAM
+    (torch-based stages like YOLO subject detection), OR meaningful non-Ollama
+    device residency (CTranslate2 / Whisper, which torch can't see). Poisoning
+    stays Ollama-specific: models loaded but placed on CPU.
+    """
+    est_used = vram_used_ollama + max(0, torch_reserved or 0)
+    vram_used_bytes = max(est_used, device_used or 0)
+    gpu_in_use = bool(
+        ollama_in_use
+        or (torch_reserved or 0) > _TORCH_INUSE_FLOOR
+        or (device_used is not None
+            and (device_used - vram_used_ollama) > _DEVICE_INUSE_FLOOR)
+    )
+    gpu_poisoned = bool(gpu_available and has_loaded_models and not ollama_in_use)
+    return vram_used_bytes, gpu_in_use, gpu_poisoned
+
 
 async def _get_gpu_info() -> dict:
     """Get GPU hardware info. Tries Ollama's container first since the app
@@ -519,16 +591,46 @@ async def _check_model_gpu(client: httpx.AsyncClient, model: str) -> tuple[str, 
 
 @router.get("/gpu-status")
 async def get_gpu_status():
-    """Real-time GPU memory usage and loaded Ollama models. Polled every 2s."""
+    """Real-time GPU memory usage and loaded Ollama models. Polled every 2s.
+
+    Reflects the WHOLE pipeline's GPU use during analysis — Ollama models, the
+    app container's torch VRAM (YOLO etc.), AND the real device usage from
+    nvidia-smi (which captures CTranslate2 / Whisper that torch can't see) — so
+    the Analysis-page panel truthfully shows whether the GPU is being used.
+    """
     gpu = await _get_gpu_info()
     loaded_models = await _get_ollama_loaded_models()
 
-    # Compute dynamic VRAM and poisoning state from loaded models
-    vram_used = sum(m["vram_bytes"] for m in loaded_models)
-    gpu["vram_used_bytes"] = vram_used
-    gpu["gpu_in_use"] = any(m["vram_bytes"] > 0 for m in loaded_models)
+    vram_used_ollama = sum(m["vram_bytes"] for m in loaded_models)
+    ollama_in_use = any(m["vram_bytes"] > 0 for m in loaded_models)
 
-    # If we see a model on GPU but the cache said no GPU, invalidate cache
+    # App-container torch VRAM (covers torch-based stages like YOLO).
+    torch_gpu = None
+    torch_reserved = 0
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch_reserved = torch.cuda.memory_reserved()
+            torch_gpu = {
+                "allocated_bytes": torch.cuda.memory_allocated(),
+                "reserved_bytes": torch_reserved,
+            }
+    except (ImportError, Exception):
+        pass
+
+    # Real device usage (all processes, incl. CTranslate2 / Whisper).
+    device_used = await _device_vram_used_bytes()
+
+    gpu["vram_used_bytes"], gpu["gpu_in_use"], gpu["gpu_poisoned"] = _compute_gpu_usage(
+        vram_used_ollama=vram_used_ollama,
+        ollama_in_use=ollama_in_use,
+        torch_reserved=torch_reserved,
+        device_used=device_used,
+        has_loaded_models=bool(loaded_models),
+        gpu_available=bool(gpu.get("gpu_available")),
+    )
+
+    # If we now see GPU activity but the cached probe said no GPU, invalidate it.
     if gpu["gpu_in_use"] and not gpu.get("gpu_available"):
         global _gpu_info_cache
         _gpu_info_cache = None
@@ -539,32 +641,12 @@ async def get_gpu_status():
         if gpu["vram_total_bytes"] == 0:
             gpu["vram_total_bytes"] = int(3.6 * 1024 * 1024 * 1024)
 
-    # Detect GPU scheduler poisoning: hardware exists but loaded models are on CPU
-    if gpu["gpu_available"] and loaded_models and not gpu["gpu_in_use"]:
-        gpu["gpu_poisoned"] = True
-    else:
-        gpu["gpu_poisoned"] = False
-
     ollama_available = False
     try:
         async with httpx.AsyncClient(timeout=3) as client:
             resp = await client.head(f"{settings.OLLAMA_HOST}")
             ollama_available = resp.status_code == 200
     except Exception:
-        pass
-
-    # Torch GPU memory info (separate from Ollama — this is the app container)
-    torch_gpu = None
-    try:
-        import torch
-        if torch.cuda.is_available():
-            torch_gpu = {
-                "allocated_bytes": torch.cuda.memory_allocated(),
-                "reserved_bytes": torch.cuda.memory_reserved(),
-            }
-            # Torch reserved memory counts as VRAM used (it's unavailable to Ollama)
-            gpu["vram_used_bytes"] = vram_used + torch_gpu["reserved_bytes"]
-    except (ImportError, Exception):
         pass
 
     return {

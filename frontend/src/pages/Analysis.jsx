@@ -13,6 +13,7 @@ import TranscriptViewer from '../components/TranscriptViewer';
 import ClipCard from '../components/ClipCard';
 import ReframeGrade from '../components/ReframeGrade';
 import ComputeCard from '../components/ComputeCard';
+import PipelineDiagnostics from '../components/PipelineDiagnostics';
 import sanitizeJob, { sanitizeSubtitleSettings } from '../utils/sanitizeJob';
 import { sendNotification, requestNotificationPermission } from '../utils/notifications';
 import ClipSettingsPanel from '../components/ClipSettingsPanel';
@@ -3076,6 +3077,13 @@ export default function Analysis() {
             pipelineStartTime={pipelineStartTime}
             isLive={isProcessing}
           />
+          {/* Live GPU / VRAM diagnostics — shows whether the GPU is actually
+              being used during analysis (Whisper / YOLO / Ollama). The
+              synthetic test runner is hidden while a job is processing so it
+              can't contend for VRAM with the live run. */}
+          {(isProcessing || job.status === 'complete') && (
+            <PipelineDiagnostics showTestRunner={!isProcessing} />
+          )}
         </>
       )}
 

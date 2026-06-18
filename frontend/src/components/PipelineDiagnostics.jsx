@@ -275,7 +275,11 @@ function PhaseRow({ phase }) {
 }
 
 // ── Main Component ──────────────────────────────────────────────────────
-export default function PipelineDiagnostics() {
+// ``showTestRunner`` (default true) gates the synthetic "Run Pipeline Test"
+// tool. The Analysis page embeds this panel during a LIVE job and passes false,
+// so the user can't kick off a model-loading test that would contend for VRAM
+// with the job actually running.
+export default function PipelineDiagnostics({ showTestRunner = true } = {}) {
   const [gpuStatus, setGpuStatus] = useState(null);
   const [loadedModels, setLoadedModels] = useState([]);
   const [torchGpu, setTorchGpu] = useState(null);
@@ -407,6 +411,7 @@ export default function PipelineDiagnostics() {
       )}
 
       {/* Pipeline Test Runner */}
+      {showTestRunner && (
       <div style={{ ...cardStyle, marginTop: 12 }}>
         <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 10 }}>
           Simulates the full video analysis pipeline — same order, same VRAM management.
@@ -471,6 +476,7 @@ export default function PipelineDiagnostics() {
           </div>
         )}
       </div>
+      )}
     </div>
   );
 }
