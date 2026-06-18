@@ -2860,7 +2860,21 @@ def _build_judge_prompt(candidate: ClipCandidate, transcript_slice: str,
     if avoid_subjects.strip():
         avoid = f"\nUser wants to avoid: {avoid_subjects}"
 
-    return f"""You are an expert viral content editor judging a potential short-form clip.
+    # Today's live trend brief (daily-cached; warmed by the SEO stage / a prior
+    # job today). A moment that rides a CURRENT trend/format is more shareable,
+    # so let the judge factor it in. Empty (no nudge) when the cache is cold.
+    trend = ""
+    try:
+        from backend.services.trend_brief import read_cached_brief
+        _tb = read_cached_brief("both", "")
+        if _tb:
+            trend = ("\n\nTODAY'S SHORT-FORM TREND CONTEXT (favor moments that fit a "
+                     "CURRENT trend/format, but never reward an off-topic match):\n"
+                     + _tb.strip())
+    except Exception:
+        pass
+
+    return f"""You are an expert viral content editor judging a potential short-form clip.{trend}
 
 CLIP: {_fmt_time(candidate.start_s)} → {_fmt_time(candidate.end_s)} ({candidate.duration_s:.0f}s)
 

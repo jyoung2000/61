@@ -584,19 +584,34 @@ PLATFORM_PROFILES["both"] = PLATFORM_PROFILES["tiktok"]
 PLATFORM_PROFILES["default"] = PLATFORM_PROFILES["tiktok"]
 
 
-def build_platform_seo_prompt(platform: str) -> str:
+def build_platform_seo_prompt(platform: str, trend_brief: str = "") -> str:
     """Return the platform-specific SEO prompt for the given platform slug.
 
     Falls back to ``PLATFORM_PROFILES['default']`` (TikTok-style) when the
     platform is unknown so a new clip type still gets reasonable output
-    instead of crashing.
+    instead of crashing. When ``trend_brief`` is supplied (today's live
+    hashtags / sounds / hook formats / topics) it is injected so the title,
+    caption, tags and hook reflect what's working on the platform RIGHT NOW —
+    not evergreen guesses from the model's stale training data.
     """
     profile = PLATFORM_PROFILES.get(platform) or PLATFORM_PROFILES["default"]
+    trend_block = ""
+    if (trend_brief or "").strip():
+        trend_block = (
+            "TODAY'S LIVE TREND BRIEF (use this — it is CURRENT; prefer it over "
+            "anything you 'remember'):\n"
+            f"{trend_brief.strip()}\n"
+            "Pull 2-4 relevant CURRENT hashtags from the brief into TAGS (only if "
+            "they genuinely fit the clip — never force an unrelated trend), and "
+            "shape the TITLE/hook with a hook format that's working right now. Do "
+            "NOT mention dates or that you used a trend brief.\n\n"
+        )
     return (
         "You write social media captions and tags like a real creator on the "
         "specific platform you're targeting — not a marketer, not a robot. "
         "The text should feel native to that platform's culture.\n\n"
         f"{profile['guidance']}\n\n"
+        f"{trend_block}"
         "HARD CONSTRAINTS (the validator WILL truncate / reject if you miss):\n"
         f"  • title_max_chars: {profile['title_max']}\n"
         f"  • description_max_chars: {profile['description_max']}\n"

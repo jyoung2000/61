@@ -1517,8 +1517,16 @@ async def _generate_seo_for_platform(
 
     custom_prompts = load_prompts()
     # Swap the platform-agnostic default with the per-platform prompt for
-    # this call only — leaves the user's custom_prompts.json untouched.
-    platform_prompt = build_platform_seo_prompt(canonical)
+    # this call only — leaves the user's custom_prompts.json untouched. Inject
+    # today's live trend brief (daily-cached, fail-soft) so the regenerated
+    # title/caption/tags/hook reflect what's trending right now.
+    _trend_brief = ""
+    try:
+        from backend.services.trend_brief import get_trend_brief
+        _trend_brief = await get_trend_brief("both", "")
+    except Exception:
+        pass
+    platform_prompt = build_platform_seo_prompt(canonical, trend_brief=_trend_brief)
     custom_prompts = custom_prompts.model_copy(update={"seo": platform_prompt})
 
     orchestrator = AIOrchestrator(ws_broadcast=ws_broadcast, custom_prompts=custom_prompts)

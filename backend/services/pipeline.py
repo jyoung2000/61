@@ -1379,6 +1379,17 @@ async def _auto_generate_clip_seo(
     prompt_cache: dict[str, str] = {}
     base_prompts = load_prompts()
 
+    # Fetch TODAY's live short-form trend brief once (daily-cached, fail-soft) so
+    # every clip's SEO — title, caption, tags, hook — reflects what's actually
+    # trending on TikTok / YT Shorts right now, not the model's stale guesses.
+    _trend_brief = ""
+    try:
+        from backend.services.trend_brief import get_trend_brief
+        _trend_brief = await get_trend_brief("both", "")
+    except Exception as _tb_err:
+        logger.debug("[%s] live trend brief unavailable (%s) — SEO uses evergreen "
+                     "patterns", job_id, _tb_err)
+
     generated = 0
     failed = 0
     updated_clips = []
@@ -1406,7 +1417,8 @@ async def _auto_generate_clip_seo(
             clip_transcript = clip_dict.get("suggested_caption") or clip_dict.get("title", "")
 
         if platform not in prompt_cache:
-            prompt_cache[platform] = build_platform_seo_prompt(platform)
+            prompt_cache[platform] = build_platform_seo_prompt(
+                platform, trend_brief=_trend_brief)
         custom_prompts = base_prompts.model_copy(
             update={"seo": prompt_cache[platform]})
 

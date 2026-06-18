@@ -188,6 +188,23 @@ class Settings(BaseSettings):
     CLIP_AVOID_SUBJECTS: str = ""      # topics to skip, comma-separated
     CLIP_DISCOVERY_PROMPT: str = ""    # custom VideoLLaMA3 prompt; "" = built-in default
 
+    # ── Live trend brief (titles/tags/captions/hooks that work TODAY) ──
+    # Social platforms change day-by-day and an LLM's training data is stale, so
+    # ClipAI fetches a LIVE short-form trend brief (current hashtags / sounds /
+    # hook formats / topics for TikTok + YouTube Shorts) once per day and injects
+    # it into the clip judge + SEO generation. Three tiers, fail-soft: a web-
+    # search model (primary) → Google Trends (free fallback, needs pytrends) →
+    # the static lexicon (last resort). Refreshed daily; cached so it's one
+    # cheap fetch/day reused across every clip. Set False to use the static
+    # lexicon only (no live calls, no cost).
+    LIVE_TRENDS_ENABLED: bool = True
+    # OpenRouter web-search model for tier 1. ``perplexity/sonar`` has built-in
+    # web search; alternatively append ``:online`` to any model (e.g.
+    # ``google/gemini-2.5-flash:online``) to enable OpenRouter's web plugin.
+    LIVE_TRENDS_MODEL: str = "perplexity/sonar"
+    LIVE_TRENDS_REGION: str = "united_states"   # Google Trends region (tier 2)
+    LIVE_TRENDS_CACHE_HOURS: int = 24           # refresh cadence (trends move daily)
+
     # ── Self-hosted mode — route the analysis pipeline to local AI ──
     # The master toggle flips every "auto" engine local; a per-engine
     # override ("local" / "cloud") wins over the master when set.
