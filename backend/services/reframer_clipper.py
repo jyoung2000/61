@@ -3015,20 +3015,25 @@ def select_diverse_clips(candidates: List[ClipCandidate],
         return []
 
     selected = []
-    remaining = list(candidates)
+    # Work on a LOCAL score copy so we never mutate the candidates'
+    # ``composite_score``. This function is called twice on the same objects
+    # (pre-judge pool + final selection); persistently penalising the shared
+    # score corrupted the second pass.
+    remaining = [[c, float(getattr(c, "composite_score", 0.0) or 0.0)]
+                 for c in candidates]
 
     for _ in range(max_clips):
         if not remaining:
             break
 
         # Pick the highest-scoring remaining candidate
-        best = remaining[0]
+        best = remaining[0][0]
         selected.append(best)
         best_center = (best.start_s + best.end_s) / 2
 
-        # Penalize remaining candidates near the selected one
+        # Penalize remaining candidates near the selected one (local score only)
         new_remaining = []
-        for c in remaining[1:]:
+        for c, sc in remaining[1:]:
             c_center = (c.start_s + c.end_s) / 2
             dist = abs(c_center - best_center)
 
@@ -3036,7 +3041,7 @@ def select_diverse_clips(candidates: List[ClipCandidate],
             if dist < min_gap_s:
                 # Stronger penalty for closer candidates
                 penalty = 1.0 - (dist / min_gap_s) * 0.7  # up to 70% penalty
-                c.composite_score *= (1.0 - penalty)
+                sc = sc * (1.0 - penalty)
 
             # Also skip candidates that heavily overlap with the selected one
             overlap_start = max(c.start_s, best.start_s)
@@ -3046,10 +3051,10 @@ def select_diverse_clips(candidates: List[ClipCandidate],
             if shorter > 0 and overlap / shorter > 0.8:
                 continue  # skip >80% overlap
 
-            new_remaining.append(c)
+            new_remaining.append([c, sc])
 
         # Re-sort after score adjustments
-        new_remaining.sort(key=lambda c: c.composite_score, reverse=True)
+        new_remaining.sort(key=lambda t: t[1], reverse=True)
         remaining = new_remaining
 
     return selected
@@ -3549,10 +3554,23 @@ class ClipExtractor:
                         if len(parts) == 2:
                             new_start = _parse_mmss(parts[0])
                             new_end = _parse_mmss(parts[1])
+                            # A trim must SHRINK the clip, not RELOCATE it. Reject a
+                            # suggestion that doesn't substantially overlap the
+                            # original candidate — otherwise a model that returns the
+                            # same early "highlight" window for many candidates
+                            # collapses them ALL onto the opening (the clip-clustering
+                            # bug: every clip ends up in the first ~2 minutes).
                             if new_end > new_start:
-                                c.start_s = new_start
-                                c.end_s = new_end
-                                c.duration_s = new_end - new_start
+                                _ov = max(0.0, min(new_end, c.end_s) - max(new_start, c.start_s))
+                                if _ov >= 0.5 * (new_end - new_start):
+                                    c.start_s = new_start
+                                    c.end_s = new_end
+                                    c.duration_s = new_end - new_start
+                                else:
+                                    logger.debug(
+                                        "Judge trim %s ignored — relocates clip away "
+                                        "from its %.0f-%.0fs window",
+                                        trim, c.start_s, c.end_s)
                     except Exception:
                         pass
 
@@ -3575,6 +3593,28 @@ class ClipExtractor:
         keepers.sort(key=lambda c: c.composite_score, reverse=True)
         min_gap = max(20, video_dur / (eff_max * 2))
         final = select_diverse_clips(keepers, eff_max, video_dur, min_gap_s=min_gap)
+
+        # Diagnostics: why this many clips, and whether they spread across the
+        # episode or bunch up. Shows the judge verdict mix, the keeper pool's
+        # time-span vs the video, and the chosen clip start times — so a
+        # "few clips clustered in the opening" run is explainable at a glance.
+        try:
+            _vc = {}
+            for c in candidates:
+                _vc[getattr(c, "judge_verdict", "") or "(none)"] = \
+                    _vc.get(getattr(c, "judge_verdict", "") or "(none)", 0) + 1
+            _kc = [(c.start_s + c.end_s) / 2 for c in keepers]
+            _span = (max(_kc) - min(_kc)) if _kc else 0
+            logger.info(
+                "Final clip selection: video=%.0fs eff_max=%d · candidates=%d "
+                "verdicts=%s · keeper pool=%d spanning %.0f-%.0fs (%.0f%% of video) "
+                "· selected=%d at %s",
+                video_dur, eff_max, len(candidates), _vc, len(keepers),
+                (min(_kc) if _kc else 0), (max(_kc) if _kc else 0),
+                (100.0 * _span / video_dur) if video_dur else 0,
+                len(final), [f"{int(c.start_s)}s" for c in final])
+        except Exception:
+            pass
 
         # Sort final clips by time for sequential output
         final.sort(key=lambda c: c.start_s)
