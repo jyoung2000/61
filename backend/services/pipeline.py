@@ -1191,7 +1191,7 @@ async def _refresh_clips_with_translation(
             "[%s] clip refresh: load_job returned None — skipping (translated=%d)",
             job_id, len(translated or []),
         )
-        return 0
+        return 0, []
     source_clips = list(job.clips or [])
     used_fallback = False
     if not source_clips and fallback_clips:
@@ -1202,7 +1202,7 @@ async def _refresh_clips_with_translation(
         source_clips = list(fallback_clips)
         used_fallback = True
     if not source_clips:
-        return 0
+        return 0, []
 
     updated_clips = []
     changed = 0
@@ -1269,7 +1269,11 @@ async def _refresh_clips_with_translation(
             job_id, changed, len(updated_clips),
             " (restored from in-process fallback)" if used_fallback else "",
         )
-    return changed
+    # Return the rebuilt list so the caller can hand the SAME (target-language)
+    # clips straight to Auto-SEO — the DB round-trip reads back 0 clips during
+    # post-processing, so without this the SEO step would re-load the STALE
+    # source-language fallback and clobber these captions/hooks/titles.
+    return changed, updated_clips
 
 
 async def _auto_generate_clip_seo(
@@ -1334,7 +1338,7 @@ async def _auto_generate_clip_seo(
             "[%s] Auto-SEO skipped early: job_loaded=False, clip_count=0",
             job_id,
         )
-        return (0, 0)
+        return (0, 0, list(fallback_clips or []))
     # When the fresh DB snapshot has 0 clips but the caller threaded
     # through the post-COMPLETE list, run against that — otherwise the
     # cards on the Viral Clips page ship as bare transcript snippets
@@ -1363,7 +1367,7 @@ async def _auto_generate_clip_seo(
             "[%s] Auto-SEO skipped early: job_loaded=True, clip_count=0",
             job_id,
         )
-        return (0, 0)
+        return (0, 0, [])
     logger.info(
         "[%s] Auto-SEO starting on %d clips, %d transcript segments",
         job_id, len(source_clips), len(transcript or []),
@@ -1471,7 +1475,10 @@ async def _auto_generate_clip_seo(
             "[%s] Auto-SEO: all %d clips already had SEO, nothing to generate",
             job_id, len(updated_clips),
         )
-    return (generated, failed)
+    # Return the SEO'd list so the caller persists THESE (target-language
+    # caption/hook/title carried from source_clips + the SEO fields) in the
+    # COMPLETE save, instead of re-reading 0 clips from the DB.
+    return (generated, failed, updated_clips)
 
 
 async def _polish_transcript_loop(
@@ -1642,16 +1649,31 @@ async def _run_post_clip_followups(job_id: str, orchestrator, pp_result: Optiona
     """
     pp = pp_result or {}
     fallback_clips = list(clips or [])
+    # The authoritative clip list to hand back for the COMPLETE save. Starts as
+    # the in-process clips and is upgraded to the refreshed / SEO'd list as those
+    # steps run, so the final save never depends on the DB reading back clips.
+    final_clips = list(fallback_clips)
     target_name = pp.get("target_name") or "the target language"
 
     # (a) Re-derive clip caption / hook_text / title from the translated
     #     transcript so the Viral Clips cards show the target language.
+    # ``seo_input_clips`` is what Auto-SEO (step b) runs on. It MUST be the
+    # refreshed (target-language) list, not the original ``fallback_clips`` —
+    # the DB reads back 0 clips here, so if SEO fell back to the stale source
+    # list it would re-persist Japanese captions over the English refresh.
+    seo_input_clips = fallback_clips
     if pp.get("translated") and pp.get("target_transcript"):
         try:
-            _refreshed = await _refresh_clips_with_translation(
+            _refreshed, _refreshed_clips = await _refresh_clips_with_translation(
                 job_id, list(pp["target_transcript"]),
                 fallback_clips=fallback_clips,
             )
+            if _refreshed_clips:
+                seo_input_clips = _refreshed_clips
+                # Carry the English list forward even if SEO returns nothing,
+                # so a skipped/failed SEO pass can't revert the COMPLETE save
+                # to the source-language clips.
+                final_clips = _refreshed_clips
             if _refreshed > 0:
                 await broadcast_ws(job_id, {
                     "type": "clips_refreshed",
@@ -1677,11 +1699,13 @@ async def _run_post_clip_followups(job_id: str, orchestrator, pp_result: Optiona
             "type": "background_task", "task": "auto_seo", "status": "running",
             "message": "Generating SEO titles, captions, and tags for clips...",
         })
-        _g, _f = await _auto_generate_clip_seo(
+        _g, _f, _seo_clips = await _auto_generate_clip_seo(
             job_id, list(seo_segments or []), orchestrator,
-            fallback_clips=fallback_clips,
+            fallback_clips=seo_input_clips,
             output_language=pp.get("output_lang", ""),
         )
+        if _seo_clips:
+            final_clips = _seo_clips
         await broadcast_ws(job_id, {
             "type": "background_task", "task": "auto_seo", "status": "complete",
             "message": (f"SEO generated for {_g} clips"
@@ -1693,6 +1717,10 @@ async def _run_post_clip_followups(job_id: str, orchestrator, pp_result: Optiona
             "type": "background_task", "task": "auto_seo", "status": "failed",
             "message": f"Auto-SEO skipped: {str(_seo_err)[:80]}",
         })
+    # Hand the final (target-language caption/hook/title + SEO) list back so the
+    # caller can persist it directly — the DB round-trip can't be trusted to
+    # have these clips during post-processing.
+    return final_clips
 
 
 async def _background_post_processing(
@@ -4148,13 +4176,21 @@ async def _run_analysis_inner(job_id: str):
     # in-process ``clips`` is threaded as the fallback for the DB-round-trip-empty
     # case. Best-effort: a failure here never aborts the finalize.
     try:
-        await _run_post_clip_followups(job_id, orchestrator, _pp_result, clips)
-        _pp_after = await database.load_job(job_id)
-        if _pp_after is not None and getattr(_pp_after, "clips", None):
-            clips = [
-                c.model_dump() if hasattr(c, "model_dump") else c
-                for c in _pp_after.clips
-            ]
+        _final_clips = await _run_post_clip_followups(
+            job_id, orchestrator, _pp_result, clips)
+        # Prefer the in-process result (target-language caption/hook/title + SEO)
+        # — the DB round-trip reads back 0 clips during post-processing, and
+        # falling back to it would ship the stale source-language list. Only use
+        # the DB reload when the followups returned nothing.
+        if _final_clips:
+            clips = _final_clips
+        else:
+            _pp_after = await database.load_job(job_id)
+            if _pp_after is not None and getattr(_pp_after, "clips", None):
+                clips = [
+                    c.model_dump() if hasattr(c, "model_dump") else c
+                    for c in _pp_after.clips
+                ]
     except Exception as _fu_err:
         logger.warning(
             "[%s] Post-clip follow-ups failed (non-fatal): %s",
