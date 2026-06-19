@@ -482,6 +482,15 @@ class Settings(BaseSettings):
     # its timespan falls inside a music span.
     SUBTITLE_SUPPRESS_SPEECH_IN_MUSIC: bool = True
     SUBTITLE_MUSIC_SUPPRESS_OVERLAP: float = 0.6
+    # The spectral classifier can mislabel dialogue over a loud orchestral /
+    # action cue as ``music``; blanket suppression then deletes a whole spoken
+    # section (observed as minute-long holes vs the reference subtitle track).
+    # With this True, suppression inside a music span drops ONLY sung
+    # vocalisations / onomatopoeia (``ああああ``, ``lalala``) and keeps
+    # lexically-diverse real dialogue. A genuine OP/ED song is still marked
+    # ``[♪ music ♪]`` (its marker survives because no real dialogue remains in
+    # the span). Set False to restore blanket suppression of every cue.
+    SUBTITLE_MUSIC_SUPPRESS_VOCALIZATIONS_ONLY: bool = True
 
     # ── Audio Analysis ──
     AUDIO_EVENT_DETECTION: bool = True          # spectral audio event classification

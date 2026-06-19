@@ -498,20 +498,57 @@ def _music_spans_from_events(events: list, min_seconds: float) -> list:
     return spans
 
 
+def _is_nonlexical_vocalization(text: str) -> bool:
+    """True when ``text`` is sung / hummed filler or onomatopoeia
+    (``ああああ``, ``lalala``, ``mmmm``, ``ーーー``) rather than real dialogue.
+
+    Music-span suppression uses this so it removes only the vocalisations
+    Whisper invents over a song bed — never lexically-diverse real dialogue
+    that merely overlaps a span the spectral classifier *mislabelled*
+    ``music`` (e.g. dialogue over a loud orchestral / action cue). A
+    minute-long spoken section always has many distinct characters and is
+    therefore always kept; losing it is far worse than leaving one stray
+    sung line. Pure / deterministic; script-agnostic (the distinct-character
+    test works for CJK syllabaries and elongated latin vowels alike)."""
+    import re as _re
+    t = _re.sub(r"[\s\W_]+", "", str(text or ""), flags=_re.UNICODE).lower()
+    if len(t) < 4:
+        # Too short to call sung filler — keep real short words ("はい",
+        # "ok", "go"). Suppression targets the long song bed, not these.
+        return False
+    distinct = len(set(t))
+    if distinct <= 2:
+        # ≤2 morae stretched over ≥4 positions: "ああああ" / "lalala" /
+        # "ーーー" / "mmmm" — the classic hallucinated-lyric signature.
+        return True
+    # A single character dominating the cue ("aaaargh", "naaaaa").
+    most = max(t.count(c) for c in set(t))
+    return most / len(t) >= 0.7
+
+
 def suppress_speech_in_music_spans(
     transcript: list,
     music_spans: list,
     min_overlap_frac: float = 0.6,
+    vocalizations_only: bool = True,
 ) -> tuple[list, list]:
     """Drop transcribed speech cues sitting inside sustained music-only spans.
 
-    In an OP/ED/insert-song span the spectral classifier labels the whole span
-    ``music``; BGM-under-dialogue is classified ``speech`` instead, so REAL
-    dialogue over music is NOT inside a music span and is left untouched.
-    Whisper nonetheless hallucinates lyrics / vocalisations (the ``ああああ`` /
-    fake-lyric cues) over the song — this removes any cue whose timespan is ≥
+    Whisper hallucinates lyrics / vocalisations (the ``ああああ`` / fake-lyric
+    cues) over a song bed; this removes any cue whose timespan is ≥
     ``min_overlap_frac`` inside a music span so the span can be positively
     labelled ``[♪ music ♪]`` instead. Bracketed markers are always kept.
+
+    When ``vocalizations_only`` is True (default), a cue inside a music span
+    is dropped ONLY if it reads as a sung vocalisation
+    (:func:`_is_nonlexical_vocalization`). The spectral classifier is not
+    perfect — a loud orchestral / action cue under dialogue can be mislabelled
+    ``music`` — so lexically-diverse real dialogue is kept even when it
+    overlaps a "music" span; otherwise whole spoken sections disappear from
+    the transcript. The ``[♪ music ♪]`` marker for such a span is then dropped
+    downstream by ``merge_markers`` (it overlaps the surviving dialogue), so a
+    true OP/ED song still gets marked while real dialogue survives. Set
+    ``vocalizations_only=False`` to restore blanket suppression.
 
     Returns ``(kept, suppressed)``. Pure / deterministic."""
     if not transcript or not music_spans:
@@ -543,11 +580,15 @@ def suppress_speech_in_music_spans(
 
     kept, suppressed = [], []
     for seg in transcript:
-        if is_subtitle_marker(_txt(seg)):
+        txt = _txt(seg)
+        if is_subtitle_marker(txt):
             kept.append(seg)
             continue
         s, e = _span(seg)
-        if e > s and _music_overlap_frac(s, e) >= min_overlap_frac:
+        inside_music = e > s and _music_overlap_frac(s, e) >= min_overlap_frac
+        if inside_music and (
+            not vocalizations_only or _is_nonlexical_vocalization(txt)
+        ):
             suppressed.append(seg)
         else:
             kept.append(seg)
@@ -561,6 +602,7 @@ async def mark_and_suppress_music(
     suppress: bool = True,
     min_overlap_frac: float = 0.6,
     label: str = MUSIC_MARKER,
+    vocalizations_only: bool = True,
 ) -> tuple[list, int, int]:
     """Classify the audio ONCE, then suppress hallucinated speech in sustained
     music-only spans and insert ``[♪ music ♪]`` markers over them.
@@ -582,7 +624,8 @@ async def mark_and_suppress_music(
     if suppress:
         spans = _music_spans_from_events(music_events, min_seconds)
         transcript, dropped = suppress_speech_in_music_spans(
-            transcript, spans, min_overlap_frac=min_overlap_frac)
+            transcript, spans, min_overlap_frac=min_overlap_frac,
+            vocalizations_only=vocalizations_only)
         n_suppressed = len(dropped)
     # Build markers AFTER suppression so they fill the now-cleared song spans
     # (a marker that overlapped a hallucinated lyric would have been dropped).

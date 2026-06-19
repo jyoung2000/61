@@ -3681,6 +3681,7 @@ async def _run_analysis_inner(job_id: str):
                     min_seconds=float(getattr(settings, "SUBTITLE_MUSIC_MIN_SEC", 5.0)),
                     suppress=bool(getattr(settings, "SUBTITLE_SUPPRESS_SPEECH_IN_MUSIC", True)),
                     min_overlap_frac=float(getattr(settings, "SUBTITLE_MUSIC_SUPPRESS_OVERLAP", 0.6)),
+                    vocalizations_only=bool(getattr(settings, "SUBTITLE_MUSIC_SUPPRESS_VOCALIZATIONS_ONLY", True)),
                 )
                 if _n_suppressed or _n_markers:
                     logger.info(
