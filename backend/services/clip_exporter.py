@@ -22,6 +22,7 @@ except Exception:
 
 from backend.config import settings as app_settings
 from backend import database
+from backend.services.caption_text import strip_cue_timestamps
 from backend.models import TranscriptSegment
 from backend.services.ass_generator import (
     generate_ass,
@@ -6203,7 +6204,7 @@ async def export_clip(
                 active_word_bg_color=settings.get("active_word_bg_color", "#000000"),
                 active_word_bg_opacity=settings.get("active_word_bg_opacity", 0),
                 active_word_bg_radius=settings.get("active_word_bg_radius", 4),
-                hook_text=hook_text,
+                hook_text=strip_cue_timestamps(hook_text or ""),
                 platform=settings.get("platform", ""),
             )
 
