@@ -123,6 +123,21 @@ class FaceDetector:
         # position.  Cleared on scene cuts via clear_nonhuman_cache().
         self._nonhuman_cache = []       # list of (x1, y1, x2, y2)
 
+        # YOLO-World subsampling: the open-vocab subject detector is the single
+        # heaviest per-frame cost in PERCEIVE (~0.5s/frame → ~17 min on a 24-min
+        # video). We run it every Nth detect() call and carry the subject bboxes
+        # forward on the in-between frames. YuNet faces + motion still run every
+        # frame, so framing density is unchanged — subjects don't teleport in
+        # one ~0.8s sample. stride=1 restores the old every-frame behavior.
+        try:
+            from backend.config import settings as _settings
+            self._yolo_stride = max(1, int(getattr(_settings, "REFRAMER_YOLO_STRIDE", 2)))
+        except Exception:
+            self._yolo_stride = 2
+        self._yolo_det_count = 0            # detect() calls since last YOLO run
+        self._cached_person_bboxes = []     # carried forward on skipped frames
+        self._cached_nonhuman_raw = []
+
         if model_dir is None:
             try:
                 # This file lives in backend/services/; the model weights
@@ -564,12 +579,23 @@ class FaceDetector:
                 # person_bboxes  → positive gate (keep faces on humans)
                 # nonhuman_bboxes → negative gate (reject faces on toys/figurines)
                 if self._yolo_model is not None:
-                    person_bboxes, nonhuman_bboxes_raw = \
-                        self._get_split_subject_bboxes(frame_bgr)
-                    # Update spatial cache and get effective nonhuman zones
-                    # (current detection + cache from recent frames where
-                    # YOLO detected the toy but not this frame)
-                    self._update_nonhuman_cache(nonhuman_bboxes_raw)
+                    # Run the heavy open-vocab detector every Nth frame; carry
+                    # its subject bboxes forward on the in-between frames (the
+                    # nonhuman spatial cache already persists within a scene).
+                    if (self._yolo_det_count % self._yolo_stride) == 0:
+                        person_bboxes, nonhuman_bboxes_raw = \
+                            self._get_split_subject_bboxes(frame_bgr)
+                        self._cached_person_bboxes = person_bboxes
+                        self._cached_nonhuman_raw = nonhuman_bboxes_raw
+                        # Update spatial cache only on real detections, so the
+                        # carry-forward frames don't re-stamp stale zones.
+                        self._update_nonhuman_cache(nonhuman_bboxes_raw)
+                    else:
+                        person_bboxes = self._cached_person_bboxes
+                        nonhuman_bboxes_raw = self._cached_nonhuman_raw
+                    self._yolo_det_count += 1
+                    # Effective nonhuman zones = this frame's (or carried) raw
+                    # detection unioned with the persistent spatial cache.
                     nonhuman_bboxes = self._get_effective_nonhuman_bboxes(
                         nonhuman_bboxes_raw)
                 else:
@@ -707,6 +733,11 @@ class FaceDetector:
         Called by the analyzer on scene cuts — a nonhuman subject in scene A
         probably isn't in the same position in scene B."""
         self._nonhuman_cache = []
+        # A scene cut invalidates the carried-forward subject bboxes, so drop
+        # them and force a fresh YOLO pass on the next frame of the new scene.
+        self._cached_person_bboxes = []
+        self._cached_nonhuman_raw = []
+        self._yolo_det_count = 0
 
     def _update_nonhuman_cache(self, nonhuman_bboxes):
         """Merge new YOLO detections into the spatial cache.

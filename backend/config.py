@@ -170,6 +170,12 @@ class Settings(BaseSettings):
     REFRAMER_MAX_SAMPLES: int = 1800       # total face/motion samples cap
     REFRAMER_SAMPLE_FPS: float = 5.0       # ceiling fps (short videos)
     REFRAMER_MIN_SAMPLE_FPS: float = 1.2   # floor fps (very long videos)
+    # The heavy YOLO-World open-vocab subject detector (the ~0.5s/frame cost
+    # behind the 17-min face stage) runs every Nth sampled frame, carrying its
+    # subject bboxes forward in between. YuNet faces + motion still run EVERY
+    # frame, so framing density is unchanged; subjects don't teleport in one
+    # ~0.8s sample. 2 ≈ halves the YOLO cost; 1 restores every-frame detection.
+    REFRAMER_YOLO_STRIDE: int = 2
     # On a STATIC frame with no face, no person, AND no motion (a title card /
     # logo / credits), spectral saliency latches onto the highest-contrast EDGE
     # (e.g. a centered logo's wing-tip) and mis-frames the crop off to the side.
