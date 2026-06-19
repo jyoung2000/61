@@ -183,6 +183,17 @@ class Settings(BaseSettings):
     # saliency edge. Frames with motion or a person/face are unaffected (they
     # still track the subject). Set False to restore pure saliency framing.
     REFRAMER_CENTER_STATIC_GRAPHICS: bool = True
+    # ── Reframer crop zoom (face-size normalization) ──
+    # During export the crop can be punched IN to drive the detected face
+    # toward a fixed fraction of the frame (``_compute_zoom_factor`` — target
+    # ~15% of crop width, up to 1.15x). On a 16:9 → 9:16 reframe this ENLARGES
+    # any subject whose face is naturally smaller than that target, which makes
+    # talking heads look "too big" and amplifies any tracking error (a slightly
+    # off-center subject looks much worse when it is also blown up). The
+    # reference reframer applies no punch-in at all: it renders the full-height
+    # 9:16 slice and lets the subject sit at its natural size. Default off for
+    # reference-parity framing; set True to restore face-size normalization.
+    REFRAMER_FACE_SIZE_ZOOM: bool = False
 
     # ── Clip generation (Primary AI / VideoLLaMA3) defaults ──
     # Exposed in Settings > Clip Generation and overlaid onto the clipper

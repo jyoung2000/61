@@ -4319,8 +4319,12 @@ def _build_filter_chain(
             crop_w = crop_w - (crop_w % 2)
             crop_h = crop_h - (crop_h % 2)
 
-            # Apply dynamic zoom based on face size (static per-clip)
-            if face_width_pct > 0:
+            # Apply dynamic zoom based on face size (static per-clip).
+            # Gated by REFRAMER_FACE_SIZE_ZOOM (default off): the reference
+            # reframer applies no punch-in, so by default the crop keeps its
+            # full-height aspect-derived size and the subject stays at natural
+            # size instead of being enlarged toward a fixed face-fill target.
+            if face_width_pct > 0 and app_settings.REFRAMER_FACE_SIZE_ZOOM:
                 zoom = _compute_zoom_factor(face_width_pct)
                 if abs(zoom - 1.0) > 0.02:
                     crop_w = int(crop_w / zoom)
