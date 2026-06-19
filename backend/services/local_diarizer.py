@@ -204,14 +204,39 @@ class LocalEmbeddingDiarizer:
 
     def __init__(self, device: Optional[str] = None, threshold: Optional[float] = None):
         from backend.config import settings as _settings
-        # ECAPA is tiny and runs during the perception stage while Whisper holds
-        # the GPU — default to CPU to avoid VRAM contention (it's fast enough).
-        self.device = (device or getattr(_settings, "LOCAL_DIARIZER_DEVICE", "cpu") or "cpu").lower()
+        # ECAPA is tiny (~80 MB) but embedding 100+ cues on CPU costs MINUTES;
+        # on the GPU it's seconds. "auto" prefers the GPU when one is present
+        # with free VRAM (the perception models are released before diarization
+        # runs, so it's free), and _load_model() still falls back to CPU on any
+        # CUDA failure — so this never loses diarization.
+        _want = (device or getattr(_settings, "LOCAL_DIARIZER_DEVICE", "auto") or "auto").lower()
+        self.device = self._resolve_device(_want)
         self.threshold = float(
             threshold if threshold is not None
             else getattr(_settings, "LOCAL_DIARIZER_THRESHOLD", 0.70))
         self.model_id = getattr(
             _settings, "LOCAL_DIARIZER_MODEL", "speechbrain/spkrec-ecapa-voxceleb")
+
+    @staticmethod
+    def _resolve_device(want: str) -> str:
+        """Resolve the configured device. Explicit 'cpu'/'cuda' pass through;
+        'auto' picks the GPU when CUDA is available with a little free VRAM
+        (ECAPA needs ~80 MB), else CPU. Any CUDA failure at load time still
+        falls back to CPU in ``_load_model``, so 'auto' is risk-free."""
+        if want in ("cpu", "cuda"):
+            return want
+        # "auto" (or anything unrecognized) → prefer GPU only when it's actually
+        # usable. A 200 MB floor leaves headroom over ECAPA's ~80 MB even while
+        # Whisper is still resident on a 4 GB card.
+        try:
+            import torch
+            if torch.cuda.is_available():
+                free_mb = torch.cuda.mem_get_info()[0] / 1024 / 1024
+                if free_mb >= 200:
+                    return "cuda"
+        except Exception:
+            pass
+        return "cpu"
 
     @staticmethod
     def _has_dependencies() -> bool:

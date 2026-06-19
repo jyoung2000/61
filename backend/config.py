@@ -491,7 +491,12 @@ class Settings(BaseSettings):
     # left/right heuristic), fully offline after a one-time ~80 MB model fetch.
     LOCAL_DIARIZATION_ENABLED: bool = True
     LOCAL_DIARIZER_MODEL: str = "speechbrain/spkrec-ecapa-voxceleb"
-    LOCAL_DIARIZER_DEVICE: str = "cpu"   # tiny model; CPU avoids GPU contention
+    # "auto" runs ECAPA on the GPU when one is free (it's a tiny ~80 MB model,
+    # and embedding 100+ cues on CPU costs MINUTES — 7 min on a 24-min video —
+    # vs seconds on the GPU), falling back to CPU when CUDA is absent/contended.
+    # Force "cpu" or "cuda" to override. The perception models are released
+    # before diarization, so the GPU is free by the time this runs.
+    LOCAL_DIARIZER_DEVICE: str = "auto"
     # Cosine-distance threshold for splitting speakers (agglomerative clustering).
     # Higher = more merging = fewer speakers. 0.55 over-split music/noisy audio
     # (an AMV clustered into the 8-speaker cap); 0.70 is a steadier default for
