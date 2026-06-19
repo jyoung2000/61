@@ -2645,7 +2645,7 @@ def _keyframes_from_cached_render_plan(
     pulling in the rest of ``clip_exporter``'s heavyweight dependency
     graph (cv2 / MediaPipe / ffmpeg / pydantic_settings).
     """
-    from backend.services.compat_stubs import (
+    from backend.services.render_plan_keyframes import (
         keyframes_from_cached_render_plan,
     )
     return keyframes_from_cached_render_plan(
@@ -6539,6 +6539,16 @@ async def export_clip(
                         if _job_for_rp
                         else None
                     )
+                    if not _cached_rp_dict:
+                        # JobResult carries no render_plan field; the analysis
+                        # pipeline writes the reframer's full-video RenderPlan
+                        # (the planner's smooth per-frame track) to this
+                        # sidecar. Read it so the export follows the planner
+                        # instead of re-deriving a coarser cluster-snap crop.
+                        _rp_sidecar = f"/data/uploads/{job_id}/render_plan.json"
+                        if os.path.exists(_rp_sidecar):
+                            with open(_rp_sidecar) as _rpf:
+                                _cached_rp_dict = json.load(_rpf)
                     if _cached_rp_dict:
                         _rp_kfs = _keyframes_from_cached_render_plan(
                             _cached_rp_dict,
@@ -6548,6 +6558,22 @@ async def export_clip(
                         if _rp_kfs and len(_rp_kfs) >= 2:
                             keyframes = _rp_kfs
                             _using_cached_render_plan_keyframes = True
+                            # This tier skips the dense-detection pass that
+                            # normally fills _avg_face_y, so derive vertical
+                            # framing from the scenes (only used for crops
+                            # shorter than full height, e.g. 1:1 / 4:5).
+                            if subject_scenes:
+                                _rp_face_ys = []
+                                for _s in subject_scenes:
+                                    if hasattr(_s, 'face_positions') and _s.face_positions:
+                                        for _fp in _s.face_positions:
+                                            _y = _fp.get('y', 0)
+                                            if 10 < _y < 90:
+                                                _rp_face_ys.append(_y)
+                                    elif hasattr(_s, 'precise_y') and _s.precise_y and 10 < _s.precise_y < 90:
+                                        _rp_face_ys.append(_s.precise_y)
+                                if _rp_face_ys:
+                                    _avg_face_y = sum(_rp_face_ys) / len(_rp_face_ys)
                             logger.info(
                                 "[SubjectTracking] clip %s: Using %d keyframes "
                                 "from cached RenderPlan (motion_path preserved — "

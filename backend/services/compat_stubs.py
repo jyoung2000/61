@@ -678,7 +678,13 @@ def four_axis_scoring_enabled(*args, **kwargs) -> bool:
 
 
 def keyframes_from_cached_render_plan(*args, **kwargs) -> list:
-    return []
+    # No longer inert: the real parser turns the cached RenderPlan's
+    # motion_path into subject-tracking keyframes so the export follows the
+    # planner's track. Imported lazily to keep this module dependency-light.
+    from backend.services.render_plan_keyframes import (
+        keyframes_from_cached_render_plan as _impl,
+    )
+    return _impl(*args, **kwargs)
 
 
 def correct_transcript(segments, *args, **kwargs):
