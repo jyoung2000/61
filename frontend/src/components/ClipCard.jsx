@@ -33,8 +33,6 @@ export default function ClipCard({ clip, jobId, isBest, onPreview, onExport, onD
   const [editingTitle, setEditingTitle] = useState(false);
   const [titleText, setTitleText] = useState('');
   const [savingTitle, setSavingTitle] = useState(false);
-  // Score Breakdown panel (Enhancement 1) — collapsed by default.
-  const [breakdownOpen, setBreakdownOpen] = useState(false);
 
   // In focus mode the LLM puts relevance in viral_score and the
   // backend moves the composite virality to viral_score_composite.
@@ -45,23 +43,12 @@ export default function ClipCard({ clip, jobId, isBest, onPreview, onExport, onD
     ? (clip.focus_relevance != null ? clip.focus_relevance : clip.viral_score)
     : clip.viral_score;
   const compositeScore = clip.viral_score_composite != null ? clip.viral_score_composite : clip.viral_score;
-  const diag = clip.score_diagnostics || {};
-  const axisScores = diag.axis_scores || {
-    hook: clip.hook_score || 0,
-    flow: clip.flow_score || 0,
-    value: clip.value_score || 0,
-    trend: clip.trend_score || 0,
-  };
-  const axisReasons = diag.axis_reasons || {
-    hook: clip.hook_reason,
-    flow: clip.flow_reason,
-    value: clip.value_reason,
-    trend: clip.trend_reason,
-  };
-  const weights = diag.weights || { hook: 0.3, flow: 0.25, value: 0.3, trend: 0.15 };
-  const contentType = diag.content_type || null;
-  const legacyFill = !!diag.legacy_fill;
-  const hasAnyAxis = Object.values(axisScores).some((v) => (v || 0) > 0);
+
+  // Prefer the auto-generated SEO fields for the tagline / description / tags;
+  // they fill in once the background SEO job runs and are simply hidden before.
+  const tagline = String(clip.seo_title || '').trim();
+  const seoDescription = String(clip.seo_description || '').trim();
+  const seoTags = Array.isArray(clip.seo_tags) ? clip.seo_tags : [];
 
   // Focus tier color (ported from ViralClips.jsx 1576-1584 per Bug 5)
   const tier = clip.focus_tier;
@@ -289,6 +276,18 @@ export default function ClipCard({ clip, jobId, isBest, onPreview, onExport, onD
         </h4>
       )}
 
+      {/* Tagline — the SEO/platform headline, shown under the title once the
+          background SEO job has produced it. */}
+      {tagline && tagline !== String(clip.title || '') && (
+        <div style={{
+          fontSize: 12, color: 'var(--text-secondary)', fontStyle: 'italic',
+          marginTop: -2, marginBottom: 8, lineHeight: 1.3,
+          overflowWrap: 'anywhere', wordBreak: 'break-word',
+        }}>
+          {tagline}
+        </div>
+      )}
+
       {/* Time display / editor */}
       <div style={{ display: 'flex', gap: 8, marginBottom: 12, flexWrap: 'wrap', alignItems: 'center' }}>
         {editingTimes ? (
@@ -402,114 +401,44 @@ export default function ClipCard({ clip, jobId, isBest, onPreview, onExport, onD
           overflowWrap: 'anywhere', wordBreak: 'break-word',
         }}
       >
-        <div style={{ marginBottom: 4 }}>
-          <strong style={{ color: 'var(--text-primary)' }}>Caption:</strong> {stripInlineTimestamps(String(clip.suggested_caption || ''))}
-        </div>
-        <div style={{ marginBottom: 4 }}>
-          <strong style={{ color: 'var(--text-primary)' }}>Hook:</strong> {stripInlineTimestamps(String(clip.hook_text || ''))}
-        </div>
-        <div style={{ marginBottom: 4 }}>
-          <strong style={{ color: 'var(--text-primary)' }}>Why it works:</strong> {String(clip.why_this_works || '')}
-        </div>
-        {clip.viral_score_reasoning && (
+        {seoDescription && (
+          <div style={{ marginBottom: 4 }}>
+            <strong style={{ color: 'var(--text-primary)' }}>Description:</strong> {stripInlineTimestamps(seoDescription)}
+          </div>
+        )}
+        {seoTags.length > 0 && (
+          <div style={{ marginBottom: 4, display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+            <strong style={{ color: 'var(--text-primary)' }}>Tags:</strong>
+            {seoTags.map((t, ti) => (
+              <span key={ti} style={{
+                padding: '2px 6px',
+                background: 'rgba(0,217,255,0.08)',
+                color: 'var(--accent-cyan)',
+                border: '1px solid rgba(0,217,255,0.25)',
+                borderRadius: 3, fontSize: 10,
+                fontFamily: 'var(--font-mono)',
+              }}>
+                {String(t)}
+              </span>
+            ))}
+          </div>
+        )}
+        {clip.hook_text && (
+          <div style={{ marginBottom: 4 }}>
+            <strong style={{ color: 'var(--text-primary)' }}>Hook:</strong> {stripInlineTimestamps(String(clip.hook_text || ''))}
+          </div>
+        )}
+        {clip.suggested_caption && (
+          <div style={{ marginBottom: 4 }}>
+            <strong style={{ color: 'var(--text-primary)' }}>Caption:</strong> {stripInlineTimestamps(String(clip.suggested_caption || ''))}
+          </div>
+        )}
+        {clip.why_this_works && (
           <div>
-            <strong style={{ color: 'var(--text-primary)' }}>Score reasoning:</strong> {String(clip.viral_score_reasoning || '')}
+            <strong style={{ color: 'var(--text-primary)' }}>Why it works:</strong> {String(clip.why_this_works || '')}
           </div>
         )}
       </div>
-
-      {/* Score Breakdown panel (Enhancement 1 + Bug 5 in the clip-focus audit) */}
-      {hasAnyAxis && (
-        <div style={{ marginTop: 8, marginBottom: 8 }}>
-          <button
-            type="button"
-            onClick={() => setBreakdownOpen((v) => !v)}
-            aria-expanded={breakdownOpen}
-            aria-controls={`clip-breakdown-${clip.id}`}
-            style={{
-              fontSize: 10, color: 'var(--text-muted)',
-              background: 'transparent', border: 'none', padding: 0,
-              cursor: 'pointer', textTransform: 'uppercase', letterSpacing: '0.05em',
-              fontFamily: 'var(--font-mono)',
-            }}
-          >
-            {breakdownOpen ? '▼' : '▶'} Score Breakdown
-            {legacyFill && (
-              <span style={{ marginLeft: 6, color: 'var(--accent-amber)' }} title="Axis scores estimated from legacy composite">
-                (legacy)
-              </span>
-            )}
-          </button>
-          {breakdownOpen && (
-            <div id={`clip-breakdown-${clip.id}`} style={{
-              marginTop: 8, padding: 10,
-              background: 'var(--bg-elevated)',
-              borderRadius: 'var(--radius-sm)',
-              border: '1px solid var(--border)',
-            }}>
-              {isFocusClip && clip.focus_relevance != null && (
-                <div style={{ marginBottom: 10 }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, marginBottom: 3, color: 'var(--success)' }}>
-                    <span style={{ fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Relevance</span>
-                    <span style={{ fontFamily: 'var(--font-mono)' }}>{clip.focus_relevance}/100</span>
-                  </div>
-                  <div style={{ height: 6, background: 'rgba(52,199,89,0.15)', borderRadius: 3, overflow: 'hidden' }}>
-                    <div style={{
-                      width: `${Math.max(0, Math.min(100, clip.focus_relevance))}%`,
-                      height: '100%', background: 'var(--success)',
-                    }} />
-                  </div>
-                </div>
-              )}
-              {['hook', 'flow', 'value', 'trend'].map((axis) => {
-                const score = axisScores[axis] || 0;
-                const weight = weights[axis] || 0;
-                const contribution = Math.round(score * weight * 10) / 10;
-                const reason = axisReasons[axis];
-                return (
-                  <div key={axis} style={{ marginBottom: 8, opacity: legacyFill ? 0.55 : 1 }}>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, marginBottom: 3, color: 'var(--text-secondary)' }}>
-                      <span style={{ fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
-                        {axis}
-                        <span style={{ color: 'var(--text-muted)', marginLeft: 4, fontWeight: 400 }}>
-                          ({Math.round(weight * 100)}%)
-                        </span>
-                      </span>
-                      <span style={{ fontFamily: 'var(--font-mono)' }}>
-                        {score} <span style={{ color: 'var(--text-muted)' }}>= {contribution}</span>
-                      </span>
-                    </div>
-                    <div style={{
-                      height: 6,
-                      background: 'var(--bg-panel)',
-                      borderRadius: 3,
-                      overflow: 'hidden',
-                      backgroundImage: legacyFill ? 'repeating-linear-gradient(45deg, var(--bg-panel), var(--bg-panel) 4px, var(--border) 4px, var(--border) 8px)' : undefined,
-                    }}>
-                      <div style={{
-                        width: `${Math.max(0, Math.min(100, score))}%`,
-                        height: '100%',
-                        background: 'var(--accent-cyan)',
-                      }} />
-                    </div>
-                    {reason && (
-                      <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 3, lineHeight: 1.4 }}>
-                        {String(reason).slice(0, 140)}
-                      </div>
-                    )}
-                  </div>
-                );
-              })}
-              <div style={{ fontSize: 9, color: 'var(--text-muted)', marginTop: 6, fontFamily: 'var(--font-mono)' }}>
-                Composite via {contentType || 'generic'} weights
-                {legacyFill && ' (legacy fill)'}
-                {!isFocusClip && compositeScore != null && ` = ${compositeScore}`}
-                {isFocusClip && compositeScore != null && ` (virality: ${compositeScore})`}
-              </div>
-            </div>
-          )}
-        </div>
-      )}
 
       <div style={{ display: 'flex', gap: 6, alignItems: 'stretch', marginTop: 12 }}>
         <button
@@ -598,24 +527,6 @@ export default function ClipCard({ clip, jobId, isBest, onPreview, onExport, onD
           )}
         </div>
       </div>
-      {/* "Find more like this" per-clip action (Enhancement 7) */}
-      {onFindMoreLikeThis && (
-        <div style={{ marginTop: 6 }}>
-          <button
-            onClick={() => onFindMoreLikeThis(clip)}
-            title="Run a new focus search using this clip's subject/focus as the query"
-            style={{
-              padding: '4px 10px', fontSize: 10, fontWeight: 600,
-              background: 'transparent',
-              color: 'var(--text-secondary)',
-              border: '1px dashed var(--border)',
-              borderRadius: 'var(--radius-sm)', cursor: 'pointer',
-            }}
-          >
-            ✨ Find more like this
-          </button>
-        </div>
-      )}
     </div>
   );
 }
