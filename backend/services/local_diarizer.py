@@ -222,9 +222,15 @@ class LocalEmbeddingDiarizer:
         """Resolve the configured device. Explicit 'cpu'/'cuda' pass through;
         'auto' picks the GPU when CUDA is available with a little free VRAM
         (ECAPA needs ~80 MB), else CPU. Any CUDA failure at load time still
-        falls back to CPU in ``_load_model``, so 'auto' is risk-free."""
-        if want in ("cpu", "cuda"):
-            return want
+        falls back to CPU in ``_load_model``, so 'auto' is risk-free.
+
+        GPU is returned as ``cuda:0`` (indexed): SpeechBrain's run_opts parser
+        splits the device string on ':' and warns "not enough values to unpack"
+        on a bare 'cuda', so normalize 'cuda' → 'cuda:0' here."""
+        if want == "cpu":
+            return "cpu"
+        if want in ("cuda", "cuda:0", "gpu"):
+            return "cuda:0"
         # "auto" (or anything unrecognized) → prefer GPU only when it's actually
         # usable. A 200 MB floor leaves headroom over ECAPA's ~80 MB even while
         # Whisper is still resident on a 4 GB card.
@@ -233,7 +239,7 @@ class LocalEmbeddingDiarizer:
             if torch.cuda.is_available():
                 free_mb = torch.cuda.mem_get_info()[0] / 1024 / 1024
                 if free_mb >= 200:
-                    return "cuda"
+                    return "cuda:0"
         except Exception:
             pass
         return "cpu"

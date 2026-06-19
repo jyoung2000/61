@@ -22,15 +22,17 @@ def _fake_torch(*, available: bool, free_mb: float):
 
 
 def test_explicit_cpu_and_cuda_pass_through(monkeypatch):
-    # Explicit choices are honored regardless of hardware.
+    # Explicit choices are honored regardless of hardware. 'cuda' is normalized
+    # to the indexed 'cuda:0' form SpeechBrain's run_opts parser expects.
     monkeypatch.setitem(sys.modules, "torch", _fake_torch(available=False, free_mb=0))
     assert D._resolve_device("cpu") == "cpu"
-    assert D._resolve_device("cuda") == "cuda"
+    assert D._resolve_device("cuda") == "cuda:0"
+    assert D._resolve_device("cuda:0") == "cuda:0"
 
 
 def test_auto_prefers_gpu_when_free_vram(monkeypatch):
     monkeypatch.setitem(sys.modules, "torch", _fake_torch(available=True, free_mb=2648))
-    assert D._resolve_device("auto") == "cuda"
+    assert D._resolve_device("auto") == "cuda:0"
 
 
 def test_auto_falls_back_to_cpu_without_cuda(monkeypatch):
