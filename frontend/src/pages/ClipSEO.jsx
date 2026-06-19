@@ -3,6 +3,7 @@ import { useParams, Link } from 'react-router-dom';
 import { ShareButton } from '../components/ShareDialog';
 import { showToast } from '../components/Toast';
 import { processKeyframes, interpolateSubjectX, isDynamic, computeClipSubjectX, fetchRenderPlan } from '../utils/subjectTracking';
+import { stripInlineTimestamps } from '../utils/stripTimestamps';
 import ClipSettingsPanel from '../components/ClipSettingsPanel';
 import TranscriptViewer from '../components/TranscriptViewer';
 import VideoEditor from '../components/VideoEditor';
@@ -1554,7 +1555,7 @@ export default function ClipSEO() {
             </div>
             {clip.hook_text && (
               <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 4 }}>
-                <strong style={{ color: 'var(--text-primary)' }}>Hook:</strong> {String(clip.hook_text || '')}
+                <strong style={{ color: 'var(--text-primary)' }}>Hook:</strong> {stripInlineTimestamps(String(clip.hook_text || ''))}
               </div>
             )}
             {clip.why_this_works && (

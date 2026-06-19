@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { stripInlineTimestamps } from '../utils/stripTimestamps';
 
 function formatDuration(seconds) {
   const m = Math.floor(seconds / 60);
@@ -21,7 +22,7 @@ function parseDuration(str) {
   return null;
 }
 
-export default function ClipCard({ clip, jobId, isBest, onPreview, onExport, onDelete, onTimesChanged, onFindMoreLikeThis, selected, onSelect, exportQuality = '1080p', scenes }) {
+export default function ClipCard({ clip, jobId, isBest, onPreview, onExport, onDelete, onTimesChanged, onFindMoreLikeThis, selected, onSelect, exportQuality = '1080p' }) {
   const [exporting, setExporting] = useState(false);
   const [qualityMenuOpen, setQualityMenuOpen] = useState(false);
   const [deleting, setDeleting] = useState(false);
@@ -70,18 +71,6 @@ export default function ClipCard({ clip, jobId, isBest, onPreview, onExport, onD
   const tierBg = tier === 'strong' ? 'rgba(52,199,89,0.15)'
     : tier === 'moderate' ? 'rgba(255,214,0,0.15)'
     : 'rgba(142,142,147,0.15)';
-
-  // Find the most important scene description within this clip's time range
-  const clipSubject = React.useMemo(() => {
-    if (!scenes?.length) return null;
-    const inRange = scenes.filter(
-      (s) => s.timestamp >= clip.start_time && s.timestamp <= clip.end_time
-    );
-    if (!inRange.length) return null;
-    // Pick the highest importance scene as the primary subject
-    const best = inRange.reduce((a, b) => (b.importance_score > a.importance_score ? b : a), inRange[0]);
-    return best.description;
-  }, [scenes, clip.start_time, clip.end_time]);
 
   const scoreColor = primaryScore >= 80
     ? 'var(--accent-amber)'
@@ -407,18 +396,6 @@ export default function ClipCard({ clip, jobId, isBest, onPreview, onExport, onD
         )}
       </div>
 
-      {clipSubject && (
-        <div style={{
-          fontSize: 11, color: 'var(--text-muted)', marginBottom: 10,
-          padding: '6px 8px', background: 'var(--bg-elevated)',
-          borderRadius: 'var(--radius-sm)', borderLeft: '2px solid var(--accent-cyan)',
-          lineHeight: 1.4,
-        }}>
-          <span style={{ fontWeight: 600, color: 'var(--text-secondary)', fontSize: 10, textTransform: 'uppercase', letterSpacing: '0.03em' }}>Detected subject: </span>
-          {clipSubject.length > 120 ? clipSubject.slice(0, 120) + '...' : clipSubject}
-        </div>
-      )}
-
       <div
         style={{
           fontSize: 12, color: 'var(--text-secondary)', marginBottom: 8,
@@ -426,10 +403,10 @@ export default function ClipCard({ clip, jobId, isBest, onPreview, onExport, onD
         }}
       >
         <div style={{ marginBottom: 4 }}>
-          <strong style={{ color: 'var(--text-primary)' }}>Caption:</strong> {String(clip.suggested_caption || '')}
+          <strong style={{ color: 'var(--text-primary)' }}>Caption:</strong> {stripInlineTimestamps(String(clip.suggested_caption || ''))}
         </div>
         <div style={{ marginBottom: 4 }}>
-          <strong style={{ color: 'var(--text-primary)' }}>Hook:</strong> {String(clip.hook_text || '')}
+          <strong style={{ color: 'var(--text-primary)' }}>Hook:</strong> {stripInlineTimestamps(String(clip.hook_text || ''))}
         </div>
         <div style={{ marginBottom: 4 }}>
           <strong style={{ color: 'var(--text-primary)' }}>Why it works:</strong> {String(clip.why_this_works || '')}

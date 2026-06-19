@@ -4,6 +4,7 @@ import { showToast } from '../components/Toast';
 import ClipPreview from '../components/ClipPreview';
 import ClipSettingsPanel from '../components/ClipSettingsPanel';
 import EditorErrorBoundary from '../components/EditorErrorBoundary';
+import { stripInlineTimestamps } from '../utils/stripTimestamps';
 import useResponsive from '../hooks/useResponsive';
 import useEncodingManager from '../hooks/useEncodingManager';
 import { useAuth } from '../auth/AuthContext';
@@ -1668,26 +1669,6 @@ export default function ViralClips() {
                   )}
                 </div>
 
-                {/* Detected subject from scene analysis */}
-                {clip._scenes?.length > 0 && (() => {
-                  const inRange = clip._scenes.filter(
-                    (s) => s.timestamp >= clip.start_time && s.timestamp <= clip.end_time
-                  );
-                  if (!inRange.length) return null;
-                  const best = inRange.reduce((a, b) => (b.importance_score > a.importance_score ? b : a), inRange[0]);
-                  return (
-                    <div style={{
-                      fontSize: 11, color: 'var(--text-muted)', marginBottom: 10,
-                      padding: '6px 8px', background: 'var(--bg-elevated)',
-                      borderRadius: 'var(--radius-sm)', borderLeft: '2px solid var(--accent-cyan)',
-                      lineHeight: 1.4,
-                    }}>
-                      <span style={{ fontWeight: 600, color: 'var(--text-secondary)', fontSize: 10, textTransform: 'uppercase', letterSpacing: '0.03em' }}>Detected subject: </span>
-                      {String(best.description || '').length > 120 ? String(best.description).slice(0, 120) + '...' : String(best.description || '')}
-                    </div>
-                  );
-                })()}
-
                 {(() => {
                   // Prefer the auto-generated SEO fields over the raw
                   // transcript-derived ones. The background ``_auto_generate_clip_seo``
@@ -1720,7 +1701,7 @@ export default function ViralClips() {
                         <div style={{ marginBottom: 4 }}>
                           <strong style={{ color: 'var(--text-primary)' }}>
                             {hasSeo && clip.seo_description ? 'Description:' : 'Caption:'}
-                          </strong> {String(seoDescription)}
+                          </strong> {stripInlineTimestamps(String(seoDescription))}
                         </div>
                       )}
                       {seoTags.length > 0 && (
@@ -1745,7 +1726,7 @@ export default function ViralClips() {
                       )}
                       {clip.hook_text && (
                         <div style={{ marginBottom: 4 }}>
-                          <strong style={{ color: 'var(--text-primary)' }}>Hook:</strong> {String(clip.hook_text || '')}
+                          <strong style={{ color: 'var(--text-primary)' }}>Hook:</strong> {stripInlineTimestamps(String(clip.hook_text || ''))}
                         </div>
                       )}
                       {seoTip && (

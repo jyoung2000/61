@@ -20,6 +20,7 @@ from backend.services.render_plan import (
     RenderPlan, RenderOp, RenderOpKind, Rect, MotionKeypoint,
 )
 from backend.services.reframer_models import interpolate_x
+from backend.services.caption_text import strip_cue_timestamps
 
 logger = logging.getLogger("clipai.reframer_bridge")
 
@@ -482,14 +483,18 @@ def to_fez_clips(clipper_candidates: list, editorial_results: list = None) -> li
         vlm_reason = str(get("vlm_reason", "") or "").strip()
         judge_title = str(get("judge_title", "") or "").strip()
 
+        # ``transcript_slice`` carries inline ``[m:ss]`` cue markers; strip them
+        # from the social-facing hook/caption/title (shown on cards and used as
+        # on-screen overlays) — "[0:00]" is just noise there.
+        _clean_slice = strip_cue_timestamps(transcript_slice)
         title = judge_title or vlm_hook[:80] or (
-            " ".join(transcript_slice.split()[:8]) or f"Clip {idx}")
-        hook_text = vlm_hook or (transcript_slice[:120] if transcript_slice else title)
+            " ".join(_clean_slice.split()[:8]) or f"Clip {idx}")
+        hook_text = vlm_hook or (_clean_slice[:120] if _clean_slice else title)
         reasoning = vlm_reason or (
             f"Selected by signal analysis (score {composite:.2f}).")
         why = vlm_reason or (
             "Strong audio/visual engagement signals across this window.")
-        caption = (transcript_slice[:150] if transcript_slice else title)
+        caption = (_clean_slice[:150] if _clean_slice else title)
 
         source = str(get("source", "") or "")
         clip_type = _CLIP_TYPE_BY_SOURCE.get(source, "highlight")

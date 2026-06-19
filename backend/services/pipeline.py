@@ -1185,6 +1185,7 @@ async def _refresh_clips_with_translation(
     captured at ``COMPLETE`` time) so the refresh still runs against
     the same dataset the rest of the pipeline used.
     """
+    from backend.services.caption_text import strip_cue_timestamps
     job = await database.load_job(job_id)
     if job is None:
         logger.warning(
@@ -1225,15 +1226,18 @@ async def _refresh_clips_with_translation(
         judge_title = (clip_dict.get("judge_title") or "").strip()
         idx = clip_dict.get("id", 0)
 
+        # The slice carries inline ``[m:ss]`` cue markers; strip them from the
+        # social-facing title/hook/caption (they are shown on cards and used as
+        # on-screen overlays) while leaving the slice itself intact.
         new_title = judge_title or vlm_hook[:80] or (
-            " ".join(new_slice.split()[:8]) or f"Clip {idx}")
+            " ".join(strip_cue_timestamps(new_slice).split()[:8]) or f"Clip {idx}")
         # Prefer the TRANSLATED slice for the hook — vlm_hook is the VLM's
         # source-language line, so keeping it (as before) left every hook in the
         # source language even after translation. Use the first translated cue;
         # fall back to vlm_hook only when the slice is empty.
         _first_cue = new_slice.split("\n", 1)[0].strip() if new_slice else ""
-        new_hook = _first_cue[:120] or vlm_hook or new_title
-        new_caption = new_slice[:150] if new_slice else new_title
+        new_hook = strip_cue_timestamps(_first_cue)[:120] or vlm_hook or new_title
+        new_caption = strip_cue_timestamps(new_slice)[:150] if new_slice else new_title
         new_why = vlm_reason or (
             "Strong audio/visual engagement signals across this window.")
         new_reasoning = vlm_reason or clip_dict.get("viral_score_reasoning", "")

@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import { immer } from 'zustand/middleware/immer';
 import { temporal } from 'zundo';
+import { stripInlineTimestamps } from '../utils/stripTimestamps';
 
 // ── Default track setup ─────────────────────────────────────────────────────
 const createDefaultTracks = () => [
@@ -1146,7 +1147,7 @@ const useTimelineStore = create(
             fadeIn: 0.3,
             fadeOut: 0.5,
             transition: null,
-            textContent: hookText,
+            textContent: stripInlineTimestamps(hookText),
             textStyle: {
               fontSize: 28,
               fontWeight: 700,

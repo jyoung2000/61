@@ -4764,7 +4764,6 @@ export default function Analysis() {
                     selected={selectedClips.has(clip.id)}
                     onSelect={handleSelectClip}
                     exportQuality={clipSettings?.exportQuality || '1080p'}
-                    scenes={job.scenes}
                   />
                 ))}
               </div>
