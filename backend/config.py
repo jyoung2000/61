@@ -457,14 +457,15 @@ class Settings(BaseSettings):
     # post-edit it with the dedicated local translation model
     # (``OLLAMA_TRANSLATION_MODEL``, e.g. qwen2.5:3b) acting as an MT
     # post-editor: fix fluency / honorifics / idioms / glossary consistency
-    # against the source — NOT a cold re-translation. Small models post-edit
-    # far better than they translate from scratch, so NLLB-draft → MTPE is the
-    # offline parity move. Cue count + timing are preserved; a bad/short
-    # response falls back to the raw NLLB draft (fail-soft). Only runs when an
-    # Ollama host + translation model are configured. Set False to ship the raw
-    # NMT draft. (Also respects TRANSCRIPT_POLISHING_ENABLED, the master LLM-
-    # polish switch.)
-    OFFLINE_TRANSLATION_MTPE_ENABLED: bool = True
+    # against the source — NOT a cold re-translation. Cue count + timing are
+    # preserved; a bad/short response falls back to the raw NLLB draft.
+    # OPT-IN (default OFF): without a canonical-name glossary, a tiny local
+    # model (qwen2.5:3b on a 4 GB card) MANGLES proper nouns during the
+    # post-edit ("Darlian" → "Liliana Doria", "Quatre" → "Catur"), and the raw
+    # NLLB-1.3B draft is a dedicated translator that renders names more
+    # faithfully. Enable it once a Custom Vocabulary glossary is populated (the
+    # post-edit then keeps those spellings canonical) for the fluency gain.
+    OFFLINE_TRANSLATION_MTPE_ENABLED: bool = False
     # Context window for the MTPE pass. Raised from the old 4096 toward 8192 so
     # longer videos keep real surrounding context (qwen2.5 supports it).
     OFFLINE_TRANSLATION_MTPE_NUM_CTX: int = 8192
