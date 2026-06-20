@@ -1,3 +1,46 @@
+# ClipAI — Transcription recall on music-heavy content (vocal separation + preconditioning)
+
+Diagnosed from a real run's `clipai_logs_*.txt` on the Gundam Wing episode:
+whole dialogue sections (e.g. 2:55–4:27, 10:08–11:08) came back as **silence**.
+The log showed `covered_silence: 64.7%`, `0 hallucinations quarantined`, and
+music suppression dropping only **3** cues — so the loss was NOT over-zealous
+music suppression. The audio is dialogue under a loud music/SFX bed that
+Whisper's VAD hears as no-speech and drops, even on the vad-off gap-fill pass.
+
+Three stacked fixes (priority order):
+
+1. **Vocal separation before ASR (`vocal_separator.py`).** Run Demucs
+   `--two-stems vocals` as a *subprocess* (so all its GPU memory frees on exit)
+   BEFORE Whisper loads, then transcribe only the isolated vocal stem. CUDA
+   with a small `--segment` to fit the 4 GB GTX 1650, automatic CPU fallback,
+   self-healing to the original audio on any failure. Threaded through
+   `ReframeEngine → Perceiver → AudioIntelligence.transcribe(audio_path_override=)`.
+   Gated by `VOCAL_SEPARATION_ENABLED` (default on, **no-op until
+   `pip install demucs`**; htdemucs downloads ~80 MB on first run → needs net).
+
+2. **Audio preconditioning now reaches the ASR.** `WHISPER_AUDIO_PRECONDITION`
+   (highpass + afftdn denoise + loudnorm) was only applied to the
+   diarization/music copy; the reframer transcribe path re-extracted RAW audio.
+   Mirrored the exact chain into `transcribe()`'s own extraction (with a raw
+   fallback) so faint speech is recovered as documented.
+
+3. **Music suppression no longer deletes real dialogue.** Suppression inside a
+   "music" span now drops only non-lexical vocalisations (`ああああ`/`lalala`),
+   keeping lexically-diverse dialogue when the spectral classifier mislabels a
+   loud-BGM scene as music (`SUBTITLE_MUSIC_SUPPRESS_VOCALIZATIONS_ONLY`).
+
+Proper-noun errors (Darlian→"Dorian", "Hatsune Miku") are the **empty Custom
+Vocabulary glossary**, not a bug — populate Settings → Custom Vocabulary.
+
+Verify on the Unraid host (no GPU/weights/media here, so this is unit-tested +
+code-traced only). After rebuild + `pip install demucs`, the
+`clipai_logs_*.txt` should show: a `vocal_separation` stage, `[AUDIO] Using
+pre-separated vocal track`, a higher `covered_speech` / lower
+`covered_silence`, and the 2:55–4:27 / 10:08–11:08 dialogue present. New tests:
+`backend/tests/test_vocal_separator.py`, extended `test_music_marking.py`.
+
+---
+
 # ClipAI — Offline Mode: one switch runs the whole pipeline on the local GPU
 
 Settings → AI Provider now has an **Offline Mode (Local GPU)** toggle. One
