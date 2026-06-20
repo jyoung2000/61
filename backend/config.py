@@ -164,10 +164,13 @@ class Settings(BaseSettings):
     # music / SFX (which the VAD otherwise hears as no-speech and drops) is
     # transcribed. Runs as a subprocess BEFORE Whisper loads, so it gets the
     # whole GPU and frees it on exit. Self-heals: if demucs isn't installed or
-    # the pass fails, the job transcribes the original audio unchanged. Adds a
-    # few minutes/episode (GPU) — more on CPU — so it's worth it mainly for
-    # music-heavy / anime source material. No-op until ``pip install demucs``.
-    VOCAL_SEPARATION_ENABLED: bool = True
+    # the pass fails, the job transcribes the original audio unchanged.
+    # OPT-IN (default OFF): on a Japanese OP/ED with an English-loanword chorus
+    # the dry vocal stem can flip Whisper's auto language detection to 'en'
+    # (transcribe() now re-detects on the ORIGINAL audio to guard against this,
+    # but separation also amplifies song vocals and is unvalidated as a blanket
+    # default). Enable it deliberately for music-heavy material and compare.
+    VOCAL_SEPARATION_ENABLED: bool = False
     VOCAL_SEPARATION_MODEL: str = "htdemucs"   # demucs model name
     VOCAL_SEPARATION_DEVICE: str = "auto"       # auto | cuda | cpu
     VOCAL_SEPARATION_SEGMENT: int = 7           # demucs --segment (CUDA VRAM cap)

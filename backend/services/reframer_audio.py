@@ -568,6 +568,43 @@ class AudioIntelligence:
             audio_size = os.path.getsize(audio_path)
             log.log_stage('AUDIO', f'Audio extracted: {audio_size/1048576:.1f} MB')
 
+            # ── Language-detection guard for vocal-stem overrides ──
+            # An isolated vocal stem can fool Whisper's auto language detection:
+            # an OP song with an English chorus ("Just wild beat communication")
+            # reads as 'en' on the DRY vocals even though the episode is
+            # Japanese. That mislabels the whole transcript 'en', which makes
+            # the pipeline SKIP translation and Whisper hallucinate English over
+            # the Japanese audio (observed: looped OP lyrics + drifted cues).
+            # When transcribing a supplied stem with language=auto, detect the
+            # language on the ORIGINAL video audio (music intact — it reliably
+            # reads 'ja') and force it.
+            if audio_path_override and whisper_lang is None:
+                try:
+                    _det_wav = tempfile.mktemp(suffix='.wav')
+                    subprocess.run([
+                        'ffmpeg', '-y', '-i', video_path, '-t', '120', '-vn',
+                        '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le', _det_wav,
+                    ], capture_output=True, timeout=120)
+                    if os.path.exists(_det_wav):
+                        _dseg, _dinfo = self.engine.transcribe(
+                            _det_wav, language=None, vad_filter=False)
+                        _detected = getattr(_dinfo, 'language', None)
+                        _detprob = getattr(_dinfo, 'language_probability', 0.0) or 0.0
+                        try:
+                            os.remove(_det_wav)
+                        except Exception:
+                            pass
+                        if _detected:
+                            whisper_lang = _detected
+                            log.log_stage('AUDIO',
+                                f'Language detected on ORIGINAL audio: '
+                                f'{whisper_lang} ({_detprob:.2f}) — overrides the '
+                                'vocal-stem auto-detect (songs misread as en)')
+                except Exception as _ld_err:
+                    log.log_stage('AUDIO',
+                        f'Original-audio language detect failed ({_ld_err}) — '
+                        'using vocal-stem auto-detect')
+
             # Pre-flight: the GPU model is already loaded — only the
             # batched-inference workspace is left to allocate. Reload on
             # CPU only when the remaining headroom is below that workspace
