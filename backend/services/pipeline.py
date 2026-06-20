@@ -4031,10 +4031,18 @@ async def _run_analysis_inner(job_id: str):
         job_id, JobStatus.GENERATING_SUMMARY, 70, "Generating video summary...",
     )
     summary = None
+    # Summarize the TRANSLATED (target-language) transcript when we produced one,
+    # so the summary comes out in the output language even on a weak local model.
+    # `transcript` was reset to the SOURCE track above (~line 3997), so feeding it
+    # to the summary made the offline summary come back in the source language
+    # (Japanese) — the cloud models happened to translate-on-the-fly and hid it.
+    _summary_transcript = transcript
+    if _pp_result and _pp_result.get("translated") and _pp_result.get("target_transcript"):
+        _summary_transcript = _pp_result["target_transcript"]
     async with _stage_timer(job_id, "summary"):
         try:
             _sr = await orchestrator.generate_summary(
-                transcript, scenes, job_id, tier=tier,
+                _summary_transcript, scenes, job_id, tier=tier,
                 output_language=(_pp_result or {}).get("output_lang", ""))
             summary = _sr[0] if isinstance(_sr, tuple) else _sr
         except Exception as _se:
@@ -4045,7 +4053,7 @@ async def _run_analysis_inner(job_id: str):
     summary_dict = summary.model_dump() if hasattr(summary, "model_dump") else summary
     if summary is None or not has_real_summary_content(summary_dict):
         try:
-            summary = VideoSummary(**build_summary_from_transcript(transcript, scenes))
+            summary = VideoSummary(**build_summary_from_transcript(_summary_transcript, scenes))
         except Exception:
             summary = VideoSummary(
                 overview="Summary unavailable for this video.",
