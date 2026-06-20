@@ -41,6 +41,15 @@ pyannote.audio>=3.1.0,<4.0
 # (==2.5.1 matches the local "+cu121" build identifier.)
 torch==2.5.1
 torchaudio==2.5.1
+# Demucs vocal separation — isolate the vocal stem before Whisper so dialogue
+# buried under loud music/SFX (which the VAD otherwise drops as no-speech) gets
+# transcribed. 4.0.1 requires only torch>=1.8.1 / torchaudio>=0.8 (no upper cap)
+# and pins NO numpy version, so the cu121 torch==2.5.1 above already satisfies
+# it and pip does NOT swap the CUDA wheel (the Dockerfile's post-reqs torch
+# guard would fail the build if a dep ever forced it). Pure-Python sdist (no
+# compiler). htdemucs weights (~80 MB) are pre-fetched in the Dockerfile; the
+# stage is gated at runtime by VOCAL_SEPARATION_ENABLED and self-heals if absent.
+demucs>=4.0,<5
 # Local, no-HF-token speaker diarization: SpeechBrain ECAPA embeddings +
 # clustering on Whisper's speech segments (the fallback used when pyannote's
 # gated model can't load without HF_TOKEN). The ECAPA model (~80 MB) is a PUBLIC

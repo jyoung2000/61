@@ -218,6 +218,15 @@ RUN mkdir -p /app/backend/models && \
       "https://github.com/ultralytics/assets/releases/download/v8.2.0/yolov8s-worldv2.pt" && \
     python3 -c "from ultralytics import YOLO; m = YOLO('/app/backend/models/yolov8s-worldv2.pt'); print(f'YOLO-World v2 loaded: {len(m.names)} classes')"
 
+# Pre-download the Demucs htdemucs model (~80 MB) for vocal separation so the
+# first job with VOCAL_SEPARATION_ENABLED doesn't stall on a download — and so
+# it works on hosts with no outbound internet. Cached in the torch-hub dir
+# (same root user at build + runtime, so it persists into the image). The
+# "|| echo WARN" keeps the build green if the CDN is unreachable; the runtime
+# loader self-heals to the full audio if the model still can't be fetched.
+RUN python3 -c "from demucs.pretrained import get_model; get_model('htdemucs'); print('htdemucs cached')" \
+    || echo "WARN: htdemucs pre-download failed — will download at runtime"
+
 # ── Optional: VideoLLaMA2 — local audio-visual Primary AI ──
 # VideoLLaMA2.1-7B-AV gives offline clip discovery that hears the video
 # (laughter, applause, music). It needs ~10GB VRAM (RTX 4070+) and pulls

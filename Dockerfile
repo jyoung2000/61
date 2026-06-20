@@ -124,6 +124,13 @@ RUN mkdir -p /data/models && \
       "https://github.com/ultralytics/assets/releases/download/v8.2.0/yolov8n.pt" && \
     python3 -c "from ultralytics import YOLO; m = YOLO('/data/models/yolov8n.pt'); print(f'YOLOv8n loaded: {len(m.names)} classes')"
 
+# Pre-download the Demucs htdemucs model (~80 MB) for vocal separation so the
+# first job with VOCAL_SEPARATION_ENABLED doesn't stall on a download (and works
+# offline). Cached in the torch-hub dir; "|| echo WARN" keeps the build green if
+# the CDN is unreachable — the runtime loader self-heals to the full audio.
+RUN python3 -c "from demucs.pretrained import get_model; get_model('htdemucs'); print('htdemucs cached')" \
+    || echo "WARN: htdemucs pre-download failed — will download at runtime"
+
 # Pre-download InsightFace buffalo_s ArcFace pack so the first run with
 # CLIPAI_FACE_EMBEDDING=arcface doesn't stall while the model downloads.
 # CPU-only via onnxruntime — never touches the GPU. The "|| echo" keeps
