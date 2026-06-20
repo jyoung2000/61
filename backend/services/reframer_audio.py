@@ -501,7 +501,8 @@ class AudioIntelligence:
 
     def transcribe(self, video_path: str, duration_ms: int,
                     language: str = 'auto',
-                    on_progress: Callable = None) -> dict:
+                    on_progress: Callable = None,
+                    audio_path_override: Optional[str] = None) -> dict:
         """Transcribe the video's audio track.
         Optimized for speed: beam_size=1 (greedy), larger batch_size."""
         if not self.available:
@@ -514,44 +515,55 @@ class AudioIntelligence:
 
         try:
             import tempfile
-            audio_path = tempfile.mktemp(suffix='.wav')
-            # Audio preconditioning for the ASR input. This path re-extracts
-            # the audio straight from the video for Whisper, so the denoise /
-            # loudness-normalise chain frame_extractor.extract_audio applies to
-            # the diarization/music copy was NOT reaching the transcriber —
-            # faint dialogue under music/SFX was being dropped by VAD as a
-            # result. Mirror the SAME chain here, gated by the documented
-            # WHISPER_AUDIO_PRECONDITION setting:
-            #   highpass=f=80    — strip AC hum / rumble below 80 Hz
-            #   afftdn=nf=-25    — adaptive FFT broadband denoise
-            #   loudnorm=...     — bring quiet speech up to a consistent level
-            _precondition = bool(getattr(settings, "WHISPER_AUDIO_PRECONDITION", True))
-            log.log_stage('AUDIO',
-                f'Extracting audio from {os.path.basename(video_path)}'
-                f' (preconditioning {"on" if _precondition else "off"})...')
-            _extract_cmd = ['ffmpeg', '-y', '-i', video_path, '-vn']
-            if _precondition:
-                _extract_cmd += ['-af',
-                    'highpass=f=80,afftdn=nf=-25,loudnorm=I=-18:LRA=11:TP=-1.5']
-            _extract_cmd += ['-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le',
-                             audio_path]
-            result = subprocess.run(_extract_cmd, capture_output=True, timeout=240)
-
-            if not os.path.exists(audio_path):
-                log.log_error('AUDIO', f'Audio extraction failed (exit={result.returncode})')
-                # Preconditioning can fail on exotic codecs / filter builds;
-                # retry once with a plain copy so a filter error never costs us
-                # the whole transcript.
+            _own_audio = False
+            if audio_path_override and os.path.exists(audio_path_override):
+                # A pre-separated vocal stem (already 16 kHz mono) was supplied
+                # by the vocal-separation stage — transcribe it directly instead
+                # of re-extracting from the video. The caller owns the file.
+                audio_path = audio_path_override
+                log.log_stage('AUDIO',
+                    f'Using pre-separated vocal track '
+                    f'({os.path.basename(audio_path)}) — skipping extraction')
+            else:
+                audio_path = tempfile.mktemp(suffix='.wav')
+                _own_audio = True
+                # Audio preconditioning for the ASR input. This path re-extracts
+                # the audio straight from the video for Whisper, so the denoise /
+                # loudness-normalise chain frame_extractor.extract_audio applies to
+                # the diarization/music copy was NOT reaching the transcriber —
+                # faint dialogue under music/SFX was being dropped by VAD as a
+                # result. Mirror the SAME chain here, gated by the documented
+                # WHISPER_AUDIO_PRECONDITION setting:
+                #   highpass=f=80    — strip AC hum / rumble below 80 Hz
+                #   afftdn=nf=-25    — adaptive FFT broadband denoise
+                #   loudnorm=...     — bring quiet speech up to a consistent level
+                _precondition = bool(getattr(settings, "WHISPER_AUDIO_PRECONDITION", True))
+                log.log_stage('AUDIO',
+                    f'Extracting audio from {os.path.basename(video_path)}'
+                    f' (preconditioning {"on" if _precondition else "off"})...')
+                _extract_cmd = ['ffmpeg', '-y', '-i', video_path, '-vn']
                 if _precondition:
-                    log.log_stage('AUDIO',
-                        'Preconditioned extract failed — retrying without filters')
-                    subprocess.run([
-                        'ffmpeg', '-y', '-i', video_path,
-                        '-vn', '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le',
-                        audio_path,
-                    ], capture_output=True, timeout=180)
+                    _extract_cmd += ['-af',
+                        'highpass=f=80,afftdn=nf=-25,loudnorm=I=-18:LRA=11:TP=-1.5']
+                _extract_cmd += ['-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le',
+                                 audio_path]
+                result = subprocess.run(_extract_cmd, capture_output=True, timeout=240)
+
                 if not os.path.exists(audio_path):
-                    return {'speech_active': {}, 'segments': [], 'language': ''}
+                    log.log_error('AUDIO', f'Audio extraction failed (exit={result.returncode})')
+                    # Preconditioning can fail on exotic codecs / filter builds;
+                    # retry once with a plain copy so a filter error never costs us
+                    # the whole transcript.
+                    if _precondition:
+                        log.log_stage('AUDIO',
+                            'Preconditioned extract failed — retrying without filters')
+                        subprocess.run([
+                            'ffmpeg', '-y', '-i', video_path,
+                            '-vn', '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le',
+                            audio_path,
+                        ], capture_output=True, timeout=180)
+                    if not os.path.exists(audio_path):
+                        return {'speech_active': {}, 'segments': [], 'language': ''}
 
             audio_size = os.path.getsize(audio_path)
             log.log_stage('AUDIO', f'Audio extracted: {audio_size/1048576:.1f} MB')
@@ -901,10 +913,13 @@ class AudioIntelligence:
 
             report = ledger.coverage_report()
 
-            try:
-                os.remove(audio_path)
-            except Exception:
-                pass
+            # Only delete the temp WAV we extracted ourselves; a supplied
+            # vocal-stem override is owned (and cleaned up) by the caller.
+            if _own_audio:
+                try:
+                    os.remove(audio_path)
+                except Exception:
+                    pass
 
             elapsed = log.stop_timer('transcribe')
             speed_ratio = duration_sec / max(0.01, elapsed)

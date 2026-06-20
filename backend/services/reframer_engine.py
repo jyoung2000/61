@@ -58,11 +58,14 @@ class ReframeEngine:
     def __init__(self, video_path: str, sample_fps: float = 5.0,
                  log_dir: str = None, aspect_ratio: str = '9:16',
                  source_language: str = 'auto',
-                 trace_path: str = None):
+                 trace_path: str = None,
+                 transcribe_audio_path: Optional[str] = None):
         self.video_path = video_path
         self.sample_fps = sample_fps
         self.aspect_ratio = aspect_ratio
         self.source_language = source_language
+        # Optional pre-separated vocal stem fed to Whisper (vocal separation).
+        self.transcribe_audio_path = transcribe_audio_path
         self.perception: Optional[PerceptionResult] = None
         self.plan: Optional[RenderPlan] = None
         self.log = reset_logger(log_dir)
@@ -100,7 +103,8 @@ class ReframeEngine:
         # Stage 1: Perception (faces + audio + motion)
         self.log.log_stage('ENGINE', '═══ STAGE 1: PERCEIVE (faces, audio, motion) ═══')
         perceiver = Perceiver(self.video_path, self.sample_fps,
-                              source_language=self.source_language)
+                              source_language=self.source_language,
+                              transcribe_audio_path=self.transcribe_audio_path)
         self.perception = perceiver.run(on_progress=on_progress)
 
         # Store audio device + EFFECTIVE model info for GUI display. The

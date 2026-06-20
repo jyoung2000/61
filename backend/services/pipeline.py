@@ -3354,9 +3354,45 @@ async def _run_analysis_inner(job_id: str):
         "[%s] Reframer source language=%s, subtitle target=%s",
         job_id, _engine_source_lang, (job.subtitle_language or "").strip() or "(same as source)",
     )
+    # ── Vocal separation (Demucs) before ASR ──
+    # Isolate the vocal stem so dialogue buried under loud music/SFX (which the
+    # VAD otherwise hears as no-speech and drops) gets transcribed. Runs here —
+    # BEFORE the engine loads Whisper/YOLO — as a subprocess, so it gets the
+    # whole GPU and frees it on exit. Any failure (not installed, OOM, codec)
+    # returns None and the engine transcribes the raw audio unchanged.
+    _vocals_path = None
+    if getattr(settings, "VOCAL_SEPARATION_ENABLED", False):
+        try:
+            from backend.services.vocal_separator import separate_vocals, is_available
+            if is_available():
+                async with _stage_timer(job_id, "vocal_separation"):
+                    _vocals_path = await asyncio.to_thread(
+                        separate_vocals, video_path,
+                        os.path.join(job_dir, "demucs"),
+                        model=getattr(settings, "VOCAL_SEPARATION_MODEL", "htdemucs"),
+                        device=getattr(settings, "VOCAL_SEPARATION_DEVICE", "auto"),
+                        segment=int(getattr(settings, "VOCAL_SEPARATION_SEGMENT", 7)),
+                        timeout=int(getattr(settings, "VOCAL_SEPARATION_TIMEOUT", 1800)),
+                    )
+                logger.info(
+                    "[%s] Vocal separation: %s", job_id,
+                    f"transcribing isolated vocals ({os.path.basename(_vocals_path)})"
+                    if _vocals_path else "no output — transcribing full audio",
+                )
+            else:
+                logger.info(
+                    "[%s] VOCAL_SEPARATION_ENABLED but demucs not installed "
+                    "(pip install demucs) — transcribing full audio", job_id)
+        except Exception as _vs_err:
+            logger.warning(
+                "[%s] Vocal separation failed (%s) — transcribing full audio",
+                job_id, _vs_err)
+            _vocals_path = None
+
     engine = ReframeEngine(video_path, sample_fps=_sample_fps,
                            aspect_ratio="9:16", trace_path=_trace_path,
-                           source_language=_engine_source_lang)
+                           source_language=_engine_source_lang,
+                           transcribe_audio_path=_vocals_path)
     async with _stage_timer(job_id, "reframer_analysis"):
         reframer_plan = await asyncio.to_thread(engine.analyze, _engine_progress)
     perception = engine.perception

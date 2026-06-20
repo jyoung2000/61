@@ -159,6 +159,19 @@ class Settings(BaseSettings):
     # on ≥6 GB cards; this flag extends the ladder so mid-tier GPUs
     # get ``small → medium`` on ≥2.5 GB as well.
     WHISPER_AUTO_UPGRADE: bool = True
+    # ── Vocal separation (Demucs) before ASR ──
+    # Isolate the vocal stem before Whisper so dialogue buried under loud
+    # music / SFX (which the VAD otherwise hears as no-speech and drops) is
+    # transcribed. Runs as a subprocess BEFORE Whisper loads, so it gets the
+    # whole GPU and frees it on exit. Self-heals: if demucs isn't installed or
+    # the pass fails, the job transcribes the original audio unchanged. Adds a
+    # few minutes/episode (GPU) — more on CPU — so it's worth it mainly for
+    # music-heavy / anime source material. No-op until ``pip install demucs``.
+    VOCAL_SEPARATION_ENABLED: bool = True
+    VOCAL_SEPARATION_MODEL: str = "htdemucs"   # demucs model name
+    VOCAL_SEPARATION_DEVICE: str = "auto"       # auto | cuda | cpu
+    VOCAL_SEPARATION_SEGMENT: int = 7           # demucs --segment (CUDA VRAM cap)
+    VOCAL_SEPARATION_TIMEOUT: int = 1800        # seconds, hard ceiling per pass
     FRAME_SAMPLE_RATE: int = 10        # seconds between frames (lower=more detail, slower)
     MAX_CLIP_CANDIDATES: int = 12
 

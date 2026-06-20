@@ -47,10 +47,14 @@ class Perceiver:
     """
 
     def __init__(self, video_path: str, sample_fps: float = 5.0,
-                 source_language: str = 'auto'):
+                 source_language: str = 'auto',
+                 transcribe_audio_path: Optional[str] = None):
         self.path = video_path
         self.sample_fps = sample_fps
         self.source_language = source_language
+        # Optional pre-separated vocal stem to transcribe instead of the raw
+        # video audio (vocal-separation stage). None → extract from video.
+        self.transcribe_audio_path = transcribe_audio_path
         self.cancelled = False
 
         # Tiered face detector: YOLO → DNN → Haar
@@ -598,7 +602,8 @@ class Perceiver:
             audio_result = self.audio_intel.transcribe(
                 self.path, r.duration_ms,
                 language=self.source_language,
-                on_progress=on_progress)
+                on_progress=on_progress,
+                audio_path_override=self.transcribe_audio_path)
             r.speech_active = audio_result.get('speech_active', {})
             r.transcript_segments = audio_result.get('segments', [])
             r.detected_language = audio_result.get('language', '')
