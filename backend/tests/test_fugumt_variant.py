@@ -41,14 +41,27 @@ def test_get_marian_variant_none_when_unavailable(monkeypatch):
 
 
 def test_resolve_engine_passes_fugumt_through():
-    # The router must not swallow an explicit fugumt request.
+    # The router must not swallow an explicit fugumt request, and AUTO should
+    # prefer FuguMT for Japanese↔English.
     t = pytest.importorskip(
         "backend.services.translator",
         reason="translator's cloud-provider imports aren't available in this env")
     from backend.config import settings
-    monkey = settings.TRANSLATION_ENGINE
+    # ja↔en pair detection (either direction, tolerant of spellings).
+    assert t._is_ja_en_pair("ja", "en") and t._is_ja_en_pair("en", "ja")
+    assert t._is_ja_en_pair("jpn_Jpan", "eng_Latn")
+    assert not t._is_ja_en_pair("ja", "fr")
+    eng, prefer = settings.TRANSLATION_ENGINE, settings.NMT_PREFER_FUGUMT_JA_EN
     try:
         settings.TRANSLATION_ENGINE = "fugumt"
         assert t._resolve_translation_engine("ja", "en") == "fugumt"
+        # AUTO + ja→en → fugumt when the preference is on, NOT for other pairs.
+        settings.TRANSLATION_ENGINE = "auto"
+        settings.NMT_PREFER_FUGUMT_JA_EN = True
+        settings.DEEPL_API_KEY = ""
+        settings.GOOGLE_TRANSLATE_API_KEY = ""
+        assert t._resolve_translation_engine("ja", "en") == "fugumt"
+        settings.NMT_PREFER_FUGUMT_JA_EN = False
+        assert t._resolve_translation_engine("ja", "en") != "fugumt"
     finally:
-        settings.TRANSLATION_ENGINE = monkey
+        settings.TRANSLATION_ENGINE, settings.NMT_PREFER_FUGUMT_JA_EN = eng, prefer

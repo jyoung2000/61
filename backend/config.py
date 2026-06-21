@@ -438,6 +438,10 @@ class Settings(BaseSettings):
     # TRANSLATION_ENGINE=fugumt; it only covers ja↔en, so the router falls back
     # to NLLB for any other pair.
     NMT_FUGUMT_TEMPLATE: str = "staka/fugumt-{src}-{tgt}"
+    # With TRANSLATION_ENGINE=auto, prefer FuguMT for Japanese↔English (it beats
+    # the NLLB/Opus generalists on everyday JA vocabulary). Other pairs still
+    # resolve to NLLB/Opus. Set False to keep auto on NLLB for ja↔en too.
+    NMT_PREFER_FUGUMT_JA_EN: bool = True
     # Auto-download the offline NMT model the first time a translation needs
     # it (no manual Settings step). When ``auto`` resolves to a local engine
     # but nothing is on disk yet, the translator fetches + converts NLLB-200

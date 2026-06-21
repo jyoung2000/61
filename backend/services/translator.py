@@ -1218,12 +1218,23 @@ async def _translate_via_nmt(
     return out
 
 
+def _is_ja_en_pair(source: str, target: str) -> bool:
+    """True for a Japanese↔English pair (either direction), tolerant of ISO /
+    Flores / language-name spellings (ja/jpn/japanese, en/eng/english)."""
+    def _norm(x):
+        return (x or "").strip().lower().split("-")[0].split("_")[0]
+    s, t = _norm(source), _norm(target)
+    s_ja, t_ja = s in ("ja", "jpn", "jp", "japanese"), t in ("ja", "jpn", "jp", "japanese")
+    s_en, t_en = s in ("en", "eng", "english"), t in ("en", "eng", "english")
+    return (s_ja and t_en) or (s_en and t_ja)
+
+
 def _resolve_translation_engine(source: str, target: str) -> str:
     """Pick the translation engine to use based on settings + availability.
 
-    Returns one of: ``"deepl"``, ``"google"``, ``"nllb"``, ``"opus-mt"``.
-    Translation is offline-only and never resolves to an LLM. The router in
-    ``translate_segments_with_fallback`` consults this when
+    Returns one of: ``"deepl"``, ``"google"``, ``"nllb"``, ``"opus-mt"``,
+    ``"fugumt"``. Translation is offline-only and never resolves to an LLM. The
+    router in ``translate_segments_with_fallback`` consults this when
     ``TRANSLATION_ENGINE=auto``.
     """
     requested = (getattr(settings, "TRANSLATION_ENGINE", "auto") or "auto").lower()
@@ -1239,6 +1250,13 @@ def _resolve_translation_engine(source: str, target: str) -> str:
         return "deepl"
     if (getattr(settings, "GOOGLE_TRANSLATE_API_KEY", "") or "").strip():
         return "google"
+    # Japanese↔English: FuguMT (a JA-specialist Marian model) is markedly more
+    # accurate than the NLLB/Opus generalists on everyday vocabulary, so prefer
+    # it for this pair offline. Auto-downloads on first use and falls back to
+    # NLLB if it can't load. Disable via NMT_PREFER_FUGUMT_JA_EN.
+    if (bool(getattr(settings, "NMT_PREFER_FUGUMT_JA_EN", True))
+            and _is_ja_en_pair(source, target)):
+        return "fugumt"
     try:
         from backend.services.nmt_translator import pick_local_engine, iso_to_flores
         engine = pick_local_engine(source, target)
