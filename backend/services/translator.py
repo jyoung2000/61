@@ -1032,7 +1032,26 @@ async def _translate_via_nmt(
     except Exception as e:
         logger.warning("NMT module unavailable: %s", e)
         return None
-    engine = pick_local_engine(source_language, target_language)
+    engine = None
+    # FuguMT (Japanese-specialised Marian model) when explicitly requested —
+    # loaded through the Opus-MT machinery in its own cache dir. FuguMT is
+    # ja↔en only, so anything else (or a load failure) falls through to the
+    # standard NLLB path below.
+    if engine_pref == "fugumt":
+        try:
+            from backend.services.nmt_translator import get_marian_variant
+            engine = await asyncio.to_thread(
+                get_marian_variant, source_language, target_language, "fugumt",
+                getattr(settings, "NMT_FUGUMT_TEMPLATE", "staka/fugumt-{src}-{tgt}"),
+                bool(autodownload),
+            )
+        except Exception as _fm_err:
+            logger.warning(
+                "FuguMT unavailable for %s→%s (%s) — falling back to NLLB",
+                source_language, target_language, _fm_err)
+            engine = None
+    if engine is None:
+        engine = pick_local_engine(source_language, target_language)
     if engine is None and autodownload:
         # Auto-download the offline model on demand (Task 1). NLLB-200 is the
         # preferred single-model download; Opus-MT only when explicitly asked.
@@ -1073,7 +1092,7 @@ async def _translate_via_nmt(
     if isinstance(engine, NMTTranslator):
         model_label = engine.model_id
     else:
-        model_label = "Helsinki-NLP/opus-mt-{}-{}".format(
+        model_label = getattr(engine, "hf_repo", None) or "Helsinki-NLP/opus-mt-{}-{}".format(
             getattr(engine, "source", source_language),
             getattr(engine, "target", target_language),
         )
@@ -1213,7 +1232,7 @@ def _resolve_translation_engine(source: str, target: str) -> str:
     # model only polishes — so they fall through to AUTO, which always resolves
     # to an offline NMT engine. (Whisper's native audio→English path is handled
     # upstream in the pipeline before this text router is ever consulted.)
-    if requested in ("deepl", "google", "opus-mt", "nllb"):
+    if requested in ("deepl", "google", "opus-mt", "nllb", "fugumt"):
         return requested
     # AUTO selection — offline-first, never an LLM.
     if (getattr(settings, "DEEPL_API_KEY", "") or "").strip():
@@ -1317,7 +1336,7 @@ async def translate_segments_with_fallback(
 
     # ── Local NMT engines (Opus-MT, NLLB) — offline default, auto-downloaded ──
     _nmt_error: Exception | None = None
-    if engine in ("opus-mt", "nllb"):
+    if engine in ("opus-mt", "nllb", "fugumt"):
         # Quality mode (Task 5): try the larger CPU LLM + NLLB backstop first.
         # If it's not configured / produced nothing, fall through to the speed
         # NMT→MTPE chain below. Speed mode never enters this branch.

@@ -3621,7 +3621,7 @@ class SaveSubtitleQualityRequest(BaseModel):
     deepl_api_key: Optional[str] = None
 
 
-_VALID_TRANSLATION_ENGINES = {"auto", "llm", "nllb", "opus-mt", "google", "deepl", "whisper"}
+_VALID_TRANSLATION_ENGINES = {"auto", "llm", "nllb", "opus-mt", "fugumt", "google", "deepl", "whisper"}
 _VALID_NMT_DEVICES = {"auto", "cpu", "cuda"}
 _VALID_PLATFORM_PROFILES = {"", "tiktok", "reels", "shorts", "horizontal", "square"}
 
@@ -3773,15 +3773,21 @@ async def download_nmt_model(req: DownloadNMTRequest):
             return {"status": "ok", "engine": "nllb", "path": path}
         except Exception as e:
             return {"status": "error", "engine": "nllb", "message": str(e)}
-    if engine == "opus-mt":
+    if engine in ("opus-mt", "fugumt"):
         if not req.source or not req.target:
-            return {"status": "error", "message": "source + target language codes required for opus-mt"}
+            return {"status": "error", "message": f"source + target language codes required for {engine}"}
         try:
+            from backend.config import settings as _s
             from backend.services.nmt_translator import ensure_opus_mt_downloaded
-            path = await asyncio.to_thread(ensure_opus_mt_downloaded, req.source, req.target)
-            return {"status": "ok", "engine": "opus-mt", "path": path}
+            _kw = ({} if engine == "opus-mt"
+                   else {"subdir": "fugumt",
+                         "model_template": getattr(_s, "NMT_FUGUMT_TEMPLATE",
+                                                   "staka/fugumt-{src}-{tgt}")})
+            path = await asyncio.to_thread(
+                lambda: ensure_opus_mt_downloaded(req.source, req.target, **_kw))
+            return {"status": "ok", "engine": engine, "path": path}
         except Exception as e:
-            return {"status": "error", "engine": "opus-mt", "message": str(e)}
+            return {"status": "error", "engine": engine, "message": str(e)}
     return {"status": "error", "message": f"unknown engine: {engine}"}
 
 

@@ -381,7 +381,7 @@ class Settings(BaseSettings):
     # WHISPER_TRANSLATE_TO_EN); otherwise: DeepL > Google (both key-gated) >
     # Opus-MT > NLLB. Translation NEVER uses an LLM — the AI model only polishes
     # the already-translated text for readability.
-    TRANSLATION_ENGINE: str = "auto"            # auto | nllb | opus-mt | google | deepl | whisper
+    TRANSLATION_ENGINE: str = "auto"            # auto | nllb | opus-mt | fugumt | google | deepl | whisper
     # Prefer Whisper's native audio→English translate task for non-English →
     # English jobs (matches repo-60's offline approach). It is a single-step,
     # fully-offline ASR-translate pass that avoids the transcribe-then-translate
@@ -431,6 +431,13 @@ class Settings(BaseSettings):
     # ``NMT_NLLB_MODEL=facebook/nllb-200-distilled-600M``.
     NMT_NLLB_MODEL: str = "facebook/nllb-200-distilled-1.3B"
     NMT_OPUS_MT_TEMPLATE: str = "Helsinki-NLP/opus-mt-{src}-{tgt}"
+    # FuguMT (staka/fugumt-ja-en): a JParaCrawl-trained, Japanese-specialised
+    # Marian model — markedly better ja↔en than the NLLB/Opus generalists on
+    # everyday vocabulary and idioms. Loads through the Opus-MT machinery
+    # (CTranslate2 int8, ~300 MB) in its own cache dir. Selected via
+    # TRANSLATION_ENGINE=fugumt; it only covers ja↔en, so the router falls back
+    # to NLLB for any other pair.
+    NMT_FUGUMT_TEMPLATE: str = "staka/fugumt-{src}-{tgt}"
     # Auto-download the offline NMT model the first time a translation needs
     # it (no manual Settings step). When ``auto`` resolves to a local engine
     # but nothing is on disk yet, the translator fetches + converts NLLB-200

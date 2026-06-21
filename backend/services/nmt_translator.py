@@ -359,8 +359,8 @@ def _nllb_dir(model_id: str) -> str:
     return os.path.join(_models_dir(), "nllb", model_id.replace("/", "_"))
 
 
-def _opus_dir(src: str, tgt: str) -> str:
-    return os.path.join(_models_dir(), "opus-mt", f"{src}-{tgt}")
+def _opus_dir(src: str, tgt: str, subdir: str = "opus-mt") -> str:
+    return os.path.join(_models_dir(), subdir, f"{src}-{tgt}")
 
 
 # ── Disk-space / cleanup helpers ─────────────────────────────────────────
@@ -938,21 +938,35 @@ class OpusMTTranslator:
     and cache them.
     """
 
-    _cache: dict[tuple[str, str], "OpusMTTranslator"] = {}
+    _cache: dict[tuple, "OpusMTTranslator"] = {}
 
-    def __init__(self, source: str, target: str):
+    def __init__(self, source: str, target: str, *,
+                 subdir: str = "opus-mt", model_template: Optional[str] = None):
         self.source = source.lower()
         self.target = target.lower()
+        # ``subdir`` + ``model_template`` let a Marian-format *variant* (e.g.
+        # FuguMT, staka/fugumt-ja-en — a Japanese-specialised translator) reuse
+        # this exact CTranslate2/SentencePiece loader in its own cache dir.
+        self.subdir = subdir
+        self.model_template = model_template
         self._translator = None
         self._tokenizer = None
         self._loaded = False
 
     @classmethod
-    def get(cls, source: str, target: str) -> "OpusMTTranslator":
-        key = (source.lower(), target.lower())
+    def get(cls, source: str, target: str, *,
+            subdir: str = "opus-mt", model_template: Optional[str] = None) -> "OpusMTTranslator":
+        key = (source.lower(), target.lower(), subdir)
         if key not in cls._cache:
-            cls._cache[key] = cls(source, target)
+            cls._cache[key] = cls(source, target, subdir=subdir, model_template=model_template)
         return cls._cache[key]
+
+    @property
+    def hf_repo(self) -> str:
+        """The HF repo id this variant loads from (for logging/labels)."""
+        from backend.config import settings as _s
+        tmpl = self.model_template or _s.NMT_OPUS_MT_TEMPLATE
+        return tmpl.format(src=self.source, tgt=self.target)
 
     def is_available(self) -> bool:
         try:
@@ -960,7 +974,7 @@ class OpusMTTranslator:
             import sentencepiece  # noqa: F401
         except Exception:
             return False
-        path = _opus_dir(self.source, self.target)
+        path = _opus_dir(self.source, self.target, self.subdir)
         return os.path.exists(os.path.join(path, "model.bin"))
 
     def load(self):
@@ -968,7 +982,7 @@ class OpusMTTranslator:
             return
         import ctranslate2
         import sentencepiece as spm
-        path = _opus_dir(self.source, self.target)
+        path = _opus_dir(self.source, self.target, self.subdir)
         if not os.path.exists(os.path.join(path, "model.bin")):
             raise FileNotFoundError(
                 f"Opus-MT model {self.source}-{self.target} not downloaded at {path}."
@@ -1262,39 +1276,66 @@ def ensure_nllb_downloaded(
     return target_dir
 
 
-def ensure_opus_mt_downloaded(source: str, target: str) -> str:
-    """Download + convert an Opus-MT pair to CTranslate2 (int8) on demand.
+def ensure_opus_mt_downloaded(source: str, target: str, *,
+                              subdir: str = "opus-mt",
+                              model_template: Optional[str] = None) -> str:
+    """Download + convert an Opus-MT (or Marian variant) pair to CTranslate2
+    (int8) on demand.
 
     Same semantics as ``ensure_nllb_downloaded`` (disk guard, HF-cache
     cleanup, partial-dir cleanup on failure), plus an LRU cap on how many
-    pair dirs are kept (``NMT_MAX_OPUS_PAIRS``).
+    pair dirs are kept (``NMT_MAX_OPUS_PAIRS``). ``subdir`` + ``model_template``
+    select a Marian variant (e.g. FuguMT) into its own cache dir; the LRU cap
+    only applies to the shared ``opus-mt`` subdir.
     """
     from backend.config import settings as _settings
     src, tgt = source.lower(), target.lower()
-    target_dir = _opus_dir(src, tgt)
+    target_dir = _opus_dir(src, tgt, subdir)
     if os.path.exists(os.path.join(target_dir, "model.bin")):
-        _touch_opus_pair(src, tgt)
+        if subdir == "opus-mt":
+            _touch_opus_pair(src, tgt)
         return target_dir
-    _require_free_space(target_dir, _OPUS_MIN_FREE_BYTES, f"Opus-MT {src}-{tgt}")
-    model_id = _settings.NMT_OPUS_MT_TEMPLATE.format(src=src, tgt=tgt)
+    _require_free_space(target_dir, _OPUS_MIN_FREE_BYTES, f"{subdir} {src}-{tgt}")
+    model_id = (model_template or _settings.NMT_OPUS_MT_TEMPLATE).format(src=src, tgt=tgt)
     logger.info(
-        "NMT: downloading + converting Opus-MT %s (one-time) → %s",
-        model_id, target_dir,
+        "NMT: downloading + converting %s %s (one-time) → %s",
+        subdir, model_id, target_dir,
     )
     _convert_with_cleanup(
-        model_id, target_dir, f"Opus-MT {src}-{tgt}",
+        model_id, target_dir, f"{subdir} {src}-{tgt}",
         tokenizer_files=("source.spm", "target.spm", "vocab.json"),
     )
     if not os.path.exists(os.path.join(target_dir, "source.spm")):
         present = sorted(os.listdir(target_dir)) if os.path.isdir(target_dir) else []
         raise RuntimeError(
-            f"Opus-MT {src}-{tgt} converted but the SentencePiece tokenizer "
+            f"{subdir} {src}-{tgt} converted but the SentencePiece tokenizer "
             f"(source.spm) is missing (have: {present})."
         )
-    _touch_opus_pair(src, tgt)
-    # Prune least-recently-used pairs beyond the cap now that a new one landed.
-    _enforce_opus_pair_cap()
+    if subdir == "opus-mt":
+        _touch_opus_pair(src, tgt)
+        # Prune least-recently-used pairs beyond the cap now that a new one landed.
+        _enforce_opus_pair_cap()
     return target_dir
+
+
+def get_marian_variant(source: str, target: str, subdir: str,
+                       model_template: str, autodownload: bool = True):
+    """Get (downloading if needed) a Marian/Opus-format model under its own
+    ``subdir`` + HF ``model_template``.
+
+    Exposes FuguMT (``staka/fugumt-ja-en``) — a JParaCrawl-trained,
+    Japanese-specialised translator — through the same CTranslate2 loader as
+    Opus-MT. Returns an ``OpusMTTranslator`` ready to translate, or ``None``
+    when the variant has no model for the pair and can't be downloaded (the
+    caller then falls back to NLLB).
+    """
+    t = OpusMTTranslator.get(source, target, subdir=subdir, model_template=model_template)
+    if t.is_available():
+        return t
+    if not autodownload:
+        return None
+    ensure_opus_mt_downloaded(source, target, subdir=subdir, model_template=model_template)
+    return t if t.is_available() else None
 
 
 # ── Convenience: pick the right local engine for a pair ──────────────────

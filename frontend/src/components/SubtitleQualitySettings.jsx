@@ -44,6 +44,7 @@ const ENGINE_OPTIONS = [
   { value: 'auto',    label: 'Auto (DeepL → Google → Opus-MT → NLLB → LLM)' },
   { value: 'deepl',   label: 'DeepL (cloud, best fluency, requires key)' },
   { value: 'google',  label: 'Google Cloud Translation (requires key)' },
+  { value: 'fugumt',  label: 'FuguMT (local, Japanese↔English specialist — best for JA)' },
   { value: 'opus-mt', label: 'Opus-MT (local, fastest, per-pair download)' },
   { value: 'nllb',    label: 'NLLB-200 (local, 200 languages, ~600 MB)' },
   { value: 'llm',     label: 'LLM via orchestrator (legacy)' },
