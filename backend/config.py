@@ -442,6 +442,12 @@ class Settings(BaseSettings):
     # the NLLB/Opus generalists on everyday JA vocabulary). Other pairs still
     # resolve to NLLB/Opus. Set False to keep auto on NLLB for ja↔en too.
     NMT_PREFER_FUGUMT_JA_EN: bool = True
+    # After offline NMT, auto-unify recurring proper nouns the small model spelled
+    # several ways ("Doria"/"Dorian", "Zechs"/"Zex") to the dominant spelling.
+    # Fully automatic (no glossary), output-only, conservative — makes names
+    # CONSISTENT (not necessarily the official spelling, which offline models
+    # don't know). Set False to keep the raw NMT spellings.
+    NMT_AUTO_NAME_CONSISTENCY: bool = True
     # Auto-download the offline NMT model the first time a translation needs
     # it (no manual Settings step). When ``auto`` resolves to a local engine
     # but nothing is on disk yet, the translator fetches + converts NLLB-200

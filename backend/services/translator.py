@@ -1390,6 +1390,24 @@ async def translate_segments_with_fallback(
                 except Exception as _mt_e:
                     logger.warning(
                         "Offline MTPE pass errored (%s) — keeping raw NMT draft", _mt_e)
+                # Auto name-consistency: small offline models spell recurring
+                # proper nouns several ways ("Doria"/"Dorian", "Zechs"/"Zex");
+                # unify the rare variants to the dominant spelling. Automatic
+                # (no glossary needed) + output-only, so it can't break the
+                # translation. Makes names consistent, not necessarily official.
+                if bool(getattr(settings, "NMT_AUTO_NAME_CONSISTENCY", True)):
+                    try:
+                        from backend.services.name_consistency import (
+                            unify_proper_noun_variants,
+                        )
+                        out, _n_fixed = unify_proper_noun_variants(out)
+                        if _n_fixed:
+                            logger.info(
+                                "Name consistency: unified %d proper-noun variant(s) "
+                                "to their dominant spelling", _n_fixed)
+                    except Exception as _nc_e:
+                        logger.warning(
+                            "Name-consistency pass skipped (%s)", _nc_e)
                 return out
         except Exception as e:
             _nmt_error = e
