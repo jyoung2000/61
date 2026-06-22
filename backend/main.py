@@ -796,24 +796,53 @@ def _auto_resume_enabled() -> bool:
     return os.environ.get("CLIPAI_AUTO_RESUME", "1").strip().lower() not in ("0", "false", "no")
 
 
-# Strong refs to in-flight resume tasks so the event loop doesn't GC them
-# mid-run (asyncio only holds a weak reference to bare create_task results).
-_resume_tasks: set = set()
+# Queue of job_ids to auto-resume, drained sequentially by a single background
+# task. Module-global so the drainer keeps a strong ref (asyncio only weakly
+# references bare create_task results) and so multiple recovery passes share one
+# drainer.
+_resume_queue: list[str] = []
+_resume_drainer = None
 
 
 def _schedule_resume(job_id: str) -> None:
-    """Re-queue a job's analysis on the running event loop.
+    """Queue a job to auto-resume once startup has settled.
 
-    The pipeline reuses the frame/audio cache and the engine checkpoint, so a
-    resumed run continues where the interrupted one left off rather than
-    restarting from scratch. Imported lazily so the heavy provider stack isn't
-    pulled in at module import time.
+    Resumed runs are deferred (NOT fired during startup) and executed one at a
+    time so each runs in the same fully-warmed environment a user-triggered
+    analysis does. Firing them inline at startup raced the Whisper/GPU preload
+    and the model/settings/auth warmup, so the AI stages (transcript polish /
+    translation / summary) hit GPU + model contention a continuous run never
+    sees — and a revived job could finish without its transcript/translation.
+    Imported lazily so the heavy provider stack isn't pulled in at import time.
     """
     import asyncio
+    global _resume_drainer
+    _resume_queue.append(job_id)
+    if _resume_drainer is None or _resume_drainer.done():
+        _resume_drainer = asyncio.create_task(_drain_resume_queue())
+
+
+async def _drain_resume_queue() -> None:
+    """Wait for startup to settle, then run each queued resume to completion,
+    sequentially — never two heavy runs at once on the shared GPU."""
+    import asyncio
     from backend.services.pipeline import run_analysis
-    task = asyncio.create_task(run_analysis(job_id))
-    _resume_tasks.add(task)
-    task.add_done_callback(_resume_tasks.discard)
+    try:
+        delay = float(os.environ.get("CLIPAI_RESUME_DELAY_S", "30") or 30)
+    except ValueError:
+        delay = 30.0
+    if delay > 0:
+        # Let the GPU/Whisper preload + model warmup + auth/settings seeding
+        # finish so the resumed pipeline sees a ready system.
+        await asyncio.sleep(delay)
+    while _resume_queue:
+        jid = _resume_queue.pop(0)
+        try:
+            logger.info("Auto-resume: starting deferred run for %s", jid)
+            await run_analysis(jid)
+            logger.info("Auto-resume: finished run for %s", jid)
+        except Exception as exc:  # noqa: BLE001 — one bad job must not block the rest
+            logger.warning("Auto-resume run for %s failed: %s", jid, exc)
 
 
 async def _auto_resume_interrupted_jobs() -> tuple[int, int]:

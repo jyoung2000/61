@@ -151,6 +151,36 @@ def test_startup_with_auto_resume_disabled_fails_resultless(monkeypatch):
     assert scheduled == []
 
 
+# ── Deferred resume drainer ──────────────────────────────────────────
+
+
+def test_resume_drainer_runs_jobs_sequentially_after_delay(monkeypatch):
+    """Resumes are deferred + drained one at a time so each runs in a settled,
+    fully-warmed environment (not racing startup warmup)."""
+    import backend.services.pipeline as pl
+
+    calls = []
+
+    async def fake_run(jid):
+        calls.append(jid)
+
+    monkeypatch.setattr(pl, "run_analysis", fake_run)
+    monkeypatch.setenv("CLIPAI_RESUME_DELAY_S", "0")  # no grace delay in the test
+
+    async def go():
+        main._resume_queue.clear()
+        main._resume_drainer = None
+        main._schedule_resume("j1")
+        main._schedule_resume("j2")  # shares the one drainer, not a 2nd
+        for _ in range(50):
+            await asyncio.sleep(0.01)
+            if main._resume_drainer and main._resume_drainer.done():
+                break
+
+    asyncio.run(go())
+    assert calls == ["j1", "j2"]  # ran sequentially, in order
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-v"]))

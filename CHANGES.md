@@ -1,3 +1,31 @@
+# ClipAI — Auto-resume now defers + serializes its runs (transcript/translation completes)
+
+Follow-up to the resume feature: a revived job could finish WITHOUT its
+transcript polish or translation. Root cause was timing, not the resume logic
+(which reuses the exact same post-engine code path). Auto-resume fired its
+`run_analysis` as a fire-and-forget task *during* container startup, so the
+resumed pipeline raced the Whisper/GPU preload and the model + settings/auth
+warmup. The AI stages — transcript polish, subtitle translation, summary — then
+hit GPU/model contention (and, for cloud, keys/overlay not yet applied) that a
+normal user-triggered run never sees, so they failed-soft and the job completed
+with a raw/untranslated transcript.
+
+Fix (`backend/main.py`): resumes are now **queued and drained by a single
+background task** that (a) waits a grace period for startup to settle
+(`CLIPAI_RESUME_DELAY_S`, default 30s) and (b) runs each resumed job to
+completion **sequentially** — never two heavy runs at once on the shared GPU.
+A revived job therefore executes in the same fully-warmed environment a
+continuous run does and completes every step (polish → translation → summary →
+clips → COMPLETE) identically. New test:
+`tests/test_auto_resume.py::test_resume_drainer_runs_jobs_sequentially_after_delay`.
+
+Verify on the host: analyse a non-English video, restart the container
+mid-run, and confirm the log shows `Auto-resume: starting deferred run …` after
+the grace delay, the `subtitle_translation … complete` background-task event,
+and a populated translated transcript on the finished job.
+
+---
+
 # ClipAI — Resume failed/interrupted jobs (engine checkpoint + auto-resume on restart)
 
 When the container went down mid-analysis (restart, crash, OOM), the worker
