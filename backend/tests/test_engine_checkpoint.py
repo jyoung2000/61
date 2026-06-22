@@ -168,12 +168,10 @@ def test_full_checkpoint_round_trip(tmp_path, monkeypatch):
     assert pr.scene_cuts == [1000, 3000]
     assert pr.transcript_segments[0]["text"] == "hello"
 
-    # Nested CoverageLedger / LedgerBin rebuilt as real objects with int keys.
-    assert pr.coverage_ledger is not None
-    assert set(pr.coverage_ledger.bins.keys()) == {0, 20}
-    assert pr.coverage_ledger.bins[0].status == "covered_speech"
-    assert pr.coverage_ledger.bins[0].text == "hello"
-    assert pr.coverage_ledger.coverage_ratio > 0  # method still callable
+    # coverage_ledger is deliberately NOT checkpointed (planner-only, and its
+    # tens-of-thousands of 20ms bins froze the event loop on resume) — it comes
+    # back at its None default. The bins set above must not survive the round-trip.
+    assert pr.coverage_ledger is None
 
     # Plan preserved.
     assert rp.source_width == 1920

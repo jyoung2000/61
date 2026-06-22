@@ -11,13 +11,14 @@ died mid-run. This module serializes those two objects to a per-job
 ``checkpoint/`` directory right after the engine stage finishes, and reloads
 them on the next run when the source + analysis parameters are unchanged.
 
-A reload returns objects that behave *byte-identically* to a fresh engine
-run: the int-keyed timeline dicts (``face_timeline``, ``motion_timeline`` …)
-are restored to integer keys (downstream code does ``int(t_ms / 1000)`` on
-them, which would crash on the string keys JSON produces), and the nested
-:class:`CoverageLedger` / :class:`LedgerBin` dataclasses are rebuilt. The
-bridge / clipper / evaluator therefore consume a resumed perception exactly
-as they would a freshly-computed one.
+A reload returns a perception the post-engine stages (bridge / clipper /
+evaluator) consume exactly as a freshly-computed one: the int-keyed timeline
+dicts (``face_timeline``, ``motion_timeline`` …) are restored to integer keys
+(downstream code does ``int(t_ms / 1000)`` on them, which would crash on the
+string keys JSON produces). The only field deliberately dropped is
+``coverage_ledger`` — a millisecond-resolution structure read only by the
+planner (which has already run by checkpoint time); see the note by
+``_INT_KEYED_FIELDS``.
 
 Validity is gated on a *signature* (source SHA + sample-fps + aspect ratio +
 source language + vocal-separation setting + a planner-flag fingerprint), so a
@@ -52,8 +53,17 @@ _INT_KEYED_FIELDS = (
     "track_speaker_map", "speech_active", "audio_rms", "audio_events",
     "person_timeline", "saliency_hotspot",
 )
-_LEDGER_BIN_FIELDS = ("status", "text", "source", "confidence",
-                      "speaker_id", "event_type")
+# NOTE: ``coverage_ledger`` is deliberately NOT checkpointed. It is a
+# millisecond-resolution structure (20ms bins → tens of thousands of
+# ``LedgerBin`` dataclasses on a long video) consumed ONLY by the planner,
+# which runs *inside* ``engine.analyze()`` — i.e. before this checkpoint is
+# written. Nothing after the engine (bridge / summary / clip detection) reads
+# it. Serializing + rebuilding all those bins in pure Python on a resume held
+# the GIL long enough to starve the asyncio event loop, freezing the 2s
+# ``/api/diagnostics/gpu-status`` poll (the "VRAM bar stopped working" report).
+# Dropping it makes resume cheap; a restored perception simply has
+# ``coverage_ledger=None``, which the model documents as the supported
+# "fall back to speech_active" state.
 
 
 def _numpy_safe_default(obj):
@@ -113,19 +123,6 @@ def _signatures_match(saved: dict, expected: dict) -> bool:
 # ── Serialization ────────────────────────────────────────────────────
 
 
-def _serialize_ledger(cl) -> Optional[dict]:
-    if cl is None:
-        return None
-    bins = {}
-    for k, b in (getattr(cl, "bins", None) or {}).items():
-        bins[int(k)] = {f: getattr(b, f, None) for f in _LEDGER_BIN_FIELDS}
-    return {
-        "bin_width_ms": int(getattr(cl, "bin_width_ms", 20) or 20),
-        "duration_ms": int(getattr(cl, "duration_ms", 0) or 0),
-        "bins": bins,
-    }
-
-
 def _serialize_perception(p) -> dict:
     d = {
         "src_w": int(getattr(p, "src_w", 0) or 0),
@@ -136,29 +133,11 @@ def _serialize_perception(p) -> dict:
         "scene_cuts": list(getattr(p, "scene_cuts", None) or []),
         "transcript_segments": list(getattr(p, "transcript_segments", None) or []),
         "detected_language": getattr(p, "detected_language", "") or "",
-        "coverage_ledger": _serialize_ledger(getattr(p, "coverage_ledger", None)),
+        # coverage_ledger intentionally omitted — see note by _INT_KEYED_FIELDS.
     }
     for field in _INT_KEYED_FIELDS:
         d[field] = getattr(p, field, None) or {}
     return d
-
-
-def _deserialize_ledger(d):
-    from backend.services.reframer_models import CoverageLedger, LedgerBin
-    if not d:
-        return None
-    bins = {}
-    for k, v in (d.get("bins") or {}).items():
-        try:
-            ik = int(k)
-        except (TypeError, ValueError):
-            continue
-        bins[ik] = LedgerBin(**{f: v.get(f) for f in _LEDGER_BIN_FIELDS if f in v})
-    return CoverageLedger(
-        bins=bins,
-        bin_width_ms=int(d.get("bin_width_ms", 20) or 20),
-        duration_ms=int(d.get("duration_ms", 0) or 0),
-    )
 
 
 def _int_keyed(d) -> dict:
@@ -182,7 +161,7 @@ def _deserialize_perception(d: dict):
         scene_cuts=[int(c) for c in (d.get("scene_cuts") or [])],
         transcript_segments=list(d.get("transcript_segments") or []),
         detected_language=d.get("detected_language", "") or "",
-        coverage_ledger=_deserialize_ledger(d.get("coverage_ledger")),
+        # coverage_ledger stays at its None default (not checkpointed).
     )
     for field in _INT_KEYED_FIELDS:
         setattr(p, field, _int_keyed(d.get(field)))

@@ -11,10 +11,15 @@ the reframer engine finishes, its in-memory `PerceptionResult` + `RenderPlan`
 are serialized to a per-job `checkpoint/` dir. On the next run, if a checkpoint
 exists for THIS exact source + analysis config, the pipeline restores it and
 skips straight to bridge → summary → clip detection — no re-detection, no
-re-transcription. The round-trip is faithful: the int-keyed timeline dicts
-(`face_timeline`, `motion_timeline`, …) are restored to **integer** keys
-(downstream does `int(t_ms / 1000)` on them and would crash on JSON's string
-keys), and the nested `CoverageLedger`/`LedgerBin` dataclasses are rebuilt.
+re-transcription. The round-trip is faithful for everything the post-engine
+stages read: the int-keyed timeline dicts (`face_timeline`, `motion_timeline`,
+…) are restored to **integer** keys (downstream does `int(t_ms / 1000)` on them
+and would crash on JSON's string keys). The millisecond-resolution
+`coverage_ledger` is deliberately NOT checkpointed — it's read only by the
+planner (already run by checkpoint time), and serializing/rebuilding its
+tens-of-thousands of 20ms bins in pure Python on resume held the GIL long
+enough to starve the event loop and freeze the live `/diagnostics/gpu-status`
+VRAM poll. Dropping it keeps the checkpoint tiny and resume non-blocking.
 
 Reuse is gated on a *signature* — source SHA-256, sample-fps, aspect ratio,
 source language, vocal-separation setting, and a fingerprint of the reframer
