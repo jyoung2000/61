@@ -388,6 +388,11 @@ async def trigger_analysis(job_id: str, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=404, detail="Job not found")
     if job.status not in ("queued", "failed", "complete"):
         raise HTTPException(status_code=409, detail="Analysis already in progress")
+    # A user-initiated (re)analysis is a fresh start — reset the auto-resume
+    # budget so a job that previously hit the restart cap can be retried and,
+    # if interrupted again, still auto-resume.
+    if getattr(job, "resume_attempts", 0):
+        await database.update_job_status(job_id, resume_attempts=0)
     background_tasks.add_task(run_analysis, job_id)
     return {"job_id": job_id, "status": "analysis_started"}
 

@@ -232,6 +232,12 @@ class JobResult(BaseModel):
     status: JobStatus = JobStatus.QUEUED
     progress: int = 0  # 0-100
     progress_message: str = ""
+    # How many times this job has been auto-resumed after a container
+    # restart interrupted it mid-analysis. Capped (see
+    # ``backend.main._MAX_AUTO_RESUME_ATTEMPTS``) so a job that crashes the
+    # container can't relaunch itself forever — past the cap it's marked
+    # FAILED. Reset to 0 when the run completes or the user re-analyzes.
+    resume_attempts: int = 0
     provider_used: dict = {}  # {task: model_name}
     created_at: str = ""
     updated_at: str = ""

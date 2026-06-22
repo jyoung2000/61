@@ -777,6 +777,7 @@ from backend.services.pipeline_helpers import (  # noqa: E402
     _drain_pipeline_telemetry,
     is_synthetic_scene,
 )
+from backend.services import pipeline_checkpoint  # noqa: E402
 
 # ── Pipeline heartbeat — prevents >15s gaps in progress updates ──────
 class _PipelineHeartbeat:
@@ -2427,6 +2428,22 @@ async def _background_post_processing(
     return _result
 
 
+# Reframer/planner env flags that change the engine's perception or plan.
+# Folded into the engine-checkpoint signature so flipping any of them
+# invalidates a saved checkpoint (the next run re-runs the engine) instead of
+# silently resuming with the previous behavior.
+_PLANNER_ENV_FLAGS = (
+    "CLIPAI_ANIME_ANCHOR", "CLIPAI_MUSIC_BEAT_SNAP", "CLIPAI_GAMEPLAY_TRACKER",
+    "CLIPAI_EDITORIAL_PRIOR", "CLIPAI_THIRDS_BIAS", "CLIPAI_GAZE_LEAD_ROOM_V2",
+    "REFRAMER_MAX_SAMPLES", "REFRAMER_SAMPLE_FPS", "REFRAMER_MIN_SAMPLE_FPS",
+)
+
+
+def _planner_fingerprint() -> str:
+    """Stable fingerprint of the env flags that steer the reframer engine."""
+    return ";".join(f"{k}={os.environ.get(k, '')}" for k in _PLANNER_ENV_FLAGS)
+
+
 async def run_analysis(job_id: str):
     """Execute the full analysis pipeline for a video job."""
     # Clear any stale finalization gate from a previous run so this run's
@@ -2579,6 +2596,10 @@ async def _run_analysis_inner(job_id: str):
     job_dir = f"/data/uploads/{job_id}"
     frames_dir = os.path.join(job_dir, "frames")
     audio_path = os.path.join(job_dir, "audio.wav")
+    # Snapshot before this run overwrites it — used to keep the Compute card
+    # complete when resuming from an engine checkpoint (some rows can't be
+    # rebuilt without a live engine / fresh extraction this run).
+    _prior_compute_summary = getattr(job, "compute_summary", None) or {}
 
     # Record pipeline start time for ETA and total duration tracking
     _pipeline_start = _time.monotonic()
@@ -3120,6 +3141,11 @@ async def _run_analysis_inner(job_id: str):
     #
     # Disable with CLIPAI_FORCE_REEXTRACT=1.
     _force_reextract = os.environ.get("CLIPAI_FORCE_REEXTRACT", "").lower() in ("1", "true", "yes")
+    # Tracked across both extraction branches so the engine checkpoint (saved
+    # after the reframer stage) can key on the exact source bytes. On a cache
+    # hit this is already the matched SHA; on a fresh extract it's filled in
+    # once hashing succeeds below.
+    _source_sha256_local = getattr(job, "source_sha256", "") or ""
     cached_extraction = None
     if not _force_reextract:
         try:
@@ -3191,6 +3217,7 @@ async def _run_analysis_inner(job_id: str):
             _sha = await asyncio.to_thread(_hash_file_sha256, video_path)
             if _sha:
                 await database.update_job_status(job_id, source_sha256=_sha)
+                _source_sha256_local = _sha
         except Exception as _he:
             logger.info("[%s] source hash failed (%s); cache disabled for next run", job_id, _he)
     total_frames = len(frames)
@@ -3354,14 +3381,63 @@ async def _run_analysis_inner(job_id: str):
         "[%s] Reframer source language=%s, subtitle target=%s",
         job_id, _engine_source_lang, (job.subtitle_language or "").strip() or "(same as source)",
     )
+    # ── Engine checkpoint probe (RESUME) ──
+    # The reframer engine (face/motion detection + Whisper transcription +
+    # planning) is the single most expensive stage. If a previous run got this
+    # far and saved a checkpoint for THIS exact source + analysis config,
+    # restore its perception + plan and skip straight to bridge → summary →
+    # clips. This is what lets a failed/interrupted job "continue where it left
+    # off" instead of re-detecting and re-transcribing from scratch. Bypass
+    # with CLIPAI_FORCE_REANALYZE=1.
+    _engine_ckpt_signature = pipeline_checkpoint.checkpoint_signature(
+        source_sha=_source_sha256_local,
+        source_language=_engine_source_lang,
+        sample_fps=_sample_fps,
+        aspect_ratio="9:16",
+        vocal_sep_key=(
+            f"{bool(getattr(settings, 'VOCAL_SEPARATION_ENABLED', False))}:"
+            f"{getattr(settings, 'VOCAL_SEPARATION_MODEL', 'htdemucs')}"
+        ),
+        planner_fingerprint=_planner_fingerprint(),
+    )
+    _force_reanalyze = os.environ.get(
+        "CLIPAI_FORCE_REANALYZE", "").lower() in ("1", "true", "yes")
+    _resumed_from_checkpoint = False
+    engine = None
+    reframer_plan = None
+    perception = None
+    if not _force_reanalyze:
+        try:
+            _ckpt = await pipeline_checkpoint.load_engine_checkpoint(
+                job_id, signature=_engine_ckpt_signature)
+        except Exception as _ckpt_probe_err:
+            logger.info("[%s] checkpoint probe failed (%s); running engine fresh",
+                        job_id, _ckpt_probe_err)
+            _ckpt = None
+        if _ckpt is not None:
+            perception, reframer_plan, engine = _ckpt
+            _resumed_from_checkpoint = True
+            _record_pipeline_warning(
+                job_id,
+                "Resumed from a saved checkpoint — reused detection, "
+                "transcription, and the reframe plan from a previous run.")
+            await _update_progress(
+                job_id, JobStatus.ANALYZING_SCENES, 56,
+                "Resuming — reusing saved detection + transcription...")
+            logger.info(
+                "[%s] RESUME: restored engine checkpoint (%d transcript segs) — "
+                "skipping detection + transcription", job_id,
+                len(getattr(perception, "transcript_segments", None) or []))
+
     # ── Vocal separation (Demucs) before ASR ──
     # Isolate the vocal stem so dialogue buried under loud music/SFX (which the
     # VAD otherwise hears as no-speech and drops) gets transcribed. Runs here —
     # BEFORE the engine loads Whisper/YOLO — as a subprocess, so it gets the
     # whole GPU and frees it on exit. Any failure (not installed, OOM, codec)
     # returns None and the engine transcribes the raw audio unchanged.
+    # Skipped entirely on a resumed run (the transcript is already restored).
     _vocals_path = None
-    if getattr(settings, "VOCAL_SEPARATION_ENABLED", False):
+    if not _resumed_from_checkpoint and getattr(settings, "VOCAL_SEPARATION_ENABLED", False):
         try:
             from backend.services.vocal_separator import separate_vocals, is_available
             if is_available():
@@ -3389,14 +3465,29 @@ async def _run_analysis_inner(job_id: str):
                 job_id, _vs_err)
             _vocals_path = None
 
-    engine = ReframeEngine(video_path, sample_fps=_sample_fps,
-                           aspect_ratio="9:16", trace_path=_trace_path,
-                           source_language=_engine_source_lang,
-                           transcribe_audio_path=_vocals_path)
-    async with _stage_timer(job_id, "reframer_analysis"):
-        reframer_plan = await asyncio.to_thread(engine.analyze, _engine_progress)
-    perception = engine.perception
-    _log_gpu_memory(job_id, "post-reframer")
+    if not _resumed_from_checkpoint:
+        engine = ReframeEngine(video_path, sample_fps=_sample_fps,
+                               aspect_ratio="9:16", trace_path=_trace_path,
+                               source_language=_engine_source_lang,
+                               transcribe_audio_path=_vocals_path)
+        async with _stage_timer(job_id, "reframer_analysis"):
+            reframer_plan = await asyncio.to_thread(engine.analyze, _engine_progress)
+        perception = engine.perception
+        _log_gpu_memory(job_id, "post-reframer")
+
+        # Checkpoint the (expensive) engine output so a failed/interrupted run
+        # can RESUME here next time — skipping detection + transcription —
+        # instead of re-running the whole engine. Best-effort: never break the
+        # run over a serialization hiccup.
+        await pipeline_checkpoint.save_engine_checkpoint(
+            job_id, perception, reframer_plan,
+            signature=_engine_ckpt_signature,
+            audio_meta={
+                "device": getattr(engine, "_perceiver_audio_device", None),
+                "model": getattr(engine, "_perceiver_audio_model", None),
+                "requested": getattr(engine, "_perceiver_audio_model_requested", None),
+            },
+        )
 
     await _update_progress(
         job_id, JobStatus.ANALYZING_SCENES, 57,
@@ -3407,24 +3498,27 @@ async def _run_analysis_inner(job_id: str):
     # audio→English translate, KEEP the engine loaded so that pass REUSES it
     # (no second load) — the translate step frees the VRAM afterwards, and a
     # defensive release runs right before the summary regardless of path.
-    _det_lang_pp = (getattr(perception, "detected_language", "") or "").strip().lower()
-    _pp_tgt = (job.subtitle_language or "").strip().lower()
-    _pp_src = (job.language or "").strip().lower() or _det_lang_pp
-    if not _pp_tgt and _pp_src and _pp_src not in ("en", "english"):
-        _pp_tgt = "en"  # auto-translate non-English → English
-    _keep_whisper_for_translate = (
-        bool(getattr(settings, "WHISPER_TRANSLATE_TO_EN", True))
-        and _pp_tgt == "en"
-        and _pp_src not in ("en", "english", "")
-        and bool(getattr(perception, "transcript_segments", None))
-    )
-    if _keep_whisper_for_translate:
-        logger.info(
-            "[%s] Keeping Whisper engine loaded for native audio→English translate "
-            "(reuse — no second load on small GPUs)", job_id)
-    else:
-        await _release_whisper_vram(job_id)
-        _log_gpu_memory(job_id, "post-whisper-release")
+    # On a RESUMED run no Whisper was loaded (the transcript came from the
+    # checkpoint), so this release/keep dance is a no-op and is skipped.
+    if not _resumed_from_checkpoint:
+        _det_lang_pp = (getattr(perception, "detected_language", "") or "").strip().lower()
+        _pp_tgt = (job.subtitle_language or "").strip().lower()
+        _pp_src = (job.language or "").strip().lower() or _det_lang_pp
+        if not _pp_tgt and _pp_src and _pp_src not in ("en", "english"):
+            _pp_tgt = "en"  # auto-translate non-English → English
+        _keep_whisper_for_translate = (
+            bool(getattr(settings, "WHISPER_TRANSLATE_TO_EN", True))
+            and _pp_tgt == "en"
+            and _pp_src not in ("en", "english", "")
+            and bool(getattr(perception, "transcript_segments", None))
+        )
+        if _keep_whisper_for_translate:
+            logger.info(
+                "[%s] Keeping Whisper engine loaded for native audio→English translate "
+                "(reuse — no second load on small GPUs)", job_id)
+        else:
+            await _release_whisper_vram(job_id)
+            _log_gpu_memory(job_id, "post-whisper-release")
 
     _n_face_samples = sum(1 for v in (perception.face_timeline or {}).values() if v)
     logger.info(
@@ -3880,6 +3974,12 @@ async def _run_analysis_inner(job_id: str):
     # CPU (different code paths, different reasons), so each gets
     # its own row in the Compute card.
     compute_summary = _build_compute_summary(engine, perception)
+    if _resumed_from_checkpoint:
+        # On a resumed run the live ``engine`` is a stub and frame extraction
+        # was served from cache (no fresh LAST_EXTRACTION_LABEL), so some rows
+        # can't be rebuilt this run. Keep the prior run's rows underneath so the
+        # Compute card stays complete; anything we did rebuild wins on top.
+        compute_summary = {**_prior_compute_summary, **compute_summary}
     logger.info(
         "[%s] compute summary: %s",
         job_id,
@@ -4369,6 +4469,9 @@ async def _run_analysis_inner(job_id: str):
         estimated_cost_usd=_total_cost_usd,
         cost_breakdown=_cost_breakdown,
         default_layout_mode="single",
+        # Clear the auto-resume attempt counter now the run finished, so a later
+        # unrelated re-analyze that gets interrupted starts its budget fresh.
+        resume_attempts=0,
     )
     # Robust, self-diagnosing finalization. The plain update_job_status was
     # observed to silently NOT persist the COMPLETE payload (status stayed

@@ -1,3 +1,49 @@
+# ClipAI — Resume failed/interrupted jobs (engine checkpoint + auto-resume on restart)
+
+When the container went down mid-analysis (restart, crash, OOM), the worker
+thread died and the job could only be RE-ANALYSED FROM SCRATCH — re-running the
+single most expensive stage (face/motion detection + Whisper transcription +
+the reframe planner) every time. The frame+audio extraction was already cached,
+but nothing after it was. This adds a true resume.
+
+**1. Engine checkpoint (`backend/services/pipeline_checkpoint.py`).** Right after
+the reframer engine finishes, its in-memory `PerceptionResult` + `RenderPlan`
+are serialized to a per-job `checkpoint/` dir. On the next run, if a checkpoint
+exists for THIS exact source + analysis config, the pipeline restores it and
+skips straight to bridge → summary → clip detection — no re-detection, no
+re-transcription. The round-trip is faithful: the int-keyed timeline dicts
+(`face_timeline`, `motion_timeline`, …) are restored to **integer** keys
+(downstream does `int(t_ms / 1000)` on them and would crash on JSON's string
+keys), and the nested `CoverageLedger`/`LedgerBin` dataclasses are rebuilt.
+
+Reuse is gated on a *signature* — source SHA-256, sample-fps, aspect ratio,
+source language, vocal-separation setting, and a fingerprint of the reframer
+env flags — so a stale checkpoint is never used after the source or analysis
+settings change. Bypass with `CLIPAI_FORCE_REANALYZE=1`.
+
+**2. Auto-resume on container restart (`backend/main.py`).** Startup recovery
+now: (a) completes jobs that already have results, then (b) **re-queues**
+result-less interrupted jobs to RESUME from the checkpoint (continue where they
+left off) instead of marking them FAILED. A persisted `resume_attempts` counter
+caps this at `CLIPAI_MAX_RESUME_ATTEMPTS` (default 3) so a job that crashes the
+container can't relaunch itself forever — past the cap it's marked FAILED.
+Disable the whole behavior with `CLIPAI_AUTO_RESUME=0` (reverts to the old
+fail-and-wait-for-manual-re-analyse flow). The counter resets on COMPLETE and
+on a user-triggered re-analysis.
+
+New env knobs: `CLIPAI_AUTO_RESUME` (default on), `CLIPAI_MAX_RESUME_ATTEMPTS`
+(default 3), `CLIPAI_FORCE_REANALYZE` (force a clean engine re-run).
+
+Verify on the Unraid host (no GPU/weights/media here, so this is unit-tested +
+code-traced only): analyse a video, `docker compose restart app` mid-run, and
+confirm the log shows `RESUME: restored engine checkpoint … skipping detection
++ transcription` and the job finishes without re-running Whisper. New tests:
+`backend/tests/test_engine_checkpoint.py` (serialization round-trip, int-key
+restoration, signature gating) and `tests/test_auto_resume.py` (startup
+complete/resume/fail routing + attempt cap).
+
+---
+
 # ClipAI — Transcription recall on music-heavy content (vocal separation + preconditioning)
 
 Diagnosed from a real run's `clipai_logs_*.txt` on the Gundam Wing episode:

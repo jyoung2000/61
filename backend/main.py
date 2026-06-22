@@ -724,7 +724,11 @@ def _is_stale(job, stale_after_s: float) -> bool:
     return age is None or age >= stale_after_s
 
 
-async def _recover_stale_jobs(*, complete_stale_s: float, fail_stale_s: float) -> tuple[int, int]:
+async def _recover_stale_jobs(
+    *,
+    complete_stale_s: Optional[float],
+    fail_stale_s: Optional[float],
+) -> tuple[int, int]:
     """Recover non-terminal jobs that no live run is advancing.
 
     - has results (clips / summary) + stale ≥ ``complete_stale_s`` → COMPLETE
@@ -732,8 +736,12 @@ async def _recover_stale_jobs(*, complete_stale_s: float, fail_stale_s: float) -
     - no results + stale ≥ ``fail_stale_s`` → FAILED (the run died mid-flight;
       surface a clear, re-analysable error instead of an eternal spinner).
 
-    Staleness keeps this from ever completing/failing an in-flight run. Pass
-    ``0`` for both at startup. Returns ``(completed, failed)``."""
+    Passing ``None`` for either threshold SKIPS that branch entirely — used by
+    the startup recovery, which completes finished jobs in one pass and then
+    routes the result-less ones through auto-resume in another, so this must
+    not also fail them. Staleness otherwise keeps this from ever
+    completing/failing an in-flight run (pass ``0`` for both at startup to act
+    regardless of age). Returns ``(completed, failed)``."""
     import backend.database as _db
     completed = failed = 0
     for job in await _db.list_jobs(include_unowned=True):
@@ -741,7 +749,7 @@ async def _recover_stale_jobs(*, complete_stale_s: float, fail_stale_s: float) -
             continue
         has_results = bool(getattr(job, "clips", None)) or getattr(job, "summary", None) is not None
         if has_results:
-            if _is_stale(job, complete_stale_s):
+            if complete_stale_s is not None and _is_stale(job, complete_stale_s):
                 await _db.update_job_status(
                     job.job_id, status="complete", progress=100,
                     progress_message="Analysis complete",
@@ -751,7 +759,7 @@ async def _recover_stale_jobs(*, complete_stale_s: float, fail_stale_s: float) -
                     job.job_id, job.status,
                 )
                 completed += 1
-        elif _is_stale(job, fail_stale_s):
+        elif fail_stale_s is not None and _is_stale(job, fail_stale_s):
             await _db.update_job_status(
                 job.job_id, status="failed", progress=0,
                 progress_message="Analysis interrupted — please re-analyse",
@@ -775,28 +783,123 @@ async def _reconcile_finished_jobs() -> int:
     return completed
 
 
+# How many times a job may auto-resume after a container restart interrupted
+# it mid-analysis before we give up and mark it FAILED. A safety net so a job
+# that crashes the container (e.g. OOM on a pathological source) can't relaunch
+# itself in an endless loop across restarts. Override with
+# ``CLIPAI_MAX_RESUME_ATTEMPTS``.
+_MAX_AUTO_RESUME_ATTEMPTS = max(0, int(os.environ.get("CLIPAI_MAX_RESUME_ATTEMPTS", "3") or 3))
+
+
+def _auto_resume_enabled() -> bool:
+    """Auto-resume is on by default; ``CLIPAI_AUTO_RESUME=0`` disables it."""
+    return os.environ.get("CLIPAI_AUTO_RESUME", "1").strip().lower() not in ("0", "false", "no")
+
+
+# Strong refs to in-flight resume tasks so the event loop doesn't GC them
+# mid-run (asyncio only holds a weak reference to bare create_task results).
+_resume_tasks: set = set()
+
+
+def _schedule_resume(job_id: str) -> None:
+    """Re-queue a job's analysis on the running event loop.
+
+    The pipeline reuses the frame/audio cache and the engine checkpoint, so a
+    resumed run continues where the interrupted one left off rather than
+    restarting from scratch. Imported lazily so the heavy provider stack isn't
+    pulled in at module import time.
+    """
+    import asyncio
+    from backend.services.pipeline import run_analysis
+    task = asyncio.create_task(run_analysis(job_id))
+    _resume_tasks.add(task)
+    task.add_done_callback(_resume_tasks.discard)
+
+
+async def _auto_resume_interrupted_jobs() -> tuple[int, int]:
+    """Re-queue jobs that were mid-analysis when the process died.
+
+    Runs at startup, where every worker thread is already dead, so every
+    non-terminal *result-less* job is genuinely orphaned. Each is re-queued to
+    RESUME (reusing the engine checkpoint + extraction cache) up to
+    ``_MAX_AUTO_RESUME_ATTEMPTS``; past the cap it's marked FAILED so a
+    crash-looping job can't spin forever. Jobs that already have results are
+    left untouched here — :func:`recover_orphaned_jobs` completes those first.
+
+    Returns ``(resumed, failed)``.
+    """
+    import backend.database as _db
+    resumed = failed = 0
+    for job in await _db.list_jobs(include_unowned=True):
+        if job.status not in _NON_TERMINAL_STATUSES:
+            continue
+        has_results = bool(getattr(job, "clips", None)) or getattr(job, "summary", None) is not None
+        if has_results:
+            continue  # completed by recover_orphaned_jobs' first pass
+        attempts = int(getattr(job, "resume_attempts", 0) or 0)
+        if attempts >= _MAX_AUTO_RESUME_ATTEMPTS:
+            await _db.update_job_status(
+                job.job_id, status="failed", progress=0,
+                progress_message=(
+                    f"Analysis interrupted — auto-resume gave up after "
+                    f"{attempts} attempt(s). Re-analyse to retry."),
+            )
+            logger.warning(
+                "Auto-resume: job %s hit the attempt cap (%d) — marked FAILED",
+                job.job_id, attempts)
+            failed += 1
+            continue
+        # Bump the counter (persisted, so it survives the next restart) and
+        # re-queue. run_analysis resets the status to QUEUED itself.
+        await _db.update_job_status(
+            job.job_id, status="queued", progress=0,
+            resume_attempts=attempts + 1,
+            progress_message="Resuming after restart…",
+        )
+        try:
+            _schedule_resume(job.job_id)
+            resumed += 1
+            logger.info(
+                "Auto-resume: re-queued job %s (attempt %d/%d)",
+                job.job_id, attempts + 1, _MAX_AUTO_RESUME_ATTEMPTS)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Auto-resume: failed to schedule %s: %s", job.job_id, exc)
+    return resumed, failed
+
+
 @app.on_event("startup")
 async def recover_orphaned_jobs():
-    """Mark jobs that were running when the server last shut down as failed.
+    """Recover jobs that were running when the server last shut down.
 
-    Pipeline worker threads do not survive a process restart.  Any job whose
-    status is still an in-progress value will never advance on its own — mark
-    it failed immediately so the UI shows a clear error instead of an eternal
-    spinner, and so re-analysis can be triggered straight away.
+    Pipeline worker threads do not survive a process restart, so any job left
+    in a non-terminal status is orphaned and will never advance on its own.
+
+      * has results (clips / summary) → marked COMPLETE (its finished work is
+        on disk; only the COMPLETE save was lost).
+      * result-less + auto-resume enabled → re-queued to RESUME from the engine
+        checkpoint + extraction cache (continue where it left off), capped by
+        ``_MAX_AUTO_RESUME_ATTEMPTS``.
+      * result-less + auto-resume disabled → marked FAILED (the old behavior),
+        so the UI shows a clear, re-analysable error instead of a spinner.
     """
     try:
-        # Every worker thread is already dead at startup, so there's no in-flight
-        # run to protect — recover unconditionally (stale_s=0). Jobs with results
-        # become COMPLETE; result-less ones become FAILED. This now covers EVERY
-        # non-terminal status (including ``translating``), which the old hardcoded
-        # set missed — the cause of jobs stuck spinning at "translating" forever.
-        completed, recovered = await _recover_stale_jobs(
-            complete_stale_s=0, fail_stale_s=0)
-        if recovered or completed:
+        # Pass 1 — complete the jobs that actually finished. fail_stale_s=None
+        # so this pass ONLY completes (with-results) jobs and never fails the
+        # result-less ones; pass 2 decides their fate.
+        completed, _ = await _recover_stale_jobs(complete_stale_s=0, fail_stale_s=None)
+
+        # Pass 2 — the result-less orphans.
+        if _auto_resume_enabled():
+            resumed, failed = await _auto_resume_interrupted_jobs()
+        else:
+            _, failed = await _recover_stale_jobs(complete_stale_s=None, fail_stale_s=0)
+            resumed = 0
+
+        if completed or resumed or failed:
             logger.info(
-                "Startup recovery: %d orphaned job(s) marked failed, "
-                "%d finished-but-unmarked job(s) marked complete",
-                recovered, completed,
+                "Startup recovery: %d finished job(s) marked complete, "
+                "%d orphan(s) auto-resumed, %d marked failed",
+                completed, resumed, failed,
             )
     except Exception as exc:
         logger.warning("Orphaned job recovery failed (non-fatal): %s", exc)
