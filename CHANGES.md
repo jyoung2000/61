@@ -1,3 +1,39 @@
+# ClipAI — Transcription no longer times out on long videos (the real "translation didn't run" cause)
+
+A 2 h video came back with `0 transcript segments`, an empty summary ("no
+transcript was available"), and no subtitle translation. Root cause from the
+logs: the reframer's `transcribe()` RE-EXTRACTED audio from the video with the
+preconditioning chain (`highpass + afftdn denoise + loudnorm`) under a hardcoded
+**240 s** timeout — but that exact chain takes ~10 min on a 2 h file (the main
+pipeline's own `audio.wav` extraction logged 624 s). So it timed out, Whisper
+got no audio, and with no transcript the pipeline silently skipped translation
+and produced an empty summary. Translation was never the problem — there was
+simply nothing to translate (mode-independent: same in offline and cloud).
+
+Fixes (`backend/services/reframer_audio.py`):
+- `transcribe()` now **reuses the pipeline's already-extracted `audio.wav`**
+  (same job dir, identical preconditioning chain) instead of re-extracting —
+  eliminating ~10 min of duplicate ffmpeg work AND the timeout entirely.
+- The fallback extraction (when no `audio.wav` exists) now uses a
+  **duration-scaled timeout** (floor 10 min, ~realtime + slack) and catches
+  `TimeoutExpired` so a slow/odd codec falls back to a plain copy instead of
+  killing the whole transcript.
+
+Supporting changes:
+- `pipeline.py` now emits a visible job warning + WS notice when analysis
+  produces **0 transcript segments**, so a transcription failure can't masquerade
+  as a clean COMPLETE with an empty summary again.
+- `pipeline_checkpoint.py` `CHECKPOINT_VERSION` bumped to 2 so the empty-transcript
+  checkpoint the failed run cached is invalidated — the next analyze/resume
+  re-runs the engine and transcribes correctly.
+
+Verify on the host: re-analyse the 2 h video; the log should show
+`[AUDIO] Reusing pre-extracted audio.wav … skipping redundant re-extraction`,
+a non-zero `transcript segments` count, a populated summary, and — for a
+non-English source — the subtitle translation running.
+
+---
+
 # ClipAI — Auto-resume now defers + serializes its runs (transcript/translation completes)
 
 Follow-up to the resume feature: a revived job could finish WITHOUT its

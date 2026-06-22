@@ -39,7 +39,10 @@ logger = logging.getLogger(__name__)
 
 # Bump when the on-disk shape changes so old checkpoints are ignored
 # (re-run the engine) instead of deserialized into the wrong fields.
-CHECKPOINT_VERSION = 1
+# v2: invalidates checkpoints written before the transcribe-reuses-audio.wav
+# fix — those could carry an empty (timed-out) transcript that a resume would
+# otherwise keep reusing.
+CHECKPOINT_VERSION = 2
 
 _PERCEPTION_FILE = "engine_perception.json"
 _PLAN_FILE = "engine_plan.json"

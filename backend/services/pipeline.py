@@ -3553,6 +3553,30 @@ async def _run_analysis_inner(job_id: str):
         )
         subject_track = to_fez_subject_track(perception, reframer_plan)
 
+    # Loud, visible signal when transcription came back empty. Without a
+    # transcript the pipeline silently skips subtitle translation AND produces
+    # an empty summary ("no transcript was available") — so surface it as a job
+    # warning + WS notice instead of letting the run look cleanly COMPLETE. The
+    # usual cause is a transcription/audio-extraction failure (see the [AUDIO]
+    # error in the logs), not a genuinely silent video.
+    if not transcript:
+        _record_pipeline_warning(
+            job_id,
+            "Transcription produced no segments — subtitle translation and the "
+            "text summary were skipped. Check the audio track / [AUDIO] log lines.")
+        logger.warning(
+            "[%s] No transcript segments after analysis — translation + summary "
+            "will be skipped (likely a transcription/audio-extraction failure).",
+            job_id)
+        try:
+            await broadcast_ws(job_id, {
+                "type": "compute_warning",
+                "message": ("No speech transcript was produced — translation and "
+                            "summary skipped. Check the source audio."),
+            })
+        except Exception:
+            pass
+
     # Whisper's detected language — hoisted here so the critical-path polish
     # block below can pass it to the polisher (CJK-specific rules). It was
     # previously only assigned much later, which raised UnboundLocalError in

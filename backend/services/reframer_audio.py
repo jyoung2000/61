@@ -525,45 +525,75 @@ class AudioIntelligence:
                     f'Using pre-separated vocal track '
                     f'({os.path.basename(audio_path)}) — skipping extraction')
             else:
-                audio_path = tempfile.mktemp(suffix='.wav')
-                _own_audio = True
-                # Audio preconditioning for the ASR input. This path re-extracts
-                # the audio straight from the video for Whisper, so the denoise /
-                # loudness-normalise chain frame_extractor.extract_audio applies to
-                # the diarization/music copy was NOT reaching the transcriber —
-                # faint dialogue under music/SFX was being dropped by VAD as a
-                # result. Mirror the SAME chain here, gated by the documented
-                # WHISPER_AUDIO_PRECONDITION setting:
-                #   highpass=f=80    — strip AC hum / rumble below 80 Hz
-                #   afftdn=nf=-25    — adaptive FFT broadband denoise
-                #   loudnorm=...     — bring quiet speech up to a consistent level
+                # Prefer the pipeline's already-extracted ``audio.wav`` (same job
+                # dir) over a SECOND extraction. The main pipeline writes
+                # audio.wav with the EXACT same preconditioning chain (both gated
+                # by WHISPER_AUDIO_PRECONDITION), so re-extracting here just
+                # duplicated ~10 min of ffmpeg work — and under the old fixed
+                # 240 s timeout it TIMED OUT on long videos (the denoise+loudnorm
+                # chain runs for minutes on a 2 h file), returning an EMPTY
+                # transcript. With no transcript the pipeline then silently
+                # skipped subtitle translation and produced an empty summary —
+                # the "translation didn't run" / "no transcript available"
+                # symptom. Reuse the shared file when present; extract only as a
+                # fallback, with a duration-scaled timeout.
                 _precondition = bool(getattr(settings, "WHISPER_AUDIO_PRECONDITION", True))
-                log.log_stage('AUDIO',
-                    f'Extracting audio from {os.path.basename(video_path)}'
-                    f' (preconditioning {"on" if _precondition else "off"})...')
-                _extract_cmd = ['ffmpeg', '-y', '-i', video_path, '-vn']
-                if _precondition:
-                    _extract_cmd += ['-af',
-                        'highpass=f=80,afftdn=nf=-25,loudnorm=I=-18:LRA=11:TP=-1.5']
-                _extract_cmd += ['-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le',
-                                 audio_path]
-                result = subprocess.run(_extract_cmd, capture_output=True, timeout=240)
-
-                if not os.path.exists(audio_path):
-                    log.log_error('AUDIO', f'Audio extraction failed (exit={result.returncode})')
-                    # Preconditioning can fail on exotic codecs / filter builds;
-                    # retry once with a plain copy so a filter error never costs us
-                    # the whole transcript.
+                _sibling_wav = os.path.join(
+                    os.path.dirname(video_path) or ".", "audio.wav")
+                if os.path.isfile(_sibling_wav) and os.path.getsize(_sibling_wav) > 1024:
+                    audio_path = _sibling_wav
+                    _own_audio = False  # shared file — must NOT be deleted below
+                    log.log_stage('AUDIO',
+                        f'Reusing pre-extracted audio.wav '
+                        f'({os.path.getsize(audio_path) / 1048576:.1f} MB) — '
+                        'skipping redundant re-extraction')
+                else:
+                    audio_path = tempfile.mktemp(suffix='.wav')
+                    _own_audio = True
+                    log.log_stage('AUDIO',
+                        f'Extracting audio from {os.path.basename(video_path)}'
+                        f' (preconditioning {"on" if _precondition else "off"})...')
+                    _extract_cmd = ['ffmpeg', '-y', '-i', video_path, '-vn']
                     if _precondition:
-                        log.log_stage('AUDIO',
-                            'Preconditioned extract failed — retrying without filters')
-                        subprocess.run([
-                            'ffmpeg', '-y', '-i', video_path,
-                            '-vn', '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le',
-                            audio_path,
-                        ], capture_output=True, timeout=180)
+                        _extract_cmd += ['-af',
+                            'highpass=f=80,afftdn=nf=-25,loudnorm=I=-18:LRA=11:TP=-1.5']
+                    _extract_cmd += ['-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le',
+                                     audio_path]
+                    # Scale the timeout with duration: a fixed 240 s cap
+                    # guaranteed failure on long videos. Floor 10 min; otherwise
+                    # allow ~realtime + slack (extraction runs well under that).
+                    _dur_s = int((duration_ms or 0) / 1000)
+                    _extract_timeout = max(600, _dur_s + 120)
+                    result = None
+                    try:
+                        result = subprocess.run(_extract_cmd, capture_output=True,
+                                                timeout=_extract_timeout)
+                    except subprocess.TimeoutExpired:
+                        log.log_error('AUDIO',
+                            f'Audio extraction timed out after {_extract_timeout}s')
+
                     if not os.path.exists(audio_path):
-                        return {'speech_active': {}, 'segments': [], 'language': ''}
+                        log.log_error(
+                            'AUDIO',
+                            'Audio extraction failed'
+                            + (f' (exit={result.returncode})' if result is not None
+                               else ' (timeout)'))
+                        # Preconditioning can fail on exotic codecs / filter builds
+                        # (or be slow); retry once with a plain copy so a filter
+                        # error never costs us the whole transcript.
+                        if _precondition:
+                            log.log_stage('AUDIO',
+                                'Preconditioned extract failed — retrying without filters')
+                            try:
+                                subprocess.run([
+                                    'ffmpeg', '-y', '-i', video_path,
+                                    '-vn', '-ac', '1', '-ar', '16000',
+                                    '-c:a', 'pcm_s16le', audio_path,
+                                ], capture_output=True, timeout=max(600, _dur_s + 120))
+                            except subprocess.TimeoutExpired:
+                                log.log_error('AUDIO', 'Plain extraction also timed out')
+                        if not os.path.exists(audio_path):
+                            return {'speech_active': {}, 'segments': [], 'language': ''}
 
             audio_size = os.path.getsize(audio_path)
             log.log_stage('AUDIO', f'Audio extracted: {audio_size/1048576:.1f} MB')
