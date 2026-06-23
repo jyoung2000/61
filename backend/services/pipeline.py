@@ -3294,6 +3294,20 @@ async def _run_analysis_inner(job_id: str):
             f"Extracted {frames_so_far} frames so far{size_note}...",
         )
 
+    async def _audio_progress(fraction: float):
+        # Audio extraction runs CONCURRENTLY with frame extraction and is the
+        # long pole on long videos (afftdn/loudnorm are CPU-bound). GPU frame
+        # extraction finishes first, so without this the UI froze on the last
+        # "Extracted N frames" message while ffmpeg ground on — looking stuck
+        # at the next step (faces) with no VRAM in use. Reporting live audio
+        # progress keeps the message accurate and resets the stuck-timer.
+        f = max(0.0, min(1.0, fraction))
+        pct = 8 + int(f * 6)  # same 8-14% band as frames
+        await _update_progress(
+            job_id, JobStatus.EXTRACTING_FRAMES, pct,
+            f"Preconditioning audio for transcription… ({int(f * 100)}%)",
+        )
+
     # ── Re-analyze cache: if frames + audio already exist on disk AND
     #    the source SHA-256 matches what's recorded on the job, skip
     #    the (expensive) re-extract. Saves 30–60% of total wall time
@@ -3352,6 +3366,8 @@ async def _run_analysis_inner(job_id: str):
                             video_path, audio_path,
                             cancel_check=cancel_check,
                             precondition=bool(getattr(settings, "WHISPER_AUDIO_PRECONDITION", True)),
+                            video_duration=metadata["duration"],
+                            progress_callback=_audio_progress,
                         ),
                     ),
                     timeout=_EXTRACTION_TIMEOUT,

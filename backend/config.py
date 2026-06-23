@@ -98,6 +98,16 @@ class Settings(BaseSettings):
     # mixed / quiet / noisy source material — this is the single
     # biggest reason Whisper drops faint speech.
     WHISPER_AUDIO_PRECONDITION: bool = True
+    # The afftdn (FFT spectral denoiser) step of the preconditioning chain is
+    # CPU-bound at only a few × realtime — on a 2 h track it alone adds ~15-20
+    # min to the "frame+audio extraction" stage. Because fast GPU frame
+    # extraction finishes long before it, the run LOOKS stuck at the next step
+    # (faces) with no VRAM in use while ffmpeg grinds the audio. highpass +
+    # single-pass loudnorm are far cheaper and carry most of the coverage win,
+    # so on long videos we drop ONLY afftdn. Skip afftdn when the track exceeds
+    # this many minutes; 0 disables the cap (always denoise). No effect when
+    # WHISPER_AUDIO_PRECONDITION is off.
+    WHISPER_PRECONDITION_DENOISE_MAX_MIN: int = 45
     # Silero VAD onset sensitivity. 0.15 (faster-whisper default) is
     # conservative and drops whispered / soft speech on realistic
     # content. 0.10 matches silero's published default and catches the

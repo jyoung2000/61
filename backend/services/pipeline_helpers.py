@@ -30,6 +30,42 @@ from contextlib import asynccontextmanager
 logger = logging.getLogger(__name__)
 
 
+# ── Audio preconditioning filter chain (duration-aware) ──────────
+#
+# Whisper transcript coverage improves when the audio is pre-conditioned
+# before ASR: highpass kills rumble, ``afftdn`` (FFT spectral denoise) pulls
+# quiet speech out of constant backgrounds, and ``loudnorm`` lifts off-mic
+# speech into Whisper's sensitive band. But ``afftdn`` is CPU-bound at only a
+# few × realtime — on a 2 h track it alone adds ~15-20 min to the
+# "frame+audio extraction" stage. Since fast GPU frame extraction finishes
+# long before it, the pipeline looks "stuck at faces" (the next step can't
+# start until audio is done) with no VRAM in use. highpass + single-pass
+# loudnorm are far cheaper and carry most of the coverage benefit, so on long
+# videos we drop ONLY ``afftdn`` and keep the rest.
+
+def build_precondition_filters(
+    precondition: bool,
+    duration_sec: float,
+    denoise_max_min: float = 45.0,
+) -> "str | None":
+    """Return the ffmpeg ``-af`` chain for audio preconditioning, or ``None``.
+
+    ``None`` means "no ``-af`` filter" (plain extraction). When ``precondition``
+    is on this always applies ``highpass`` + ``loudnorm``; the expensive
+    ``afftdn`` FFT denoiser is included only when the track is at/under
+    ``denoise_max_min`` minutes (``denoise_max_min <= 0`` disables that cap,
+    i.e. always denoise).
+    """
+    if not precondition:
+        return None
+    filters = ["highpass=f=80"]
+    dur_min = (duration_sec or 0.0) / 60.0
+    if denoise_max_min <= 0 or dur_min <= denoise_max_min:
+        filters.append("afftdn=nf=-25")
+    filters.append("loudnorm=I=-18:LRA=11:TP=-1.5")
+    return ",".join(filters)
+
+
 # ── Per-job stage-timing accumulator ────────────────────────────
 #
 # Keyed by job_id so concurrent analyses don't clobber each other;

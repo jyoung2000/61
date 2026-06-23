@@ -117,6 +117,55 @@ async def _run_subprocess_cancellable(
         raise
 
 
+async def _run_subprocess_with_file_progress(
+    cmd: list[str],
+    output_path: str,
+    expected_bytes: int,
+    cancel_check: Optional[Callable] = None,
+    progress_callback: Optional[Callable] = None,
+    poll_interval: float = 3.0,
+) -> tuple[int, bytes]:
+    """Like :func:`_run_subprocess_cancellable`, but reports progress by
+    polling the size of the growing output file against ``expected_bytes``.
+
+    ffmpeg streams the WAV to disk as it processes, so output size is a cheap,
+    dependency-free progress signal for the long audio-preconditioning pass —
+    the same approach :func:`_extract_with_strategy` uses by counting frames.
+    Lets the UI show live "Preconditioning audio… N%" instead of freezing on
+    the last frame-extraction message while afftdn/loudnorm grind on CPU.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    comm_task = asyncio.ensure_future(proc.communicate())
+    try:
+        while not comm_task.done():
+            await asyncio.sleep(poll_interval)
+            if not comm_task.done() and cancel_check:
+                cancel_check()  # raises CancelledError if cancelled
+            if progress_callback and expected_bytes > 0:
+                try:
+                    cur = os.path.getsize(output_path) if os.path.exists(output_path) else 0
+                    # Cap at 0.99 — the final byte/header flush lands when the
+                    # process exits and we then report 1.0 explicitly.
+                    frac = max(0.0, min(0.99, cur / expected_bytes))
+                    await progress_callback(frac)
+                except Exception:
+                    pass
+        _, stderr = comm_task.result()
+        return proc.returncode, stderr
+    except BaseException:
+        proc.terminate()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            proc.kill()
+        comm_task.cancel()
+        raise
+
+
 async def get_video_metadata(video_path: str) -> dict:
     """Extract video metadata using FFprobe."""
     cmd = [
@@ -954,6 +1003,8 @@ async def extract_audio(
     cancel_check: Optional[Callable] = None,
     *,
     precondition: bool = False,
+    video_duration: float = 0.0,
+    progress_callback: Optional[Callable] = None,
 ) -> str:
     """Extract audio track from video as WAV for Whisper.
 
@@ -989,8 +1040,20 @@ async def extract_audio(
         "-vn",
     ]
     if precondition:
-        af_chain = "highpass=f=80,afftdn=nf=-25,loudnorm=I=-18:LRA=11:TP=-1.5"
-        cmd.extend(["-af", af_chain])
+        from backend.services.pipeline_helpers import build_precondition_filters
+        denoise_max_min = float(getattr(
+            settings, "WHISPER_PRECONDITION_DENOISE_MAX_MIN", 45) or 0)
+        af_chain = build_precondition_filters(
+            True, video_duration, denoise_max_min)
+        if af_chain:
+            cmd.extend(["-af", af_chain])
+        if "afftdn" not in (af_chain or "") and video_duration:
+            logger.info(
+                "Long audio (%.1f min > %.0f min cap): skipping the afftdn FFT "
+                "denoise to avoid a CPU-bound preconditioning stall — keeping "
+                "highpass + loudnorm (most of the coverage benefit)",
+                video_duration / 60.0, denoise_max_min,
+            )
     cmd.extend([
         "-acodec", "pcm_s16le",
         "-ar", "16000", "-ac", "1",
@@ -1000,7 +1063,15 @@ async def extract_audio(
         "FFmpeg audio extraction command (precondition=%s): %s",
         precondition, " ".join(cmd),
     )
-    returncode, stderr = await _run_subprocess_cancellable(cmd, cancel_check)
+    # 16 kHz mono pcm_s16le → 2 bytes/sample; +44 B WAV header. Used to turn
+    # the growing output file size into a live progress signal.
+    expected_bytes = (int((video_duration or 0) * 16000 * 2) + 44
+                      if (video_duration and progress_callback) else 0)
+    if progress_callback and expected_bytes > 0:
+        returncode, stderr = await _run_subprocess_with_file_progress(
+            cmd, output_path, expected_bytes, cancel_check, progress_callback)
+    else:
+        returncode, stderr = await _run_subprocess_cancellable(cmd, cancel_check)
     if returncode != 0:
         # Preconditioning can fail on unusual container layouts / corrupt
         # audio streams. Retry once without filters so the analysis can
@@ -1030,5 +1101,10 @@ async def extract_audio(
                 returncode, video_path, input_mb, output_path, free_mb, error_msg,
             )
             raise RuntimeError(f"Audio extraction failed:\n{error_msg}")
+    if progress_callback:
+        try:
+            await progress_callback(1.0)
+        except Exception:
+            pass
     logger.info("Audio extraction complete: %s", output_path)
     return output_path

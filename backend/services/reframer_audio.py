@@ -555,8 +555,16 @@ class AudioIntelligence:
                         f' (preconditioning {"on" if _precondition else "off"})...')
                     _extract_cmd = ['ffmpeg', '-y', '-i', video_path, '-vn']
                     if _precondition:
-                        _extract_cmd += ['-af',
-                            'highpass=f=80,afftdn=nf=-25,loudnorm=I=-18:LRA=11:TP=-1.5']
+                        # Duration-aware chain — drop the CPU-bound afftdn FFT
+                        # denoise on long tracks (same rule as the main
+                        # frame_extractor path) so this fallback can't stall for
+                        # 15-20 min on a 2 h video.
+                        from backend.services.pipeline_helpers import build_precondition_filters
+                        _af = build_precondition_filters(
+                            True, (duration_ms or 0) / 1000.0,
+                            float(getattr(settings, "WHISPER_PRECONDITION_DENOISE_MAX_MIN", 45) or 0))
+                        if _af:
+                            _extract_cmd += ['-af', _af]
                     _extract_cmd += ['-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le',
                                      audio_path]
                     # Scale the timeout with duration: a fixed 240 s cap

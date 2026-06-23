@@ -1,3 +1,37 @@
+# ClipAI — "Stuck at faces, no VRAM" was the audio-precondition pass: drop afftdn on long videos + live audio progress
+
+A 128-min offline run looked frozen at the face step with the VRAM bar reading
+"No models loaded". The log told the real story: the `frame+audio extraction`
+stage runs frame extraction and audio extraction CONCURRENTLY (`asyncio.gather`)
+and only advances when BOTH finish. GPU frame extraction completed in ~7 min
+(339 frames at 05:03:02), but there was no "Audio extraction complete" line after
+it — the audio-preconditioning ffmpeg pass (`highpass,afftdn=nf=-25,loudnorm`) was
+still grinding. `afftdn` is an FFT spectral denoiser that runs CPU-bound at only a
+few × realtime, so on a 2 h track it alone adds ~15-20 min. The faces/perceiver
+step can't start until the stage finishes, so the run *looks* stuck at faces, and
+"No models loaded" is actually CORRECT — Ollama was unloaded to free the 4 GB GTX
+1650 for Whisper, Whisper hasn't loaded yet, and ffmpeg audio filtering is CPU, not
+a GPU model. Nothing was broken; the audio precondition was just the silent long pole.
+
+Fixes:
+- **Drop only `afftdn` on long videos** (`pipeline_helpers.build_precondition_filters`,
+  used by both `frame_extractor.extract_audio` and the `reframer_audio` fallback).
+  highpass + single-pass loudnorm are far cheaper and carry most of the coverage
+  benefit, so tracks over `WHISPER_PRECONDITION_DENOISE_MAX_MIN` minutes (default
+  45; 0 disables the cap) keep `highpass,loudnorm` and skip the expensive denoise.
+  Cuts the 2 h audio pass from ~15-20 min toward ~3-5 min.
+- **Live audio progress** (`extract_audio` now takes `video_duration` +
+  `progress_callback`; `_run_subprocess_with_file_progress` polls the growing WAV
+  size against the expected PCM byte count). The pipeline's `_audio_progress` pushes
+  "Preconditioning audio for transcription… N%", so once GPU frames finish the UI no
+  longer freezes on the last "Extracted N frames" message — it shows the audio pass
+  advancing, which also keeps the stuck-timer reset. Accurate messaging for the
+  phase that previously looked dead.
+
+New unit tests in `tests/test_audio_precondition_chain.py` (added to CI).
+
+---
+
 # ClipAI — Phantom-hallucination removal: TACT confidence gate + unconditional loop dedup (1:1 transcript)
 
 A ~79 %-silent JA source produced a transcript flooded with invented cues that

@@ -73,6 +73,7 @@ jobs:
             tests/test_whisper_native_translate.py \
             tests/test_clip_detection_graceful.py \
             tests/test_phantom_hallucination_filter.py \
+            tests/test_audio_precondition_chain.py \
             backend/tests/test_repetition_and_timeline.py \
             backend/tests/test_translation_fail_loud.py \
             backend/tests/test_engine_checkpoint.py
