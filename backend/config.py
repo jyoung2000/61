@@ -136,6 +136,15 @@ class Settings(BaseSettings):
     WHISPER_GAP_FILL_ENABLED: bool = True
     WHISPER_GAP_FILL_MIN_SEC: float = 1.5
     WHISPER_GAP_FILL_NO_SPEECH_THRESHOLD: float = 0.25
+    # Skip gap-fill entirely when the uncovered gaps exceed this fraction of the
+    # video — i.e. the content is mostly NON-speech (music / silence), where
+    # re-transcribing with VAD off invents far more than it recovers. On a
+    # ~70%-silent anime the gap-fill pass re-transcribed 89 min of a 128-min
+    # video and added 653 mostly-hallucinated cues (repeated run-ons + short
+    # phantoms) that flooded the transcript; the VAD main pass is far more
+    # reliable on such material. Speech-heavy videos (small gap fraction) are
+    # unaffected — they still get gap-fill. 0 disables the cap.
+    WHISPER_GAP_FILL_MAX_FRACTION: float = 0.6
     # Hard ceiling on the duration of any single gap-fill segment. With
     # ``vad_filter=False`` Whisper can collapse a whole OP song / minutes of
     # narration into one run-on cue stamped at a single timestamp. Any
@@ -167,20 +176,27 @@ class Settings(BaseSettings):
     # ── TACT phantom-hallucination filter (confidence-gated) ──
     # Whisper invents short, low-confidence cues over silence / music — the
     # "Don't let", "So nice", "Hmm." fragments (and repeated verbatim run-ons)
-    # seen flooding a ~79%-silent video — that slip past BOTH the exact-match
+    # seen flooding a mostly-silent video — that slip past BOTH the exact-match
     # boilerplate blocklist AND the no_speech_prob>0.7 clamp. The Temporal
     # Audio Coverage (TACT) ledger already classifies a word as
     # ``low_confidence`` below 0.4; this gate feeds that SAME signal back to
     # DROP a cue when its words are OVERWHELMINGLY low-confidence (avg below
-    # ``MAX_AVG_CONF`` and at least ``MIN_LOWCONF_FRAC`` of words under 0.4)
-    # AND Whisper itself doubted the chunk was speech (no_speech_prob at/above
-    # ``MIN_NO_SPEECH``). ALL THREE must hold, so genuine quiet speech —
-    # confident words even at a moderate no_speech_prob — is preserved. Set
-    # WHISPER_PHANTOM_FILTER_ENABLED=False to disable.
+    # ``MAX_AVG_CONF`` and at least ``MIN_LOWCONF_FRAC`` of words under 0.4).
+    # That low-confidence conjunction is the real discriminator — real speech
+    # essentially never has 80%+ of its words below 0.4 confidence, so it is
+    # preserved while the invented cues are dropped.
+    #
+    # ``MIN_NO_SPEECH`` defaults to 0.0 (the no_speech_prob condition is OFF).
+    # It MUST NOT default high: the gap-fill pass only keeps segments with
+    # no_speech_prob below its 0.25 threshold, so requiring a HIGH no_speech_prob
+    # made this gate unable to fire on the gap-fill hallucinations that are the
+    # actual flood (an earlier 0.50 default quarantined only ~4 cues on a video
+    # drowning in them). Raise it only if you want to additionally require
+    # Whisper-self-doubt on top of the confidence signal.
     WHISPER_PHANTOM_FILTER_ENABLED: bool = True
     WHISPER_PHANTOM_MAX_AVG_CONF: float = 0.40
     WHISPER_PHANTOM_MIN_LOWCONF_FRAC: float = 0.80
-    WHISPER_PHANTOM_MIN_NO_SPEECH: float = 0.50
+    WHISPER_PHANTOM_MIN_NO_SPEECH: float = 0.0
     # Auto-upgrade the Whisper model tier when the detected GPU has
     # spare VRAM. Existing logic already jumped ``small → large-v3-turbo``
     # on ≥6 GB cards; this flag extends the ladder so mid-tier GPUs

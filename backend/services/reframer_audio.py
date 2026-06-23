@@ -1125,6 +1125,21 @@ class AudioIntelligence:
             return []
 
         total_gap_sec = sum(e - s for s, e in gaps)
+
+        # Mostly-non-speech guard: when the uncovered gaps dominate the video,
+        # the content is music / silence and re-transcribing it with VAD off
+        # invents far more than it recovers (on a ~70%-silent anime this added
+        # 653 mostly-hallucinated cues). Trust the VAD main pass instead.
+        _max_frac = float(getattr(settings, "WHISPER_GAP_FILL_MAX_FRACTION", 0.6))
+        if _max_frac > 0 and duration_sec > 0 and (total_gap_sec / duration_sec) > _max_frac:
+            log.log_stage('AUDIO',
+                f'Gap-fill: gaps are {total_gap_sec / duration_sec:.0%} of the video '
+                f'(> {_max_frac:.0%} cap) — content is mostly non-speech '
+                '(music/silence). Skipping gap-fill to avoid flooding the '
+                'transcript with hallucinated cues; the VAD main pass is more '
+                'reliable on this material.')
+            return []
+
         log.log_stage('AUDIO',
             f'Gap-fill: re-transcribing {len(gaps)} run(s) '
             f'totalling {total_gap_sec:.1f}s '
@@ -1303,6 +1318,26 @@ class AudioIntelligence:
                     'no_speech_prob': round(no_speech_prob, 3),
                     'source': 'gap_fill',
                 })
+
+        # Drop low-confidence phantom cues the gap-fill pass invents over
+        # silence / music. Gap-fill only keeps segments BELOW its no_speech
+        # threshold, so these phantoms have LOW no_speech_prob and the main
+        # per-segment no_speech clamp can't catch them — the word-confidence
+        # signal is the discriminator. Same gate the main pass uses, with the
+        # no_speech requirement off (min_no_speech=0.0) since it doesn't apply
+        # here. This is what removes the gap-fill flood on quiet/musical content.
+        if bool(getattr(settings, "WHISPER_PHANTOM_FILTER_ENABLED", True)) and out:
+            from backend.services.transcript_dedup import is_low_confidence_phantom
+            _ph_max = float(getattr(settings, "WHISPER_PHANTOM_MAX_AVG_CONF", 0.40))
+            _ph_frac = float(getattr(settings, "WHISPER_PHANTOM_MIN_LOWCONF_FRAC", 0.80))
+            _kept = [s for s in out if not is_low_confidence_phantom(
+                s.get('words') or [], s.get('no_speech_prob', 0.0),
+                max_avg_conf=_ph_max, min_lowconf_frac=_ph_frac, min_no_speech=0.0)]
+            _dropped_ph = len(out) - len(_kept)
+            if _dropped_ph:
+                log.log_stage('AUDIO',
+                    f'Gap-fill: dropped {_dropped_ph} low-confidence phantom cue(s)')
+                out = _kept
 
         # Collapse near-duplicate re-transcriptions (overlapping in time AND
         # similar in text — e.g. the repeated 作戦名オペレーション・メテオ) that the

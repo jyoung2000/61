@@ -132,6 +132,49 @@ New unit tests in `tests/test_audio_precondition_chain.py` (added to CI).
 
 ---
 
+# ClipAI — Phantom flood traced to gap-fill: cap it on mostly-silent video + make the confidence gate actually fire
+
+The latest run's transcript still showed the phantom flood (repeated "Don't let" /
+"So nice" / "Hmm." and verbatim Japanese run-ons, many left untranslated). The log
+pinned the real cause — and why the earlier phantom filter didn't catch it:
+
+- **Gap-fill was the flood.** On this ~70%-silent (128-min) video the gap-fill pass
+  re-transcribed **5326 s (89 min) of "gaps" with VAD off**, adding **653 segments**
+  to a 133-segment main pass — almost all hallucinated cues over music/silence. The
+  untranslated Japanese run-ons in the output were exactly these (FuguMT can't
+  translate looped run-ons, so they shipped in source form).
+- **The confidence gate could never fire on them.** Gap-fill only keeps segments
+  BELOW its `no_speech_threshold` (0.25), so every gap-fill cue has a LOW
+  `no_speech_prob` — but the gate required `no_speech_prob ≥ 0.50`. Result: only
+  ~4 cues quarantined on a video drowning in them. And the gate was only wired into
+  the main loop, never applied to gap-fill output.
+
+Fixes:
+- **`WHISPER_GAP_FILL_MAX_FRACTION` (new, default 0.6):** when uncovered gaps exceed
+  this fraction of the video, the content is mostly non-speech and `_gap_fill_pass`
+  now SKIPS — the VAD main pass is far more reliable there. Speech-heavy videos
+  (small gap fraction, e.g. the Gundam case gap-fill exists for) are unaffected.
+  This alone removes the 653-cue flood here (786 → ~133 segments).
+- **`WHISPER_PHANTOM_MIN_NO_SPEECH` default 0.50 → 0.0:** the low-confidence
+  conjunction (avg < 0.40 AND ≥80% of words < 0.4) is the real discriminator and
+  must not be gated behind a HIGH `no_speech_prob` it will never see on gap-fill /
+  VAD-kept cues. Real speech essentially never has 80%+ of its words below 0.4
+  confidence, so it's preserved.
+- **Confidence gate now applied to gap-fill output** (`_gap_fill_pass`), where the
+  hallucinations actually live, using the same `is_low_confidence_phantom` helper
+  with the no_speech requirement off.
+
+Net: the gap-fill hallucination flood is removed at the source on mostly-silent
+content, and on normal content low-confidence gap-fill phantoms are dropped — so the
+transcript tracks the real (sparse) dialogue ~1:1 and far fewer cues reach
+translation. New regression test in `tests/test_phantom_hallucination_filter.py`.
+
+> Note: this run's audio was extracted before the deploy (old `afftdn` chain, reused
+> on resume), so the 16 kHz-resample/afftdn-skip speedups will only show on a fresh
+> upload.
+
+---
+
 # ClipAI — Phantom-hallucination removal: TACT confidence gate + unconditional loop dedup (1:1 transcript)
 
 A ~79 %-silent JA source produced a transcript flooded with invented cues that

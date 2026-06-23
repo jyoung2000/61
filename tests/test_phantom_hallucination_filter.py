@@ -67,6 +67,17 @@ def test_no_words_is_not_phantom():
     assert is_low_confidence_phantom([], no_speech_prob=0.9) is False
 
 
+def test_gapfill_style_low_no_speech_phantom_caught_when_floor_disabled():
+    # Gap-fill keeps only segments BELOW its no_speech threshold, so its
+    # invented cues have LOW no_speech_prob. With the no_speech floor disabled
+    # (min_no_speech=0.0, the new default) the confidence conjunction still
+    # flags them — this is the flood the old 0.5 floor could never catch.
+    words = [_w("Don't", 0.2), _w("let", 0.18)]
+    assert is_low_confidence_phantom(words, 0.1, min_no_speech=0.0) is True
+    # With the old 0.5 floor the same gap-fill phantom slipped through:
+    assert is_low_confidence_phantom(words, 0.1, min_no_speech=0.5) is False
+
+
 def test_words_without_confidences_is_not_phantom():
     words = [{"word": "x", "start": 0, "end": 1}]
     assert is_low_confidence_phantom(words, no_speech_prob=0.9) is False
