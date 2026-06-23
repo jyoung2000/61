@@ -1,3 +1,35 @@
+# ClipAI — Transcript-tab edits now reach the subtitle elements (and back), even with a translation
+
+Editing a line in the Transcript tab (text, speaker, split/merge, delete, insert)
+didn't change the subtitle elements on the video — and timeline edits didn't always
+land in the transcript either. Root cause: when a translation exists, the tab shows
+the **translated** transcript by default, but every edit endpoint blindly wrote to
+the **source** transcript. The two tracks have *different segmentation* (one source
+cue → several translated cues), so a translated-list index lands on a different
+source cue or out of range — the edit silently hit the wrong line or 404'd, so it
+"didn't take."
+
+Fix — every single-track edit now declares which track it targets, and the backend
+honours it:
+- **`backend/routers/jobs.py`**: new `_resolve_transcript_rows(job, target)` /
+  `_persist_transcript_rows(...)` helpers pick and save the right list. `target=
+  "translated"` edits `translated_transcript` *only when one exists*, else falls
+  back to the source. Wired through PUT (update), DELETE, POST (insert) and
+  bulk-update-speaker; each response echoes the resolved `target`.
+- **`TranscriptViewer.jsx`**: derives `editTarget = (hasTranslation &&
+  !showingOriginal) ? 'translated' : 'original'` and sends it on all five edit
+  calls, so it always edits exactly the track it's displaying.
+- **`VideoEditor.jsx`**: new `transcriptTarget` prop is sent on the forward-sync
+  PUT (timeline → transcript) so element edits hit the displayed track too;
+  reverse-sync already keys `transcriptIndex` off the same track.
+- **`Analysis.jsx`** passes a `transcriptTarget` that flips together with
+  `activeTranscript`; **`ClipSEO.jsx`** passes one mirroring its `stableTranscript`.
+
+Net effect: text/speaker/timing/add/delete stay in lockstep both ways, on the
+original *and* the translated track, on desktop and mobile.
+
+---
+
 # ClipAI — No false "Reconnecting to container…" during analysis: health probe decoupled from Ollama
 
 The connection banner showed "Reconnecting to container…" mid-analysis even though

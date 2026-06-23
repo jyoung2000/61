@@ -2857,6 +2857,7 @@ export default function Analysis() {
               jobId={jobId}
               clipId={clipPreview.id}
               transcript={activeTranscript}
+              transcriptTarget={(hasTranslation && !showOriginalTranscript) ? 'translated' : 'original'}
               onTranscriptUpdated={fetchJob}
               isProcessing={isProcessing}
               onSubjectKeyframes={setEditorSubjectKeyframes}
@@ -2962,6 +2963,7 @@ export default function Analysis() {
               onSettingsChange={setClipSettings}
               jobId={jobId}
               transcript={activeTranscript}
+              transcriptTarget={(hasTranslation && !showOriginalTranscript) ? 'translated' : 'original'}
               onTranscriptUpdated={fetchJob}
               isProcessing={isProcessing}
               onSubjectKeyframes={setEditorSubjectKeyframes}

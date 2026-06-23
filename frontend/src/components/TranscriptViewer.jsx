@@ -88,6 +88,12 @@ function _transcriptBaseName(videoName) {
 
 export default function TranscriptViewer({ transcript, onSeek, jobId, onSpeakerRenamed, onTranscriptUpdated, onSpeakerColorChanged, onSpeakerAdded, speakerColors, timeRange, currentTime, maxHeight, hasTranslation = false, showingOriginal = false, onToggleOriginal = null, videoName = '' }) {
   const { isMobile } = useResponsive();
+  // Which track this viewer is editing. The displayed (translated) subtitles
+  // and the source transcript have DIFFERENT segmentation, so every edit must
+  // tell the backend which list its index refers to — otherwise an edit to the
+  // translated view silently lands on the wrong source cue and never shows up
+  // on the subtitle elements / exports.
+  const editTarget = (hasTranslation && !showingOriginal) ? 'translated' : 'original';
   const scrollContainerRef = useRef(null);
   const activeSegRef = useRef(null);
   const [search, setSearch] = useState('');
@@ -462,7 +468,7 @@ export default function TranscriptViewer({ transcript, onSeek, jobId, onSpeakerR
       const res = await fetch(`/api/jobs/${jobId}/transcript/${editingSegIdx}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: newText }),
+        body: JSON.stringify({ text: newText, target: editTarget }),
       });
       if (res.ok) {
         cancelSegEdit();
@@ -491,7 +497,7 @@ export default function TranscriptViewer({ transcript, onSeek, jobId, onSpeakerR
       const res = await fetch(`/api/jobs/${jobId}/transcript/${originalIdx}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ speaker: newSpeaker }),
+        body: JSON.stringify({ speaker: newSpeaker, target: editTarget }),
       });
       if (res.ok && onTranscriptUpdated) onTranscriptUpdated();
     } catch (err) {
@@ -540,7 +546,7 @@ export default function TranscriptViewer({ transcript, onSeek, jobId, onSpeakerR
       const res = await fetch(`/api/jobs/${jobId}/transcript/bulk-update-speaker`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ segment_indices: [...selectedIndices], speaker: newSpeaker }),
+        body: JSON.stringify({ segment_indices: [...selectedIndices], speaker: newSpeaker, target: editTarget }),
       });
       if (res.ok) {
         clearSelection();
@@ -557,7 +563,7 @@ export default function TranscriptViewer({ transcript, onSeek, jobId, onSpeakerR
   const handleDeleteSegment = async (originalIdx) => {
     if (!jobId) return;
     try {
-      const res = await fetch(`/api/jobs/${jobId}/transcript/${originalIdx}`, { method: 'DELETE' });
+      const res = await fetch(`/api/jobs/${jobId}/transcript/${originalIdx}?target=${editTarget}`, { method: 'DELETE' });
       if (res.ok && onTranscriptUpdated) onTranscriptUpdated();
     } catch (err) {
       console.error('Segment delete failed:', err);
@@ -592,6 +598,7 @@ export default function TranscriptViewer({ transcript, onSeek, jobId, onSpeakerR
           end: parseFloat(insertEnd) || 0,
           text,
           speaker: insertSpeaker || 'Speaker 1',
+          target: editTarget,
         }),
       });
       if (res.ok) {

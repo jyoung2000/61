@@ -50,6 +50,34 @@ async def _require_job_access(job_id: str, user: User):
     raise HTTPException(status_code=404, detail="Job not found")
 
 
+def _resolve_transcript_rows(job, target):
+    """Pick the transcript list a single-track edit should target.
+
+    Editing the displayed TRANSLATED subtitles must hit ``translated_transcript``,
+    not the source: the two tracks have DIFFERENT segmentation (a JA source cue
+    becomes several English cues), so applying a translated-list index to the
+    source list lands on a different cue (or out of range) — which is why
+    transcript-tab edits "didn't take." Returns ``(rows, use_translated)``."""
+    use_translated = (
+        (target or "").strip().lower() == "translated"
+        and bool(getattr(job, "translated_transcript", None))
+    )
+    return (job.translated_transcript if use_translated else job.transcript), use_translated
+
+
+async def _persist_transcript_rows(job_id, job, rows, use_translated):
+    """Persist an edited transcript list to the correct track."""
+    if use_translated:
+        await database.update_job_status(
+            job_id,
+            translated_transcript=[
+                s.model_dump() if hasattr(s, "model_dump") else s for s in rows],
+        )
+    else:
+        job.transcript = rows
+        await database.save_job(job)
+
+
 class SpeakerRenameRequest(BaseModel):
     speaker_names: dict[str, str]  # {"Speaker 1": "Eric"}
 
@@ -772,6 +800,8 @@ async def rename_speakers(job_id: str, req: SpeakerRenameRequest):
 class BulkUpdateSpeakerRequest(BaseModel):
     segment_indices: list[int]
     speaker: str
+    # "translated" edits the translated track (when present), else "original".
+    target: str | None = None
 
 
 @router.put("/jobs/{job_id}/transcript/bulk-update-speaker")
@@ -780,23 +810,24 @@ async def bulk_update_speaker(job_id: str, req: BulkUpdateSpeakerRequest):
     job = await database.load_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    if not job.transcript:
+    rows, use_translated = _resolve_transcript_rows(job, req.target)
+    if not rows:
         raise HTTPException(status_code=404, detail="No transcript")
 
     updated = []
     for idx in req.segment_indices:
-        if idx < 0 or idx >= len(job.transcript):
+        if idx < 0 or idx >= len(rows):
             continue
-        seg = job.transcript[idx]
+        seg = rows[idx]
         if isinstance(seg, dict):
             seg = TranscriptSegment(**seg)
-        seg = seg.model_copy(update={"speaker": req.speaker})
-        job.transcript[idx] = seg
+        rows[idx] = seg.model_copy(update={"speaker": req.speaker})
         updated.append(idx)
 
     if updated:
-        await database.save_job(job)
-    return {"job_id": job_id, "updated_indices": updated, "speaker": req.speaker}
+        await _persist_transcript_rows(job_id, job, rows, use_translated)
+    return {"job_id": job_id, "updated_indices": updated, "speaker": req.speaker,
+            "target": "translated" if use_translated else "original"}
 
 
 class UpdateTranscriptSegmentRequest(BaseModel):
@@ -857,17 +888,20 @@ async def update_transcript_segment(job_id: str, segment_index: int, req: Update
 
 
 @router.delete("/jobs/{job_id}/transcript/{segment_index}")
-async def delete_transcript_segment(job_id: str, segment_index: int):
-    """Delete a single transcript segment."""
+async def delete_transcript_segment(job_id: str, segment_index: int, target: str | None = None):
+    """Delete a single transcript segment (from the translated track when
+    ``target=translated`` and a translation exists, else the source)."""
     job = await database.load_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    if not job.transcript or segment_index < 0 or segment_index >= len(job.transcript):
+    rows, use_translated = _resolve_transcript_rows(job, target)
+    if not rows or segment_index < 0 or segment_index >= len(rows):
         raise HTTPException(status_code=404, detail="Segment not found")
 
-    job.transcript.pop(segment_index)
-    await database.save_job(job)
-    return {"job_id": job_id, "deleted_index": segment_index, "remaining": len(job.transcript)}
+    rows.pop(segment_index)
+    await _persist_transcript_rows(job_id, job, rows, use_translated)
+    return {"job_id": job_id, "deleted_index": segment_index, "remaining": len(rows),
+            "target": "translated" if use_translated else "original"}
 
 
 class InsertTranscriptSegmentRequest(BaseModel):
@@ -875,32 +909,39 @@ class InsertTranscriptSegmentRequest(BaseModel):
     end: float
     text: str
     speaker: str
+    # "translated" inserts into the translated track (when present), else "original".
+    target: str | None = None
 
 
 @router.post("/jobs/{job_id}/transcript")
 async def insert_transcript_segment(job_id: str, req: InsertTranscriptSegmentRequest):
-    """Insert a new transcript segment. It is placed in chronological order."""
+    """Insert a new transcript segment, in chronological order, into the track
+    being edited (translated when ``target=translated`` and present, else source)."""
     job = await database.load_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
     new_seg = TranscriptSegment(start=req.start, end=req.end, text=req.text, speaker=req.speaker)
+    rows, use_translated = _resolve_transcript_rows(job, req.target)
 
-    if not job.transcript:
-        job.transcript = [new_seg]
+    if not rows:
+        rows = [new_seg]
         insert_index = 0
     else:
         # Find insertion point to maintain chronological order
         insert_index = 0
-        for i, seg in enumerate(job.transcript):
+        for i, seg in enumerate(rows):
             s = seg if isinstance(seg, TranscriptSegment) else TranscriptSegment(**seg)
             if s.start > new_seg.start:
                 break
             insert_index = i + 1
-        job.transcript.insert(insert_index, new_seg)
+        rows.insert(insert_index, new_seg)
 
-    await database.save_job(job)
-    return {"job_id": job_id, "inserted_index": insert_index, "segment": new_seg.model_dump()}
+    if use_translated:
+        job.translated_transcript = rows
+    await _persist_transcript_rows(job_id, job, rows, use_translated)
+    return {"job_id": job_id, "inserted_index": insert_index, "segment": new_seg.model_dump(),
+            "target": "translated" if use_translated else "original"}
 
 
 class BulkTranscriptReplaceRequest(BaseModel):

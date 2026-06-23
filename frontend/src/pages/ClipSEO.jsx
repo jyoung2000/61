@@ -1265,6 +1265,7 @@ export default function ClipSEO() {
             jobId={jobId}
             clipId={clipId}
             transcript={stableTranscript}
+            transcriptTarget={job?.translated_transcript?.length ? 'translated' : 'original'}
             onTranscriptUpdated={fetchJob}
             onVideoRef={handleVideoRef}
             renderPlan={renderPlan}

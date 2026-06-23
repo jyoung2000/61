@@ -231,6 +231,12 @@ export default function VideoEditor({
   clipId,
   transcript,
   onTranscriptUpdated,
+  // Which transcript track the ``transcript`` prop is (and that subtitle-element
+  // edits should write back to): "translated" when showing the translated
+  // subtitles (the default), else "original". Must match what was passed as
+  // ``transcript`` so forward-sync edits hit the right list (the two tracks have
+  // different segmentation).
+  transcriptTarget = 'translated',
   // Public share integration. When provided, the export POST is
   // redirected to the token-gated ``/api/share/public/{token}/...``
   // endpoints so share-link recipients can export without signing in.
@@ -849,7 +855,7 @@ export default function VideoEditor({
           const res = await fetch(`/api/jobs/${jobId}/transcript/${upd.segmentIndex}`, {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(upd.body),
+            body: JSON.stringify({ ...upd.body, target: transcriptTarget }),
           });
           if (res.ok) {
             if (upd.body.text != null) {
@@ -866,7 +872,7 @@ export default function VideoEditor({
     return () => {
       if (subtitleSyncTimerRef.current) clearTimeout(subtitleSyncTimerRef.current);
     };
-  }, [timelineStoreItems, jobId, transcript, clipStart, onTranscriptUpdated]);
+  }, [timelineStoreItems, jobId, transcript, clipStart, onTranscriptUpdated, transcriptTarget]);
 
   // Derived: the currently selected segment object (or null)
   const selectedSegment = useMemo(
