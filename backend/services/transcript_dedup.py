@@ -23,6 +23,51 @@ def _is_marker_text(s: str) -> bool:
     return ("♪" in t) or (len(inner.split()) <= 2 and inner.replace(" ", "").isalpha())
 
 
+def is_low_confidence_phantom(
+    words: list,
+    no_speech_prob: float,
+    *,
+    max_avg_conf: float = 0.40,
+    min_lowconf_frac: float = 0.80,
+    min_no_speech: float = 0.50,
+    conf_key: str = "confidence",
+) -> bool:
+    """True when a cue is a low-confidence phantom Whisper hallucination.
+
+    Whisper invents short cues over silence / music — the "Don't let",
+    "So nice", "Hmm." fragments that flood a mostly-silent video — which
+    survive the exact-match boilerplate blocklist and the ``no_speech_prob``
+    > 0.7 clamp (they sit just under it). The Temporal Audio Coverage (TACT)
+    ledger already classifies a *word* as ``low_confidence`` below 0.4; this
+    feeds that SAME signal back to DROP the *cue* when its words are
+    OVERWHELMINGLY low-confidence (average below ``max_avg_conf`` AND at least
+    ``min_lowconf_frac`` of words under 0.4) AND Whisper itself doubted the
+    chunk was speech (``no_speech_prob`` at/above ``min_no_speech``).
+
+    ALL conditions must hold, so genuine quiet speech — which Whisper
+    transcribes with confident words even when ``no_speech_prob`` is moderate
+    — is preserved. Cues with no word-level confidences return ``False``
+    (other filters handle those).
+
+    Schema-flexible: ``words`` may be dicts or objects carrying ``conf_key``.
+    """
+    if not words or no_speech_prob < min_no_speech:
+        return False
+    confs = []
+    for w in words:
+        c = w.get(conf_key) if isinstance(w, dict) else getattr(w, conf_key, None)
+        if c is not None:
+            try:
+                confs.append(float(c))
+            except (TypeError, ValueError):
+                continue
+    if not confs:
+        return False
+    avg_conf = sum(confs) / len(confs)
+    lowconf_frac = sum(1 for c in confs if c < 0.4) / len(confs)
+    return avg_conf < max_avg_conf and lowconf_frac >= min_lowconf_frac
+
+
 def drop_repetition_loops(
     segments: list,
     text_key: str = "text",

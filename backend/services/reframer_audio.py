@@ -758,6 +758,14 @@ class AudioIntelligence:
             # ── TACT: Hallucination detection constants ──
             # Boilerplate phrases live in the module-level
             # _BOILERPLATE_HALLUCINATIONS (multilingual). See _is_boilerplate_hallucination.
+            # The confidence-gated phantom filter (check #4 below) reuses the
+            # ledger's own low-confidence signal to drop invented cues over
+            # silence; resolve its thresholds once here, not per-segment.
+            from backend.services.transcript_dedup import is_low_confidence_phantom
+            _phantom_on = bool(getattr(settings, "WHISPER_PHANTOM_FILTER_ENABLED", True))
+            _phantom_max_avg = float(getattr(settings, "WHISPER_PHANTOM_MAX_AVG_CONF", 0.40))
+            _phantom_min_frac = float(getattr(settings, "WHISPER_PHANTOM_MIN_LOWCONF_FRAC", 0.80))
+            _phantom_min_ns = float(getattr(settings, "WHISPER_PHANTOM_MIN_NO_SPEECH", 0.50))
 
             for seg in segments_iter:
                 start_ms = int(seg.start * 1000)
@@ -765,6 +773,22 @@ class AudioIntelligence:
 
                 text = seg.text.strip()
                 no_speech_prob = getattr(seg, 'no_speech_prob', 0.0) or 0.0
+
+                # Extract word-level timestamps if available. Done BEFORE the
+                # hallucination filter so the TACT confidence gate (check #4)
+                # can read per-word confidences; also consumed downstream.
+                words = []
+                if hasattr(seg, 'words') and seg.words:
+                    for w in seg.words:
+                        word_conf = getattr(w, 'probability', None)
+                        if word_conf is None:
+                            word_conf = getattr(w, 'confidence', 1.0) or 1.0
+                        words.append({
+                            'word': w.word.strip() if hasattr(w, 'word') else str(w).strip(),
+                            'start': round(getattr(w, 'start', seg.start), 3),
+                            'end': round(getattr(w, 'end', seg.end), 3),
+                            'confidence': round(float(word_conf), 3),
+                        })
 
                 # ── TACT: Hallucination filter ──
                 is_hallucination = False
@@ -793,19 +817,22 @@ class AudioIntelligence:
                                     is_hallucination = True
                                     break
 
-                # Extract word-level timestamps if available
-                words = []
-                if hasattr(seg, 'words') and seg.words:
-                    for w in seg.words:
-                        word_conf = getattr(w, 'probability', None)
-                        if word_conf is None:
-                            word_conf = getattr(w, 'confidence', 1.0) or 1.0
-                        words.append({
-                            'word': w.word.strip() if hasattr(w, 'word') else str(w).strip(),
-                            'start': round(getattr(w, 'start', seg.start), 3),
-                            'end': round(getattr(w, 'end', seg.end), 3),
-                            'confidence': round(float(word_conf), 3),
-                        })
+                # 4. TACT confidence gate — the key phantom filter.
+                #    Whisper invents short, low-confidence cues over the long
+                #    silent / musical stretches (this material was ~79% silence)
+                #    that survive every check above: they aren't boilerplate,
+                #    their no_speech_prob sits just under 0.7, and they're too
+                #    short for the in-segment repetition test ("Don't let",
+                #    "So nice", "Hmm."). Reuse the ledger's own low-confidence
+                #    signal to drop them — but only with corroboration, so real
+                #    quiet speech is kept (see is_low_confidence_phantom).
+                if (not is_hallucination and text and words and _phantom_on
+                        and is_low_confidence_phantom(
+                            words, no_speech_prob,
+                            max_avg_conf=_phantom_max_avg,
+                            min_lowconf_frac=_phantom_min_frac,
+                            min_no_speech=_phantom_min_ns)):
+                    is_hallucination = True
 
                 seg_entry = {
                     'start_sec': round(seg.start, 3),
@@ -862,18 +889,30 @@ class AudioIntelligence:
                         # them in temporal order.
                         segments.extend(gap_segments)
                         segments.sort(key=lambda s: s.get('start_sec', 0))
-                        # Drop repetition-loop hallucinations the gap-fill
-                        # pass produces over music / quiet regions (the same
-                        # line emitted dozens of times across the timeline).
-                        _pre_dedup = len(segments)
-                        segments = _drop_repetition_loops(segments)
                         log.log_stage('AUDIO',
                             f'Gap-fill added {len(gap_segments)} segments '
-                            f'(total {_pre_dedup}, {len(segments)} after '
-                            f'repetition-loop filter)')
+                            f'(total {len(segments)})')
                 except Exception as gf_err:
                     log.log_stage('AUDIO',
                         f'Gap-fill pass failed (non-fatal): {gf_err}')
+
+            # ── Drop repetition-loop hallucinations (BOTH passes) ──
+            # Whisper loops over music / quiet regions and re-emits the SAME
+            # line repeatedly, scattered across the timeline — the repeated
+            # verbatim Japanese run-ons (seen 10-11× each) and the short English
+            # fragments on the mostly-silent material. Run UNCONDITIONALLY, not
+            # just when gap-fill produced output: the MAIN pass loops too, and
+            # on a ~79%-silent video gap-fill may add nothing yet the primary
+            # transcript still carries the repeats. Order-preserving; keeps the
+            # earliest occurrence (bracketed markers and a few short
+            # interjections are exempt — see drop_repetition_loops).
+            if segments:
+                _pre_dedup = len(segments)
+                segments = _drop_repetition_loops(segments)
+                if len(segments) != _pre_dedup:
+                    log.log_stage('AUDIO',
+                        f'Repetition-loop filter: {_pre_dedup} → {len(segments)} '
+                        f'segments ({_pre_dedup - len(segments)} loop repeats dropped)')
 
             # ── Clamp timestamp drift to the real audio end ──
             # faster-whisper drifts/loops on repetitive music and can stamp cues

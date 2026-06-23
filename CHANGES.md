@@ -1,3 +1,49 @@
+# ClipAI — Phantom-hallucination removal: TACT confidence gate + unconditional loop dedup (1:1 transcript)
+
+A ~79 %-silent JA source produced a transcript flooded with invented cues that
+translated through unchanged, so the output read nothing like 1:1: short English
+phantoms over silence — "Don't let" (13×), "So nice" (12×), "Hmm." (11×) — plus
+long Japanese run-ons re-emitted VERBATIM 10–11× each (decoder loops over the
+quiet stretches). Counting cue bodies in the shipped transcript: **551 of 1806
+cues (30 %) were scattered loop-repeats**, and the short English ones weren't
+repeats of real dialogue at all — they were silence phantoms.
+
+**Is TACT being used?** Yes — the Temporal Audio Coverage ledger (20 ms bins:
+covered_speech / low_confidence / covered_silence / quarantined …) is built every
+run and logged ("TACT coverage: … covered_silence 79.2 %, low_confidence 6.6 %,
+covered_speech 14.2 %"), and it drives the reframer. **But until now it was a
+reporting/perception layer only** — its silence/low-confidence classification was
+never fed back to DROP transcript cues. The cues handed to translation were
+filtered solely by the exact-match boilerplate blocklist, a `no_speech_prob>0.7`
+clamp, and an in-segment repetition test — none of which catch a short,
+low-confidence, repeated fragment sitting in silence. That gap is the phantom flood.
+
+Fix — make TACT actually filter the transcript:
+- **Confidence-gated phantom filter (new `transcript_dedup.is_low_confidence_phantom`,
+  wired as hallucination check #4 in `reframer_audio.transcribe`).** Reuses the
+  ledger's OWN low-confidence signal (word conf < 0.4): a cue is dropped when its
+  words are overwhelmingly low-confidence (avg < `WHISPER_PHANTOM_MAX_AVG_CONF`
+  0.40 AND ≥ `WHISPER_PHANTOM_MIN_LOWCONF_FRAC` 0.80 of words under 0.4) **AND**
+  Whisper itself doubted there was speech (`no_speech_prob` ≥
+  `WHISPER_PHANTOM_MIN_NO_SPEECH` 0.50). All three must hold, so genuine quiet
+  speech — confident words even at a moderate no_speech_prob — is preserved.
+  Gated by `WHISPER_PHANTOM_FILTER_ENABLED` (default on).
+- **Repetition-loop dedup now runs UNCONDITIONALLY** (was only invoked when the
+  gap-fill pass produced segments). The MAIN pass loops too, and on a mostly-silent
+  video gap-fill may add nothing yet the primary transcript still carries the
+  verbatim repeats. `drop_repetition_loops` keeps the earliest occurrence (one for
+  long lines, ≤3 for short interjections; bracketed `[♪ music ♪]` markers exempt).
+  Verified on the real transcript: 1806 → 1255 cues (551 loop-repeats removed),
+  each long run-on collapsed 11→1.
+
+Net: the long Japanese lines appear once each, the short English silence-phantoms
+are removed before they're ever translated (also saving translation budget), and
+the transcript tracks the audio 1:1. New unit tests in
+`tests/test_phantom_hallucination_filter.py` (+ `backend/tests/test_repetition_and_timeline.py`
+added to CI) pin both behaviours.
+
+---
+
 # ClipAI — Offline translation completeness: per-cue plain-text LLM cleanup of NMT leftovers
 
 A 2 h JA→EN run still shipped ~25 % of cues in Japanese. The logs pinned it
@@ -19,10 +65,10 @@ status, and is fully fail-soft (any failure keeps the existing cue). New knobs:
 `TRANSLATION_LLM_CLEANUP_MAX_CUES` (default 500; 0 disables),
 `TRANSLATION_LLM_CLEANUP_BUDGET_S` (default 1200).
 
-Still open (separate ASR-quality issue, not translation): on this ~79 %-silent
-source Whisper also emits short phantom repeats ("Don't let", "So nice") that
-translate through unchanged — the hallucination blocklist catches fixed phrases
-but not these.
+Separate ASR-quality issue (not translation): on this ~79 %-silent source Whisper
+also emits short phantom repeats ("Don't let", "So nice") that translate through
+unchanged — the hallucination blocklist catches fixed phrases but not these.
+**Resolved by the TACT confidence gate + unconditional loop dedup — see the entry above.**
 
 ---
 

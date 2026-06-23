@@ -154,6 +154,23 @@ class Settings(BaseSettings):
     # Temperature fallback ladder — on a degenerate/low-confidence segment
     # Whisper retries at the next temperature instead of emitting the loop.
     WHISPER_TEMPERATURE_FALLBACK: tuple = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
+    # ── TACT phantom-hallucination filter (confidence-gated) ──
+    # Whisper invents short, low-confidence cues over silence / music — the
+    # "Don't let", "So nice", "Hmm." fragments (and repeated verbatim run-ons)
+    # seen flooding a ~79%-silent video — that slip past BOTH the exact-match
+    # boilerplate blocklist AND the no_speech_prob>0.7 clamp. The Temporal
+    # Audio Coverage (TACT) ledger already classifies a word as
+    # ``low_confidence`` below 0.4; this gate feeds that SAME signal back to
+    # DROP a cue when its words are OVERWHELMINGLY low-confidence (avg below
+    # ``MAX_AVG_CONF`` and at least ``MIN_LOWCONF_FRAC`` of words under 0.4)
+    # AND Whisper itself doubted the chunk was speech (no_speech_prob at/above
+    # ``MIN_NO_SPEECH``). ALL THREE must hold, so genuine quiet speech —
+    # confident words even at a moderate no_speech_prob — is preserved. Set
+    # WHISPER_PHANTOM_FILTER_ENABLED=False to disable.
+    WHISPER_PHANTOM_FILTER_ENABLED: bool = True
+    WHISPER_PHANTOM_MAX_AVG_CONF: float = 0.40
+    WHISPER_PHANTOM_MIN_LOWCONF_FRAC: float = 0.80
+    WHISPER_PHANTOM_MIN_NO_SPEECH: float = 0.50
     # Auto-upgrade the Whisper model tier when the detected GPU has
     # spare VRAM. Existing logic already jumped ``small → large-v3-turbo``
     # on ≥6 GB cards; this flag extends the ladder so mid-tier GPUs
