@@ -162,6 +162,44 @@ def test_cache_probe_miss_when_too_few_frames(tmp_path):
     assert result is None
 
 
+# ── Reframer sample-rate cap (face-detection cost on long videos) ─
+
+
+def test_sample_fps_caps_long_video():
+    """A 128-min video must respect the sample cap, not the fps floor.
+
+    Regression: ``max(fps_floor, …)`` let the 1.2 fps floor override the 1800
+    cap → ~9 200 samples → face detection ran ~5x longer than intended.
+    """
+    from backend.services.pipeline_helpers import resolve_sample_fps
+    fps = resolve_sample_fps(7677, max_samples=1800, fps_ceiling=5.0, fps_floor=1.2)
+    assert fps * 7677 <= 1900  # ~1800, not ~9200
+
+
+def test_sample_fps_short_video_uses_ceiling():
+    from backend.services.pipeline_helpers import resolve_sample_fps
+    assert resolve_sample_fps(300, max_samples=1800, fps_ceiling=5.0, fps_floor=1.2) == 5.0
+
+
+def test_sample_fps_medium_video_unchanged_by_floor():
+    # ~24.5 min: the floor still applies (stays within the cap) — no regression.
+    from backend.services.pipeline_helpers import resolve_sample_fps
+    fps = resolve_sample_fps(1470, max_samples=1800, fps_ceiling=5.0, fps_floor=1.2)
+    assert 1700 <= fps * 1470 <= 1850
+
+
+def test_sample_fps_multi_hour_keeps_abs_floor():
+    from backend.services.pipeline_helpers import resolve_sample_fps
+    fps = resolve_sample_fps(14400, max_samples=1800, fps_ceiling=5.0,
+                             fps_floor=1.2, abs_floor=0.2)
+    assert fps == 0.2  # cap would give 0.125; abs floor keeps coverage, still bounded
+
+
+def test_sample_fps_zero_duration_falls_back_to_ceiling():
+    from backend.services.pipeline_helpers import resolve_sample_fps
+    assert resolve_sample_fps(0, max_samples=1800, fps_ceiling=5.0, fps_floor=1.2) == 5.0
+
+
 # ── Stage timings + warnings accumulation ───────────────────────
 
 

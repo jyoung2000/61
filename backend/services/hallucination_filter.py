@@ -21,6 +21,12 @@ BOILERPLATE_HALLUCINATIONS = frozenset({
     'bye bye', 'thanks for listening', 'music playing',
     'music', 'applause', 'subtitles by', 'captions by',
     'thank you', 'thanks', 'the end',
+    # "see you next time" family — a very common Whisper end-of-segment phantom
+    # (emitted directly in English even on JA audio); seen repeating across a
+    # mostly-silent video. Standalone-only (exact cue match), so real dialogue
+    # is unaffected.
+    'see you next time', "i'll see you next time", 'see you next week',
+    'see you again', 'see you',
     # Japanese — the most common Whisper-JA hallucinations over music/credits.
     'ご視聴ありがとうございました', 'ご視聴ありがとうございます',
     'ご視聴いただきありがとうございました',
@@ -29,6 +35,10 @@ BOILERPLATE_HALLUCINATIONS = frozenset({
     'チャンネル登録お願いします', 'チャンネル登録をお願いします',
     'ありがとうございました', 'おやすみなさい', '次回もお楽しみに',
     'バイバイ',
+    # JA "the end" / "see you next time" phantoms (the bare 終わり/おわり cue
+    # floods credits + silent stretches). Exact-cue match only.
+    'おわり', '終わり', 'おしまい', 'また次回', 'また来週', 'また来年',
+    'また会いましょう',
     # Korean
     '시청해주셔서 감사합니다', '구독과 좋아요', '감사합니다',
     # Chinese

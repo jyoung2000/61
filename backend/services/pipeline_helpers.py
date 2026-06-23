@@ -128,6 +128,33 @@ def cpu_fallback_stages(compute_summary: dict) -> list:
     return out
 
 
+def resolve_sample_fps(
+    video_duration_s: float,
+    *,
+    max_samples: int,
+    fps_ceiling: float,
+    fps_floor: float,
+    abs_floor: float = 0.2,
+) -> float:
+    """Pick the reframer's per-frame sample rate (the dominant analysis cost).
+
+    Cap-respecting: never above ``fps_ceiling``, and never more than
+    ``max_samples`` frames total. The comfort floor (``fps_floor``) may only
+    RAISE the rate for shorter videos — it must never override the sample cap on
+    long ones. The old ``max(fps_floor, …)`` did exactly that, so a 128-min
+    video sampled at the 1.2 fps floor (~9 200 frames, 5x the 1 800 cap) and
+    face/motion detection ran ~5x longer than intended. ``abs_floor`` is a hard
+    minimum so a multi-hour video still gets usable temporal coverage when the
+    cap alone would drop below it.
+    """
+    if video_duration_s <= 0:
+        return fps_ceiling
+    fps = min(fps_ceiling, max_samples / video_duration_s)
+    if fps_floor * video_duration_s <= max_samples:
+        fps = max(fps, fps_floor)
+    return max(fps, abs_floor)
+
+
 def _drain_pipeline_telemetry(job_id: str) -> tuple[dict[str, float], list[str]]:
     """Pop the accumulated timings + warnings for ``job_id``.
 

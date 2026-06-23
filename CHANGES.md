@@ -1,3 +1,34 @@
+# ClipAI — Long videos: face detection no longer 5x over-samples + drop "see you next time"/"おわり" hallucinations
+
+Two issues from a 128-min offline run (GTX 1650):
+
+**Slowness — face/motion detection sampled 5x more than its own cap.** The log
+showed `Reframer sample rate: 1.20 fps (128.0 min video, ~9212 samples,
+cap=1800)` and `reframer_analysis finished in 3352.0s` (~56 min). The sample
+cap (1800) was being overridden by the min-fps *floor* (1.2): for any video
+longer than ~25 min, `max(floor, …)` sampled at the floor instead of honoring
+the cap, so a 2 h video analysed ~9 200 frames instead of 1 800 — ~5x the
+intended work. Fixed: `resolve_sample_fps` (extracted + unit-tested) now treats
+the floor as a comfort minimum that only applies while it stays within the cap;
+long videos honor the cap (128 min → 1 800 samples → ~12 min instead of ~56).
+A configurable `REFRAMER_ABS_MIN_SAMPLE_FPS` (default 0.2) keeps multi-hour
+videos from under-sampling.
+
+**Transcript/translation quality — "see you next time" / "おわり" hallucinations.**
+The video is ~79% silence, and Whisper hallucinated phantom end-of-segment
+phrases over the quiet stretches — "See you next time", "I'll see you next
+time", and the bare Japanese 終わり/おわり ("the end") — which then dominated the
+translated subtitles. Those weren't in the multilingual hallucination blocklist;
+added them (and the JA また次回/また来週 family). Exact-cue match only, so real
+dialogue (e.g. おわりにしましょう) is untouched.
+
+NOTE: this run ALSO had the offline NMT (FuguMT) leave ~18% of cues
+untranslated (long un-punctuated run-on lines) after the local LLM (qwen2.5:3b)
+hit its 90 s per-chunk timeout — that half-Japanese output is a separate,
+model-capability issue still being addressed.
+
+---
+
 # ClipAI — Transcription no longer times out on long videos (the real "translation didn't run" cause)
 
 A 2 h video came back with `0 transcript segments`, an empty summary ("no

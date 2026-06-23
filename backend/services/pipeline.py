@@ -776,6 +776,7 @@ from backend.services.pipeline_helpers import (  # noqa: E402
     _record_pipeline_warning,
     _drain_pipeline_telemetry,
     is_synthetic_scene,
+    resolve_sample_fps,
 )
 from backend.services import pipeline_checkpoint  # noqa: E402
 
@@ -3333,9 +3334,16 @@ async def _run_analysis_inner(job_id: str):
     _max_samples = max(300, int(getattr(settings, "REFRAMER_MAX_SAMPLES", 1800)))
     _fps_ceiling = float(getattr(settings, "REFRAMER_SAMPLE_FPS", 5.0))
     _fps_floor = float(getattr(settings, "REFRAMER_MIN_SAMPLE_FPS", 1.2))
-    _sample_fps = _fps_ceiling
-    if video_duration > 0:
-        _sample_fps = max(_fps_floor, min(_fps_ceiling, _max_samples / video_duration))
+    # Cap-respecting sample rate — see resolve_sample_fps. The comfort floor
+    # only raises the rate for shorter videos; it never blows past _max_samples
+    # on long ones (which used to make face detection ~5x slower than intended).
+    _sample_fps = resolve_sample_fps(
+        video_duration,
+        max_samples=_max_samples,
+        fps_ceiling=_fps_ceiling,
+        fps_floor=_fps_floor,
+        abs_floor=float(getattr(settings, "REFRAMER_ABS_MIN_SAMPLE_FPS", 0.2)),
+    )
     logger.info(
         "[%s] Reframer sample rate: %.2f fps (%.1f min video, ~%d samples, cap=%d)",
         job_id, _sample_fps, video_duration / 60.0,
