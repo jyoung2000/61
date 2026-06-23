@@ -23,7 +23,12 @@ export default function useConnectionStatus() {
   const ping = useCallback(async () => {
     const start = Date.now();
     try {
-      const res = await fetch('/api/providers/status', {
+      // Trivial liveness probe — must NOT depend on provider/Ollama health.
+      // Pinging /api/providers/status (a 5 s Ollama call) made this banner show
+      // "Reconnecting to container…" during offline processing even though the
+      // container was reachable and the pipeline was working. /api/health does
+      // no provider work and returns instantly.
+      const res = await fetch('/api/health', {
         signal: AbortSignal.timeout(5000),
       });
       if (res.ok) {

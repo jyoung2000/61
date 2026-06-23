@@ -1,3 +1,27 @@
+# ClipAI — No false "Reconnecting to container…" during analysis: health probe decoupled from Ollama
+
+The connection banner showed "Reconnecting to container…" mid-analysis even though
+the container was reachable and the pipeline was progressing. `useConnectionStatus`
+pings every 8 s with a 5 s `AbortSignal` and flips to "reconnecting" after 2
+consecutive failures — but it pinged `GET /api/providers/status`, which `await`s a
+5 s Ollama `/api/tags` call. During offline processing Ollama is busy serving the
+pipeline, so that call is slow; the frontend's 5 s timeout cancels the request
+*before its 30 s cache is populated*, so the next poll misses the cache and times
+out too → two consecutive failures → false banner.
+
+Fix: a dependency-free liveness probe.
+- **`GET /api/health`** (new, `main.py`): returns `{"status":"ok"}` instantly — no
+  provider/Ollama/disk work. It only reflects whether the web server's event loop
+  is responsive, which is what "is the container reachable" actually means.
+- **`useConnectionStatus`** now pings `/api/health` instead of
+  `/api/providers/status`. Provider/Ollama health is a separate concern (still shown
+  in the models/diagnostics panels).
+
+(The heavy pipeline work is offloaded to threads, so the event loop stays responsive
+and the trivial probe returns well under the 5 s timeout even mid-export.)
+
+---
+
 # ClipAI — Preview player loads during analysis (no more blocking browser-preview transcode)
 
 The in-page preview player wouldn't load while an offline job was processing. Root

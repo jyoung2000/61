@@ -1046,6 +1046,22 @@ if _symlinked:
     logger.info("Symlinked %d system fonts into /data/fonts for FFmpeg fontsdir", _symlinked)
 
 
+@app.get("/api/health")
+async def api_health():
+    """Trivial liveness probe for the frontend connection-status banner.
+
+    Deliberately does NO provider / Ollama / disk work — it only confirms the
+    web server's event loop is responsive. The banner must reflect "is the
+    container reachable", which is independent of whether Ollama is busy serving
+    the offline pipeline. Previously the banner pinged ``/api/providers/status``,
+    which awaits a 5 s Ollama ``/api/tags`` call; during offline processing that
+    call is slow, the frontend's own 5 s timeout cancels the request before its
+    result is cached, the next poll misses the cache and times out too, and after
+    two consecutive failures the UI falsely showed "Reconnecting to container…"
+    even though the pipeline was working fine."""
+    return {"status": "ok"}
+
+
 # Background browser-preview generation: strong refs so tasks aren't GC'd, plus
 # an in-flight set so concurrent Range requests don't schedule duplicate work.
 _PREVIEW_BG_TASKS: set = set()
