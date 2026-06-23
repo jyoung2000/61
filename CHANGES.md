@@ -132,6 +132,42 @@ New unit tests in `tests/test_audio_precondition_chain.py` (added to CI).
 
 ---
 
+# ClipAI — Translation QA on every path: no subtitle is left in the source language
+
+Subtitles were still shipping with source-language cues. The cause was a hole in
+where the cleanup ran, not a missing capability:
+
+- The per-cue re-translate QA (`_llm_cleanup_untranslated`) ran **only on the
+  offline-NMT path**. The latest run took the **editorial-LLM path**
+  (`fraction_untranslated < 0.20` → returned early), so it shipped the residual
+  source-language cues *without* cleanup. The Whisper-native path had the same hole.
+- The final purity gate only **rejected** a wholesale (>20%) half-source draft
+  (keeping the labelled source transcript) — it never **fixed** the ≤20% stragglers.
+
+Why the earlier steps don't cover this:
+- **Transcript step** dedups/cleans the *source* transcript (repetition-loop +
+  phantom filters). It doesn't translate, so it can't guarantee target-language.
+- **Subtitle polishing** (MT post-edit) only *refines already-translated* text and
+  is explicitly forbidden from reintroducing the source language — it assumes its
+  input is already translated, so it doesn't re-translate source-language cues.
+
+Fix — the QA now runs on the FINAL transcript and on every engine path:
+- `_llm_cleanup_untranslated` is now invoked on **all three** `translate_subtitles`
+  paths (LLM / Whisper-native / NMT), not just NMT — so no engine can ship
+  source-language stragglers.
+- A **final QA pass** runs on the polished, deduped, resegmented transcript right
+  before the purity gate: it detects any cue still in the source script and
+  re-translates it one-by-one with the LLM (idempotent + fail-soft; a clean track
+  is a no-op). The existing purity gate remains the backstop.
+
+Combined with the gap-fill flood fix (below — which removes the hallucinated
+run-ons at the source, before they ever reach translation), the persisted track is
+fully target-language with no repeated/hallucinated lines. (Offline runs without
+any LLM are unchanged: the cleanup no-ops without an orchestrator and the purity
+gate still guards.)
+
+---
+
 # ClipAI — Phantom flood traced to gap-fill: cap it on mostly-silent video + make the confidence gate actually fire
 
 The latest run's transcript still showed the phantom flood (repeated "Don't let" /

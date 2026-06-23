@@ -481,6 +481,11 @@ async def translate_subtitles(segments, source_lang, target_lang, *, video_path=
     endpoint so they can't drift. When ``job_id`` is given, Whisper VRAM is
     released after a Whisper pass and before a local-NMT load (the low-VRAM
     ordering the 4 GB-GPU pipeline needs).
+
+    EVERY path (LLM / Whisper-native / NMT) runs the per-cue
+    ``_llm_cleanup_untranslated`` QA before returning, so no engine can ship a
+    track with source-language stragglers (the cleanup previously ran only on
+    the NMT path, which let the LLM/Whisper paths leak source-language cues).
     """
     from backend.services.translator import (
         translate_segments_with_fallback, _resolve_translation_engine,
@@ -533,6 +538,13 @@ async def translate_subtitles(segments, source_lang, target_lang, *, video_path=
             if _llm:
                 _resid = fraction_untranslated(_llm, target_lang)
                 if _resid < 0.20:
+                    # Universal QA: the LLM can still echo/leave a few hard cues in
+                    # the source language. Re-translate those per-cue so the LLM
+                    # path can't ship half-source either (this cleanup previously
+                    # ran ONLY on the NMT path, so LLM/Whisper leftovers slipped
+                    # through). Fail-soft + bounded; a clean draft is a no-op.
+                    _llm = await _llm_cleanup_untranslated(
+                        _llm, source_lang, target_lang, orchestrator, glossary, job_id)
                     logger.info("Translate via editorial LLM: %d segments → %s (complete)",
                                 len(_llm), target_lang)
                     return _llm, "llm"
@@ -625,6 +637,12 @@ async def translate_subtitles(segments, source_lang, target_lang, *, video_path=
         if _wt:
             if job_id:
                 await _release_whisper_vram(job_id)
+            # Universal QA: Whisper's translate task leaves the odd hard/music cue
+            # in the source language even after the purity gate above (which only
+            # rejects a WHOLESALE half-source draft). Re-translate the stragglers
+            # per-cue so this path can't ship source either. Fail-soft.
+            _wt = await _llm_cleanup_untranslated(
+                _wt, source_lang, target_lang, orchestrator, glossary, job_id)
             return _wt, "whisper"
 
     # Offline NMT path. Free Whisper VRAM first when a local NMT engine will load
@@ -2483,6 +2501,23 @@ async def _background_post_processing(
                            else getattr(s, "end", 0)) or 0)))
             except Exception:
                 pass
+
+            # ── Final translation QA (re-translate stragglers, don't just reject) ──
+            # The definitive check on the FINAL, polished transcript: whichever
+            # engine produced the draft — and after post-edit / resegmentation /
+            # readability reflow — detect any cue still in the source language and
+            # re-translate it one-by-one with the LLM. This is the QA the earlier
+            # steps DON'T do: the transcript step dedups the SOURCE, and the
+            # subtitle polisher only refines ALREADY-translated text; neither
+            # re-translates source-language stragglers. Idempotent (a clean track
+            # has zero leftovers → no-op) and fail-soft, so it can only help.
+            try:
+                _translated_out = await _llm_cleanup_untranslated(
+                    _translated_out, source_lang, target_lang,
+                    orchestrator, glossary, job_id)
+            except Exception as _qa_err:
+                logger.warning("[%s] Final translation QA cleanup skipped (%s)",
+                               job_id, _qa_err)
 
             # ── Final purity gate (the invariant this whole effort enforces) ──
             # A "translation" must NEVER be shipped half-source-language. If the
