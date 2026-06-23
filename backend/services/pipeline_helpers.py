@@ -128,6 +128,45 @@ def cpu_fallback_stages(compute_summary: dict) -> list:
     return out
 
 
+def resolve_clip_progress(frac, message, last_pct: int):
+    """Decide the (pct, label) for one clip-stage progress tick, or ``None`` to
+    skip it.
+
+    - ``pct`` maps ``frac`` 0-1 onto the 80-97 % band, forward-only (never below
+      ``last_pct`` — the ProgressBar is monotonic).
+    - WITH a ``message`` (e.g. "Exporting clip 12/63 …"): always emit, even if
+      the % is flat — the changing text is what keeps the activity log and the
+      frontend's stuck-timer alive through the long export tail (the bug where a
+      63-clip export sat at ~96 % with one static label and tripped the
+      "pipeline may be stuck" banner).
+    - WITHOUT a message: emit only when the bar actually advances, with a
+      band-derived label, so identical updates aren't spammed.
+
+    Returns ``(pct, label)`` or ``None``.
+    """
+    try:
+        f = float(frac or 0)
+    except (TypeError, ValueError):
+        f = 0.0
+    f = max(0.0, min(1.0, f))
+    pct = max(80 + int(f * 17), int(last_pct))
+    if message:
+        return pct, str(message)
+    if pct <= last_pct:
+        return None
+    if f < 0.10:
+        label = "Scoring clip candidates from signal density..."
+    elif f < 0.55:
+        label = "Asking the VLM to discover viral moments..."
+    elif f < 0.75:
+        label = "Judging clip candidates for hook + flow..."
+    elif f < 0.95:
+        label = "Exporting top clips..."
+    else:
+        label = "Finalizing clip detection..."
+    return pct, label
+
+
 def resolve_sample_fps(
     video_duration_s: float,
     *,

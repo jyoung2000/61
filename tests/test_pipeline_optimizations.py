@@ -200,6 +200,38 @@ def test_sample_fps_zero_duration_falls_back_to_ceiling():
     assert resolve_sample_fps(0, max_samples=1800, fps_ceiling=5.0, fps_floor=1.2) == 5.0
 
 
+# ── Clip-export progress (the "stuck for 36m" banner fix) ────────
+
+
+def test_clip_progress_per_clip_message_always_emits():
+    """A per-clip message must emit even when the % is flat — that's what keeps
+    the frontend stuck-timer reset through the long 60+ clip export tail."""
+    from backend.services.pipeline_helpers import resolve_clip_progress
+    res = resolve_clip_progress(0.86, "Exporting clip 12/63…", 96)
+    assert res is not None and res[1] == "Exporting clip 12/63…"
+    # Next clip: bar still ~96 % (flat) but the message changed → still emits.
+    res2 = resolve_clip_progress(0.87, "Exporting clip 13/63…", res[0])
+    assert res2 is not None and res2[1] == "Exporting clip 13/63…"
+
+
+def test_clip_progress_no_message_skips_when_flat():
+    from backend.services.pipeline_helpers import resolve_clip_progress
+    # No message + no forward movement → skip (don't spam identical band labels).
+    assert resolve_clip_progress(0.86, None, 96) is None
+
+
+def test_clip_progress_no_message_emits_band_label_on_advance():
+    from backend.services.pipeline_helpers import resolve_clip_progress
+    res = resolve_clip_progress(0.50, None, 80)
+    assert res is not None and "VLM" in res[1]
+
+
+def test_clip_progress_is_monotonic():
+    from backend.services.pipeline_helpers import resolve_clip_progress
+    pct, _ = resolve_clip_progress(0.0, "x", 95)
+    assert pct == 95  # never ticks below the last reported pct
+
+
 # ── Stage timings + warnings accumulation ───────────────────────
 
 

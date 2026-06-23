@@ -1,3 +1,24 @@
+# ClipAI — Clip export reports per-clip progress (no more false "pipeline may be stuck" banner)
+
+Exporting many reframed clips (e.g. 63 clips × ~45-135 s each ≈ 47 min) is the
+longest tail of a run, but the UI sat at ~96 % with a single static "Exporting
+top clips…" the whole time and tripped the red "No progress update for 36m — the
+pipeline may be stuck" banner. The clipper already called its progress callback
+per clip, but the pipeline relay (a) compressed export into ~94→97 % (≈3 integer
+ticks across 60+ clips) and (b) only emitted on an integer-% increase with a
+static label — and the frontend's stuck-timer keys off `progress_message`
+changes, which never changed.
+
+Fix: the export loop now reports a per-clip MESSAGE ("Exporting clip k/N …"),
+and the progress relay (`resolve_clip_progress`, extracted + unit-tested) always
+forwards a message even when the % is flat (while staying monotonic). The
+changing text resets the stuck-timer every clip (~45-135 s), so the alarming
+300 s "may be stuck" banner no longer fires during a healthy long export, and
+each tick also stamps `updated_at` so backend stale-job recovery sees liveness.
+No frontend change needed.
+
+---
+
 # ClipAI — Offline translation no longer ships half-Japanese (LLM timeout + NMT leftover cleanup)
 
 The offline JA→EN translation left ~18% of lines in Japanese. From the logs:

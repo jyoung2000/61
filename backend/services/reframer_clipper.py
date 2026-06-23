@@ -3397,9 +3397,11 @@ class ClipExtractor:
             judge_candidates, signals, self.perception)
 
         # ── FINAL RANK + EXPORT ───────────────────────────────
+        # Forward an optional per-clip message (m) through to the pipeline's
+        # progress relay so the long export phase reports "Exporting clip k/N".
         self.clips = self._final_rank_and_export(
             judge_candidates,
-            lambda p: on_progress(0.85 + p * 0.15) if on_progress else None
+            lambda p, m=None: on_progress(0.85 + p * 0.15, m) if on_progress else None
         )
 
         if on_progress:
@@ -3640,11 +3642,17 @@ class ClipExtractor:
         out_dir = os.path.join(os.path.dirname(self.video_path), "clips")
         os.makedirs(out_dir, exist_ok=True)
 
-        # Export each clip
+        # Export each clip. Report a per-clip MESSAGE (not just a fraction):
+        # exporting N reframed clips is the longest tail of the run (~45-135s
+        # each), and a single static "Exporting top clips…" let the UI's
+        # stuck-timer trip the "pipeline may be stuck" banner. A changing
+        # "Exporting clip k/N …" keeps the activity log + stuck-timer alive.
         exported = []
+        _n_final = len(final)
         for idx, c in enumerate(final):
             if on_progress:
-                on_progress(idx / max(1, len(final)))
+                on_progress(idx / max(1, _n_final),
+                            f"Exporting clip {idx + 1}/{_n_final}…")
 
             base_name = os.path.splitext(os.path.basename(self.video_path))[0]
             # Use judge title or VLM hook for filename

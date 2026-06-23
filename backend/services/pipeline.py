@@ -828,6 +828,7 @@ from backend.services.pipeline_helpers import (  # noqa: E402
     _drain_pipeline_telemetry,
     is_synthetic_scene,
     resolve_sample_fps,
+    resolve_clip_progress,
 )
 from backend.services import pipeline_checkpoint  # noqa: E402
 
@@ -4332,32 +4333,16 @@ async def _run_analysis_inner(job_id: str):
             _loop = asyncio.get_running_loop()
             _last_clipper_pct = [80]  # mutable cell for the closure
 
-            def _clipper_progress(frac):
-                try:
-                    f = float(frac or 0)
-                except (TypeError, ValueError):
-                    f = 0.0
-                f = max(0.0, min(1.0, f))
-                # Map 0-1 to 80-97 %; leave the final 1 % for the
-                # "Saving results..." broadcast at the end of the
-                # pipeline so the bar always moves forward.
-                pct = 80 + int(f * 17)
-                if pct <= _last_clipper_pct[0]:
-                    return  # ProgressBar is monotonic — skip backward ticks
+            def _clipper_progress(frac, message=None):
+                # resolve_clip_progress maps frac→80-97 %% forward-only and
+                # decides whether to emit. A per-clip ``message`` ("Exporting clip
+                # k/N …") always emits so the long export tail keeps the activity
+                # log + stuck-timer alive; a plain fraction emits only on advance.
+                res = resolve_clip_progress(frac, message, _last_clipper_pct[0])
+                if res is None:
+                    return
+                pct, label = res
                 _last_clipper_pct[0] = pct
-                # Phase-aware message — derive a label from the
-                # fraction so the user sees what's happening rather
-                # than a static "Detecting viral clip candidates...".
-                if f < 0.10:
-                    label = "Scoring clip candidates from signal density..."
-                elif f < 0.55:
-                    label = "Asking the VLM to discover viral moments..."
-                elif f < 0.75:
-                    label = "Judging clip candidates for hook + flow..."
-                elif f < 0.95:
-                    label = "Exporting top clips..."
-                else:
-                    label = "Finalizing clip detection..."
                 try:
                     asyncio.run_coroutine_threadsafe(
                         _update_progress(
