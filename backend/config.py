@@ -413,6 +413,13 @@ class Settings(BaseSettings):
     # shorter JSON array faster + more reliably (less timeout risk). 0 = auto
     # (8 for Ollama, 18 for cloud).
     TRANSLATION_LLM_BATCH: int = 0
+    # After the offline NMT (FuguMT/NLLB) runs, any cue it left in the source
+    # language is re-translated ONE AT A TIME with a plain-text LLM call (robust
+    # where the batched JSON path fails on small local models). Cap the number of
+    # such cues (0 disables the cleanup) and bound its wall-clock time so a
+    # hopelessly-garbled transcript can't run for hours.
+    TRANSLATION_LLM_CLEANUP_MAX_CUES: int = 500
+    TRANSLATION_LLM_CLEANUP_BUDGET_S: float = 1200.0
     WHISPER_TRANSLATE_TO_EN: bool = True
     # Whisper-native translate is a second full ASR pass; it's only worth it when
     # it can run on the GPU. Below this much FREE VRAM it would fall back to CPU

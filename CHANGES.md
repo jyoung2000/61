@@ -1,3 +1,31 @@
+# ClipAI — Offline translation completeness: per-cue plain-text LLM cleanup of NMT leftovers
+
+A 2 h JA→EN run still shipped ~25 % of cues in Japanese. The logs pinned it
+exactly: the local LLM ran (`text_completion via ollama qwen2.5:3b … completed
+in 128.9s`) but its batched JSON-array output was unparseable
+(`editorial model returned no usable output`), so `translate_via_llm` bailed →
+fell to FuguMT, which left `185/742 cue(s) untranslated (recovered 0/185)` on the
+long colloquial run-ons. The previous leftover-cleanup also used the JSON-array
+path, so it bailed the same way.
+
+Fix: the NMT-leftover cleanup (`pipeline._llm_cleanup_untranslated`) now
+re-translates each still-source cue **one at a time with a PLAIN-TEXT request**
+("translate this line; reply with only the translation"). That's the most robust
+local-model call — no JSON to misparse and no cross-cue alignment risk — so it
+recovers the cues FuguMT couldn't. It dedups identical run-ons (they repeat
+across many timestamps) so it's fast + consistent, is bounded by a cue cap +
+wall-clock budget, surfaces an accurate "Recovering N untranslated subtitle(s)…"
+status, and is fully fail-soft (any failure keeps the existing cue). New knobs:
+`TRANSLATION_LLM_CLEANUP_MAX_CUES` (default 500; 0 disables),
+`TRANSLATION_LLM_CLEANUP_BUDGET_S` (default 1200).
+
+Still open (separate ASR-quality issue, not translation): on this ~79 %-silent
+source Whisper also emits short phantom repeats ("Don't let", "So nice") that
+translate through unchanged — the hallucination blocklist catches fixed phrases
+but not these.
+
+---
+
 # ClipAI — Accurate live messaging during Whisper + translation (no false "stuck" banner)
 
 The long Whisper and translation phases showed the red "No progress update —

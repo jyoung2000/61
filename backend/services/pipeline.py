@@ -658,41 +658,126 @@ async def translate_subtitles(segments, source_lang, target_lang, *, video_path=
 
 async def _llm_cleanup_untranslated(segments, source_lang, target_lang,
                                     orchestrator, glossary, job_id):
-    """Re-translate any cues left in the source language by the offline NMT
-    using the editorial LLM (only the leftovers). Returns ``segments`` unchanged
-    when there's nothing to fix, no orchestrator, a CJK target, or on any error."""
+    """Re-translate cues the offline NMT left in the source language, ONE CUE AT
+    A TIME via a PLAIN-TEXT LLM call.
+
+    FuguMT/NLLB reliably leave long colloquial run-on cues untranslated, and the
+    JSON-array LLM path is brittle with small local models — qwen2.5:3b returned
+    unparseable batched output and bailed, so the subtitles shipped ~25%
+    Japanese. A per-cue plain-text request ("translate this line; reply with only
+    the translation") is the most robust local-model call: no JSON to misparse
+    and no cross-cue alignment risk, so it recovers the leftovers FuguMT
+    couldn't. Bounded (cue cap + wall-clock budget) and fully fail-soft — any
+    failure keeps the existing (source) cue. Returns ``segments`` unchanged when
+    there's nothing to fix / no orchestrator / a CJK target."""
     if not orchestrator or not segments:
         return segments
     try:
         from backend.services.translator import (
-            translate_via_llm, _cjk_ratio, _CJK_LANGS, fraction_untranslated,
+            _cjk_ratio, _CJK_LANGS, fraction_untranslated,
         )
-        _tgt = (target_lang or "").strip().lower().split("-")[0]
-        if _tgt in _CJK_LANGS:
-            return segments  # a CJK target legitimately contains CJK
-        def _txt(s):
-            return (s.get("text", "") if isinstance(s, dict) else getattr(s, "text", "")) or ""
+        from backend.models import TranscriptSegment
+    except Exception:
+        return segments
+    _tgt = (target_lang or "").strip().lower().split("-")[0]
+    if _tgt in _CJK_LANGS:
+        return segments  # a CJK target legitimately contains CJK
+
+    def _txt(s):
+        return (s.get("text", "") if isinstance(s, dict) else getattr(s, "text", "")) or ""
+
+    try:
         leftover_idx = [i for i, s in enumerate(segments) if _cjk_ratio(_txt(s)) > 0.30]
         if not leftover_idx:
             return segments
-        logger.info(
-            "[%s] Offline NMT left %d/%d cue(s) in the source language "
-            "(%.0f%% ) — cleaning up with the editorial LLM",
-            job_id, len(leftover_idx), len(segments),
-            100 * fraction_untranslated(segments, target_lang))
-        leftovers = [segments[i] for i in leftover_idx]
-        fixed = await translate_via_llm(
-            leftovers, source_lang, target_lang, orchestrator,
-            glossary=glossary, job_id=job_id or "")
-        if not fixed:
+
+        _cap = int(getattr(settings, "TRANSLATION_LLM_CLEANUP_MAX_CUES", 500) or 0)
+        _budget = float(getattr(settings, "TRANSLATION_LLM_CLEANUP_BUDGET_S", 1200) or 0)
+        if _cap <= 0:
+            return segments  # cleanup disabled
+        if len(leftover_idx) > _cap:
+            logger.warning(
+                "[%s] %d untranslated cue(s) exceed the LLM-cleanup cap (%d) — "
+                "skipping; transcript may be too garbled to recover cue-by-cue",
+                job_id, len(leftover_idx), _cap)
             return segments
-        for i, f in zip(leftover_idx, fixed):
-            ftxt = _txt(f)
-            if ftxt and _cjk_ratio(ftxt) <= 0.30:
-                segments[i] = f
+
+        _tgt_name = "English" if _tgt == "en" else (target_lang or "English")
         logger.info(
-            "[%s] LLM leftover cleanup: %.0f%% source-script remaining",
-            job_id, 100 * fraction_untranslated(segments, target_lang))
+            "[%s] Offline NMT left %d/%d cue(s) in the source language (%.0f%%) — "
+            "per-cue LLM cleanup (budget %.0fs)",
+            job_id, len(leftover_idx), len(segments),
+            100 * fraction_untranslated(segments, target_lang), _budget)
+        # Accurate, visible status so the (multi-minute) cleanup doesn't look idle.
+        try:
+            await _update_progress(
+                job_id, JobStatus.TRANSLATING, 68,
+                f"Recovering {len(leftover_idx)} untranslated subtitle(s) with the LLM…",
+                heartbeat_label="subtitle translation")
+        except Exception:
+            pass
+
+        _t0 = _time.monotonic()
+        _fixed = 0
+        # The same hallucinated/looped run-on repeats across many cues — translate
+        # each UNIQUE source text once and reuse it, so the cleanup is fast and
+        # consistent. "" caches an attempted-but-failed text so its duplicates
+        # are skipped instead of re-tried.
+        _cache: dict[str, str] = {}
+        for i in leftover_idx:
+            cur = segments[i]
+            src_text = _txt(cur).strip()
+            if not src_text:
+                continue
+            t = _cache.get(src_text)
+            if t is None:  # not attempted yet
+                if _budget > 0 and _time.monotonic() - _t0 > _budget:
+                    logger.warning("[%s] LLM cleanup budget reached (%d unique done)",
+                                   job_id, len(_cache))
+                    break
+                prompt = (
+                    f"Translate this subtitle line into natural, fluent {_tgt_name}. "
+                    f"Reply with ONLY the {_tgt_name} translation — no quotes, no "
+                    f"notes, do not repeat the original.\n\n{src_text}")
+                # ``except Exception`` only — a real cancel (CancelledError, a
+                # BaseException) still propagates and stops the run.
+                try:
+                    resp = await orchestrator.text_completion(
+                        prompt, timeout=60, job_id=job_id or "", skip_circuit_breaker=True)
+                except Exception:
+                    _cache[src_text] = ""
+                    continue
+                t = (resp or "").strip().strip('"').strip()
+                low = t.lower()
+                for _pref in ("translation:", "english:", "translation -",
+                              "english -", "translation —", "english —"):
+                    if low.startswith(_pref):
+                        t = t[len(_pref):].strip()
+                        break
+                if not t or _cjk_ratio(t) > 0.30:
+                    _cache[src_text] = ""  # echoed source / failed → keep FuguMT cue
+                    continue
+                _cache[src_text] = t
+            elif t == "":  # previously attempted and failed
+                continue
+            if glossary:
+                for k, v in glossary.items():
+                    ks, vs = (k or "").strip(), (v or "").strip()
+                    if ks and vs and ks in t:
+                        t = t.replace(ks, vs)
+            if isinstance(cur, dict):
+                segments[i] = {**cur, "text": t}
+            else:
+                segments[i] = TranscriptSegment(
+                    text=t,
+                    start=float(getattr(cur, "start", 0.0) or 0.0),
+                    end=float(getattr(cur, "end", 0.0) or 0.0),
+                    speaker=getattr(cur, "speaker", None) or "Speaker 1")
+            _fixed += 1
+        logger.info(
+            "[%s] LLM cleanup recovered %d/%d cue(s); %.0f%% source-script remaining",
+            job_id, _fixed, len(leftover_idx),
+            100 * fraction_untranslated(segments, target_lang))
         return segments
     except Exception as _e:  # noqa: BLE001 — cleanup is best-effort
         logger.info("[%s] LLM leftover cleanup skipped (%s)", job_id, _e)
