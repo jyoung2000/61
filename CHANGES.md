@@ -1,3 +1,43 @@
+# ClipAI — Durable PROCESSING LOG: survives tab reload, new device, container restart
+
+The Analysis page's PROCESSING LOG was built purely from live WebSocket messages
+into local React state (`activityLog`), with no fetch of history on mount — so a
+tab reload, opening the job on another device, or a container restart reset it to
+empty and only showed FUTURE events. The full pipeline journey was lost.
+
+Now every user-facing event is persisted server-side and re-fetched on load:
+- **`services/job_events.py`** (new, stdlib-only): `broadcast_ws` appends each event
+  append-only to `/data/uploads/{job_id}/events.jsonl` — cheap one-line writes that
+  never rewrite the multi-MB `job.json`, captured even when no client is connected.
+  Keepalive `heartbeat`/`pong` pings are skipped and rapid same-stage `status` ticks
+  are throttled (8 s) so the durable log carries meaningful events, not noise; a
+  one-time compaction caps file growth on very long runs.
+- **`GET /api/jobs/{id}/events`** (new, same owner/admin auth as the other job
+  routes) returns the most-recent events in chronological order.
+- **Analysis.jsx** hydrates `activityLog` from that endpoint on mount and merges it
+  with any live entries (time-ordered, de-duped via `eventToLogEntry` +
+  `mergeLogEntries`), so the log renders in full on a fresh tab/device and keeps
+  streaming live afterward.
+
+New unit tests in `tests/test_job_events_persistence.py` (added to CI).
+
+---
+
+# ClipAI — Audio preconditioning runs at 16 kHz (GPU not applicable): ~3× faster offline
+
+Answering "would audio preconditioning speed up on the GPU?": **no — ffmpeg's audio
+filters (`highpass`/`afftdn`/`loudnorm`) are CPU-only; there is no CUDA build of
+them (ffmpeg GPU accel is video decode/encode/scale).** A torch/torchaudio GPU
+rewrite is possible but not worth the VRAM contention on a 4 GB GTX 1650 that
+Whisper needs. The real, GPU-free win: the preconditioning filtergraph ran at the
+SOURCE rate (e.g. 48 kHz) and only resampled to 16 kHz at output, so `afftdn`/
+`loudnorm` chewed ~3× more samples than necessary. `build_precondition_filters` now
+prepends `aresample=16000` so the whole chain runs at Whisper's 16 kHz target —
+lossless for ASR (Whisper consumes 16 kHz mono regardless) and ~3× fewer samples,
+stacking with the earlier "drop afftdn on long videos" change. Tests updated.
+
+---
+
 # ClipAI — "Stuck at faces, no VRAM" was the audio-precondition pass: drop afftdn on long videos + live audio progress
 
 A 128-min offline run looked frozen at the face step with the VRAM bar reading

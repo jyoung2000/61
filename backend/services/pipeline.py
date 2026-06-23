@@ -1037,6 +1037,15 @@ async def broadcast_ws(job_id: str, message: dict):
             safe_message[k] = str(v.value) if hasattr(v, 'value') else str(v)
         else:
             safe_message[k] = v
+    # Persist the event to the job's durable log BEFORE broadcasting, so the
+    # PROCESSING LOG survives tab reloads / new devices / container restarts and
+    # is captured even when no client is currently subscribed. Best-effort,
+    # synchronous (no await → atomic), and filtered/throttled internally.
+    try:
+        from backend.services.job_events import append_job_event
+        append_job_event(job_id, safe_message)
+    except Exception:
+        pass
     subscribers = _ws_subscribers.get(job_id, [])
     dead = []
     for ws in subscribers:

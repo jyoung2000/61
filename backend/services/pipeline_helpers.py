@@ -58,7 +58,14 @@ def build_precondition_filters(
     """
     if not precondition:
         return None
-    filters = ["highpass=f=80"]
+    # Resample to Whisper's 16 kHz target FIRST so every downstream filter runs
+    # on ~3× fewer samples than a 48 kHz source (afftdn/loudnorm cost scales with
+    # sample count). This is the most effective speedup available here: ffmpeg
+    # audio filters are CPU-only — there is NO CUDA build of afftdn/loudnorm/
+    # highpass (ffmpeg GPU accel is video decode/encode/scale only), so the work
+    # can't move to the GPU; shrinking the sample count is the lever. Lossless
+    # for ASR since Whisper consumes 16 kHz mono regardless.
+    filters = ["aresample=16000", "highpass=f=80"]
     dur_min = (duration_sec or 0.0) / 60.0
     if denoise_max_min <= 0 or dur_min <= denoise_max_min:
         filters.append("afftdn=nf=-25")

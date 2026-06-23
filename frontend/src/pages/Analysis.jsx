@@ -41,6 +41,64 @@ function formatDuration(seconds) {
   return `${m}:${s.toString().padStart(2, '0')}`;
 }
 
+// Map a persisted WS event (from GET /api/jobs/:id/events) onto the activity-log
+// entry shape ProcessingLog renders. Mirrors the live ws.onmessage handlers so a
+// reloaded log looks the same as the live one. Returns null for events with no
+// displayable message. ev.ts is wall-clock epoch SECONDS (set server-side).
+function eventToLogEntry(ev) {
+  if (!ev || typeof ev !== 'object') return null;
+  const wsType = String(ev.type || '');
+  const absMs = (typeof ev.ts === 'number' ? ev.ts : Date.now() / 1000) * 1000;
+  const tsStr = new Date(absMs).toLocaleTimeString([], {
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+  });
+  const baseMsg = (ev.message != null && typeof ev.message !== 'object')
+    ? String(ev.message) : '';
+  let type = 'info';
+  let message = baseMsg;
+  switch (wsType) {
+    case 'status': type = 'status'; break;
+    case 'complete': type = 'success'; message = baseMsg || 'Analysis complete'; break;
+    case 'error': type = 'error'; break;
+    case 'compute_warning': type = 'warning'; break;
+    case 'fallback': type = 'info'; break;
+    case 'cancelled': type = 'warning'; message = baseMsg || 'Cancelled'; break;
+    case 'clips_generated':
+      type = 'success';
+      message = baseMsg || (ev.count != null ? `Generated ${ev.count} clip(s)` : 'Clips generated');
+      break;
+    case 'export_complete': type = 'success'; message = baseMsg || 'Export complete'; break;
+    case 'background_task': {
+      const st = String(ev.status || '');
+      type = st === 'complete' ? 'success' : st === 'failed' ? 'warning' : 'status';
+      message = baseMsg || String(ev.task || 'Background task');
+      break;
+    }
+    default: type = 'info';
+  }
+  if (!message) return null;
+  const entry = { ts: tsStr, type, message, _absTime: absMs };
+  if (ev.stage_id) entry.stage_id = String(ev.stage_id);
+  if (ev.progress != null) entry.progress = ev.progress;
+  return entry;
+}
+
+// Merge persisted history with whatever live entries already arrived, ordered by
+// time and de-duped (an event can be both persisted AND replayed live on connect).
+function mergeLogEntries(historical, live) {
+  const all = [...(historical || []), ...(live || [])];
+  all.sort((a, b) => (a._absTime || 0) - (b._absTime || 0));
+  const seen = new Set();
+  const out = [];
+  for (const e of all) {
+    const key = `${Math.round((e._absTime || 0) / 1000)}|${e.type}|${e.message}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(e);
+  }
+  return out;
+}
+
 // Compare two subtitle/transcript segment lists for meaningful equality
 // (same count, same text, timing within 50 ms). Used by the timeline→
 // transcript reverse-sync to skip a write when nothing actually changed —
@@ -1016,6 +1074,30 @@ export default function Analysis() {
   useEffect(() => {
     try { localStorage.setItem(GEN_STORAGE_KEY, JSON.stringify(genSettings)); } catch {}
   }, [genSettings]);
+
+  // Hydrate the PROCESSING LOG from the durable server-side event log so it
+  // survives tab reloads / a new device / a container restart (the live
+  // WebSocket only carries FUTURE events). Runs once per job; merges with any
+  // live entries that already arrived, de-duped + time-ordered.
+  useEffect(() => {
+    if (!jobId) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch(`/api/jobs/${jobId}/events`);
+        if (!res.ok || cancelled) return;
+        const data = await res.json();
+        const historical = (data.events || [])
+          .map(eventToLogEntry)
+          .filter(Boolean);
+        if (!historical.length || cancelled) return;
+        setActivityLog((prev) => mergeLogEntries(historical, prev));
+      } catch {
+        /* best-effort — live WS still populates the log going forward */
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [jobId]);
 
   // Initial fetch + WebSocket with auto-reconnection
   useEffect(() => {

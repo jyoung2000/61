@@ -104,6 +104,25 @@ async def get_job(job_id: str, user: User = Depends(get_current_user)):
     return data
 
 
+@router.get("/jobs/{job_id}/events")
+async def get_job_events(
+    job_id: str,
+    limit: int = 2000,
+    user: User = Depends(get_current_user),
+):
+    """Durable PROCESSING LOG events for a job.
+
+    The Analysis page hydrates its activity log from this on mount so the log is
+    viewable in full after a tab reload, from a new device, or after a container
+    restart — the live WebSocket only carries FUTURE events. Events are persisted
+    append-only to the job dir (see ``services.job_events``); this returns the
+    most-recent ``limit`` of them in chronological order.
+    """
+    await _require_job_access(job_id, user)
+    from backend.services.job_events import load_job_events
+    return {"job_id": job_id, "events": load_job_events(job_id, limit=limit)}
+
+
 @router.get("/jobs/{job_id}/transcripts")
 async def get_transcripts(job_id: str, user: User = Depends(get_current_user)):
     """Lightweight transcript fetch — the source + translated transcripts and the

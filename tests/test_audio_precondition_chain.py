@@ -20,7 +20,7 @@ def test_precondition_off_returns_none():
 
 def test_short_video_keeps_full_chain_including_afftdn():
     af = build_precondition_filters(True, 10 * 60.0, denoise_max_min=45)
-    assert af == "highpass=f=80,afftdn=nf=-25,loudnorm=I=-18:LRA=11:TP=-1.5"
+    assert af == "aresample=16000,highpass=f=80,afftdn=nf=-25,loudnorm=I=-18:LRA=11:TP=-1.5"
 
 
 def test_video_exactly_at_cap_keeps_afftdn():
@@ -31,7 +31,14 @@ def test_video_exactly_at_cap_keeps_afftdn():
 def test_long_video_drops_afftdn_keeps_highpass_and_loudnorm():
     af = build_precondition_filters(True, 128 * 60.0, denoise_max_min=45)
     assert "afftdn" not in af
-    assert af == "highpass=f=80,loudnorm=I=-18:LRA=11:TP=-1.5"
+    assert af == "aresample=16000,highpass=f=80,loudnorm=I=-18:LRA=11:TP=-1.5"
+
+
+def test_resample_to_16k_is_always_first_when_on():
+    # The downsample-first speedup: filters must run at 16 kHz, not source rate.
+    for dur in (5 * 60.0, 128 * 60.0):
+        af = build_precondition_filters(True, dur, denoise_max_min=45)
+        assert af.startswith("aresample=16000,")
 
 
 def test_cap_zero_disables_the_cap_always_denoise():
