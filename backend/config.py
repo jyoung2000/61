@@ -429,10 +429,23 @@ class Settings(BaseSettings):
     SUBTITLE_MAX_CPS: float = 20.0              # chars/sec (Netflix adult standard)
     SUBTITLE_MAX_CHARS_PER_LINE: int = 42       # Netflix Latin standard
     SUBTITLE_MIN_DURATION_MS: int = 833         # 5/6 second (Netflix minimum)
-    SUBTITLE_MAX_DURATION_MS: int = 4500        # 4.5s — tighter than Netflix (7s),
-                                                # closer to YouTube/TikTok pacing
-                                                # so a long Whisper segment gets
-                                                # broken into bite-sized captions
+    SUBTITLE_MAX_DURATION_MS: int = 9000        # Raised from 4.5s. Slow / heavily
+                                                # -paused speech (JA→EN especially)
+                                                # leaves 2-3 word fragments ~4-6s
+                                                # apart; a tight cap refused to
+                                                # merge two of them (their combined
+                                                # span exceeds it), so they stayed
+                                                # choppy. 9s lets the phrase-merge
+                                                # combine such fragments into
+                                                # complete, readable captions (it's
+                                                # past Netflix's 7s ideal, but a
+                                                # complete clause shown for 9s of
+                                                # genuinely slow speech reads far
+                                                # better than 5 word-fragments).
+                                                # Normal-pace speech still lands
+                                                # ~4-5s — bounded by the 2-line/CPS
+                                                # budget — so only slow content
+                                                # uses the extra room.
     SUBTITLE_SMART_LINE_BREAKS: bool = True     # linguistic boundary breaks
     # Minimum characters a split piece may carry. Stops the duration
     # splitter from shattering slow / dramatic narration (Whisper detects
@@ -448,7 +461,7 @@ class Settings(BaseSettings):
     # lines, and is the biggest lever on the duration sub-score (no more sub-833ms
     # flashes). Only bridges SMALL gaps (continuous speech) — never a real pause,
     # a speaker change, or a [♪ music ♪] marker. 0 disables the merge.
-    SUBTITLE_MERGE_MAX_GAP_MS: int = 1200
+    SUBTITLE_MERGE_MAX_GAP_MS: int = 3000
     SUBTITLE_PLATFORM_SAFE_ZONES: bool = True   # per-platform margin profiles
     SUBTITLE_PLATFORM_PROFILE: str = ""         # "" | tiktok | reels | shorts | horizontal | square
 

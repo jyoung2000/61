@@ -1122,7 +1122,9 @@ def compute_readability_report(
     max_cps: Optional[float] = None,
     ideal_cps: Optional[float] = None,
     max_chars_per_line: Optional[int] = None,
-    max_duration_ms: int = 4500,
+    max_duration_ms: int = 9000,   # Matches the formatter's cap so merged
+                                   # phrase-cues (longer on slow speech) aren't
+                                   # scored as duration violations.
     min_duration_ms: int = 833,
 ) -> dict:
     """Score a subtitle transcript for human readability.
