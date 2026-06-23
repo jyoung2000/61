@@ -3642,20 +3642,15 @@ class ClipExtractor:
         out_dir = os.path.join(os.path.dirname(self.video_path), "clips")
         os.makedirs(out_dir, exist_ok=True)
 
-        # Export each clip. Report a per-clip MESSAGE (not just a fraction):
-        # exporting N reframed clips is the longest tail of the run (~45-135s
-        # each), and a single static "Exporting top clips…" let the UI's
+        # Export each clip (GPU-encoded, several at a time). Report a per-clip
+        # MESSAGE (not just a fraction): exporting N clips is the longest tail of
+        # the run, and a single static "Exporting top clips…" let the UI's
         # stuck-timer trip the "pipeline may be stuck" banner. A changing
         # "Exporting clip k/N …" keeps the activity log + stuck-timer alive.
-        exported = []
         _n_final = len(final)
-        for idx, c in enumerate(final):
-            if on_progress:
-                on_progress(idx / max(1, _n_final),
-                            f"Exporting clip {idx + 1}/{_n_final}…")
 
+        def _clip_name_for(idx: int, c) -> str:
             base_name = os.path.splitext(os.path.basename(self.video_path))[0]
-            # Use judge title or VLM hook for filename
             slug = ""
             if c.judge_title:
                 slug = re.sub(r'[^\w\s-]', '', c.judge_title)
@@ -3663,21 +3658,67 @@ class ClipExtractor:
             elif c.vlm_hook:
                 slug = re.sub(r'[^\w\s-]', '', c.vlm_hook[:30])
                 slug = re.sub(r'[\s]+', '_', slug).strip('_')
+            return (f"{base_name}_clip{idx+1}_{slug}.mp4" if slug
+                    else f"{base_name}_clip{idx+1}.mp4")
 
-            if slug:
-                clip_name = f"{base_name}_clip{idx+1}_{slug}.mp4"
-            else:
-                clip_name = f"{base_name}_clip{idx+1}.mp4"
+        # (idx, clip, clip_name, clip_path)
+        tasks = [(idx, c, _clip_name_for(idx, c)) for idx, c in enumerate(final)]
+        tasks = [(idx, c, cn, os.path.join(out_dir, cn)) for idx, c, cn in tasks]
 
-            clip_path = os.path.join(out_dir, clip_name)
+        try:
+            from backend.config import settings as _cs
+            _conc = max(1, int(getattr(_cs, "CLIP_EXPORT_CONCURRENCY", 2) or 1))
+        except Exception:
+            _conc = 2
+        _conc = max(1, min(_conc, _n_final))
 
-            ok = _export_clip(self.video_path, clip_path, c.start_s, c.end_s)
-            if ok:
-                exported.append(c)
-                logger.info(
-                    f"Exported clip {idx+1}/{len(final)}: "
-                    f"{_fmt_time(c.start_s)}–{_fmt_time(c.end_s)} "
-                    f"({c.duration_s:.0f}s) → {clip_name}")
+        _ok: list[tuple[int, object]] = []   # (idx, clip) for successful exports
+
+        def _log_ok(idx, c, cn):
+            logger.info(
+                f"Exported clip {idx+1}/{_n_final}: "
+                f"{_fmt_time(c.start_s)}–{_fmt_time(c.end_s)} "
+                f"({c.duration_s:.0f}s) → {cn}")
+
+        if _conc <= 1:
+            for idx, c, cn, cp in tasks:
+                if on_progress:
+                    on_progress(idx / max(1, _n_final),
+                                f"Exporting clip {idx + 1}/{_n_final}…")
+                if _export_clip(self.video_path, cp, c.start_s, c.end_s):
+                    _ok.append((idx, c))
+                    _log_ok(idx, c, cn)
+        else:
+            # Export several clips at once — they're independent ffmpeg jobs and
+            # the small 9:16 frames are cheap, so the GPU/CPU sit idle between
+            # sequential encodes. as_completed yields on THIS thread, so
+            # on_progress is still called serially (no interleaving).
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            _done = 0
+            logger.info("Clip export: %d clips, %d at a time (GPU encode)",
+                        _n_final, _conc)
+            with ThreadPoolExecutor(max_workers=_conc) as _ex:
+                _futs = {
+                    _ex.submit(_export_clip, self.video_path, cp, c.start_s, c.end_s):
+                        (idx, c, cn)
+                    for idx, c, cn, cp in tasks
+                }
+                for _fut in as_completed(_futs):
+                    idx, c, cn = _futs[_fut]
+                    _done += 1
+                    if on_progress:
+                        on_progress(_done / max(1, _n_final),
+                                    f"Exporting clips… ({_done}/{_n_final})")
+                    try:
+                        if _fut.result():
+                            _ok.append((idx, c))
+                            _log_ok(idx, c, cn)
+                    except Exception as _ee:
+                        logger.warning("clip %d export errored: %s", idx + 1, _ee)
+
+        # Restore chronological order (parallel completion is out of order).
+        _ok.sort(key=lambda t: t[0])
+        exported = [c for _i, c in _ok]
 
         # Write manifest
         manifest = {
@@ -3712,22 +3753,69 @@ class ClipExtractor:
 
 def _export_clip(video_path: str, output_path: str,
                  start_s: float, end_s: float) -> bool:
-    """Extract a clip from the reframed video using FFmpeg."""
+    """Extract a candidate clip — a plain time-cut of the source video (no
+    reframing/subtitles are burned here; those are applied later on export).
+
+    Clip export was the longest tail of the pipeline: the old
+    ``libx264 -preset fast -crf 18`` re-encoded every clip on the CPU
+    (~45-135 s each × dozens of clips). Speedups, fastest first:
+
+      * ``CLIP_EXPORT_STREAM_COPY`` (opt-in): no re-encode at all — remux the
+        bytes (``-c copy``). Near-instant, but the cut snaps to the nearest
+        keyframe so a clip can begin a second or two early.
+      * GPU encoder (NVENC/VAAPI/QSV, per the GPU toggle): frame-accurate and
+        ~5-10× faster than CPU libx264. This is the default.
+      * Fast CPU encode (``libx264 -preset veryfast``): the fallback.
+
+    ``-ss``/``-to`` stay BEFORE ``-i`` for fast keyframe seek, so only the clip
+    span is decoded. Each option falls through to the next if it fails."""
     try:
-        result = subprocess.run([
-            'ffmpeg', '-y',
-            '-ss', f"{start_s:.2f}",
-            '-to', f"{end_s:.2f}",
-            '-i', video_path,
-            '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
-            '-c:a', 'aac', '-b:a', '128k',
-            '-movflags', '+faststart',
-            output_path
-        ], capture_output=True, timeout=120)
-        return result.returncode == 0 and os.path.exists(output_path)
-    except Exception as e:
-        logger.warning(f"FFmpeg clip export failed: {e}")
-        return False
+        from backend.config import settings
+    except Exception:
+        settings = None
+    _crf = int(getattr(settings, "CLIP_EXPORT_CRF", 21) if settings else 21)
+    _stream_copy = bool(getattr(settings, "CLIP_EXPORT_STREAM_COPY", False) if settings else False)
+    base = ['ffmpeg', '-y', '-ss', f"{start_s:.2f}", '-to', f"{end_s:.2f}",
+            '-i', video_path]
+    tail = ['-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', output_path]
+
+    cmds: list[list] = []
+    # Fastest (opt-in): stream-copy — no transcode, keyframe-approximate start.
+    if _stream_copy:
+        cmds.append(base + ['-c', 'copy', '-movflags', '+faststart', output_path])
+    # Preferred: GPU encoder (respects GPU_ACCELERATION_ENABLED; returns libx264
+    # itself when the toggle is off or no GPU encoder is present).
+    try:
+        from backend.services.clip_exporter import _gpu_encode_args
+        # preset only affects the libx264 fallback inside the helper (NVENC uses
+        # its own p5); "veryfast" keeps the CPU path quick when the GPU is off.
+        _vargs = _gpu_encode_args({"preset": "veryfast", "crf": _crf}, "1080p")
+        if _vargs:
+            cmds.append(base + _vargs + tail)
+    except Exception:
+        pass
+    # Fallback (and the path when GPU detection is unavailable): fast CPU encode.
+    # veryfast + crf 21 is far quicker than the old fast + crf 18 and plenty for
+    # review clips.
+    _cpu = base + ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', str(_crf),
+                   '-pix_fmt', 'yuv420p'] + tail
+    if not cmds or cmds[-1] != _cpu:
+        cmds.append(_cpu)
+
+    for attempt, cmd in enumerate(cmds):
+        try:
+            result = subprocess.run(cmd, capture_output=True, timeout=180)
+            if result.returncode == 0 and os.path.exists(output_path) \
+                    and os.path.getsize(output_path) > 0:
+                return True
+            logger.warning(
+                "clip export attempt %d/%d failed (rc=%s): %s",
+                attempt + 1, len(cmds), result.returncode,
+                (result.stderr or b"")[-300:].decode("utf-8", "replace"))
+        except Exception as e:
+            logger.warning("clip export attempt %d/%d error: %s",
+                           attempt + 1, len(cmds), e)
+    return False
 
 
 def _parse_mmss(s: str) -> float:

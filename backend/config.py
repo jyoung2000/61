@@ -267,6 +267,23 @@ class Settings(BaseSettings):
     CLIP_MIN_DURATION: int = 60        # seconds — shortest clip
     CLIP_MAX_DURATION: int = 300       # seconds — longest clip
     CLIP_COUNT: int = 0                # 0 = auto (scales with video length)
+    # ── Clip export speed ──
+    # The candidate-clip exporter used to re-encode every clip with CPU libx264
+    # at -crf 18 — the single longest tail of the pipeline (~45-135 s/clip ×
+    # dozens of clips = the bulk of a long run). It now uses the GPU encoder
+    # (NVENC/VAAPI/QSV per the GPU toggle) at this quality, ~5-10× faster with no
+    # meaningful loss for review clips, and exports several at once. CRF/CQ 21 is
+    # visually transparent for these previews (18 was overkill). Concurrency runs
+    # N clip encodes in parallel (independent ffmpeg jobs; the small 9:16 frames
+    # are cheap) — 0/1 = sequential.
+    CLIP_EXPORT_CRF: int = 21
+    CLIP_EXPORT_CONCURRENCY: int = 2
+    # Opt-in: skip re-encoding candidate clips entirely and just remux the bytes
+    # (``-c copy``). Near-instant (the whole export phase drops from many minutes
+    # to seconds), but the cut snaps to the nearest keyframe, so a clip may begin
+    # a second or two before its intended moment. Great when you just need fast
+    # previews to review; leave off when you need frame-accurate starts.
+    CLIP_EXPORT_STREAM_COPY: bool = False
     CLIP_PREFERRED_SUBJECTS: str = ""  # topics to prioritize, comma-separated
     CLIP_AVOID_SUBJECTS: str = ""      # topics to skip, comma-separated
     CLIP_DISCOVERY_PROMPT: str = ""    # custom VideoLLaMA3 prompt; "" = built-in default

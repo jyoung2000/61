@@ -132,6 +132,37 @@ New unit tests in `tests/test_audio_precondition_chain.py` (added to CI).
 
 ---
 
+# ClipAI — Much faster clip export: GPU encode + parallel + optional stream-copy
+
+Clip export was the single longest tail of the run — ~48 min for 63 clips in the
+latest log. Cause: ``reframer_clipper._export_clip`` re-encoded every candidate
+clip on the CPU (``libx264 -preset fast -crf 18``) even though the box has NVENC,
+and exported them one at a time. The candidate clips are plain time-cuts of the
+source (no reframing/subtitles burned in — that happens later on export), so the
+heavy CPU re-encode was pure waste.
+
+Speedups (fastest first; ``_export_clip`` falls through each):
+- **GPU encode (default).** Reuses the exporter's ``_gpu_encode_args`` (NVENC/
+  VAAPI/QSV, respecting the GPU toggle) at ``CLIP_EXPORT_CRF`` (21, visually
+  transparent for review clips; 18 was overkill) — frame-accurate and ~5-10×
+  faster than CPU libx264. Falls back to ``libx264 -preset veryfast`` if the GPU
+  encode fails. ``-ss``/``-to`` stay before ``-i`` (fast keyframe seek).
+- **Parallel export.** ``CLIP_EXPORT_CONCURRENCY`` (default 2) runs several
+  independent clip encodes at once via a thread pool; progress is reported on
+  completion and stays serialized, so the "Exporting clips… (k/N)" status and the
+  stuck-timer still behave. Clips are re-sorted to chronological order after.
+- **Stream-copy (opt-in, ``CLIP_EXPORT_STREAM_COPY``).** No transcode at all —
+  remux the bytes; the whole export phase drops from many minutes to seconds. The
+  cut snaps to the nearest keyframe (a clip may start a second or two early), so
+  it's off by default and ideal when you just want fast previews to review.
+
+Net for that 63-clip run: ~48 min → roughly 5-10 min on GPU (×~2 with the default
+concurrency), or seconds with stream-copy. New config: ``CLIP_EXPORT_CRF``,
+``CLIP_EXPORT_CONCURRENCY``, ``CLIP_EXPORT_STREAM_COPY``. (Separately, fewer clips
+also helps linearly — set ``CLIP_COUNT`` if 63 candidates is more than you need.)
+
+---
+
 # ClipAI — Readable captions: merge choppy fragments + recurring-name glossary in cleanup
 
 Follow-up to the fresh run (now fully translated + phantom-free): the transcript
