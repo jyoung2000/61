@@ -280,6 +280,37 @@ export function EncodingProvider({ children }) {
                 a.click();
                 document.body.removeChild(a);
               });
+
+            // Companion SEO sidecar (.txt): viral score, title, caption,
+            // hashtags, recommended platform, per-platform SEO + captions.
+            // Same blob-download approach as the clip; staggered slightly so
+            // the browser treats it as a separate download rather than
+            // collapsing the two clicks into one.
+            const seoUrl = rewriteForFetch(msg.seo_url);
+            if (seoUrl) {
+              const seoName = `[${qualityTag}] ${safeName}.txt`;
+              setTimeout(() => {
+                fetch(seoUrl)
+                  .then((res) => {
+                    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                    return res.blob();
+                  })
+                  .then((blob) => {
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = seoName;
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    setTimeout(() => URL.revokeObjectURL(url), 5000);
+                    pushLog('info', `SEO info downloaded: ${seoName}`);
+                  })
+                  .catch((err) => {
+                    console.warn('[EncodingManager] SEO sidecar download failed:', err);
+                  });
+              }, 800);
+            }
           }
           _maybeCloseWs(jobId);
         } else if (msg.type === 'error') {

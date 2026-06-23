@@ -1325,14 +1325,26 @@ export default function ClipSEO() {
                 </button>
               )}
               {downloadUrl && (
-                <a href={downloadUrl} download style={{
-                  padding: '6px 12px', fontSize: 11, fontWeight: 600,
-                  background: 'var(--bg-elevated)', color: 'var(--accent-cyan)',
-                  border: '1px solid var(--accent-cyan)', borderRadius: 'var(--radius-sm)',
-                  textDecoration: 'none', whiteSpace: 'nowrap',
-                }}>
-                  Download
-                </a>
+                <>
+                  <a href={downloadUrl} download style={{
+                    padding: '6px 12px', fontSize: 11, fontWeight: 600,
+                    background: 'var(--bg-elevated)', color: 'var(--accent-cyan)',
+                    border: '1px solid var(--accent-cyan)', borderRadius: 'var(--radius-sm)',
+                    textDecoration: 'none', whiteSpace: 'nowrap',
+                  }}>
+                    Download
+                  </a>
+                  <a href={`/api/jobs/${jobId}/clips/${clipId}/seo.txt`} download
+                    title="Download SEO info (viral score, title, caption, tags, platform)"
+                    style={{
+                      padding: '6px 12px', fontSize: 11, fontWeight: 600,
+                      background: 'var(--bg-elevated)', color: 'var(--text-secondary)',
+                      border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)',
+                      textDecoration: 'none', whiteSpace: 'nowrap',
+                    }}>
+                    SEO .txt
+                  </a>
+                </>
               )}
 
               <div style={{ width: 1, height: 20, background: 'var(--border)', margin: '0 4px' }} />
@@ -1726,19 +1738,35 @@ export default function ClipSEO() {
                   Export MP4
                 </button>
                 {downloadUrl && (
-                  <a
-                    href={downloadUrl}
-                    download
-                    style={{
-                      padding: '10px 16px',
-                      background: 'var(--bg-elevated)', color: 'var(--accent-cyan)',
-                      border: '1px solid var(--accent-cyan)', borderRadius: 'var(--radius-sm)',
-                      fontSize: 12, fontWeight: 600, textDecoration: 'none',
-                      display: 'flex', alignItems: 'center',
-                    }}
-                  >
-                    Download Again
-                  </a>
+                  <>
+                    <a
+                      href={downloadUrl}
+                      download
+                      style={{
+                        padding: '10px 16px',
+                        background: 'var(--bg-elevated)', color: 'var(--accent-cyan)',
+                        border: '1px solid var(--accent-cyan)', borderRadius: 'var(--radius-sm)',
+                        fontSize: 12, fontWeight: 600, textDecoration: 'none',
+                        display: 'flex', alignItems: 'center',
+                      }}
+                    >
+                      Download Again
+                    </a>
+                    <a
+                      href={`/api/jobs/${jobId}/clips/${clipId}/seo.txt`}
+                      download
+                      title="Download SEO info (viral score, title, caption, tags, platform)"
+                      style={{
+                        padding: '10px 16px',
+                        background: 'var(--bg-elevated)', color: 'var(--text-secondary)',
+                        border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)',
+                        fontSize: 12, fontWeight: 600, textDecoration: 'none',
+                        display: 'flex', alignItems: 'center',
+                      }}
+                    >
+                      SEO .txt
+                    </a>
+                  </>
                 )}
               </div>
             )}

@@ -284,6 +284,11 @@ class Settings(BaseSettings):
     # a second or two before its intended moment. Great when you just need fast
     # previews to review; leave off when you need frame-accurate starts.
     CLIP_EXPORT_STREAM_COPY: bool = False
+    # When a clip is exported, also drop a human-readable ``.txt`` next to the
+    # MP4 (and auto-download it in the UI) carrying the clip's viral score,
+    # title, suggested caption, hashtags, recommended platform, per-platform
+    # SEO copy and captions — everything you'd paste into a social upload form.
+    CLIP_EXPORT_SEO_SIDECAR: bool = True
     CLIP_PREFERRED_SUBJECTS: str = ""  # topics to prioritize, comma-separated
     CLIP_AVOID_SUBJECTS: str = ""      # topics to skip, comma-separated
     CLIP_DISCOVERY_PROMPT: str = ""    # custom VideoLLaMA3 prompt; "" = built-in default

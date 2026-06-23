@@ -5037,21 +5037,41 @@ export default function Analysis() {
                   <h3 style={{ fontSize: 14, marginBottom: 12, color: 'var(--accent-cyan)' }}>Exported Clips</h3>
                   <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
                     {job.exported_clips.map((ec, i) => (
-                      <a
-                        key={i}
-                        href={`/api/files/${jobId}/clips/${ec.filename}`}
-                        download
-                        style={{
-                          padding: '8px 16px',
-                          background: 'var(--bg-elevated)',
-                          border: '1px solid var(--border)',
-                          borderRadius: 'var(--radius-sm)',
-                          fontSize: 12,
-                          color: 'var(--accent-cyan)',
-                        }}
-                      >
-                        {String(ec.filename || '')}
-                      </a>
+                      <div key={i} style={{ display: 'flex', alignItems: 'stretch', gap: 0 }}>
+                        <a
+                          href={`/api/files/${jobId}/clips/${ec.filename}`}
+                          download
+                          style={{
+                            padding: '8px 16px',
+                            background: 'var(--bg-elevated)',
+                            border: '1px solid var(--border)',
+                            borderRadius: ec.clip_id != null ? 'var(--radius-sm) 0 0 var(--radius-sm)' : 'var(--radius-sm)',
+                            fontSize: 12,
+                            color: 'var(--accent-cyan)',
+                          }}
+                        >
+                          {String(ec.filename || '')}
+                        </a>
+                        {ec.clip_id != null && (
+                          <a
+                            href={`/api/jobs/${jobId}/clips/${ec.clip_id}/seo.txt`}
+                            download
+                            title="Download SEO info (viral score, title, caption, tags, platform)"
+                            style={{
+                              padding: '8px 12px',
+                              background: 'var(--bg-elevated)',
+                              border: '1px solid var(--border)',
+                              borderLeft: 'none',
+                              borderRadius: '0 var(--radius-sm) var(--radius-sm) 0',
+                              fontSize: 12,
+                              color: 'var(--text-secondary)',
+                              whiteSpace: 'nowrap',
+                            }}
+                          >
+                            SEO .txt
+                          </a>
+                        )}
+                      </div>
                     ))}
                   </div>
                 </div>

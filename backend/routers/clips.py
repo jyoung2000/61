@@ -408,10 +408,20 @@ async def export_clip_endpoint(
                 })
                 await database.save_job(j)
 
+            # SEO sidecar (.txt) the exporter wrote next to the MP4 — same
+            # name, ``.txt`` extension. Sent so the frontend can auto-download
+            # it alongside the clip. Only advertise it if it's actually on disk.
+            _seo_basename = os.path.splitext(os.path.basename(output_path))[0] + ".txt"
+            _seo_path = os.path.join(os.path.dirname(output_path), _seo_basename)
+            _seo_url = (
+                f"/api/files/{job_id}/clips/{quote(_seo_basename)}?t={int(time.time())}"
+                if os.path.isfile(_seo_path) else None
+            )
             await broadcast_ws(job_id, {
                 "type": "export_complete",
                 "clip_id": req.clip_id,
                 "download_url": f"/api/files/{job_id}/clips/{quote(os.path.basename(output_path))}?t={int(time.time())}",
+                "seo_url": _seo_url,
                 "message": f"Clip {req.clip_id} exported in {elapsed}s [{req.export_quality or '1080p'}]",
                 "qa_passed": True,
             })
@@ -1986,6 +1996,64 @@ async def update_clip_seo(job_id: str, clip_id: int, req: UpdateClipSEORequest):
         "shorts_description": clip.shorts_description,
         "longform_description": clip.longform_description,
     }
+
+
+@router.get("/jobs/{job_id}/clips/{clip_id}/seo.txt")
+async def download_clip_seo_text(job_id: str, clip_id: int):
+    """Download a clip's SEO info as a ``.txt``: viral score, title,
+    suggested caption, hashtags, recommended platform, per-platform SEO and
+    the clip's captions.
+
+    Built fresh from the live job so it reflects SEO edits made after the
+    export, and works even for clips exported before sidecars existed (the
+    exporter also drops the same file next to the MP4 at export time). This
+    powers the companion download next to every "Download clip" affordance.
+    """
+    from fastapi.responses import Response
+    from backend.services.clip_seo_sidecar import format_clip_seo_text, find_clip
+
+    job = await database.load_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    clip = find_clip(job, clip_id)
+    if not clip:
+        raise HTTPException(status_code=404, detail="Clip not found")
+
+    # Prefer the metadata from this clip's most recent export so the file
+    # mirrors what was actually rendered; fall back to the clip's own range.
+    export_info = {"job_id": job_id}
+    mp4_name = None
+    for ec in reversed(getattr(job, "exported_clips", None) or []):
+        if ec.get("clip_id") == clip_id:
+            export_info.update({
+                "start": ec.get("start"),
+                "end": ec.get("end"),
+                "export_quality": ec.get("export_quality"),
+                "aspect_ratio": ec.get("aspect_ratio"),
+                "subtitles_enabled": ec.get("subtitles_enabled"),
+                "clip_title": ec.get("title"),
+            })
+            mp4_name = ec.get("filename")
+            break
+    if export_info.get("start") is None:
+        export_info["start"] = getattr(clip, "start_time", None)
+        export_info["end"] = getattr(clip, "end_time", None)
+
+    transcript = (getattr(job, "translated_transcript", None)
+                  or getattr(job, "transcript", None) or [])
+    mp4_label = mp4_name or f"clip_{clip_id}.mp4"
+    txt_name = (os.path.splitext(mp4_name)[0] + ".txt") if mp4_name else f"clip_{clip_id}_seo.txt"
+    text = format_clip_seo_text(job, clip, mp4_label,
+                                export_info=export_info, transcript=transcript)
+    headers = {
+        # ASCII fallback + RFC 5987 UTF-8 name (titles may contain Unicode).
+        "Content-Disposition": (
+            f'attachment; filename="clip_{clip_id}_seo.txt"; '
+            f"filename*=UTF-8''{quote(txt_name)}"
+        ),
+        "Cache-Control": "no-store",
+    }
+    return Response(content=text, media_type="text/plain; charset=utf-8", headers=headers)
 
 
 # ═══════════════════════════════════════════════════════

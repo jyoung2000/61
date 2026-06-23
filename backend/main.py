@@ -1153,6 +1153,7 @@ async def serve_file(job_id: str, path: str, request: Request):
         ".gif": "image/gif", ".webp": "image/webp",
         ".mp3": "audio/mpeg", ".wav": "audio/wav", ".aac": "audio/aac",
         ".ogg": "audio/ogg", ".flac": "audio/flac",
+        ".txt": "text/plain; charset=utf-8",  # per-clip SEO sidecar
     }
     content_type = _CONTENT_TYPES.get(ext, "application/octet-stream")
 

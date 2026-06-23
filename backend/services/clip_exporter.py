@@ -7920,6 +7920,32 @@ async def export_clip(
         )
 
         logger.info(f"Exported clip {clip_id} to {output_path}")
+
+        # Drop a human-readable SEO sidecar (.txt) next to the MP4 so the
+        # user gets the clip's viral score, title, caption, hashtags,
+        # recommended platform, per-platform SEO and captions to paste into
+        # a social upload. Best-effort — never fail the export over it.
+        if app_settings.CLIP_EXPORT_SEO_SIDECAR:
+            try:
+                from backend.services.clip_seo_sidecar import write_clip_seo_sidecar
+                _job = await database.load_job(job_id)
+                if _job is not None:
+                    write_clip_seo_sidecar(
+                        _job, clip_id, output_path,
+                        export_info={
+                            "start": start,
+                            "end": end,
+                            "export_quality": export_quality,
+                            "aspect_ratio": aspect_ratio,
+                            "subtitles_enabled": subtitles_enabled,
+                            "clip_title": clip_title,
+                            "hook_text": hook_text,
+                            "job_id": job_id,
+                        },
+                    )
+            except Exception as _seo_err:  # pragma: no cover — best-effort
+                logger.warning("SEO sidecar generation skipped: %s", _seo_err)
+
         return output_path
 
     finally:

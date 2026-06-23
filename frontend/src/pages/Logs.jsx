@@ -857,6 +857,26 @@ export default function Logs() {
                       >
                         Export MP4
                       </a>
+                      {ec.clip_id != null && (
+                        <a
+                          href={`/api/jobs/${ec.jobId}/clips/${ec.clip_id}/seo.txt`}
+                          download
+                          title="Download SEO info (viral score, title, caption, tags, platform)"
+                          style={{
+                            padding: '6px 12px',
+                            background: 'var(--bg-elevated)',
+                            color: 'var(--text-secondary)',
+                            border: '1px solid var(--border)',
+                            borderRadius: 'var(--radius-sm)',
+                            fontSize: 12,
+                            fontWeight: 600,
+                            textDecoration: 'none',
+                            whiteSpace: 'nowrap',
+                          }}
+                        >
+                          SEO .txt
+                        </a>
+                      )}
                       {qualityMenuOpen === i && (
                         <div style={{
                           position: 'absolute', bottom: '100%', right: 0,

@@ -76,6 +76,7 @@ jobs:
             tests/test_audio_precondition_chain.py \
             tests/test_job_events_persistence.py \
             tests/test_browser_preview_nonblocking.py \
+            tests/test_clip_seo_sidecar.py \
             backend/tests/test_repetition_and_timeline.py \
             backend/tests/test_translation_fail_loud.py \
             backend/tests/test_engine_checkpoint.py

@@ -1,3 +1,33 @@
+# ClipAI — Every exported clip now ships an SEO ``.txt`` next to the MP4
+
+Exporting/downloading a clip now also gives you a human-readable ``.txt`` with
+everything you'd paste into a social upload form: **viral score** (+ the
+hook/flow/value/trend breakdown and reasoning), **title** (and SEO title),
+**suggested caption**, **hashtags**, **recommended platform**, **per-platform
+SEO** (title/description/tags/tips for each target), description, "why this
+works", the **export details**, and the clip's **captions/transcript** (range-
+filtered, clip-relative timestamps).
+
+How it works:
+- **`backend/services/clip_seo_sidecar.py`** (new): pure-stdlib formatter +
+  best-effort writer. Reads every field defensively (pydantic model *or*
+  persisted dict), filters captions to the clip window, and renders a tidy
+  sectioned report. A sidecar problem never fails the actual export.
+- **`clip_exporter.export_clip`** drops `[QUALITY] Title.txt` next to the MP4
+  after each render (gated by `CLIP_EXPORT_SEO_SIDECAR`, default on), so **all**
+  export paths — UI, API, agent, batch, share — get it for free.
+- **Auto-download**: the export's WebSocket `export_complete` now carries a
+  `seo_url`; `useEncodingManager` fetches and saves it right after the clip,
+  so a single Export click lands both `[1080P] Title.mp4` and
+  `[1080P] Title.txt`. The share-page URL rewriter is applied to it too.
+- **Re-download**: a new `GET /api/jobs/{job}/clips/{clip}/seo.txt` builds the
+  file *fresh* from the live job (so it reflects SEO edits made after export and
+  works for clips exported before this shipped). Companion "SEO .txt" links sit
+  next to every "Download clip" affordance — the ClipSEO toolbar, the Analysis
+  **Exported Clips** list, and the Logs **Exported** list.
+
+---
+
 # ClipAI — Transcript-tab edits now reach the subtitle elements (and back), even with a translation
 
 Editing a line in the Transcript tab (text, speaker, split/merge, delete, insert)
