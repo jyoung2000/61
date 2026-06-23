@@ -1,3 +1,29 @@
+# ClipAI — Less choppy translated captions: borrow idle time before splitting
+
+A translated CJK→EN cue is usually longer than the short source window that
+timed it, so the CPS (reading-speed) enforcer used to **shatter** it into 2-3
+word flashes — the last run shipped 520 cues from 193 translated lines, 44% of
+them ≤3 words. That's the opposite of the YouTube/Netflix look.
+
+Fix — **Pass 0.7: extend-before-split** (`subtitle_formatter.enforce_readability`,
+gated by `SUBTITLE_EXTEND_BEFORE_SPLIT`, default on). Before splitting an
+over-fast cue, first stretch its on-screen time into the **idle gap after it**
+(this clip was only ~24% speech — there's plenty), bounded by the next cue's
+start and the max display duration so it can never overrun a neighbour or
+inflate the timeline. Only cues that are *still* over the cap after stretching
+get split. On the failing example a 23-CPS line drops to exactly the 20 cap by
+gaining 0.3 s and stays a single readable phrase. `SUBTITLE_MIN_SPLIT_CHARS`
+also raised 10 → 14 so any split that *does* happen can't strand a ~2-word cue.
+
+(Diagnostic note for the 4 GB GTX 1650 run: the dominant quality limiter was
+VRAM — `llava:7b` (~4 GB) and `qwen2.5:3b` both OOM'd, so source polishing
+failed 0/107 and the LLM circuit-breaker went DEGRADED mid-run. Smaller models
+— e.g. `moondream:1.8b` for vision — avoid the cascade. The translated track the
+backend *persisted* was 100% English at grade A; any source-language lines in an
+exported file came from a snapshot taken across the run's 33-min reconnect.)
+
+---
+
 # ClipAI — Every exported clip now ships an SEO ``.txt`` next to the MP4
 
 Exporting/downloading a clip now also gives you a human-readable ``.txt`` with

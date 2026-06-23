@@ -825,6 +825,43 @@ def enforce_readability(
             segments, max_cps=max_cps, max_chars_per_line=max_chars_per_line,
             max_lines=max_lines, max_dur_s=max_dur_s, max_gap_s=_merge_gap_s)
 
+    # ── Pass 0.7: borrow idle time to satisfy CPS BEFORE splitting ──────
+    # A cue that reads too fast (CPS over the cap) does NOT need to be shattered
+    # into 2-3 word flashes when there's silence after it — stretch its display
+    # time into that gap first, then let Pass 1 split only what's STILL over cap.
+    # This is the dominant anti-choppiness lever for translated CJK→EN tracks:
+    # the English is longer than the short source window that timed the cue, so
+    # without this every long line gets cut into fragments. The new end is
+    # BOUNDED by the next cue's start (minus the min gap) and the max display
+    # duration, so it can only consume genuine idle time — never overrun a
+    # neighbour or inflate the timeline. Word timing (when present) is preserved.
+    try:
+        from backend.config import settings as _es
+        _extend_before_split = bool(getattr(_es, "SUBTITLE_EXTEND_BEFORE_SPLIT", True))
+    except Exception:
+        _extend_before_split = True
+    if _extend_before_split:
+        _ext: list[TranscriptSegment] = []
+        _n = len(segments)
+        for _i, seg in enumerate(segments):
+            _t = (seg.text or "").strip()
+            _d = max(0.001, seg.end - seg.start)
+            if _t and not _is_bracket_marker(_t) and _cps(_t, _d) > max_cps:
+                # ``_cps(text, 1.0)`` is the cue's effective (CJK-weighted) length;
+                # dividing by the cap gives the duration that lands exactly at it.
+                _target_dur = _cps(_t, 1.0) / max_cps if max_cps > 0 else _d
+                _next_start = (segments[_i + 1].start
+                               if _i + 1 < _n else seg.end + _target_dur)
+                _new_end = max(seg.end, min(seg.start + min(_target_dur, max_dur_s),
+                                            _next_start - min_gap_s))
+                if _new_end > seg.end:
+                    seg = TranscriptSegment(
+                        start=seg.start, end=_new_end, text=seg.text,
+                        speaker=seg.speaker, words=seg.words, confidence=seg.confidence,
+                    )
+            _ext.append(seg)
+        segments = _ext
+
     # ── Pass 1: CPS-driven splitting + filler trimming + duration extension
     for seg in segments:
         if not (seg and (seg.text or "").strip()):

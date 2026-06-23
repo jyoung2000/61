@@ -456,7 +456,16 @@ class Settings(BaseSettings):
     # splitter from shattering slow / dramatic narration (Whisper detects
     # multi-second pauses *between* words) into unreadable one-word cues,
     # which also wrecks per-cue translation. 0 disables the guard.
-    SUBTITLE_MIN_SPLIT_CHARS: int = 10
+    SUBTITLE_MIN_SPLIT_CHARS: int = 14
+    # Before splitting an over-fast (CPS > cap) cue into 2-3 word flashes, first
+    # STRETCH its on-screen time into the idle gap after it (bounded by the next
+    # cue + the max display duration — never overruns a neighbour). Translated
+    # CJK→EN cues are often longer than the source window that timed them, so the
+    # naive fix is to shatter them; borrowing the (usually ample) silence after a
+    # line keeps it a single readable phrase instead. The biggest lever against
+    # choppiness on paused / sparse-speech videos. Splitting still runs for cues
+    # that are STILL over the cap after stretching.
+    SUBTITLE_EXTEND_BEFORE_SPLIT: bool = True
     # Greedy phrase-merge: combine consecutive same-speaker cues into one fuller
     # cue (up to the duration / 2-line / CPS limits) when the gap between them is
     # at most this many ms. VAD over-segments slow / paused speech, so the
