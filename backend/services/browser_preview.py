@@ -231,6 +231,61 @@ def _preview_path_for(source_path: str) -> str:
     return os.path.join(directory, "browser_preview.v2.mp4")
 
 
+def _none_marker_for(source_path: str) -> str:
+    """Sentinel written when a source needs NO preview (already browser-friendly).
+
+    Lets the fast path resolve "serve the raw source" without re-running ffprobe
+    on every Range request — otherwise scrubbing an already-compatible MP4 spawns
+    an ffprobe per seek, which is exactly the kind of contention that stalled the
+    preview during offline analysis."""
+    return _preview_path_for(source_path) + ".none"
+
+
+def cached_browser_preview(source_path: str):
+    """Non-blocking resolution of what to serve — never probes or transcodes.
+
+    Returns:
+      * the cached preview path when a fresh ``browser_preview.v2.mp4`` exists,
+      * ``source_path`` when we've already determined no preview is needed
+        (fresh ``.none`` sentinel) or the source isn't a real file,
+      * ``None`` when UNRESOLVED — the caller should serve the raw source now and
+        (when appropriate) trigger background generation.
+
+    This keeps the HTTP request path free of ffprobe/ffmpeg so the ``<video>``
+    element always gets bytes immediately, even while the analysis pipeline is
+    saturating the CPU/GPU.
+    """
+    if not source_path or not os.path.isfile(source_path):
+        return source_path
+    target = _preview_path_for(source_path)
+    try:
+        src_m = os.path.getmtime(source_path)
+    except OSError:
+        return None
+    if os.path.isfile(target):
+        try:
+            if os.path.getmtime(target) >= src_m and os.path.getsize(target) > 0:
+                return target
+        except OSError:
+            return target
+    marker = _none_marker_for(source_path)
+    if os.path.isfile(marker):
+        try:
+            if os.path.getmtime(marker) >= src_m:
+                return source_path
+        except OSError:
+            pass
+    return None
+
+
+def _touch_none_marker(source_path: str) -> None:
+    try:
+        with open(_none_marker_for(source_path), "w", encoding="utf-8") as fh:
+            fh.write(str(int(time.time())))
+    except OSError:
+        pass
+
+
 def _should_copy_video(probe: _ProbeResult) -> bool:
     """Return True when it is safe to stream-copy the source video.
 
@@ -497,6 +552,9 @@ def ensure_browser_preview(source_path: str) -> str:
         # deployments without ffprobe available.
         return source_path
     if not _needs_preview(source_path, probe):
+        # Cache the "already browser-friendly" decision so future Range requests
+        # resolve via cached_browser_preview() without re-probing.
+        _touch_none_marker(source_path)
         return source_path
 
     lock_path = _lock_path_for(target_path)

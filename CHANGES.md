@@ -1,3 +1,32 @@
+# ClipAI — Preview player loads during analysis (no more blocking browser-preview transcode)
+
+The in-page preview player wouldn't load while an offline job was processing. Root
+cause: `GET /api/files/{id}/video.*` (`main.py:serve_file`) `await`ed
+`ensure_browser_preview()` for the source video on EVERY request — which re-ran
+`ffprobe` per Range request and, for non-browser-friendly sources, kicked off a
+full (up to 30-min) ffmpeg transcode. During offline analysis that work contended
+with the saturated pipeline, so the `<video>` request hung and the player never
+loaded.
+
+Fix — the request path never blocks on ffprobe/ffmpeg now:
+- **`browser_preview.cached_browser_preview()`** (new): non-blocking resolution —
+  returns the cached `browser_preview.v2.mp4` if fresh, the raw source if we've
+  already determined none is needed (a new `.none` sentinel, written once so
+  scrubbing an already-compatible MP4 no longer spawns an ffprobe per seek), or
+  `None` when unresolved.
+- **`serve_file`** serves the cached preview when ready, otherwise streams the RAW
+  source immediately (range requests still work), and only schedules preview
+  generation **in the background** — and only when `pipeline.is_job_analyzing(id)`
+  is False, so the transcode can't steal CPU/GPU from the live pipeline.
+- Background generation (`_schedule_browser_preview`) is deduped per source and
+  holds strong task refs.
+
+Net: the player loads instantly during analysis (raw source); the polished
+browser preview is still produced afterward for incompatible/oversize sources.
+New unit tests in `tests/test_browser_preview_nonblocking.py` (added to CI).
+
+---
+
 # ClipAI — Durable PROCESSING LOG: survives tab reload, new device, container restart
 
 The Analysis page's PROCESSING LOG was built purely from live WebSocket messages

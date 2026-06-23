@@ -969,6 +969,16 @@ class _PipelineHeartbeat:
 # Active heartbeats per job
 _heartbeats: dict[str, _PipelineHeartbeat] = {}
 
+
+def is_job_analyzing(job_id: str) -> bool:
+    """True while ``run_analysis`` is actively processing this job.
+
+    A heartbeat is registered for the whole run and removed in the ``finally``,
+    so this is a cheap in-memory signal. Used by the file-serving endpoint to
+    avoid kicking off a CPU-heavy browser-preview transcode that would contend
+    with the live offline pipeline (which is what stalled the preview player)."""
+    return job_id in _heartbeats
+
 # Strong references to in-flight background tasks so the asyncio loop
 # doesn't garbage-collect them mid-flight (transcript polish + subtitle
 # translation, scheduled after analysis completes).

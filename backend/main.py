@@ -1046,6 +1046,39 @@ if _symlinked:
     logger.info("Symlinked %d system fonts into /data/fonts for FFmpeg fontsdir", _symlinked)
 
 
+# Background browser-preview generation: strong refs so tasks aren't GC'd, plus
+# an in-flight set so concurrent Range requests don't schedule duplicate work.
+_PREVIEW_BG_TASKS: set = set()
+_PREVIEW_INFLIGHT: set = set()
+
+
+def _schedule_browser_preview(source_path: str) -> None:
+    """Kick off browser-preview generation in the BACKGROUND (never blocks the
+    request). Deduped per source path. Used only when the owning job is not
+    actively analyzing, so the transcode can't contend with the live pipeline."""
+    import asyncio
+    if source_path in _PREVIEW_INFLIGHT:
+        return
+    _PREVIEW_INFLIGHT.add(source_path)
+
+    async def _gen():
+        try:
+            from backend.services.browser_preview import ensure_browser_preview_async
+            await ensure_browser_preview_async(source_path)
+        except Exception as e:  # pragma: no cover — best-effort
+            logger.debug("background browser_preview failed for %s: %s", source_path, e)
+        finally:
+            _PREVIEW_INFLIGHT.discard(source_path)
+
+    try:
+        t = asyncio.create_task(_gen())
+        _PREVIEW_BG_TASKS.add(t)
+        t.add_done_callback(_PREVIEW_BG_TASKS.discard)
+    except RuntimeError:
+        # No running loop (shouldn't happen inside a request) — drop the flag.
+        _PREVIEW_INFLIGHT.discard(source_path)
+
+
 @app.get("/api/files/{job_id}/{path:path}")
 async def serve_file(job_id: str, path: str, request: Request):
     """Serve video files and exported clips with range request support."""
@@ -1075,11 +1108,25 @@ async def serve_file(job_id: str, path: str, request: Request):
     _basename = os.path.basename(file_path).lower()
     _is_source_video = _basename.startswith("video.") and "/clips/" not in path
     if _is_source_video:
+        # NEVER block the request on ffprobe/ffmpeg. Previously this awaited
+        # ensure_browser_preview(), which re-probed on every Range request and
+        # could trigger a 30-min transcode — during offline analysis that
+        # contended with the pipeline and left the preview player hanging
+        # ("not loading"). Now: serve the cached preview if ready; otherwise
+        # stream the RAW source immediately and (only when the job isn't mid-
+        # analysis) build the preview in the background for next time.
         try:
-            from backend.services.browser_preview import ensure_browser_preview_async
-            file_path = await ensure_browser_preview_async(file_path)
+            from backend.services.browser_preview import cached_browser_preview
+            resolved = cached_browser_preview(file_path)
+            if resolved is not None:
+                file_path = resolved
+            else:
+                from backend.services.pipeline import is_job_analyzing
+                if not is_job_analyzing(job_id):
+                    _schedule_browser_preview(file_path)
+                # else: serve the raw source as-is during analysis
         except Exception as e:  # pragma: no cover — fallback path
-            logger.warning("serve_file: browser_preview generation failed: %s", e)
+            logger.warning("serve_file: browser_preview resolution failed: %s", e)
 
     file_size = os.path.getsize(file_path)
     ext = os.path.splitext(file_path)[1].lower()
