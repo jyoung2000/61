@@ -1091,6 +1091,7 @@ export default function TranscriptViewer({ transcript, onSeek, jobId, onSpeakerR
           maxHeight: maxHeight || 500,
           overflowY: 'auto',
           overflowX: 'hidden',
+          WebkitOverflowScrolling: 'touch',   // momentum scrolling on iOS
           position: 'relative',
           scrollbarGutter: 'stable',
           // Stop wheel scrolls from chaining to the page when the
@@ -1146,10 +1147,12 @@ export default function TranscriptViewer({ transcript, onSeek, jobId, onSpeakerR
                   borderRadius: 'var(--radius-sm)',
                   transition: 'background 0.2s, border-color 0.2s, box-shadow 0.2s',
                   ...(isActiveSeg && !isSelected ? {
-                    background: 'rgba(10,132,255,0.18)',
-                    borderLeft: '3px solid var(--accent-cyan)',
-                    boxShadow: 'inset 0 0 0 1px rgba(10,132,255,0.35)',
-                    paddingLeft: 5,
+                    // Currently-spoken line — unmistakably blue so it's easy to
+                    // track while the video plays (was a faint 18% tint).
+                    background: 'rgba(10,132,255,0.32)',
+                    borderLeft: '4px solid #0a84ff',
+                    boxShadow: 'inset 0 0 0 1px rgba(10,132,255,0.55)',
+                    paddingLeft: 4,
                   } : isSelected ? {
                     background: 'var(--accent-cyan-dim, rgba(0,217,255,0.12))',
                     borderLeft: '2px solid var(--accent-cyan)',

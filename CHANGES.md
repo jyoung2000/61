@@ -132,6 +132,24 @@ New unit tests in `tests/test_audio_precondition_chain.py` (added to CI).
 
 ---
 
+# ClipAI — Transcript tab: clearer blue "now-playing" highlight + smoother mobile autoscroll
+
+The transcript tab already tracks playback (TranscriptViewer computes the active
+line from the player's currentTime, highlights it, and auto-centers it via a
+manual-override-aware lerp; both the Analysis tab — side-by-side inline player on
+desktop, stacked on mobile — and the ClipSEO pages feed it a live currentTime). Two
+polish fixes so it reads clearly and scrolls right on both desktop and mobile:
+- The active line's highlight was a faint 18% blue tint; bumped to a clear 32% blue
+  with a 4px ``#0a84ff`` left bar so the currently-spoken line is obvious.
+- Added ``WebkitOverflowScrolling: touch`` to the transcript scroll container for
+  momentum scrolling on iOS. (The container already had ``overscroll-behavior:
+  contain`` + ``touch-action: pan-y``, so manual scrolling and the auto-center
+  coexist on touch devices.)
+Both changes live in the shared ``TranscriptViewer``, so they apply on the Analysis
+transcript tab and the SEO pages at once.
+
+---
+
 # ClipAI — Much faster clip export: GPU encode + parallel + optional stream-copy
 
 Clip export was the single longest tail of the run — ~48 min for 63 clips in the
