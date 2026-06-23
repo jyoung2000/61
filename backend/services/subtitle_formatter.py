@@ -651,6 +651,66 @@ def _split_would_strand(left_text: str, right_text: str, min_chars: int) -> bool
             or _piece_too_short(right_text, is_cjk, min_chars))
 
 
+def _is_bracket_marker(text: str) -> bool:
+    """True for a bracketed non-speech caption marker (``[♪ music ♪]``,
+    ``[applause]``). Such cues must never be merged into adjacent dialogue."""
+    t = (text or "").strip()
+    return t.startswith("[") and t.endswith("]")
+
+
+def _merge_for_readability(
+    segments: list[TranscriptSegment],
+    max_cps: float,
+    max_chars_per_line: int,
+    max_lines: int,
+    max_dur_s: float,
+    max_gap_s: float,
+) -> list[TranscriptSegment]:
+    """Greedily merge consecutive same-speaker cues into the longest cue that
+    still satisfies every readability limit (duration, 2-line char budget, CPS).
+
+    Combats the over-segmentation that makes a transcript read like a flicker of
+    2-3 word lines: slow / paused speech that VAD split into "So am I" /
+    "planning on" / "eating with you" becomes one complete, readable caption.
+    Bridges only SMALL gaps (continuous speech ≤ ``max_gap_s``) and never crosses
+    a speaker change or a ``[♪ music ♪]`` marker. Order-preserving."""
+    if not segments or max_gap_s <= 0:
+        return segments
+    char_budget = max(int(max_chars_per_line), int(max_chars_per_line) * max(1, int(max_lines)))
+    out: list[TranscriptSegment] = []
+    for seg in segments:
+        txt = (seg.text or "").strip()
+        if not out:
+            out.append(seg)
+            continue
+        prev = out[-1]
+        prev_txt = (prev.text or "").strip()
+        gap = seg.start - prev.end
+        same_speaker = (prev.speaker or "") == (seg.speaker or "")
+        if (txt and prev_txt and same_speaker
+                and not _is_bracket_marker(prev_txt) and not _is_bracket_marker(txt)
+                and 0.0 <= gap <= max_gap_s):
+            joiner = "" if (_is_cjk(prev_txt) and _is_cjk(txt)) else " "
+            cand = (prev_txt + joiner + txt).strip()
+            cand_end = max(prev.end, seg.end)
+            cand_dur = max(0.001, cand_end - prev.start)
+            # Only merge when the RESULT is still fully readable: fits a 2-line
+            # cue, stays within the max display duration, and reads at/under the
+            # CPS cap (``_cps`` weights CJK glyphs). Otherwise leave them split.
+            if (cand_dur <= max_dur_s
+                    and len(cand.replace("\n", " ")) <= char_budget
+                    and _cps(cand, cand_dur) <= max_cps):
+                out[-1] = TranscriptSegment(
+                    start=prev.start, end=cand_end, text=cand,
+                    speaker=prev.speaker,
+                    words=(list(prev.words or []) + list(seg.words or [])),
+                    confidence=prev.confidence,
+                )
+                continue
+        out.append(seg)
+    return out
+
+
 def enforce_readability(
     segments: list[TranscriptSegment],
     max_cps: float = 20.0,
@@ -749,6 +809,21 @@ def enforce_readability(
                 )
         repaired.append(seg)
     segments = repaired
+
+    # ── Pass 0.5: Greedy phrase merge (fewer, fuller, more readable cues) ──
+    # Build consecutive same-speaker fragments up to the readable maximum BEFORE
+    # the splitter runs, so the output is complete phrases per cue (the
+    # YouTube/Netflix look) instead of a stream of 2-3 word flashes. Anything
+    # still over the CPS/duration cap is then split at clause boundaries below.
+    try:
+        from backend.config import settings as _ms
+        _merge_gap_s = float(getattr(_ms, "SUBTITLE_MERGE_MAX_GAP_MS", 1200)) / 1000.0
+    except Exception:
+        _merge_gap_s = 1.2
+    if _merge_gap_s > 0:
+        segments = _merge_for_readability(
+            segments, max_cps=max_cps, max_chars_per_line=max_chars_per_line,
+            max_lines=max_lines, max_dur_s=max_dur_s, max_gap_s=_merge_gap_s)
 
     # ── Pass 1: CPS-driven splitting + filler trimming + duration extension
     for seg in segments:

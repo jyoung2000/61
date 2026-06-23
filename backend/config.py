@@ -422,6 +422,16 @@ class Settings(BaseSettings):
     # multi-second pauses *between* words) into unreadable one-word cues,
     # which also wrecks per-cue translation. 0 disables the guard.
     SUBTITLE_MIN_SPLIT_CHARS: int = 10
+    # Greedy phrase-merge: combine consecutive same-speaker cues into one fuller
+    # cue (up to the duration / 2-line / CPS limits) when the gap between them is
+    # at most this many ms. VAD over-segments slow / paused speech, so the
+    # translator emits many 2-3 word fragments ("So am I" / "planning on" /
+    # "eating with you"); merging them into complete phrases is what makes the
+    # transcript read like YouTube/Netflix captions instead of a flicker of short
+    # lines, and is the biggest lever on the duration sub-score (no more sub-833ms
+    # flashes). Only bridges SMALL gaps (continuous speech) — never a real pause,
+    # a speaker change, or a [♪ music ♪] marker. 0 disables the merge.
+    SUBTITLE_MERGE_MAX_GAP_MS: int = 1200
     SUBTITLE_PLATFORM_SAFE_ZONES: bool = True   # per-platform margin profiles
     SUBTITLE_PLATFORM_PROFILE: str = ""         # "" | tiktok | reels | shorts | horizontal | square
 

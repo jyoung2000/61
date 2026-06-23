@@ -721,6 +721,17 @@ async def _llm_cleanup_untranslated(segments, source_lang, target_lang,
             return segments
 
         _tgt_name = "English" if _tgt == "en" else (target_lang or "English")
+        # Recurring-name glossary so each cue's re-translation renders names the
+        # SAME way the main pass did (consistency — no "Mika"/"Mikka"/"Mikako"
+        # drift, no coined name turned into an ordinary word). Same auto-extractor
+        # translate_via_llm uses; empty string when nothing recurs.
+        _terms_block = ""
+        try:
+            from backend.services.glossary import build_translation_glossary_block
+            _terms_block = build_translation_glossary_block(
+                segments, source_lang, _tgt_name)
+        except Exception:
+            _terms_block = ""
         logger.info(
             "[%s] Offline NMT left %d/%d cue(s) in the source language (%.0f%%) — "
             "per-cue LLM cleanup (budget %.0fs)",
@@ -754,7 +765,8 @@ async def _llm_cleanup_untranslated(segments, source_lang, target_lang,
                                    job_id, len(_cache))
                     break
                 prompt = (
-                    f"Translate this subtitle line into natural, fluent {_tgt_name}. "
+                    (_terms_block or "")
+                    + f"Translate this subtitle line into natural, fluent {_tgt_name}. "
                     f"Reply with ONLY the {_tgt_name} translation — no quotes, no "
                     f"notes, do not repeat the original.\n\n{src_text}")
                 # ``except Exception`` only — a real cancel (CancelledError, a

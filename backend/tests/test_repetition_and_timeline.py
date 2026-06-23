@@ -141,6 +141,68 @@ def test_find_split_point_lands_on_word_boundary_not_mid_word():
     assert all(w in src_words for w in t[idx:].split())
 
 
+# ── greedy phrase merge (fewer, fuller, readable cues) ───────────────────
+
+def _ts(start, end, text, speaker="Speaker 1"):
+    return TranscriptSegment(start=start, end=end, text=text, speaker=speaker)
+
+
+def test_merge_combines_short_same_speaker_fragments():
+    from backend.services.subtitle_formatter import _merge_for_readability
+    segs = [_ts(0.0, 1.0, "So am I planning on"),
+            _ts(1.1, 2.0, "eating with"),
+            _ts(2.1, 3.0, "you today too")]
+    out = _merge_for_readability(segs, max_cps=20.0, max_chars_per_line=42,
+                                 max_lines=2, max_dur_s=4.5, max_gap_s=1.2)
+    assert len(out) == 1
+    assert out[0].text == "So am I planning on eating with you today too"
+    assert out[0].start == 0.0 and out[0].end == 3.0
+
+
+def test_merge_stops_at_speaker_change():
+    from backend.services.subtitle_formatter import _merge_for_readability
+    segs = [_ts(0.0, 1.0, "Hello there", "Speaker 1"),
+            _ts(1.1, 2.0, "Hi back", "Speaker 2")]
+    out = _merge_for_readability(segs, 20.0, 42, 2, 4.5, 1.2)
+    assert len(out) == 2
+
+
+def test_merge_stops_at_large_gap():
+    from backend.services.subtitle_formatter import _merge_for_readability
+    segs = [_ts(0.0, 1.0, "First thought"), _ts(5.0, 6.0, "Much later")]
+    out = _merge_for_readability(segs, 20.0, 42, 2, 4.5, 1.2)
+    assert len(out) == 2
+
+
+def test_merge_respects_max_duration_and_cps_and_markers():
+    from backend.services.subtitle_formatter import _merge_for_readability
+    # Would exceed 4.5s → not merged.
+    a = _merge_for_readability([_ts(0.0, 3.0, "Aaa"), _ts(3.1, 6.5, "Bbb")],
+                               20.0, 42, 2, 4.5, 1.2)
+    assert len(a) == 2
+    # Merge would read at 22 CPS (>20) → not merged.
+    b = _merge_for_readability([_ts(0.0, 0.5, "abcdefghijk"),
+                                _ts(0.5, 1.0, "lmnopqrstuv")],
+                               20.0, 42, 2, 4.5, 1.2)
+    assert len(b) == 2
+    # A [♪ music ♪] marker never merges into dialogue.
+    c = _merge_for_readability([_ts(0.0, 1.0, "[♪ music ♪]"),
+                                _ts(1.1, 2.0, "Hello")],
+                               20.0, 42, 2, 4.5, 1.2)
+    assert len(c) == 2
+
+
+def test_enforce_readability_merges_choppy_fragments_into_fewer_cues():
+    # End-to-end: choppy fragments collapse to a complete, readable caption.
+    segs = [_ts(0.0, 1.0, "So am I planning on"),
+            _ts(1.1, 2.0, "eating with"),
+            _ts(2.1, 3.0, "you today too")]
+    out = enforce_readability(segs)
+    assert len(out) <= 2
+    words = " ".join(p.text.replace("\n", " ") for p in out).split()
+    assert words == "So am I planning on eating with you today too".split()
+
+
 def test_enforce_readability_never_breaks_a_word_on_wordless_cue():
     # Short duration → over-CPS → forces the char-proportional splitter to
     # recurse into the word-boundary fallback (the mid-word bug site). No

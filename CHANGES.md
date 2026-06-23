@@ -132,6 +132,40 @@ New unit tests in `tests/test_audio_precondition_chain.py` (added to CI).
 
 ---
 
+# ClipAI — Readable captions: merge choppy fragments + recurring-name glossary in cleanup
+
+Follow-up to the fresh run (now fully translated + phantom-free): the transcript
+still read choppily — strings of 2-3 word cues ("So am I planning on" / "eating
+with" / "you today too") because VAD over-segments slow/paused speech and the
+translator emits one cue per fragment. Short cues also fail the readability grade's
+duration sub-score (sub-833ms flashes), capping it at B.
+
+A — Greedy phrase merge (the YouTube/Netflix look). New
+``subtitle_formatter._merge_for_readability`` runs BEFORE the splitter in
+``enforce_readability``: it combines consecutive SAME-SPEAKER cues into the longest
+caption that still satisfies every limit — ≤ 2 lines × 42 chars, ≤ 4.5 s, and
+≤ the CPS cap (Netflix 17/21 Latin, 13 CJK) — bridging only small gaps (continuous
+speech, ≤ ``SUBTITLE_MERGE_MAX_GAP_MS`` = 1200 ms), never a real pause, a speaker
+change, or a ``[♪ music ♪]`` marker. So fragments become complete phrases and only
+genuinely-long cues are then split at clause boundaries. This lifts the duration +
+gap sub-scores (fewer, fuller cues) toward an A and reads far more naturally, the
+same on offline and cloud (shared formatter). New config:
+``SUBTITLE_MERGE_MAX_GAP_MS``.
+
+B — Recurring-name glossary in the per-cue cleanup. The auto recurring-terms
+glossary (``glossary.extract_recurring_terms``) was already fed to the main
+``translate_via_llm`` pass; it now also primes the per-cue LLM cleanup
+(``_llm_cleanup_untranslated``) so any re-translated stragglers render names the
+SAME way (no "Mika"/"Mikka"/"Mikako" drift, no coined name flattened to an ordinary
+word). (One-off ASR mis-hearings of a name still need a bigger model or a
+user-supplied glossary.json — the recurrence-based glossary only pins names that
+actually repeat.)
+
+Regression tests for the merge + word-boundary split added to
+``backend/tests/test_repetition_and_timeline.py``.
+
+---
+
 # ClipAI — Subtitle splitter no longer breaks mid-word ("You said th" / "is is …")
 
 A fresh run came back fully translated and phantom-free (the gap-fill + QA fixes
