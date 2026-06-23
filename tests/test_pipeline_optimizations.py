@@ -232,6 +232,23 @@ def test_clip_progress_is_monotonic():
     assert pct == 95  # never ticks below the last reported pct
 
 
+# ── Translation progress band (accurate "Translating… (a/b)" bar) ─
+
+
+def test_translation_progress_pct_maps_fraction_to_band():
+    from backend.services.pipeline_helpers import translation_progress_pct
+    assert translation_progress_pct("Translating subtitles… (0/621)") == 63
+    assert translation_progress_pct("Translating subtitles… (621/621)") == 69
+    mid = translation_progress_pct("Translating subtitles… (310/621)")
+    assert 64 <= mid <= 66  # ~50% lands mid-band, and the bar ADVANCES
+
+
+def test_translation_progress_pct_defaults_without_hint():
+    from backend.services.pipeline_helpers import translation_progress_pct
+    assert translation_progress_pct("Translating with the editorial model…") == 64
+    assert translation_progress_pct("") == 64
+
+
 # ── Stage timings + warnings accumulation ───────────────────────
 
 

@@ -1,3 +1,33 @@
+# ClipAI — Accurate live messaging during Whisper + translation (no false "stuck" banner)
+
+The long Whisper and translation phases showed the red "No progress update —
+pipeline may be stuck" banner even though the run was alive (just slow), and the
+messaging was inaccurate (the heartbeat said "scene analysis" while Whisper ran;
+translation sat at a static 63 % "Translating…").
+
+Root cause: the frontend `heartbeat` handler's comment claimed to "reset the
+stuck timer" but never did — so the 15 s heartbeats (and the per-batch
+`background_task` translation pings) never reset it, and the timer climbed to the
+300 s alarm. And the heartbeat label was derived from the coarse JobStatus, not
+the actual sub-phase.
+
+Fixes:
+- **Frontend (`Analysis.jsx`):** a flowing heartbeat means the event loop is
+  alive and the run is NOT stuck — so `heartbeat` AND running `background_task`
+  messages now reset the stuck-timer. The "may be stuck" banner now only fires
+  when heartbeats actually STOP (event loop blocked / process dead).
+- **Backend (`pipeline.py`):** `_update_progress` takes a `heartbeat_label`
+  override so the heartbeat names the real sub-phase — "transcription" while
+  Whisper runs inside the ANALYZING_SCENES stage (was the misleading "scene
+  analysis"), "face + motion detection" during face analysis.
+- **Backend translation progress:** the per-batch translation status now pushes
+  a REAL progress update (not just a `background_task` ping) — `translation_progress_pct`
+  (extracted + unit-tested) maps the "(a/b)" cue count onto the 63→69 % band, so
+  the bar advances and the message reads "Translating subtitles… (310/621)"
+  instead of a static label.
+
+---
+
 # ClipAI — Clip export reports per-clip progress (no more false "pipeline may be stuck" banner)
 
 Exporting many reframed clips (e.g. 63 clips × ~45-135 s each ≈ 47 min) is the

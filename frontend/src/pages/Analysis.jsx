@@ -1200,6 +1200,13 @@ export default function Analysis() {
               auto_seo: 'seo',
             };
             const bgStageId = TASK_STAGE_MAP[taskName] || taskName;
+            // A running background task (translation / polishing / SEO batches)
+            // is live activity — reset the stuck-timer so a long translation
+            // doesn't look stopped while it's steadily working through cues.
+            if (taskStatus === 'running') {
+              lastProgressRef.current = { ...lastProgressRef.current, time: Date.now() };
+              setStuckSeconds((prev) => (prev === 0 ? prev : 0));
+            }
             pushLog(
               taskStatus === 'complete' ? 'success' : taskStatus === 'failed' ? 'warning' : 'info',
               taskMsg,
@@ -1220,8 +1227,15 @@ export default function Analysis() {
               fetchJob();
             }
           } else if (msg.type === 'heartbeat') {
-            // Pipeline heartbeat — shows the pipeline is still alive during
-            // long-running stages.  Log it and reset the stuck timer.
+            // Pipeline heartbeat — proof the backend is ALIVE (just slow) during
+            // a long stage (Whisper transcription, subtitle translation). The
+            // heartbeat fires every ~15s from a background task, so a flowing
+            // heartbeat means the event loop is running and the run is NOT stuck.
+            // Reset the stuck-timer on it so a slow phase no longer trips the
+            // false "pipeline may be stuck" banner — that banner now only fires
+            // when heartbeats actually STOP (event loop blocked / process dead).
+            lastProgressRef.current = { ...lastProgressRef.current, time: Date.now() };
+            setStuckSeconds((prev) => (prev === 0 ? prev : 0));
             pushLog('info', String(msg.message || 'Still processing...'),
               { stage_id: currentStageIdRef.current || '' });
           } else if (msg.type === 'readability' && msg.transcript_readability) {

@@ -128,6 +128,27 @@ def cpu_fallback_stages(compute_summary: dict) -> list:
     return out
 
 
+def translation_progress_pct(message: str, *, lo: int = 63, hi: int = 69,
+                             default: int = 64) -> int:
+    """Map a translation status message onto the translation band of the bar.
+
+    Translation reports per-batch messages like ``"Translating subtitles…
+    (310/621)"``. Parse the trailing ``(a/b)`` cue count and scale it into the
+    ``lo``-``hi`` band so the main progress bar actually advances during the
+    multi-minute pass instead of sitting at a static %. Falls back to
+    ``default`` when there's no parseable hint.
+    """
+    try:
+        import re as _re
+        m = _re.search(r"\((\d+)\s*/\s*(\d+)\)", message or "")
+        if m and int(m.group(2)) > 0:
+            frac = min(1.0, max(0.0, int(m.group(1)) / int(m.group(2))))
+            return lo + int(frac * max(0, hi - lo))
+    except Exception:
+        pass
+    return default
+
+
 def resolve_clip_progress(frac, message, last_pct: int):
     """Decide the (pct, label) for one clip-stage progress tick, or ``None`` to
     skip it.

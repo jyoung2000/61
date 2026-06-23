@@ -829,6 +829,7 @@ from backend.services.pipeline_helpers import (  # noqa: E402
     is_synthetic_scene,
     resolve_sample_fps,
     resolve_clip_progress,
+    translation_progress_pct,
 )
 from backend.services import pipeline_checkpoint  # noqa: E402
 
@@ -1110,6 +1111,7 @@ async def _persist_complete_job(job_id: str, fields: dict) -> bool:
 async def _update_progress(
     job_id: str, status: str, progress: int, message: str,
     protect_terminal: bool = True,
+    heartbeat_label: str = "",
 ):
     """Update job progress in DB and broadcast via WebSocket.
     If a cancel has been requested, raises CancelledError instead of
@@ -1167,7 +1169,11 @@ async def _update_progress(
             "translating": "subtitle translation",
             "detecting_clips": "clip detection",
         }
-        stage_label = _stage_labels.get(status_str, status_str)
+        # ``heartbeat_label`` lets a caller override the status-derived label so
+        # the heartbeat names the actual SUB-phase (e.g. "transcription" while
+        # Whisper runs inside the ANALYZING_SCENES engine stage, instead of the
+        # misleading "scene analysis"). Falls back to the per-status label.
+        stage_label = heartbeat_label or _stage_labels.get(status_str, status_str)
         hb.touch(stage_label)
 
 
@@ -2046,6 +2052,22 @@ async def _background_post_processing(
             # the existing websocket channel.
             async def _nmt_status(msg: str):
                 logger.info("[%s] %s", job_id, msg)
+                # Push a REAL progress update (not just a background_task ping) so
+                # the main bar + progress_message reflect translation progress —
+                # otherwise it sat at a static 63 % "Translating…" for the whole
+                # multi-minute pass and looked stuck. An optional "(a/b)" hint in
+                # the message (per-batch cue counts) is mapped onto the 63→69 %
+                # translation band so the bar actually advances; the changing
+                # message also keeps the stuck-timer reset. ``except Exception``
+                # only — a real cancel (CancelledError, a BaseException) still
+                # propagates and stops the translation.
+                _pct = translation_progress_pct(msg)
+                try:
+                    await _update_progress(
+                        job_id, JobStatus.TRANSLATING, _pct, msg,
+                        heartbeat_label="subtitle translation")
+                except Exception:
+                    pass
                 await broadcast_ws(job_id, {
                     "type": "background_task",
                     "task": "subtitle_translation",
@@ -3346,21 +3368,28 @@ async def _run_analysis_inner(job_id: str):
         phase = _engine_phase[0]
         elapsed = _time.monotonic() - _perceive_t0
 
+        # ``hb_label`` names the actual sub-phase so the heartbeat (which fires
+        # during the long stretches where the % stalls — e.g. Whisper's post-VAD
+        # merge) reads "Still processing... (transcription — Xm)" instead of the
+        # misleading "scene analysis".
         if phase == 'faces':
             pct_int = int(15 + frac * 27)  # 15% → 42%
             pct_int = max(15, min(42, pct_int))
             msg = f"Detecting faces + motion analysis ({int(frac * 100)}%)"
+            hb_label = "face + motion detection"
             if frac >= 0.02 and elapsed > 15:
                 eta = elapsed * (1.0 - frac) / max(frac, 0.01)
                 msg += f" — {_fmt_eta(eta)} left"
         elif phase == 'whisper_pending':
             pct_int = 42
             msg = "Releasing face detection models — freeing GPU for Whisper..."
+            hb_label = "transcription"
         else:  # whisper
             pct_int = int(42 + frac * 14)  # 42% → 56%
             pct_int = max(42, min(56, pct_int))
             w_elapsed = _time.monotonic() - _whisper_t0[0]
             msg = f"Transcribing audio with Whisper ({int(frac * 100)}%)"
+            hb_label = "transcription"
             if frac >= 0.02 and w_elapsed > 5:
                 eta = w_elapsed * (1.0 - frac) / max(frac, 0.01)
                 msg += f" — {_fmt_eta(eta)} left"
@@ -3369,6 +3398,7 @@ async def _run_analysis_inner(job_id: str):
             asyncio.run_coroutine_threadsafe(
                 _update_progress(
                     job_id, JobStatus.ANALYZING_SCENES, pct_int, msg,
+                    heartbeat_label=hb_label,
                 ),
                 _loop,
             )
