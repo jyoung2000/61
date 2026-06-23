@@ -99,6 +99,32 @@ function mergeLogEntries(historical, live) {
   return out;
 }
 
+// Rebuild the PipelineTracker's stage state from persisted events so the
+// multi-stage progress bar + per-stage timings survive a page refresh (each
+// status event carries stage_id + wall-clock ts). Stage CHANGES are never
+// throttled server-side, so every stage's first event is present and the
+// transitions are accurate. Returns seconds-based per-stage durations plus the
+// active stage and pipeline start/last timestamps (epoch seconds).
+function reconstructStageState(events) {
+  let firstTs = null, lastTs = null, lastStage = '', lastStageStartTs = null;
+  const stageTimes = {};
+  for (const ev of events || []) {
+    const ts = typeof ev?.ts === 'number' ? ev.ts : null;
+    if (ts == null) continue;
+    if (firstTs == null) firstTs = ts;
+    lastTs = ts;
+    const sid = typeof ev.stage_id === 'string' ? ev.stage_id : '';
+    if (sid && sid !== lastStage) {
+      if (lastStage && lastStageStartTs != null) {
+        stageTimes[lastStage] = Math.max(0, Math.floor(ts - lastStageStartTs));
+      }
+      lastStage = sid;
+      lastStageStartTs = ts;
+    }
+  }
+  return { stageTimes, currentStageId: lastStage, firstTs, lastTs, lastStageStartTs };
+}
+
 // Compare two subtitle/transcript segment lists for meaningful equality
 // (same count, same text, timing within 50 ms). Used by the timeline→
 // transcript reverse-sync to skip a write when nothing actually changed —
@@ -1058,9 +1084,15 @@ export default function Analysis() {
     setActivityLog((prev) => [...prev, { ...safeExtra, ts, type, message: safeMsg, _absTime: Date.now() }]);
   }, []);
 
-  // Pipeline elapsed timer — increments every second while processing
+  // Pipeline elapsed timer — increments every second while processing.
+  // Gated on a non-terminal, loaded job: on refresh of a COMPLETE/FAILED job
+  // (or before the job has loaded) it must NOT tick, otherwise it would race up
+  // from the reconstructed original start time. For terminal jobs the frozen
+  // value seeded during hydration stands.
   useEffect(() => {
     if (!pipelineStartTime) return;
+    const terminal = !job || ['complete', 'failed', 'cancelled'].includes(String(job.status));
+    if (terminal) return;
     if (pipelineElapsedRef.current) clearInterval(pipelineElapsedRef.current);
     pipelineElapsedRef.current = setInterval(() => {
       setPipelineElapsed(Math.floor((Date.now() - pipelineStartTime) / 1000));
@@ -1068,7 +1100,7 @@ export default function Analysis() {
     return () => {
       if (pipelineElapsedRef.current) clearInterval(pipelineElapsedRef.current);
     };
-  }, [pipelineStartTime]);
+  }, [pipelineStartTime, job?.status]);
 
   // Persist generation settings
   useEffect(() => {
@@ -1087,9 +1119,31 @@ export default function Analysis() {
         const res = await fetch(`/api/jobs/${jobId}/events`);
         if (!res.ok || cancelled) return;
         const data = await res.json();
-        const historical = (data.events || [])
-          .map(eventToLogEntry)
-          .filter(Boolean);
+        const rawEvents = data.events || [];
+        if (cancelled) return;
+
+        // Rebuild the PIPELINE PROGRESS tracker (durable across refresh). Seed
+        // only what live WS hasn't already set, so a concurrently-arriving live
+        // stage event (newer) always wins.
+        const st = reconstructStageState(rawEvents);
+        if (st.firstTs != null) {
+          setStageTimes((prev) => ({ ...st.stageTimes, ...prev }));
+          if (st.currentStageId) {
+            setCurrentStageId((prev) => prev || st.currentStageId);
+            if (!currentStageIdRef.current) currentStageIdRef.current = st.currentStageId;
+            if (st.lastStageStartTs != null && stageStartRef.current[st.currentStageId] == null) {
+              stageStartRef.current[st.currentStageId] = st.lastStageStartTs * 1000;
+            }
+          }
+          setPipelineStartTime((pt) => pt || st.firstTs * 1000);
+          // Initial elapsed = span up to the last persisted event. For a still-
+          // running job the 1 s timer overrides this immediately; for a
+          // terminal job the timer is gated off so this frozen value stands.
+          setPipelineElapsed((e) => e || Math.max(0, Math.floor(st.lastTs - st.firstTs)));
+        }
+
+        // Hydrate the PROCESSING LOG.
+        const historical = rawEvents.map(eventToLogEntry).filter(Boolean);
         if (!historical.length || cancelled) return;
         setActivityLog((prev) => mergeLogEntries(historical, prev));
       } catch {

@@ -18,6 +18,13 @@ Now every user-facing event is persisted server-side and re-fetched on load:
   with any live entries (time-ordered, de-duped via `eventToLogEntry` +
   `mergeLogEntries`), so the log renders in full on a fresh tab/device and keeps
   streaming live afterward.
+- **PIPELINE PROGRESS tracker is durable too.** Each persisted status event carries
+  `stage_id` + `ts`, so the same hydration fetch rebuilds the multi-stage bar's
+  state (`reconstructStageState`): the active stage, per-stage durations, pipeline
+  start, and elapsed — instead of resetting to a blank bar on refresh. (Stage
+  CHANGES are never throttled server-side, so every stage's first event survives and
+  the transitions are exact.) The elapsed timer is gated on a non-terminal, loaded
+  job so a refreshed COMPLETE job shows a frozen total, not a runaway count.
 
 New unit tests in `tests/test_job_events_persistence.py` (added to CI).
 
