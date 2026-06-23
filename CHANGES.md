@@ -1,3 +1,33 @@
+# ClipAI — Offline translation no longer ships half-Japanese (LLM timeout + NMT leftover cleanup)
+
+The offline JA→EN translation left ~18% of lines in Japanese. From the logs:
+the editorial LLM (qwen2.5:3b) hit its per-batch timeout — `Text completion
+timed out after 90s` — on the FIRST batch, so `translate_via_llm` bailed
+entirely and fell back to FuguMT, which then left 119/661 colloquial run-on cues
+untranslated (`completeness pass recovered 0/119`). The LLM path is the better,
+COMPLETE one (it has its own 3-pass source-script retry); it just needed to not
+get killed mid-answer.
+
+Two fixes (both, per request):
+- **Let the local LLM finish (`translator.py`).** The per-batch translation
+  timeout is now a generous, configurable CEILING
+  (`TRANSLATION_LLM_TIMEOUT_FLOOR`=180 s, `TRANSLATION_LLM_SECONDS_PER_SEGMENT`=12,
+  was `max(60, 5×batch)`) — raising a ceiling never slows the fast path, it only
+  stops a slow local model being killed and dropped to NMT. Batches are also
+  smaller on Ollama (`TRANSLATION_LLM_BATCH`, auto=8) so each produces a short
+  JSON array quickly + reliably.
+- **Harden the NMT fallback (`pipeline.py`).** The offline router is LLM-free by
+  design, but `translate_subtitles` (LLM-first → NMT) now runs a fail-soft
+  leftover cleanup: after NMT, any cue still in source script is re-translated
+  with the editorial LLM (leftovers only, bounded, never raises). So even when
+  the run falls to FuguMT, the shipped subtitles aren't half-source.
+
+Combined with the previous hallucination-blocklist additions, the translated
+track should now be complete English without the "see you next time" / おわり
+phantom repeats.
+
+---
+
 # ClipAI — Long videos: face detection no longer 5x over-samples + drop "see you next time"/"おわり" hallucinations
 
 Two issues from a 128-min offline run (GTX 1650):

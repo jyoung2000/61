@@ -202,8 +202,15 @@ async def translate_via_llm(
             f"Lines:\n{numbered}"
         )
         try:
+            # Per-batch timeout is a CEILING (raising it never slows the fast
+            # path — it only stops a slow LOCAL model being killed mid-answer and
+            # falling back to the weaker offline NMT). A small editorial model on
+            # a 4 GB GPU needs well over the old 5 s/segment / 60 s floor: a
+            # first batch also pays the model load. Generous + configurable.
+            _per_seg = float(getattr(settings, "TRANSLATION_LLM_SECONDS_PER_SEGMENT", 12.0))
+            _floor = float(getattr(settings, "TRANSLATION_LLM_TIMEOUT_FLOOR", 180.0))
             resp = await orchestrator.text_completion(
-                prompt, timeout=max(60.0, len(batch) * 5.0), job_id=job_id)
+                prompt, timeout=max(_floor, len(batch) * _per_seg), job_id=job_id)
         except Exception as e:
             logger.warning("LLM translate: call failed (%s)", e)
             return None
@@ -218,7 +225,18 @@ async def translate_via_llm(
         mid = len(batch) // 2                      # split on failure and recurse
         return (await _translate_batch(batch[:mid])) + (await _translate_batch(batch[mid:]))
 
-    BATCH = 18
+    # Smaller batches on a local model: a 3B model on a small GPU generates a
+    # short JSON array far faster + more reliably than an 18-line one, so each
+    # batch is much less likely to hit the timeout (the failure that dropped the
+    # whole LLM path to FuguMT and left ~18% of cues in Japanese). Cloud models
+    # keep the larger batch. Configurable via TRANSLATION_LLM_BATCH.
+    try:
+        _chain = orchestrator._get_active_chain() if orchestrator else []
+        _is_ollama = bool(_chain) and getattr(_chain[0], "provider_name", "") == "ollama"
+    except Exception:
+        _is_ollama = False
+    BATCH = int(getattr(settings, "TRANSLATION_LLM_BATCH", 8 if _is_ollama else 18) or
+                (8 if _is_ollama else 18))
     total = len(segments)
     out_segs: list[TranscriptSegment] = []
     _any_ok = False

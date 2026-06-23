@@ -185,7 +185,14 @@ class Settings(BaseSettings):
     # the dominant analysis stage at a small reframing-accuracy cost.
     REFRAMER_MAX_SAMPLES: int = 1800       # total face/motion samples cap
     REFRAMER_SAMPLE_FPS: float = 5.0       # ceiling fps (short videos)
-    REFRAMER_MIN_SAMPLE_FPS: float = 1.2   # floor fps (very long videos)
+    REFRAMER_MIN_SAMPLE_FPS: float = 1.2   # floor fps (MEDIUM videos — applied
+                                           # only while it stays within the cap)
+    # Hard floor for VERY long videos where even the cap-respecting rate falls
+    # below MIN_SAMPLE_FPS. Keeps a multi-hour video from under-sampling while
+    # still bounding total samples. The MIN_SAMPLE_FPS floor no longer overrides
+    # the sample cap (a 2 h video used to sample ~9 200 frames vs the 1 800 cap,
+    # making face detection ~5x slower) — see resolve_sample_fps.
+    REFRAMER_ABS_MIN_SAMPLE_FPS: float = 0.2
     # The heavy YOLO-World open-vocab subject detector (the ~0.5s/frame cost
     # behind the 17-min face stage) runs every Nth sampled frame, carrying its
     # subject bboxes forward in between. YuNet faces + motion still run EVERY
@@ -396,6 +403,16 @@ class Settings(BaseSettings):
     # produced half-translated tracks. Falls back to Whisper-native / offline NMT
     # when no LLM is configured or it comes back still source-language.
     TRANSLATION_PREFER_LLM: bool = True
+    # Per-batch timeout for LLM subtitle translation (a CEILING — never slows the
+    # fast path). A small editorial model on a low-VRAM GPU needs far more than
+    # the old 5 s/segment / 60 s floor; too low and it gets killed mid-answer and
+    # falls back to the weaker offline NMT, leaving cues in the source language.
+    TRANSLATION_LLM_SECONDS_PER_SEGMENT: float = 12.0
+    TRANSLATION_LLM_TIMEOUT_FLOOR: float = 180.0
+    # LLM translation batch size. Smaller batches on a local model generate a
+    # shorter JSON array faster + more reliably (less timeout risk). 0 = auto
+    # (8 for Ollama, 18 for cloud).
+    TRANSLATION_LLM_BATCH: int = 0
     WHISPER_TRANSLATE_TO_EN: bool = True
     # Whisper-native translate is a second full ASR pass; it's only worth it when
     # it can run on the GPU. Below this much FREE VRAM it would fall back to CPU

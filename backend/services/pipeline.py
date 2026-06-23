@@ -645,7 +645,58 @@ async def translate_subtitles(segments, source_lang, target_lang, *, video_path=
     )
     out = (await asyncio.wait_for(_nmt_coro, timeout=nmt_timeout)
            if nmt_timeout else await _nmt_coro)
+    # Belt-and-suspenders completeness: the offline NMT (especially FuguMT on
+    # colloquial, un-punctuated run-on speech) can leave a chunk of cues in the
+    # source language. The offline router is LLM-free by design, but THIS entry
+    # point is allowed to use the editorial LLM — so when one is available, clean
+    # up only the still-source cues with it instead of shipping half-source subs.
+    # Fail-soft + bounded (leftover cues only).
+    out = await _llm_cleanup_untranslated(
+        out, source_lang, target_lang, orchestrator, glossary, job_id)
     return out, "nmt"
+
+
+async def _llm_cleanup_untranslated(segments, source_lang, target_lang,
+                                    orchestrator, glossary, job_id):
+    """Re-translate any cues left in the source language by the offline NMT
+    using the editorial LLM (only the leftovers). Returns ``segments`` unchanged
+    when there's nothing to fix, no orchestrator, a CJK target, or on any error."""
+    if not orchestrator or not segments:
+        return segments
+    try:
+        from backend.services.translator import (
+            translate_via_llm, _cjk_ratio, _CJK_LANGS, fraction_untranslated,
+        )
+        _tgt = (target_lang or "").strip().lower().split("-")[0]
+        if _tgt in _CJK_LANGS:
+            return segments  # a CJK target legitimately contains CJK
+        def _txt(s):
+            return (s.get("text", "") if isinstance(s, dict) else getattr(s, "text", "")) or ""
+        leftover_idx = [i for i, s in enumerate(segments) if _cjk_ratio(_txt(s)) > 0.30]
+        if not leftover_idx:
+            return segments
+        logger.info(
+            "[%s] Offline NMT left %d/%d cue(s) in the source language "
+            "(%.0f%% ) — cleaning up with the editorial LLM",
+            job_id, len(leftover_idx), len(segments),
+            100 * fraction_untranslated(segments, target_lang))
+        leftovers = [segments[i] for i in leftover_idx]
+        fixed = await translate_via_llm(
+            leftovers, source_lang, target_lang, orchestrator,
+            glossary=glossary, job_id=job_id or "")
+        if not fixed:
+            return segments
+        for i, f in zip(leftover_idx, fixed):
+            ftxt = _txt(f)
+            if ftxt and _cjk_ratio(ftxt) <= 0.30:
+                segments[i] = f
+        logger.info(
+            "[%s] LLM leftover cleanup: %.0f%% source-script remaining",
+            job_id, 100 * fraction_untranslated(segments, target_lang))
+        return segments
+    except Exception as _e:  # noqa: BLE001 — cleanup is best-effort
+        logger.info("[%s] LLM leftover cleanup skipped (%s)", job_id, _e)
+        return segments
 
 
 # Back-compat alias — historical name. This path is LLM-first now, not
