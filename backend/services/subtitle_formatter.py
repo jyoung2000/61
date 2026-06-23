@@ -311,10 +311,16 @@ def _find_split_point(text: str) -> Optional[int]:
     )]
     if conj_breaks:
         return min(conj_breaks, key=lambda i: abs(i - mid))
-    # Fall back: word boundary nearest centre.
-    words = text.split()
-    if len(words) >= 2:
-        return text.index(words[len(words) // 2])
+    # Fall back: the whitespace boundary nearest the centre. Must use actual
+    # space positions — NOT ``text.index(words[mid])``, which returns the first
+    # SUBSTRING match and can land mid-word: e.g. the middle word "is" of
+    # "You said this is delicious cake" matches inside "th[is]", splitting it as
+    # "You said th" + "is is delicious cake". Splitting on a real space keeps
+    # every piece whole-worded.
+    space_positions = [i for i, ch in enumerate(text) if ch.isspace()]
+    if space_positions:
+        best = min(space_positions, key=lambda i: abs(i - mid))
+        return best + 1  # index just AFTER the space (right piece is then stripped)
     return None
 
 

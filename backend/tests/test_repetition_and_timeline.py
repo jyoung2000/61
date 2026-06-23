@@ -123,3 +123,33 @@ def test_oversize_repair_still_splits_corrupt_block_when_gap_exists():
     assert len(out) >= 2
     # Still bounded by the hard cap (~30s) — not minutes.
     assert max(s.end for s in out) <= 10.8 + 35.0
+
+
+# ── word-boundary splitting (no mid-word breaks) ─────────────────────────
+
+def test_find_split_point_lands_on_word_boundary_not_mid_word():
+    # Regression: text.index(words[mid]) returned the first SUBSTRING match, so
+    # the middle word "is" matched inside "th[is]" → "You said th" + "is is …".
+    from backend.services.subtitle_formatter import _find_split_point
+    t = "You said this is delicious cake"
+    idx = _find_split_point(t)
+    assert idx is not None
+    # No characters lost and both sides are whole words from the original.
+    assert (t[:idx] + t[idx:]) == t
+    src_words = t.split()
+    assert all(w in src_words for w in t[:idx].split())
+    assert all(w in src_words for w in t[idx:].split())
+
+
+def test_enforce_readability_never_breaks_a_word_on_wordless_cue():
+    # Short duration → over-CPS → forces the char-proportional splitter to
+    # recurse into the word-boundary fallback (the mid-word bug site). No
+    # emitted token may be a broken word fragment (e.g. "th" from "this").
+    seg = _seg(0.0, 2.0,
+               "You said this is delicious cake and I ate all of it too")
+    out = enforce_readability([seg])
+    assert len(out) >= 2  # it did split
+    tokens = " ".join(p.text.replace("\n", " ") for p in out).split()
+    src = set(seg.text.split())
+    assert all(tok.strip(".,!?;:") in src for tok in tokens), tokens
+

@@ -132,6 +132,21 @@ New unit tests in `tests/test_audio_precondition_chain.py` (added to CI).
 
 ---
 
+# ClipAI — Subtitle splitter no longer breaks mid-word ("You said th" / "is is …")
+
+A fresh run came back fully translated and phantom-free (the gap-fill + QA fixes
+landed), but the readability splitter produced mid-word cue breaks like
+``[4:40] You said th`` / ``[4:43] is is delicious cake``. Cause: in
+``subtitle_formatter._find_split_point``, the Latin word-boundary fallback used
+``text.index(words[mid])`` — which returns the first SUBSTRING match. For
+"You said this is delicious cake" the middle word "is" matched INSIDE "th[is]",
+so the split landed at column 11 (mid-word). It now splits on the actual
+whitespace position nearest the centre, so every emitted piece is whole-worded.
+Regression tests added (in CI). This mainly bites LLM-translated cues, which have
+no word-level timing and therefore fall through to this text-only split path.
+
+---
+
 # ClipAI — Translation QA on every path: no subtitle is left in the source language
 
 Subtitles were still shipping with source-language cues. The cause was a hole in
