@@ -80,6 +80,7 @@ jobs:
             tests/test_subtitle_extend_before_split.py \
             tests/test_subtitle_sentence_merge.py \
             tests/test_subtitle_split_tolerance.py \
+            tests/test_transcript_sanitize.py \
             backend/tests/test_repetition_and_timeline.py \
             backend/tests/test_translation_fail_loud.py \
             backend/tests/test_engine_checkpoint.py

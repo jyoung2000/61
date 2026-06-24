@@ -1,3 +1,28 @@
+# ClipAI — Self-heal transcripts corrupted by an interrupted run / resume
+
+A run that suffered a mid-pipeline **container restart** (GPU dropped to CPU) plus
+~15 websocket reconnects shipped a `translated_transcript` that was a union of the
+source + translated tracks with every cue duplicated ~10× — 584 cues, 37% still
+Japanese. The backend itself had persisted a clean 482-cue English track
+(`0% still source-script`); the damage happened *afterwards*, in the resume/relay
+path, which no amount of translation-logic tuning prevents.
+
+Fix — a defensive **`sanitize_translated_transcript`** (drop cues still in the
+source script for a non-CJK target + collapse gross duplication, leaving a clean
+track untouched):
+- **`GET /jobs/{id}/transcripts`** self-heals on read: if the stored track is
+  corrupted it's cleaned, persisted back once (so edit indices stay consistent),
+  and served clean — the panel and the download stop showing the garbled union.
+  On the real corrupted file this took 584 → 226 cues, 37% Japanese → 0%.
+- The pipeline also sanitizes once more right before persisting, so an
+  interrupted resume starts from a clean base.
+- No-op on a healthy track; never touches a CJK target; idempotent.
+
+(Root cause is environment instability — the GPU keeps vanishing and the
+container restarts mid-job. A stable run with no restart produced a clean,
+English-only transcript. This change makes the output resilient when a restart
+does happen.)
+
 # ClipAI — Stop the CPS splitter from re-shattering merged captions
 
 A deployed run (`build 6b9d08d`) proved the merge worked but was being undone:

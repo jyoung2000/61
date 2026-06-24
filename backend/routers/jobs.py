@@ -167,6 +167,28 @@ async def get_transcripts(job_id: str, user: User = Depends(get_current_user)):
         return [r.model_dump(mode="json") if hasattr(r, "model_dump") else dict(r)
                 for r in (rows or [])]
 
+    # Self-heal a translated_transcript corrupted by an interrupted run / resume
+    # (duplicated cues, source-language relapse). The pipeline persists a clean
+    # track; this repairs damage that happened afterwards so the panel + the
+    # download never show the garbled union. Persist the repair once (subsequent
+    # polls find it clean → no-op) so edit indices stay consistent with storage.
+    _tt = getattr(job, "translated_transcript", []) or []
+    if _tt:
+        try:
+            from backend.services.transcript_sanitize import sanitize_translated_transcript
+            _clean, _changed = sanitize_translated_transcript(
+                _tt, getattr(job, "subtitle_language", "") or "en")
+            if _changed:
+                import logging as _lg
+                _lg.getLogger("backend.routers.jobs").warning(
+                    "[%s] Self-healed translated_transcript: %d → %d cue(s) "
+                    "(dropped source-language / duplicate artifacts from an "
+                    "interrupted run)", job_id, len(_tt), len(_clean))
+                await database.update_job_status(job_id, translated_transcript=_clean)
+                job.translated_transcript = _clean
+        except Exception:
+            pass
+
     return {
         "job_id": job_id,
         "status": str(getattr(job, "status", "") or ""),

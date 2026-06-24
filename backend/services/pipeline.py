@@ -2552,6 +2552,18 @@ async def _background_post_processing(
             # so the job is NOT terminal yet — the COMPLETE save happens in
             # ``_run_analysis_inner`` after clips. The post-clip caption refresh
             # + Auto-SEO run from ``_run_post_clip_followups`` using ``_result``.
+            # Final hygiene pass: drop any duplicate / source-language cue before
+            # storing (a clean track is unchanged) so a later interrupted resume
+            # has a clean base to work from.
+            try:
+                from backend.services.transcript_sanitize import sanitize_translated_transcript
+                _san, _san_changed = sanitize_translated_transcript(_translated_out, target_lang)
+                if _san_changed:
+                    logger.info("[%s] Sanitized translated_transcript before persist: %d → %d",
+                                job_id, len(_translated_out), len(_san))
+                    _translated_out = _san
+            except Exception:
+                pass
             logger.info(
                 "[%s] Persisting translated_transcript (%d segments)",
                 job_id, len(_translated_out),
