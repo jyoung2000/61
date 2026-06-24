@@ -843,13 +843,16 @@ def enforce_readability(
     if _extend_before_split:
         _ext: list[TranscriptSegment] = []
         _n = len(segments)
+        _n_extended = 0
         for _i, seg in enumerate(segments):
             _t = (seg.text or "").strip()
             _d = max(0.001, seg.end - seg.start)
             if _t and not _is_bracket_marker(_t) and _cps(_t, _d) > max_cps:
                 # ``_cps(text, 1.0)`` is the cue's effective (CJK-weighted) length;
-                # dividing by the cap gives the duration that lands exactly at it.
-                _target_dur = _cps(_t, 1.0) / max_cps if max_cps > 0 else _d
+                # dividing by the cap gives the duration that hits it exactly. The
+                # 8% headroom lands the cue just UNDER the cap so the splitter
+                # below doesn't re-fire on a floating-point-equal CPS.
+                _target_dur = (_cps(_t, 1.0) / max_cps) * 1.08 if max_cps > 0 else _d
                 _next_start = (segments[_i + 1].start
                                if _i + 1 < _n else seg.end + _target_dur)
                 _new_end = max(seg.end, min(seg.start + min(_target_dur, max_dur_s),
@@ -859,8 +862,13 @@ def enforce_readability(
                         start=seg.start, end=_new_end, text=seg.text,
                         speaker=seg.speaker, words=seg.words, confidence=seg.confidence,
                     )
+                    _n_extended += 1
             _ext.append(seg)
         segments = _ext
+        if _n_extended:
+            logger.info(
+                "enforce_readability: extended %d/%d over-fast cue(s) into idle "
+                "time before splitting (anti-choppiness)", _n_extended, _n)
 
     # ── Pass 1: CPS-driven splitting + filler trimming + duration extension
     for seg in segments:

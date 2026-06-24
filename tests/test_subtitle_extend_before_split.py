@@ -43,7 +43,7 @@ def test_extend_keeps_line_whole_instead_of_splitting():
     matches = [s for s in out if s.text.replace("\n", " ").strip() == _LINE]
     assert len(matches) == 1, [s.text for s in out]
     seg = matches[0]
-    assert _cps(seg.text.replace("\n", " "), seg.end - seg.start) <= 20.0 + 0.5
+    assert _cps(seg.text.replace("\n", " "), seg.end - seg.start) <= 20.0
 
 
 def test_extend_never_overruns_the_next_cue():
