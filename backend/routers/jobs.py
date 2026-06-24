@@ -179,11 +179,31 @@ async def get_transcripts(job_id: str, user: User = Depends(get_current_user)):
             _clean, _changed = sanitize_translated_transcript(
                 _tt, getattr(job, "subtitle_language", "") or "en")
             if _changed:
+                # The corrupted track is also choppy — it carries the fragments
+                # an older build (or the interrupted split) left behind, and a
+                # plain de-dup can't un-fragment them. Re-flow it for readability
+                # (merge short cues into full lines) so a healed transcript reads
+                # like one from a fresh run on the current build.
+                try:
+                    from backend.services.subtitle_formatter import enforce_readability
+                    from backend.models import TranscriptSegment as _TSr
+                    from backend.config import settings as _rs
+                    _m = [r if isinstance(r, _TSr) else _TSr(**r) for r in _clean]
+                    _m = enforce_readability(
+                        _m,
+                        max_cps=float(getattr(_rs, "SUBTITLE_MAX_CPS", 20.0)),
+                        max_chars_per_line=int(getattr(_rs, "SUBTITLE_MAX_CHARS_PER_LINE", 42)),
+                        min_duration_ms=int(getattr(_rs, "SUBTITLE_MIN_DURATION_MS", 833)),
+                        max_duration_ms=int(getattr(_rs, "SUBTITLE_MAX_DURATION_MS", 9000)),
+                    )
+                    _clean = [s.model_dump(mode="json") for s in _m]
+                except Exception:
+                    pass
                 import logging as _lg
                 _lg.getLogger("backend.routers.jobs").warning(
                     "[%s] Self-healed translated_transcript: %d → %d cue(s) "
-                    "(dropped source-language / duplicate artifacts from an "
-                    "interrupted run)", job_id, len(_tt), len(_clean))
+                    "(dropped source-language / duplicate artifacts + re-flowed "
+                    "for readability)", job_id, len(_tt), len(_clean))
                 await database.update_job_status(job_id, translated_transcript=_clean)
                 job.translated_transcript = _clean
         except Exception:
