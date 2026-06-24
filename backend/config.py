@@ -476,6 +476,14 @@ class Settings(BaseSettings):
     # flashes). Only bridges SMALL gaps (continuous speech) — never a real pause,
     # a speaker change, or a [♪ music ♪] marker. 0 disables the merge.
     SUBTITLE_MERGE_MAX_GAP_MS: int = 3000
+    # When the previous cue ends MID-SENTENCE (no terminal punctuation), widen
+    # the merge bridge to this gap so the thought is completed into one line
+    # ("and it's your" + "boobs here." → "and it's your boobs here.") instead of
+    # trailing off across two flashes. ~42% of translated cues ended mid-sentence
+    # on real runs, most within ~6s of their continuation. Still bounded by the
+    # 2-line / max-duration / CPS caps, so parts that are genuinely far apart
+    # (sparse speech) stay split. 0 disables the wider bridge.
+    SUBTITLE_SENTENCE_MERGE_GAP_MS: int = 6000
     SUBTITLE_PLATFORM_SAFE_ZONES: bool = True   # per-platform margin profiles
     SUBTITLE_PLATFORM_PROFILE: str = ""         # "" | tiktok | reels | shorts | horizontal | square
 

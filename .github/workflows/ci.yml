@@ -78,6 +78,7 @@ jobs:
             tests/test_browser_preview_nonblocking.py \
             tests/test_clip_seo_sidecar.py \
             tests/test_subtitle_extend_before_split.py \
+            tests/test_subtitle_sentence_merge.py \
             backend/tests/test_repetition_and_timeline.py \
             backend/tests/test_translation_fail_loud.py \
             backend/tests/test_engine_checkpoint.py

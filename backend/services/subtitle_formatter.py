@@ -658,6 +658,14 @@ def _is_bracket_marker(text: str) -> bool:
     return t.startswith("[") and t.endswith("]")
 
 
+def _ends_sentence(text: str) -> bool:
+    """True when ``text`` reads as a finished sentence (ends in terminal
+    punctuation, ignoring trailing quotes/brackets). Used to decide whether a
+    cue is mid-thought and should pull in its continuation."""
+    s = (text or "").rstrip().rstrip('"”’\')]')
+    return bool(s) and s[-1] in ".?!…。！？"
+
+
 def _merge_for_readability(
     segments: list[TranscriptSegment],
     max_cps: float,
@@ -665,6 +673,7 @@ def _merge_for_readability(
     max_lines: int,
     max_dur_s: float,
     max_gap_s: float,
+    sentence_gap_s: float = 0.0,
 ) -> list[TranscriptSegment]:
     """Greedily merge consecutive same-speaker cues into the longest cue that
     still satisfies every readability limit (duration, 2-line char budget, CPS).
@@ -672,8 +681,13 @@ def _merge_for_readability(
     Combats the over-segmentation that makes a transcript read like a flicker of
     2-3 word lines: slow / paused speech that VAD split into "So am I" /
     "planning on" / "eating with you" becomes one complete, readable caption.
-    Bridges only SMALL gaps (continuous speech ≤ ``max_gap_s``) and never crosses
-    a speaker change or a ``[♪ music ♪]`` marker. Order-preserving."""
+    Bridges gaps of continuous speech ≤ ``max_gap_s`` and never crosses a speaker
+    change or a ``[♪ music ♪]`` marker. When the previous cue ends MID-SENTENCE
+    (no terminal punctuation) the bridge widens to ``sentence_gap_s`` so the
+    thought is completed into one line instead of trailing off ("and it's your" →
+    "boobs here.") — the main lever against lines that read as incomplete. The
+    duration / 2-line / CPS caps still bound the merged cue, so a sentence whose
+    parts are genuinely far apart stays split. Order-preserving."""
     if not segments or max_gap_s <= 0:
         return segments
     char_budget = max(int(max_chars_per_line), int(max_chars_per_line) * max(1, int(max_lines)))
@@ -687,9 +701,12 @@ def _merge_for_readability(
         prev_txt = (prev.text or "").strip()
         gap = seg.start - prev.end
         same_speaker = (prev.speaker or "") == (seg.speaker or "")
+        # A finished sentence starts a fresh cue (one-sentence-per-cue is ideal);
+        # an UNFINISHED one earns a wider bridge to complete the thought.
+        eff_gap = max_gap_s if _ends_sentence(prev_txt) else max(max_gap_s, sentence_gap_s)
         if (txt and prev_txt and same_speaker
                 and not _is_bracket_marker(prev_txt) and not _is_bracket_marker(txt)
-                and 0.0 <= gap <= max_gap_s):
+                and 0.0 <= gap <= eff_gap):
             joiner = "" if (_is_cjk(prev_txt) and _is_cjk(txt)) else " "
             cand = (prev_txt + joiner + txt).strip()
             cand_end = max(prev.end, seg.end)
@@ -818,12 +835,20 @@ def enforce_readability(
     try:
         from backend.config import settings as _ms
         _merge_gap_s = float(getattr(_ms, "SUBTITLE_MERGE_MAX_GAP_MS", 1200)) / 1000.0
+        _sentence_gap_s = float(getattr(_ms, "SUBTITLE_SENTENCE_MERGE_GAP_MS", 6000)) / 1000.0
     except Exception:
         _merge_gap_s = 1.2
+        _sentence_gap_s = 6.0
     if _merge_gap_s > 0:
+        _pre_merge = len(segments)
         segments = _merge_for_readability(
             segments, max_cps=max_cps, max_chars_per_line=max_chars_per_line,
-            max_lines=max_lines, max_dur_s=max_dur_s, max_gap_s=_merge_gap_s)
+            max_lines=max_lines, max_dur_s=max_dur_s, max_gap_s=_merge_gap_s,
+            sentence_gap_s=_sentence_gap_s)
+        if len(segments) < _pre_merge:
+            logger.info(
+                "enforce_readability: merged %d → %d cue(s) into fuller lines "
+                "(anti-choppiness)", _pre_merge, len(segments))
 
     # ── Pass 0.7: borrow idle time to satisfy CPS BEFORE splitting ──────
     # A cue that reads too fast (CPS over the cap) does NOT need to be shattered

@@ -1,3 +1,27 @@
+# ClipAI — Complete-sentence captions: finish a mid-sentence cue into one line
+
+Follow-up to extend-before-split. Measuring a real run, **42% of translated cues
+ended mid-sentence** ("and it's your" → "boobs here.", "Is it the way" / "that
+makes" / "someone feel" / "shameless the best?") — they read as incomplete and
+choppy. The merge that fixes this only bridged a 3s gap, but the median gap to
+the continuation was ~4s, so most fragments slipped through.
+
+Fix — **sentence-completion merge** (`_merge_for_readability` +
+`SUBTITLE_SENTENCE_MERGE_GAP_MS`, default 6s). When the previous cue has no
+terminal punctuation (it's mid-thought), the merge bridge widens from 3s to 6s
+to pull in its continuation, so the line finishes as one cue. A cue that already
+ends a sentence still starts fresh (one-sentence-per-cue), and the 2-line /
+max-duration / CPS caps still bound the result — so fragments that are genuinely
+far apart (sparse, breathy speech) stay split rather than parking one line on
+screen for 12s. Simulated on the last run's output it cut ≤3-word cues from 236
+→ 82 and mid-sentence cues from 215 → 105.
+
+Both this and extend-before-split now log a line when they fire
+(`enforce_readability: merged N → M …` / `extended N/M …`) so a deployed build
+is verifiable from the run log.
+
+---
+
 # ClipAI — Less choppy translated captions: borrow idle time before splitting
 
 A translated CJK→EN cue is usually longer than the short source window that
