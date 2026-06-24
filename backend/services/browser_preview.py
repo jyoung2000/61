@@ -228,7 +228,7 @@ def _preview_path_for(source_path: str) -> str:
     playback smoothness improves on the next request.
     """
     directory = os.path.dirname(source_path) or "."
-    return os.path.join(directory, "browser_preview.v2.mp4")
+    return os.path.join(directory, "browser_preview.v3.mp4")
 
 
 def _none_marker_for(source_path: str) -> str:
@@ -570,15 +570,32 @@ def ensure_browser_preview(source_path: str) -> str:
         # blocking the recipient forever.
         return source_path
 
+    # Encode to a TEMP file and atomically rename on success. A container
+    # restart / OOM-kill mid-encode (common on this deployment) otherwise leaves
+    # a TRUNCATED browser_preview file that still passes the size>0 + mtime
+    # freshness check in cached_browser_preview() — so the <video> element is
+    # handed an unplayable partial file and stalls on "Loading video..." forever.
+    # With temp+rename the final name only ever points at a complete file.
+    tmp_path = target_path + ".building.tmp.mp4"
     try:
-        cmd = _build_ffmpeg_cmd(source_path, target_path, probe)
+        try:
+            if os.path.isfile(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        cmd = _build_ffmpeg_cmd(source_path, tmp_path, probe)
         logger.info(
             "browser_preview: building %s from %s (video=%s, audio=%s)",
             target_path, source_path, probe.video_codec, probe.audio_codec,
         )
         t0 = time.time()
-        ok = _run_ffmpeg(cmd, target_path)
+        ok = _run_ffmpeg(cmd, tmp_path)
         if not ok:
+            return source_path
+        try:
+            os.replace(tmp_path, target_path)
+        except OSError as e:
+            logger.warning("browser_preview: atomic rename failed (%s) — serving source", e)
             return source_path
         logger.info(
             "browser_preview: built %s in %.1fs", target_path, time.time() - t0,
@@ -586,6 +603,11 @@ def ensure_browser_preview(source_path: str) -> str:
         return target_path
     finally:
         _release_lock(lock_path)
+        try:
+            if os.path.isfile(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
 
 
 async def ensure_browser_preview_async(source_path: str) -> str:

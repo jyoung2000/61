@@ -1,3 +1,27 @@
+# ClipAI — Preview video no longer stalls on a corrupt/partial cached preview
+
+The in-editor preview could sit on "Loading video…" forever even after analysis
+finished. Cause: the browser-preview transcode wrote **directly** to
+`browser_preview.v2.mp4`, so a container restart / OOM-kill mid-encode (frequent
+on this deployment) left a **truncated** file that still passed the
+`size>0 && mtime` freshness check — the `<video>` element was then handed an
+unplayable partial file and stalled, with no event to recover from.
+
+Fixes:
+- **Atomic preview write** (`browser_preview.ensure_browser_preview`): encode to a
+  `.building.tmp.mp4` and `os.replace()` onto the final name only on success, so
+  the cached name never points at a partial file. Bumped the cache name to
+  `browser_preview.v3.mp4` so any already-corrupt `v2` file is abandoned and
+  rebuilt cleanly (the raw source is served meanwhile).
+- **Frontend escape hatch** (`VideoEditor`): a 30s watchdog detects a `<video>`
+  that never reaches `canplay` and surfaces **"Open video directly ↗"** (loads the
+  source in a new tab / native player) + **Reload**, instead of an endless
+  spinner. The hard-error state gained the same direct-open link.
+
+(The underlying trigger is the environment restarting mid-job; the atomic write
+makes the preview resilient to it, and the escape hatch guarantees the user is
+never stuck.)
+
 # ClipAI — Self-heal transcripts corrupted by an interrupted run / resume
 
 A run that suffered a mid-pipeline **container restart** (GPU dropped to CPU) plus

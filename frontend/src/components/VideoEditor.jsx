@@ -606,6 +606,11 @@ export default function VideoEditor({
   const timecodeInputRef = useRef(null);
   const [videoReady, setVideoReady] = useState(false);
   const [videoError, setVideoError] = useState(false);
+  // True when the <video> hasn't reached canplay within the watchdog window —
+  // it's effectively stuck (a non-faststart big file over a tunnel, or an
+  // unplayable byte stream) and the user needs an escape hatch rather than an
+  // infinite spinner.
+  const [videoSlow, setVideoSlow] = useState(false);
 
   // Volume: 0-200 (percentage)
   const [volume, setVolume] = useState(100);
@@ -1348,10 +1353,20 @@ export default function VideoEditor({
     };
     const onCanPlay = () => {
       setVideoReady(true);
+      setVideoSlow(false);
+      if (_watchdog) { clearTimeout(_watchdog); _watchdog = null; }
       if (video.duration && isFinite(video.duration)) {
         setVideoDuration(video.duration);
       }
     };
+    // Watchdog: if the element hasn't become playable within 30s it's stuck
+    // (commonly a large non-faststart source over a tunnel, where the browser
+    // must pull the whole file before it can start). Surface an "open directly"
+    // escape instead of an endless spinner. Cleared the moment canplay fires.
+    setVideoSlow(false);
+    let _watchdog = setTimeout(() => {
+      if ((videoRef.current?.readyState ?? 0) < 3) setVideoSlow(true);
+    }, 30000);
     const onError = () => {
       // Retry once on transient failures (partial content, stale range)
       if (!video._retried) {
@@ -1373,6 +1388,7 @@ export default function VideoEditor({
     // If already past canplay when effect runs (e.g. cached)
     if (video.readyState >= 3) {
       setVideoReady(true);
+      if (_watchdog) { clearTimeout(_watchdog); _watchdog = null; }
       if (video.duration && isFinite(video.duration)) {
         setVideoDuration(video.duration);
       }
@@ -1383,6 +1399,7 @@ export default function VideoEditor({
       }
     }
     return () => {
+      if (_watchdog) { clearTimeout(_watchdog); _watchdog = null; }
       video.removeEventListener('loadedmetadata', onMetadata);
       video.removeEventListener('canplay', onCanPlay);
       video.removeEventListener('durationchange', onDuration);
@@ -2938,9 +2955,15 @@ export default function VideoEditor({
     return (
       <div className="ve-error">
         <span>Failed to load video</span>
-        <button className="ve-error__retry" onClick={() => { setVideoError(false); videoRef.current?.load(); }}>
-          Retry
-        </button>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <button className="ve-error__retry" onClick={() => { setVideoError(false); setVideoSlow(false); videoRef.current?.load(); }}>
+            Retry
+          </button>
+          <a href={src} target="_blank" rel="noopener noreferrer" className="ve-error__retry"
+             style={{ textDecoration: 'none', display: 'inline-flex', alignItems: 'center' }}>
+            Open directly ↗
+          </a>
+        </div>
       </div>
     );
   }
@@ -3177,6 +3200,25 @@ export default function VideoEditor({
             <span style={{ fontSize: 12, color: 'var(--text-muted, #888)', letterSpacing: '0.02em' }}>
               Loading video...
             </span>
+            {videoSlow && (
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 8, marginTop: 6 }}>
+                <span style={{ fontSize: 11, color: 'var(--text-muted, #888)', maxWidth: 320, textAlign: 'center' }}>
+                  Taking longer than usual — the source may be large or still buffering.
+                </span>
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <a href={src} target="_blank" rel="noopener noreferrer" style={{
+                    padding: '5px 12px', fontSize: 11, fontWeight: 600, textDecoration: 'none',
+                    color: 'var(--accent-cyan, #0a84ff)', border: '1px solid var(--accent-cyan, #0a84ff)',
+                    borderRadius: 6,
+                  }}>Open video directly ↗</a>
+                  <button onClick={() => { setVideoSlow(false); videoRef.current?.load(); }} style={{
+                    padding: '5px 12px', fontSize: 11, fontWeight: 600, cursor: 'pointer',
+                    color: 'var(--text-secondary, #ccc)', background: 'transparent',
+                    border: '1px solid var(--border, #444)', borderRadius: 6,
+                  }}>Reload</button>
+                </div>
+              </div>
+            )}
           </div>
         )}
 
