@@ -1,3 +1,33 @@
+# ClipAI — Stop the CPS splitter from re-shattering merged captions
+
+A deployed run (`build 6b9d08d`) proved the merge worked but was being undone:
+the log showed `merged 193 → 174` then the reading-speed (CPS) splitter
+**re-exploded it to 503** — so the shipped track was still 43% ≤3-word cues. The
+20 cps cap splits every merged sentence straight back into 2-3 word flashes.
+
+Fix — **`SUBTITLE_SPLIT_CPS_TOLERANCE`** (default 1.5). A cue is now kept WHOLE
+up to `max_cps × tolerance` (30 cps) and only split above that; the same relaxed
+cap governs merging, so complete sentences survive. Extend-into-idle-time still
+targets the strict 20 cps wherever there's silence, so lines read at the proper
+speed where there's room and only genuinely cramped ones run fast. Re-merging the
+last run's output under the new rule cut ≤3-word cues 43% → ~20% and mid-sentence
+cues 38% → 30%; the live gain is larger because it prevents the split at the
+source. Set the tolerance to 1.0 to restore strict Netflix CPS.
+
+# ClipAI — Save-guard keeps the CLEANER translated track (no source-language relapse)
+
+On long jobs with a mid-run reconnect, ~3% of the shipped "translated" cues came
+back in the source language (Japanese), interleaved with their English — even
+though the backend persisted a 100%-English track (`0% still source-script`,
+grade A). Root cause: a stale/resumed snapshot with the same cue COUNT but source
+text re-merged in overwrote the clean track; the existing save-guard only blocked
+*empty* incoming saves, not *dirtier* ones.
+
+Fix — the guard now compares the source-script fraction of the incoming vs.
+on-disk `translated_transcript` and keeps whichever is more fully translated (a
+real re-translation is cleaner, so it still wins). Skipped for CJK targets. This
+stops the reconnect-correlated Japanese relapse without affecting normal saves.
+
 # ClipAI — Complete-sentence captions: finish a mid-sentence cue into one line
 
 Follow-up to extend-before-split. Measuring a real run, **42% of translated cues

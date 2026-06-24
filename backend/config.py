@@ -432,6 +432,15 @@ class Settings(BaseSettings):
     # Wired into srt_generator + ass_generator as a preprocessing step.
     SUBTITLE_CPS_ENFORCEMENT: bool = True       # enforce reading speed limits
     SUBTITLE_MAX_CPS: float = 20.0              # chars/sec (Netflix adult standard)
+    # Keep a cue WHOLE up to ``SUBTITLE_MAX_CPS × this`` and only split above it.
+    # The reading-speed cap alone shatters every merged sentence right back into
+    # 2-3 word flashes (a 193→174 merge re-exploded to 500+ cues), which is the
+    # opposite of the goal. At 1.5 a cue is kept intact up to 30 cps and only the
+    # genuinely unreadable ones split; Pass 0.7 still EXTENDS cues into idle time
+    # toward the strict 20 cps, so lines read at the proper speed where there's
+    # room and only the cramped ones run fast. 1.0 restores strict Netflix CPS;
+    # raise toward 2.0 for even fuller (faster-reading) lines.
+    SUBTITLE_SPLIT_CPS_TOLERANCE: float = 1.5
     SUBTITLE_MAX_CHARS_PER_LINE: int = 42       # Netflix Latin standard
     SUBTITLE_MIN_DURATION_MS: int = 833         # 5/6 second (Netflix minimum)
     SUBTITLE_MAX_DURATION_MS: int = 9000        # Raised from 4.5s. Slow / heavily

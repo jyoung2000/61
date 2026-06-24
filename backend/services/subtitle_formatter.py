@@ -785,6 +785,21 @@ def enforce_readability(
                 max_cps, max_chars_per_line,
             )
 
+    # Reading-speed tolerance for SPLIT / MERGE decisions. The priority is
+    # fuller, complete lines over strict reading speed ("fixing choppiness is
+    # the main goal"), so a cue is kept WHOLE up to ``max_cps × tolerance`` and
+    # only split above it — otherwise the CPS splitter shatters every merged
+    # sentence right back into 2-3 word flashes (the 193→174 merge was being
+    # re-exploded to 500+). Pass 0.7 still EXTENDS toward the strict ``max_cps``
+    # wherever there's idle time, so cues read at the proper speed where there's
+    # room and only the genuinely cramped ones run fast. 1.0 = strict Netflix.
+    try:
+        from backend.config import settings as _ts
+        _cps_tol = float(getattr(_ts, "SUBTITLE_SPLIT_CPS_TOLERANCE", 1.5))
+    except Exception:
+        _cps_tol = 1.5
+    keep_cps = max_cps * max(1.0, _cps_tol)
+
     out: list[TranscriptSegment] = []
     max_dur_s = max_duration_ms / 1000.0
     min_dur_s = min_duration_ms / 1000.0
@@ -842,7 +857,7 @@ def enforce_readability(
     if _merge_gap_s > 0:
         _pre_merge = len(segments)
         segments = _merge_for_readability(
-            segments, max_cps=max_cps, max_chars_per_line=max_chars_per_line,
+            segments, max_cps=keep_cps, max_chars_per_line=max_chars_per_line,
             max_lines=max_lines, max_dur_s=max_dur_s, max_gap_s=_merge_gap_s,
             sentence_gap_s=_sentence_gap_s)
         if len(segments) < _pre_merge:
@@ -904,14 +919,14 @@ def enforce_readability(
         # boundaries exist.
         changed = True
         while changed and any(
-            _cps(p.text.strip(), max(0.001, p.end - p.start)) > max_cps
+            _cps(p.text.strip(), max(0.001, p.end - p.start)) > keep_cps
             for p in pieces
         ):
             new_pieces: list[TranscriptSegment] = []
             changed = False
             for p in pieces:
-                if _cps(p.text.strip(), max(0.001, p.end - p.start)) > max_cps:
-                    halves = _split_segment(p, max_cps, min_split_chars=min_split_chars)
+                if _cps(p.text.strip(), max(0.001, p.end - p.start)) > keep_cps:
+                    halves = _split_segment(p, keep_cps, min_split_chars=min_split_chars)
                     if len(halves) > 1:
                         new_pieces.extend(halves)
                         changed = True

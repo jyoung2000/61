@@ -106,6 +106,34 @@ async def _save_job_unlocked(job: JobResult, *, _preserve_terminal_status: bool 
                             "Save guard [%s]: kept existing transcript_readability — "
                             "incoming save carried the stale source-language score.",
                             job.job_id)
+                # Refuse to replace a CLEANER translated track with a DIRTIER one.
+                # A stale snapshot captured mid-translation (or a resume that merged
+                # source cues back in after a long reconnect) can carry the SAME cue
+                # count but more source-language (untranslated) text — the empty
+                # check above misses it because neither side is empty. Compare the
+                # source-script fraction and keep whichever is more fully translated;
+                # a genuine re-translation is CLEANER (lower fraction) so it still
+                # wins. Skipped for CJK targets (CJK output is correct there).
+                _cur_tt = _cur.get("translated_transcript") or []
+                _new_tt = data.get("translated_transcript") or []
+                if _cur_tt and _new_tt:
+                    try:
+                        from backend.services.translator import fraction_untranslated
+                        _tgt = (data.get("subtitle_language")
+                                or _cur.get("subtitle_language") or "en")
+                        _cur_frac = fraction_untranslated(_cur_tt, _tgt)
+                        _new_frac = fraction_untranslated(_new_tt, _tgt)
+                        if _new_frac > _cur_frac + 0.02:
+                            data["translated_transcript"] = _cur_tt
+                            if _cur.get("transcript_readability"):
+                                data["transcript_readability"] = _cur["transcript_readability"]
+                            logger.warning(
+                                "Save guard [%s]: kept cleaner translated_transcript "
+                                "(%.0f%% source-script) over a dirtier incoming save "
+                                "(%.0f%%) — stale/reconnect snapshot.",
+                                job.job_id, 100 * _cur_frac, 100 * _new_frac)
+                    except Exception:
+                        pass
                 # Same anti-wipe for the video summary. It is written ONCE by the
                 # summary stage via ``update_job_status(job_id, summary=...)`` — a
                 # separate DB write that does NOT update the in-memory pipeline job.
