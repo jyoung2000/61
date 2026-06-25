@@ -8,12 +8,18 @@ export default function ProgressBar({ progress, message, variant = 'cyan' }) {
   // This prevents the bar from jumping backward on transient state updates.
   const peakRef = useRef(0);
   const safeProgress = Math.min(100, Math.max(0, progress));
-  if (safeProgress >= peakRef.current) {
+  // A LARGE backward drop is not jitter — it's a genuine restart. A job revived
+  // after a container crash re-runs the early stages (e.g. it died at 95% during
+  // clip export and comes back at ~5% re-extracting/transcribing). Follow that
+  // down so the bar tells the truth, instead of sticking at the old peak and
+  // implying the job is about to finish when it actually started over.
+  const RESTART_DROP = 15; // percentage points below peak that means "restarted"
+  if (
+    safeProgress >= peakRef.current ||              // advancing
+    safeProgress === 0 ||                            // explicit reset
+    safeProgress <= peakRef.current - RESTART_DROP   // restart / revive
+  ) {
     peakRef.current = safeProgress;
-  }
-  // Reset peak when progress drops to 0 (new task started)
-  if (safeProgress === 0) {
-    peakRef.current = 0;
   }
   const displayProgress = peakRef.current;
 

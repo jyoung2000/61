@@ -1,3 +1,23 @@
+# ClipAI — Progress bar tells the truth when a job is revived
+
+When a crashed job auto-resumed, it genuinely restarts the early stages (only
+SHA-cached frames are reused; faces/Whisper/translation re-run unless a full
+engine checkpoint from the *same build* exists), but the progress bar stayed
+pinned at its last value (e.g. 95%) — so it looked like the job would finish in
+seconds when it had actually started over. Cause: `ProgressBar` is monotonic
+(peak-only) and reset only at exactly 0, but a revive emits 1%+, never 0, so the
+peak never dropped.
+
+Fix: `ProgressBar` now follows a **large backward drop** (≥15 percentage points)
+as a real restart, while still absorbing small out-of-order jitter. A revived job
+now visibly drops to where it actually resumes and climbs from there, matching the
+"Resuming after restart…" message.
+
+(Reusing more than frames across a revive is limited by design — the engine
+checkpoint that skips detection/transcription is invalidated when you redeploy a
+new build between runs, since a new build may analyze differently. A same-build
+crash-revive still resumes from the checkpoint.)
+
 # ClipAI — Transcript lines stop shifting while you read them
 
 The Transcript tab re-shuffled cues every few seconds while open. Cause: the
