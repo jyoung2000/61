@@ -1,3 +1,21 @@
+# ClipAI — Transcript lines stop shifting while you read them
+
+The Transcript tab re-shuffled cues every few seconds while open. Cause: the
+on-read self-heal (added to repair interrupted-run corruption) re-ran
+`enforce_readability` — a cue MERGE/split pass — on **every poll** of
+`GET /jobs/{id}/transcripts`. That pass is not a fixed point of the sanitizer, so
+each poll re-merged into a slightly different cue count and re-persisted it; the
+Analysis page (which replaces the list when the length changes) then re-rendered
+with reordered lines. That's the "lines move around while viewing" symptom.
+
+Fix — the read path now does **only the idempotent sanitize** (drop
+source-language relapse + gross duplication + sort). It heals genuine corruption
+**once**, and because sanitize is a proven fixed point, every later poll returns
+identical data → the panel makes it a no-op → the transcript stays put. The
+readability re-flow (merge) now happens only in the pipeline at translate time
+(once per run), never on every read. Verified to converge: pass 1 heals, passes
+2+ report no change.
+
 # ClipAI — Clips survive a crash mid-export (no more "No clips detected" after a death)
 
 A job that died mid clip-export (e.g. at 48/63 when the container restarts) came
