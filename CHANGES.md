@@ -1,3 +1,32 @@
+# ClipAI — Transcript panel ordering is now a hard, stable guarantee
+
+Report: "the translate UI doesn't properly order the subtitle lines." The panel
+already sorted by timestamp, but the sort was `((a.start ?? 0) - (b.start ?? 0))`
+which left two weak spots:
+
+- **Equal-start cues kept their array position.** JS `sort` is stable, so cues
+  sharing a start time fell back to *incoming array order*. The translated track
+  is handed to the panel in different orders across the 15 s poll (re-analyze
+  writes, readability splits, and crash-resume unions interleave it), so those
+  ties could visibly reshuffle between polls.
+- **A non-numeric `start`** (a numeric string, `null`, or a missing field — which
+  a crash-resumed union can produce) made the subtraction `NaN`, and `NaN`
+  comparisons make `Array.sort`'s result undefined.
+
+Fix: ordering now uses `compareCues`, a TOTAL order over the cue's own fields —
+numeric-safe start, then end, then text — so the on-screen position is a pure
+function of cue *content*, never of array index. The same cues always render in
+the same order; a poll that hands them over reordered can't reshuffle the panel.
+The `.srt` / `.txt` exports use the same comparator, so downloads and the on-
+screen list match exactly.
+
+Note: this guarantees ORDER. It does not fix cue *timestamps* that are themselves
+wrong — e.g. a long line stamped `0:15` whose content belongs at ~33 min, or a
+short phrase repeated at two times. That is crash-resume corruption (this job
+re-translated across 3 container restarts and the stored track is a damaged
+union), addressed separately by the engine-checkpoint reliability fix (fewer
+re-translations) — a clean run is the real cure.
+
 # ClipAI — Stop wasting a doomed GPU attempt on every clip export
 
 A run's backend log showed `clip export attempt 1/2 failed (rc=218): … Nothing was

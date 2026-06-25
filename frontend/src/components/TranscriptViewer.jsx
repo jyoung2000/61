@@ -23,14 +23,35 @@ function formatTime(seconds) {
   return `${m}:${s.toString().padStart(2, '0')}`;
 }
 
+// Coerce a cue start/end to a finite number of seconds for ordering. The
+// translated track can arrive with a start that is a numeric string, null, or
+// missing (a crash-resume can leave a damaged union), and `"x" - "y"` / NaN
+// comparisons make Array.sort order undefined — so normalize first.
+function cueSeconds(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+
+// Total order over cues that depends ONLY on the cue's own fields (start, then
+// end, then text), never on its position in the incoming array. That makes the
+// on-screen order a pure function of content: the same cues always render in the
+// same order, so a re-analyze / poll that hands us the same cues in a different
+// array order can't reshuffle the panel.
+function compareCues(a, b) {
+  return (cueSeconds(a.start) - cueSeconds(b.start))
+    || (cueSeconds(a.end) - cueSeconds(b.end))
+    || String(a.text || '').localeCompare(String(b.text || ''));
+}
+
+
 function toSRT(segments) {
   // Match the backend / hand-authored SRT format: chronological cues, and
   // omit the "Speaker:" prefix when the whole transcript is a single speaker
   // (narration / solo talking-head) — keep it only for multi-speaker content.
   const cues = (segments || [])
-    .filter((s) => (s.text || '').trim() && s.end >= s.start)
+    .filter((s) => (s.text || '').trim() && cueSeconds(s.end) >= cueSeconds(s.start))
     .slice()
-    .sort((a, b) => a.start - b.start);
+    .sort(compareCues);
   const distinctSpeakers = new Set(
     cues.map((s) => (s.speaker || '').trim()).filter(Boolean),
   );
@@ -57,7 +78,7 @@ function toTXT(segments) {
   const cues = (segments || [])
     .filter((s) => (s.text || '').trim())
     .slice()
-    .sort((a, b) => a.start - b.start);
+    .sort(compareCues);
   const distinctSpeakers = new Set(cues.map((s) => (s.speaker || '').trim()).filter(Boolean));
   const showSpeaker = distinctSpeakers.size > 1;
   return cues
@@ -169,10 +190,13 @@ export default function TranscriptViewer({ transcript, onSeek, jobId, onSpeakerR
     // processing — so without this sort the panel rendered raw order and
     // visibly reshuffled between polls. The SRT/TXT exports already sort; this
     // makes the on-screen list match them and stay put, ordered by timestamp.
+    // ``compareCues`` is a TOTAL order over the cue's own fields (numeric-safe
+    // start, then end, then text), so equal-start cues also have a deterministic
+    // position — the list can't reshuffle even when the incoming array reorders
+    // or a start arrives as a string/null.
     // (Editing still maps via ``transcript.indexOf(seg)`` to the backend index,
     // so a sorted DISPLAY copy doesn't affect edit/delete/speaker targeting.)
-    return base.slice().sort(
-      (a, b) => ((a.start ?? 0) - (b.start ?? 0)) || ((a.end ?? 0) - (b.end ?? 0)));
+    return base.slice().sort(compareCues);
   }, [timeFiltered, search]);
 
   // Determine which segment is currently playing (by original transcript index).
