@@ -86,6 +86,69 @@ def _numpy_safe_default(obj):
     return str(obj)
 
 
+def _json_safe_key(k):
+    """Coerce a dict key into something ``json.dumps`` accepts.
+
+    ``json.dumps``'s ``default=`` hook rescues VALUES only — a non-str/int key
+    (a numpy int from any detector, a float, a tuple) makes the whole
+    ``dumps`` call raise *before* ``default`` is ever consulted, which would
+    silently lose the entire checkpoint. The engine's timelines are int-keyed
+    (``time_ms``), so integral keys are normalized to ``int`` (JSON stringifies
+    them, and :func:`_int_keyed` restores them on load); everything else
+    degrades to ``str``.
+    """
+    if isinstance(k, bool):  # bool is an int subclass — keep it distinct
+        return k
+    if isinstance(k, (str, int)):
+        return k
+    try:
+        import numpy as np
+        if isinstance(k, np.integer):
+            return int(k)
+        if isinstance(k, np.floating):
+            f = float(k)
+            return int(f) if f.is_integer() else str(f)
+    except ImportError:
+        pass
+    if isinstance(k, float):
+        return int(k) if k.is_integer() else str(k)
+    return str(k)
+
+
+def _json_safe(obj):
+    """Recursively coerce ``obj`` into a structure ``json.dumps`` cannot choke
+    on — including dict KEYS, which the ``default=`` hook never sees.
+
+    This is the durable-write guarantee for the engine checkpoint: a single
+    un-serializable leaf (a stray numpy key from a future detector, a ``set``,
+    a ``Path``) used to make the save raise, get swallowed by the best-effort
+    ``except``, and leave the next revive to re-run detection + transcription
+    from scratch. Normalizing the payload up front means the save either writes
+    a reloadable checkpoint or fails loudly — never silently.
+    """
+    try:
+        import numpy as np
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.bool_):
+            return bool(obj)
+        if isinstance(obj, np.ndarray):
+            return [_json_safe(v) for v in obj.tolist()]
+    except ImportError:
+        pass
+    if isinstance(obj, dict):
+        return {_json_safe_key(k): _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set, frozenset)):
+        return [_json_safe(v) for v in obj]
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    # Unknown leaf (dataclass instance, Path, custom object): stringify — the
+    # same ultimate fallback the old ``default=`` hook applied to values.
+    return str(obj)
+
+
 def checkpoint_dir(job_id: str) -> str:
     return f"/data/uploads/{job_id}/checkpoint"
 
@@ -121,6 +184,26 @@ def _signatures_match(saved: dict, expected: dict) -> bool:
     if not expected.get("source_sha"):
         return False
     return all(saved.get(k) == expected.get(k) for k in expected)
+
+
+def _signature_diff(saved: dict, expected: dict) -> str:
+    """Human-readable reason a saved signature doesn't match the expected one,
+    for the load-miss log. Makes a non-resuming revive self-diagnosing instead
+    of a mystery full re-run."""
+    if not isinstance(saved, dict):
+        return f"saved signature is not a dict ({type(saved).__name__})"
+    if not expected.get("source_sha"):
+        return "expected source_sha is empty — no checkpoint can be trusted"
+    parts = []
+    for k in expected:
+        sv, ev = saved.get(k), expected.get(k)
+        if sv != ev:
+            # SHAs are long; show a prefix so the line stays readable.
+            if k == "source_sha":
+                sv = (str(sv)[:12] + "…") if sv else "(none)"
+                ev = (str(ev)[:12] + "…") if ev else "(none)"
+            parts.append(f"{k}: saved={sv!r} != expected={ev!r}")
+    return "; ".join(parts) if parts else "saved signature is missing expected keys"
 
 
 # ── Serialization ────────────────────────────────────────────────────
@@ -178,7 +261,21 @@ def _atomic_write(path: str, content: str) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(content)
+            # Flush to disk before the rename so an abrupt container kill (the
+            # crash mode this whole module exists for) can't leave the file's
+            # bytes in a buffer while the rename has already landed.
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, path)
+        # fsync the directory too so the rename itself is durable.
+        try:
+            dir_fd = os.open(directory, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
     except BaseException:
         try:
             os.unlink(tmp)
@@ -191,13 +288,17 @@ def _save_sync(job_id: str, perception, reframer_plan, signature: dict,
                audio_meta: dict) -> bool:
     from dataclasses import asdict
     d = checkpoint_dir(job_id)
+    # _json_safe() before dumps so a stray un-serializable key/value (numpy,
+    # set, Path) can't make the whole save raise — see _json_safe's docstring.
+    # default= is kept as a last-ditch net for anything _json_safe missed.
     _atomic_write(
         os.path.join(d, _PERCEPTION_FILE),
-        json.dumps(_serialize_perception(perception), default=_numpy_safe_default),
+        json.dumps(_json_safe(_serialize_perception(perception)),
+                   default=_numpy_safe_default),
     )
     _atomic_write(
         os.path.join(d, _PLAN_FILE),
-        json.dumps(asdict(reframer_plan), default=_numpy_safe_default),
+        json.dumps(_json_safe(asdict(reframer_plan)), default=_numpy_safe_default),
     )
     # Meta last: its presence is the "checkpoint is complete + valid" marker,
     # so a crash between the perception/plan writes never yields a half
@@ -206,6 +307,16 @@ def _save_sync(job_id: str, perception, reframer_plan, signature: dict,
         os.path.join(d, _META_FILE),
         json.dumps({"signature": signature, "audio": audio_meta or {}}, indent=2),
     )
+    # Verify-after-save: reload what we just wrote and confirm it round-trips
+    # with THIS signature, while the engine output is still in hand. A write
+    # that "succeeded" but can't be reloaded (corrupt JSON, an empty source
+    # SHA the loader always rejects, a partial flush) would otherwise surface
+    # only on the next revive — as a silent, full re-run of detection +
+    # transcription. Failing here turns that into one loud log line instead.
+    if _load_sync(job_id, signature) is None:
+        raise RuntimeError(
+            "verify-after-save failed — the checkpoint just written does not "
+            "reload with a matching signature (resume would not work)")
     return True
 
 
@@ -227,15 +338,24 @@ async def save_engine_checkpoint(
         await asyncio.to_thread(
             _save_sync, job_id, perception, reframer_plan, signature, audio_meta or {})
         logger.info(
-            "[%s] Engine checkpoint saved (%d transcript segs, %d face samples) — "
-            "a resume will skip detection + transcription",
+            "[%s] Engine checkpoint saved + verified (%d transcript segs, %d face "
+            "samples; sha=%s lang=%s fps=%s) — a resume will skip detection + "
+            "transcription",
             job_id,
             len(getattr(perception, "transcript_segments", None) or []),
             sum(1 for v in (getattr(perception, "face_timeline", None) or {}).values() if v),
+            (signature.get("source_sha") or "")[:12] or "(none)",
+            signature.get("source_language"),
+            signature.get("sample_fps"),
         )
         return True
     except Exception as exc:  # noqa: BLE001 — checkpointing must never break a run
-        logger.warning("[%s] Engine checkpoint save failed (non-fatal): %s", job_id, exc)
+        # ERROR, not warning: a failed checkpoint means the NEXT revive of this
+        # job will re-run the single most expensive stage from scratch (the
+        # "died at translate → restarted faces" report). Make that visible.
+        logger.error(
+            "[%s] Engine checkpoint save FAILED (%s) — a future resume will have "
+            "to RE-RUN detection + transcription from scratch", job_id, exc)
         return False
 
 
@@ -244,14 +364,25 @@ def _load_sync(job_id: str, expected_signature: dict):
     meta_path = os.path.join(d, _META_FILE)
     perception_path = os.path.join(d, _PERCEPTION_FILE)
     plan_path = os.path.join(d, _PLAN_FILE)
-    if not (os.path.isfile(meta_path) and os.path.isfile(perception_path)
-            and os.path.isfile(plan_path)):
+    present = {p: os.path.isfile(p) for p in (meta_path, perception_path, plan_path)}
+    if not all(present.values()):
+        missing = [os.path.basename(p) for p, ok in present.items() if not ok]
+        # A wholly-absent checkpoint is the normal first-run / source-changed
+        # case — stay quiet. A PARTIAL one (some files, not all) is a real
+        # problem (interrupted write, manual deletion) worth flagging.
+        if any(present.values()):
+            logger.warning(
+                "[%s] Engine checkpoint incomplete — missing %s; re-running engine",
+                job_id, missing)
         return None
 
     with open(meta_path, "r", encoding="utf-8") as f:
         meta = json.load(f)
     if not _signatures_match(meta.get("signature") or {}, expected_signature):
-        logger.info("[%s] Engine checkpoint present but signature differs — re-running engine", job_id)
+        logger.info(
+            "[%s] Engine checkpoint present but signature differs (%s) — "
+            "re-running engine", job_id,
+            _signature_diff(meta.get("signature") or {}, expected_signature))
         return None
 
     with open(perception_path, "r", encoding="utf-8") as f:

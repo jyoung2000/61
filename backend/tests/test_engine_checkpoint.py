@@ -104,6 +104,111 @@ def test_signature_includes_planner_fingerprint():
     assert pc._signatures_match(base, other) is False
 
 
+def test_signature_diff_names_the_differing_field():
+    a = pc.checkpoint_signature(source_sha="abc123def456xyz", source_language="en",
+                                sample_fps=5.0, aspect_ratio="9:16")
+    b = pc.checkpoint_signature(source_sha="abc123def456xyz", source_language="ja",
+                                sample_fps=5.0, aspect_ratio="9:16")
+    diff = pc._signature_diff(a, b)
+    assert "source_language" in diff and "sample_fps" not in diff
+    # An empty EXPECTED sha is the "can never trust a checkpoint" case and is
+    # called out explicitly rather than as a field mismatch.
+    empty = pc.checkpoint_signature(source_sha="", source_language="en",
+                                    sample_fps=5.0, aspect_ratio="9:16")
+    assert "source_sha is empty" in pc._signature_diff(a, empty)
+
+
+# ── Serialization hardening (the actual silent-failure cause) ─────────
+#
+# A single un-serializable dict KEY made the whole save raise — and the
+# best-effort ``except`` swallowed it, so the next revive re-ran detection +
+# transcription from scratch ("died at translate → restarted faces"). The
+# ``default=`` hook can't help: it only ever sees VALUES. ``_json_safe`` must
+# normalize keys too. These run without numpy by using stdlib types json also
+# rejects as keys (tuples) / values (sets, custom objects).
+
+
+def test_json_safe_key_normalizes_integral_and_stringifies_the_rest():
+    assert pc._json_safe_key(5) == 5
+    assert pc._json_safe_key("k") == "k"
+    assert pc._json_safe_key(True) is True            # bool stays distinct from 1
+    assert pc._json_safe_key(3.0) == 3                # integral float → int (round-trips)
+    assert pc._json_safe_key(2.5) == "2.5"            # fractional float → str
+    assert pc._json_safe_key((1, 2)) == "(1, 2)"      # tuple key → str
+
+
+def test_json_safe_makes_an_unserializable_payload_dumpable():
+    class Weird:
+        def __str__(self):
+            return "weird"
+
+    payload = {
+        (1, 2): "tuple-key",              # tuple key → json.dumps raises without coercion
+        3: {"nested": {1.0: "x"}},        # integral float key deep down
+        "set": {Weird()},                 # set of a custom object as a value
+        "n": None,
+    }
+    # The raw payload is genuinely un-dumpable — proves the coercion is load-bearing.
+    with pytest.raises(TypeError):
+        json.dumps(payload)
+    # After _json_safe it dumps + reloads cleanly.
+    out = json.dumps(pc._json_safe(payload))
+    back = json.loads(out)
+    assert back["3"]["nested"]["1"] == "x"
+    assert back["set"] == ["weird"]
+    assert back["n"] is None
+
+
+# ── Verify-after-save + numpy round-trip (need the real dataclasses) ──
+
+
+def test_save_with_empty_sha_fails_verify(tmp_path, monkeypatch):
+    """A checkpoint the loader can never accept (empty source SHA) must be
+    reported as a FAILED save, not a silent success that strands the next
+    revive with no usable checkpoint."""
+    pytest.importorskip("cv2")
+    from backend.services.reframer_models import PerceptionResult, RenderPlan
+
+    monkeypatch.setattr(pc, "checkpoint_dir", lambda jid: str(tmp_path / jid))
+    sig = pc.checkpoint_signature(source_sha="", source_language="en",
+                                  sample_fps=5.0, aspect_ratio="9:16")
+    ok = asyncio.run(pc.save_engine_checkpoint(
+        "jobEmptySha", PerceptionResult(), RenderPlan(), signature=sig, audio_meta={}))
+    assert ok is False
+
+
+def test_save_survives_numpy_keys_and_values(tmp_path, monkeypatch):
+    """The real engine emits numpy scalars in timeline values (and a future
+    detector could emit numpy KEYS). The save must still produce a checkpoint
+    that reloads with integer keys."""
+    pytest.importorskip("cv2")
+    np = pytest.importorskip("numpy")
+    from backend.services.reframer_models import PerceptionResult, RenderPlan
+
+    monkeypatch.setattr(pc, "checkpoint_dir", lambda jid: str(tmp_path / jid))
+    perception = PerceptionResult(
+        src_w=1920, src_h=1080, fps=30.0, duration_ms=2000, total_frames=60,
+        face_timeline={np.int64(0): [{"cx": np.int32(5), "score": np.float32(0.9)}],
+                       np.int64(500): []},
+        motion_timeline={np.int64(500): np.float64(1.25)},
+    )
+    plan = RenderPlan(
+        source_width=1920, source_height=1080,
+        keyframes=[{"time_ms": np.int64(0), "x": np.float32(1.5)}],
+    )
+    sig = pc.checkpoint_signature(source_sha="np-sha", source_language="en",
+                                  sample_fps=5.0, aspect_ratio="9:16")
+    ok = asyncio.run(pc.save_engine_checkpoint(
+        "jobNumpy", perception, plan, signature=sig, audio_meta={}))
+    assert ok is True  # would have been False (silent serialization failure) before
+
+    loaded = asyncio.run(pc.load_engine_checkpoint("jobNumpy", signature=sig))
+    assert loaded is not None
+    pr, _rp, _stub = loaded
+    assert all(isinstance(k, int) for k in pr.face_timeline)
+    assert all(isinstance(k, int) for k in pr.motion_timeline)
+
+
 # ── Full round-trip (needs the real dataclasses → OpenCV) ────────────
 
 

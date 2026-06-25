@@ -1,3 +1,46 @@
+# ClipAI — A job that dies after detection actually resumes (no more "died at translate → restarted faces")
+
+A job ran through face detection + Whisper transcription + planning, reached the
+translate stage, then the container died (the recurring NVIDIA driver RPC
+timeout). On auto-resume it re-ran **faces from scratch** instead of restoring
+the engine checkpoint — wasting the most expensive ~25 minutes of work on every
+revive. The previous build *claimed* a same-build crash-revive resumes from the
+checkpoint; in practice it often didn't.
+
+Root cause: the checkpoint **save was failing silently**. `save_engine_checkpoint`
+is best-effort — it wraps everything in `except: log + swallow` so checkpointing
+can never break a run. But `json.dumps(..., default=hook)` only routes *values*
+through the hook; a single non-serializable dict **key** (a numpy int from a
+detector, a tuple, etc.) makes the whole `dumps` raise *before* the hook is ever
+consulted. The save threw, got swallowed, and nothing on disk recorded the
+failure — so the next revive found no checkpoint and re-ran detection +
+transcription. Worse, **nothing verified the checkpoint was reloadable**, so the
+failure was invisible until the next crash exposed it.
+
+Fix — make the checkpoint durable, self-checking, and self-diagnosing:
+
+- **`_json_safe()` normalizes the whole payload before `dumps`** — including dict
+  keys (integral keys → `int` so they round-trip, everything else → `str`) and
+  numpy/`set`/`Path`/unknown leaves. The save can no longer raise on a stray type.
+- **Verify-after-save**: right after writing, the checkpoint is reloaded and its
+  signature re-checked *while the engine output is still in hand*. A write that
+  can't be reloaded (corrupt JSON, an empty source SHA the loader always rejects,
+  a partial flush) now fails **loudly at save time** instead of silently stranding
+  the next revive.
+- **`fsync` on file + directory** in the atomic write, so the checkpoint survives
+  an abrupt container kill — the exact crash this module exists for.
+- **Loud, specific logs**: a failed save is now `ERROR` ("a future resume will
+  have to RE-RUN detection + transcription"); a load-miss reports *why* — which
+  files are missing, or the exact signature field that differs (`source_language:
+  saved='ja' != expected='auto'`, etc.). The next occurrence is diagnosable from
+  one log line instead of guesswork.
+
+So a same-build crash-revive of a job that died any time after the engine finished
+(bridge, summary, translate, clip export) now restores detection + transcription +
+the reframe plan and jumps straight to ~56% — as originally intended. (The
+underlying cause of the deaths themselves is the host NVIDIA driver instability,
+which is infra, not app code — this makes the recovery actually work.)
+
 # ClipAI — Progress bar tells the truth when a job is revived
 
 When a crashed job auto-resumed, it genuinely restarts the early stages (only
