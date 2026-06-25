@@ -4562,13 +4562,35 @@ async def _run_analysis_inner(job_id: str):
                 except Exception:
                     pass  # best-effort — never break clip extraction
 
+            def _persist_candidates(final_candidates):
+                # Snapshot the RANKED clips to the DB before the long export loop
+                # so a container death mid-export (frequent on this box) keeps the
+                # clip LIST — the user still sees the clips and can re-export
+                # individually — instead of losing all of them and seeing "No
+                # clips detected". The final enriched persist overwrites this on a
+                # clean finish. Best-effort, runs on the clipper thread.
+                try:
+                    _snap = to_fez_clips(final_candidates)
+                    _snap_dicts = [c.model_dump() if hasattr(c, "model_dump") else c
+                                   for c in _snap]
+                    if _snap_dicts:
+                        asyncio.run_coroutine_threadsafe(
+                            database.update_job_status(job_id, clips=_snap_dicts),
+                            _loop,
+                        )
+                        logger.info(
+                            "[%s] Snapshotted %d clip candidate(s) before export "
+                            "(crash-safe)", job_id, len(_snap_dicts))
+                except Exception as _pc_err:
+                    logger.debug("[%s] clip candidate snapshot skipped: %s", job_id, _pc_err)
+
             # Hard cap so clip detection can never hang the job indefinitely
             # (e.g. the VLM can't load + Replicate is rate-limited). The clipper
             # already trips a 429 circuit breaker and always has the signal-based
             # pass; this is the last-resort backstop — on timeout we continue
             # with no VLM clips rather than leaving the UI stuck.
             raw_clips = await asyncio.wait_for(
-                asyncio.to_thread(clip_extractor.run, _clipper_progress),
+                asyncio.to_thread(clip_extractor.run, _clipper_progress, _persist_candidates),
                 timeout=_SUMMARY_CLIP_TIMEOUT,
             )
             clips = to_fez_clips(raw_clips)

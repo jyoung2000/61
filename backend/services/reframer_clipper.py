@@ -3178,8 +3178,15 @@ class ClipExtractor:
         # to populate the job's analysis-cost card.
         self.total_cost_usd: float = 0.0
 
-    def run(self, on_progress: Callable = None) -> List[ClipCandidate]:
-        """Execute the full clip extraction pipeline."""
+    def run(self, on_progress: Callable = None,
+            on_candidates: Callable = None) -> List[ClipCandidate]:
+        """Execute the full clip extraction pipeline.
+
+        ``on_candidates(final_candidates)`` fires once the clips are RANKED but
+        BEFORE the (long, crash-prone) export loop, so the caller can persist the
+        clip list immediately — a container death mid-export then keeps the clips
+        instead of losing all of them.
+        """
         logger.info(f"Starting clip extraction: {self.video_path}")
         logger.info(f"Config: VLM={self.config.videollama2_enabled}, "
                      f"cloud={self.config.cloud_backend}, "
@@ -3401,7 +3408,8 @@ class ClipExtractor:
         # progress relay so the long export phase reports "Exporting clip k/N".
         self.clips = self._final_rank_and_export(
             judge_candidates,
-            lambda p, m=None: on_progress(0.85 + p * 0.15, m) if on_progress else None
+            lambda p, m=None: on_progress(0.85 + p * 0.15, m) if on_progress else None,
+            on_ranked=on_candidates,
         )
 
         if on_progress:
@@ -3594,7 +3602,8 @@ class ClipExtractor:
             on_progress(1.0)
 
     def _final_rank_and_export(self, candidates: List[ClipCandidate],
-                               on_progress: Callable = None) -> List[ClipCandidate]:
+                               on_progress: Callable = None,
+                               on_ranked: Callable = None) -> List[ClipCandidate]:
         """Final ranking and FFmpeg clip extraction."""
         video_dur = _get_video_duration(self.video_path)
         eff_max = self.config.effective_max_clips(video_dur)
@@ -3637,6 +3646,16 @@ class ClipExtractor:
 
         if not final:
             return []
+
+        # Hand the RANKED clips to the caller before the export loop starts. The
+        # export tail is the longest, most crash-prone phase (N FFmpeg encodes);
+        # persisting the list here means a container death mid-export keeps the
+        # clips (the user sees them + can re-export) instead of losing all N.
+        if on_ranked:
+            try:
+                on_ranked(list(final))
+            except Exception:
+                pass
 
         # Create output directory next to the video
         out_dir = os.path.join(os.path.dirname(self.video_path), "clips")

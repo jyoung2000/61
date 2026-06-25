@@ -1,3 +1,21 @@
+# ClipAI — Clips survive a crash mid-export (no more "No clips detected" after a death)
+
+A job that died mid clip-export (e.g. at 48/63 when the container restarts) came
+back with **zero clips** — "No clips detected" — even though detection had found
+63 and rendered 48. Cause: clip detection + export is one monolithic call and the
+clip list was only persisted *after* the whole thing returned, so a crash in the
+long export tail lost the entire list.
+
+Fix — **snapshot the ranked clips before the export loop**. `ClipExtractor.run`
+gained an `on_candidates` hook that fires the moment clips are ranked (before any
+FFmpeg encode); the pipeline persists them immediately. Now a death mid-export
+keeps the clip list (the user sees the clips and can re-export individually via
+the per-clip export button), and any clips already rendered are on disk. The
+final enriched persist (captions/SEO) still overwrites on a clean finish.
+
+(Same underlying trigger as the transcript/preview corruption: the container
+restarting mid-job. This makes the clip stage resilient to it.)
+
 # ClipAI — Preview video no longer stalls on a corrupt/partial cached preview
 
 The in-editor preview could sit on "Loading video…" forever even after analysis
