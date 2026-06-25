@@ -1,3 +1,39 @@
+# ClipAI — Stop wasting a doomed GPU attempt on every clip export
+
+A run's backend log showed `clip export attempt 1/2 failed (rc=218): … Nothing was
+written into output file … frame= 0` for **all 63 clips** — every clip tried the
+GPU encoder (`h264_nvenc`), got nothing, then fell back to CPU. On a 4 GB GTX 1650
+the NVENC session can't be created while Ollama is resident (it holds the VRAM
+during clip detection/SEO), so the GPU path is doomed for the whole batch —
+`detect_gpu_capabilities()` even reports NVENC "available" after its own test fails,
+*expecting* this per-clip CPU fallback. The result: 63 wasted NVENC attempts and a
+noisy log.
+
+Fix: `_export_clip` now tags each candidate command as GPU or CPU, and the first
+time the GPU path fails while the CPU path succeeds it latches a batch-scoped flag
+(`_gpu_encode_unavailable`, reset at the start of each export run) so the remaining
+clips skip straight to CPU. One real GPU probe per run instead of one per clip; the
+clips still export identically (CPU), just without the wasted attempt and the
+misleading failure spam.
+
+# ClipAI — Transcript self-heal stops churning the DB (and the misleading log)
+
+The same log showed `Self-healed translated_transcript: 512 → 512 cue(s) (dropped
+source-language / duplicate artifacts)` logged **dozens of times** in one run —
+with the count unchanged (512 → 512), so *nothing was actually dropped*. Cause: the
+on-read heal sorts cues and treats a reorder as "changed", then persists. But mid
+run the pipeline still holds the in-memory job and overwrites
+`translated_transcript` at translate time, so the DB heal never sticks and every
+poll re-sorts → re-persists → re-logs. (The sanitizer itself is idempotent — a pure
+reorder converges in one pass; verified — so this was churn, not a heal loop, and it
+self-resolved when the run finished.)
+
+Fix: the read path now persists the heal only when it removed real corruption (cues
+dropped) **or** the run is already terminal (a reorder-only fix, persisted once).
+Mid-run reorders are still served sorted for display but not written, so the DB and
+log stop churning. The WARN now fires only when cues were genuinely dropped — no
+more "512 → 512 (dropped …)" that dropped nothing.
+
 # ClipAI — A job that dies after detection actually resumes (no more "died at translate → restarted faces")
 
 A job ran through face detection + Whisper transcription + planning, reached the

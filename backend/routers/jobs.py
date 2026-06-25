@@ -179,23 +179,34 @@ async def get_transcripts(job_id: str, user: User = Depends(get_current_user)):
             _clean, _changed = sanitize_translated_transcript(
                 _tt, getattr(job, "subtitle_language", "") or "en")
             if _changed:
-                # Heal genuine corruption (source-language relapse / gross
-                # duplication) exactly ONCE — then it's a stable no-op, because
-                # ``sanitize_translated_transcript`` is idempotent: the next poll
-                # finds the cleaned track unchanged and re-persists nothing.
+                # Always SERVE the cleaned/sorted track for display (set below) —
+                # but be careful about PERSISTING it.
                 #
                 # We deliberately do NOT re-flow / merge cues on read. That pass
                 # (enforce_readability) is not a fixed point of the sanitizer, so
                 # running it per-poll re-merged and re-persisted slightly different
-                # cues every few seconds — which is exactly the "transcript lines
-                # move around while I'm reading them" symptom. Re-flow belongs in
-                # the pipeline (once, at translate time), never on every read.
-                import logging as _lg
-                _lg.getLogger("backend.routers.jobs").warning(
-                    "[%s] Self-healed translated_transcript: %d → %d cue(s) "
-                    "(dropped source-language / duplicate artifacts)",
-                    job_id, len(_tt), len(_clean))
-                await database.update_job_status(job_id, translated_transcript=_clean)
+                # cues every few seconds — the "transcript lines move around while
+                # I'm reading them" symptom. Re-flow belongs in the pipeline (once,
+                # at translate time), never on every read.
+                _dropped = len(_clean) < len(_tt)
+                _status = str(getattr(job, "status", "") or "").lower()
+                _terminal = _status in (
+                    "complete", "completed", "failed", "error", "cancelled", "canceled")
+                # Persist when we removed real corruption (cues dropped), or once
+                # the run is over for a reorder-only fix. We do NOT persist a
+                # reorder-only change mid-run: the pipeline still holds the
+                # in-memory job and overwrites translated_transcript at translate
+                # time, so persisting every poll just churns the DB + log without
+                # sticking (observed: the same "512 → 512" heal logged dozens of
+                # times during one resumed run).
+                if _dropped or _terminal:
+                    import logging as _lg
+                    if _dropped:
+                        _lg.getLogger("backend.routers.jobs").warning(
+                            "[%s] Self-healed translated_transcript: %d → %d cue(s) "
+                            "(dropped source-language / duplicate artifacts)",
+                            job_id, len(_tt), len(_clean))
+                    await database.update_job_status(job_id, translated_transcript=_clean)
                 job.translated_transcript = _clean
         except Exception:
             pass

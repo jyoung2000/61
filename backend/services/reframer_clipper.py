@@ -3692,6 +3692,9 @@ class ClipExtractor:
         _conc = max(1, min(_conc, _n_final))
 
         _ok: list[tuple[int, object]] = []   # (idx, clip) for successful exports
+        # Re-test the GPU encoder fresh each export run — a previous job may have
+        # disabled it while Ollama was loaded; this one might have the GPU free.
+        _gpu_encode_unavailable.clear()
 
         def _log_ok(idx, c, cn):
             logger.info(
@@ -3770,6 +3773,13 @@ class ClipExtractor:
         return exported
 
 
+# Set the first time the GPU encoder fails while the CPU path succeeds during a
+# batch export, so the remaining clips skip the doomed NVENC attempt instead of
+# repeating it dozens of times (the "every clip exports twice" symptom when
+# Ollama is holding the 4 GB GPU). Reset at the start of each export run.
+_gpu_encode_unavailable = threading.Event()
+
+
 def _export_clip(video_path: str, output_path: str,
                  start_s: float, end_s: float) -> bool:
     """Extract a candidate clip — a plain time-cut of the source video (no
@@ -3798,10 +3808,10 @@ def _export_clip(video_path: str, output_path: str,
             '-i', video_path]
     tail = ['-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', output_path]
 
-    cmds: list[list] = []
+    cmds: list[tuple[bool, list]] = []   # (is_gpu, argv)
     # Fastest (opt-in): stream-copy — no transcode, keyframe-approximate start.
     if _stream_copy:
-        cmds.append(base + ['-c', 'copy', '-movflags', '+faststart', output_path])
+        cmds.append((False, base + ['-c', 'copy', '-movflags', '+faststart', output_path]))
     # Preferred: GPU encoder (respects GPU_ACCELERATION_ENABLED; returns libx264
     # itself when the toggle is off or no GPU encoder is present).
     try:
@@ -3810,7 +3820,12 @@ def _export_clip(video_path: str, output_path: str,
         # its own p5); "veryfast" keeps the CPU path quick when the GPU is off.
         _vargs = _gpu_encode_args({"preset": "veryfast", "crf": _crf}, "1080p")
         if _vargs:
-            cmds.append(base + _vargs + tail)
+            # _gpu_encode_args returns libx264 when the GPU toggle is off — only
+            # treat it as a GPU command when it actually names a hw encoder, so
+            # the skip-after-failure logic doesn't disable the CPU path.
+            _is_gpu = any(enc in str(a) for a in _vargs
+                          for enc in ("nvenc", "vaapi", "qsv"))
+            cmds.append((_is_gpu, base + _vargs + tail))
     except Exception:
         pass
     # Fallback (and the path when GPU detection is unavailable): fast CPU encode.
@@ -3818,20 +3833,41 @@ def _export_clip(video_path: str, output_path: str,
     # review clips.
     _cpu = base + ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', str(_crf),
                    '-pix_fmt', 'yuv420p'] + tail
-    if not cmds or cmds[-1] != _cpu:
-        cmds.append(_cpu)
+    if not cmds or cmds[-1][1] != _cpu:
+        cmds.append((False, _cpu))
 
-    for attempt, cmd in enumerate(cmds):
+    # Skip the GPU attempt outright if a previous clip in this batch already
+    # proved it can't run (Ollama holding the GPU, or the card's NVENC is
+    # unusable) — otherwise every one of dozens of clips wastes a doomed NVENC
+    # attempt before falling back to CPU.
+    _skip_gpu = _gpu_encode_unavailable.is_set()
+    _gpu_failed_here = False
+    for attempt, (is_gpu, cmd) in enumerate(cmds):
+        if is_gpu and _skip_gpu:
+            continue
         try:
             result = subprocess.run(cmd, capture_output=True, timeout=180)
             if result.returncode == 0 and os.path.exists(output_path) \
                     and os.path.getsize(output_path) > 0:
+                # GPU failed but CPU just worked → stop trying NVENC for the rest
+                # of this batch. Latch once (Event is process-wide but reset per
+                # export run), so we log the switch a single time.
+                if _gpu_failed_here and not is_gpu \
+                        and not _gpu_encode_unavailable.is_set():
+                    _gpu_encode_unavailable.set()
+                    logger.warning(
+                        "GPU clip encode failed but CPU succeeded — using CPU for "
+                        "the remaining clips this run (GPU likely busy with Ollama)")
                 return True
+            if is_gpu:
+                _gpu_failed_here = True
             logger.warning(
                 "clip export attempt %d/%d failed (rc=%s): %s",
                 attempt + 1, len(cmds), result.returncode,
                 (result.stderr or b"")[-300:].decode("utf-8", "replace"))
         except Exception as e:
+            if is_gpu:
+                _gpu_failed_here = True
             logger.warning("clip export attempt %d/%d error: %s",
                            attempt + 1, len(cmds), e)
     return False
