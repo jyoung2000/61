@@ -107,15 +107,19 @@ async def _save_job_unlocked(job: JobResult, *, _preserve_terminal_status: bool 
     # Normalize transcript fields to TranscriptSegment instances before dumping,
     # so model_dump() doesn't emit a per-cue serialization warning for any dicts
     # a caller assigned (see _coerce_segments). This is the single chokepoint all
-    # save paths pass through.
-    for _tk in ("transcript", "translated_transcript"):
-        _rows = getattr(job, _tk, None)
-        if isinstance(_rows, list) and any(isinstance(r, dict) for r in _rows):
-            try:
-                setattr(job, _tk, _coerce_segments(_rows))
-            except Exception:
-                pass
-    data = job.model_dump(mode="json")
+    # save paths pass through. Run the coercion + model_dump OFF the event loop:
+    # serializing a job bloated by a corrupted run (tens of thousands of cues) is
+    # heavy enough to stall the loop on every progress write during a run.
+    def _coerce_and_dump():
+        for _tk in ("transcript", "translated_transcript"):
+            _rows = getattr(job, _tk, None)
+            if isinstance(_rows, list) and any(isinstance(r, dict) for r in _rows):
+                try:
+                    setattr(job, _tk, _coerce_segments(_rows))
+                except Exception:
+                    pass
+        return job.model_dump(mode="json")
+    data = await asyncio.to_thread(_coerce_and_dump)
 
     # ── Anti-clobber guard (whole-object save_job path only) ────────────
     # A load → modify → save_job with a job captured just before a newer write
@@ -224,7 +228,9 @@ async def _save_job_unlocked(job: JobResult, *, _preserve_terminal_status: bool 
         except Exception:
             pass
 
-    content = json.dumps(data, indent=2, default=_numpy_safe_default)
+    # Encode off the event loop too (a multi-MB job dict is slow to stringify).
+    content = await asyncio.to_thread(
+        json.dumps, data, indent=2, default=_numpy_safe_default)
     # Atomic write: write to temp file then rename to prevent readers
     # from seeing a truncated/empty file during concurrent access.
     fd, tmp_path = tempfile.mkstemp(dir=directory, suffix=".tmp")
@@ -256,8 +262,13 @@ async def _load_job_unlocked(job_id: str) -> Optional[JobResult]:
         if not content.strip():
             logger.warning("Empty job.json for %s, treating as not found", job_id)
             return None
-        data = json.loads(content)
-        return JobResult(**data)
+        # Parse + validate OFF the event loop. A job bloated by a corrupted run
+        # (tens of thousands of transcript cues, each with per-word timestamps)
+        # makes json.loads + Pydantic validation take long enough to stall the
+        # loop — which surfaces as "Connection lost" in the UI and every other
+        # request hanging while a transcript "loads forever". load_job runs on
+        # every poll, so this is the hot path.
+        return await asyncio.to_thread(lambda: JobResult(**json.loads(content)))
     except (json.JSONDecodeError, Exception) as e:
         logger.warning("Failed to load job %s: %s", job_id, e)
         return None

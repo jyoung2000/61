@@ -1,3 +1,26 @@
+# ClipAI — Transcript no longer freezes the container ("Connection lost")
+
+Report: opening a job's transcript "takes forever to load, slows the whole
+container, and shows Connection lost." Cause: a job bloated by the earlier
+crash-resume corruption (tens of thousands of transcript cues, each with per-word
+timestamps) was being parsed, sanitized, and serialized **synchronously on the
+asyncio event loop** — so while one request churned through it, every other
+request (including the frontend's health ping) stalled and the UI flipped to
+"Connection lost."
+
+Fix — move the heavy per-job CPU work OFF the event loop:
+- `database._load_job_unlocked`: `json.loads` + Pydantic validation now run in a
+  worker thread (this is the hot path — `load_job` runs on every poll).
+- `database._save_job_unlocked`: the coerce + `model_dump` + `json.dumps` now run
+  in a thread (so progress writes during a run don't stall the loop either).
+- `GET /jobs/{id}/transcripts`: the on-read self-heal sanitize and the per-cue
+  dump of both tracks now run in a thread.
+
+The loop stays responsive regardless of one job's size, so the UI no longer drops
+its connection. (The bloated job itself is still large to load; re-analyzing it on
+the current build gives a normal-size, clean transcript — that's the real cure for
+that specific record.)
+
 # ClipAI — Diagnostics bundle stays readable (cap the reframe problems list)
 
 A "full logs" export came back as 106k lines — but only 65 were actual runtime

@@ -176,7 +176,12 @@ async def get_transcripts(job_id: str, user: User = Depends(get_current_user)):
     if _tt:
         try:
             from backend.services.transcript_sanitize import sanitize_translated_transcript
-            _clean, _changed = sanitize_translated_transcript(
+            # Sanitize OFF the event loop — on a transcript bloated by a corrupted
+            # run (tens of thousands of cues) the sort + per-char CJK scan is heavy
+            # enough to stall the loop on every poll ("Connection lost" + the
+            # transcript "loading forever").
+            _clean, _changed = await asyncio.to_thread(
+                sanitize_translated_transcript,
                 _tt, getattr(job, "subtitle_language", "") or "en")
             if _changed:
                 # Always SERVE the cleaned/sorted track for display (set below) —
@@ -211,14 +216,21 @@ async def get_transcripts(job_id: str, user: User = Depends(get_current_user)):
         except Exception:
             pass
 
+    # Dump both tracks OFF the event loop — model_dump per cue × thousands of
+    # cues (each with per-word timestamps) is heavy enough to stall the loop on
+    # every poll for a bloated transcript.
+    _src_rows, _tt_rows = await asyncio.to_thread(
+        lambda: (_dump(getattr(job, "transcript", [])),
+                 _dump(getattr(job, "translated_transcript", []))))
+
     return {
         "job_id": job_id,
         "status": str(getattr(job, "status", "") or ""),
         "translation_status": getattr(job, "translation_status", None),
         "subtitle_language": getattr(job, "subtitle_language", "") or "",
         "language": getattr(job, "language", "") or "",
-        "transcript": _dump(getattr(job, "transcript", [])),
-        "translated_transcript": _dump(getattr(job, "translated_transcript", [])),
+        "transcript": _src_rows,
+        "translated_transcript": _tt_rows,
         # The video summary rides this lightweight poll too. It is persisted
         # mid-pipeline but otherwise only reaches the UI via the full (often
         # multi-MB) GET /jobs/{id} — the very request too large/slow to land over
