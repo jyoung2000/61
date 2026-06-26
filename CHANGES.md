@@ -1,3 +1,22 @@
+# ClipAI — Honest build label + no stale "Exporting clips" on reconnect
+
+Two cosmetic fixes:
+
+- **Build label was "unknown — (no subject)".** The image can't read git at
+  runtime (``.git`` is excluded from the build context), so the SHA/subject must
+  be passed as build args — but a plain ``docker compose build`` (without
+  ``export BUILD_SHA=…``) leaves them at their "unknown" default. Added
+  ``deploy.sh``, which captures the SHA + commit subject from git and exports
+  them before building, so the startup log reads e.g. ``ClipAI build: d531150 —
+  Collapse duplicate transcript lines``. Use ``./deploy.sh`` to redeploy.
+
+- **A reconnect hours later showed a bogus "Exporting clips (59/63)".** On WS
+  connect the server replays the job's current state, but for a finished job it
+  was sending the stored ``progress_message`` — often a stale intermediate
+  ("Exporting clips… (59/63)", because clip export emits progress out of order
+  under concurrency). It now sends a clean terminal line ("Analysis complete" /
+  "Cancelled" / the failure reason), so a late reconnect reflects reality.
+
 # ClipAI — Collapse duplicate transcript lines (Whisper repetition)
 
 Even on a clean run the translated transcript repeated whole lines at different

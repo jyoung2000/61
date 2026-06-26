@@ -25,11 +25,25 @@ async def websocket_job_progress(websocket: WebSocket, job_id: str):
         if job is not None:
             status = job.status.value if hasattr(job.status, "value") else str(job.status)
             terminal = status in ("complete", "failed", "cancelled")
+            # For a TERMINAL job, send a clean status line — NOT the stored
+            # progress_message, which is often a stale intermediate like
+            # "Exporting clips… (59/63)" (clip export emits progress out of order
+            # under concurrency, so the last-persisted message isn't the final
+            # one). Replaying that on a reconnect hours later showed a bogus
+            # "Exporting clips (59/63)" event long after the run finished.
+            if status == "complete":
+                msg = "Analysis complete"
+            elif status == "cancelled":
+                msg = "Cancelled"
+            elif status == "failed":
+                msg = getattr(job, "progress_message", "") or "Analysis failed"
+            else:
+                msg = getattr(job, "progress_message", "") or ""
             await websocket.send_json({
                 "type": "complete" if status == "complete" else "status",
                 "status": status,
                 "progress": int(getattr(job, "progress", 0) or (100 if terminal else 0)),
-                "message": getattr(job, "progress_message", "") or "",
+                "message": msg,
             })
     except Exception as e:  # best-effort — never block the connection
         logger.debug("ws connect status replay failed for %s: %s", job_id, e)
