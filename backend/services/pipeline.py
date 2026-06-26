@@ -3690,6 +3690,15 @@ async def _run_analysis_inner(job_id: str):
                 job_id,
                 "Resumed from a saved checkpoint — reused detection, "
                 "transcription, and the reframe plan from a previous run.")
+            try:
+                await broadcast_ws(job_id, {
+                    "type": "checkpoint",
+                    "message": (
+                        "Resumed from checkpoint — reused saved detection + "
+                        "transcription (skipped re-analysis)."),
+                })
+            except Exception:
+                pass
             await _update_progress(
                 job_id, JobStatus.ANALYZING_SCENES, 56,
                 "Resuming — reusing saved detection + transcription...")
@@ -3748,7 +3757,7 @@ async def _run_analysis_inner(job_id: str):
         # can RESUME here next time — skipping detection + transcription —
         # instead of re-running the whole engine. Best-effort: never break the
         # run over a serialization hiccup.
-        await pipeline_checkpoint.save_engine_checkpoint(
+        _ckpt_saved = await pipeline_checkpoint.save_engine_checkpoint(
             job_id, perception, reframer_plan,
             signature=_engine_ckpt_signature,
             audio_meta={
@@ -3757,6 +3766,20 @@ async def _run_analysis_inner(job_id: str):
                 "requested": getattr(engine, "_perceiver_audio_model_requested", None),
             },
         )
+        # Surface a CHECKPOINT marker in the processing log so the user can see
+        # exactly where a restart will pick up — detection + transcription are
+        # now saved; a crash after this point resumes here instead of re-running
+        # the most expensive ~25 min stage.
+        if _ckpt_saved:
+            try:
+                await broadcast_ws(job_id, {
+                    "type": "checkpoint",
+                    "message": (
+                        "Checkpoint reached — detection + transcription saved. "
+                        "If the job restarts, it resumes from here."),
+                })
+            except Exception:
+                pass
 
     await _update_progress(
         job_id, JobStatus.ANALYZING_SCENES, 57,

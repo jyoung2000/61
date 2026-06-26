@@ -60,6 +60,7 @@ function eventToLogEntry(ev) {
     case 'status': type = 'status'; break;
     case 'complete': type = 'success'; message = baseMsg || 'Analysis complete'; break;
     case 'error': type = 'error'; break;
+    case 'checkpoint': type = 'checkpoint'; message = baseMsg || 'Checkpoint reached'; break;
     case 'compute_warning': type = 'warning'; break;
     case 'fallback': type = 'info'; break;
     case 'cancelled': type = 'warning'; message = baseMsg || 'Cancelled'; break;
@@ -1272,6 +1273,9 @@ export default function Analysis() {
           } else if (msg.type === 'fallback') {
             pushLog('warning', `Provider fallback: ${String(msg.from_provider || '?')} → ${String(msg.to_provider || '?')} (${String(msg.reason || 'unknown')})`);
             showToast(`Fallback: ${String(msg.from_provider || '?')} -> ${String(msg.to_provider || '?')}: ${String(msg.reason || '')}`, 'warning');
+          } else if (msg.type === 'checkpoint') {
+            // A resume point was reached/restored — show where a restart picks up.
+            pushLog('checkpoint', String(msg.message || 'Checkpoint reached'));
           } else if (msg.type === 'compute_warning') {
             // The pipeline ran a heavy stage on CPU despite GPU being enabled.
             const m = String(msg.message || 'Running on CPU — analysis will be slow.');

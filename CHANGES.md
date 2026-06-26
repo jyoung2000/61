@@ -1,3 +1,36 @@
+# ClipAI — Clip export now resumes instead of stopping short after a crash
+
+Report: if a job dies while exporting clips, it never finishes exporting all the
+clips — you end up with fewer than were found. Cause: the clip list is
+snapshotted BEFORE export (so a crash doesn't lose the candidates), so a job that
+died mid-export has the full found-count in ``clips`` but only some MP4s on disk.
+Startup recovery saw "has clips" and marked it COMPLETE — stranding the unfinished
+exports.
+
+Fix (two parts):
+- **Recovery now gates "complete" on the export actually finishing** — the
+  ``clips_manifest.json`` (written right after the export loop) or every clip's
+  ``*_clip*.mp4`` being present. A job with the list but missing files is treated
+  as "needs resume", so it re-queues and finishes the rest instead of being
+  declared done. (A genuinely-complete job, or one with only a summary, is
+  unaffected; any inspection error fails safe to "complete" so nothing loops.)
+- **Clip export is now idempotent** — ``_export_clip`` skips a clip whose MP4 is
+  already on disk, so a resumed run finishes only the clips it never reached
+  rather than re-encoding the whole batch.
+
+Net: a crash at clip 30/63 now resumes and produces all 63, instead of completing
+with 30.
+
+# ClipAI — Checkpoint indicator in the processing log
+
+You can now see, right in the processing log, when the pipeline reaches its resume
+checkpoint — so if a job fails you know exactly where it will pick up. After
+detection + transcription are saved, a cyan ⚑ "Checkpoint reached — detection +
+transcription saved. If the job restarts, it resumes from here." line appears
+(and on a resumed run, a matching "Resumed from checkpoint…" line). The marker is
+styled as a milestone (cyan, bold, left-bar) so it stands out from ordinary
+status lines, and it's persisted to the job event log so it survives reloads.
+
 # ClipAI — Fix the per-segment PUT storm that kept the GUI from loading
 
 The container logs showed hundreds of `PUT /api/jobs/<id>/transcript/<N>` requests

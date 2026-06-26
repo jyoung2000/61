@@ -33,19 +33,23 @@ const STAGE_BADGES = {
 };
 
 const TYPE_ICONS = {
-  status:  '›',
-  success: '✓',
-  warning: '⚠',
-  error:   '✕',
-  info:    '·',
+  status:     '›',
+  success:    '✓',
+  warning:    '⚠',
+  error:      '✕',
+  info:       '·',
+  checkpoint: '⚑',
 };
 
 const TYPE_COLORS = {
-  status:  'var(--text-secondary)',
-  success: 'var(--success, #22c55e)',
-  warning: 'var(--accent-amber, #f59e0b)',
-  error:   'var(--danger, #ef4444)',
-  info:    'var(--text-muted)',
+  status:     'var(--text-secondary)',
+  success:    'var(--success, #22c55e)',
+  warning:    'var(--accent-amber, #f59e0b)',
+  error:      'var(--danger, #ef4444)',
+  info:       'var(--text-muted)',
+  // A saved resume point — make it stand out so the user can see where a
+  // restart would pick up.
+  checkpoint: 'var(--accent-cyan, #06b6d4)',
 };
 
 function fmtRelative(absTime, startTime) {
@@ -154,7 +158,16 @@ export default function ProcessingLog({
                     <div style={{ flex: 1, height: 1, background: stageColor, opacity: 0.4 }} />
                   </div>
                 )}
-                <div style={{ display: 'flex', gap: 6, alignItems: 'baseline' }}>
+                <div style={{
+                  display: 'flex', gap: 6, alignItems: 'baseline',
+                  // Make a checkpoint read as a milestone, not just another line.
+                  ...(entry.type === 'checkpoint' ? {
+                    fontWeight: 600,
+                    background: 'var(--accent-cyan, #06b6d4)11',
+                    borderLeft: '2px solid var(--accent-cyan, #06b6d4)',
+                    padding: '2px 4px 2px 6px', margin: '2px 0', borderRadius: 3,
+                  } : {}),
+                }}>
                   {/* Relative elapsed time */}
                   <span style={{ color: 'var(--text-muted)', flexShrink: 0, minWidth: 40 }}>
                     {relTime || entry.ts || ''}
