@@ -511,7 +511,8 @@ export default function VideoEditor({
         if (subItem.transcriptIndex == null) updates.transcriptIndex = match._origIdx;
         if (Object.keys(updates).length > 0) {
           updateTimelineItem(subItem.id, updates);
-          lastSyncedSubtitlesRef.current.set(subItem.id, match.text);
+          const _prevSync = lastSyncedSubtitlesRef.current.get(subItem.id) || {};
+          lastSyncedSubtitlesRef.current.set(subItem.id, { ..._prevSync, text: match.text });
         }
       }
     });
@@ -827,22 +828,33 @@ export default function VideoEditor({
 
       const seg = transcript[matchIdx];
       const timelineText = subItem.subtitleText || '';
-      const lastSynced = lastSyncedSubtitlesRef.current.get(subItem.id);
+      // The last values WE pushed for this item. A timeline⇄transcript round-trip
+      // doesn't always converge exactly (clip-relative ⇄ absolute rounding, or a
+      // mismatched cue on a corrupted transcript), so without remembering what we
+      // already sent, the start/end/speaker sync re-fired on every run — and
+      // onTranscriptUpdated() reloads the transcript, which re-triggers this
+      // effect → an infinite per-segment PUT storm that saturated the backend and
+      // kept the whole GUI from loading. Guarding every field against its
+      // last-synced value bounds each cue to one PUT per distinct value.
+      const lastSynced = lastSyncedSubtitlesRef.current.get(subItem.id) || {};
       const body = {};
 
       // Text change
-      if (timelineText !== (seg.text || '') && timelineText !== lastSynced) {
+      if (timelineText !== (seg.text || '') && timelineText !== lastSynced.text) {
         body.text = timelineText;
       }
       // Speaker change
-      if (subItem.speaker && subItem.speaker !== seg.speaker) {
+      if (subItem.speaker && subItem.speaker !== seg.speaker
+          && subItem.speaker !== lastSynced.speaker) {
         body.speaker = subItem.speaker;
       }
       // Timing change — convert clip-relative back to absolute
-      if (Math.abs(subAbsStart - (seg.start ?? 0)) > 0.05) {
+      if (Math.abs(subAbsStart - (seg.start ?? 0)) > 0.05
+          && (lastSynced.start == null || Math.abs(subAbsStart - lastSynced.start) > 0.05)) {
         body.start = subAbsStart;
       }
-      if (Math.abs(subAbsEnd - (seg.end ?? 0)) > 0.05) {
+      if (Math.abs(subAbsEnd - (seg.end ?? 0)) > 0.05
+          && (lastSynced.end == null || Math.abs(subAbsEnd - lastSynced.end) > 0.05)) {
         body.end = subAbsEnd;
       }
 
@@ -863,9 +875,16 @@ export default function VideoEditor({
             body: JSON.stringify({ ...upd.body, target: transcriptTarget }),
           });
           if (res.ok) {
-            if (upd.body.text != null) {
-              lastSyncedSubtitlesRef.current.set(upd.itemId, upd.body.text);
-            }
+            // Remember everything we just synced for this item so the same value
+            // is never re-PUT (breaks the reload→re-sync loop above).
+            const prev = lastSyncedSubtitlesRef.current.get(upd.itemId) || {};
+            lastSyncedSubtitlesRef.current.set(upd.itemId, {
+              ...prev,
+              ...(upd.body.text != null ? { text: upd.body.text } : {}),
+              ...(upd.body.speaker != null ? { speaker: upd.body.speaker } : {}),
+              ...(upd.body.start != null ? { start: upd.body.start } : {}),
+              ...(upd.body.end != null ? { end: upd.body.end } : {}),
+            });
           }
         } catch (err) {
           console.error('Subtitle sync to transcript failed:', err);

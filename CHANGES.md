@@ -1,3 +1,26 @@
+# ClipAI — Fix the per-segment PUT storm that kept the GUI from loading
+
+The container logs showed hundreds of `PUT /api/jobs/<id>/transcript/<N>` requests
+for the SAME cue indices, repeating across 6 connections nonstop — each one
+re-saving the whole (bloated) job. That saturated the backend so the app's own API
+calls were starved and the GUI wouldn't load.
+
+Cause: the VideoEditor's reverse-sync (timeline subtitles → transcript). The TEXT
+change was guarded by "did I already sync this value", but **start / end / speaker
+were not**. So any timeline⇄transcript timing mismatch re-PUT every run — and the
+sync's `onTranscriptUpdated()` reloads the transcript, which re-triggers the sync.
+On a corrupted job (every cue mistimed) that's an infinite per-cue PUT loop over
+all ~367 cues.
+
+Fix: remember the last value we synced for EACH field (text/speaker/start/end) per
+timeline item and skip a PUT when it matches — so each cue is written at most once
+per distinct value. The reload→re-sync feedback can no longer loop. Genuine edits
+still go through (a new value differs from the last-synced one).
+
+Combined with moving job load/save off the event loop, the backend stays
+responsive. The corrupted job is still the trigger — re-analyzing (or deleting) it
+is the real cure for that record.
+
 # ClipAI — Transcript no longer freezes the container ("Connection lost")
 
 Report: opening a job's transcript "takes forever to load, slows the whole
