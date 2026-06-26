@@ -1,3 +1,16 @@
+# ClipAI — Diagnostics bundle stays readable (cap the reframe problems list)
+
+A "full logs" export came back as 106k lines — but only 65 were actual runtime
+logs; the rest was the diagnostics bundle, dominated by one job's
+``reframe_report.problems`` list (~6,200 per-keyframe findings) dumped verbatim.
+The on-disk artifacts were already size-capped; the DB report's ``problems`` list
+was not.
+
+Fix: the diagnostics export now caps ``problems`` to the first 40 entries with a
+``problems_omitted`` count (SSH in for the full report). The aggregate scores at
+the top of the report — the part that actually matters for triage — are
+untouched. Future bundles are a fraction of the size and actually readable.
+
 # ClipAI — Fix the GUI not loading: stop the Pydantic serializer warning flood
 
 The GUI stopped loading and the backend log filled with thousands of

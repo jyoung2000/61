@@ -1719,6 +1719,13 @@ _DIAGNOSTIC_JOB_LIMIT = 20
 # on a 24-min video and well below the export's overall budget.
 _DIAGNOSTIC_FILE_MAX_BYTES = 2 * 1024 * 1024
 
+# The DB ``reframe_report`` carries a ``problems`` list with one entry per
+# flagged keyframe — thousands on a long video (one export was 6,200 entries /
+# ~100k lines, dwarfing everything else and making the bundle unreadable). The
+# aggregate scores at the top are what matter for triage; cap the per-problem
+# detail to a readable sample and note how many were omitted.
+_DIAGNOSTIC_PROBLEMS_MAX = 40
+
 
 def _recent_job_dirs(uploads_root: str, limit: int) -> list[tuple[str, str, float]]:
     """Return ``(job_id, job_dir, mtime)`` for the ``limit`` most-recent
@@ -1984,7 +1991,22 @@ async def _collect_job_diagnostics() -> str:
         if report:
             out.append("\n--- reframe_report ---\n")
             import json as _json
-            out.append(_json.dumps(report, indent=2, default=str))
+            # Cap the per-keyframe ``problems`` list so one job's thousands of
+            # findings can't bloat the bundle into the 100k-line range — the
+            # aggregate scores above the list are what triage needs.
+            _rpt = report
+            try:
+                _probs = report.get("problems") if isinstance(report, dict) else None
+                if isinstance(_probs, list) and len(_probs) > _DIAGNOSTIC_PROBLEMS_MAX:
+                    _rpt = dict(report)
+                    _rpt["problems"] = _probs[:_DIAGNOSTIC_PROBLEMS_MAX]
+                    _rpt["problems_omitted"] = (
+                        f"{len(_probs) - _DIAGNOSTIC_PROBLEMS_MAX} more "
+                        f"(showing first {_DIAGNOSTIC_PROBLEMS_MAX} of "
+                        f"{len(_probs)}; SSH in for the full reframe_report)")
+            except Exception:
+                _rpt = report
+            out.append(_json.dumps(_rpt, indent=2, default=str))
             out.append("\n")
 
         # The on-disk artifacts.
