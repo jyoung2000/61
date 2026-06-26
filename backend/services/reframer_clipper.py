@@ -3798,6 +3798,15 @@ def _export_clip(video_path: str, output_path: str,
 
     ``-ss``/``-to`` stay BEFORE ``-i`` for fast keyframe seek, so only the clip
     span is decoded. Each option falls through to the next if it fails."""
+    # Idempotent / resumable: if this clip is already on disk (a previous run
+    # died part-way through the batch and this is a resume), keep it instead of
+    # re-encoding. This is what lets a resumed job finish ONLY the clips it never
+    # reached, rather than redoing the whole batch.
+    try:
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            return True
+    except OSError:
+        pass
     try:
         from backend.config import settings
     except Exception:

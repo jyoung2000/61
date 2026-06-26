@@ -724,6 +724,40 @@ def _is_stale(job, stale_after_s: float) -> bool:
     return age is None or age >= stale_after_s
 
 
+def _has_complete_results(job) -> bool:
+    """Whether a non-terminal job has results complete enough to mark COMPLETE
+    (vs. needing a resume to finish).
+
+    The clip list is snapshotted BEFORE export (so a crash mid-export doesn't
+    lose the candidates), which means ``job.clips`` being non-empty does NOT mean
+    every clip's MP4 was written. A job that died mid-export therefore has the
+    full found-count in ``clips`` but only some files on disk — marking it
+    COMPLETE there strands the user with fewer exported clips than were found
+    (the reported bug). Gate on the export actually having finished:
+
+      * ``clips_manifest.json`` exists (written right after the export loop), OR
+      * every clip already has its ``*_clip*.mp4`` on disk.
+
+    Otherwise the export is unfinished → return False so recovery RESUMES it (the
+    export skips clips already on disk and finishes the rest). Jobs with only a
+    summary (died before clip detection) keep the prior behavior. Fail-safe: any
+    inspection error returns True so we never strand a job in a resume loop.
+    """
+    import glob as _glob
+    import backend.database as _db
+    clips = getattr(job, "clips", None)
+    if clips:
+        try:
+            clips_dir = os.path.join(_db._job_dir(job.job_id), "clips")
+            if os.path.isfile(os.path.join(clips_dir, "clips_manifest.json")):
+                return True
+            n_files = len(_glob.glob(os.path.join(clips_dir, "*_clip*.mp4")))
+            return n_files >= len(clips)
+        except Exception:
+            return True
+    return getattr(job, "summary", None) is not None
+
+
 async def _recover_stale_jobs(
     *,
     complete_stale_s: Optional[float],
@@ -747,7 +781,9 @@ async def _recover_stale_jobs(
     for job in await _db.list_jobs(include_unowned=True):
         if job.status not in _NON_TERMINAL_STATUSES:
             continue
-        has_results = bool(getattr(job, "clips", None)) or getattr(job, "summary", None) is not None
+        # A mid-export crash leaves the full clip LIST but only some MP4s — treat
+        # that as "needs resume", not "complete" (see _has_complete_results).
+        has_results = _has_complete_results(job)
         if has_results:
             if complete_stale_s is not None and _is_stale(job, complete_stale_s):
                 await _db.update_job_status(
@@ -862,8 +898,10 @@ async def _auto_resume_interrupted_jobs() -> tuple[int, int]:
     for job in await _db.list_jobs(include_unowned=True):
         if job.status not in _NON_TERMINAL_STATUSES:
             continue
-        has_results = bool(getattr(job, "clips", None)) or getattr(job, "summary", None) is not None
-        if has_results:
+        # Same gate as Pass 1: a job that died mid-export (full clip list but
+        # missing MP4s) is NOT complete — fall through and re-queue it so the
+        # export finishes the clips it never reached.
+        if _has_complete_results(job):
             continue  # completed by recover_orphaned_jobs' first pass
         attempts = int(getattr(job, "resume_attempts", 0) or 0)
         if attempts >= _MAX_AUTO_RESUME_ATTEMPTS:
