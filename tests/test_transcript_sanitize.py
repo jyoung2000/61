@@ -21,13 +21,24 @@ def test_drops_source_language_cues_for_english_target():
     assert [c["text"] for c in clean] == ["Hello there.", "How are you?"]
 
 
-def test_collapses_gross_duplication_keeps_two():
+def test_collapses_substantial_duplicate_to_one():
+    # A substantial line (a real sentence) that repeats verbatim is Whisper
+    # repetition / corruption — collapse to a single occurrence.
     rows = [{"start": i * 3.0, "end": i * 3 + 2.0,
              "text": "Just for a little while. Really?", "speaker": "Speaker 1"}
             for i in range(10)]
     clean, changed = sanitize_translated_transcript(rows, "en")
     assert changed
-    assert len(clean) == 2  # 10 identical copies → at most 2
+    assert len(clean) == 1
+
+
+def test_keeps_two_short_repeats():
+    # Short lines can legitimately recur — keep a couple, drop the gross excess.
+    rows = [{"start": i * 3.0, "end": i * 3 + 2.0, "text": "Yes?", "speaker": "Speaker 1"}
+            for i in range(10)]
+    clean, changed = sanitize_translated_transcript(rows, "en")
+    assert changed
+    assert len(clean) == 2
 
 
 def test_clean_track_is_untouched():

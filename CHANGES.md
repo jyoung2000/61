@@ -1,3 +1,22 @@
+# ClipAI — Collapse duplicate transcript lines (Whisper repetition)
+
+Even on a clean run the translated transcript repeated whole lines at different
+times — e.g. "panties look cute." at 0:00 and 0:09, "specific places before?" at
+2:39 and 6:47. Cause: Whisper repetition/hallucination on this kind of non-speech
+audio (music, moans, silence) emits the same source line at several timestamps,
+and translation is strictly 1:1, so it carries every copy through.
+
+Fix: ``transcript_sanitize`` now collapses a SUBSTANTIAL line (≥16 chars — a real
+sentence/phrase) to a single occurrence instead of keeping up to two. SHORT lines
+("Yes?", "No no") can legitimately recur and still keep a couple; markers
+("[♪ music ♪]") are never deduped (music plays at multiple points). The pass
+stays idempotent and order-preserving, and runs both before persist and on the
+read self-heal, so old transcripts clean up on next view too.
+
+Note: this removes verbatim REPEATS. The remaining short mid-sentence fragments
+(e.g. "I'm actually") are inherent to this source's pause-heavy pacing — Whisper
+splits on the pauses — and are left as-is to avoid over-merging unrelated lines.
+
 # ClipAI — Clip judge works offline again (no more HTTP 400 on every clip)
 
 In Offline Mode the clip-scoring judge is the best local *editorial* model —
