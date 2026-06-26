@@ -767,8 +767,16 @@ class AIOrchestrator:
 
         for provider in chain:
             try:
+                # Local models (qwen2.5:3b) ignore a "return ONLY JSON" instruction
+                # in free-form mode and emit prose — the observed cause of the
+                # reduce failing ("No valid JSON found") and dropping to the
+                # truncated fallback. Ollama exposes a grammar-constrained JSON
+                # mode; request it so the 3B reduce actually returns parseable JSON.
+                _kw = {}
+                if getattr(provider, "provider_name", "") == "ollama":
+                    _kw["json_mode"] = True
                 raw = await asyncio.wait_for(
-                    provider.text_complete(reduce_prompt, max_tokens=1000 if is_ollama else 2000),
+                    provider.text_complete(reduce_prompt, max_tokens=1000 if is_ollama else 2000, **_kw),
                     timeout=120 if is_ollama else 90,
                 )
                 data = extract_json(raw)
@@ -778,12 +786,18 @@ class AIOrchestrator:
                 logger.warning("[%s] Reduce summary via %s failed: %s", job_id, provider.provider_name, e)
                 continue
 
-        # Fallback: use mini-summaries as overview
-        overview = " ".join(mini_summaries[:6])
-        if len(overview) > 500:
-            overview = overview[:500].rsplit(" ", 1)[0] + "..."
+        # Fallback: stitch the mini-summaries into a cohesive overview. The
+        # reduce JSON contract failed, but the per-chunk summaries are plain
+        # prose the small model CAN produce — strip the "[m:ss-m:ss]" time tags
+        # and join several so the overview reads as a paragraph, not one chunk.
+        import re as _re
+        _clean = [_re.sub(r"^\[[0-9:.\-\s]+\]\s*", "", s).strip() for s in mini_summaries]
+        _clean = [s for s in _clean if s]
+        overview = " ".join(_clean[:8])
+        if len(overview) > 900:
+            overview = overview[:900].rsplit(" ", 1)[0] + "..."
         return VideoSummary(
-            overview=overview,
+            overview=overview or " ".join(mini_summaries[:6]),
             key_topics=[],
             tone="conversational",
             estimated_audience="general viewers",

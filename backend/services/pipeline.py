@@ -1000,6 +1000,21 @@ class _PipelineHeartbeat:
 _heartbeats: dict[str, _PipelineHeartbeat] = {}
 
 
+def set_heartbeat_stage(job_id: str, stage: str) -> None:
+    """Re-label the keepalive for a sub-phase that doesn't emit progress.
+
+    The heartbeat's stage label is normally derived from the job STATUS via
+    ``_update_progress``. Phases that run AFTER the clip stage but before the
+    COMPLETE save (Auto-SEO, caption refresh) keep the status on
+    ``detecting_clips`` and emit no progress, so the 15s keepalive kept saying
+    "Still processing... (clip detection — Xm elapsed)" for minutes while it was
+    actually generating SEO. Calling this once at the top of such a phase makes
+    the keepalive name the real work and reset its elapsed clock."""
+    hb = _heartbeats.get(job_id)
+    if hb:
+        hb.touch(stage)
+
+
 def is_job_analyzing(job_id: str) -> bool:
     """True while ``run_analysis`` is actively processing this job.
 
@@ -1570,6 +1585,10 @@ async def _auto_generate_clip_seo(
         "[%s] Auto-SEO starting on %d clips, %d transcript segments",
         job_id, len(source_clips), len(transcript or []),
     )
+    # Re-label the keepalive so the multi-minute SEO pass reads as
+    # "SEO generation" instead of the stale "clip detection" (the status stays
+    # detecting_clips through here — see _run_post_clip_followups).
+    set_heartbeat_stage(job_id, "SEO generation")
 
     video_summary = ""
     if job.summary:
@@ -1596,7 +1615,20 @@ async def _auto_generate_clip_seo(
     generated = 0
     failed = 0
     updated_clips = []
-    for clip in source_clips:
+    _seo_total = len(source_clips)
+    for _seo_idx, clip in enumerate(source_clips, 1):
+        # Visible, throttled progress so the activity log shows the SEO pass
+        # advancing instead of a silent multi-minute gap (the bar already sits
+        # at ~98% post-export; this only updates the message line + keepalive).
+        if _seo_idx == 1 or _seo_idx % 8 == 0 or _seo_idx == _seo_total:
+            set_heartbeat_stage(job_id, "SEO generation")
+            try:
+                await broadcast_ws(job_id, {
+                    "type": "status",
+                    "message": f"Generating SEO for clips… ({_seo_idx}/{_seo_total})",
+                })
+            except Exception:
+                pass
         clip_dict = clip.model_dump() if hasattr(clip, "model_dump") else dict(clip)
         platform = _resolve(clip_dict.get("platform"))
 
@@ -4575,10 +4607,16 @@ async def _run_analysis_inner(job_id: str):
                     return
                 pct, label = res
                 _last_clipper_pct[0] = pct
+                # Once we're in the export tail, name the keepalive "clip export"
+                # so a gap between two slow encodes doesn't read as "Still
+                # processing... (clip detection …)" while clips are clearly
+                # being written.
+                _hb_label = "clip export" if str(label).lstrip().startswith("Exporting") else ""
                 try:
                     asyncio.run_coroutine_threadsafe(
                         _update_progress(
                             job_id, JobStatus.DETECTING_CLIPS, pct, label,
+                            heartbeat_label=_hb_label,
                         ),
                         _loop,
                     )

@@ -1256,8 +1256,14 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
 
         raise ProviderError(f"Ollama text failed after 2 attempts (model={self._editorial_model})")
 
-    async def text_complete(self, prompt: str, max_tokens: int = 4096, timeout: int | None = None) -> str:
-        return await self._call_text(prompt, max_tokens=max_tokens)
+    async def text_complete(self, prompt: str, max_tokens: int = 4096, timeout: int | None = None,
+                            json_mode: bool = False) -> str:
+        # ``json_mode`` routes to Ollama's grammar-constrained ``format: "json"``
+        # output. Small local models (qwen2.5:3b) routinely ignore a "return
+        # ONLY JSON" instruction in free-form mode and emit prose, which made
+        # the map-reduce summary REDUCE step fail ("No valid JSON found") and
+        # fall back to a truncated overview. Constraining the grammar fixes that.
+        return await self._call_text(prompt, max_tokens=max_tokens, json_mode=json_mode)
 
     async def analyze_frames(
         self, frames: list[FrameData], custom_prompt: Optional[str] = None,
