@@ -1,3 +1,33 @@
+# ClipAI — Fix the GUI not loading: stop the Pydantic serializer warning flood
+
+The GUI stopped loading and the backend log filled with thousands of
+`UserWarning: Pydantic serializer warnings: PydanticSerializationUnexpectedValue
+(Expected TranscriptSegment … input_type=dict)` — one per cue, on every save.
+
+Cause: `translated_transcript` / `transcript` are typed `list[TranscriptSegment]`,
+but several callers assign plain **dicts** — the transcript editor dumps segments
+to dicts before saving (`s.model_dump()`), and the on-read self-heal sanitizes to
+dicts. Pydantic does NOT re-validate on plain attribute assignment, so those dicts
+sit in the field unconverted; the next `job.model_dump()` then warns once per cue.
+On this job's bloated transcript (thousands of cues from the crash-resume
+corruption) that's thousands of synchronous `stderr` writes on every save —
+enough to stall the asyncio event loop so concurrent GUI requests can't complete.
+The job edits still returned `200`, but the UI couldn't load.
+
+Fix, two layers:
+- **Coerce at the save chokepoint.** `database._save_job_unlocked` (which every
+  save path funnels through) now converts any dict items in `transcript` /
+  `translated_transcript` back to `TranscriptSegment` before `model_dump()`. Load
+  already validates dicts→models (`JobResult(**data)`), so reads were clean; this
+  makes writes clean too. Defensive: fills missing required fields, never raises.
+- **Silence the benign warning process-wide** as a safety net (`models.py`), so no
+  un-coerced path (a broadcast, a future caller) can ever reintroduce the
+  loop-stalling flood. The data serializes correctly either way.
+
+Note: the underlying transcript bloat is the same crash-resume corruption tracked
+elsewhere; a clean run yields a normal-size transcript. This fix makes the GUI
+load regardless.
+
 # ClipAI — Transcript panel ordering is now a hard, stable guarantee
 
 Report: "the translate UI doesn't properly order the subtitle lines." The panel

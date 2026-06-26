@@ -8,7 +8,7 @@ from typing import Optional
 
 import aiofiles
 
-from backend.models import JobResult
+from backend.models import JobResult, TranscriptSegment
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +47,46 @@ def _job_path(job_id: str) -> str:
     return os.path.join(_job_dir(job_id), "job.json")
 
 
+def _coerce_segments(rows):
+    """Coerce a transcript list to ``TranscriptSegment`` instances.
+
+    Several callers assign ``transcript`` / ``translated_transcript`` as plain
+    dicts — the transcript editor dumps segments to dicts before saving, and the
+    on-read self-heal sanitizes to dicts. Pydantic does NOT re-validate on plain
+    attribute assignment, so those dicts sit in a ``list[TranscriptSegment]``
+    field unconverted, and every later ``job.model_dump()`` then emits a
+    ``PydanticSerializationUnexpectedValue`` warning PER CUE. On a long
+    transcript that is thousands of synchronous stderr writes on each save —
+    enough to stall the event loop so the GUI can't load (the reported symptom).
+
+    Coercing to models keeps serialization clean and fast. Defensive: fills
+    missing required fields and never raises (a hopelessly malformed cue is
+    dropped rather than crashing the save).
+    """
+    if not isinstance(rows, list):
+        return rows
+    out = []
+    for r in rows:
+        if isinstance(r, TranscriptSegment):
+            out.append(r)
+        elif isinstance(r, dict):
+            try:
+                out.append(TranscriptSegment(**r))
+            except Exception:
+                try:
+                    out.append(TranscriptSegment(
+                        start=float(r.get("start") or 0.0),
+                        end=float(r.get("end") or r.get("start") or 0.0),
+                        text=str(r.get("text") or ""),
+                        speaker=str(r.get("speaker") or "Speaker 1"),
+                    ))
+                except Exception:
+                    pass  # drop a malformed cue rather than break the save
+        else:
+            out.append(r)
+    return out
+
+
 async def _save_job_unlocked(job: JobResult, *, _preserve_terminal_status: bool = False) -> None:
     """Write a job to disk WITHOUT acquiring the per-job lock.
 
@@ -64,6 +104,17 @@ async def _save_job_unlocked(job: JobResult, *, _preserve_terminal_status: bool 
     directory = _job_dir(job.job_id)
     os.makedirs(directory, exist_ok=True)
     path = _job_path(job.job_id)
+    # Normalize transcript fields to TranscriptSegment instances before dumping,
+    # so model_dump() doesn't emit a per-cue serialization warning for any dicts
+    # a caller assigned (see _coerce_segments). This is the single chokepoint all
+    # save paths pass through.
+    for _tk in ("transcript", "translated_transcript"):
+        _rows = getattr(job, _tk, None)
+        if isinstance(_rows, list) and any(isinstance(r, dict) for r in _rows):
+            try:
+                setattr(job, _tk, _coerce_segments(_rows))
+            except Exception:
+                pass
     data = job.model_dump(mode="json")
 
     # ── Anti-clobber guard (whole-object save_job path only) ────────────

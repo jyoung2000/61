@@ -1,6 +1,18 @@
+import warnings
 from enum import Enum
 from typing import Optional, Union
 from pydantic import BaseModel, model_validator
+
+# A ``list[TranscriptSegment]`` field can transiently hold plain dicts (the
+# transcript editor dumps segments to dicts; the on-read self-heal sanitizes to
+# dicts) before they're coerced back to models at the save chokepoint
+# (``database._coerce_segments``). Pydantic emits ONE serializer warning per such
+# cue on ``model_dump()`` — on a long transcript that flood of synchronous stderr
+# writes stalls the event loop and the GUI stops loading. Silence this specific,
+# benign warning process-wide so no un-coerced path can reintroduce that stall;
+# the data still serializes correctly either way.
+warnings.filterwarnings(
+    "ignore", message="Pydantic serializer warnings", category=UserWarning)
 
 
 class JobStatus(str, Enum):
