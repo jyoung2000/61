@@ -31,11 +31,19 @@ export default function ProgressBar({ progress, message, variant = 'cyan' }) {
             display: 'flex',
             justifyContent: 'space-between',
             alignItems: 'center',
+            gap: 8,
             marginBottom: 6,
           }}
         >
-          <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>{typeof message === 'string' ? message : String(message ?? '')}</span>
-          <span style={{ fontSize: 12, fontWeight: 600, fontFamily: 'var(--font-mono)', color }}>{displayProgress}%</span>
+          {/* Truncate to one line so a long status string can't wrap and shove
+              the % off-screen on a narrow (mobile) viewport. */}
+          <span style={{
+            fontSize: 12, color: 'var(--text-secondary)',
+            flex: 1, minWidth: 0, overflow: 'hidden',
+            textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+          }}>{typeof message === 'string' ? message : String(message ?? '')}</span>
+          {/* % never shrinks — stays pinned and readable on the right. */}
+          <span style={{ fontSize: 12, fontWeight: 600, fontFamily: 'var(--font-mono)', color, flexShrink: 0 }}>{displayProgress}%</span>
         </div>
       )}
       <div

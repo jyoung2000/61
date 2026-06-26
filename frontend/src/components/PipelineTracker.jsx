@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
+import useResponsive from '../hooks/useResponsive';
 
 // Stage color palette keyed by stage group
 const STAGE_COLORS = {
@@ -63,6 +64,11 @@ export default function PipelineTracker({
   };
 
   const currentIdx = displayStages.findIndex((s) => s.id === currentStageId);
+  const { isMobile } = useResponsive();
+  const activeStage = currentIdx >= 0 ? displayStages[currentIdx] : null;
+  const activeLabel = activeStage
+    ? (activeStage.label || STAGE_LABELS[activeStage.id] || activeStage.id) : '';
+  const activeColor = STAGE_COLORS[currentStageId] || 'var(--text-secondary)';
 
   return (
     <div style={{
@@ -126,7 +132,32 @@ export default function PipelineTracker({
         })}
       </div>
 
-      {/* Stage labels row */}
+      {/* Stage labels.
+          On mobile, 10 proportional labels collapse to a few pixels each and
+          ellipsize to nothing — so show a single readable line for the CURRENT
+          stage (label · step N/M) instead. The proportional bar above still
+          gives the at-a-glance overview. The full per-stage row stays on wider
+          screens. */}
+      {isMobile ? (
+        <div style={{
+          marginTop: 6, textAlign: 'center',
+          fontSize: 11, fontFamily: 'var(--font-mono)',
+          whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+        }}>
+          {isComplete ? (
+            <span style={{ color: STAGE_COLORS.saving }}>All stages complete</span>
+          ) : isFailed ? (
+            <span style={{ color: 'var(--danger, #ef4444)' }}>Stopped — re-analyse to resume</span>
+          ) : currentIdx >= 0 ? (
+            <>
+              <span style={{ color: activeColor, fontWeight: 600 }}>{activeLabel}</span>
+              <span style={{ color: 'var(--text-muted)' }}>
+                {` · step ${currentIdx + 1}/${displayStages.length}`}
+              </span>
+            </>
+          ) : null}
+        </div>
+      ) : (
       <div style={{ display: 'flex', gap: 2, marginTop: 5 }}>
         {displayStages.map((stage, idx) => {
           const weight = STAGE_WEIGHTS[stage.id] || 5;
@@ -174,6 +205,7 @@ export default function PipelineTracker({
           );
         })}
       </div>
+      )}
 
       <style>{`
         @keyframes shimmer {

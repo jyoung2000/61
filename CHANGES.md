@@ -1,3 +1,22 @@
+# ClipAI — Pipeline progress is responsive on mobile
+
+The pipeline progress UI didn't fit a phone screen:
+- ``ProgressBar``'s header put the status message and the % in a space-between
+  row with no truncation, so a long message (e.g. "Re-using cached extraction —
+  563 frames (SHA matched)") wrapped and pushed the % around on narrow widths.
+- ``PipelineTracker`` rendered 10 proportional stage labels in one row; on a
+  phone the small-weight stages collapsed to a few pixels and the 9px labels
+  ellipsized to nothing.
+
+Fixes:
+- ``ProgressBar``: the message now truncates to a single line (ellipsis) and the
+  % is ``flexShrink: 0`` so it's always pinned and readable, at any width.
+- ``PipelineTracker``: on mobile (<768px) the cramped 10-label row is replaced by
+  one readable line for the CURRENT stage — e.g. "Faces · step 3/10" (or "All
+  stages complete" / "Stopped — re-analyse to resume"). The proportional colored
+  stage bar (which scales fine) stays on every size, and the full per-stage label
+  row still shows on tablet/desktop.
+
 # ClipAI — Clip export now resumes instead of stopping short after a crash
 
 Report: if a job dies while exporting clips, it never finishes exporting all the
