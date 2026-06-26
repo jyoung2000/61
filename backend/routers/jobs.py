@@ -179,30 +179,36 @@ async def get_transcripts(job_id: str, user: User = Depends(get_current_user)):
     _tt = getattr(job, "translated_transcript", []) or []
     if _tt:
         try:
-            from backend.services.transcript_sanitize import sanitize_translated_transcript
+            from backend.services.transcript_sanitize import (
+                sanitize_translated_transcript, merge_transcript_fragments)
+            _lang = getattr(job, "subtitle_language", "") or "en"
+            _status = str(getattr(job, "status", "") or "").lower()
+            _terminal = _status in (
+                "complete", "completed", "failed", "error", "cancelled", "canceled")
             # Sanitize OFF the event loop — on a transcript bloated by a corrupted
             # run (tens of thousands of cues) the sort + per-char CJK scan is heavy
             # enough to stall the loop on every poll ("Connection lost" + the
             # transcript "loading forever").
             _clean, _changed = await asyncio.to_thread(
-                sanitize_translated_transcript,
-                _tt, getattr(job, "subtitle_language", "") or "en")
-            if _changed:
-                # Always SERVE the cleaned/sorted track for display (set below) —
-                # but be careful about PERSISTING it.
-                #
-                # We deliberately do NOT re-flow / merge cues on read. That pass
-                # (enforce_readability) is not a fixed point of the sanitizer, so
-                # running it per-poll re-merged and re-persisted slightly different
-                # cues every few seconds — the "transcript lines move around while
-                # I'm reading them" symptom. Re-flow belongs in the pipeline (once,
-                # at translate time), never on every read.
+                sanitize_translated_transcript, _tt, _lang)
+            # Fold Whisper's mid-sentence fragment splits into whole utterances —
+            # but ONLY for a TERMINAL job. A finished transcript is stable, so this
+            # strictly-idempotent merge persists once and is a no-op on every later
+            # poll. We must NOT run it mid-run: re-flowing a LIVE transcript on each
+            # poll is what caused the "lines move around while I'm reading" churn,
+            # and the pipeline already merges once at translate time. (Plain
+            # sanitize — drop/dedup/sort — still runs for live jobs above.)
+            _merged_changed = False
+            if _terminal:
+                _merged, _merged_changed = await asyncio.to_thread(
+                    merge_transcript_fragments, _clean, _lang)
+                if _merged_changed:
+                    _clean = _merged
+            if _changed or _merged_changed:
+                # Always SERVE the cleaned/merged track for display (set below).
                 _dropped = len(_clean) < len(_tt)
-                _status = str(getattr(job, "status", "") or "").lower()
-                _terminal = _status in (
-                    "complete", "completed", "failed", "error", "cancelled", "canceled")
-                # Persist when we removed real corruption (cues dropped), or once
-                # the run is over for a reorder-only fix. We do NOT persist a
+                # Persist when we removed corruption / merged fragments, or once the
+                # run is over for a reorder-only fix. We do NOT persist a
                 # reorder-only change mid-run: the pipeline still holds the
                 # in-memory job and overwrites translated_transcript at translate
                 # time, so persisting every poll just churns the DB + log without
@@ -210,7 +216,11 @@ async def get_transcripts(job_id: str, user: User = Depends(get_current_user)):
                 # times during one resumed run).
                 if _dropped or _terminal:
                     import logging as _lg
-                    if _dropped:
+                    if _merged_changed:
+                        _lg.getLogger("backend.routers.jobs").info(
+                            "[%s] Merged translated_transcript fragments on read: "
+                            "%d → %d cue(s)", job_id, len(_tt), len(_clean))
+                    elif _dropped:
                         _lg.getLogger("backend.routers.jobs").warning(
                             "[%s] Self-healed translated_transcript: %d → %d cue(s) "
                             "(dropped source-language / duplicate artifacts)",

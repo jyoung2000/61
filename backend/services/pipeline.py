@@ -2588,12 +2588,21 @@ async def _background_post_processing(
             # storing (a clean track is unchanged) so a later interrupted resume
             # has a clean base to work from.
             try:
-                from backend.services.transcript_sanitize import sanitize_translated_transcript
+                from backend.services.transcript_sanitize import (
+                    sanitize_translated_transcript, merge_transcript_fragments)
                 _san, _san_changed = sanitize_translated_transcript(_translated_out, target_lang)
                 if _san_changed:
                     logger.info("[%s] Sanitized translated_transcript before persist: %d → %d",
                                 job_id, len(_translated_out), len(_san))
                     _translated_out = _san
+                # Fold Whisper's mid-sentence fragment splits ("It's just the" /
+                # "number 21.") back into whole utterances so the translate panel
+                # + SRT read as sentences, not 2-4-word slivers. Idempotent.
+                _merged, _merged_changed = merge_transcript_fragments(_translated_out, target_lang)
+                if _merged_changed:
+                    logger.info("[%s] Merged translated_transcript fragments: %d → %d cue(s)",
+                                job_id, len(_translated_out), len(_merged))
+                    _translated_out = _merged
             except Exception:
                 pass
             logger.info(
