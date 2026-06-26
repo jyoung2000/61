@@ -2303,49 +2303,68 @@ class OllamaJudge:
     """Ollama editorial judge — local models via /api/chat.
 
     Vision is supported for multimodal models (llava, llama3.2-vision,
-    moondream, qwen2.5vl, etc.) by passing the ``images`` field on the
-    user message. Non-vision models simply ignore it.
+    moondream, qwen2.5vl, etc.) by passing the ``images`` field on the user
+    message. A TEXT-ONLY model, however, does NOT silently ignore ``images`` —
+    Ollama rejects the request with HTTP 400. In Offline Mode the clip judge is
+    the best local *editorial* (text) model, so every judged clip used to 400
+    and clip ranking silently degraded to signal-only heuristics. We now detect
+    that, latch it, and judge text-only for the rest of the batch.
     """
 
     def __init__(self, host: str, model: str = "llama3.2-vision:11b"):
         self.host = host.rstrip("/")
         self.model = model
+        # Set once a request with images is rejected, so the remaining clips in
+        # the batch skip images outright instead of each eating a doomed attempt.
+        self._vision_unsupported = False
 
-    def judge(self, candidate: ClipCandidate, transcript_slice: str,
-              keyframes_b64: List[str], signal_summary: str,
-              preferred_subjects: str = "",
-              avoid_subjects: str = "") -> dict:
+    def _post_chat(self, prompt: str, keyframes_b64: List[str]) -> str:
         import urllib.request
-
-        prompt = _build_judge_prompt(
-            candidate, transcript_slice, signal_summary,
-            preferred_subjects, avoid_subjects)
-
         msg = {"role": "user", "content": prompt}
         if keyframes_b64:
             msg["images"] = keyframes_b64[:4]
-
         payload = json.dumps({
             "model": self.model,
             "messages": [msg],
             "stream": False,
             "options": {"temperature": 0.3, "num_predict": 1024},
         }).encode()
-
-        url = f"{self.host}/api/chat"
         req = urllib.request.Request(
-            url, data=payload,
-            headers={"Content-Type": "application/json"},
-            method='POST',
+            f"{self.host}/api/chat", data=payload,
+            headers={"Content-Type": "application/json"}, method='POST',
         )
+        # Local inference can be slow; Ollama needs the longer ceiling.
+        resp = urllib.request.urlopen(req, timeout=120)
+        data = json.loads(resp.read().decode())
+        return (data.get("message") or {}).get("content", "")
 
+    def judge(self, candidate: ClipCandidate, transcript_slice: str,
+              keyframes_b64: List[str], signal_summary: str,
+              preferred_subjects: str = "",
+              avoid_subjects: str = "") -> dict:
+        prompt = _build_judge_prompt(
+            candidate, transcript_slice, signal_summary,
+            preferred_subjects, avoid_subjects)
+
+        send_images = bool(keyframes_b64) and not self._vision_unsupported
         try:
-            # Local inference can be slow; Ollama needs the longer ceiling.
-            resp = urllib.request.urlopen(req, timeout=120)
-            data = json.loads(resp.read().decode())
-            text = (data.get("message") or {}).get("content", "")
-            return _parse_judge_response(text)
+            return _parse_judge_response(
+                self._post_chat(prompt, keyframes_b64 if send_images else []))
         except Exception as e:
+            # A text-only model 400s on images — drop them and retry once (and
+            # latch so the rest of the batch goes straight to text-only). This
+            # keeps the judge scoring on transcript + signals instead of failing
+            # every clip and silently falling back to heuristic-only ranking.
+            if send_images:
+                self._vision_unsupported = True
+                logger.info(
+                    "Ollama judge: model %s rejected images (%s) — judging "
+                    "text-only for the remaining clips", self.model, e)
+                try:
+                    return _parse_judge_response(self._post_chat(prompt, []))
+                except Exception as e2:
+                    logger.warning(f"Ollama judge error (text-only retry): {e2}")
+                    return {"error": str(e2)}
             logger.warning(f"Ollama judge error: {e}")
             return {"error": str(e)}
 

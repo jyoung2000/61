@@ -1,3 +1,18 @@
+# ClipAI — Clip judge works offline again (no more HTTP 400 on every clip)
+
+In Offline Mode the clip-scoring judge is the best local *editorial* model —
+a TEXT model (e.g. qwen2.5:3b-instruct). But ``OllamaJudge`` sends clip keyframes
+as ``images``, and a text-only model doesn't ignore them — Ollama rejects the
+request with HTTP 400. So every judged clip failed ("Ollama judge error: HTTP
+Error 400") and ranking silently fell back to signal-only heuristics.
+
+Fix: ``OllamaJudge`` now retries text-only when a request with images is rejected,
+and latches that so the rest of the batch skips images outright (one wasted
+attempt, not one per clip). The judge scores clips on transcript + signals
+instead of failing — and a genuinely vision-capable local model still gets the
+keyframes. (The docstring's wrong claim that "non-vision models simply ignore"
+images is corrected.)
+
 # ClipAI — Dashboard / new-tab loads fast again (don't full-parse every transcript)
 
 Opening a new tab sat on "Connecting to container…" for a long time. Cause:
