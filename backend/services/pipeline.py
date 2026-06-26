@@ -1205,6 +1205,13 @@ async def _persist_complete_job(job_id: str, fields: dict) -> bool:
                     for _k, _v in fields.items():
                         if hasattr(job, _k):
                             setattr(job, _k, _v)
+                    # This path writes job.json DIRECTLY, bypassing the
+                    # _save_job_unlocked chokepoint — so enforce the clean
+                    # translated-track invariant here too. The loaded job can
+                    # carry a source+translated union (the "38% Japanese, looped"
+                    # corruption); without this the COMPLETE write would persist
+                    # it and only the read-time heal would hide it.
+                    database._sanitize_translated_for_save(job)
                     try:
                         data = job.model_dump(mode="json")
                         content = _json.dumps(

@@ -36,6 +36,27 @@ def test_collapses_substantial_duplicate_to_one():
     assert len(clean) == 1
 
 
+def test_cleans_source_translated_union():
+    # The exact corruption a buggy/unguarded save persisted: English translated
+    # cues + a Japanese source relapse + a hallucination loop, all unioned into
+    # one translated_transcript. Sanitize (the save-chokepoint invariant) must
+    # drop ALL the Japanese and collapse the loop, keeping only clean English.
+    rows = []
+    rows += [{"start": float(i), "end": i + 1.0, "text": f"This is English line {i}.",
+              "speaker": "Speaker 1"} for i in range(20)]
+    rows += [{"start": 100.0 + i, "end": 101.0 + i, "text": "これは日本語の行です、まだ翻訳されていません。",
+              "speaker": "Speaker 1"} for i in range(15)]
+    rows += [{"start": 200.0 + i * 5, "end": 202.0 + i * 5,
+              "text": "No no, that's a bit too much, I don't mind being done.",
+              "speaker": "Speaker 1"} for i in range(16)]
+    clean, changed = sanitize_translated_transcript(rows, "en")
+    assert changed
+    assert all("これ" not in c["text"] for c in clean)          # no source relapse
+    assert sum(1 for c in clean
+               if c["text"].startswith("No no")) == 0           # gross loop dropped
+    assert len(clean) == 20                                     # clean English kept
+
+
 def test_drops_gross_repetition_hallucination_loop():
     # A substantial line emitted 16× across the video is a Whisper hallucination
     # loop — every copy is dropped, not trimmed to one.
