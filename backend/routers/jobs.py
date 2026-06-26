@@ -65,6 +65,39 @@ def _resolve_transcript_rows(job, target):
     return (job.translated_transcript if use_translated else job.transcript), use_translated
 
 
+async def _clean_translated_rows(job):
+    """The translated track sanitized + (for a terminal job) fragment-merged —
+    the SAME clean cues the ``/transcripts`` panel serves.
+
+    Subtitle DOWNLOADS must use this. The panel self-heals on read, but the
+    SRT/VTT/subtitle endpoints read the raw ``translated_transcript``, so a
+    corrupted resume that left a looped / source-language union in storage
+    shipped that straight into the downloaded file (observed: the same hallucinated
+    block repeated a dozen times, 38% still Japanese). Sanitize drops the
+    source-script relapse + collapses gross duplication; the terminal-only merge
+    folds Whisper's mid-sentence fragments. Off-thread (heavy on a bloated track)
+    and fail-soft."""
+    tt = getattr(job, "translated_transcript", []) or []
+    if not tt:
+        return tt
+    try:
+        from backend.services.transcript_sanitize import (
+            sanitize_translated_transcript, merge_transcript_fragments)
+        lang = getattr(job, "subtitle_language", "") or "en"
+        status = str(getattr(job, "status", "") or "").lower()
+        terminal = status in (
+            "complete", "completed", "failed", "error", "cancelled", "canceled")
+        clean, _ = await asyncio.to_thread(sanitize_translated_transcript, tt, lang)
+        if terminal:
+            merged, mchanged = await asyncio.to_thread(
+                merge_transcript_fragments, clean, lang)
+            if mchanged:
+                clean = merged
+        return clean
+    except Exception:
+        return tt
+
+
 async def _persist_transcript_rows(job_id, job, rows, use_translated):
     """Persist an edited transcript list to the correct track."""
     if use_translated:
@@ -534,7 +567,7 @@ async def download_srt(
     source = job.transcript
     lang_suffix = ""
     if translated and job.translated_transcript and len(job.translated_transcript) > 0:
-        source = job.translated_transcript
+        source = await _clean_translated_rows(job)
         lang_suffix = "_translated"
 
     if not source:
@@ -596,7 +629,7 @@ async def download_vtt(
     source = job.transcript
     lang_suffix = ""
     if translated and job.translated_transcript and len(job.translated_transcript) > 0:
-        source = job.translated_transcript
+        source = await _clean_translated_rows(job)
         lang_suffix = "_translated"
 
     if not source:
@@ -672,7 +705,7 @@ async def download_subtitles(
                 and job.translated_transcript):
             translated_segments = [
                 TranscriptSegment(**s) if isinstance(s, dict) else s
-                for s in job.translated_transcript
+                for s in await _clean_translated_rows(job)
             ]
         if translated_segments is None:
             from backend.services.translator import (
@@ -700,7 +733,7 @@ async def download_subtitles(
         source = job.transcript
         lang_suffix = ""
         if translated and job.translated_transcript and len(job.translated_transcript) > 0:
-            source = job.translated_transcript
+            source = await _clean_translated_rows(job)
             lang_suffix = "_translated"
         if not source:
             raise HTTPException(status_code=404, detail="No transcript available")

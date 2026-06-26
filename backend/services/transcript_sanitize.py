@@ -45,6 +45,14 @@ _MAX_DUPLICATES = 2
 # A normalized cue this long (chars) is treated as substantial → collapsed to a
 # single occurrence rather than the 2-copy allowance.
 _SUBSTANTIAL_DEDUP_CHARS = 16
+# When a SUBSTANTIAL line recurs at least this many times it isn't "a duplicate
+# to trim to one" — it's a Whisper hallucination LOOP (the same full sentence
+# emitted at a dozen-plus timestamps over non-speech audio: moans, music,
+# silence), carried 1:1 through translation. Keeping even one places a wrong line
+# at a wrong time, so drop EVERY occurrence. 6+ verbatim repeats of a real
+# sentence is vanishingly rare in genuine dialogue. Observed: a 4-line block
+# repeated 16× across 64:00–114:00 of a mostly-non-speech video.
+_GROSS_REPEAT_DROP = 6
 
 
 def _cjk_ratio(text: str) -> float:
@@ -191,6 +199,21 @@ def sanitize_translated_transcript(segments, target_lang: str = "en"):
         # A CJK target legitimately contains CJK — only de-dup there, never drop.
         drop_source_script = tgt not in _CJK_TARGETS
 
+        # Pre-count normalized keys so a SUBSTANTIAL line that recurs ≥
+        # _GROSS_REPEAT_DROP times can be recognized as a hallucination LOOP and
+        # dropped entirely (not just trimmed to one). Markers + source-script
+        # relapses are excluded from the count exactly as from the keep logic.
+        totals: dict[str, int] = {}
+        for seg in rows:
+            text = (_get(seg, "text", "") or "").strip()
+            if not text or _is_marker(text):
+                continue
+            if drop_source_script and _cjk_ratio(text) > 0.30:
+                continue
+            key = " ".join(text.lower().split())
+            if len(key) >= _SUBSTANTIAL_DEDUP_CHARS:
+                totals[key] = totals.get(key, 0) + 1
+
         kept = []
         counts: dict[str, int] = {}
         for seg in rows:
@@ -201,6 +224,10 @@ def sanitize_translated_transcript(segments, target_lang: str = "en"):
                 continue  # source-language relapse — not part of a translation
             if not _is_marker(text):
                 key = " ".join(text.lower().split())
+                # A substantial line repeated many times over is a Whisper
+                # hallucination loop — drop every copy, not just the excess.
+                if len(key) >= _SUBSTANTIAL_DEDUP_CHARS and totals.get(key, 0) >= _GROSS_REPEAT_DROP:
+                    continue
                 n = counts.get(key, 0)
                 # Substantial lines collapse to one; short lines keep up to 2.
                 cap = 1 if len(key) >= _SUBSTANTIAL_DEDUP_CHARS else _MAX_DUPLICATES

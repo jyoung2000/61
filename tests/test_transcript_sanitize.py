@@ -25,11 +25,33 @@ def test_drops_source_language_cues_for_english_target():
 
 
 def test_collapses_substantial_duplicate_to_one():
-    # A substantial line (a real sentence) that repeats verbatim is Whisper
-    # repetition / corruption — collapse to a single occurrence.
+    # A substantial line (a real sentence) that repeats a few times is Whisper
+    # repetition / corruption — collapse to a single occurrence (a handful of
+    # repeats is below the gross-loop threshold, so one copy is kept).
     rows = [{"start": i * 3.0, "end": i * 3 + 2.0,
              "text": "Just for a little while. Really?", "speaker": "Speaker 1"}
-            for i in range(10)]
+            for i in range(4)]
+    clean, changed = sanitize_translated_transcript(rows, "en")
+    assert changed
+    assert len(clean) == 1
+
+
+def test_drops_gross_repetition_hallucination_loop():
+    # A substantial line emitted 16× across the video is a Whisper hallucination
+    # loop — every copy is dropped, not trimmed to one.
+    rows = [{"start": i * 300.0, "end": i * 300 + 2.0,
+             "text": "No no, that's a bit too much, I don't mind being done like that.",
+             "speaker": "Speaker 1"} for i in range(16)]
+    clean, changed = sanitize_translated_transcript(rows, "en")
+    assert changed
+    assert len(clean) == 0
+
+
+def test_moderate_repeat_still_keeps_one():
+    # 3 verbatim repeats (below the gross-loop threshold) collapse to one, not zero.
+    rows = [{"start": i * 30.0, "end": i * 30 + 2.0,
+             "text": "This is a normal recurring sentence here.", "speaker": "Speaker 1"}
+            for i in range(3)]
     clean, changed = sanitize_translated_transcript(rows, "en")
     assert changed
     assert len(clean) == 1
