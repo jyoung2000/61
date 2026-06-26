@@ -96,12 +96,16 @@ async def get_pipeline_stages(_user: User = Depends(get_current_user)):
 async def list_jobs(user: User = Depends(get_current_user)):
     # Admin sees all jobs (including legacy unowned ones).
     # Regular users only see their own.
+    # light=True: the list only needs summary fields + clip count, never the
+    # transcripts — skip validating thousands of cues per job so the dashboard
+    # loads fast even with a bloated job on disk.
     if user.role == Role.ADMIN:
-        jobs = await database.list_jobs()
+        jobs = await database.list_jobs(light=True)
     else:
         jobs = await database.list_jobs(
             owner_user_id=user.id,
             owner_username=user.username,
+            light=True,
         )
     return [
         {

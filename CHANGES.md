@@ -1,3 +1,19 @@
+# ClipAI — Dashboard / new-tab loads fast again (don't full-parse every transcript)
+
+Opening a new tab sat on "Connecting to container…" for a long time. Cause:
+``GET /api/jobs`` (the dashboard list) calls ``database.list_jobs()``, which read
+AND fully Pydantic-validated EVERY job on disk — including a job bloated by the
+crash corruption (thousands of cues, each with per-word timestamps) — just to
+return ~10 summary fields. That validation ran on the event loop, so it both made
+the list slow and starved the ``/api/health`` ping that the "Connecting to
+container…" banner waits on.
+
+Fix: ``list_jobs(light=True)`` (used by the dashboard list + startup recovery)
+drops the per-cue ``transcript`` / ``translated_transcript`` arrays before
+validation — callers there only need summary fields, status, clips and summary —
+and the parse now runs in a worker thread. A bloated job can no longer slow the
+list or block the health ping, so a fresh tab connects and renders quickly.
+
 # ClipAI — Pipeline progress is responsive on mobile
 
 The pipeline progress UI didn't fit a phone screen:

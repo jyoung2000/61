@@ -288,11 +288,30 @@ async def load_job(job_id: str) -> Optional[JobResult]:
         return await _load_job_unlocked(job_id)
 
 
+def _parse_job_record(content: str, light: bool) -> JobResult:
+    """Parse + validate a job.json string into a JobResult — meant to run OFF
+    the event loop via ``asyncio.to_thread``.
+
+    ``light=True`` drops the heavy per-cue transcript arrays before validation.
+    ``list_jobs`` callers only read summary fields, status, clips and summary —
+    never the transcripts — and validating thousands of TranscriptSegment /
+    WordTimestamp models per job is what made the dashboard job list (and the
+    ``/api/health`` ping behind the "Connecting to container…" banner) crawl once
+    a job's transcript ballooned.
+    """
+    data = json.loads(content)
+    if light and isinstance(data, dict):
+        data.pop("transcript", None)
+        data.pop("translated_transcript", None)
+    return JobResult(**data)
+
+
 async def list_jobs(
     *,
     owner_user_id: Optional[str] = None,
     owner_username: Optional[str] = None,
     include_unowned: bool = False,
+    light: bool = False,
 ) -> list[JobResult]:
     """List all jobs on disk.
 
@@ -321,8 +340,9 @@ async def list_jobs(
             try:
                 async with aiofiles.open(job_path, "r") as f:
                     content = await f.read()
-                data = json.loads(content)
-                job = JobResult(**data)
+                # Parse + validate off the loop; ``light`` skips the heavy
+                # transcript arrays so a bloated job can't stall the whole list.
+                job = await asyncio.to_thread(_parse_job_record, content, light)
                 if owner_user_id is not None:
                     row_owner = job.owner_user_id or ""
                     row_name = (getattr(job, "owner_username", "") or "").strip().lower()

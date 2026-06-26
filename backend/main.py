@@ -778,7 +778,7 @@ async def _recover_stale_jobs(
     regardless of age). Returns ``(completed, failed)``."""
     import backend.database as _db
     completed = failed = 0
-    for job in await _db.list_jobs(include_unowned=True):
+    for job in await _db.list_jobs(include_unowned=True, light=True):
         if job.status not in _NON_TERMINAL_STATUSES:
             continue
         # A mid-export crash leaves the full clip LIST but only some MP4s — treat
@@ -895,7 +895,7 @@ async def _auto_resume_interrupted_jobs() -> tuple[int, int]:
     """
     import backend.database as _db
     resumed = failed = 0
-    for job in await _db.list_jobs(include_unowned=True):
+    for job in await _db.list_jobs(include_unowned=True, light=True):
         if job.status not in _NON_TERMINAL_STATUSES:
             continue
         # Same gate as Pass 1: a job that died mid-export (full clip list but
