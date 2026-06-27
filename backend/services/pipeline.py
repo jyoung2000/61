@@ -2140,6 +2140,20 @@ async def _background_post_processing(
         _result["target_name"] = target_name
         logger.info("[%s] Subtitle translation: %s → %s (%d segments)",
                     job_id, source_name, target_name, len(transcript))
+        # ── Cross-video contamination trace ──────────────────────────────────
+        # Log a sample of the SOURCE cues actually being translated for THIS job,
+        # so a "transcript belongs to a different video" report can be pinned to
+        # the exact stage: if these source lines already match the wrong video,
+        # the leak is upstream (audio/Whisper); if they're correct here but the
+        # stored/translated track is wrong, it's downstream. Cheap + safe.
+        try:
+            def _txt(_c):
+                return (_c.get("text") if isinstance(_c, dict) else getattr(_c, "text", "")) or ""
+            _src_sample = " | ".join(_txt(c)[:50] for c in (transcript or [])[:4])
+            logger.info("[%s] XLATE-TRACE source[ja] sample (n=%d): %s",
+                        job_id, len(transcript or []), _src_sample)
+        except Exception:
+            pass
 
         # Per-video glossary (Key Name and Phrases) — loaded from disk so
         # the user can drop a JSON file in via the Settings UI without
@@ -2277,6 +2291,15 @@ async def _background_post_processing(
 
             logger.info("[%s] Translate DONE: %d/%d segments changed → %s",
                         job_id, changed, len(translated), target_lang)
+            try:
+                _out_sample = " | ".join(
+                    ((getattr(t, "text", "") or "") if not isinstance(t, dict)
+                     else (t.get("text") or ""))[:50]
+                    for t in (translated or [])[:4])
+                logger.info("[%s] XLATE-TRACE translated[%s] sample: %s",
+                            job_id, target_lang, _out_sample)
+            except Exception:
+                pass
             # Never relabel the source as translated: if NOTHING changed the
             # translation effectively failed, so bail to the no-translation
             # path (keeps the source transcript + runs SEO on it) rather than
@@ -3862,6 +3885,25 @@ async def _run_analysis_inner(job_id: str):
         len(reframer_plan.keyframes or []),
         len(reframer_plan.strategy_log or []),
     )
+    # ── Cross-video contamination trace ───────────────────────────────────────
+    # Prove the analyzed audio/video belong to THIS job and show the RAW Whisper
+    # source: if a later "transcript belongs to a different video" report comes
+    # in, this pins whether the source transcript was already wrong at perception
+    # time (wrong/stale audio → upstream) or only became wrong downstream.
+    try:
+        import os as _os
+        _vid = f"/data/uploads/{job_id}/video.mp4"
+        _aud = f"/data/uploads/{job_id}/audio.wav"
+        _vsz = _os.path.getsize(_vid) if _os.path.exists(_vid) else -1
+        _asz = _os.path.getsize(_aud) if _os.path.exists(_aud) else -1
+        _segs0 = (getattr(perception, "transcript_segments", None) or [])[:4]
+        _raw = " | ".join((getattr(s, "text", "") or "")[:50] for s in _segs0)
+        logger.info(
+            "[%s] PERCEIVE-TRACE video=%.1fMB audio=%.1fMB lang=%s raw_source[0:4]: %s",
+            job_id, _vsz / 1e6, _asz / 1e6,
+            getattr(perception, "detected_language", "?"), _raw)
+    except Exception:
+        pass
 
     # ── Bridge — convert reframer output into Fez data contracts ──
     cancel_check()
