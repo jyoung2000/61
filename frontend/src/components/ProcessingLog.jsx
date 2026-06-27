@@ -1,4 +1,37 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+
+// A "progress-like" entry is one a stage emits repeatedly as it advances — a
+// percent, an N/M counter, an "Extracted N frames", a "Still processing …
+// elapsed" heartbeat, or an identical retry line. Left as-is the log balloons
+// (summary alone emits 21 "chunk N/21" lines; Whisper a tick per %, export/SEO
+// one per clip). Collapse a run of them — same stage + same message SHAPE — to
+// the single LATEST occurrence so each step shows ONE updating line. Milestones
+// (success / warning / error / checkpoint and one-off status lines) are never
+// collapsed. Purely presentational: the durable event list is untouched.
+const _PROGRESS_RE = /\d+\s*\/\s*\d+|\d+\s*%|elapsed\)|Extracted\s+\d+\s+frames|chunk\s+\d+|Attempting SEO generation|Translating subtitles with/i;
+
+function _progressSig(entry) {
+  if (!entry || (entry.type !== 'status' && entry.type !== 'info')) return null;
+  const msg = typeof entry.message === 'string' ? entry.message : '';
+  if (!msg || !_PROGRESS_RE.test(msg)) return null;
+  const stage = entry.stage_id || entry._stageId || '';
+  // Mask run-specific numbers so "chunk 5/21" and "chunk 6/21" share one key.
+  return stage + '|' + msg.replace(/\d+/g, '#');
+}
+
+// Keep only the LAST occurrence of each progress signature, preserving order
+// and every non-progress (milestone) entry.
+function collapseProgress(entries) {
+  const lastIndex = new Map();
+  for (let i = 0; i < entries.length; i++) {
+    const sig = _progressSig(entries[i]);
+    if (sig) lastIndex.set(sig, i);
+  }
+  return entries.filter((e, i) => {
+    const sig = _progressSig(e);
+    return !sig || lastIndex.get(sig) === i;
+  });
+}
 
 const STAGE_COLORS = {
   queue:         '#6b7280',
@@ -71,12 +104,15 @@ export default function ProcessingLog({
   const scrollRef = useRef(null);
   const prevStageRef = useRef(null);
 
+  // Collapse repeated per-step progress into one updating line each.
+  const visible = useMemo(() => collapseProgress(entries), [entries]);
+
   // Auto-scroll to bottom on new entries
   useEffect(() => {
     if (expanded && scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
-  }, [entries.length, expanded]);
+  }, [visible.length, expanded]);
 
   const warningCount = entries.filter((e) => e.type === 'warning').length;
   const errorCount = entries.filter((e) => e.type === 'error').length;
@@ -112,7 +148,7 @@ export default function ProcessingLog({
           )}
           Processing Log
           <span style={{ color: 'var(--text-muted)', textTransform: 'none', letterSpacing: 0 }}>
-            ({entries.length} events
+            ({visible.length} steps
             {warningCount > 0 && <span style={{ color: 'var(--accent-amber, #f59e0b)', marginLeft: 4 }}> {warningCount}⚠</span>}
             {errorCount > 0 && <span style={{ color: 'var(--danger, #ef4444)', marginLeft: 4 }}> {errorCount}✕</span>}
             )
@@ -131,11 +167,11 @@ export default function ProcessingLog({
             lineHeight: 1.75,
           }}
         >
-          {entries.map((entry, i) => {
+          {visible.map((entry, i) => {
             const stageId = entry.stage_id || entry._stageId || '';
             const stageColor = STAGE_COLORS[stageId] || 'var(--border)';
             const stageBadge = STAGE_BADGES[stageId] || '';
-            const showStageSep = stageId && stageId !== (entries[i - 1]?.stage_id || entries[i - 1]?._stageId || '');
+            const showStageSep = stageId && stageId !== (visible[i - 1]?.stage_id || visible[i - 1]?._stageId || '');
             const icon = TYPE_ICONS[entry.type] || '·';
             const iconColor = TYPE_COLORS[entry.type] || TYPE_COLORS.info;
             const relTime = fmtRelative(entry._absTime, pipelineStartTime);

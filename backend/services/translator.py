@@ -1140,8 +1140,21 @@ async def _translate_via_nmt(
             else:
                 translations = engine.translate_batch(texts, glossary=glossary)
             out.extend(_apply_batch_translations(batch, translations))
+            _done = min(start + len(batch), len(segments))
+            # Granular progress in the processing log (mirrors the LLM path at
+            # translate_segments) so an offline-NMT translation shows
+            # "Translating subtitles… (N/M)" rather than only a generic
+            # "Still processing…" heartbeat — the LLM-failed→NMT-fallback case
+            # otherwise displayed no per-batch progress at all.
+            if status_callback:
+                try:
+                    res = status_callback(f"Translating subtitles… ({_done}/{len(segments)})")
+                    if hasattr(res, "__await__"):
+                        await res
+                except Exception:
+                    pass
             if progress_callback:
-                pct = int(((start + len(batch)) / max(1, len(segments))) * 100)
+                pct = int((_done / max(1, len(segments))) * 100)
                 try:
                     res = progress_callback(pct)
                     if hasattr(res, "__await__"):
