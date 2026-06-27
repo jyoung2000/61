@@ -66,33 +66,28 @@ def _resolve_transcript_rows(job, target):
 
 
 async def _clean_translated_rows(job):
-    """The translated track sanitized + (for a terminal job) fragment-merged —
-    the SAME clean cues the ``/transcripts`` panel serves.
+    """The translated track SANITIZED (drop source-script + dedup) — the same
+    clean cues the ``/transcripts`` panel serves.
 
-    Subtitle DOWNLOADS must use this. The panel self-heals on read, but the
-    SRT/VTT/subtitle endpoints read the raw ``translated_transcript``, so a
-    corrupted resume that left a looped / source-language union in storage
-    shipped that straight into the downloaded file (observed: the same hallucinated
-    block repeated a dozen times, 38% still Japanese). Sanitize drops the
-    source-script relapse + collapses gross duplication; the terminal-only merge
-    folds Whisper's mid-sentence fragments. Off-thread (heavy on a bloated track)
-    and fail-soft."""
+    Subtitle DOWNLOADS must use this. The SRT/VTT/subtitle endpoints otherwise
+    read the raw ``translated_transcript``, so a corrupted resume that left a
+    looped / source-language union in storage shipped that straight into the
+    downloaded file (observed: the same hallucinated block repeated a dozen
+    times, 38% still Japanese). Sanitize is idempotent (drop + dedup + sort), so
+    it's safe to apply on every read.
+
+    NOTE: this does NOT re-run the fragment MERGE. The merge is applied ONCE at
+    translate time and the merged track is what's stored; re-merging on read
+    formed a non-idempotent loop that eroded finished transcripts (412 → 13).
+    The stored track is already merged, so sanitizing it is all a download needs.
+    Off-thread (heavy on a bloated track) and fail-soft."""
     tt = getattr(job, "translated_transcript", []) or []
     if not tt:
         return tt
     try:
-        from backend.services.transcript_sanitize import (
-            sanitize_translated_transcript, merge_transcript_fragments)
+        from backend.services.transcript_sanitize import sanitize_translated_transcript
         lang = getattr(job, "subtitle_language", "") or "en"
-        status = str(getattr(job, "status", "") or "").lower()
-        terminal = status in (
-            "complete", "completed", "failed", "error", "cancelled", "canceled")
         clean, _ = await asyncio.to_thread(sanitize_translated_transcript, tt, lang)
-        if terminal:
-            merged, mchanged = await asyncio.to_thread(
-                merge_transcript_fragments, clean, lang)
-            if mchanged:
-                clean = merged
         return clean
     except Exception:
         return tt
@@ -212,48 +207,38 @@ async def get_transcripts(job_id: str, user: User = Depends(get_current_user)):
     _tt = getattr(job, "translated_transcript", []) or []
     if _tt:
         try:
-            from backend.services.transcript_sanitize import (
-                sanitize_translated_transcript, merge_transcript_fragments)
-            _lang = getattr(job, "subtitle_language", "") or "en"
-            _status = str(getattr(job, "status", "") or "").lower()
-            _terminal = _status in (
-                "complete", "completed", "failed", "error", "cancelled", "canceled")
+            from backend.services.transcript_sanitize import sanitize_translated_transcript
             # Sanitize OFF the event loop — on a transcript bloated by a corrupted
             # run (tens of thousands of cues) the sort + per-char CJK scan is heavy
             # enough to stall the loop on every poll ("Connection lost" + the
-            # transcript "loading forever").
+            # transcript "loading forever"). Sanitize is DROP + DEDUP + SORT only —
+            # it is idempotent, so re-running it on read converges immediately.
             _clean, _changed = await asyncio.to_thread(
-                sanitize_translated_transcript, _tt, _lang)
-            # Fold Whisper's mid-sentence fragment splits into whole utterances —
-            # but ONLY for a TERMINAL job. A finished transcript is stable, so this
-            # strictly-idempotent merge persists once and is a no-op on every later
-            # poll. We must NOT run it mid-run: re-flowing a LIVE transcript on each
-            # poll is what caused the "lines move around while I'm reading" churn,
-            # and the pipeline already merges once at translate time. (Plain
-            # sanitize — drop/dedup/sort — still runs for live jobs above.)
-            _merged_changed = False
-            if _terminal:
-                _merged, _merged_changed = await asyncio.to_thread(
-                    merge_transcript_fragments, _clean, _lang)
-                if _merged_changed:
-                    _clean = _merged
-            if _changed or _merged_changed:
-                # Always SERVE the cleaned/merged track for display (set below).
+                sanitize_translated_transcript,
+                _tt, getattr(job, "subtitle_language", "") or "en")
+            if _changed:
+                # Always SERVE the cleaned/sorted track for display (set below).
+                #
+                # We deliberately do NOT re-flow / MERGE cues on read. The
+                # fragment merge is applied ONCE at translate time and the merged
+                # track is what's stored; re-merging on every poll AND persisting
+                # the result formed a non-idempotent read→persist loop that
+                # eroded a finished transcript one cue per poll (observed in
+                # production: 412 → 13 cues over a viewing session) — the same
+                # class of bug as the old "lines move around while I'm reading"
+                # churn. Reflow belongs in the pipeline, once; read only sanitizes.
                 _dropped = len(_clean) < len(_tt)
-                # Persist when we removed corruption / merged fragments, or once the
-                # run is over for a reorder-only fix. We do NOT persist a
+                _status = str(getattr(job, "status", "") or "").lower()
+                _terminal = _status in (
+                    "complete", "completed", "failed", "error", "cancelled", "canceled")
+                # Persist when we removed real corruption (cues dropped), or once
+                # the run is over for a reorder-only fix. We do NOT persist a
                 # reorder-only change mid-run: the pipeline still holds the
                 # in-memory job and overwrites translated_transcript at translate
-                # time, so persisting every poll just churns the DB + log without
-                # sticking (observed: the same "512 → 512" heal logged dozens of
-                # times during one resumed run).
+                # time, so persisting every poll just churns the DB + log.
                 if _dropped or _terminal:
-                    import logging as _lg
-                    if _merged_changed:
-                        _lg.getLogger("backend.routers.jobs").info(
-                            "[%s] Merged translated_transcript fragments on read: "
-                            "%d → %d cue(s)", job_id, len(_tt), len(_clean))
-                    elif _dropped:
+                    if _dropped:
+                        import logging as _lg
                         _lg.getLogger("backend.routers.jobs").warning(
                             "[%s] Self-healed translated_transcript: %d → %d cue(s) "
                             "(dropped source-language / duplicate artifacts)",

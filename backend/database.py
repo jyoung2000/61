@@ -87,43 +87,6 @@ def _coerce_segments(rows):
     return out
 
 
-def _sanitize_translated_for_save(job) -> None:
-    """Enforce the clean-translated-track invariant on the way to disk.
-
-    Several write paths can land a ``translated_transcript`` that still contains
-    source-language cues or gross Whisper-repetition duplicates — the COMPLETE
-    save writes the job DIRECTLY (bypassing the anti-clobber guard), and a
-    transcript edit / reverse-sync can POST a source+translated UNION. That is
-    the "38% Japanese, the same block looped 16×" corruption we previously only
-    repaired on read (so the stored copy stayed dirty and every export that
-    didn't self-heal shipped it). Cleaning here makes the STORED track the same
-    clean cues the panel + downloads serve, for EVERY writer.
-
-    Drop source-script + dedup ONLY — never the fragment MERGE (that reflow
-    belongs at translate time / terminal read, not on every save). Acts only when
-    the subtitle language is a known, non-empty target: ``sanitize_*`` no-ops for
-    a CJK target, and an UNSET language means we can't tell the target yet, so we
-    leave it untouched rather than risk dropping a not-yet-labelled CJK track.
-    Idempotent + fail-soft."""
-    try:
-        lang = (getattr(job, "subtitle_language", "") or "").strip()
-        if not lang:
-            return
-        rows = getattr(job, "translated_transcript", None)
-        if not isinstance(rows, list) or not rows:
-            return
-        from backend.services.transcript_sanitize import sanitize_translated_transcript
-        clean, changed = sanitize_translated_transcript(rows, lang)
-        if changed:
-            job.translated_transcript = clean
-            logger.info(
-                "Save sanitize [%s]: cleaned translated_transcript %d → %d cue(s) "
-                "(dropped source-script / gross-repetition before persist).",
-                getattr(job, "job_id", "?"), len(rows), len(clean))
-    except Exception:
-        pass
-
-
 async def _save_job_unlocked(job: JobResult, *, _preserve_terminal_status: bool = False) -> None:
     """Write a job to disk WITHOUT acquiring the per-job lock.
 
@@ -148,9 +111,6 @@ async def _save_job_unlocked(job: JobResult, *, _preserve_terminal_status: bool 
     # serializing a job bloated by a corrupted run (tens of thousands of cues) is
     # heavy enough to stall the loop on every progress write during a run.
     def _coerce_and_dump():
-        # Enforce the clean-translated invariant (drop source-script + dedup)
-        # before serialization, so no writer can persist a contaminated union.
-        _sanitize_translated_for_save(job)
         for _tk in ("transcript", "translated_transcript"):
             _rows = getattr(job, _tk, None)
             if isinstance(_rows, list) and any(isinstance(r, dict) for r in _rows):
