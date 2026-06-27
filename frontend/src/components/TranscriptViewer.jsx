@@ -44,6 +44,25 @@ function compareCues(a, b) {
 }
 
 
+// Fraction of a string that is CJK (Japanese kana/kanji, Korean, Chinese,
+// half-width katakana), over CJK + Latin letters. Mirrors the backend
+// transcript_sanitize._cjk_ratio so the panel/export agree with the server.
+function _cjkRatio(text) {
+  const t = text || '';
+  let cjk = 0, base = 0;
+  for (const ch of t) {
+    const code = ch.codePointAt(0);
+    const isCjk = (code >= 0x3040 && code <= 0x30ff)   // hiragana + katakana
+      || (code >= 0x3400 && code <= 0x9fff)            // CJK ideographs
+      || (code >= 0xac00 && code <= 0xd7a3)            // Hangul
+      || (code >= 0xff66 && code <= 0xff9d);           // half-width katakana
+    if (isCjk) { cjk++; base++; }
+    else if (/[a-z]/i.test(ch)) { base++; }
+  }
+  return base ? cjk / base : 0;
+}
+
+
 function toSRT(segments) {
   // Match the backend / hand-authored SRT format: chronological cues, and
   // omit the "Speaker:" prefix when the whole transcript is a single speaker
@@ -171,11 +190,26 @@ export default function TranscriptViewer({ transcript, onSeek, jobId, onSpeakerR
   );
 
   const timeFiltered = useMemo(() => {
-    if (!timeRange) return transcript;
-    return transcript.filter((seg) =>
-      seg.start < timeRange.end && seg.end > timeRange.start
-    );
-  }, [transcript, timeRange]);
+    let rows = !timeRange
+      ? transcript
+      : transcript.filter((seg) =>
+          seg.start < timeRange.end && seg.end > timeRange.start);
+    // Hide untranslated source-language cues that leaked into a TRANSLATED
+    // track. The backend sanitizer enforces this on the stored track, but a
+    // corrupted source+translated union can still surface raw source cues on
+    // read — and the .txt/.srt exports below are generated from THESE rows, so
+    // they'd otherwise ship the leaked source. Only act when we're showing the
+    // translation AND it's predominantly non-CJK (e.g. JA→EN): then a handful of
+    // fully-CJK cues are untranslated leakage. A CJK TARGET (EN→JA) leaves the
+    // whole track CJK, so the guard below is false and nothing is dropped.
+    if (!showingOriginal && rows.length) {
+      const cjkHeavy = rows.filter((s) => _cjkRatio(s.text) > 0.30).length;
+      if (cjkHeavy > 0 && cjkHeavy < rows.length * 0.5) {
+        rows = rows.filter((s) => _cjkRatio(s.text) <= 0.30);
+      }
+    }
+    return rows;
+  }, [transcript, timeRange, showingOriginal]);
 
   const filtered = useMemo(() => {
     const base = !search.trim()
