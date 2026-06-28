@@ -23,6 +23,33 @@ import { hexToRgbString } from '../utils/colorUtils';
 import { runEditorQA, autoFixTrackCompatibility } from '../utils/editorQA';
 import './VideoEditor.css';
 
+// Fraction of a string that is CJK over CJK + Latin letters (mirrors the
+// backend sanitizer / timelineStore / TranscriptViewer). Used to spot
+// untranslated source-language cues that leaked into a translated subtitle
+// track. >0.30 ⇒ "this cue is in the source script".
+function _veCjkRatio(text) {
+  const t = text || '';
+  let cjk = 0, base = 0;
+  for (const ch of t) {
+    const c = ch.codePointAt(0);
+    const isCjk = (c >= 0x3040 && c <= 0x30ff) || (c >= 0x3400 && c <= 0x9fff)
+      || (c >= 0xac00 && c <= 0xd7a3) || (c >= 0xff66 && c <= 0xff9d);
+    if (isCjk) { cjk++; base++; }
+    else if (/[a-z]/i.test(ch)) { base++; }
+  }
+  return base ? cjk / base : 0;
+}
+
+// Is the transcript (the TARGET) itself predominantly CJK? If so, CJK cues are
+// expected and must NOT be treated as a leak. Only when the target is non-CJK
+// does a CJK cue mean an untranslated source-language leftover.
+function _veTargetIsCjk(transcript) {
+  const rows = (transcript || []).filter((r) => ((r && r.text) || '').trim());
+  if (!rows.length) return false;
+  const cjkHeavy = rows.filter((r) => _veCjkRatio(r.text) > 0.30).length;
+  return cjkHeavy >= rows.length * 0.5;
+}
+
 // ── Segment Color Palette ────────────────────────────────────────────────────
 const SEGMENT_COLORS = [
   '#0A84FF', // Blue (Apple system blue)
@@ -391,21 +418,34 @@ export default function VideoEditor({
             clipEnd: effectiveEnd,
           });
         } else if (!subtitlesUserEdited) {
-          // Detect a STALE recovered subtitle track — one built from an earlier
-          // transcript (e.g. before translation finished), so its text no longer
-          // matches the cue it indexes into. Sample a few non-marker cues; if
-          // most don't match the current transcript, rebuild from it so the
-          // burned-in subtitles match the panel ("subtitles don't match the
-          // transcript"). User-edited tracks are left alone.
-          const sample = subItems
-            .filter((s) => (s.subtitleText || '').trim() && !(s.subtitleText || '').trim().startsWith('['))
-            .slice(0, 6);
-          let mismatch = 0;
-          for (const s of sample) {
+          // Detect a STALE or source-language-leaked recovered subtitle track and
+          // rebuild it from the current transcript. Two independent tells, checked
+          // across ALL non-marker cues (cheap, runs once on init):
+          //   1. text mismatch — the cue text no longer matches the transcript row
+          //      it indexes into (track built from an EARLIER transcript, e.g.
+          //      before translation finished); OR
+          //   2. source-language leak — the cue is still in the source script
+          //      (e.g. Japanese) while the transcript is translated, so a stray
+          //      cue would burn onto an English video.
+          // Either tell means the burned-in subtitles won't match the panel, so
+          // rebuild from the current transcript. The whole-track scan (not a
+          // first-N sample) catches a MIXED Japanese/English track where the
+          // first cues happen to be fine. User-edited tracks are left alone.
+          const targetIsCjk = _veTargetIsCjk(transcript);
+          const cues = subItems.filter((s) => {
+            const t = (s.subtitleText || '').trim();
+            return t && !t.startsWith('[');
+          });
+          let mismatch = 0, cjkLeak = 0;
+          for (const s of cues) {
+            const txt = (s.subtitleText || '').trim();
             const t = transcript[s.transcriptIndex];
-            if (!t || (t.text || '').trim() !== (s.subtitleText || '').trim()) mismatch++;
+            if (!t || (t.text || '').trim() !== txt) mismatch++;
+            if (!targetIsCjk && _veCjkRatio(txt) > 0.30) cjkLeak++;
           }
-          if (sample.length > 0 && mismatch >= Math.ceil(sample.length / 2)) {
+          const stale = cues.length > 0
+            && (mismatch >= Math.ceil(cues.length / 2) || cjkLeak > 0);
+          if (stale) {
             rebuildSubtitlesFromTranscript({
               subtitleSegments: transcript,
               clipStart,
