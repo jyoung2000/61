@@ -1,73 +1,29 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 
-// A "progress-like" entry is one a stage emits repeatedly as it advances — a
-// percent, an N/M counter, an "Extracted N frames", a "Still processing …
-// elapsed" heartbeat, or an identical retry line. Left as-is the log balloons
-// (summary alone emits 21 "chunk N/21" lines; Whisper a tick per %, export/SEO
-// one per clip; translation a batch tick every few seconds). The display policy
-// is "live trail, fold when done": while a job is LIVE the currently-running
-// stage shows a short TRAIL of its last few progress steps so you can watch the
-// current step advance (e.g. 88→96→104→108 of 108); every FINISHED stage — and
-// the whole log once the job ends — folds to the single latest line. Milestones
-// (success / warning / error / checkpoint and one-off status lines) are never
-// touched. Purely presentational: the durable event list is untouched.
-const _PROGRESS_RE = /\d+\s*\/\s*\d+|\d+\s*%|elapsed\)|Extracted\s+\d+\s+frames|chunk\s+\d+|Attempting SEO generation|Translating subtitles with/i;
-
-// How many recent progress steps the ACTIVE (currently-running) stage keeps
-// visible while live, so the user perceives motion instead of one updating
-// number. Finished stages always fold to 1.
-const _PROGRESS_TRAIL = 5;
-
-function _progressSig(entry) {
-  if (!entry || (entry.type !== 'status' && entry.type !== 'info')) return null;
-  const msg = typeof entry.message === 'string' ? entry.message : '';
-  if (!msg || !_PROGRESS_RE.test(msg)) return null;
-  const stage = entry.stage_id || entry._stageId || '';
-  // Mask run-specific numbers so "chunk 5/21" and "chunk 6/21" share one key.
-  return stage + '|' + msg.replace(/\d+/g, '#');
-}
-
-// Apply the "live trail, fold when done" policy. Every non-progress (milestone)
-// entry is preserved in order. For progress entries:
-//   • While ``isLive``, the ACTIVE stage (the stage of the most recent entry)
-//     keeps the last ``_PROGRESS_TRAIL`` occurrences of each signature — a short
-//     accumulating trail you watch advance.
-//   • Every other stage — and ALL stages once the job is no longer live — folds
-//     to the single latest occurrence of each signature (clean saved log).
-function collapseProgress(entries, isLive = false) {
-  // The active stage is only meaningful while live: it's the stage_id of the
-  // most recent entry that carries one.
-  let activeStage = null;
-  if (isLive) {
-    for (let i = entries.length - 1; i >= 0; i--) {
-      const sid = entries[i]?.stage_id || entries[i]?._stageId;
-      if (sid) { activeStage = sid; break; }
-    }
-  }
-  const lastIndex = new Map();     // sig -> last index (for folded stages)
-  const activeIdxs = new Map();    // sig -> [indices] (active stage only)
+// The Processing Log shows a line for EACH progress step a stage emits — the
+// per-batch translation ticks ("Translating subtitles… (N/M)"), Whisper/face
+// percentages, summary chunks, export "(N/M)" — so you can follow exactly where
+// a run is and what it did, live AND in the saved log you review afterward. The
+// durable event log is already throttled server-side (≈1 event / stage / 8 s),
+// which keeps the volume sane without hiding the progression; here we only drop a
+// run of the EXACT same (type + stage + message + progress) line — which can
+// appear when the persisted history overlaps the live socket, or a status is
+// re-broadcast. Everything distinct is kept, in order. Purely presentational.
+function dedupeConsecutive(entries) {
+  const out = [];
   for (let i = 0; i < entries.length; i++) {
-    const sig = _progressSig(entries[i]);
-    if (!sig) continue;
-    lastIndex.set(sig, i);
-    const sid = entries[i].stage_id || entries[i]._stageId || '';
-    if (activeStage && sid === activeStage) {
-      const arr = activeIdxs.get(sig) || [];
-      arr.push(i);
-      activeIdxs.set(sig, arr);
+    const e = entries[i];
+    const prev = out[out.length - 1];
+    if (prev
+        && prev.type === e.type
+        && (prev.stage_id || prev._stageId || '') === (e.stage_id || e._stageId || '')
+        && (prev.message || '') === (e.message || '')
+        && (prev.progress ?? null) === (e.progress ?? null)) {
+      continue;
     }
+    out.push(e);
   }
-  // Indices to keep for the active stage: the last _PROGRESS_TRAIL per signature.
-  const keepTrail = new Set();
-  for (const arr of activeIdxs.values()) {
-    for (const idx of arr.slice(-_PROGRESS_TRAIL)) keepTrail.add(idx);
-  }
-  return entries.filter((e, i) => {
-    const sig = _progressSig(e);
-    if (!sig) return true;                       // milestones always shown
-    if (activeIdxs.has(sig)) return keepTrail.has(i);  // active stage: trail only
-    return lastIndex.get(sig) === i;             // folded: only the latest
-  });
+  return out;
 }
 
 const STAGE_COLORS = {
@@ -141,9 +97,9 @@ export default function ProcessingLog({
   const scrollRef = useRef(null);
   const prevStageRef = useRef(null);
 
-  // Live trail for the running stage; fold finished stages (and the whole log
-  // once the job is done) to one line each.
-  const visible = useMemo(() => collapseProgress(entries, isLive), [entries, isLive]);
+  // Show every distinct progress step (server-side throttle bounds the volume);
+  // only collapse exact consecutive duplicates.
+  const visible = useMemo(() => dedupeConsecutive(entries), [entries]);
 
   // Auto-scroll to bottom on new entries
   useEffect(() => {
