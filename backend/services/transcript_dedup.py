@@ -155,6 +155,58 @@ def drop_repetition_loops(
     return out, dropped
 
 
+def drop_scattered_duplicates(
+    segments: list,
+    text_key: str = "text",
+    *,
+    threshold: int = 4,
+    keep: int = 1,
+) -> tuple[list, int]:
+    """Collapse a phrase that recurs VERBATIM ``threshold``+ times across the
+    whole timeline down to its first ``keep`` occurrence(s).
+
+    ``drop_repetition_loops`` only fully collapses LONG (> ``long_block_chars``)
+    blocks; a SHORT phrase is capped at 3, and a CJK utterance is frequently
+    under that length so it is treated as short too. That left transcripts where
+    a small set of short fragments ("real breasts and you're", "Going deeper,
+    uh…") each recurred 5–10× — the duplicated-transcript report: a Whisper loop
+    on the source, or a small editorial model echoing the same safe phrase for
+    several distinct source lines. Real dialogue does not repeat the SAME
+    fragment 4+ times verbatim across a video (a genuine interjection stays at
+    2–3×), so a high recurrence count is an unambiguous artifact regardless of
+    length.
+
+    Markers ("[♪ music ♪]") are exempt — every occurrence is kept. Phrases that
+    recur fewer than ``threshold`` times are left untouched, preserving genuine
+    short interjections. Order-preserving; keeps the earliest occurrence(s).
+    Returns ``(kept_segments, dropped_count)``.
+    """
+    from collections import Counter
+    counts: Counter = Counter()
+    for seg in segments or []:
+        raw = (_seg_get(seg, text_key, "") or "").strip()
+        if not raw or _is_marker_text(raw):
+            continue
+        counts[_normalize_text(raw)] += 1
+    seen: dict = {}
+    out: list = []
+    dropped = 0
+    for seg in segments or []:
+        raw = (_seg_get(seg, text_key, "") or "").strip()
+        if not raw or _is_marker_text(raw):
+            out.append(seg)
+            continue
+        k = _normalize_text(raw)
+        if counts.get(k, 0) >= threshold:
+            n = seen.get(k, 0)
+            if n >= keep:
+                dropped += 1
+                continue
+            seen[k] = n + 1
+        out.append(seg)
+    return out, dropped
+
+
 def _seg_get(seg, key, default=None):
     if isinstance(seg, dict):
         return seg.get(key, default)

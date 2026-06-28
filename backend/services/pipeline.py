@@ -2206,6 +2206,37 @@ async def _background_post_processing(
                     _trans_input.append(_TS_for_translate(**t))
                 except Exception:
                     pass
+        # ── (a0-pre) Strip Whisper repetition-loop hallucinations from the SOURCE
+        # BEFORE translating. On music / quiet / repetitive audio Whisper loops and
+        # re-emits the same line at many scattered timestamps. The LLM/NMT paths
+        # translate each copy 1:1, so the loop reappeared in the TRANSLATED
+        # transcript (the "duplicated transcript" report) — and the translated-side
+        # loop-drop was gated to the Whisper-native path, so it survived. Dropping
+        # it here fixes the duplication at the ROOT for every engine and shrinks the
+        # translate workload. ``_music_markers`` were already held out, so a real
+        # ``[♪ music ♪]`` is untouched; genuine short interjections are CAPPED (to
+        # 3), not erased, by the dropper.
+        if _trans_input:
+            try:
+                from backend.services.transcript_dedup import (
+                    collapse_adjacent_duplicates as _cad,
+                    collapse_overlapping_duplicates as _cod,
+                    drop_repetition_loops as _drl,
+                    drop_scattered_duplicates as _dsd,
+                )
+                _pre_src_dd = len(_trans_input)
+                _trans_input, _sa = _cad(_trans_input)
+                _trans_input, _so = _cod(_trans_input)
+                _trans_input, _ss = _dsd(_trans_input)
+                _trans_input, _sl = _drl(_trans_input)
+                if _sa or _so or _sl or _ss:
+                    logger.info(
+                        "[%s] Source dedup before translate: %d → %d cue(s) "
+                        "(%d adjacent, %d overlapping, %d repetition-loop, %d scattered)",
+                        job_id, _pre_src_dd, len(_trans_input), _sa, _so, _sl, _ss)
+            except Exception as _sdd_err:
+                logger.warning("[%s] Pre-translate source dedup skipped (%s)",
+                               job_id, _sdd_err)
         # ── (a0) Resegment the SOURCE into one-utterance-per-cue units before
         # translating (Task 5). NMT translates cleaner sentence units far more
         # reliably than run-on blocks, and it keeps source↔target cue counts
@@ -2497,27 +2528,38 @@ async def _background_post_processing(
             try:
                 from backend.services.transcript_dedup import (
                     collapse_adjacent_duplicates, drop_repetition_loops,
-                    collapse_overlapping_duplicates,
+                    collapse_overlapping_duplicates, drop_scattered_duplicates,
                 )
                 _tl = [t.model_dump() if hasattr(t, "model_dump") else dict(t) for t in translated]
                 _pre_dd = len(_tl)
                 _tl, _a = collapse_adjacent_duplicates(_tl)
                 _tl, _o = collapse_overlapping_duplicates(_tl)
-                # The global repetition-loop drop targets WHISPER hallucinations
-                # (its translate task loops on music/silence). Offline NMT
-                # translates the source 1:1 and never hallucinates loops, so any
-                # repeats in NMT output are LEGITIMATE — a song chorus or recurring
-                # narration that genuinely repeats across the timeline. Running the
-                # loop-drop on it would silently delete those real cues (the AMV
-                # case), so gate it to the Whisper-native path only.
+                # Repetition-loop drop on the TRANSLATED text. The SOURCE is now
+                # deduped BEFORE translation (step a0-pre), so a clean source can no
+                # longer seed a translated loop; this is the safety net for repeats
+                # the translator ITSELF emits — a small editorial model (the LLM
+                # path) routinely echoes the same safe phrase for several distinct
+                # source lines ("Oh, did you see this?" ×7). Run it for the LLM and
+                # Whisper-native paths (markers are held out separately and genuine
+                # short interjections are CAPPED, not erased, so a real recurring
+                # line survives). Left off for the pure offline-NMT path, whose 1:1
+                # output the original AMV/chorus concern targeted.
                 _l = 0
-                if _used_whisper_native:
+                _s = 0
+                if _used_whisper_native or _used_llm:
+                    # Scattered-dedup FIRST, on the original counts: collapse short
+                    # fragments the translator echoed many times ("real breasts and
+                    # you're" ×10) to the first occurrence. 4+ verbatim recurrences
+                    # = an artifact; genuine 2–3× interjections are preserved. Run
+                    # it before the loop-drop, whose short-interjection cap of 3
+                    # would otherwise mask the high counts and leave 3× repeats.
+                    _tl, _s = drop_scattered_duplicates(_tl)
                     _tl, _l = drop_repetition_loops(_tl)
                 translated = _tl
-                if _a or _o or _l:
+                if _a or _o or _l or _s:
                     logger.info(
-                        "[%s] Translated transcript dedup: %d → %d (%d adj, %d overlap, %d loop)",
-                        job_id, _pre_dd, len(translated), _a, _o, _l)
+                        "[%s] Translated transcript dedup: %d → %d (%d adj, %d overlap, %d loop, %d scattered)",
+                        job_id, _pre_dd, len(translated), _a, _o, _l, _s)
             except Exception as _dd_err:
                 logger.warning("[%s] Translated dedup skipped (%s)", job_id, _dd_err)
 

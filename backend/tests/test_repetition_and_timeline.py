@@ -16,6 +16,7 @@ from backend.models import TranscriptSegment, WordTimestamp
 from backend.services.transcript_dedup import (
     collapse_adjacent_duplicates,
     drop_repetition_loops,
+    drop_scattered_duplicates,
 )
 from backend.services.subtitle_formatter import enforce_readability
 
@@ -52,6 +53,50 @@ def test_blank_segments_passthrough():
     segs = [_d(0, 1, ""), _d(1, 2, "  ")]
     kept, dropped = drop_repetition_loops(segs)
     assert dropped == 0 and len(kept) == 2
+
+
+# ── scattered-duplicate collapse (short fragments echoed many times) ─────────
+
+def test_scattered_short_fragment_collapsed_to_one():
+    # A SHORT fragment the translator echoed 10× — drop_repetition_loops would
+    # cap it at 3 (it's under long_block_chars); the scattered pass takes it to 1.
+    segs = [_d(i * 5, i * 5 + 2, "real breasts and you're") for i in range(10)]
+    kept, dropped = drop_scattered_duplicates(segs)
+    assert len(kept) == 1
+    assert dropped == 9
+
+
+def test_scattered_below_threshold_preserved():
+    # A genuine interjection at 3× is below the default threshold (4) → untouched.
+    segs = [_d(i, i + 1, "Yes.") for i in range(3)]
+    kept, dropped = drop_scattered_duplicates(segs)
+    assert dropped == 0 and len(kept) == 3
+
+
+def test_scattered_markers_exempt():
+    # Music markers must never be collapsed, however many times they appear.
+    segs = [_d(i * 10, i * 10 + 2, "[♪ music ♪]") for i in range(6)]
+    kept, dropped = drop_scattered_duplicates(segs)
+    assert dropped == 0 and len(kept) == 6
+
+
+def test_scattered_distinct_lines_all_kept():
+    segs = [_d(0, 1, "alpha"), _d(2, 3, "beta"), _d(4, 5, "gamma")]
+    kept, dropped = drop_scattered_duplicates(segs)
+    assert dropped == 0 and len(kept) == 3
+
+
+def test_scattered_keeps_first_occurrence_order():
+    segs = [
+        _d(0, 1, "keeper one"),
+        _d(2, 3, "echo"), _d(4, 5, "echo"), _d(6, 7, "echo"),
+        _d(8, 9, "echo"), _d(10, 11, "echo"),
+        _d(12, 13, "keeper two"),
+    ]
+    kept, dropped = drop_scattered_duplicates(segs)
+    texts = [k["text"] for k in kept]
+    assert texts == ["keeper one", "echo", "keeper two"]
+    assert dropped == 4
 
 
 # ── adjacent-duplicate collapse ──────────────────────────────────────────
