@@ -26,6 +26,11 @@ function dedupeConsecutive(entries) {
   return out;
 }
 
+// Max rows actually rendered into the DOM. A long run can emit 700+ live ticks;
+// re-rendering all of them on every websocket event is what made the tab feel
+// slow. The header still reports the true total.
+const _MAX_VISIBLE_ROWS = 250;
+
 const STAGE_COLORS = {
   queue:         '#6b7280',
   metadata:      '#06b6d4',
@@ -97,9 +102,16 @@ export default function ProcessingLog({
   const scrollRef = useRef(null);
   const prevStageRef = useRef(null);
 
-  // Show every distinct progress step (server-side throttle bounds the volume);
-  // only collapse exact consecutive duplicates.
-  const visible = useMemo(() => dedupeConsecutive(entries), [entries]);
+  // Show every distinct progress step; only collapse exact consecutive
+  // duplicates.
+  const deduped = useMemo(() => dedupeConsecutive(entries), [entries]);
+  // Cap the RENDERED rows for performance. A long run emits hundreds of live
+  // progress ticks (frame counts, Whisper %, export N/M); rendering — and
+  // re-rendering on every websocket event — all of them makes the tab sluggish
+  // ("going slower"). Render the most recent window; the header keeps the true
+  // total. Live, the newest steps (the ones you're watching) are always in view.
+  const truncated = deduped.length > _MAX_VISIBLE_ROWS;
+  const visible = truncated ? deduped.slice(-_MAX_VISIBLE_ROWS) : deduped;
 
   // Auto-scroll to bottom on new entries
   useEffect(() => {
@@ -142,7 +154,8 @@ export default function ProcessingLog({
           )}
           Processing Log
           <span style={{ color: 'var(--text-muted)', textTransform: 'none', letterSpacing: 0 }}>
-            ({visible.length} steps
+            ({deduped.length} steps
+            {truncated && <span> · showing last {_MAX_VISIBLE_ROWS}</span>}
             {warningCount > 0 && <span style={{ color: 'var(--accent-amber, #f59e0b)', marginLeft: 4 }}> {warningCount}⚠</span>}
             {errorCount > 0 && <span style={{ color: 'var(--danger, #ef4444)', marginLeft: 4 }}> {errorCount}✕</span>}
             )
