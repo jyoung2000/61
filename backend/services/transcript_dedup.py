@@ -207,6 +207,62 @@ def drop_scattered_duplicates(
     return out, dropped
 
 
+def collapse_repeated_runs(
+    segments: list,
+    text_key: str = "text",
+    *,
+    min_run: int = 3,
+) -> tuple[list, int]:
+    """Drop a CONTIGUOUS run of cues whose normalized-text sequence already
+    appeared earlier — the Whisper double-pass / gap-fill signature where a whole
+    span (e.g. a 2-minute opening) is re-transcribed at later timestamps, so the
+    SAME ordered block of cues shows up twice.
+
+    Per-phrase dedup can't catch this: ``drop_repetition_loops`` caps a short
+    line at 3 and ``drop_scattered_duplicates`` only fires at 4+ occurrences, so
+    a block of short cues repeated 2-3× survives — each individual line is within
+    tolerance. This matches the block as a UNIT: a run of ``min_run``+ consecutive
+    cues equal (normalised) to an earlier run is the later (duplicate) copy and is
+    dropped. Keeps the EARLIEST occurrence; markers break a run (never matched).
+    Order-preserving. Returns ``(kept_segments, dropped_count)``.
+    """
+    segs = list(segments or [])
+    n = len(segs)
+    if n < min_run * 2:
+        return segs, 0
+    keys: list = []
+    for s in segs:
+        raw = (_seg_get(s, text_key, "") or "").strip()
+        keys.append(None if (not raw or _is_marker_text(raw)) else _normalize_text(raw))
+    drop = [False] * n
+    first: dict = {}     # normalised key -> earliest (kept) index
+    i = 0
+    while i < n:
+        k = keys[i]
+        if k is None:
+            i += 1
+            continue
+        p = first.get(k)
+        if p is not None and p < i:
+            # Extend the match between the earlier block (from p) and here (i).
+            run = 0
+            while (i + run < n and p + run < i
+                   and keys[i + run] is not None
+                   and keys[i + run] == keys[p + run]):
+                run += 1
+            if run >= min_run:
+                for j in range(i, i + run):
+                    drop[j] = True
+                i += run
+                continue
+        if k not in first:
+            first[k] = i
+        i += 1
+    if not any(drop):
+        return segs, 0
+    return [s for j, s in enumerate(segs) if not drop[j]], sum(drop)
+
+
 def _seg_get(seg, key, default=None):
     if isinstance(seg, dict):
         return seg.get(key, default)

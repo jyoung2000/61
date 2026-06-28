@@ -739,6 +739,7 @@ def enforce_readability(
     smart_line_breaks: bool = True,
     auto_cjk: bool = True,
     min_split_chars: Optional[int] = None,
+    allow_split: bool = True,
 ) -> list[TranscriptSegment]:
     """Apply Netflix-style readability rules to a list of subtitle events.
 
@@ -916,8 +917,12 @@ def enforce_readability(
             continue
         pieces = [seg]
         # Iteratively split until each piece is within CPS or no more
-        # boundaries exist.
-        changed = True
+        # boundaries exist. ``allow_split`` gates this off for cues with no word
+        # timestamps (the editorial-LLM translation path): splitting them falls
+        # back to a char-proportional time cut that scatters 2-4 word slivers
+        # across guessed timestamps. Those cues stay WHOLE here; the duration-
+        # extend + filler-trim below (and line-wrap in Pass 3) still apply.
+        changed = allow_split
         while changed and any(
             _cps(p.text.strip(), max(0.001, p.end - p.start)) > keep_cps
             for p in pieces
@@ -974,6 +979,10 @@ def enforce_readability(
 
     def _try_split_one(seg: TranscriptSegment):
         """Return [left, right] when a split succeeded, else None."""
+        # Gated off for word-less cues (LLM translation path): a duration split
+        # there is char-proportional and scrambles cue timing. Keep the cue whole.
+        if not allow_split:
+            return None
         # Priority 1: word-level pause split.
         gap_split = _word_gap_split_point(seg)
         if gap_split is not None:

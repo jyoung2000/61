@@ -2223,17 +2223,21 @@ async def _background_post_processing(
                     collapse_overlapping_duplicates as _cod,
                     drop_repetition_loops as _drl,
                     drop_scattered_duplicates as _dsd,
+                    collapse_repeated_runs as _crr,
                 )
                 _pre_src_dd = len(_trans_input)
+                # Block-level first (on the raw sequence): drop a whole run of
+                # cues re-transcribed at later timestamps (Whisper double-pass).
+                _trans_input, _sr = _crr(_trans_input)
                 _trans_input, _sa = _cad(_trans_input)
                 _trans_input, _so = _cod(_trans_input)
                 _trans_input, _ss = _dsd(_trans_input)
                 _trans_input, _sl = _drl(_trans_input)
-                if _sa or _so or _sl or _ss:
+                if _sa or _so or _sl or _ss or _sr:
                     logger.info(
                         "[%s] Source dedup before translate: %d → %d cue(s) "
-                        "(%d adjacent, %d overlapping, %d repetition-loop, %d scattered)",
-                        job_id, _pre_src_dd, len(_trans_input), _sa, _so, _sl, _ss)
+                        "(%d run, %d adjacent, %d overlapping, %d repetition-loop, %d scattered)",
+                        job_id, _pre_src_dd, len(_trans_input), _sr, _sa, _so, _sl, _ss)
             except Exception as _sdd_err:
                 logger.warning("[%s] Pre-translate source dedup skipped (%s)",
                                job_id, _sdd_err)
@@ -2498,6 +2502,13 @@ async def _background_post_processing(
                         min_duration_ms=int(getattr(settings, "SUBTITLE_MIN_DURATION_MS", 833)),
                         max_duration_ms=int(getattr(settings, "SUBTITLE_MAX_DURATION_MS", 7000)),
                         smart_line_breaks=bool(getattr(settings, "SUBTITLE_SMART_LINE_BREAKS", True)),
+                        # The editorial-LLM cues carry NO word timestamps, so any
+                        # CPS/duration split falls back to a char-proportional time
+                        # cut that scatters 2-4 word slivers across guessed times
+                        # (the "fragmented transcript" report). Keep its 1:1 cues
+                        # WHOLE — merge/extend/wrap still run. Whisper-native + NMT
+                        # keep splitting (they have/derive word timing).
+                        allow_split=not _used_llm,
                     )
                     _cur = [
                         t if isinstance(t, _TSr)
@@ -2529,9 +2540,16 @@ async def _background_post_processing(
                 from backend.services.transcript_dedup import (
                     collapse_adjacent_duplicates, drop_repetition_loops,
                     collapse_overlapping_duplicates, drop_scattered_duplicates,
+                    collapse_repeated_runs,
                 )
                 _tl = [t.model_dump() if hasattr(t, "model_dump") else dict(t) for t in translated]
                 _pre_dd = len(_tl)
+                _r = 0
+                if _used_whisper_native or _used_llm:
+                    # Block-level safety net: drop a whole run of cues that
+                    # reappears later (a source double-pass that survived into the
+                    # translation as a repeated block).
+                    _tl, _r = collapse_repeated_runs(_tl)
                 _tl, _a = collapse_adjacent_duplicates(_tl)
                 _tl, _o = collapse_overlapping_duplicates(_tl)
                 # Repetition-loop drop on the TRANSLATED text. The SOURCE is now
@@ -2556,10 +2574,10 @@ async def _background_post_processing(
                     _tl, _s = drop_scattered_duplicates(_tl)
                     _tl, _l = drop_repetition_loops(_tl)
                 translated = _tl
-                if _a or _o or _l or _s:
+                if _a or _o or _l or _s or _r:
                     logger.info(
-                        "[%s] Translated transcript dedup: %d → %d (%d adj, %d overlap, %d loop, %d scattered)",
-                        job_id, _pre_dd, len(translated), _a, _o, _l, _s)
+                        "[%s] Translated transcript dedup: %d → %d (%d run, %d adj, %d overlap, %d loop, %d scattered)",
+                        job_id, _pre_dd, len(translated), _r, _a, _o, _l, _s)
             except Exception as _dd_err:
                 logger.warning("[%s] Translated dedup skipped (%s)", job_id, _dd_err)
 

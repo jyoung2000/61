@@ -17,6 +17,7 @@ from backend.services.transcript_dedup import (
     collapse_adjacent_duplicates,
     drop_repetition_loops,
     drop_scattered_duplicates,
+    collapse_repeated_runs,
 )
 from backend.services.subtitle_formatter import enforce_readability
 
@@ -97,6 +98,38 @@ def test_scattered_keeps_first_occurrence_order():
     texts = [k["text"] for k in kept]
     assert texts == ["keeper one", "echo", "keeper two"]
     assert dropped == 4
+
+
+# ── block / repeated-run collapse (a re-transcribed span shows up twice) ─────
+
+def test_repeated_block_dropped_keeps_first():
+    block = ["alpha one", "beta two", "gamma three", "delta four"]
+    segs = [_d(i, i + 1, t) for i, t in enumerate(block)]                 # 0-3
+    segs += [_d(10, 11, "unrelated middle")]                              # 4
+    segs += [_d(20 + i, 21 + i, t) for i, t in enumerate(block)]         # 5-8 (repeat)
+    kept, dropped = collapse_repeated_runs(segs)
+    assert dropped == 4                                  # the whole second block
+    assert [k["text"] for k in kept] == block + ["unrelated middle"]
+
+
+def test_short_run_below_min_kept():
+    # A 2-cue coincidental repeat is below min_run (3) → left alone.
+    segs = [_d(0, 1, "ok"), _d(1, 2, "sure"), _d(5, 6, "ok"), _d(6, 7, "sure")]
+    kept, dropped = collapse_repeated_runs(segs)
+    assert dropped == 0 and len(kept) == 4
+
+
+def test_repeated_block_distinct_content_untouched():
+    segs = [_d(i, i + 1, f"line {i}") for i in range(12)]
+    kept, dropped = collapse_repeated_runs(segs)
+    assert dropped == 0 and len(kept) == 12
+
+
+def test_markers_break_a_run():
+    # Identical markers shouldn't be treated as a repeated run.
+    segs = [_d(i * 5, i * 5 + 1, "[♪ music ♪]") for i in range(8)]
+    kept, dropped = collapse_repeated_runs(segs)
+    assert dropped == 0 and len(kept) == 8
 
 
 # ── adjacent-duplicate collapse ──────────────────────────────────────────
