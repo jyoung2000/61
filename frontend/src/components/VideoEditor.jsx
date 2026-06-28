@@ -354,6 +354,8 @@ export default function VideoEditor({
   const addItem = useTimelineStore((s) => s.addItem);
   const removeItem = useTimelineStore((s) => s.removeItem);
   const addSubtitlesFromTranscript = useTimelineStore((s) => s.addSubtitlesFromTranscript);
+  const rebuildSubtitlesFromTranscript = useTimelineStore((s) => s.rebuildSubtitlesFromTranscript);
+  const subtitlesUserEdited = useTimelineStore((s) => s.subtitlesUserEdited);
   const multiTrackInitialized = useRef(false);
   const lastInitClipEnd = useRef(0);
   useEffect(() => {
@@ -381,13 +383,35 @@ export default function VideoEditor({
     // with ``transcriptIndex`` — identical to the initFromClip path.
     if (!needsInit && !storeClipMismatch) {
       if (Array.isArray(transcript) && transcript.length > 0) {
-        const hasSubtitles = timelineStoreItems.some((it) => it.type === 'subtitle');
-        if (!hasSubtitles) {
+        const subItems = timelineStoreItems.filter((it) => it.type === 'subtitle');
+        if (subItems.length === 0) {
           addSubtitlesFromTranscript({
             subtitleSegments: transcript,
             clipStart,
             clipEnd: effectiveEnd,
           });
+        } else if (!subtitlesUserEdited) {
+          // Detect a STALE recovered subtitle track — one built from an earlier
+          // transcript (e.g. before translation finished), so its text no longer
+          // matches the cue it indexes into. Sample a few non-marker cues; if
+          // most don't match the current transcript, rebuild from it so the
+          // burned-in subtitles match the panel ("subtitles don't match the
+          // transcript"). User-edited tracks are left alone.
+          const sample = subItems
+            .filter((s) => (s.subtitleText || '').trim() && !(s.subtitleText || '').trim().startsWith('['))
+            .slice(0, 6);
+          let mismatch = 0;
+          for (const s of sample) {
+            const t = transcript[s.transcriptIndex];
+            if (!t || (t.text || '').trim() !== (s.subtitleText || '').trim()) mismatch++;
+          }
+          if (sample.length > 0 && mismatch >= Math.ceil(sample.length / 2)) {
+            rebuildSubtitlesFromTranscript({
+              subtitleSegments: transcript,
+              clipStart,
+              clipEnd: effectiveEnd,
+            });
+          }
         }
       }
       return;
@@ -409,7 +433,7 @@ export default function VideoEditor({
     }
     multiTrackInitialized.current = true;
     lastInitClipEnd.current = effectiveEnd;
-  }, [src, clipStart, clipEnd, initFromClip, recovered, timelineStoreItems.length, transcript, addItem, addSubtitlesFromTranscript]);
+  }, [src, clipStart, clipEnd, initFromClip, recovered, timelineStoreItems.length, transcript, addItem, addSubtitlesFromTranscript, rebuildSubtitlesFromTranscript, subtitlesUserEdited]);
 
   // ── Sync: settings.subtitlesEnabled → timeline track visibility ──
   // The settings toggle is the PRIMARY control for subtitle visibility.

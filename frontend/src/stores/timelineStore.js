@@ -324,6 +324,22 @@ let _itemIdCounter = 1;
 const nextItemId = () => `item-${_itemIdCounter++}`;
 const nextMediaId = () => `media-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
 
+// Fraction of a string that is CJK over CJK + Latin letters (mirrors the
+// backend sanitizer + TranscriptViewer). Used to drop untranslated source cues
+// that leaked into a translated track so they never burn onto the video.
+function _subCjkRatio(text) {
+  const t = text || '';
+  let cjk = 0, base = 0;
+  for (const ch of t) {
+    const c = ch.codePointAt(0);
+    const isCjk = (c >= 0x3040 && c <= 0x30ff) || (c >= 0x3400 && c <= 0x9fff)
+      || (c >= 0xac00 && c <= 0xd7a3) || (c >= 0xff66 && c <= 0xff9d);
+    if (isCjk) { cjk++; base++; }
+    else if (/[a-z]/i.test(ch)) { base++; }
+  }
+  return base ? cjk / base : 0;
+}
+
 // ── Subtitle item builder (shared by initFromClip + addSubtitlesFromTranscript) ──
 // Sorts segments by start time, resolves overlaps so a late-arriving subtitle
 // never starts before its predecessor ended, preserves word-level timestamps
@@ -332,10 +348,19 @@ const nextMediaId = () => `media-${Date.now()}-${Math.random().toString(36).slic
 // back to brittle time-proximity heuristics.
 function buildSubtitleItems({ subtitleSegments, clipStart, clipEnd, duration }) {
   if (!Array.isArray(subtitleSegments) || subtitleSegments.length === 0) return [];
-  const sorted = subtitleSegments
+  let tagged = subtitleSegments
     .map((seg, origIdx) => ({ ...seg, _origIdx: origIdx }))
-    .filter(seg => seg.end > clipStart && seg.start < clipEnd)
-    .sort((a, b) => a.start - b.start);
+    .filter(seg => seg.end > clipStart && seg.start < clipEnd);
+  // Drop untranslated source-language cues (CJK in a predominantly non-CJK
+  // track — e.g. stray Japanese in a JA→EN translation) so the burned-in
+  // subtitles match the cleaned translated transcript. ``_origIdx`` is the
+  // FULL-transcript index (assigned before this filter), so surviving cues keep
+  // correct reverse-sync edit targeting. A CJK TARGET keeps its whole track.
+  const cjkHeavy = tagged.filter(s => _subCjkRatio(s.text) > 0.30).length;
+  if (cjkHeavy > 0 && cjkHeavy < tagged.length * 0.5) {
+    tagged = tagged.filter(s => _subCjkRatio(s.text) <= 0.30);
+  }
+  const sorted = tagged.sort((a, b) => a.start - b.start);
 
   const out = [];
   let lastSubEnd = 0;
@@ -1218,6 +1243,34 @@ const useTimelineStore = create(
             subtitleText: it.subtitleText,
             position: { ...it.position },
             size: { ...it.size },
+          }));
+      }),
+
+      // Replace the whole subtitle track with a fresh build from the current
+      // transcript. Used when recovered timeline state carries STALE subtitles
+      // — built from an earlier transcript (e.g. before translation finished),
+      // so they don't match the final transcript (the "subtitles on the video
+      // don't match the transcript" report). Caller gates on subtitlesUserEdited
+      // so a user's manual subtitle edits are never discarded.
+      rebuildSubtitlesFromTranscript: ({ subtitleSegments, clipStart, clipEnd }) => set((state) => {
+        const duration = clipEnd - clipStart;
+        if (duration <= 0) return;
+        state.items = state.items.filter(it => it.type !== 'subtitle');
+        const newItems = buildSubtitleItems({ subtitleSegments, clipStart, clipEnd, duration });
+        state.items.push(...newItems);
+        // Snapshot the full shape (incl. transcriptIndex + words) so a later
+        // reset-timings restores reverse-sync linkage and karaoke, not just text.
+        state._originalSubtitles = state.items
+          .filter(it => it.type === 'subtitle')
+          .map(it => ({
+            id: it.id,
+            start: it.start,
+            end: it.end,
+            subtitleText: it.subtitleText,
+            speaker: it.speaker,
+            words: it.words,
+            position: { ...it.position },
+            transcriptIndex: it.transcriptIndex,
           }));
       }),
 
