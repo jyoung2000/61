@@ -417,42 +417,11 @@ export default function VideoEditor({
             clipStart,
             clipEnd: effectiveEnd,
           });
-        } else if (!subtitlesUserEdited) {
-          // Detect a STALE or source-language-leaked recovered subtitle track and
-          // rebuild it from the current transcript. Two independent tells, checked
-          // across ALL non-marker cues (cheap, runs once on init):
-          //   1. text mismatch — the cue text no longer matches the transcript row
-          //      it indexes into (track built from an EARLIER transcript, e.g.
-          //      before translation finished); OR
-          //   2. source-language leak — the cue is still in the source script
-          //      (e.g. Japanese) while the transcript is translated, so a stray
-          //      cue would burn onto an English video.
-          // Either tell means the burned-in subtitles won't match the panel, so
-          // rebuild from the current transcript. The whole-track scan (not a
-          // first-N sample) catches a MIXED Japanese/English track where the
-          // first cues happen to be fine. User-edited tracks are left alone.
-          const targetIsCjk = _veTargetIsCjk(transcript);
-          const cues = subItems.filter((s) => {
-            const t = (s.subtitleText || '').trim();
-            return t && !t.startsWith('[');
-          });
-          let mismatch = 0, cjkLeak = 0;
-          for (const s of cues) {
-            const txt = (s.subtitleText || '').trim();
-            const t = transcript[s.transcriptIndex];
-            if (!t || (t.text || '').trim() !== txt) mismatch++;
-            if (!targetIsCjk && _veCjkRatio(txt) > 0.30) cjkLeak++;
-          }
-          const stale = cues.length > 0
-            && (mismatch >= Math.ceil(cues.length / 2) || cjkLeak > 0);
-          if (stale) {
-            rebuildSubtitlesFromTranscript({
-              subtitleSegments: transcript,
-              clipStart,
-              clipEnd: effectiveEnd,
-            });
-          }
         }
+        // A non-empty but STALE / source-language-leaked recovered track is
+        // reconciled by the dedicated "keep subtitles in sync with the
+        // transcript" effect below — which, unlike this init effect, can't be
+        // bypassed by needsInit / recovered / the length-keyed dependency.
       }
       return;
     }
@@ -474,6 +443,51 @@ export default function VideoEditor({
     multiTrackInitialized.current = true;
     lastInitClipEnd.current = effectiveEnd;
   }, [src, clipStart, clipEnd, initFromClip, recovered, timelineStoreItems.length, transcript, addItem, addSubtitlesFromTranscript, rebuildSubtitlesFromTranscript, subtitlesUserEdited]);
+
+  // ── Keep the subtitle track in sync with the current transcript ──
+  // Runs INDEPENDENTLY of the init effect above, whose branching (needsInit /
+  // recovered / storeClipMismatch / a length-keyed dependency) can route around
+  // an in-line check — so a recovered IndexedDB track built from an EARLIER
+  // transcript (e.g. the pre-translation Japanese source) survives and burns
+  // onto the video. IndexedDB recovery only validates timing/dupes, NOT
+  // language, so a stale Japanese track restores cleanly. This effect keys on
+  // the full ``timelineStoreItems`` array (so a recovery with the SAME item
+  // count still triggers it) and on ``transcript`` (so it fires the moment the
+  // translated transcript arrives). When the track is NOT user-edited and is
+  // demonstrably stale — most cues' text no longer matches the transcript row
+  // they index, OR any cue is still in the source script while the transcript
+  // is translated (CJK in a non-CJK track) — it rebuilds from the transcript.
+  // Rebuilding yields a matching, leak-free track, so the re-run is a no-op (no
+  // loop); a CJK-target user (ja/zh/ko subtitles) keeps their cues.
+  useEffect(() => {
+    if (!src) return;
+    const effectiveEnd = clipEnd > clipStart ? clipEnd : 0;
+    if (effectiveEnd <= 0) return;
+    if (!Array.isArray(transcript) || transcript.length === 0) return;
+    if (subtitlesUserEdited) return;
+    const subItems = timelineStoreItems.filter((it) => it.type === 'subtitle');
+    if (subItems.length === 0) return;   // empty track → the init effect backfills it
+    const targetIsCjk = _veTargetIsCjk(transcript);
+    const cues = subItems.filter((s) => {
+      const t = (s.subtitleText || '').trim();
+      return t && !t.startsWith('[');
+    });
+    if (cues.length === 0) return;
+    let mismatch = 0, cjkLeak = 0;
+    for (const s of cues) {
+      const txt = (s.subtitleText || '').trim();
+      const t = transcript[s.transcriptIndex];
+      if (!t || (t.text || '').trim() !== txt) mismatch++;
+      if (!targetIsCjk && _veCjkRatio(txt) > 0.30) cjkLeak++;
+    }
+    if (mismatch >= Math.ceil(cues.length / 2) || cjkLeak > 0) {
+      rebuildSubtitlesFromTranscript({
+        subtitleSegments: transcript,
+        clipStart,
+        clipEnd: effectiveEnd,
+      });
+    }
+  }, [src, clipStart, clipEnd, transcript, timelineStoreItems, subtitlesUserEdited, rebuildSubtitlesFromTranscript]);
 
   // ── Sync: settings.subtitlesEnabled → timeline track visibility ──
   // The settings toggle is the PRIMARY control for subtitle visibility.
