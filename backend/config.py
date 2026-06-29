@@ -42,8 +42,31 @@ class Settings(BaseSettings):
     # On 6GB+ GPUs switch Primary AI to llava:7b (or larger) in Settings.
     OLLAMA_HOST: str = "http://ollama:11434"
     OLLAMA_PRIMARY_MODEL: str = "moondream:1.8b"
-    OLLAMA_EDITORIAL_MODEL: str = "qwen2.5:3b-instruct"
-    OLLAMA_TRANSLATION_MODEL: str = "qwen2.5:3b"  # Dedicated model for subtitle translation (multilingual)
+    # Local editorial + translation brain. Qwen3-4B-Instruct-2507 is a
+    # NON-thinking (no <think> blocks), 256K-native, Apache-2.0 model explicitly
+    # tuned for multilingual translation — a strict upgrade over qwen2.5:3b for
+    # both the editorial work and the LLM-first translation path (which routes
+    # through the editorial model). The q4_K_M quant (~2.5 GB) fits a 4 GB GTX
+    # 1650 AFTER Whisper VRAM is released. The exact Ollama tag may vary by quant
+    # (…-q4_K_M / -q8_0 / -fp16) or a user Modelfile, so it's overridable via the
+    # OLLAMA_EDITORIAL_MODEL / OLLAMA_TRANSLATION_MODEL env vars — never hardcode
+    # a tag deeper in the code; resolve from settings.
+    OLLAMA_EDITORIAL_MODEL: str = "qwen3:4b-instruct-2507-q4_K_M"
+    # Dedicated model for subtitle translation / offline MTPE (multilingual).
+    OLLAMA_TRANSLATION_MODEL: str = "qwen3:4b-instruct-2507-q4_K_M"
+    # ── Qwen3 translation sampling ──
+    # Qwen3 is prone to repetition without a presence/repetition penalty, and for
+    # deterministic subtitle JSON we want LOW temperature. These apply ONLY to the
+    # Qwen3 family on the dedicated translation path (see
+    # translator._translate_batch_via_ollama / local_models.qwen3_translation_options)
+    # — they do NOT change global editorial sampling (summaries/descriptions still
+    # use their higher-diversity settings). Qwen3's official non-thinking sampling
+    # guidance: temperature ~0.7 for chat, but subtitle translation wants
+    # determinism, so we default lower.
+    QWEN3_TRANSLATION_TEMPERATURE: float = 0.2
+    QWEN3_TRANSLATION_TOP_P: float = 0.8
+    QWEN3_TRANSLATION_REPEAT_PENALTY: float = 1.05
+    QWEN3_TRANSLATION_PRESENCE_PENALTY: float = 0.5
 
     # VideoLLaMA2 — optional local audio-visual model for Primary AI.
     # Requires ~10GB VRAM (RTX 4070+); on smaller GPUs the engine falls
