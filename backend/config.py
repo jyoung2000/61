@@ -562,6 +562,13 @@ class Settings(BaseSettings):
     # 2-line / max-duration / CPS caps, so parts that are genuinely far apart
     # (sparse speech) stay split. 0 disables the wider bridge.
     SUBTITLE_SENTENCE_MERGE_GAP_MS: int = 6000
+    # Hard ceiling (ms) on the gap the phrase-merge will EVER bridge, even for a
+    # mid-sentence continuation. Diarization labels everything "Speaker 1" on
+    # single-speaker content, so the sentence-merge bridge (6 s) could glue cues
+    # across a genuine pause into a run-on. This caps that: a silence larger than
+    # this is treated as a real boundary and never merged across. 0 disables the
+    # cap (legacy behavior).
+    SUBTITLE_MERGE_MAX_PAUSE_MS: int = 4000
     SUBTITLE_PLATFORM_SAFE_ZONES: bool = True   # per-platform margin profiles
     SUBTITLE_PLATFORM_PROFILE: str = ""         # "" | tiktok | reels | shorts | horizontal | square
 
@@ -615,6 +622,31 @@ class Settings(BaseSettings):
     # this fraction of the source-transcript timeline, discard it and use dense
     # offline NMT on the full source instead (every source cue gets translated).
     WHISPER_TRANSLATE_MIN_COVERAGE: float = 0.6
+    # ── Hybrid word-timed line splitting (JA→EN) ──
+    # The editorial LLM produces the authoritative English TEXT but no timing;
+    # Whisper's translate task produces audio-aligned English WORD timestamps but
+    # weaker text. When True, after the LLM translation we run a Whisper-native
+    # English pass purely as a TIMING REFERENCE and project those word times onto
+    # the LLM text (same-language EN↔EN monotonic alignment). The projected
+    # per-word times let the readability splitter break run-on LLM cues at real
+    # audio pauses. Whisper-EN text NEVER enters the output (text stays 100% LLM).
+    # Degradation ladder: A=Whisper-EN projection, B=source-JA word-pause timings,
+    # C=keep the cue whole (never char-proportional-time a word-less cue).
+    HYBRID_WORD_TIMING_ENABLED: bool = True
+    # Minimum fraction of an LLM cue's words that must align to a Whisper-EN word
+    # for the projection to be trusted (else the cue falls to tier B/C).
+    HYBRID_MIN_ANCHOR_RATIO: float = 0.30
+    # Time margin (s) around an LLM cue when gathering Whisper-EN candidate words
+    # (the two translations drift, so allow slack at the edges).
+    HYBRID_ALIGN_MARGIN_S: float = 2.0
+    # The Whisper-EN timing pass is a second ASR pass; only run it when the engine
+    # is still cached (free reuse) or this much VRAM is free. Otherwise degrade to
+    # tier B. Reuses WHISPER_TRANSLATE_MIN_FREE_GB's intent at a lower floor since
+    # this is inference-only on a (possibly) already-warm model.
+    HYBRID_WHISPER_REF_MIN_FREE_GB: float = 3.0
+    # Per-pass ceiling (s) for the Whisper-EN timing reference; on timeout we
+    # degrade to tier B rather than block the job.
+    HYBRID_WHISPER_REF_TIMEOUT_S: float = 1800.0
     TRANSLATION_CONTEXT_WINDOW: int = 5         # segments before/after for context
     TRANSLATION_GLOSSARY_ENABLED: bool = True   # per-video KNP glossary support
     # Auto-derive a per-video glossary of recurring proper nouns from the source

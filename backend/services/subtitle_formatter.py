@@ -503,6 +503,7 @@ def _split_segment(
     target_cps: float,
     min_piece_duration: float = 0.5,
     min_split_chars: int = 0,
+    word_timed_split_only: bool = False,
 ) -> list[TranscriptSegment]:
     """Try to split a single segment in two at a linguistic boundary so
     each half satisfies the CPS limit. Returns ``[seg]`` if no useful
@@ -583,6 +584,12 @@ def _split_segment(
             speaker=seg.speaker, words=right_words, confidence=seg.confidence,
         )
         return [left, right]
+
+    # No word timing for this split point. When ``word_timed_split_only`` is set
+    # (the hybrid LLM path), refuse the char-proportional fallback — a word-less
+    # cue is kept WHOLE rather than scrambled across guessed timestamps. Tier C.
+    if word_timed_split_only:
+        return [seg]
 
     # No word timing — fall back to character-proportional duration
     # (the legacy behaviour). Used to be the default; now reserved for
@@ -676,6 +683,7 @@ def _merge_for_readability(
     max_dur_s: float,
     max_gap_s: float,
     sentence_gap_s: float = 0.0,
+    hard_max_gap_s: Optional[float] = None,
 ) -> list[TranscriptSegment]:
     """Greedily merge consecutive same-speaker cues into the longest cue that
     still satisfies every readability limit (duration, 2-line char budget, CPS).
@@ -706,6 +714,12 @@ def _merge_for_readability(
         # A finished sentence starts a fresh cue (one-sentence-per-cue is ideal);
         # an UNFINISHED one earns a wider bridge to complete the thought.
         eff_gap = max_gap_s if _ends_sentence(prev_txt) else max(max_gap_s, sentence_gap_s)
+        # Hard ceiling: never bridge a genuinely large pause, even mid-sentence.
+        # On single-speaker content (diarization labels everything "Speaker 1")
+        # the sentence-merge bridge would otherwise glue cues across a real
+        # silence into a run-on.
+        if hard_max_gap_s is not None and hard_max_gap_s > 0:
+            eff_gap = min(eff_gap, hard_max_gap_s)
         if (txt and prev_txt and same_speaker
                 and not _is_bracket_marker(prev_txt) and not _is_bracket_marker(txt)
                 and 0.0 <= gap <= eff_gap):
@@ -742,6 +756,7 @@ def enforce_readability(
     auto_cjk: bool = True,
     min_split_chars: Optional[int] = None,
     allow_split: bool = True,
+    word_timed_split_only: bool = False,
 ) -> list[TranscriptSegment]:
     """Apply Netflix-style readability rules to a list of subtitle events.
 
@@ -760,6 +775,12 @@ def enforce_readability(
          of ≤ ``max_chars_per_line`` characters.
       4. Gap enforcement → guarantee ≥ ``min_gap_ms`` between consecutive
          events to prevent visual flicker.
+
+    ``word_timed_split_only`` (hybrid LLM path): when True, a cue may only be
+    split where its own word timestamps give a real time for the cut — the
+    char-proportional time fallback is disabled, so a word-less cue is kept WHOLE
+    instead of being scrambled across guessed timestamps. Cues that carry
+    projected word timings (tier A/B) still split on real audio pauses.
     """
     if not segments:
         return []
@@ -871,15 +892,18 @@ def enforce_readability(
         from backend.config import settings as _ms
         _merge_gap_s = float(getattr(_ms, "SUBTITLE_MERGE_MAX_GAP_MS", 1200)) / 1000.0
         _sentence_gap_s = float(getattr(_ms, "SUBTITLE_SENTENCE_MERGE_GAP_MS", 6000)) / 1000.0
+        _hard_gap_ms = float(getattr(_ms, "SUBTITLE_MERGE_MAX_PAUSE_MS", 4000))
+        _hard_gap_s = (_hard_gap_ms / 1000.0) if _hard_gap_ms > 0 else None
     except Exception:
         _merge_gap_s = 1.2
         _sentence_gap_s = 6.0
+        _hard_gap_s = 4.0
     if _merge_gap_s > 0:
         _pre_merge = len(segments)
         segments = _merge_for_readability(
             segments, max_cps=keep_cps, max_chars_per_line=max_chars_per_line,
             max_lines=max_lines, max_dur_s=max_dur_s, max_gap_s=_merge_gap_s,
-            sentence_gap_s=_sentence_gap_s)
+            sentence_gap_s=_sentence_gap_s, hard_max_gap_s=_hard_gap_s)
         if len(segments) < _pre_merge:
             logger.info(
                 "enforce_readability: merged %d → %d cue(s) into fuller lines "
@@ -950,7 +974,9 @@ def enforce_readability(
             changed = False
             for p in pieces:
                 if _cps(p.text.strip(), max(0.001, p.end - p.start)) > keep_cps:
-                    halves = _split_segment(p, keep_cps, min_split_chars=min_split_chars)
+                    halves = _split_segment(
+                        p, keep_cps, min_split_chars=min_split_chars,
+                        word_timed_split_only=word_timed_split_only)
                     if len(halves) > 1:
                         new_pieces.extend(halves)
                         changed = True
@@ -1035,6 +1061,10 @@ def enforce_readability(
             if word_timed is not None:
                 mid, left_words, right_words = word_timed
                 mid = max(seg.start + 0.05, min(seg.end - 0.05, mid))
+            elif word_timed_split_only:
+                # Hybrid LLM path: no real per-word time for this cut → keep the
+                # cue whole rather than char-proportionally scrambling it (tier C).
+                return None
             else:
                 dur = seg.end - seg.start
                 ratio = len(left_text) / max(1, len(seg.text))
