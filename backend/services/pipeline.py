@@ -424,6 +424,53 @@ def _whisper_engine_cached() -> bool:
         return False
 
 
+async def _get_whisper_en_timing_reference(
+    video_path: str, source_lang: str, source_segments: list, job_id: str,
+) -> list:
+    """Run a Whisper-native English pass PURELY as a timing reference for the
+    hybrid word-timing projection (its TEXT is never used — only ``.words``).
+
+    Gated on VRAM: only runs when the transcription engine is still cached (free
+    reuse) or enough VRAM is free; otherwise returns ``[]`` so the caller
+    degrades to tier B. Fail-soft on timeout / OOM / any error — never blocks the
+    job, never eats the CPU path."""
+    if not getattr(settings, "HYBRID_WORD_TIMING_ENABLED", True):
+        return []
+    if not video_path:
+        return []
+    cached = _whisper_engine_cached()
+    free_gb = _gpu_free_vram_gb()
+    floor = float(getattr(settings, "HYBRID_WHISPER_REF_MIN_FREE_GB", 3.0))
+    if not cached and free_gb < floor:
+        logger.info(
+            "[%s] Hybrid timing: skipping Whisper-EN reference (engine not cached, "
+            "only %.1f GB free < %.1f GB floor) — degrading to tier B",
+            job_id, free_gb, floor)
+        return []
+    timeout = float(getattr(settings, "HYBRID_WHISPER_REF_TIMEOUT_S", 1800.0))
+    try:
+        ref = await asyncio.wait_for(
+            asyncio.to_thread(
+                _whisper_native_translate_segments, video_path, source_lang,
+                None, source_segments),
+            timeout=timeout,
+        )
+        logger.info(
+            "[%s] Hybrid timing: Whisper-EN reference ready (%d cue(s), reuse=%s)",
+            job_id, len(ref or []), cached)
+        return ref or []
+    except asyncio.TimeoutError:
+        logger.warning(
+            "[%s] Hybrid timing: Whisper-EN reference timed out (%.0fs) — "
+            "degrading to tier B", job_id, timeout)
+        return []
+    except Exception as e:
+        logger.warning(
+            "[%s] Hybrid timing: Whisper-EN reference failed (%s) — degrading to "
+            "tier B", job_id, e)
+        return []
+
+
 def _timeline_coverage_s(segments) -> float:
     """Total seconds of timeline covered by the cues, merging overlaps.
 
@@ -2471,9 +2518,46 @@ async def _background_post_processing(
             if _used_llm:
                 logger.info(
                     "[%s] Translated resegmentation skipped — LLM cues are already "
-                    "1:1 and inherit the source's word-timed boundaries; re-segmenting "
-                    "word-less cues would char-proportionally re-time (scramble) them",
+                    "1:1 and inherit the source's word-timed boundaries; instead "
+                    "projecting real word timings so the splitter can break run-ons",
                     job_id)
+                # ── (c-hybrid) Project audio-aligned word timings onto the LLM text ──
+                # The LLM gives faithful English but NO timing. Get Whisper's
+                # native English word timestamps as a TIMING REFERENCE (its text is
+                # discarded) and project them onto the LLM cues via same-language
+                # EN↔EN alignment (tier A); fall back to the 1:1 source cue's word
+                # pauses (tier B); else keep the cue whole (tier C). Cues that gain
+                # word timing can then be split at REAL audio pauses below.
+                if getattr(settings, "HYBRID_WORD_TIMING_ENABLED", True):
+                    try:
+                        from backend.services.subtitle_aligner import project_hybrid_timings
+                        from backend.models import TranscriptSegment as _TSh
+                        _llm_cues = [
+                            t if isinstance(t, _TSh)
+                            else _TSh(**(t.model_dump() if hasattr(t, "model_dump") else t))
+                            for t in translated
+                        ]
+                        _whisper_ref = await _get_whisper_en_timing_reference(
+                            getattr(job, "file_path", None), source_lang,
+                            [s.model_dump() if hasattr(s, "model_dump") else dict(s)
+                             for s in _trans_input] if _trans_input else None,
+                            job_id)
+                        _tiers = project_hybrid_timings(
+                            _llm_cues, whisper_en_segments=_whisper_ref,
+                            source_cues=list(_trans_input) if _trans_input else None,
+                            margin_s=float(getattr(settings, "HYBRID_ALIGN_MARGIN_S", 2.0)),
+                            min_anchor_ratio=float(getattr(settings, "HYBRID_MIN_ANCHOR_RATIO", 0.30)),
+                        )
+                        translated = _llm_cues
+                        logger.info(
+                            "[%s] Hybrid timing projected: tier A (Whisper-EN)=%d, "
+                            "tier B (source-pause)=%d, tier C (kept whole)=%d of %d cue(s)",
+                            job_id, _tiers["tier_a"], _tiers["tier_b"],
+                            _tiers["tier_c"], _tiers["total"])
+                    except Exception as _hy_err:
+                        logger.warning(
+                            "[%s] Hybrid word-timing projection failed (%s) — keeping "
+                            "LLM cues whole", job_id, _hy_err)
             elif getattr(settings, "SENTENCE_SEGMENTATION_ENABLED", True) and not _pre_resegmented:
                 try:
                     from backend.services.sentence_segmenter import resegment_by_sentence
@@ -2502,13 +2586,14 @@ async def _background_post_processing(
                         min_duration_ms=int(getattr(settings, "SUBTITLE_MIN_DURATION_MS", 833)),
                         max_duration_ms=int(getattr(settings, "SUBTITLE_MAX_DURATION_MS", 9000)),
                         smart_line_breaks=bool(getattr(settings, "SUBTITLE_SMART_LINE_BREAKS", True)),
-                        # The editorial-LLM cues carry NO word timestamps, so any
-                        # CPS/duration split falls back to a char-proportional time
-                        # cut that scatters 2-4 word slivers across guessed times
-                        # (the "fragmented transcript" report). Keep its 1:1 cues
-                        # WHOLE — merge/extend/wrap still run. Whisper-native + NMT
-                        # keep splitting (they have/derive word timing).
-                        allow_split=not _used_llm,
+                        # Splitting is enabled, but on the LLM path it's gated to
+                        # cues that now carry PROJECTED word timings (tier A/B):
+                        # word_timed_split_only refuses the char-proportional time
+                        # cut that scrambled word-less cues, so tier-C cues stay
+                        # WHOLE while word-timed cues split at real audio pauses.
+                        # Whisper-native + NMT keep their existing behavior.
+                        allow_split=True,
+                        word_timed_split_only=_used_llm,
                     )
                     _cur = [
                         t if isinstance(t, _TSr)
