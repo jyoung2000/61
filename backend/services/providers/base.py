@@ -890,6 +890,16 @@ class AIProvider(ABC):
         internally reason before responding, routinely taking 60-120s+ on complex prompts.
         """
         model = self.text_model_name.lower()
+        # An explicit "thinking" tag is decisive either way.
+        if "thinking" in model:
+            return True
+        # Qwen3 ships BOTH thinking and non-thinking lines. The Instruct / 2507
+        # variants (e.g. qwen3:4b-instruct-2507) emit NO <think> blocks, so they
+        # must NOT be classed as thinking — doing so would wrongly inflate the
+        # per-batch timeout (150s vs 90s) and mis-handle their output. Only a
+        # bare/thinking qwen3 tag stays in the thinking bucket below.
+        if "qwen3" in model and ("instruct" in model or "2507" in model):
+            return False
         thinking_patterns = [
             "gemini-2.5-flash",
             "gemini-2.5-pro",
@@ -898,7 +908,7 @@ class AIProvider(ABC):
             "o4-mini",
             "deepseek-r1",
             "qwq",
-            "qwen3",        # Qwen 3.x models use extended thinking
+            "qwen3",        # bare Qwen3 tags default to the thinking line
             "reka",         # Reka models may use reasoning blocks
         ]
         return any(pattern in model for pattern in thinking_patterns)
