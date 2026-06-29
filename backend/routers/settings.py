@@ -2077,6 +2077,10 @@ async def available_models():
         _defaults = [
             (settings.OLLAMA_PRIMARY_MODEL, True),   # (model_name, is_vision)
             (settings.OLLAMA_EDITORIAL_MODEL, False),
+            # The dedicated translation model must surface in the dropdown too —
+            # otherwise a configured-but-not-yet-pulled translation model (e.g.
+            # qwen3:4b-instruct-2507-q4_K_M) is invisible until it's pulled.
+            (settings.OLLAMA_TRANSLATION_MODEL, False),
         ]
         for _def_name, _def_is_vision in _defaults:
             if not _def_name:
