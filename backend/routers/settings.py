@@ -3575,7 +3575,7 @@ def _subtitle_quality_state() -> dict:
         "subtitle_max_cps": float(getattr(settings, "SUBTITLE_MAX_CPS", 20.0)),
         "subtitle_max_chars_per_line": int(getattr(settings, "SUBTITLE_MAX_CHARS_PER_LINE", 42)),
         "subtitle_min_duration_ms": int(getattr(settings, "SUBTITLE_MIN_DURATION_MS", 833)),
-        "subtitle_max_duration_ms": int(getattr(settings, "SUBTITLE_MAX_DURATION_MS", 7000)),
+        "subtitle_max_duration_ms": int(getattr(settings, "SUBTITLE_MAX_DURATION_MS", 9000)),
         "subtitle_smart_line_breaks": bool(getattr(settings, "SUBTITLE_SMART_LINE_BREAKS", True)),
         "subtitle_platform_safe_zones": bool(getattr(settings, "SUBTITLE_PLATFORM_SAFE_ZONES", True)),
         "subtitle_platform_profile": str(getattr(settings, "SUBTITLE_PLATFORM_PROFILE", "") or ""),

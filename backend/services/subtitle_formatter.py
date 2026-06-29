@@ -6,7 +6,9 @@ SRT / ASS / VTT generators. It applies Netflix-style readability rules:
   - Characters-per-second (CPS) limit (default 20 cps adult)
   - Maximum characters per line (default 42 for Latin scripts)
   - Maximum 2 lines per subtitle event
-  - Minimum 833 ms / maximum 7000 ms subtitle duration
+  - Minimum 833 ms / maximum subtitle duration from
+    ``config.SUBTITLE_MAX_DURATION_MS`` (default 9000 ms; slow / heavily
+    paused speech needs the extra room — see the config note)
   - 80 ms minimum gap between consecutive events
   - Smart line breaking at linguistic boundaries
 
@@ -734,7 +736,7 @@ def enforce_readability(
     max_chars_per_line: int = 42,
     max_lines: int = 2,
     min_duration_ms: int = 833,
-    max_duration_ms: int = 4500,
+    max_duration_ms: Optional[int] = None,
     min_gap_ms: int = 80,
     smart_line_breaks: bool = True,
     auto_cjk: bool = True,
@@ -751,6 +753,9 @@ def enforce_readability(
          per-event maximum.
       2. Duration enforcement → ensure each event is between min and max
          milliseconds; over-long events split at linguistic boundaries.
+         ``max_duration_ms`` defaults to ``config.SUBTITLE_MAX_DURATION_MS``
+         (9000 ms) when not supplied, so the function honors the configured
+         cap rather than a stale signature literal.
       3. Smart line breaking → wrap each event into ≤ ``max_lines`` lines
          of ≤ ``max_chars_per_line`` characters.
       4. Gap enforcement → guarantee ≥ ``min_gap_ms`` between consecutive
@@ -758,6 +763,20 @@ def enforce_readability(
     """
     if not segments:
         return []
+
+    # Resolve the max-display-duration cap from config when the caller didn't
+    # pass one. The signature default used to be a hard-coded 4500 ms that
+    # disagreed with both this module's docstring and
+    # ``config.SUBTITLE_MAX_DURATION_MS`` (9000 ms): any caller that invoked
+    # ``enforce_readability(segs)`` with no kwargs silently split slow cues at
+    # 4.5 s, ignoring the configured 9 s cap. Resolve from config here so the
+    # configured value is honored everywhere.
+    if max_duration_ms is None:
+        try:
+            from backend.config import settings as _ds
+            max_duration_ms = int(getattr(_ds, "SUBTITLE_MAX_DURATION_MS", 9000))
+        except Exception:
+            max_duration_ms = 9000
 
     # Resolve the minimum-text split guard (prevents one-word cues on slow
     # speech). 0 disables it (legacy behaviour).

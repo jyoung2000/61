@@ -1804,7 +1804,7 @@ async def _polish_transcript_loop(
                     max_cps=float(getattr(settings, "SUBTITLE_MAX_CPS", 20.0)),
                     max_chars_per_line=int(getattr(settings, "SUBTITLE_MAX_CHARS_PER_LINE", 42)),
                     min_duration_ms=int(getattr(settings, "SUBTITLE_MIN_DURATION_MS", 833)),
-                    max_duration_ms=int(getattr(settings, "SUBTITLE_MAX_DURATION_MS", 4500)),
+                    max_duration_ms=int(getattr(settings, "SUBTITLE_MAX_DURATION_MS", 9000)),
                     smart_line_breaks=bool(getattr(settings, "SUBTITLE_SMART_LINE_BREAKS", True)),
                 )
             except Exception as _rd_err:
@@ -2500,7 +2500,7 @@ async def _background_post_processing(
                         max_cps=float(getattr(settings, "SUBTITLE_MAX_CPS", 20.0)),
                         max_chars_per_line=int(getattr(settings, "SUBTITLE_MAX_CHARS_PER_LINE", 42)),
                         min_duration_ms=int(getattr(settings, "SUBTITLE_MIN_DURATION_MS", 833)),
-                        max_duration_ms=int(getattr(settings, "SUBTITLE_MAX_DURATION_MS", 7000)),
+                        max_duration_ms=int(getattr(settings, "SUBTITLE_MAX_DURATION_MS", 9000)),
                         smart_line_breaks=bool(getattr(settings, "SUBTITLE_SMART_LINE_BREAKS", True)),
                         # The editorial-LLM cues carry NO word timestamps, so any
                         # CPS/duration split falls back to a char-proportional time
@@ -4220,6 +4220,21 @@ async def _run_analysis_inner(job_id: str):
                 t if isinstance(t, TranscriptSegment) else TranscriptSegment(**t)
                 for t in transcript
             ]
+            # Build the readability kwargs from config so the source-language
+            # (no-translate) path honors the same settings as the polish loop
+            # and the translation path. Without this it fell through to the
+            # function-signature defaults (notably max_duration_ms) and ignored
+            # SUBTITLE_MAX_DURATION_MS / SUBTITLE_MAX_CPS / SUBTITLE_MAX_CHARS_PER_LINE
+            # / SUBTITLE_MIN_DURATION_MS / SUBTITLE_SMART_LINE_BREAKS — a slow
+            # English cue between 4.5s and 9s got split that the configured 9s
+            # cap would have kept whole.
+            _src_enforce_kwargs = dict(
+                max_cps=float(getattr(settings, "SUBTITLE_MAX_CPS", 20.0)),
+                max_chars_per_line=int(getattr(settings, "SUBTITLE_MAX_CHARS_PER_LINE", 42)),
+                min_duration_ms=int(getattr(settings, "SUBTITLE_MIN_DURATION_MS", 833)),
+                max_duration_ms=int(getattr(settings, "SUBTITLE_MAX_DURATION_MS", 9000)),
+                smart_line_breaks=bool(getattr(settings, "SUBTITLE_SMART_LINE_BREAKS", True)),
+            )
             # Iterate the readability enforcer until the score plateaus.
             # Single-pass leaves cascade artifacts (Pass 2 extends a short
             # segment, Pass 4 caps it back below min_dur, score stays low).
@@ -4227,7 +4242,7 @@ async def _run_analysis_inner(job_id: str):
             _best_readable = list(_ts_models)
             _best_score = -1.0
             for _ in range(4):
-                _readable = enforce_readability(list(_readable))
+                _readable = enforce_readability(list(_readable), **_src_enforce_kwargs)
                 try:
                     _sc = float(compute_readability_report(list(_readable)).get("score", 0) or 0)
                 except Exception:

@@ -405,7 +405,7 @@ def generate_ass(
                 max_cps=float(getattr(_app_settings, "SUBTITLE_MAX_CPS", 20.0)),
                 max_chars_per_line=int(getattr(_app_settings, "SUBTITLE_MAX_CHARS_PER_LINE", 42)),
                 min_duration_ms=int(getattr(_app_settings, "SUBTITLE_MIN_DURATION_MS", 833)),
-                max_duration_ms=int(getattr(_app_settings, "SUBTITLE_MAX_DURATION_MS", 7000)),
+                max_duration_ms=int(getattr(_app_settings, "SUBTITLE_MAX_DURATION_MS", 9000)),
                 smart_line_breaks=bool(getattr(_app_settings, "SUBTITLE_SMART_LINE_BREAKS", True)),
             )
         except Exception:
