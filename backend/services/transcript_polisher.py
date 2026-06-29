@@ -165,28 +165,210 @@ def _coerce_segment(seg) -> dict:
     }
 
 
+# Punctuation that may be attached to a word surface without being part of the
+# spoken token (added/moved by the polish). Stripped for alignment comparison,
+# kept on the emitted surface so sentence terminators survive for the segmenter.
+_REMAP_STRIP = " \t\r\n.,!?;:…。、！？．・「」『』（）()\"'”’‘“-—–"
+
+
+def _w_get_attr(word, key, default=None):
+    """Read ``key`` off a word that may be a dict or an object."""
+    if isinstance(word, dict):
+        return word.get(key, default)
+    return getattr(word, key, default)
+
+
+def _remap_words_onto_text(orig_words, new_text, seg_start, seg_end):
+    """Re-map original per-word timestamps onto polished ``new_text``.
+
+    The polish is ~1:1 word count by design (it adds punctuation / fixes the odd
+    word), so we can carry each original word's start/end onto the matching token
+    in the edited text by walking both in order. Tokens with no original
+    counterpart (a substituted or inserted word) get their timing interpolated
+    between the surrounding anchors so the reconstructed text stays complete and
+    the timestamps stay monotonic.
+
+    Returns ``(words, confidence)`` where ``words`` is a list of
+    ``{"start","end","word"}`` dicts that, joined, reproduce ``new_text``; or
+    ``(None, 0.0)`` when there's nothing to map. ``confidence`` is the fraction
+    of original words that found a home in the edited text — the caller drops the
+    timing (keeps ``words=[]``) when it's too low to trust.
+    """
+    txt = new_text or ""
+    if not txt.strip() or not orig_words:
+        return None, 0.0
+    # Extract usable (surface, start, end) triples from the original words.
+    o: list[tuple[str, float, float]] = []
+    for w in orig_words:
+        surf = (_w_get_attr(w, "word", "") or "").strip()
+        st = _w_get_attr(w, "start", None)
+        en = _w_get_attr(w, "end", None)
+        if surf and st is not None and en is not None:
+            o.append((surf, float(st), float(en)))
+    if not o:
+        return None, 0.0
+
+    try:
+        from backend.services.subtitle_formatter import _is_cjk
+        is_cjk = _is_cjk(txt)
+    except Exception:
+        is_cjk = False
+
+    lower = txt.lower()
+    cursor = 0
+    out: list[dict] = []
+    matched = 0
+    for surf, st, en in o:
+        key = surf.strip(_REMAP_STRIP)
+        if not key:
+            continue
+        idx = lower.find(key.lower(), cursor)
+        if idx < 0:
+            # Original word's surface isn't in the edited text (substituted /
+            # dropped) — skip it; its span is absorbed by a neighbour below.
+            continue
+        end = idx + len(key)
+        # Absorb trailing attached punctuation (no intervening space) so a
+        # polish-added terminator rides on this token (the segmenter needs it).
+        while end < len(txt) and not txt[end].isspace() and txt[end] in _REMAP_STRIP:
+            end += 1
+        # Any text skipped between the cursor and this match is inserted /
+        # substituted content with no source timing — emit it as a token now so
+        # the reconstructed text is complete; its timing is interpolated later.
+        if idx > cursor:
+            gap = txt[cursor:idx].strip()
+            if gap:
+                out.append({"word": gap, "start": None, "end": None})
+        out.append({"word": txt[idx:end], "start": st, "end": en})
+        cursor = end
+        matched += 1
+    if not out:
+        return None, 0.0
+    # Trailing remainder (e.g. a final added clause) keeps the text whole.
+    if cursor < len(txt):
+        rest = txt[cursor:].strip()
+        if rest:
+            out.append({"word": rest, "start": None, "end": None})
+
+    # ── Interpolate timing for tokens that had no original counterpart ──
+    lo = float(seg_start) if seg_start is not None else o[0][1]
+    hi = float(seg_end) if seg_end is not None else o[-1][2]
+    n = len(out)
+    i = 0
+    while i < n:
+        if out[i]["start"] is not None:
+            i += 1
+            continue
+        # Maximal run [i, j) of un-timed tokens.
+        j = i
+        while j < n and out[j]["start"] is None:
+            j += 1
+        left_t = out[i - 1]["end"] if i > 0 else lo
+        right_t = out[j]["start"] if j < n else hi
+        if right_t < left_t:
+            right_t = left_t
+        span = right_t - left_t
+        count = j - i
+        for k in range(count):
+            a = left_t + span * (k / (count + 1))
+            b = left_t + span * ((k + 1) / (count + 1))
+            out[i + k]["start"] = a
+            out[i + k]["end"] = b
+        i = j
+
+    # Clamp into the segment and enforce monotonic, non-negative spans.
+    prev_end = lo
+    for w in out:
+        s = max(lo, min(hi, float(w["start"])))
+        e = max(s, min(hi, float(w["end"])))
+        if s < prev_end:
+            s = prev_end
+        if e < s:
+            e = s
+        w["start"], w["end"] = round(s, 3), round(e, 3)
+        prev_end = e
+
+    confidence = matched / max(1, len(o))
+    return out, confidence
+
+
+def _coerce_word_objs(words):
+    """Coerce a list of ``{"start","end","word"}`` dicts to ``WordTimestamp``
+    objects so a Pydantic segment stays well-typed. Returns the input unchanged
+    on any failure (downstream code reads both shapes)."""
+    if not words:
+        return words
+    try:
+        from backend.models import WordTimestamp
+        return [
+            w if not isinstance(w, dict)
+            else WordTimestamp(start=w["start"], end=w["end"], word=w["word"])
+            for w in words
+        ]
+    except Exception:
+        return words
+
+
+def _maybe_remap_words(orig, new_text):
+    """Return the word list to attach to a polished segment whose text changed.
+
+    Honors ``POLISH_REMAP_WORD_TIMESTAMPS`` / ``POLISH_REMAP_MIN_CONFIDENCE``.
+    Returns ``[]`` (the legacy null-the-words behavior) when remapping is
+    disabled, unavailable, or low-confidence."""
+    if not bool(getattr(settings, "POLISH_REMAP_WORD_TIMESTAMPS", True)):
+        return []
+    orig_words = _w_get_attr(orig, "words", None)
+    if not orig_words:
+        return []
+    seg_start = _w_get_attr(orig, "start", _w_get_attr(orig, "start_sec", None))
+    seg_end = _w_get_attr(orig, "end", _w_get_attr(orig, "end_sec", None))
+    try:
+        remapped, conf = _remap_words_onto_text(orig_words, new_text, seg_start, seg_end)
+    except Exception:
+        return []
+    min_conf = float(getattr(settings, "POLISH_REMAP_MIN_CONFIDENCE", 0.5))
+    if not remapped or conf < min_conf:
+        return []
+    return remapped
+
+
 def _emit_segment(orig, new_text: str):
     """Apply ``new_text`` back to a segment without mutating timing/speaker.
-    Round-trips both dict and Pydantic shapes."""
+    Round-trips both dict and Pydantic shapes.
+
+    When the text changed, word-level timestamps no longer align char-for-char.
+    Rather than nulling them (which wiped nearly all word timing because the
+    polish punctuates almost every segment, forcing the downstream segmenter
+    onto its char-proportional fallback), RE-MAP the original timestamps onto
+    the edited text — keeping ``words=[]`` only when alignment confidence is too
+    low. Gated by ``POLISH_REMAP_WORD_TIMESTAMPS``."""
     if isinstance(orig, dict):
         # Some pipelines use ``text``, others might use both ``text`` and
         # carry word-level timestamps. We only rewrite text.
         out = dict(orig)
         out["text"] = new_text
-        # Strip word timestamps when text changed — they no longer align.
+        # Re-map (or, on low confidence, clear) word timestamps when text changed.
         if "words" in out and out.get("text", "") != orig.get("text", ""):
-            out["words"] = []
+            out["words"] = _maybe_remap_words(orig, new_text)
         return out
     obj = orig
+    text_changed = (getattr(obj, "text", None) != new_text)
+    new_words = _maybe_remap_words(obj, new_text) if text_changed else None
     # Try to use ``model_copy`` (Pydantic v2) or fall back to attribute set.
     try:
-        new = obj.model_copy(update={"text": new_text, "words": []})
+        update = {"text": new_text}
+        if text_changed:
+            # ``model_copy(update=...)`` does NOT validate, so coerce the
+            # remapped dict words into the model's word type to keep the
+            # segment well-typed (model_dump / downstream attribute access).
+            update["words"] = _coerce_word_objs(new_words)
+        new = obj.model_copy(update=update)
         return new
     except Exception:
         try:
             setattr(obj, "text", new_text)
-            if hasattr(obj, "words"):
-                setattr(obj, "words", [])
+            if text_changed and hasattr(obj, "words"):
+                setattr(obj, "words", new_words)
         except Exception:
             pass
         return obj

@@ -412,6 +412,22 @@ class Settings(BaseSettings):
     # off if you want the polisher to actually delete fillers /
     # restructure.
     TRANSCRIPT_PRESERVE_WORDS: bool = True
+    # When the polish changes a segment's text it used to NULL the segment's
+    # word-level timestamps (they no longer aligned char-for-char). Because the
+    # polish adds punctuation to almost every segment, that wiped nearly all
+    # word timing — so the downstream sentence segmenter fell back to its
+    # char-proportional "if not words" branch and timed every sentence by
+    # character length (a uniform-speech-rate assumption that drifts hundreds
+    # of ms on slow / drawn-out speech). When True, RE-MAP the original word
+    # timestamps onto the edited text by token alignment (polish is ~1:1 word
+    # count by design) and carry the original start/end, only dropping a word's
+    # timing when it has no counterpart. Set False to restore the old
+    # null-the-words behavior.
+    POLISH_REMAP_WORD_TIMESTAMPS: bool = True
+    # Minimum fraction of edited tokens that must align to an original word for
+    # the remapped timing to be trusted. Below this the segment keeps words=[]
+    # (the polish rewrote too much to trust positional alignment).
+    POLISH_REMAP_MIN_CONFIDENCE: float = 0.5
     # Re-polish loop: keep iterating until the readability report scores
     # the transcript ≥ this target (0-100). Capped at 3 passes so a
     # poorly-segmented source can't loop forever.
