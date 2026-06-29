@@ -221,6 +221,36 @@ def _split_segment_by_sentence(seg: TranscriptSegment) -> list[TranscriptSegment
     return out or [seg]
 
 
+def timing_provenance_report(segments: list) -> dict:
+    """Summarise how each segment's timing was derived: from per-word
+    timestamps (accurate) vs. char-proportional fallback (a uniform-rate guess).
+
+    A segment counts as word-timed when it carries a non-empty ``words`` array;
+    otherwise its start/end were distributed by character length. Surfacing this
+    once per job makes timing-quality regressions (e.g. polish wiping word
+    timing) visible without digging through the transcript."""
+    total = 0
+    word_timed = 0
+    for s in segments or []:
+        words = (s.get("words") if isinstance(s, dict)
+                 else getattr(s, "words", None))
+        text = (s.get("text") if isinstance(s, dict)
+                else getattr(s, "text", "")) or ""
+        if not text.strip():
+            continue
+        total += 1
+        if words:
+            word_timed += 1
+    proportional = total - word_timed
+    pct = (word_timed / total * 100.0) if total else 100.0
+    return {
+        "total": total,
+        "word_timed": word_timed,
+        "proportional": proportional,
+        "pct_word_timed": round(pct, 1),
+    }
+
+
 def resegment_by_sentence(segments: list) -> list:
     """Merge same-speaker neighbours, then re-split at sentence boundaries.
 

@@ -722,7 +722,7 @@ class AudioIntelligence:
                     **_bias,
                 )
                 log.log_stage('AUDIO',
-                    f'Using batched inference (batch=16, beam=5, '
+                    f'Using batched inference (batch={self._batch_size}, beam=5, '
                     f'no_speech_thresh={_ns_threshold}, '
                     f'cond_prev={_decode.get("condition_on_previous_text")}, '
                     f'no_repeat_ngram={_decode.get("no_repeat_ngram_size")})')

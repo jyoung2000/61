@@ -4261,6 +4261,20 @@ async def _run_analysis_inner(job_id: str):
                 "[%s] Raw transcript reflowed for readability: %d → %d segments",
                 job_id, len(_ts_models), len(transcript),
             )
+            # Once-per-job timing-provenance summary: how many cues are
+            # word-timed vs. char-proportional. Makes timing-quality regressions
+            # (e.g. polish wiping word timing) visible at a glance.
+            try:
+                from backend.services.sentence_segmenter import timing_provenance_report
+                _tp = timing_provenance_report(transcript)
+                logger.info(
+                    "[%s] Cue timing provenance: %d/%d word-timed (%.1f%%), "
+                    "%d char-proportional",
+                    job_id, _tp["word_timed"], _tp["total"],
+                    _tp["pct_word_timed"], _tp["proportional"],
+                )
+            except Exception:
+                pass
         except Exception as _re_err:
             logger.warning(
                 "[%s] Raw transcript readability pass failed (%s) — keeping Whisper output as-is",
