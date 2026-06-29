@@ -746,6 +746,29 @@ async def mtpe_postedit_offline(
         return nmt_segments
 
     num_ctx = int(getattr(settings, "OFFLINE_TRANSLATION_MTPE_NUM_CTX", 8192))
+
+    # ── Model-availability pre-check + one-line diagnostics ──
+    # Confirm the configured translation model is actually pulled on the Ollama
+    # host. If it's missing, log an actionable `ollama pull` line and fall back to
+    # the raw NMT draft (the completeness backstop) instead of erroring inside the
+    # request path. We never auto-pull silently here. A transient list failure is
+    # non-fatal — we proceed and let the per-batch fail-soft handle any error.
+    try:
+        from backend.services.local_models import list_ollama_models, _ollama_names_match
+        installed = await list_ollama_models()
+        if installed and not any(_ollama_names_match(m, model) for m in installed):
+            logger.warning(
+                "Local translation model %r is not installed on the Ollama host "
+                "(%s) — falling back to the offline NMT draft. To enable the "
+                "Qwen3 MTPE pass, run:  ollama pull %s",
+                model, host, model)
+            return nmt_segments
+    except Exception as _avail_e:
+        logger.debug("Translation model availability check skipped (%s)", _avail_e)
+    logger.info(
+        "Local translation engine: model=%s num_ctx=%d host=%s device=ollama-auto "
+        "(GPU after Whisper release, CPU fallback on OOM)",
+        model, num_ctx, host)
     # Source↔draft 1:1 alignment lets the model repair mistranslations against
     # the source; the offline NMT path is 1:1, so this normally holds.
     src_texts = [
