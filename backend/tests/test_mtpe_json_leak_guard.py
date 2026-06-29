@@ -54,9 +54,12 @@ def test_echoed_objects_with_source_yield_clean_text_only():
 
 
 def test_stringified_dict_element_is_rejected():
-    # The model returned the dict AS a string → must be rejected (keep draft).
+    # The model returned one dict AS a string. Per-segment salvage: that index
+    # is rejected (None → keep original) while the good line still passes. The
+    # leaked dict must never appear in the output.
     resp = json.dumps(["{'index': 0, 'text': 'Hello'}", "Fine."])
-    assert P._parse_polished_response(resp, 2) is None
+    out = P._parse_polished_response(resp, 2)
+    assert out == [None, "Fine."]
 
 
 def test_plain_string_array_passes_through():
@@ -65,10 +68,20 @@ def test_plain_string_array_passes_through():
 
 
 def test_object_without_text_key_rejected():
-    assert P._parse_polished_response(json.dumps([{"index": 0, "foo": "bar"}]), 1) is None
+    # A single un-coercible element → that index is None (keep original); the
+    # response is still a valid-length array, so it is NOT whole-batch rejected.
+    assert P._parse_polished_response(json.dumps([{"index": 0, "foo": "bar"}]), 1) == [None]
+
+
+def test_one_bad_element_salvages_the_rest():
+    # One malformed element in a 3-element batch must not discard the other two.
+    resp = json.dumps(["Good one.", {"index": 1, "foo": "bar"}, "Good three."])
+    out = P._parse_polished_response(resp, 3)
+    assert out == ["Good one.", None, "Good three."]
 
 
 def test_count_mismatch_rejected():
+    # Length mismatch → alignment ambiguous → whole batch kept raw (unchanged).
     assert P._parse_polished_response(json.dumps(["a", "b"]), 3) is None
 
 

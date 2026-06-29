@@ -628,14 +628,21 @@ def _coerce_polished_item(x) -> Optional[str]:
     return None
 
 
-def _parse_polished_response(response: str, expected: int) -> Optional[list[str]]:
-    """Parse the LLM's JSON array response into ``expected`` clean strings.
+def _parse_polished_response(response: str, expected: int) -> Optional[list[Optional[str]]]:
+    """Parse the LLM's JSON array response into ``expected`` slots.
 
-    Returns ``None`` on parse failure, length mismatch, or any element that
-    can't be reduced to a clean string (so the caller keeps the draft —
-    fail-soft). Tolerates a model that echoes the input objects instead of a
-    flat string array by extracting their ``text``, and rejects any line that
-    still looks like a leaked input object."""
+    Returns ``None`` only when the response can't be parsed as a JSON array of
+    the expected length (alignment is ambiguous → caller keeps the whole batch
+    raw). Otherwise returns a list of length ``expected`` whose elements are the
+    clean polished string, or ``None`` for any single element that fails the
+    existing guards (un-coercible to a string, or still looks like a leaked
+    input object). Per-element ``None`` lets the caller keep the ORIGINAL for
+    just that index instead of reverting the whole batch — one malformed line in
+    a 20-segment batch no longer discards the other 19.
+
+    Tolerates a model that echoes the input objects instead of a flat string
+    array by extracting their ``text``. The guards themselves are unchanged;
+    only their scope narrowed from whole-batch to per-element."""
     text = (response or "").strip()
     # Strip markdown fences if the model added them.
     if text.startswith("```"):
@@ -654,17 +661,21 @@ def _parse_polished_response(response: str, expected: int) -> Optional[list[str]
     except json.JSONDecodeError:
         return None
     if not isinstance(data, list) or len(data) != expected:
+        # Length mismatch — positional alignment is unreliable, so keep the
+        # whole batch raw (unchanged behavior for this case).
         return None
-    out: list[str] = []
+    out: list[Optional[str]] = []
     for x in data:
         s = _coerce_polished_item(x)
         if s is None:
-            return None  # unrecoverable element → keep the draft
+            out.append(None)        # unrecoverable element → keep original here
+            continue
+        # A line that still looks like a stringified input object (the model
+        # returned the dict as a string) must never ship — keep original here.
+        if _LEAKED_STRUCT_RE.search(s):
+            out.append(None)
+            continue
         out.append(s)
-    # Final guard: a line that still looks like a stringified input object (the
-    # model returned the dict as a string) must never ship — keep the draft.
-    if any(_LEAKED_STRUCT_RE.search(s) for s in out):
-        return None
     return out
 
 
@@ -678,9 +689,14 @@ async def _polish_batch(
     glossary_terms: Optional[list[str]] = None,
     source_texts: Optional[list[str]] = None,
     mode: str = "asr",
-) -> Optional[list[str]]:
-    """Polish a single batch via the editorial LLM. Returns None on failure
-    so the caller can keep the originals."""
+) -> Optional[list[Optional[str]]]:
+    """Polish a single batch via the editorial LLM.
+
+    Returns ``None`` when the whole batch is unusable (LLM error, or a response
+    that can't be parsed as a JSON array of the right length). Otherwise returns
+    a list of length ``len(batch)`` where each element is the polished string or
+    ``None`` for an individual line that failed the parse-level guards (the
+    caller keeps the original for just those indices)."""
     user_prompt = _build_user_prompt(
         batch, context_before, context_after, language, glossary_terms,
         source_texts=source_texts, mode=mode)
@@ -696,6 +712,13 @@ async def _polish_batch(
         logger.warning(
             "transcript polishing: bad response shape (expected %d items)",
             len(batch),
+        )
+    elif any(p is None for p in polished):
+        logger.info(
+            "transcript polishing: salvaged %d/%d lines (kept original for %d "
+            "that failed per-line guards)",
+            sum(1 for p in polished if p is not None), len(polished),
+            sum(1 for p in polished if p is None),
         )
     return polished
 
@@ -844,11 +867,19 @@ async def correct_transcript(
         for i, (view, orig_obj) in enumerate(batch_pairs):
             orig_full = view.get("text", "")
             if polished_texts is None:
-                # Batch failed. Keep the MT draft for translation mode; for ASR
-                # fall back to a light-touch filler strip rather than nothing.
+                # Whole batch failed (LLM error / unparseable). Keep the MT draft
+                # for translation mode; for ASR fall back to a light-touch filler
+                # strip rather than nothing.
                 new_text = (orig_full if mode == "translation"
                             else _light_filler_strip(orig_full, language))
                 polished_out.append(_emit_segment(orig_obj, new_text))
+                continue
+            if polished_texts[i] is None:
+                # This specific line failed the per-line parse guards — keep its
+                # ORIGINAL text + words verbatim while the rest of the batch is
+                # polished. Re-emit the original object unchanged so word timing
+                # is preserved.
+                polished_out.append(orig_obj)
                 continue
             cand = polished_texts[i].strip()
             orig_text = orig_full.strip()
