@@ -93,6 +93,8 @@ export default function Settings() {
   const [modelsSaving, setModelsSaving] = useState(false);
   const [modelsLoading, setModelsLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  const [pulling, setPulling] = useState(false);
+  const [pullStatus, setPullStatus] = useState('');
 
   // Transcription speed settings
   const [transSettings, setTransSettings] = useState({
@@ -843,6 +845,67 @@ export default function Settings() {
       showToast('Failed to refresh models', 'error');
     } finally {
       setRefreshing(false);
+    }
+  };
+
+  // Re-query installed Ollama models + dropdown options (no OpenRouter re-fetch).
+  // Use this after pulling a model on the host so it appears in the pickers.
+  const handleReloadModels = async () => {
+    setRefreshing(true);
+    try {
+      await loadAvailableModels();
+      showToast('Model list reloaded', 'success');
+    } catch {
+      showToast('Failed to reload models', 'error');
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
+  // Pull the configured local (Ollama) models — primary, editorial, and the
+  // translation default (e.g. qwen3:4b-instruct-2507-q4_K_M) — in the
+  // background, polling progress and reloading the pickers as they arrive.
+  const handlePullModels = async () => {
+    setPulling(true);
+    setPullStatus('Starting…');
+    try {
+      const res = await fetch('/api/providers/ollama/pull', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      const data = res.ok ? await res.json() : null;
+      if (!data || data.status === 'error') {
+        showToast((data && data.message) || 'Failed to start pull', 'error');
+        setPullStatus('');
+        setPulling(false);
+        return;
+      }
+      showToast(data.message || 'Pulling models…', data.status === 'already_running' ? 'info' : 'success');
+      // Poll until the background pull finishes, reloading the list each tick.
+      let active = true;
+      let guard = 0;
+      while (active && guard < 600) {  // ~30 min ceiling at 3s/tick
+        guard += 1;
+        await new Promise((r) => setTimeout(r, 3000));
+        let st;
+        try {
+          const sres = await fetch('/api/providers/ollama/pull-status');
+          st = sres.ok ? await sres.json() : null;
+        } catch { st = null; }
+        if (!st) break;
+        setPullStatus(st.current ? `Pulling ${st.current}…`
+          : `${st.finished || 0}/${st.total || 0} done`);
+        await loadAvailableModels();
+        active = !!st.active;
+      }
+      setPullStatus('');
+      showToast('Model pull finished', 'success');
+      await loadAvailableModels();
+    } catch {
+      showToast('Failed to pull models', 'error');
+    } finally {
+      setPulling(false);
     }
   };
 
@@ -2102,6 +2165,39 @@ export default function Settings() {
                     All models saved
                   </span>
                 )}
+
+                {/* ── Reload / Pull local models ── */}
+                <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8 }}>
+                  {pulling && pullStatus && (
+                    <span style={{ fontSize: 11, color: 'var(--text-secondary)' }}>{pullStatus}</span>
+                  )}
+                  <button
+                    onClick={handleReloadModels}
+                    disabled={refreshing || pulling}
+                    title="Re-query installed Ollama models (run after pulling on the host)"
+                    style={{
+                      padding: '8px 14px', background: 'var(--bg-elevated)',
+                      color: 'var(--accent-cyan)', border: '1px solid var(--border)',
+                      borderRadius: 'var(--radius-sm)', fontSize: 12, fontWeight: 600,
+                      opacity: (refreshing || pulling) ? 0.5 : 1,
+                    }}
+                  >
+                    {refreshing ? 'Reloading…' : '↻ Reload'}
+                  </button>
+                  <button
+                    onClick={handlePullModels}
+                    disabled={pulling}
+                    title="Download the configured local models (primary, editorial, translation) onto the Ollama host"
+                    style={{
+                      padding: '8px 14px', background: 'var(--bg-elevated)',
+                      color: 'var(--accent-cyan)', border: '1px solid var(--accent-cyan)',
+                      borderRadius: 'var(--radius-sm)', fontSize: 12, fontWeight: 600,
+                      opacity: pulling ? 0.6 : 1,
+                    }}
+                  >
+                    {pulling ? 'Pulling…' : '⤓ Pull local models'}
+                  </button>
+                </div>
               </div>
 
             </>

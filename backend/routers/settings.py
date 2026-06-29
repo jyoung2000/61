@@ -1211,6 +1211,14 @@ def _pre_download_whisper_model(model_name: str):
     t.start()
 
 
+# Progress state for the manual "Pull models" button (one pull run at a time).
+# Polled by GET /providers/ollama/pull-status so the UI can show progress and
+# reload the dropdown when the pull finishes.
+_ollama_pull_state: dict = {
+    "active": False, "models": [], "done": [], "failed": [], "current": None,
+}
+
+
 def _pull_ollama_models_background(models: list[str] | None = None):
     """Pull Ollama models in a background thread.
 
@@ -1229,23 +1237,36 @@ def _pull_ollama_models_background(models: list[str] | None = None):
     if not models:
         return
 
+    # Reset the progress state for this run so the UI can track it.
+    _ollama_pull_state.update(
+        {"active": True, "models": list(models), "done": [], "failed": [],
+         "current": None})
+
     def _do_pull():
         import httpx as _httpx
         host = settings.OLLAMA_HOST
-        for model in models:
-            try:
-                logger.info("Background pull: requesting %s from Ollama...", model)
-                resp = _httpx.post(
-                    f"{host}/api/pull",
-                    json={"name": model},
-                    timeout=_httpx.Timeout(connect=10, read=1800, write=10, pool=10),
-                )
-                if resp.status_code == 200:
-                    logger.info("Background pull: %s ready", model)
-                else:
-                    logger.warning("Background pull: %s returned %d", model, resp.status_code)
-            except Exception as exc:
-                logger.warning("Background pull: %s failed (%s)", model, exc)
+        try:
+            for model in models:
+                _ollama_pull_state["current"] = model
+                try:
+                    logger.info("Background pull: requesting %s from Ollama...", model)
+                    resp = _httpx.post(
+                        f"{host}/api/pull",
+                        json={"name": model},
+                        timeout=_httpx.Timeout(connect=10, read=1800, write=10, pool=10),
+                    )
+                    if resp.status_code == 200:
+                        logger.info("Background pull: %s ready", model)
+                        _ollama_pull_state["done"].append(model)
+                    else:
+                        logger.warning("Background pull: %s returned %d", model, resp.status_code)
+                        _ollama_pull_state["failed"].append(model)
+                except Exception as exc:
+                    logger.warning("Background pull: %s failed (%s)", model, exc)
+                    _ollama_pull_state["failed"].append(model)
+        finally:
+            _ollama_pull_state["current"] = None
+            _ollama_pull_state["active"] = False
 
     threading.Thread(target=_do_pull, daemon=True, name="ollama-bg-pull").start()
 
@@ -1279,6 +1300,65 @@ async def toggle_ollama(req: ToggleOllamaRequest):
         "ollama_enabled": "ollama" in chain,
         "chain": chain,
     }
+
+
+class PullOllamaRequest(BaseModel):
+    # A single tag, or a list of tags. When both are omitted the configured
+    # primary/editorial/translation models are pulled.
+    model: Optional[str] = None
+    models: Optional[list[str]] = None
+
+
+@router.post("/providers/ollama/pull")
+async def pull_ollama_models(req: PullOllamaRequest | None = None):
+    """Kick off a background pull of one or more Ollama models.
+
+    With no body, pulls the configured primary/editorial/translation models
+    (e.g. the qwen3 translation default). Returns immediately — the pull runs in
+    a background thread; poll GET /providers/ollama/pull-status for progress.
+    Never auto-pulls anything the caller didn't ask for, and refuses to start a
+    second run while one is active."""
+    if _ollama_pull_state.get("active"):
+        return {
+            "status": "already_running",
+            "message": "A model pull is already in progress.",
+            **_ollama_pull_state,
+        }
+    host = (settings.OLLAMA_HOST or "").strip()
+    if not host:
+        return {"status": "error", "message": "No Ollama host configured."}
+
+    models: list[str] = []
+    if req and req.models:
+        models = [m.strip() for m in req.models if m and m.strip()]
+    elif req and req.model and req.model.strip():
+        models = [req.model.strip()]
+    else:
+        for m in (settings.OLLAMA_PRIMARY_MODEL, settings.OLLAMA_EDITORIAL_MODEL,
+                  settings.OLLAMA_TRANSLATION_MODEL):
+            if m and m not in models:
+                models.append(m)
+    if not models:
+        return {"status": "error", "message": "No models to pull."}
+
+    _pull_ollama_models_background(models)
+    return {
+        "status": "started",
+        "models": models,
+        "message": "Pulling " + ", ".join(models) + " in the background.",
+    }
+
+
+@router.get("/providers/ollama/pull-status")
+async def ollama_pull_status():
+    """Report progress of the most recent /providers/ollama/pull run so the UI
+    can show a spinner and reload the model list when it finishes."""
+    st = dict(_ollama_pull_state)
+    total = len(st.get("models") or [])
+    finished = len(st.get("done") or []) + len(st.get("failed") or [])
+    st["total"] = total
+    st["finished"] = finished
+    return st
 
 
 def _find_env_file() -> str | None:
