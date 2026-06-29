@@ -868,8 +868,8 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                 return 2048  # Moondream only supports 2048 context (n_ctx_train=2048)
             elif "llava" in model_lower or "vision" in model_lower:
                 return 2048  # Vision models: respect training context limit
-            elif any(s in model_lower for s in ["3b", "1b", "0.5b"]):
-                return 8192
+            elif any(s in model_lower for s in ["3b", "4b", "1b", "0.5b"]):
+                return 8192   # small models (incl. Qwen3-4B) get a roomy CPU ctx
             elif any(s in model_lower for s in ["7b", "8b"]):
                 return 4096
             return 4096

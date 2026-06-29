@@ -562,6 +562,19 @@ async def _translate_batch_via_ollama(
     context window (8192) and keep real surrounding context on long videos.
     """
     host = settings.OLLAMA_HOST
+    options = {
+        "num_ctx": int(num_ctx),
+        "temperature": 0.3,
+        "num_predict": 4096,
+    }
+    # Qwen3 family: apply low-temperature + presence/repetition penalties for
+    # deterministic subtitle JSON (Qwen3 repeats without a penalty). Gated to the
+    # Qwen3 family — non-Qwen3 models keep the default 0.3 temperature.
+    try:
+        from backend.services.local_models import qwen3_translation_options
+        options.update(qwen3_translation_options(model))
+    except Exception:
+        pass
     async with httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=15.0)) as client:
         resp = await client.post(
             f"{host}/api/chat",
@@ -569,11 +582,7 @@ async def _translate_batch_via_ollama(
                 "model": model,
                 "messages": [{"role": "user", "content": prompt}],
                 "stream": False,
-                "options": {
-                    "num_ctx": int(num_ctx),
-                    "temperature": 0.3,
-                    "num_predict": 4096,
-                },
+                "options": options,
             },
         )
         resp.raise_for_status()
