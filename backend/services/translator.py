@@ -101,6 +101,13 @@ def _parse_json_array(response: str, expected: int) -> Optional[list[str]]:
     """Parse the LLM's ``["...", "..."]`` reply into exactly ``expected`` strings."""
     import re
     text = (response or "").strip()
+    # Strip any <think>…</think> reasoning blocks before parsing. The default
+    # local model (Qwen3-4B-Instruct-2507) is NON-thinking and emits none, but a
+    # mis-tagged / swapped model could — and an unclosed block (truncated
+    # mid-think) would otherwise poison the array extraction below.
+    text = re.sub(r"(?is)<think>.*?</think>", "", text)
+    text = re.sub(r"(?is)<think>.*$", "", text)
+    text = text.strip()
     if text.startswith("```"):
         text = re.sub(r"^```[a-zA-Z0-9]*\s*\n?", "", text)
         if text.endswith("```"):

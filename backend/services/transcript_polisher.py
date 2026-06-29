@@ -644,6 +644,13 @@ def _parse_polished_response(response: str, expected: int) -> Optional[list[Opti
     array by extracting their ``text``. The guards themselves are unchanged;
     only their scope narrowed from whole-batch to per-element."""
     text = (response or "").strip()
+    # Strip any <think>…</think> reasoning blocks first. The default local model
+    # (Qwen3-4B-Instruct-2507) is NON-thinking, but a mis-tagged / swapped model
+    # could emit them; an unclosed block (truncated mid-think) would otherwise
+    # break the JSON-array extraction below.
+    text = re.sub(r"(?is)<think>.*?</think>", "", text)
+    text = re.sub(r"(?is)<think>.*$", "", text)
+    text = text.strip()
     # Strip markdown fences if the model added them.
     if text.startswith("```"):
         text = re.sub(r"^```[a-zA-Z0-9]*\s*\n?", "", text)
