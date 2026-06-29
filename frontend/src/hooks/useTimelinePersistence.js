@@ -194,8 +194,21 @@ export default function useTimelinePersistence(jobId, clipId) {
           if (corrupt) {
             await purgeCorruptEntry(db, key, reason);
           } else if (Array.isArray(state.items) && state.items.length > 0) {
-            importState(state);
-            setRecovered(true);
+            // Subtitles are DERIVED from the (server-side, clean) transcript.
+            // Unless the user manually edited them, they are not authoritative —
+            // a cache built mid-processing can hold a stale / source-language
+            // track that then shows in the editor and feeds reverse-sync. Drop
+            // non-edited subtitle items on recovery so the editor rebuilds them
+            // fresh from the current transcript. Caches predating this flag have
+            // it undefined → treated as not-edited → rebuilt. User-edited tracks
+            // (flag true) are restored intact.
+            if (!state.subtitlesUserEdited) {
+              state.items = state.items.filter((it) => it.type !== 'subtitle');
+            }
+            if (Array.isArray(state.items) && state.items.length > 0) {
+              importState(state);
+              setRecovered(true);
+            }
           }
         }
       } catch {
@@ -220,6 +233,17 @@ export default function useTimelinePersistence(jobId, clipId) {
     saveTimerRef.current = setTimeout(async () => {
       try {
         const state = exportState();
+        // Record whether subtitles are user-edited, and DON'T cache derived
+        // subtitle items: when the user hasn't edited them they're rebuilt from
+        // the clean server transcript on load, so caching them only risks
+        // persisting a stale / source-language track. User-edited subtitles ARE
+        // kept (real user content). This is the durable cure for the recurring
+        // "editor shows old / Japanese subtitles" stale-cache class.
+        const _subsEdited = !!useTimelineStore.getState().subtitlesUserEdited;
+        state.subtitlesUserEdited = _subsEdited;
+        if (!_subsEdited && Array.isArray(state.items)) {
+          state.items = state.items.filter((it) => it.type !== 'subtitle');
+        }
         // Never persist a corrupt timeline — doing so would re-seed the cache
         // we purge on load and could feed the reverse-sync. Skip the write
         // (the on-disk transcript remains the source of truth).
