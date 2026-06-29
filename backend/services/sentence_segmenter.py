@@ -104,6 +104,57 @@ def _split_text_sentences(text: str, is_cjk: bool) -> list[str]:
     return [p.strip() for p in parts if p and p.strip()]
 
 
+def _pause_split_params() -> tuple[bool, float, float]:
+    """Resolve (enabled, pause_seconds, max_cue_seconds) from config."""
+    try:
+        from backend.config import settings as _s
+        enabled = bool(getattr(_s, "SENTENCE_SPLIT_PAUSE_ENABLED", True))
+        pause_s = float(getattr(_s, "SENTENCE_SPLIT_PAUSE_MS", 400)) / 1000.0
+        max_cue_s = float(getattr(_s, "SENTENCE_SPLIT_MAX_CUE_MS", 8000)) / 1000.0
+    except Exception:
+        enabled, pause_s, max_cue_s = True, 0.4, 8.0
+    return enabled, pause_s, max_cue_s
+
+
+def _group_has_terminator(group: list) -> bool:
+    return any(_ends_sentence(_w_get(w, "word", "")) for w in group)
+
+
+def _split_words_by_pause(group: list, pause_s: float, max_cue_s: float) -> list[list]:
+    """Split a list of word-timed tokens at inter-word silence gaps.
+
+    Language-agnostic and model-free: a new cue begins when the previous word
+    ends a sentence (explicit terminator — still respected), when the silence
+    before the next word is at least ``pause_s``, or when the running cue would
+    exceed ``max_cue_s``. Words missing timing never force a split."""
+    if len(group) < 2:
+        return [group]
+    out: list[list] = []
+    cur: list = [group[0]]
+    for w in group[1:]:
+        prev = cur[-1]
+        prev_end = _w_get(prev, "end", None)
+        w_start = _w_get(w, "start", None)
+        cur_start = _w_get(cur[0], "start", None)
+        gap = None
+        if prev_end is not None and w_start is not None:
+            gap = float(w_start) - float(prev_end)
+        cur_dur = None
+        if cur_start is not None and prev_end is not None:
+            cur_dur = float(prev_end) - float(cur_start)
+        terminator = _ends_sentence(_w_get(prev, "word", ""))
+        too_long = cur_dur is not None and cur_dur >= max_cue_s
+        big_pause = gap is not None and gap >= pause_s
+        if terminator or big_pause or too_long:
+            out.append(cur)
+            cur = [w]
+        else:
+            cur.append(w)
+    if cur:
+        out.append(cur)
+    return out
+
+
 def _split_segment_by_sentence(seg: TranscriptSegment) -> list[TranscriptSegment]:
     is_cjk = _is_cjk(seg.text or "")
     words = seg.words or []
@@ -124,7 +175,7 @@ def _split_segment_by_sentence(seg: TranscriptSegment) -> list[TranscriptSegment
             cursor = end
         return out
 
-    # Word-timed path — group words into sentences.
+    # Word-timed path — group words into sentences at terminators.
     sentences: list[list] = []
     cur: list = []
     for w in words:
@@ -134,6 +185,27 @@ def _split_segment_by_sentence(seg: TranscriptSegment) -> list[TranscriptSegment
             cur = []
     if cur:
         sentences.append(cur)
+
+    # Pause-based refinement: local-mode (and CJK) transcripts often arrive with
+    # NO terminators, so terminator grouping leaves the whole block as one cue.
+    # Split such groups — and any terminator group that still runs too long — on
+    # acoustic silence using the word timestamps. Word-accurate boundaries with
+    # no model. Well-punctuated, normal-length sentences are left untouched.
+    pause_enabled, pause_s, max_cue_s = _pause_split_params()
+    if pause_enabled:
+        refined: list[list] = []
+        for grp in sentences:
+            if not grp:
+                continue
+            grp_start = _w_get(grp[0], "start", None)
+            grp_end = _w_get(grp[-1], "end", None)
+            grp_dur = (float(grp_end) - float(grp_start)
+                       if grp_start is not None and grp_end is not None else 0.0)
+            if not _group_has_terminator(grp) or grp_dur > max_cue_s:
+                refined.extend(_split_words_by_pause(grp, pause_s, max_cue_s))
+            else:
+                refined.append(grp)
+        sentences = refined
 
     if len(sentences) <= 1:
         return [seg]

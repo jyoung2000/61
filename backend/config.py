@@ -441,6 +441,25 @@ class Settings(BaseSettings):
     # before the readability pass. When False, the raw segments flow
     # straight to readability enforcement (the legacy behaviour).
     SENTENCE_SEGMENTATION_ENABLED: bool = True
+    # Pause-based (acoustic) sentence splitting. Local-mode readability depends
+    # on a ≤4B model inserting sentence punctuation, which it does poorly
+    # (especially CJK), so the terminator-based resegmenter falls back to
+    # particle/char guessing. When True, a word-timed block that has NO sentence
+    # terminators — or a terminator group that runs longer than
+    # SENTENCE_SPLIT_MAX_CUE_MS — is split on inter-word silence gaps instead
+    # (language-agnostic, no model), using the word timestamps that exist before
+    # polish. Explicit terminators are still respected when present. Set False to
+    # restore pure terminator/char-based splitting.
+    SENTENCE_SPLIT_PAUSE_ENABLED: bool = True
+    # Inter-word silence (ms) that counts as a sentence/clause boundary for the
+    # pause-based splitter. ~350-450ms is a deliberate pause without firing on
+    # ordinary dialogue rhythm.
+    SENTENCE_SPLIT_PAUSE_MS: int = 400
+    # Max cue length (ms) for the pause-based splitter: a word-timed group longer
+    # than this is broken at its largest qualifying pause even when no terminator
+    # is present, so a punctuation-less block can't survive as one wall-of-text
+    # cue.
+    SENTENCE_SPLIT_MAX_CUE_MS: int = 8000
 
     # ── Subtitle Readability + Safe Zones ──
     # Enforces Netflix-style CPS / line-length / duration limits and
