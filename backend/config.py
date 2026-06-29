@@ -428,6 +428,17 @@ class Settings(BaseSettings):
     # the remapped timing to be trusted. Below this the segment keeps words=[]
     # (the polish rewrote too much to trust positional alignment).
     POLISH_REMAP_MIN_CONFIDENCE: float = 0.5
+    # Deterministic, non-LLM punctuation restore fallback. Local-mode readability
+    # otherwise depends entirely on the ≤4B editorial model inserting sentence
+    # terminators — and when that model is unavailable, errors, or simply leaves
+    # a segment with no terminator, the resegmenter has nothing to split on. When
+    # True, such segments are passed through a lightweight punctuation restorer
+    # (the optional ``deepmultilingualpunctuation`` model for Latin scripts; a
+    # rule-based terminator for CJK) so readability does not hinge on the LLM.
+    # The dependency is lazily imported and OPTIONAL — if it isn't installed the
+    # fallback skips gracefully (Latin text is left unchanged; CJK still gets its
+    # rule-based terminator). Set False to disable entirely.
+    PUNCTUATION_RESTORE_FALLBACK_ENABLED: bool = True
     # Re-polish loop: keep iterating until the readability report scores
     # the transcript ≥ this target (0-100). Capped at 3 passes so a
     # poorly-segmented source can't loop forever.

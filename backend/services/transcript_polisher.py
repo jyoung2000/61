@@ -723,6 +723,109 @@ async def _polish_batch(
     return polished
 
 
+# ── Deterministic (non-LLM) punctuation-restore fallback ───────────────────
+# When the local editorial model is unavailable / errors / leaves a segment
+# without a terminator, restore sentence punctuation deterministically so the
+# resegmenter still has boundaries to split on. The Latin restorer is the
+# optional ``deepmultilingualpunctuation`` model (lazily loaded, cached); CJK
+# uses a rule-based terminator since that model doesn't cover CJK scripts.
+
+_TERMINATORS = ".?!…。！？"
+_TERM_CLOSERS = "\"')]}」』）”’‘“"
+
+_PUNCT_MODEL = None
+_PUNCT_MODEL_UNAVAILABLE = False
+
+
+def _ends_with_terminator(text: str) -> bool:
+    s = (text or "").rstrip()
+    while s and s[-1] in _TERM_CLOSERS:
+        s = s[:-1]
+    return bool(s) and s[-1] in _TERMINATORS
+
+
+def _get_punct_model():
+    """Lazily load + cache the optional Latin punctuation model. Returns None
+    (once) when the dependency isn't installed or fails to load."""
+    global _PUNCT_MODEL, _PUNCT_MODEL_UNAVAILABLE
+    if _PUNCT_MODEL is not None or _PUNCT_MODEL_UNAVAILABLE:
+        return _PUNCT_MODEL
+    try:
+        from deepmultilingualpunctuation import PunctuationModel
+        _PUNCT_MODEL = PunctuationModel()
+    except Exception as e:  # ImportError or model-load failure
+        logger.info(
+            "punctuation-restore fallback: optional dependency unavailable "
+            "(%s) — Latin text left unchanged", e)
+        _PUNCT_MODEL_UNAVAILABLE = True
+    return _PUNCT_MODEL
+
+
+def _restore_text_punctuation(text: str, language: str) -> str:
+    """Add sentence punctuation to ``text`` deterministically. Returns ``text``
+    unchanged when nothing can be done (so it's always fail-soft)."""
+    t = (text or "")
+    if not t.strip():
+        return text
+    if (language or "").lower() in _CJK_LANGS or _is_probably_cjk(t):
+        # Rule-based: ensure a sentence terminator at the end. The pause-based
+        # resegmenter handles internal CJK boundaries acoustically.
+        stripped = t.rstrip()
+        if stripped and stripped[-1] not in _TERMINATORS:
+            return stripped + "。"
+        return text
+    model = _get_punct_model()
+    if model is None:
+        return text
+    try:
+        restored = model.restore_punctuation(t)
+        return restored if restored and restored.strip() else text
+    except Exception as e:
+        logger.debug("punctuation-restore fallback failed (%s) — keeping text", e)
+        return text
+
+
+def _is_probably_cjk(text: str) -> bool:
+    try:
+        from backend.services.subtitle_formatter import _is_cjk
+        return _is_cjk(text)
+    except Exception:
+        return False
+
+
+def restore_punctuation_fallback(segments, language: str = "") -> list:
+    """Apply the deterministic punctuation restorer to any segment that lacks a
+    sentence terminator. Gated by ``PUNCTUATION_RESTORE_FALLBACK_ENABLED``.
+
+    Fail-soft: returns the input unchanged when disabled or on any error.
+    Timing / speaker are preserved and word timestamps are re-mapped onto the
+    restored text via ``_emit_segment``."""
+    seg_list = list(segments) if segments else []
+    if not seg_list:
+        return seg_list
+    if not bool(getattr(settings, "PUNCTUATION_RESTORE_FALLBACK_ENABLED", True)):
+        return seg_list
+    out: list = []
+    n_restored = 0
+    for seg in seg_list:
+        try:
+            text = (_coerce_segment(seg).get("text") or "")
+            if text.strip() and not _ends_with_terminator(text):
+                new_text = _restore_text_punctuation(text, language)
+                if new_text and new_text != text:
+                    out.append(_emit_segment(seg, new_text))
+                    n_restored += 1
+                    continue
+        except Exception:
+            pass
+        out.append(seg)
+    if n_restored:
+        logger.info(
+            "punctuation-restore fallback: added terminators to %d/%d segment(s)",
+            n_restored, len(seg_list))
+    return out
+
+
 async def polish_source_before_translation(
     segments: Iterable,
     orchestrator=None,
@@ -809,7 +912,10 @@ async def correct_transcript(
         return seg_list
 
     if not settings.TRANSCRIPT_POLISHING_ENABLED or orchestrator is None:
-        return seg_list
+        # No LLM polish available — readability would otherwise hinge entirely
+        # on the model. Still restore sentence terminators deterministically so
+        # the resegmenter has boundaries to work with.
+        return restore_punctuation_fallback(seg_list, language=language)
 
     # Auto-load the custom-vocabulary glossary as the canonical name list.
     if glossary_terms is None and getattr(settings, "CUSTOM_VOCABULARY_ENABLED", True):
@@ -931,4 +1037,8 @@ async def correct_transcript(
         "transcript polishing: %d/%d segments polished (job=%s lang=%s)",
         changed, len(polished_out), (job_id or "")[:8], language or "auto",
     )
+    # Safety net: the ≤4B model often misses terminators on some segments
+    # (especially CJK). Restore them deterministically so the resegmenter isn't
+    # left guessing on un-punctuated cues. No-op for already-terminated cues.
+    polished_out = restore_punctuation_fallback(polished_out, language=language)
     return polished_out
