@@ -217,43 +217,34 @@ async def get_transcripts(job_id: str, user: User = Depends(get_current_user)):
                 sanitize_translated_transcript,
                 _tt, getattr(job, "subtitle_language", "") or "en")
             if _changed:
-                # Always SERVE the cleaned/sorted track for display (set below).
+                # Serve the cleaned/sorted track for DISPLAY ONLY — NEVER persist
+                # it on read, and do not mutate the shared in-memory job either.
                 #
-                # We deliberately do NOT re-flow / MERGE cues on read. The
-                # fragment merge is applied ONCE at translate time and the merged
-                # track is what's stored; re-merging on every poll AND persisting
-                # the result formed a non-idempotent read→persist loop that
-                # eroded a finished transcript one cue per poll (observed in
-                # production: 412 → 13 cues over a viewing session) — the same
-                # class of bug as the old "lines move around while I'm reading"
-                # churn. Reflow belongs in the pipeline, once; read only sanitizes.
-                _dropped = len(_clean) < len(_tt)
-                _status = str(getattr(job, "status", "") or "").lower()
-                _terminal = _status in (
-                    "complete", "completed", "failed", "error", "cancelled", "canceled")
-                # Persist when we removed real corruption (cues dropped), or once
-                # the run is over for a reorder-only fix. We do NOT persist a
-                # reorder-only change mid-run: the pipeline still holds the
-                # in-memory job and overwrites translated_transcript at translate
-                # time, so persisting every poll just churns the DB + log.
-                if _dropped or _terminal:
-                    if _dropped:
-                        import logging as _lg
-                        _lg.getLogger("backend.routers.jobs").warning(
-                            "[%s] Self-healed translated_transcript: %d → %d cue(s) "
-                            "(dropped source-language / duplicate artifacts)",
-                            job_id, len(_tt), len(_clean))
-                    await database.update_job_status(job_id, translated_transcript=_clean)
-                job.translated_transcript = _clean
+                # Re-saving the sanitize output on every poll was a non-idempotent
+                # read→persist loop that eroded a FINISHED transcript cue-by-cue
+                # (this run: 168 → 111 over one viewing session; historically
+                # 412 → 13). It also fought the frontend's reverse-sync writes,
+                # churning the stored track. Corruption is repaired at WRITE time
+                # (the pipeline builds a clean track; the save-guard in
+                # update_job_status rejects dirtier incoming saves). Reads only
+                # sanitize for the response — they must leave storage untouched.
+                if len(_clean) < len(_tt):
+                    import logging as _lg
+                    _lg.getLogger("backend.routers.jobs").warning(
+                        "[%s] Sanitized translated_transcript for display only: "
+                        "%d → %d cue(s) (NOT persisted)",
+                        job_id, len(_tt), len(_clean))
+                _tt = _clean   # served below; job + storage are left as-is
         except Exception:
             pass
 
     # Dump both tracks OFF the event loop — model_dump per cue × thousands of
     # cues (each with per-word timestamps) is heavy enough to stall the loop on
-    # every poll for a bloated transcript.
+    # every poll for a bloated transcript. ``_tt`` is the display-sanitized
+    # translated track (storage itself is left untouched — see above).
     _src_rows, _tt_rows = await asyncio.to_thread(
         lambda: (_dump(getattr(job, "transcript", [])),
-                 _dump(getattr(job, "translated_transcript", []))))
+                 _dump(_tt)))
 
     return {
         "job_id": job_id,

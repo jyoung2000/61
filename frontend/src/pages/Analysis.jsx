@@ -688,7 +688,14 @@ export default function Analysis() {
         };
         const cF = cjkFrac(current);
         const dF = cjkFrac(derived);
-        if (cF <= 0.15 && dF >= cF + 0.15) return;  // stale/corrupted timeline — don't write it back
+        // Never write back a track that is MORE source-language than the stored
+        // one. A genuine subtitle edit never ADDS source script, so any increase
+        // means a stale / recovered union timeline (e.g. the editor opened
+        // mid-translation), not a real edit. The old gate (only block when the
+        // base was ≤15% AND the rise ≥15%) let small unions slip through and
+        // churn the stored track every poll (seen server-side as "dirtier
+        // incoming save 2–14%"). Block any meaningful increase instead.
+        if (dF > cF + 0.05) return;
       }
       const target = usingTranslated ? 'translated' : 'original';
       try {
