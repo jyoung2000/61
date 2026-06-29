@@ -56,12 +56,61 @@ def _is_vision(name: str) -> bool:
     return any(h in n for h in _VISION_HINTS)
 
 
+def _norm_ollama_name(name: str) -> str:
+    """Normalize an Ollama tag for comparison: drop an ``ollama/`` prefix and a
+    redundant ``:latest`` suffix, lowercase. Distinct size/quant tags stay
+    distinct (``qwen2.5:3b`` != ``qwen2.5:7b``)."""
+    n = (name or "").strip().lower()
+    if n.startswith("ollama/"):
+        n = n[len("ollama/"):]
+    if n.endswith(":latest"):
+        n = n[: -len(":latest")]
+    return n
+
+
+def _ollama_names_match(a: str, b: str) -> bool:
+    """True when two Ollama tags refer to the same model (tolerating an
+    ``ollama/`` prefix and a missing ``:latest``)."""
+    return bool(a) and bool(b) and _norm_ollama_name(a) == _norm_ollama_name(b)
+
+
 def _family_rank(name: str) -> int:
     n = name.lower()
     for i, fam in enumerate(_FAMILY_PREFERENCE):
         if fam in n:
             return len(_FAMILY_PREFERENCE) - i
     return 0
+
+
+def _recency_bonus(name: str) -> int:
+    """Tiebreak among same-family, same-size, same-instruct candidates toward
+    the newer release. Qwen3's '-2507' instruct line is the multilingual-tuned
+    refresh we want auto-selection to prefer over a plain '-instruct' tag."""
+    n = name.lower()
+    bonus = 0
+    if "2507" in n:
+        bonus += 2
+    if "instruct" in n:
+        bonus += 1
+    return bonus
+
+
+def qwen3_translation_options(model_name: str) -> dict:
+    """Qwen3-family sampling options for the dedicated translation path.
+
+    Returns ``{}`` for non-Qwen3 models so callers keep their existing sampling.
+    Qwen3 repeats without a penalty and we want deterministic subtitle JSON, so
+    we apply a low temperature + presence/repetition penalty + tighter top_p
+    (all configurable). Applied ONLY on the translation path — not to global
+    editorial sampling."""
+    if "qwen3" not in (model_name or "").lower():
+        return {}
+    return {
+        "temperature": float(getattr(settings, "QWEN3_TRANSLATION_TEMPERATURE", 0.2)),
+        "top_p": float(getattr(settings, "QWEN3_TRANSLATION_TOP_P", 0.8)),
+        "repeat_penalty": float(getattr(settings, "QWEN3_TRANSLATION_REPEAT_PENALTY", 1.05)),
+        "presence_penalty": float(getattr(settings, "QWEN3_TRANSLATION_PRESENCE_PENALTY", 0.5)),
+    }
 
 
 def rank_local_editorial_models(
@@ -86,11 +135,13 @@ def rank_local_editorial_models(
         if params is not None and params > max_params_b:
             continue  # too big for the card — would offload to CPU
         instruct = 1 if ("instruct" in name.lower() or "chat" in name.lower()) else 0
-        candidates.append((instruct, params or 0.0, _family_rank(name), name))
+        candidates.append(
+            (instruct, params or 0.0, _family_rank(name), _recency_bonus(name), name))
 
-    # Sort best-first: instruct, then bigger, then preferred family.
-    candidates.sort(key=lambda t: (t[0], t[1], t[2]), reverse=True)
-    return [c[3] for c in candidates]
+    # Sort best-first: instruct, then bigger, then preferred family, then the
+    # newer release (so qwen3:4b-instruct-2507 beats a plain qwen3:4b-instruct).
+    candidates.sort(key=lambda t: (t[0], t[1], t[2], t[3]), reverse=True)
+    return [c[4] for c in candidates]
 
 
 async def list_ollama_models(timeout: float = 4.0) -> list[str]:
@@ -123,4 +174,12 @@ async def select_local_editorial_models(
     if not ranked:
         fb = (getattr(settings, "OLLAMA_EDITORIAL_MODEL", "") or "").strip()
         return [fb][:limit] if fb else []
+    # The explicitly-configured editorial model wins over auto-ranking when it's
+    # actually installed — an operator who set OLLAMA_EDITORIAL_MODEL to a
+    # specific tag should get it, not whatever the heuristic ranks first.
+    configured = (getattr(settings, "OLLAMA_EDITORIAL_MODEL", "") or "").strip()
+    if configured:
+        match = next((n for n in ranked if _ollama_names_match(n, configured)), None)
+        if match and ranked[0] != match:
+            ranked = [match] + [n for n in ranked if n != match]
     return ranked[:limit]
