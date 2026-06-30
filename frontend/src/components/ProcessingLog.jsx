@@ -26,9 +26,12 @@ function dedupeConsecutive(entries) {
   return out;
 }
 
-// Max rows actually rendered into the DOM. A long run can emit 700+ live ticks;
-// re-rendering all of them on every websocket event is what made the tab feel
-// slow. The header still reports the true total.
+// Max rows rendered into the DOM WHILE A JOB IS LIVE. A long run can emit 700+
+// live ticks; re-rendering all of them on every websocket event is what made the
+// tab feel slow, so the live view shows a trailing window by default. This cap
+// does NOT apply when reviewing a finished job (no socket updates → no re-render
+// storm, so the full log renders), and the user can override it live via the
+// "show all" toggle. The header always reports the true total.
 const _MAX_VISIBLE_ROWS = 250;
 
 const STAGE_COLORS = {
@@ -99,19 +102,25 @@ export default function ProcessingLog({
   initialExpanded = true,
 }) {
   const [expanded, setExpanded] = useState(initialExpanded);
+  // Live runs window to the last N rows for performance; the user can opt into
+  // the full log mid-run with this toggle. A finished job always shows the full
+  // log regardless (see below).
+  const [showAll, setShowAll] = useState(false);
   const scrollRef = useRef(null);
   const prevStageRef = useRef(null);
 
   // Show every distinct progress step; only collapse exact consecutive
   // duplicates.
   const deduped = useMemo(() => dedupeConsecutive(entries), [entries]);
-  // Cap the RENDERED rows for performance. A long run emits hundreds of live
-  // progress ticks (frame counts, Whisper %, export N/M); rendering — and
-  // re-rendering on every websocket event — all of them makes the tab sluggish
-  // ("going slower"). Render the most recent window; the header keeps the true
-  // total. Live, the newest steps (the ones you're watching) are always in view.
-  const truncated = deduped.length > _MAX_VISIBLE_ROWS;
+  // Cap the RENDERED rows for performance ONLY while live + not "show all".
+  // The re-render-per-websocket-event storm is what made the tab sluggish; a
+  // finished job has no socket updates, so render its full log. Reviewing the
+  // complete run is the whole point of the saved log.
+  const hardCapActive = isLive && !showAll;
+  const truncated = hardCapActive && deduped.length > _MAX_VISIBLE_ROWS;
   const visible = truncated ? deduped.slice(-_MAX_VISIBLE_ROWS) : deduped;
+  // Whether a "show all / show recent" toggle is worth offering (live + over cap).
+  const canToggle = isLive && deduped.length > _MAX_VISIBLE_ROWS;
 
   // Auto-scroll to bottom on new entries
   useEffect(() => {
@@ -156,6 +165,17 @@ export default function ProcessingLog({
           <span style={{ color: 'var(--text-muted)', textTransform: 'none', letterSpacing: 0 }}>
             ({deduped.length} steps
             {truncated && <span> · showing last {_MAX_VISIBLE_ROWS}</span>}
+            {canToggle && (
+              <span
+                role="button"
+                tabIndex={0}
+                onClick={(e) => { e.stopPropagation(); setShowAll((s) => !s); }}
+                onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.stopPropagation(); setShowAll((s) => !s); } }}
+                style={{ color: 'var(--accent-cyan, #06b6d4)', marginLeft: 6, cursor: 'pointer', textDecoration: 'underline' }}
+              >
+                {showAll ? 'show recent' : 'show all'}
+              </span>
+            )}
             {warningCount > 0 && <span style={{ color: 'var(--accent-amber, #f59e0b)', marginLeft: 4 }}> {warningCount}⚠</span>}
             {errorCount > 0 && <span style={{ color: 'var(--danger, #ef4444)', marginLeft: 4 }}> {errorCount}✕</span>}
             )
