@@ -321,6 +321,55 @@ async def translate_via_llm(
     logger.info("LLM translation: %d/%d segments → %s (%.0f%% still source-script)",
                 len(out_segs), total, target_language,
                 100 * fraction_untranslated(out_segs, target_language))
+
+    # ── OPT-IN self-refinement pass (Task 3) ────────────────────────────────
+    # A second LOCAL pass that post-edits the model's OWN output for fluency /
+    # de-stutter (not a re-translate). Default off — it ~doubles an already-slow
+    # CPU-offloaded 4B inference, so it's a batch-quality lever, not interactive.
+    if (getattr(settings, "TRANSLATION_LLM_REFINE_PASS", False)
+            and _is_ollama and out_segs):
+        try:
+            from backend.services.transcript_polisher import correct_transcript
+            src_texts = [_txt(s) for s in segments]
+            if len(src_texts) != len(out_segs):
+                src_texts = None       # alignment lost → skip the source ref
+            before = fraction_untranslated(out_segs, target_language)
+            if status_callback:
+                try:
+                    r = status_callback("Refining translation for fluency (local)…")
+                    if asyncio.iscoroutine(r):
+                        await r
+                except Exception:
+                    pass
+            refined = await correct_transcript(
+                out_segs, orchestrator,
+                language=target_language, source_texts=src_texts,
+                source_language=source_language, mode="translation",
+                model_override=model_override,
+            )
+            # Guard: never accept a refine that REINTRODUCES the source language
+            # or changes the cue count (same protection as the MTPE post-edit).
+            if refined and len(refined) == len(out_segs):
+                after = fraction_untranslated(refined, target_language)
+                if after <= before + 0.02:
+                    out_segs = [
+                        r if isinstance(r, TranscriptSegment)
+                        else TranscriptSegment(
+                            text=(getattr(r, "text", "") or _seg_text(r)),
+                            start=getattr(r, "start", 0.0), end=getattr(r, "end", 0.0),
+                            speaker=getattr(r, "speaker", "") or "Speaker 1")
+                        for r in refined
+                    ]
+                    logger.info("LLM translate: self-refinement pass applied "
+                                "(%d cues)", len(out_segs))
+                else:
+                    logger.warning("LLM translate: self-refinement raised source-"
+                                   "script fraction (%.0f%%→%.0f%%) — keeping the "
+                                   "pre-refine translation", 100 * before, 100 * after)
+        except Exception as _ref_e:
+            logger.warning("LLM translate: self-refinement pass failed (%s) — "
+                           "keeping the pre-refine translation", _ref_e)
+
     return out_segs
 
 

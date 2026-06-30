@@ -670,6 +670,19 @@ class Settings(BaseSettings):
     # produced half-translated tracks. Falls back to Whisper-native / offline NMT
     # when no LLM is configured or it comes back still source-language.
     TRANSLATION_PREFER_LLM: bool = True
+    # OPT-IN second pass (default OFF). On the LLM-first path the first call did
+    # the translation, so the MTPE post-edit is (correctly) skipped — leaving the
+    # offline default as a single 4B pass with no editorial refinement. When this
+    # is on AND the active engine is local, run ONE self-refinement pass over the
+    # already-translated cues (NOT a re-translate): the model rewrites its own
+    # target lines against the aligned source purely for fluency/de-stutter,
+    # reusing correct_transcript(mode="translation") and its "never raise the
+    # source-script fraction" revert guard. COST: a second full pass over every
+    # cue — on a 4 GB card the 4B is already partial-offloaded to CPU, so this
+    # ~doubles an already-slow inference. Suitable for an unattended batch clip,
+    # never interactive. Leave OFF unless you accept the wall-clock cost; the
+    # deterministic Tasks 1/2/4/5 carry the quality at zero added latency.
+    TRANSLATION_LLM_REFINE_PASS: bool = False
     # Per-batch timeout for LLM subtitle translation (a CEILING — never slows the
     # fast path; a fast GPU batch returns in seconds regardless). A small model
     # on a low-VRAM GPU needs far more than the old 5 s/segment / 60 s floor; too
