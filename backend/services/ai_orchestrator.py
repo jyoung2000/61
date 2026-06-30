@@ -1155,10 +1155,13 @@ class AIOrchestrator:
                 # Temporarily override the provider's text model
                 original_model = provider._editorial_model
                 provider._editorial_model = self._current_model_override
-            elif model_override and pname == "openrouter" and hasattr(provider, "_editorial_model"):
+            elif model_override and pname in ("openrouter", "ollama") and hasattr(provider, "_editorial_model"):
                 # Caller-requested model for this call only (the dedicated
-                # OpenRouter translation model). Temporarily swap the
-                # provider's text model; restored in the finally below.
+                # translation model — OPENROUTER_TRANSLATION_MODEL or
+                # OLLAMA_TRANSLATION_MODEL). Lets the subtitle translator route
+                # through qwen3 while editorial/SEO keep the fast editorial model.
+                # Temporarily swap the provider's text model; restored in the
+                # finally below.
                 model_name = model_override
                 original_model = provider._editorial_model
                 provider._editorial_model = model_override

@@ -42,17 +42,19 @@ class Settings(BaseSettings):
     # On 6GB+ GPUs switch Primary AI to llava:7b (or larger) in Settings.
     OLLAMA_HOST: str = "http://ollama:11434"
     OLLAMA_PRIMARY_MODEL: str = "moondream:1.8b"
-    # Local editorial + translation brain. Qwen3-4B-Instruct-2507 is a
-    # NON-thinking (no <think> blocks), 256K-native, Apache-2.0 model explicitly
-    # tuned for multilingual translation — a strict upgrade over qwen2.5:3b for
-    # both the editorial work and the LLM-first translation path (which routes
-    # through the editorial model). The q4_K_M quant (~2.5 GB) fits a 4 GB GTX
-    # 1650 AFTER Whisper VRAM is released. The exact Ollama tag may vary by quant
-    # (…-q4_K_M / -q8_0 / -fp16) or a user Modelfile, so it's overridable via the
-    # OLLAMA_EDITORIAL_MODEL / OLLAMA_TRANSLATION_MODEL env vars — never hardcode
-    # a tag deeper in the code; resolve from settings.
-    OLLAMA_EDITORIAL_MODEL: str = "qwen3:4b-instruct-2507-q4_K_M"
-    # Dedicated model for subtitle translation / offline MTPE (multilingual).
+    # EDITORIAL model (summaries, SEO, clip scoring, transcript polish). Kept at
+    # the 3B class because it must run on the GPU for the per-clip SEO / summary
+    # passes to be fast: a 4B-q4 model does NOT fit a 4 GB GTX 1650 (it OOMs and
+    # falls back to CPU, turning 63-clip SEO into a 30+ min crawl). qwen2.5:3b
+    # (~1.8 GB) fits in the VRAM freed after Whisper.
+    OLLAMA_EDITORIAL_MODEL: str = "qwen2.5:3b-instruct"
+    # Dedicated model for subtitle TRANSLATION (and offline MTPE). Qwen3-4B-
+    # Instruct-2507 is a NON-thinking, multilingual-tuned model used ONLY for the
+    # translation pass (where quality matters most), routed via model_override so
+    # editorial/SEO keep using the fast qwen2.5 above. On a 4 GB card the 4B runs
+    # on CPU (translation is slower but higher quality); on ≥6-8 GB it fits the
+    # GPU. The exact Ollama tag may vary by quant (…-q4_K_M / -q8_0 / -fp16) or a
+    # user Modelfile — overridable via env; never hardcode a tag deeper in code.
     OLLAMA_TRANSLATION_MODEL: str = "qwen3:4b-instruct-2507-q4_K_M"
     # ── Qwen3 translation sampling ──
     # Qwen3 is prone to repetition without a presence/repetition penalty, and for

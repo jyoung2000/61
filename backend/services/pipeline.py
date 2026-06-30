@@ -507,6 +507,30 @@ def _timeline_coverage_s(segments) -> float:
     return total
 
 
+def _resolve_translation_model_override(orchestrator) -> Optional[str]:
+    """The dedicated translation model for the ACTIVE editorial provider, or
+    None when it isn't set or already equals the editorial model.
+
+    Lets the LLM-first translation use OLLAMA_TRANSLATION_MODEL /
+    OPENROUTER_TRANSLATION_MODEL (e.g. qwen3:4b-instruct-2507) while editorial /
+    SEO / summaries keep the fast editorial model."""
+    try:
+        info = orchestrator.get_editorial_model_info() if orchestrator else {}
+        prov = (info.get("provider") or "").lower()
+        editorial = (info.get("model") or "").strip()
+    except Exception:
+        prov, editorial = "", ""
+    if prov == "ollama":
+        xlate = (getattr(settings, "OLLAMA_TRANSLATION_MODEL", "") or "").strip()
+    elif prov == "openrouter":
+        xlate = (getattr(settings, "OPENROUTER_TRANSLATION_MODEL", "") or "").strip()
+    else:
+        xlate = ""
+    if not xlate or xlate == editorial:
+        return None
+    return xlate
+
+
 async def translate_subtitles(segments, source_lang, target_lang, *, video_path=None,
                               glossary=None, orchestrator=None, status_callback=None,
                               job_id=None, whisper_timeout=None, nmt_timeout=None):
@@ -571,15 +595,25 @@ async def translate_subtitles(segments, source_lang, target_lang, *, video_path=
             if job_id:
                 # The LLM runs via API/Ollama — free the reframer's Whisper VRAM now.
                 await _release_whisper_vram(job_id)
+            # Route translation through the dedicated translation model
+            # (OLLAMA_TRANSLATION_MODEL / OPENROUTER_TRANSLATION_MODEL, e.g.
+            # qwen3:4b-instruct-2507) when it differs from the editorial model,
+            # so translation gets the higher-quality model while editorial/SEO
+            # keep the fast default. None when unset or same as editorial.
+            _xlate_model = _resolve_translation_model_override(orchestrator)
             if status_callback:
                 try:
-                    await status_callback("Translating subtitles with the editorial model…")
+                    _msg = ("Translating subtitles with %s…" % _xlate_model
+                            if _xlate_model else
+                            "Translating subtitles with the editorial model…")
+                    await status_callback(_msg)
                 except Exception:
                     pass
             _llm = await asyncio.wait_for(
                 translate_via_llm(segments, source_lang, target_lang, orchestrator,
                                   glossary=glossary, job_id=job_id or "",
-                                  status_callback=status_callback),
+                                  status_callback=status_callback,
+                                  model_override=_xlate_model),
                 timeout=(nmt_timeout or 1800),
             )
             if _llm:

@@ -157,11 +157,16 @@ async def translate_via_llm(
     glossary: dict | None = None,
     job_id: str = "",
     status_callback=None,
+    model_override: str | None = None,
 ) -> Optional[list[TranscriptSegment]]:
     """Translate the SOURCE transcript text-to-text with the editorial LLM,
     1:1 — every segment, same timing + speaker. The reliable, COMPLETE path:
     unlike Whisper's translate task it never leaves lyrics / narration in the
-    source language. Returns ``None`` when no orchestrator is available."""
+    source language. Returns ``None`` when no orchestrator is available.
+
+    ``model_override`` routes the translation calls through a dedicated model
+    (e.g. OLLAMA_TRANSLATION_MODEL / OPENROUTER_TRANSLATION_MODEL) so translation
+    can use a higher-quality model while editorial/SEO keep the fast default."""
     if not orchestrator or not segments:
         return None
 
@@ -217,7 +222,8 @@ async def translate_via_llm(
             _per_seg = float(getattr(settings, "TRANSLATION_LLM_SECONDS_PER_SEGMENT", 12.0))
             _floor = float(getattr(settings, "TRANSLATION_LLM_TIMEOUT_FLOOR", 180.0))
             resp = await orchestrator.text_completion(
-                prompt, timeout=max(_floor, len(batch) * _per_seg), job_id=job_id)
+                prompt, timeout=max(_floor, len(batch) * _per_seg), job_id=job_id,
+                model_override=model_override)
         except Exception as e:
             logger.warning("LLM translate: call failed (%s)", e)
             return None
