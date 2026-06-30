@@ -244,8 +244,15 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
             timeout=httpx.Timeout(600.0, connect=15.0),
             limits=httpx.Limits(max_connections=4, max_keepalive_connections=2),
         )
-        # Track whether we need CPU-only mode due to VRAM constraints
+        # Track whether we need CPU-only mode due to VRAM constraints.
+        # ``_force_cpu`` is sticky within a model, but it must NOT leak across
+        # models: a big model (e.g. qwen3:4b translation) that OOMs to CPU should
+        # not force a SMALLER model (qwen2.5:3b editorial/SEO/summary) that fits
+        # the GPU onto the CPU too. ``_force_cpu_model`` records which model
+        # tripped it so a later call with a different model can reset and retry
+        # on the GPU.
         self._force_cpu: bool = False
+        self._force_cpu_model: Optional[str] = None
         self._vram_checked: bool = False
         self._available_vram_mb: int = 0
         # Cached GPU availability detection
@@ -589,6 +596,26 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
 
         return self._available_vram_mb
 
+    def _note_oom_force_cpu(self, model_name: str) -> None:
+        """Record that ``model_name`` OOM'd and we've dropped it to CPU. The
+        force-CPU stays scoped to this model (see ``_maybe_reset_force_cpu``)."""
+        self._force_cpu = True
+        self._force_cpu_model = model_name
+
+    def _maybe_reset_force_cpu(self, model_name: str) -> None:
+        """Clear a force-CPU that a DIFFERENT (usually larger) model tripped, so
+        a model that fits the GPU gets a fresh GPU attempt instead of inheriting
+        another model's OOM. A no-op when force-CPU isn't set, when no model was
+        recorded (treat as global — leave it), or when it's the same model."""
+        if not self._force_cpu or not self._force_cpu_model:
+            return
+        if not _ollama_names_match(self._force_cpu_model, model_name):
+            logger.info(
+                "Resetting force-CPU set by %s — current model %s may fit the GPU",
+                self._force_cpu_model, model_name)
+            self._force_cpu = False
+            self._force_cpu_model = None
+
     def _get_num_gpu(self, model_name: str) -> int:
         """Determine how many layers to offload to GPU.
 
@@ -790,10 +817,10 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
             }, timeout=120.0)
             if resp.status_code == 500 and self._is_oom_error(resp.text[:500]):
                 logger.warning(
-                    "Vision model %s OOM during warmup — forcing CPU-only for all models",
+                    "Vision model %s OOM during warmup — forcing CPU-only",
                     self._primary_model,
                 )
-                self._force_cpu = True
+                self._note_oom_force_cpu(self._primary_model)
                 # Retry with CPU
                 options["num_gpu"] = 0
                 await asyncio.sleep(3)
@@ -807,7 +834,7 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
             error_str = str(e)
             if self._is_oom_error(error_str):
                 logger.warning("Vision model OOM during warmup — forcing CPU-only: %s", error_str[:150])
-                self._force_cpu = True
+                self._note_oom_force_cpu(self._primary_model)
             else:
                 logger.warning("Ollama vision warmup failed (non-fatal): %s", e)
 
@@ -834,12 +861,12 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
             }, timeout=120.0)
             if resp.status_code == 500 and self._is_oom_error(resp.text[:500]):
                 logger.warning("Text model %s OOM during warmup — forcing CPU-only", self._editorial_model)
-                self._force_cpu = True
+                self._note_oom_force_cpu(self._editorial_model)
         except Exception as e:
             error_str = str(e)
             if self._is_oom_error(error_str):
                 logger.warning("Text model OOM during warmup — forcing CPU-only: %s", error_str[:150])
-                self._force_cpu = True
+                self._note_oom_force_cpu(self._editorial_model)
             else:
                 logger.warning("Ollama text warmup failed (non-fatal): %s", e)
 
@@ -914,6 +941,9 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
         (CPU-only) to avoid crashing the Ollama runner process.
         """
         await self._ensure_capabilities()
+        # Don't inherit a force-CPU another model (e.g. a text model) tripped —
+        # give the vision model its own GPU attempt.
+        self._maybe_reset_force_cpu(self._primary_model)
         # Adaptive timeout: caller can override. Default depends on GPU vs CPU.
         if timeout > 0:
             vision_timeout = timeout
@@ -1002,7 +1032,7 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                         "Ollama vision HTTP error with OOM pattern — retrying CPU-only: %s",
                         error_text[:200],
                     )
-                    self._force_cpu = True
+                    self._note_oom_force_cpu(self._primary_model)
                     await asyncio.sleep(3)
                     continue
                 raise ProviderError(f"Ollama vision error: {e}")
@@ -1010,7 +1040,7 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                 error_str = str(e)
                 if self._is_oom_error(error_str) and attempt == 0:
                     logger.warning("Ollama vision OOM — retrying CPU-only: %s", error_str[:200])
-                    self._force_cpu = True
+                    self._note_oom_force_cpu(self._primary_model)
                     await asyncio.sleep(3)
                     continue
                 raise ProviderError(f"Ollama vision error: {e}")
@@ -1027,6 +1057,11 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
         as long as chunks keep arriving, eliminating false timeouts entirely.
         """
         await self._ensure_capabilities()
+
+        # A different model OOM'd to CPU earlier (e.g. qwen3:4b translation);
+        # don't let that pin THIS model (e.g. qwen2.5:3b editorial/SEO/summary,
+        # which fits) onto the CPU — retry it on the GPU.
+        self._maybe_reset_force_cpu(self._editorial_model)
 
         messages = []
         if system:
@@ -1099,7 +1134,7 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                                 "Ollama text OOM (model=%s) — switching to CPU-only: %s",
                                 self._editorial_model, error_text[:200],
                             )
-                            self._force_cpu = True
+                            self._note_oom_force_cpu(self._editorial_model)
                             await asyncio.sleep(3)
                             continue
                         raise ProviderError(
@@ -1227,10 +1262,11 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                     # Rebuild payload with GPU layers
                     payload["options"]["num_gpu"] = self._get_num_gpu(self._editorial_model)
                     continue
-                # Second OOM or non-OOM error — fall back to CPU
+                # Second OOM or non-OOM error — fall back to CPU (scoped to this
+                # model so it doesn't pin a smaller model onto the CPU later).
                 if self._is_oom_error(error_text):
                     logger.warning("Ollama text OOM persists after VRAM clear — falling back to CPU")
-                    self._force_cpu = True
+                    self._note_oom_force_cpu(self._editorial_model)
                 if status_code == 404:
                     raise ProviderError(
                         f"Ollama text model {self._editorial_model!r} is not pulled "
