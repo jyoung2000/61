@@ -747,12 +747,17 @@ const useTimelineStore = create(
         return id;
       },
 
-      removeItem: (itemId) => set((state) => {
+      removeItem: (itemId, opts = {}) => set((state) => {
         const item = state.items.find(i => i.id === itemId);
         if (item) {
           const track = state.tracks.find(t => t.id === item.trackId);
           if (track?.locked) return; // Cannot remove items from locked tracks
-          if (item.type === 'subtitle') state.subtitlesUserEdited = true;
+          // ``markUserEdit: false`` for programmatic reconciliation (e.g. the
+          // translation→timeline sync pruning unmatched cues) — must not flag
+          // the track user-edited or it blocks the stale-language rebuild.
+          if (item.type === 'subtitle' && opts.markUserEdit !== false) {
+            state.subtitlesUserEdited = true;
+          }
         }
         state.items = state.items.filter(i => i.id !== itemId);
         resolveAllOverlaps(state.items);
@@ -782,14 +787,21 @@ const useTimelineStore = create(
         state.selectedItemIds = state.selectedItemIds.filter(id => !idsToRemove.has(id));
       }),
 
-      updateItem: (itemId, updates) => set((state) => {
+      updateItem: (itemId, updates, opts = {}) => set((state) => {
         const item = state.items.find(i => i.id === itemId);
         if (!item) return;
         // Prevent modifications to items on locked tracks
         const currentTrack = state.tracks.find(t => t.id === item.trackId);
         if (currentTrack?.locked) return;
         // Mark a genuine user edit so the transcript reverse-sync may fire.
-        if (item.type === 'subtitle') state.subtitlesUserEdited = true;
+        // ``markUserEdit: false`` is for PROGRAMMATIC reconciliation (e.g. the
+        // transcript→timeline sync that patches cue text when a translation
+        // arrives) — that must NOT flag the track as user-edited, or it would
+        // block the stale-language rebuild and leave un-matched cues in the
+        // source language (the "subtitle elements still in Japanese" bug).
+        if (item.type === 'subtitle' && opts.markUserEdit !== false) {
+          state.subtitlesUserEdited = true;
+        }
         // Validate track change: prevent moving items to incompatible tracks
         if (updates.trackId && updates.trackId !== item.trackId) {
           const targetTrack = state.tracks.find(t => t.id === updates.trackId);

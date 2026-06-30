@@ -588,7 +588,10 @@ export default function VideoEditor({
         // Update transcriptIndex if not set
         if (subItem.transcriptIndex == null) updates.transcriptIndex = match._origIdx;
         if (Object.keys(updates).length > 0) {
-          updateTimelineItem(subItem.id, updates);
+          // Programmatic reconciliation (transcript/translation → timeline), NOT
+          // a user edit — must not set subtitlesUserEdited, or it would block the
+          // stale-language rebuild for the cues this pass couldn't match.
+          updateTimelineItem(subItem.id, updates, { markUserEdit: false });
           const _prevSync = lastSyncedSubtitlesRef.current.get(subItem.id) || {};
           lastSyncedSubtitlesRef.current.set(subItem.id, { ..._prevSync, text: match.text });
         }
@@ -611,7 +614,8 @@ export default function VideoEditor({
         );
       }
       if (!hasMatch) {
-        removeItem(subItem.id);
+        // Programmatic prune (not a user delete) — don't flag user-edited.
+        removeItem(subItem.id, { markUserEdit: false });
       }
     });
 
