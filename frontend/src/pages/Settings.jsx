@@ -80,9 +80,9 @@ export default function Settings() {
   const [providerResults, setProviderResults] = useState({});
 
   // Per-task model selection
-  const [availableModels, setAvailableModels] = useState({ transcript: [], primary: [], editorial: [] });
-  const [currentModels, setCurrentModels] = useState({ transcript_model: '', primary_model: '', editorial_model: '', editorial_model_fallback: '' });
-  const [pendingModels, setPendingModels] = useState({ transcript_model: '', primary_model: '', editorial_model: '', editorial_model_fallback: '' });
+  const [availableModels, setAvailableModels] = useState({ transcript: [], primary: [], editorial: [], translation: [] });
+  const [currentModels, setCurrentModels] = useState({ transcript_model: '', primary_model: '', editorial_model: '', editorial_model_fallback: '', translation_model: '' });
+  const [pendingModels, setPendingModels] = useState({ transcript_model: '', primary_model: '', editorial_model: '', editorial_model_fallback: '', translation_model: '' });
   // Configured vs actually-loaded Whisper model (so the Settings page shows
   // what really ran, including a low-VRAM downgrade — not only what was asked).
   const [whisperInfo, setWhisperInfo] = useState({
@@ -494,6 +494,7 @@ export default function Settings() {
           transcript: data.transcript || [],
           primary: data.primary || data.vision || [],
           editorial: data.editorial || data.text || [],
+          translation: data.translation || data.editorial || data.text || [],
         });
       }
       // Build the saved-model state from BOTH sources. The editorial
@@ -513,6 +514,9 @@ export default function Settings() {
         primary_model: cur.primary_model || cur.vision_model || '',
         editorial_model: editorialFromEnv || editorialFromJudge,
         editorial_model_fallback: _judgeSpecToModelId(judge.fallback || ''),
+        // Dedicated subtitle-translation model (blank = reuse the editorial
+        // model). Provider-aware id from /available's ``current`` block.
+        translation_model: cur.translation_model || '',
       };
       setCurrentModels(resolved);
       setPendingModels(resolved);
@@ -670,7 +674,8 @@ export default function Settings() {
     pendingModels.transcript_model !== currentModels.transcript_model ||
     pendingModels.primary_model !== currentModels.primary_model ||
     pendingModels.editorial_model !== currentModels.editorial_model ||
-    pendingModels.editorial_model_fallback !== currentModels.editorial_model_fallback;
+    pendingModels.editorial_model_fallback !== currentModels.editorial_model_fallback ||
+    pendingModels.translation_model !== currentModels.translation_model;
 
   // Build the per-user env-var patch for a model selection. Picks
   // the right OPENROUTER_*_MODEL vs OLLAMA_*_MODEL key by inspecting
@@ -708,6 +713,11 @@ export default function Settings() {
     if (pendingModels.editorial_model !== currentModels.editorial_model) {
       body.editorial_model = pendingModels.editorial_model;
       body.text_model = pendingModels.editorial_model;  // legacy alias
+    }
+    // Dedicated subtitle-translation model (separate from editorial/SEO). Sent
+    // even when cleared to "" so the user can reset it to "use editorial".
+    if (pendingModels.translation_model !== currentModels.translation_model) {
+      body.translation_model = pendingModels.translation_model || '';
     }
 
     const editorialChanged =
@@ -2123,8 +2133,16 @@ export default function Settings() {
                 models={availableModels.editorial}
                 pendingValue={pendingModels.editorial_model}
                 savedValue={currentModels.editorial_model}
-                label="Editorial AI (transcript polishing)"
-                desc="Used to polish and clean up transcript text (punctuation, proper nouns), score clips, and generate summaries/tags, and translate subtitles. Applies when Offline Mode is OFF — in Offline Mode the editorial AI is auto-set to the best installed local model that fits your GPU."
+                label="Editorial AI (SEO, summaries, polish)"
+                desc="Used to polish transcript text (punctuation, proper nouns), score clips, and generate per-clip SEO + summaries/tags. Keep this on a fast model that fits your GPU — it runs once per clip. Subtitle translation has its own model below."
+              />
+              <ModelDropdown
+                task="translation"
+                models={availableModels.translation}
+                pendingValue={pendingModels.translation_model}
+                savedValue={currentModels.translation_model}
+                label="Subtitle Translation AI"
+                desc="Used ONLY to translate subtitles into the target language — separate from the Editorial AI so you can run a stronger (slower) model just for translation. Leave on '-- Select a model --' to reuse the Editorial AI. On a 4 GB GPU a 4B model runs on CPU (slower); pick a 3B model to keep it on the GPU."
               />
               <ModelDropdown
                 task="editorial_fallback"

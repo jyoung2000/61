@@ -2323,11 +2323,11 @@ async def save_models(req: SaveModelsRequest):
                 _upsert_env_var(env_path, "OPENROUTER_SUMMARY_MODEL", req.text_model)
                 _upsert_env_var(env_path, "OPENROUTER_PRESET", "custom")
 
-    # Dedicated OpenRouter subtitle-translation model. Kept distinct from the
-    # editorial model so polishing and translation can run different models.
-    # Ollama-prefixed picks aren't applicable here (translation routes through
-    # OLLAMA_TRANSLATION_MODEL on the Ollama fallback path), so only the
-    # OpenRouter id is persisted.
+    # Dedicated subtitle-translation model, kept distinct from the editorial
+    # model so SEO/summaries and translation can run different local models.
+    # An ``ollama/`` pick sets OLLAMA_TRANSLATION_MODEL (the local-mode picker);
+    # anything else sets OPENROUTER_TRANSLATION_MODEL. An explicit "" clears the
+    # OpenRouter pick back to "reuse editorial".
     if req.translation_model is not None:
         _tm = (req.translation_model or "").strip()
         if _tm.startswith("ollama/"):
