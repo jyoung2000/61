@@ -70,6 +70,26 @@ class Settings(BaseSettings):
     QWEN3_TRANSLATION_REPEAT_PENALTY: float = 1.05
     QWEN3_TRANSLATION_PRESENCE_PENALTY: float = 0.5
 
+    # ── Partial GPU offload for the 4B translation model on a small card ──
+    # A 4B-q4 model's weights are ~2.5 GB — most of its layers DO fit a 4 GB
+    # GTX 1650, only a few don't. The old behavior forced ALL layers onto the
+    # GPU (num_gpu=99); that OOMs, and the fallback then dumped the WHOLE model
+    # onto the CPU (very slow — the user's complaint). With partial offload we
+    # step DOWN through a layer-count ladder (num_gpu=32 → 24 → 16) so most of
+    # the model runs on the GPU and only a few layers spill to CPU — much faster
+    # than full CPU. The first rung (99) lets a roomy card place everything on
+    # GPU; the OOM-driven step-down self-tunes to whatever the card can hold, so
+    # the same ladder is correct for 4 GB and 8 GB+ cards. Set False to restore
+    # the old all-GPU-or-all-CPU behavior.
+    OLLAMA_SMALL_GPU_PARTIAL_OFFLOAD: bool = True
+    # Only models at/above this size get the partial ladder; smaller models that
+    # already fit fully keep the simple [all-GPU, CPU] path.
+    OLLAMA_PARTIAL_OFFLOAD_MIN_PARAMS_B: float = 3.5
+    # First partial rung (layer count) tried after the all-GPU attempt OOMs.
+    # qwen3:4b has ~36 layers; 32 keeps ~89% on GPU. Lowered automatically by
+    # the ladder (×0.75, ×0.5) if 32 still OOMs.
+    OLLAMA_MIDSIZE_GPU_LAYERS_START: int = 32
+
     # VideoLLaMA2 — optional local audio-visual model for Primary AI.
     # Requires ~10GB VRAM (RTX 4070+); on smaller GPUs the engine falls
     # back to the Ollama vision model, then cloud, then signal-only scoring.

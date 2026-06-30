@@ -253,6 +253,10 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
         # on the GPU.
         self._force_cpu: bool = False
         self._force_cpu_model: Optional[str] = None
+        # Remembers the GPU layer count (num_gpu) that last loaded a model
+        # successfully, so later calls start at the known-good rung of the
+        # partial-offload ladder instead of re-OOMing at num_gpu=99 every time.
+        self._gpu_layers_good: dict[str, int] = {}
         self._vram_checked: bool = False
         self._available_vram_mb: int = 0
         # Cached GPU availability detection
@@ -661,6 +665,42 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
 
         # Default: let Ollama try GPU, and we'll catch OOM in the retry logic
         return -1
+
+    def _text_gpu_ladder(self, model_name: str) -> list[int]:
+        """Descending ``num_gpu`` values to try for a text model, honoring the
+        existing CPU guardrails. ``_get_num_gpu`` returns 0 for models known to
+        exceed VRAM / forced-CPU / too-little-VRAM — those stay CPU-only. For
+        everything else we use the partial-offload ladder so a 4B model runs
+        mostly on the GPU instead of dumping entirely to CPU on OOM. Starts at
+        the last rung that loaded successfully for this model (cached) to avoid
+        re-OOMing at 99 on every call."""
+        base = self._get_num_gpu(model_name)
+        if base == 0:
+            return [0]
+        try:
+            from backend.services.local_models import (
+                gpu_offload_ladder, _ollama_names_match,
+            )
+            ladder = gpu_offload_ladder(model_name)
+        except Exception:
+            return [99, 0]
+        good = None
+        for k, v in self._gpu_layers_good.items():
+            try:
+                if _ollama_names_match(k, model_name):
+                    good = v
+                    break
+            except Exception:
+                pass
+        if good is not None:
+            trimmed = [x for x in ladder if x <= good or x == 0]
+            if good not in trimmed:
+                trimmed = [good] + trimmed
+            ladder = trimmed or [good, 0]
+        return ladder
+
+    def _remember_gpu_layers(self, model_name: str, n_gpu: int) -> None:
+        self._gpu_layers_good[model_name] = int(n_gpu)
 
     def _is_oom_error(self, error_text: str) -> bool:
         """Check if an error response indicates CUDA out-of-memory."""
@@ -1082,7 +1122,11 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
         base_stall = self.STALL_TIMEOUT_GPU if gpu_available else self.STALL_TIMEOUT_CPU
         stall_timeout = max(base_stall, effective_timeout * 0.3)
 
-        num_gpu = self._get_num_gpu(self._editorial_model)
+        # Partial-offload ladder: try all-GPU first, then progressively fewer
+        # layers on the GPU (a 4B model keeps most layers on the GPU, only a few
+        # on CPU), and full CPU only as the last resort — instead of dumping the
+        # whole model onto the CPU on the first OOM.
+        gpu_ladder = self._text_gpu_ladder(self._editorial_model)
 
         payload = {
             "model": self._editorial_model,
@@ -1091,7 +1135,7 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
             "options": {
                 "num_predict": max_tokens,
                 "num_ctx": self._get_effective_ctx(self._editorial_model),
-                "num_gpu": 99,  # Force all layers on GPU (overrides poisoned scheduler)
+                "num_gpu": gpu_ladder[0],  # first rung (99 = all layers on GPU)
                 "num_batch": 256,  # Reduce from 512 to lower compute graph VRAM (~150MB vs ~300MB)
                 "num_thread": 4,          # CPU threads for any remaining CPU work
                 "temperature": 0.5,  # Small models need more diversity to avoid repetitive descriptions
@@ -1104,16 +1148,21 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
 
         logger.debug(
             "Ollama _call_text (streaming): model=%s, prompt_len=%d, system_len=%d, "
-            "effective_timeout=%.0fs, stall_timeout=%.0fs, num_gpu=%s",
-            self._editorial_model, len(prompt), len(system), effective_timeout, stall_timeout, num_gpu,
+            "effective_timeout=%.0fs, stall_timeout=%.0fs, gpu_ladder=%s",
+            self._editorial_model, len(prompt), len(system), effective_timeout,
+            stall_timeout, gpu_ladder,
         )
 
-        for attempt in range(2):  # At most 2 attempts: GPU then CPU
+        for attempt, _n_gpu in enumerate(gpu_ladder):
+            is_last_rung = attempt == len(gpu_ladder) - 1
             try:
-                # On second attempt (after OOM), force CPU
-                if attempt == 1:
-                    payload["options"]["num_gpu"] = 0
-                    logger.info("Retrying text call with num_gpu=0 (CPU-only) after OOM")
+                # Walk the GPU ladder: each rung offloads fewer layers to the GPU
+                # than the last; the final rung (0) is CPU-only.
+                payload["options"]["num_gpu"] = _n_gpu
+                if attempt > 0:
+                    logger.info(
+                        "Retrying text call with num_gpu=%s (%s) after OOM",
+                        _n_gpu, "CPU-only" if _n_gpu == 0 else "partial GPU offload")
 
                 collected_text = []
                 total_prompt_tokens = 0
@@ -1129,12 +1178,26 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                     # Check for OOM crash in Ollama's response
                     if response.status_code == 500:
                         error_text = (await response.aread()).decode("utf-8", errors="replace")[:500]
-                        if self._is_oom_error(error_text) and attempt == 0:
+                        if self._is_oom_error(error_text) and not is_last_rung:
+                            next_gpu = gpu_ladder[attempt + 1]
                             logger.warning(
-                                "Ollama text OOM (model=%s) — switching to CPU-only: %s",
-                                self._editorial_model, error_text[:200],
+                                "Ollama text OOM (model=%s, num_gpu=%s) — stepping down "
+                                "to num_gpu=%s (%s): %s",
+                                self._editorial_model, _n_gpu, next_gpu,
+                                "CPU-only" if next_gpu == 0 else "partial GPU offload",
+                                error_text[:200],
                             )
-                            self._note_oom_force_cpu(self._editorial_model)
+                            # Only when we're about to drop to CPU do we mark the
+                            # model force-CPU (so the stall timeout widens); a
+                            # partial-GPU step keeps the model on the GPU.
+                            if next_gpu == 0:
+                                self._note_oom_force_cpu(self._editorial_model)
+                            # Clear residual VRAM (a vision model may still be
+                            # resident) before the next, smaller attempt.
+                            try:
+                                await self.clear_vram()
+                            except Exception:
+                                pass
                             await asyncio.sleep(3)
                             continue
                         raise ProviderError(
@@ -1196,6 +1259,14 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                 self._total_tokens += total_prompt_tokens + total_eval_tokens
                 result = "".join(collected_text)
 
+                # This rung loaded successfully — remember it so later calls for
+                # this model start here instead of re-OOMing at num_gpu=99.
+                self._remember_gpu_layers(self._editorial_model, _n_gpu)
+                if _n_gpu == 0:
+                    logger.info(
+                        "Ollama text ran on CPU (model=%s) — GPU offload exhausted",
+                        self._editorial_model)
+
                 if not result:
                     logger.warning("Ollama streaming returned empty response for model=%s", self._editorial_model)
                 else:
@@ -1249,23 +1320,25 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                 except Exception:
                     error_text = ""
                 status_code = e.response.status_code if e.response is not None else 0
-                if self._is_oom_error(error_text) and attempt == 0:
+                if self._is_oom_error(error_text) and not is_last_rung:
+                    next_gpu = gpu_ladder[attempt + 1]
                     logger.warning(
-                        "Ollama text CUDA OOM — clearing all models and retrying on GPU: %s",
+                        "Ollama text CUDA OOM (num_gpu=%s) — clearing VRAM and "
+                        "stepping down to num_gpu=%s (%s): %s",
+                        _n_gpu, next_gpu,
+                        "CPU-only" if next_gpu == 0 else "partial GPU offload",
                         error_text[:200],
                     )
-                    # First try: clear VRAM (likely vision model still resident) and retry on GPU
+                    # Clear VRAM (likely a vision model still resident) before the
+                    # next, smaller attempt.
                     await self.clear_vram()
                     await asyncio.sleep(3)
-                    # Reset force_cpu so retry uses GPU
-                    self._force_cpu = False
-                    # Rebuild payload with GPU layers
-                    payload["options"]["num_gpu"] = self._get_num_gpu(self._editorial_model)
+                    if next_gpu == 0:
+                        self._note_oom_force_cpu(self._editorial_model)
                     continue
-                # Second OOM or non-OOM error — fall back to CPU (scoped to this
-                # model so it doesn't pin a smaller model onto the CPU later).
+                # OOM on the last (CPU) rung or a non-OOM error.
                 if self._is_oom_error(error_text):
-                    logger.warning("Ollama text OOM persists after VRAM clear — falling back to CPU")
+                    logger.warning("Ollama text OOM persists at the lowest rung — falling back to CPU")
                     self._note_oom_force_cpu(self._editorial_model)
                 if status_code == 404:
                     raise ProviderError(
@@ -1278,19 +1351,23 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                 )
             except Exception as e:
                 error_str = str(e)
-                if self._is_oom_error(error_str) and attempt == 0:
+                if self._is_oom_error(error_str) and not is_last_rung:
+                    next_gpu = gpu_ladder[attempt + 1]
                     logger.warning(
-                        "Ollama text CUDA OOM — clearing all models and retrying on GPU: %s",
-                        error_str[:200],
+                        "Ollama text CUDA OOM (num_gpu=%s) — clearing VRAM and "
+                        "stepping down to num_gpu=%s: %s",
+                        _n_gpu, next_gpu, error_str[:200],
                     )
                     await self.clear_vram()
                     await asyncio.sleep(3)
-                    self._force_cpu = False
-                    payload["options"]["num_gpu"] = self._get_num_gpu(self._editorial_model)
+                    if next_gpu == 0:
+                        self._note_oom_force_cpu(self._editorial_model)
                     continue
                 raise ProviderError(f"Ollama text error ({type(e).__name__}): {e}")
 
-        raise ProviderError(f"Ollama text failed after 2 attempts (model={self._editorial_model})")
+        raise ProviderError(
+            f"Ollama text failed after {len(gpu_ladder)} attempts "
+            f"(model={self._editorial_model})")
 
     async def text_complete(self, prompt: str, max_tokens: int = 4096, timeout: int | None = None,
                             json_mode: bool = False) -> str:

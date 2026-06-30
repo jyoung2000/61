@@ -151,6 +151,38 @@ def qwen3_translation_options(model_name: str) -> dict:
     }
 
 
+def gpu_offload_ladder(model_name: str) -> list[int]:
+    """Descending ``num_gpu`` (layer-count) values to try for ``model_name``.
+
+    A ~4B q4 model is a hair too big to fully offload on a 4 GB card: forcing
+    all layers (num_gpu=99) OOMs, and the old fallback then dumped the WHOLE
+    model onto the CPU — very slow. Most of its layers DO fit, so we step down
+    through PARTIAL GPU offload (a layer count < the model's total) before ever
+    touching CPU, keeping the bulk of compute on the GPU. The first rung (99)
+    lets a roomy card place everything on the GPU; the OOM-driven step-down
+    self-tunes to the card, so the same ladder is right for 4 GB and 8 GB+.
+
+    Returns ``[99, 0]`` (all-GPU then CPU — the legacy path) for models that
+    already fit fully (< the partial threshold) or when partial offload is off.
+    The ladder always ends at ``0`` (CPU) as the last-resort rung."""
+    if not getattr(settings, "OLLAMA_SMALL_GPU_PARTIAL_OFFLOAD", True):
+        return [99, 0]
+    params = _parse_params_b(model_name or "")
+    threshold = float(getattr(settings, "OLLAMA_PARTIAL_OFFLOAD_MIN_PARAMS_B", 3.5))
+    if params is None or params < threshold:
+        return [99, 0]
+    start = int(getattr(settings, "OLLAMA_MIDSIZE_GPU_LAYERS_START", 32))
+    raw = [99, start, int(start * 0.75), int(start * 0.5), 0]
+    ladder: list[int] = []
+    for v in raw:
+        v = max(0, int(v))
+        if v not in ladder:
+            ladder.append(v)
+    if ladder[-1] != 0:
+        ladder.append(0)
+    return ladder
+
+
 def rank_local_editorial_models(
     model_names, max_params_b: Optional[float] = None
 ) -> list[str]:

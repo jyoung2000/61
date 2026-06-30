@@ -563,6 +563,48 @@ async def _ensure_ollama_model(model: str) -> bool:
         return False
 
 
+# OOM patterns Ollama / llama.cpp emit when a model doesn't fit in VRAM.
+_OLLAMA_OOM_PATTERNS = (
+    "out of memory", "cudamalloc", "ggml_assert", "failed to allocate cuda",
+    "cuda error", "no available", "unable to allocate",
+)
+
+# Remembers the GPU layer count that last loaded successfully for a model, so
+# every subsequent batch starts at the known-good rung instead of re-OOMing at
+# num_gpu=99 and reloading the model each time (each reload costs ~10-15s).
+_GPU_LAYERS_GOOD: dict[str, int] = {}
+
+
+def _is_ollama_oom(text: str) -> bool:
+    t = (text or "").lower()
+    return any(p in t for p in _OLLAMA_OOM_PATTERNS)
+
+
+def _translation_gpu_ladder(model: str) -> list[int]:
+    """Partial-GPU-offload ladder for the translation model, starting from the
+    last rung that loaded successfully (so we don't re-OOM at 99 every batch)."""
+    try:
+        from backend.services.local_models import gpu_offload_ladder, _ollama_names_match
+        ladder = gpu_offload_ladder(model)
+    except Exception:
+        return [99, 0]
+    good = None
+    for k, v in _GPU_LAYERS_GOOD.items():
+        try:
+            if _ollama_names_match(k, model):
+                good = v
+                break
+        except Exception:
+            pass
+    if good is not None:
+        # Start at the known-good rung; keep lower rungs (and CPU) as fallback.
+        trimmed = [x for x in ladder if x <= good or x == 0]
+        if good not in trimmed:
+            trimmed = [good] + trimmed
+        return trimmed or [good, 0]
+    return ladder
+
+
 async def _translate_batch_via_ollama(
     prompt: str,
     model: str,
@@ -573,9 +615,16 @@ async def _translate_batch_via_ollama(
 
     ``num_ctx`` is configurable so the MTPE post-edit pass can use a larger
     context window (8192) and keep real surrounding context on long videos.
+
+    Forces GPU placement via an explicit ``num_gpu`` and, on a small card where
+    the 4B model can't fully offload, steps DOWN through a partial-offload ladder
+    (most layers on GPU, a few on CPU) before falling back to full CPU — so the
+    translation runs on the GPU instead of crawling on the CPU. Without an
+    explicit num_gpu, Ollama's auto-scheduler frequently placed the model on the
+    CPU after Whisper released VRAM.
     """
     host = settings.OLLAMA_HOST
-    options = {
+    base_options = {
         "num_ctx": int(num_ctx),
         "temperature": 0.3,
         "num_predict": 4096,
@@ -585,22 +634,62 @@ async def _translate_batch_via_ollama(
     # Qwen3 family — non-Qwen3 models keep the default 0.3 temperature.
     try:
         from backend.services.local_models import qwen3_translation_options
-        options.update(qwen3_translation_options(model))
+        base_options.update(qwen3_translation_options(model))
     except Exception:
         pass
+
+    ladder = _translation_gpu_ladder(model)
+    last_status_err: Optional[Exception] = None
     async with httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=15.0)) as client:
-        resp = await client.post(
-            f"{host}/api/chat",
-            json={
-                "model": model,
-                "messages": [{"role": "user", "content": prompt}],
-                "stream": False,
-                "options": options,
-            },
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return data.get("message", {}).get("content", "")
+        for i, n_gpu in enumerate(ladder):
+            is_last = i == len(ladder) - 1
+            options = dict(base_options)
+            # num_gpu=99 → all layers on GPU (Ollama caps at the real count);
+            # a smaller positive value → that many layers on GPU, rest on CPU;
+            # 0 → CPU-only (the last-resort rung).
+            options["num_gpu"] = int(n_gpu)
+            try:
+                resp = await client.post(
+                    f"{host}/api/chat",
+                    json={
+                        "model": model,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "stream": False,
+                        "options": options,
+                    },
+                )
+                if resp.status_code == 500 and _is_ollama_oom(resp.text) and not is_last:
+                    logger.warning(
+                        "Ollama translation OOM at num_gpu=%s — stepping down to %s "
+                        "(partial GPU offload)", n_gpu, ladder[i + 1])
+                    continue
+                resp.raise_for_status()
+                data = resp.json()
+                # Remember the rung that worked so later batches skip the OOM dance.
+                _GPU_LAYERS_GOOD[model] = int(n_gpu)
+                if n_gpu == 0:
+                    logger.info("Ollama translation ran on CPU (model=%s) — GPU "
+                                "offload exhausted; expect slower throughput", model)
+                else:
+                    logger.debug("Ollama translation ran with num_gpu=%s (model=%s)",
+                                 n_gpu, model)
+                return data.get("message", {}).get("content", "")
+            except httpx.HTTPStatusError as e:
+                last_status_err = e
+                body = ""
+                try:
+                    body = e.response.text if e.response is not None else ""
+                except Exception:
+                    body = ""
+                if _is_ollama_oom(body) and not is_last:
+                    logger.warning(
+                        "Ollama translation OOM at num_gpu=%s — stepping down to %s",
+                        n_gpu, ladder[i + 1])
+                    continue
+                raise
+    if last_status_err is not None:
+        raise last_status_err
+    raise RuntimeError("Ollama translation produced no response")
 
 
 class _OllamaMTPEClient:
