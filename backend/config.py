@@ -780,8 +780,24 @@ class Settings(BaseSettings):
     # post-edit then keeps those spellings canonical) for the fluency gain.
     OFFLINE_TRANSLATION_MTPE_ENABLED: bool = False
     # Context window for the MTPE pass. Raised from the old 4096 toward 8192 so
-    # longer videos keep real surrounding context (qwen2.5 supports it).
+    # longer videos keep real surrounding context (qwen2.5 supports it). This is
+    # the CPU-rung context; GPU attempts use the smaller GPU ctx below so the KV
+    # cache fits in VRAM.
     OFFLINE_TRANSLATION_MTPE_NUM_CTX: int = 8192
+    # ── Translation context window ON the GPU ──
+    # The KV cache scales linearly with num_ctx and is the single biggest VRAM
+    # cost after the weights: for a 4B model the KV cache at 8192 ctx is ~1.2 GB,
+    # which pushes the model past a 4 GB card even with partial layer offload. A
+    # subtitle batch only needs ~2K tokens, so on GPU attempts we cap the context
+    # to this (KV cache drops to ~0.3 GB) — letting qwen3:4b actually fit and run
+    # on the GPU. The full (large) context above is still used on the CPU rung,
+    # where the KV cache lives in plentiful system RAM. Raise only if a single
+    # batch's prompt approaches this size.
+    OLLAMA_TRANSLATION_GPU_NUM_CTX: int = 2048
+    # num_batch for translation GPU attempts. A smaller batch shrinks the compute
+    # graph buffer (another VRAM cost) at a small throughput cost — worth it to
+    # keep the model on the GPU on a 4 GB card.
+    OLLAMA_TRANSLATION_GPU_NUM_BATCH: int = 128
 
     # ── Translation quality mode (Task 5) ──
     # ``speed`` (default): the offline NLLB-draft → MTPE chain above — fast and

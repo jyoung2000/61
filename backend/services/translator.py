@@ -638,6 +638,13 @@ async def _translate_batch_via_ollama(
     except Exception:
         pass
 
+    # On GPU rungs cap the context (and shrink the batch) so the KV cache +
+    # compute buffer fit in VRAM — the large MTPE context is only affordable on
+    # the CPU rung, where the KV cache lives in system RAM.
+    gpu_ctx = min(int(num_ctx),
+                  int(getattr(settings, "OLLAMA_TRANSLATION_GPU_NUM_CTX", 2048)))
+    gpu_batch = int(getattr(settings, "OLLAMA_TRANSLATION_GPU_NUM_BATCH", 128))
+
     ladder = _translation_gpu_ladder(model)
     last_status_err: Optional[Exception] = None
     async with httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=15.0)) as client:
@@ -648,6 +655,13 @@ async def _translate_batch_via_ollama(
             # a smaller positive value → that many layers on GPU, rest on CPU;
             # 0 → CPU-only (the last-resort rung).
             options["num_gpu"] = int(n_gpu)
+            if n_gpu > 0:
+                # GPU attempt: small context + batch so it fits VRAM.
+                options["num_ctx"] = gpu_ctx
+                options["num_batch"] = gpu_batch
+            else:
+                # CPU rung: use the full configured context (RAM is plentiful).
+                options["num_ctx"] = int(num_ctx)
             try:
                 resp = await client.post(
                     f"{host}/api/chat",

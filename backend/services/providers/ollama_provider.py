@@ -667,23 +667,41 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
         return -1
 
     def _text_gpu_ladder(self, model_name: str) -> list[int]:
-        """Descending ``num_gpu`` values to try for a text model, honoring the
-        existing CPU guardrails. ``_get_num_gpu`` returns 0 for models known to
-        exceed VRAM / forced-CPU / too-little-VRAM — those stay CPU-only. For
-        everything else we use the partial-offload ladder so a 4B model runs
-        mostly on the GPU instead of dumping entirely to CPU on OOM. Starts at
-        the last rung that loaded successfully for this model (cached) to avoid
-        re-OOMing at 99 on every call."""
-        base = self._get_num_gpu(model_name)
-        if base == 0:
-            return [0]
+        """Descending ``num_gpu`` values to try for a text model.
+
+        Returns ``[0]`` (CPU-only) when THIS model was already forced to CPU, or
+        it's a model known to never fit (7B/8B+). Otherwise it returns the
+        partial-offload ladder so a 4B model runs mostly on the GPU instead of
+        dumping entirely to CPU. We deliberately do NOT consult the free-VRAM
+        probe here: that probe can read stale-low right after Whisper unloads and
+        would wrongly pin a model that actually fits onto the CPU — the ladder
+        already ends at CPU, so a genuinely-too-big model still falls back, but
+        only after a real OOM rather than a guess. Starts at the last rung that
+        loaded successfully for this model (cached) to avoid re-OOMing at 99 on
+        every call."""
         try:
             from backend.services.local_models import (
                 gpu_offload_ladder, _ollama_names_match,
             )
-            ladder = gpu_offload_ladder(model_name)
         except Exception:
             return [99, 0]
+
+        # Sticky CPU only for the specific model that OOM'd (or a legacy global
+        # force-CPU with no recorded model).
+        if self._force_cpu and (
+            self._force_cpu_model is None
+            or _ollama_names_match(self._force_cpu_model, model_name)
+        ):
+            return [0]
+        # Models known to never fit a small card stay CPU-only.
+        ml = (model_name or "").lower()
+        if any(h in ml for h in (
+            ":7b", ":8b", ":13b", ":14b", ":34b", ":70b",
+            "llava:7b", "llava:13b",
+        )):
+            return [0]
+
+        ladder = gpu_offload_ladder(model_name)
         good = None
         for k, v in self._gpu_layers_good.items():
             try:
@@ -1128,6 +1146,14 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
         # whole model onto the CPU on the first OOM.
         gpu_ladder = self._text_gpu_ladder(self._editorial_model)
 
+        # A larger (4B+) model on a small card needs a smaller compute-graph
+        # buffer to fit VRAM — use a smaller num_batch when the model qualifies
+        # for partial offload (its ladder has a partial-GPU rung), otherwise keep
+        # the 256 batch that the 3B editorial model runs fine at.
+        _num_batch = 256
+        if any(0 < r < 99 for r in gpu_ladder):
+            _num_batch = int(getattr(settings, "OLLAMA_TRANSLATION_GPU_NUM_BATCH", 128))
+
         payload = {
             "model": self._editorial_model,
             "messages": messages,
@@ -1136,7 +1162,7 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                 "num_predict": max_tokens,
                 "num_ctx": self._get_effective_ctx(self._editorial_model),
                 "num_gpu": gpu_ladder[0],  # first rung (99 = all layers on GPU)
-                "num_batch": 256,  # Reduce from 512 to lower compute graph VRAM (~150MB vs ~300MB)
+                "num_batch": _num_batch,  # smaller for 4B+ to lower compute-graph VRAM
                 "num_thread": 4,          # CPU threads for any remaining CPU work
                 "temperature": 0.5,  # Small models need more diversity to avoid repetitive descriptions
                 "top_p": 0.9,        # Better variety in sampling

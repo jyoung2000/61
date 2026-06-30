@@ -82,12 +82,13 @@ class _FakeResp:
 
 
 class _FakeClient:
-    """Records the num_gpu of each /api/chat call; OOMs until num_gpu drops to
-    the configured threshold, then returns a normal response."""
+    """Records the num_gpu (and full options) of each /api/chat call; OOMs until
+    num_gpu drops to the configured threshold, then returns a normal response."""
 
     def __init__(self, succeed_at):
         self.succeed_at = succeed_at
         self.num_gpus = []
+        self.options = []
 
     async def __aenter__(self):
         return self
@@ -98,6 +99,7 @@ class _FakeClient:
     async def post(self, url, json=None, **kw):
         n = json["options"].get("num_gpu")
         self.num_gpus.append(n)
+        self.options.append(dict(json["options"]))
         if n is not None and n > self.succeed_at:
             return _FakeResp(500, text="CUDA error: out of memory")
         return _FakeResp(200, payload={"message": {"content": "translated"}})
@@ -140,6 +142,26 @@ def test_translation_cache_skips_oom_dance(monkeypatch):
     # Started at the cached rung — never re-tried the OOM'ing num_gpu=99.
     assert 99 not in fake.num_gpus
     assert fake.num_gpus[0] == 32
+
+
+def test_gpu_attempts_cap_context_cpu_keeps_full(monkeypatch):
+    # The big VRAM cost is the KV cache (∝ num_ctx). GPU attempts must use the
+    # small GPU context; only the CPU rung keeps the full (8192) context.
+    monkeypatch.setattr(settings, "OLLAMA_SMALL_GPU_PARTIAL_OFFLOAD", True, raising=False)
+    monkeypatch.setattr(settings, "OLLAMA_HOST", "http://x", raising=False)
+    monkeypatch.setattr(settings, "OLLAMA_TRANSLATION_GPU_NUM_CTX", 2048, raising=False)
+    fake = _FakeClient(succeed_at=0)        # every GPU rung OOMs → ends on CPU
+    monkeypatch.setattr(T.httpx, "AsyncClient", lambda *a, **k: fake)
+
+    import asyncio
+    asyncio.run(T._translate_batch_via_ollama("p", XLATE, num_ctx=8192))
+    # Every positive-num_gpu attempt used the small context…
+    for opt in fake.options:
+        if opt["num_gpu"] > 0:
+            assert opt["num_ctx"] == 2048
+    # …and the CPU rung used the full context.
+    assert fake.options[-1]["num_gpu"] == 0
+    assert fake.options[-1]["num_ctx"] == 8192
 
 
 def test_translation_falls_to_cpu_when_no_gpu_rung_fits(monkeypatch):
