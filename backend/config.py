@@ -579,7 +579,12 @@ class Settings(BaseSettings):
     # platform-specific safe-zone margins for TikTok / Reels / Shorts.
     # Wired into srt_generator + ass_generator as a preprocessing step.
     SUBTITLE_CPS_ENFORCEMENT: bool = True       # enforce reading speed limits
-    SUBTITLE_MAX_CPS: float = 20.0              # chars/sec (Netflix adult standard)
+    # Netflix uses language-specific reading-speed limits — up to 17 cps adult
+    # (13 cps kids) for most languages; 20 is the looser English-USA value. The
+    # output here is translated (usually non-English), so 17 is the correct
+    # target. ``_cps()`` separately down-weights CJK glyphs, so CJK content lands
+    # near Netflix's ~13 cps CJK-equivalent without a second knob.
+    SUBTITLE_MAX_CPS: float = 17.0             # Netflix language-specific adult limit
     # Keep a cue WHOLE up to ``SUBTITLE_MAX_CPS × this`` and only split above it.
     # The reading-speed cap alone shatters every merged sentence right back into
     # 2-3 word flashes (a 193→174 merge re-exploded to 500+ cues), which is the
@@ -591,23 +596,16 @@ class Settings(BaseSettings):
     SUBTITLE_SPLIT_CPS_TOLERANCE: float = 1.5
     SUBTITLE_MAX_CHARS_PER_LINE: int = 42       # Netflix Latin standard
     SUBTITLE_MIN_DURATION_MS: int = 833         # 5/6 second (Netflix minimum)
-    SUBTITLE_MAX_DURATION_MS: int = 9000        # Raised from 4.5s. Slow / heavily
-                                                # -paused speech (JA→EN especially)
-                                                # leaves 2-3 word fragments ~4-6s
-                                                # apart; a tight cap refused to
-                                                # merge two of them (their combined
-                                                # span exceeds it), so they stayed
-                                                # choppy. 9s lets the phrase-merge
-                                                # combine such fragments into
-                                                # complete, readable captions (it's
-                                                # past Netflix's 7s ideal, but a
-                                                # complete clause shown for 9s of
-                                                # genuinely slow speech reads far
-                                                # better than 5 word-fragments).
-                                                # Normal-pace speech still lands
-                                                # ~4-5s — bounded by the 2-line/CPS
-                                                # budget — so only slow content
-                                                # uses the extra room.
+    SUBTITLE_MAX_DURATION_MS: int = 7000        # Netflix maximum per event (7s).
+                                                # The phrase-merge still combines
+                                                # slow fragments up to this cap;
+                                                # fragments whose combined span
+                                                # exceeds 7s stay separate (a
+                                                # single caption must not sit on
+                                                # screen longer than 7s per spec).
+                                                # Clause-level resegmentation +
+                                                # the 2-line/CPS budget keep
+                                                # normal-pace cues ~4-5s.
     SUBTITLE_SMART_LINE_BREAKS: bool = True     # linguistic boundary breaks
     # Minimum characters a split piece may carry. Stops the duration
     # splitter from shattering slow / dramatic narration (Whisper detects
