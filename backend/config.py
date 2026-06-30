@@ -607,11 +607,17 @@ class Settings(BaseSettings):
     # when no LLM is configured or it comes back still source-language.
     TRANSLATION_PREFER_LLM: bool = True
     # Per-batch timeout for LLM subtitle translation (a CEILING — never slows the
-    # fast path). A small editorial model on a low-VRAM GPU needs far more than
-    # the old 5 s/segment / 60 s floor; too low and it gets killed mid-answer and
-    # falls back to the weaker offline NMT, leaving cues in the source language.
-    TRANSLATION_LLM_SECONDS_PER_SEGMENT: float = 12.0
-    TRANSLATION_LLM_TIMEOUT_FLOOR: float = 180.0
+    # fast path; a fast GPU batch returns in seconds regardless). A small model
+    # on a low-VRAM GPU needs far more than the old 5 s/segment / 60 s floor; too
+    # low and it gets killed mid-answer and falls back to the weaker offline NMT,
+    # leaving cues in the source language. Sized for the worst case: a 4B
+    # translation model (qwen3:4b-instruct-2507) running on CPU on a 4 GB card,
+    # where a CJK→EN batch can take a few minutes — at 180 s those batches were
+    # killed, tripping the >20% residual check and silently demoting the whole
+    # translation to NMT. 300 s floor / 20 s per segment gives CPU batches room
+    # to finish so the chosen translation model is actually the one that runs.
+    TRANSLATION_LLM_SECONDS_PER_SEGMENT: float = 20.0
+    TRANSLATION_LLM_TIMEOUT_FLOOR: float = 300.0
     # LLM translation batch size. Smaller batches on a local model generate a
     # shorter JSON array faster + more reliably (less timeout risk). 0 = auto
     # (8 for Ollama, 18 for cloud).
