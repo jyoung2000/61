@@ -144,10 +144,13 @@ def qwen3_translation_options(model_name: str) -> dict:
     if "qwen3" not in (model_name or "").lower():
         return {}
     return {
-        "temperature": float(getattr(settings, "QWEN3_TRANSLATION_TEMPERATURE", 0.2)),
+        "temperature": float(getattr(settings, "QWEN3_TRANSLATION_TEMPERATURE", 0.6)),
         "top_p": float(getattr(settings, "QWEN3_TRANSLATION_TOP_P", 0.8)),
-        "repeat_penalty": float(getattr(settings, "QWEN3_TRANSLATION_REPEAT_PENALTY", 1.05)),
-        "presence_penalty": float(getattr(settings, "QWEN3_TRANSLATION_PRESENCE_PENALTY", 0.5)),
+        "top_k": int(getattr(settings, "QWEN3_TRANSLATION_TOP_K", 20)),
+        "min_p": float(getattr(settings, "QWEN3_TRANSLATION_MIN_P", 0.0)),
+        "repeat_penalty": float(getattr(settings, "QWEN3_TRANSLATION_REPEAT_PENALTY", 1.1)),
+        "presence_penalty": float(getattr(settings, "QWEN3_TRANSLATION_PRESENCE_PENALTY", 1.2)),
+        "frequency_penalty": float(getattr(settings, "QWEN3_TRANSLATION_FREQUENCY_PENALTY", 0.3)),
     }
 
 

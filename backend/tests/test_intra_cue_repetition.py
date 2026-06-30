@@ -35,6 +35,32 @@ def test_non_repeating_line_untouched():
     assert collapse("So so good") == "So so good"
 
 
+# ── Task 2: partial / non-tiling phrase repetition with a trailing tail ──
+
+def test_repeated_phrase_with_tail():
+    assert collapse("I will protect you I will protect you no matter what") == \
+        "I will protect you no matter what"
+
+
+def test_repeated_short_phrase_with_tail():
+    assert collapse("I think I think we should go") == "I think we should go"
+
+
+def test_phrase_repeated_three_times_with_tail():
+    assert collapse("He said that he said that he said that loudly") == \
+        "He said that loudly"
+
+
+def test_cross_sentence_restatement_preserved():
+    # A repeat that ends a sentence is a restatement, not a loop — left alone.
+    assert collapse("Go home. Go home now.") == "Go home. Go home now."
+
+
+def test_markers_and_single_word_double_preserved():
+    assert collapse("Bye bye") == "Bye bye"
+    assert collapse("[♪ music ♪]") == "[♪ music ♪]"
+
+
 def test_empty_and_single_word():
     assert collapse("") == ""
     assert collapse("Hello") == "Hello"
@@ -59,6 +85,7 @@ def test_collapse_segments_preserves_markers_and_timing():
 
 
 def test_threshold_configurable():
-    # With a lower threshold, a 3-run trims; default (4) leaves it.
-    assert collapse("ha ha ha", min_word_run=3) == "ha ha"
-    assert collapse("ha ha ha") == "ha ha ha"
+    # Default (3, Netflix alignment) collapses a 3× single-word run to two;
+    # a higher explicit threshold preserves it.
+    assert collapse("ha ha ha") == "ha ha"
+    assert collapse("ha ha ha", min_word_run=4) == "ha ha ha"

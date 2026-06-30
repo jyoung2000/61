@@ -65,10 +65,26 @@ class Settings(BaseSettings):
     # use their higher-diversity settings). Qwen3's official non-thinking sampling
     # guidance: temperature ~0.7 for chat, but subtitle translation wants
     # determinism, so we default lower.
-    QWEN3_TRANSLATION_TEMPERATURE: float = 0.2
+    # Qwen3's model card warns that greedy / very-low-temperature decoding makes
+    # the model fall into ENDLESS REPETITION. For non-thinking models it
+    # recommends temperature≈0.7, top_p=0.8, top_k=20, min_p=0, plus a
+    # presence_penalty up to ~1.5 to break loops. The old near-greedy temp=0.2
+    # was itself a cause of the repeating subtitle lines, so we move to the
+    # card's anti-repetition profile (still deterministic enough for faithful
+    # subtitles at 0.6). presence/frequency penalties suppress token- and
+    # phrase-level loops at the source.
+    QWEN3_TRANSLATION_TEMPERATURE: float = 0.6      # was 0.2 — Qwen3 loops near-greedy
     QWEN3_TRANSLATION_TOP_P: float = 0.8
-    QWEN3_TRANSLATION_REPEAT_PENALTY: float = 1.05
-    QWEN3_TRANSLATION_PRESENCE_PENALTY: float = 0.5
+    QWEN3_TRANSLATION_TOP_K: int = 20               # Qwen3 non-thinking default
+    QWEN3_TRANSLATION_MIN_P: float = 0.0
+    QWEN3_TRANSLATION_REPEAT_PENALTY: float = 1.1   # was 1.05
+    # presence_penalty toward the high end can cause occasional language mixing
+    # (source tokens leaking back). The pipeline already reverts a post-edit that
+    # raises the source-script fraction (see pipeline.py fraction_untranslated
+    # guard). If language-mixing regressions appear, lower this to ~0.8 BEFORE
+    # touching temperature.
+    QWEN3_TRANSLATION_PRESENCE_PENALTY: float = 1.2  # was 0.5 — card allows up to 1.5
+    QWEN3_TRANSLATION_FREQUENCY_PENALTY: float = 0.3  # token-level loop suppression
 
     # ── Partial GPU offload for the 4B translation model on a small card ──
     # A 4B-q4 model's weights are ~2.5 GB — most of its layers DO fit a 4 GB
@@ -469,7 +485,10 @@ class Settings(BaseSettings):
     # genuine emphasis ("No, no.") is preserved.
     SUBTITLE_INTRA_CUE_DEDUP_ENABLED: bool = True
     # Minimum number of identical back-to-back words before a run is trimmed.
-    SUBTITLE_INTRA_CUE_MIN_WORD_RUN: int = 4
+    # Netflix: "if a word/phrase is repeated twice in a row, translate it only
+    # once." 3 keeps a genuine double ("No, no.") but collapses a 3×+ loop
+    # ("no no no" → "no no").
+    SUBTITLE_INTRA_CUE_MIN_WORD_RUN: int = 3
     # Per-batch time budget (seconds) for the polish loop when it runs on the
     # translation model. The translation model (qwen3:4b) is larger than the
     # editorial model and may run on CPU on a 4 GB card, so its batches are

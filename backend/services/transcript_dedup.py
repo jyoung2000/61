@@ -272,7 +272,54 @@ def _norm_token(t: str) -> str:
     )
 
 
-def _collapse_text_repetition(text: str, *, min_word_run: int = 4, keep_run: int = 2) -> str:
+_SENT_TERMINATORS = (".", "!", "?", "。", "！", "？", "…")
+
+
+def _has_sentence_terminator(surface_words: list) -> bool:
+    """True when any word in the phrase ends a sentence — so a cross-sentence
+    restatement ('Go home. Go home now.') is NOT collapsed as a loop."""
+    for w in surface_words:
+        s = (w or "").rstrip("\"')]}»”’")
+        if s.endswith(_SENT_TERMINATORS):
+            return True
+    return False
+
+
+def _collapse_consecutive_phrase_repeats(words, norm, *, max_phrase=6, min_phrase=2):
+    """Collapse any contiguous phrase (``min_phrase``..``max_phrase`` words) that
+    repeats ≥2× back-to-back ANYWHERE in the line, keeping ONE copy. Returns
+    ``(words, changed)``. Order-preserving; operates on the ORIGINAL surfaces,
+    compares on ``norm``. The repeated unit must be ≥2 words and must not end a
+    sentence (a cross-sentence restatement is left to editorial judgement)."""
+    n = len(words)
+    changed = False
+    i = 0
+    out_w, out_n = [], []
+    while i < n:
+        collapsed = False
+        # Prefer the LONGEST repeating unit at this position.
+        for p in range(min(max_phrase, (n - i) // 2), min_phrase - 1, -1):
+            unit = norm[i:i + p]
+            if not any(unit):           # skip empty / punct-only units
+                continue
+            reps = 1
+            while norm[i + reps * p: i + (reps + 1) * p] == unit:
+                reps += 1
+            if reps >= 2 and not _has_sentence_terminator(words[i:i + p]):
+                out_w.extend(words[i:i + p])   # keep ONE copy (original surfaces)
+                out_n.extend(norm[i:i + p])
+                i += reps * p
+                changed = True
+                collapsed = True
+                break
+        if not collapsed:
+            out_w.append(words[i])
+            out_n.append(norm[i])
+            i += 1
+    return out_w, changed
+
+
+def _collapse_text_repetition(text: str, *, min_word_run: int = 3, keep_run: int = 2) -> str:
     """Collapse repetition WITHIN a single line of text. Conservative.
 
     1. Whole-line phrase loop: when the line is the SAME phrase repeated k≥2
@@ -291,8 +338,19 @@ def _collapse_text_repetition(text: str, *, min_word_run: int = 4, keep_run: int
     if n < 2:
         return text
 
-    # ── Rule 1: whole-line phrase periodicity ──
     norm = [_norm_token(w) for w in words]
+
+    # ── Rule 0: consecutive repeated PHRASE anywhere in the line ──
+    # Catches the dominant 4B failure mode the tiling/single-word rules miss: a
+    # repeated phrase with a trailing tail ("I will protect you I will protect
+    # you no matter what" → "I will protect you no matter what").
+    words2, ph_changed = _collapse_consecutive_phrase_repeats(words, norm)
+    if ph_changed:
+        words = words2
+        norm = [_norm_token(w) for w in words]
+        n = len(words)
+
+    # ── Rule 1: whole-line phrase periodicity ──
     for p in range(2, n // 2 + 1):
         if n % p != 0:
             continue
@@ -304,7 +362,7 @@ def _collapse_text_repetition(text: str, *, min_word_run: int = 4, keep_run: int
     # ── Rule 2: immediate identical-word runs ──
     out: list[str] = []
     i = 0
-    changed = False
+    changed = ph_changed
     while i < n:
         j = i + 1
         while j < n and norm[j] == norm[i] and norm[i] != "":
@@ -323,7 +381,7 @@ def collapse_intra_cue_repetition(
     segments: list,
     text_key: str = "text",
     *,
-    min_word_run: int = 4,
+    min_word_run: int = 3,
     keep_run: int = 2,
 ) -> tuple[list, int]:
     """Clean repetition INSIDE individual cues — the artifact the cross-cue
