@@ -56,6 +56,44 @@ def _is_vision(name: str) -> bool:
     return any(h in n for h in _VISION_HINTS)
 
 
+def _total_vram_gb() -> float:
+    """Total CUDA VRAM in GiB (0.0 when no GPU / torch unavailable). Used to
+    decide whether a 4B editorial model can actually fit this card."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            props = torch.cuda.get_device_properties(0)
+            return props.total_memory / 1_073_741_824
+    except Exception:
+        pass
+    return 0.0
+
+
+def _effective_editorial_max_params_b() -> float:
+    """Resolve the editorial param cap, VRAM-aware.
+
+    A 4B-q4 model OOMs on a 4 GB card during the editorial stage, so on a GPU
+    smaller than ``OFFLINE_EDITORIAL_SMALL_GPU_GB`` the cap is lowered to
+    ``OFFLINE_EDITORIAL_SMALL_GPU_MAX_PARAMS_B`` (default 3B) so auto-selection
+    never picks a model that can't run on the GPU. When VRAM can't be detected
+    (0.0) the configured cap is kept unchanged (no false downscoping in CPU /
+    headless / non-CUDA environments)."""
+    configured = float(getattr(settings, "OFFLINE_EDITORIAL_MAX_PARAMS_B", 4.0))
+    small_gb = float(getattr(settings, "OFFLINE_EDITORIAL_SMALL_GPU_GB", 5.5))
+    small_cap = float(getattr(settings, "OFFLINE_EDITORIAL_SMALL_GPU_MAX_PARAMS_B", 3.0))
+    if small_gb <= 0:
+        return configured
+    total = _total_vram_gb()
+    if 0.0 < total < small_gb:
+        eff = min(configured, small_cap)
+        if eff < configured:
+            logger.info(
+                "Editorial model cap lowered to %.1fB (only %.1f GB VRAM < %.1f GB "
+                "— a 4B model OOMs and would run on CPU)", eff, total, small_gb)
+        return eff
+    return configured
+
+
 def _norm_ollama_name(name: str) -> str:
     """Normalize an Ollama tag for comparison: drop an ``ollama/`` prefix and a
     redundant ``:latest`` suffix, lowercase. Distinct size/quant tags stay
@@ -125,7 +163,9 @@ def rank_local_editorial_models(
     parsable size are kept but rank below sized ones.
     """
     if max_params_b is None:
-        max_params_b = float(getattr(settings, "OFFLINE_EDITORIAL_MAX_PARAMS_B", 4.0))
+        # VRAM-aware: on a small card (≤ OFFLINE_EDITORIAL_SMALL_GPU_GB) this
+        # resolves to the 3B cap so a 4B model that would OOM/CPU isn't picked.
+        max_params_b = _effective_editorial_max_params_b()
 
     candidates = []
     for name in model_names or []:

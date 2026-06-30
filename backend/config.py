@@ -347,6 +347,17 @@ class Settings(BaseSettings):
     # never pick one that would spill off the 4 GB 1650 onto the CPU. The dropdown
     # picks still apply when Offline Mode is off.
     OFFLINE_EDITORIAL_MAX_PARAMS_B: float = 4.0
+    # VRAM-aware editorial cap. A 4B-q4 model's weights (~2.5 GB) + its CUDA
+    # compute buffer (~2.5 GB) exceed the ~2.5 GB free on a 4 GB card during the
+    # editorial stage, so it OOMs and runs on CPU — making per-clip SEO/summaries
+    # crawl and stall the job. On cards with LESS total VRAM than
+    # OFFLINE_EDITORIAL_SMALL_GPU_GB, the editorial auto-selection cap is lowered
+    # to OFFLINE_EDITORIAL_SMALL_GPU_MAX_PARAMS_B so it picks a model that fits
+    # the GPU (e.g. qwen2.5:3b). Translation can still use a larger model via
+    # OLLAMA_TRANSLATION_MODEL (a single pass, not per-clip). Set the GB floor to
+    # 0 to disable the VRAM-aware downscope.
+    OFFLINE_EDITORIAL_SMALL_GPU_GB: float = 5.5
+    OFFLINE_EDITORIAL_SMALL_GPU_MAX_PARAMS_B: float = 3.0
     # When the cloud editorial chain is exhausted (e.g. an OpenRouter "Key limit
     # exceeded" 403), fall back to the local Ollama model for editorial tasks
     # (summary/SEO/polish/translation + the clip-scoring judge) so a run still
