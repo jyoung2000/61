@@ -531,6 +531,20 @@ def _resolve_translation_model_override(orchestrator) -> Optional[str]:
     return xlate
 
 
+def _resolve_polish_model_override(orchestrator) -> Optional[str]:
+    """The model subtitle polishing should run on.
+
+    Polishing belongs to the SUBTITLE pipeline, so by default it runs on the
+    dedicated translation model (the multilingual model that also translates the
+    subtitles) — making the translation AI the single brain that owns subtitles
+    end-to-end, while the editorial model stays reserved for SEO + summaries.
+    Returns None (→ editorial model, legacy behavior) when the flag is off or no
+    separate translation model is configured."""
+    if not getattr(settings, "SUBTITLE_POLISH_USES_TRANSLATION_MODEL", True):
+        return None
+    return _resolve_translation_model_override(orchestrator)
+
+
 async def translate_subtitles(segments, source_lang, target_lang, *, video_path=None,
                               glossary=None, orchestrator=None, status_callback=None,
                               job_id=None, whisper_timeout=None, nmt_timeout=None):
@@ -1798,8 +1812,14 @@ async def _polish_transcript_loop(
     orchestrator,
     correction_lang: str,
     mode: str = "asr",
+    model_override: Optional[str] = None,
 ) -> tuple[list, Optional[dict]]:
     """Run the LLM polish + readability loop on a transcript.
+
+    ``model_override`` pins the polish LLM to a specific model — the subtitle
+    pipeline passes the dedicated translation model so polishing runs on the
+    translation AI (not the editorial model, which is reserved for SEO +
+    summaries). None uses the editorial model.
 
     Returns ``(polished_models, best_readability_report)``. On any
     failure, returns ``(original_as_models, None)`` so callers can
@@ -1847,12 +1867,20 @@ async def _polish_transcript_loop(
     _batch_size = _adaptive_batch_size(len(polished_models))
     _total_batches = -(-len(polished_models) // _batch_size)
     _per_batch = 150 if _polish_info.get("is_thinking") else 90
+    # When polishing runs on the (larger) translation model it may sit on CPU on
+    # a small card, so its batches are slower — widen the per-batch budget so a
+    # slow-but-progressing batch isn't killed and dropped to raw text.
+    if model_override:
+        _per_batch = max(
+            _per_batch,
+            int(getattr(settings, "SUBTITLE_POLISH_TRANSLATION_SECONDS_PER_BATCH", 180)),
+        )
     _estimated_time = (_total_batches * _per_batch) * 1.5
     _correction_timeout = max(180, min(1800, int(_estimated_time) + 60))
     logger.info(
-        "[%s] Polishing timeout: %ds (segments=%d, batches=%d, per_batch=%ds, lang=%s)",
+        "[%s] Polishing timeout: %ds (segments=%d, batches=%d, per_batch=%ds, lang=%s, model=%s)",
         job_id, _correction_timeout, len(polished_models), _total_batches,
-        _per_batch, correction_lang or "auto",
+        _per_batch, correction_lang or "auto", model_override or "editorial",
     )
 
     target_score = float(getattr(settings, "TRANSCRIPT_READABILITY_TARGET", 90.0))
@@ -1868,6 +1896,7 @@ async def _polish_transcript_loop(
                     job_id=job_id,
                     language=correction_lang,
                     mode=mode,
+                    model_override=model_override,
                 ),
                 timeout=_correction_timeout,
             )
@@ -2147,6 +2176,7 @@ async def _background_post_processing(
             # assume around (the reframer always transcribes, never translates).
             polished_models, best_report = await _polish_transcript_loop(
                 job_id, transcript, orchestrator, source_lang,
+                model_override=_resolve_polish_model_override(orchestrator),
             )
             polished_dicts = [
                 p.model_dump() if hasattr(p, "model_dump") else dict(p)
@@ -2509,6 +2539,7 @@ async def _background_post_processing(
                             job_id=job_id, language=target_lang,
                             source_texts=_src_texts, source_language=source_lang,
                             mode="translation",
+                            model_override=_resolve_polish_model_override(orchestrator),
                         ),
                         timeout=max(600, len(translated) * 8),
                     )
@@ -4271,6 +4302,7 @@ async def _run_analysis_inner(job_id: str):
             _correction_lang = (_detected_lang or "").lower()
             _polished_models, _polish_report = await _polish_transcript_loop(
                 job_id, transcript, orchestrator, _correction_lang,
+                model_override=_resolve_polish_model_override(orchestrator),
             )
             if _polished_models:
                 transcript = [
@@ -4712,7 +4744,8 @@ async def _run_analysis_inner(job_id: str):
                 "source transcript as a last resort", job_id)
             try:
                 _src_models, _ = await _polish_transcript_loop(
-                    job_id, list(transcript), orchestrator, _bg_source)
+                    job_id, list(transcript), orchestrator, _bg_source,
+                    model_override=_resolve_polish_model_override(orchestrator))
                 if _src_models:
                     transcript = [
                         m.model_dump() if hasattr(m, "model_dump") else dict(m)

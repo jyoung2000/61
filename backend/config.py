@@ -429,6 +429,24 @@ class Settings(BaseSettings):
     # pass-through is used (the legacy behavior).
     TRANSCRIPT_POLISHING_ENABLED: bool = True
     TRANSCRIPT_POLISHING_BATCH_SIZE: int = 15   # segments per LLM call
+    # Subtitle polishing is part of the SUBTITLE pipeline, not the editorial
+    # pipeline. When True (default), the transcript/subtitle polish + MT
+    # post-edit run on the dedicated translation model
+    # (``OLLAMA_TRANSLATION_MODEL`` / ``OPENROUTER_TRANSLATION_MODEL`` — e.g.
+    # qwen3:4b-instruct-2507, the multilingual model that also does the
+    # translation) so the translation AI is the single brain that owns the
+    # subtitles end-to-end (translate → polish). The editorial model
+    # (``OLLAMA_EDITORIAL_MODEL`` — qwen2.5:3b) is then reserved for SEO +
+    # summaries only. Falls back to the editorial model automatically when no
+    # separate translation model is configured (e.g. cloud mode where they're
+    # the same). Set False to restore polishing on the editorial model.
+    SUBTITLE_POLISH_USES_TRANSLATION_MODEL: bool = True
+    # Per-batch time budget (seconds) for the polish loop when it runs on the
+    # translation model. The translation model (qwen3:4b) is larger than the
+    # editorial model and may run on CPU on a 4 GB card, so its batches are
+    # slower — give the polish timeout more headroom than the editorial estimate
+    # so a slow-but-progressing CPU batch isn't killed and dropped to raw text.
+    SUBTITLE_POLISH_TRANSLATION_SECONDS_PER_BATCH: int = 180
     # Task 6 — transcription polish parity. When a job translates, the heavy
     # readability polish runs on the TARGET text after translation; by default
     # the SOURCE transcript was left raw before translation. Cloud transcripts

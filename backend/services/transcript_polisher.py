@@ -696,8 +696,13 @@ async def _polish_batch(
     glossary_terms: Optional[list[str]] = None,
     source_texts: Optional[list[str]] = None,
     mode: str = "asr",
+    model_override: Optional[str] = None,
 ) -> Optional[list[Optional[str]]]:
-    """Polish a single batch via the editorial LLM.
+    """Polish a single batch via the polish LLM.
+
+    ``model_override`` routes the call to a specific model (the dedicated
+    translation model for subtitle polishing) instead of the editorial model;
+    None keeps the editorial model.
 
     Returns ``None`` when the whole batch is unusable (LLM error, or a response
     that can't be parsed as a JSON array of the right length). Otherwise returns
@@ -710,7 +715,8 @@ async def _polish_batch(
     system_prompt = _SYSTEM_PROMPT_TRANSLATION if mode == "translation" else _SYSTEM_PROMPT
     full_prompt = f"[SYSTEM]\n{system_prompt}\n\n[USER]\n{user_prompt}"
     try:
-        response = await orchestrator.text_completion(full_prompt, timeout=timeout)
+        response = await orchestrator.text_completion(
+            full_prompt, timeout=timeout, model_override=model_override)
     except Exception as e:
         logger.warning("transcript polishing: LLM call failed: %s", e)
         return None
@@ -894,8 +900,14 @@ async def correct_transcript(
     source_texts: Optional[list[str]] = None,
     source_language: str = "",
     mode: str = "asr",
+    model_override: Optional[str] = None,
 ) -> list:
-    """Polish a transcript using the editorial LLM in batches.
+    """Polish a transcript using the polish LLM in batches.
+
+    ``model_override`` pins every batch to a specific model — used so subtitle
+    polishing runs on the dedicated translation model (the multilingual model
+    that also translates) rather than the editorial model, which stays reserved
+    for SEO + summaries. None keeps the editorial model (legacy behavior).
 
     ``mode='translation'`` post-edits an already-translated draft toward natural,
     professional subtitles (aggressive on fluency, strict on meaning + timing,
@@ -975,6 +987,7 @@ async def correct_transcript(
             orchestrator, batch, ctx_before, ctx_after,
             language=language, timeout=timeout_per_batch,
             glossary_terms=glossary_terms, source_texts=batch_src, mode=mode,
+            model_override=model_override,
         )
 
         for i, (view, orig_obj) in enumerate(batch_pairs):
