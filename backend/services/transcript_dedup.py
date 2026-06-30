@@ -263,6 +263,90 @@ def collapse_repeated_runs(
     return [s for j, s in enumerate(segs) if not drop[j]], sum(drop)
 
 
+def _norm_token(t: str) -> str:
+    """Lowercased, punctuation-stripped token for repetition comparison."""
+    import unicodedata
+    return "".join(
+        ch for ch in (t or "").lower()
+        if not unicodedata.category(ch).startswith("P")
+    )
+
+
+def _collapse_text_repetition(text: str, *, min_word_run: int = 4, keep_run: int = 2) -> str:
+    """Collapse repetition WITHIN a single line of text. Conservative.
+
+    1. Whole-line phrase loop: when the line is the SAME phrase repeated k≥2
+       times back-to-back, keep ONE copy — "I will protect you I will protect
+       you" → "I will protect you". The repeating unit must be ≥2 words (a
+       single repeated word is handled by rule 2) so genuine short emphasis
+       ("Bye bye") is untouched.
+    2. Immediate identical-word run of ≥``min_word_run`` copies → keep
+       ``keep_run`` — "no no no no no" → "no no" — protecting legitimate
+       doubling ("No, no.")."""
+    raw = (text or "").strip()
+    if not raw:
+        return text
+    words = raw.split()
+    n = len(words)
+    if n < 2:
+        return text
+
+    # ── Rule 1: whole-line phrase periodicity ──
+    norm = [_norm_token(w) for w in words]
+    for p in range(2, n // 2 + 1):
+        if n % p != 0:
+            continue
+        unit = norm[:p]
+        if all(norm[i:i + p] == unit for i in range(0, n, p)) and unit != [""] * p:
+            # Keep the first occurrence's ORIGINAL words (with its punctuation).
+            return " ".join(words[:p])
+
+    # ── Rule 2: immediate identical-word runs ──
+    out: list[str] = []
+    i = 0
+    changed = False
+    while i < n:
+        j = i + 1
+        while j < n and norm[j] == norm[i] and norm[i] != "":
+            j += 1
+        run = j - i
+        if run >= min_word_run:
+            out.extend(words[i:i + keep_run])
+            changed = True
+        else:
+            out.extend(words[i:j])
+        i = j
+    return " ".join(out) if changed else raw
+
+
+def collapse_intra_cue_repetition(
+    segments: list,
+    text_key: str = "text",
+    *,
+    min_word_run: int = 4,
+    keep_run: int = 2,
+) -> tuple[list, int]:
+    """Clean repetition INSIDE individual cues — the artifact the cross-cue
+    dedup passes can't see: one translated line that reads "I will protect you
+    I will protect you" or "no no no no no no" (a small LLM duplicating its own
+    output). Markers ("[♪ music ♪]") are left untouched. Order-preserving;
+    timing/word fields are untouched. Returns ``(segments, changed_count)``."""
+    out: list = []
+    changed = 0
+    for seg in segments or []:
+        raw = (_seg_get(seg, text_key, "") or "")
+        if not raw.strip() or _is_marker_text(raw):
+            out.append(seg)
+            continue
+        cleaned = _collapse_text_repetition(
+            raw, min_word_run=min_word_run, keep_run=keep_run)
+        if cleaned != raw.strip() and cleaned != raw:
+            _seg_set(seg, text_key, cleaned)
+            changed += 1
+        out.append(seg)
+    return out, changed
+
+
 def _seg_get(seg, key, default=None):
     if isinstance(seg, dict):
         return seg.get(key, default)

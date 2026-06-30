@@ -2217,21 +2217,27 @@ async def _background_post_processing(
         try:
             from backend.services.transcript_dedup import (
                 collapse_adjacent_duplicates, drop_repetition_loops,
-                collapse_overlapping_duplicates,
+                collapse_overlapping_duplicates, collapse_intra_cue_repetition,
             )
             _src = [
                 t.model_dump() if hasattr(t, "model_dump") else dict(t)
                 for t in transcript
             ]
             _pre = len(_src)
+            _ic = 0
+            if getattr(settings, "SUBTITLE_INTRA_CUE_DEDUP_ENABLED", True):
+                _src, _ic = collapse_intra_cue_repetition(
+                    _src,
+                    min_word_run=int(getattr(settings, "SUBTITLE_INTRA_CUE_MIN_WORD_RUN", 4)),
+                )
             _src, _a = collapse_adjacent_duplicates(_src)
             _src, _o = collapse_overlapping_duplicates(_src)
             _src, _l = drop_repetition_loops(_src)
-            if _a or _o or _l:
+            if _a or _o or _l or _ic:
                 logger.info(
                     "[%s] Source transcript dedup (translation %s): %d → %d "
-                    "(%d adjacent, %d overlapping, %d repetition-loop)",
-                    job_id, "skipped/failed", _pre, len(_src), _a, _o, _l,
+                    "(%d adjacent, %d overlapping, %d repetition-loop, %d intra-cue)",
+                    job_id, "skipped/failed", _pre, len(_src), _a, _o, _l, _ic,
                 )
                 transcript = _src
                 await database.update_job_status(job_id, transcript=_src)
@@ -2690,11 +2696,20 @@ async def _background_post_processing(
                 from backend.services.transcript_dedup import (
                     collapse_adjacent_duplicates, drop_repetition_loops,
                     collapse_overlapping_duplicates, drop_scattered_duplicates,
-                    collapse_repeated_runs,
+                    collapse_repeated_runs, collapse_intra_cue_repetition,
                 )
                 _tl = [t.model_dump() if hasattr(t, "model_dump") else dict(t) for t in translated]
                 _pre_dd = len(_tl)
                 _r = 0
+                _ic = 0
+                # Clean repetition WITHIN a cue first (a line the translator
+                # duplicated against itself), so the cross-cue passes then see
+                # the cleaned text.
+                if getattr(settings, "SUBTITLE_INTRA_CUE_DEDUP_ENABLED", True):
+                    _tl, _ic = collapse_intra_cue_repetition(
+                        _tl,
+                        min_word_run=int(getattr(settings, "SUBTITLE_INTRA_CUE_MIN_WORD_RUN", 4)),
+                    )
                 if _used_whisper_native or _used_llm:
                     # Block-level safety net: drop a whole run of cues that
                     # reappears later (a source double-pass that survived into the
@@ -2724,10 +2739,10 @@ async def _background_post_processing(
                     _tl, _s = drop_scattered_duplicates(_tl)
                     _tl, _l = drop_repetition_loops(_tl)
                 translated = _tl
-                if _a or _o or _l or _s or _r:
+                if _a or _o or _l or _s or _r or _ic:
                     logger.info(
-                        "[%s] Translated transcript dedup: %d → %d (%d run, %d adj, %d overlap, %d loop, %d scattered)",
-                        job_id, _pre_dd, len(translated), _r, _a, _o, _l, _s)
+                        "[%s] Translated transcript dedup: %d → %d (%d run, %d adj, %d overlap, %d loop, %d scattered, %d intra-cue)",
+                        job_id, _pre_dd, len(translated), _r, _a, _o, _l, _s, _ic)
             except Exception as _dd_err:
                 logger.warning("[%s] Translated dedup skipped (%s)", job_id, _dd_err)
 

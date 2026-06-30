@@ -461,6 +461,15 @@ class Settings(BaseSettings):
     # separate translation model is configured (e.g. cloud mode where they're
     # the same). Set False to restore polishing on the editorial model.
     SUBTITLE_POLISH_USES_TRANSLATION_MODEL: bool = True
+    # Clean repetition INSIDE a single cue (the cross-cue dedup passes only see
+    # whole-cue duplicates). Catches a small LLM duplicating its own output in
+    # one line ("I will protect you I will protect you") or a stutter loop
+    # ("no no no no no"). Conservative: a repeated unit must be ≥2 words, and a
+    # single-word run must hit the threshold below before it's trimmed, so
+    # genuine emphasis ("No, no.") is preserved.
+    SUBTITLE_INTRA_CUE_DEDUP_ENABLED: bool = True
+    # Minimum number of identical back-to-back words before a run is trimmed.
+    SUBTITLE_INTRA_CUE_MIN_WORD_RUN: int = 4
     # Per-batch time budget (seconds) for the polish loop when it runs on the
     # translation model. The translation model (qwen3:4b) is larger than the
     # editorial model and may run on CPU on a 4 GB card, so its batches are

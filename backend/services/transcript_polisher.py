@@ -88,6 +88,9 @@ _SYSTEM_PROMPT_TRANSLATION = (
     "You MUST NOT: re-translate into a different language; change the meaning of "
     "a line; add information not in the source/draft; merge or split lines; "
     "reorder lines; or change timing.\n\n"
+    "Aim for BROADCAST subtitle quality (Netflix / professional YouTube): every "
+    "line must read as fluent, natural target language a native speaker would "
+    "say — never word-for-word or machine-literal.\n\n"
     "STRICT RULES (must follow every time):\n"
     "1. Return EXACTLY the same number of lines you receive, in order — one "
     "rewritten line per input segment. Never merge or split.\n"
@@ -95,8 +98,14 @@ _SYSTEM_PROMPT_TRANSLATION = (
     "source-language words (except proper nouns with no target form).\n"
     "3. Preserve the meaning of every line. When unsure, keep the draft.\n"
     "4. Never change timing — those fields are not in your output.\n"
-    "5. Return ONLY a JSON array of strings, no preamble, no markdown.\n"
-    "6. The array length must equal the input segment count.\n"
+    "5. NEVER repeat a phrase within a line ('I will go I will go') and NEVER "
+    "duplicate the previous line's text — if a line would just echo its "
+    "neighbour, rephrase it to carry the line's own meaning.\n"
+    "6. No stutter or filler runs ('no no no no', 'the the') — write the clean, "
+    "natural phrasing a professional subtitler would use.\n"
+    "7. Each line should be a coherent, complete thought, not a choppy fragment.\n"
+    "8. Return ONLY a JSON array of strings, no preamble, no markdown.\n"
+    "9. The array length must equal the input segment count.\n"
 )
 
 # Friendly target-language names for the MTPE prompt (ISO 639-1 → English name).

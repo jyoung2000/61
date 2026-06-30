@@ -1169,6 +1169,18 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                 "repeat_penalty": 1.15,  # Penalize repetitive phrasing
             },
         }
+        # Qwen3 is the subtitle TRANSLATION / POLISH model. It repeats without a
+        # presence penalty, and subtitle work wants determinism (faithful, stable
+        # phrasing), so swap the diverse editorial sampling for Qwen3's tuned
+        # low-temperature + presence/repeat-penalty profile. Editorial (qwen2.5)
+        # is not Qwen3, so its high-diversity sampling above is unchanged.
+        try:
+            from backend.services.local_models import qwen3_translation_options
+            _q3 = qwen3_translation_options(self._editorial_model)
+            if _q3:
+                payload["options"].update(_q3)
+        except Exception:
+            pass
         if json_mode:
             payload["format"] = "json"
 
