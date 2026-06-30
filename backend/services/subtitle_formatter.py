@@ -189,6 +189,12 @@ def _smart_split(text: str, max_chars: int, max_lines: int = 2) -> str:
         # Balance bonus — closer to centre is better.
         balance_penalty = abs(len(left) - target) / max(1, target)
         score -= balance_penalty
+        # Netflix prefers a BOTTOM-HEAVY shape: the top line should be no longer
+        # than the bottom line. Small tiebreak so a punctuation/clause boundary
+        # still wins, but between otherwise-equal cuts the top-shorter one is
+        # chosen ("shorter line on top" reads better and stays clear of subjects).
+        if len(left) <= len(right):
+            score += 0.5
 
         if score > best_score:
             best_score = score
@@ -203,7 +209,11 @@ def _smart_split(text: str, max_chars: int, max_lines: int = 2) -> str:
 
 
 def _greedy_wrap(words: list[str], max_chars: int, max_lines: int) -> str:
-    """Last-resort word wrap when smart split can't satisfy constraints."""
+    """Last-resort word wrap when smart split can't satisfy constraints.
+
+    Even here we avoid ending a line on a bare article/preposition (``the``,
+    ``of`` …): such a word is pushed down to the next line so it stays with its
+    noun, matching the smart-split guard rather than only the scored path."""
     lines: list[str] = []
     current = ""
     for w in words:
@@ -220,10 +230,31 @@ def _greedy_wrap(words: list[str], max_chars: int, max_lines: int) -> str:
                 # still violates CPS.
                 rest = [current] + words[words.index(w) + 1:]
                 lines.append(" ".join(rest))
-                return "\n".join(lines)
+                return _fix_trailing_function_words("\n".join(lines), max_chars)
     if current:
         lines.append(current)
-    return "\n".join(lines[:max_lines])
+    return _fix_trailing_function_words("\n".join(lines[:max_lines]), max_chars)
+
+
+def _fix_trailing_function_words(wrapped: str, max_chars: int) -> str:
+    """Move a line-final article/preposition to the start of the next line when
+    it fits — so a wrap never strands ``the``/``of``/``to`` away from its noun.
+    No-op when there's no next line or the move would overflow it."""
+    lines = wrapped.split("\n")
+    if len(lines) < 2:
+        return wrapped
+    for i in range(len(lines) - 1):
+        toks = lines[i].split()
+        if len(toks) < 2:
+            continue
+        last = toks[-1].lower().rstrip(",.;:!?")
+        if last in _NO_TRAILING:
+            moved = toks[-1]
+            cand_next = (moved + " " + lines[i + 1]).strip()
+            if len(cand_next) <= max_chars:
+                lines[i] = " ".join(toks[:-1])
+                lines[i + 1] = cand_next
+    return "\n".join(lines)
 
 
 # ── Sentence / clause boundary detection for over-CPS splitting ──────────
