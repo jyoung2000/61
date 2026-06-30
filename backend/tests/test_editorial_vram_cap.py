@@ -53,3 +53,10 @@ def test_rank_respects_explicit_cap_unchanged():
     ranked = LM.rank_local_editorial_models(
         ["qwen3:4b-instruct-2507-q4_K_M", "qwen2.5:3b-instruct"], max_params_b=4.0)
     assert ranked[0] == "qwen3:4b-instruct-2507-q4_K_M"
+
+
+def test_qwen35_outranks_qwen3_in_same_tier():
+    # Task 6: a qwen3.5 refresh beats qwen3-2507 within the 4B tier.
+    ranked = LM.rank_local_editorial_models(
+        ["qwen3:4b-instruct-2507-q4_K_M", "qwen3.5:4b-instruct"], max_params_b=4.0)
+    assert ranked[0] == "qwen3.5:4b-instruct"

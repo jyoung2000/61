@@ -126,6 +126,11 @@ def _recency_bonus(name: str) -> int:
     refresh we want auto-selection to prefer over a plain '-instruct' tag."""
     n = name.lower()
     bonus = 0
+    # A newer Qwen minor refresh (qwen3.5) beats qwen3 within the same size tier
+    # — it shares the ~2.5 GB Q4 footprint so the partial-offload ladder handles
+    # it identically. Outscores the 2507 bump so a 3.5 build wins when present.
+    if "qwen3.5" in n or "qwen-3.5" in n:
+        bonus += 4
     if "2507" in n:
         bonus += 2
     if "instruct" in n:
