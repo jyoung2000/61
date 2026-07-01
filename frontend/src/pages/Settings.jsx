@@ -46,6 +46,7 @@ const WHISPER_FALLBACK_MODELS = [
   { id: 'medium', hint: 'high accuracy, fits 4 GB (~769M)' },
   { id: 'large-v3', hint: 'best accuracy, tight on 4 GB (~1.5B)' },
   { id: 'large-v3-turbo', hint: 'near large-v3, 40% faster (~809M)' },
+  { id: 'kotoba-tech/kotoba-whisper-v2.0-faster', hint: 'Japanese-specialized, fits 4 GB (~756M)' },
   { id: 'distil-small.en', hint: 'English-only, very fast (~166M)', english_only: true },
   { id: 'distil-medium.en', hint: 'English-only, fast (~394M)', english_only: true },
   { id: 'distil-large-v3', hint: 'distilled large-v3, 6× faster (~756M)' },

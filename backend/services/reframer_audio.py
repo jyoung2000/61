@@ -367,6 +367,10 @@ class AudioIntelligence:
             # batched-inference workspace; a runtime OOM still falls back to CPU.
             ('large-v3-turbo','float16'):       1.8,
             ('large-v3-turbo','int8_float16'):  1.0,
+            # Kotoba-Whisper v2.0 (Japanese-specialized, distilled ~756M) — same
+            # footprint class as distil/turbo.
+            ('kotoba-tech/kotoba-whisper-v2.0-faster', 'float16'):      1.8,
+            ('kotoba-tech/kotoba-whisper-v2.0-faster', 'int8_float16'): 1.0,
             ('medium',        'float16'):       1.6,
             ('medium',        'int8_float16'):  0.85,
             ('small',         'float16'):       1.0,
@@ -667,6 +671,8 @@ class AudioIntelligence:
                             ('large-v3', 'int8_float16'): 1.6,
                             ('large-v3-turbo', 'float16'):      1.8,
                             ('large-v3-turbo', 'int8_float16'): 1.0,
+                            ('kotoba-tech/kotoba-whisper-v2.0-faster', 'float16'):      1.8,
+                            ('kotoba-tech/kotoba-whisper-v2.0-faster', 'int8_float16'): 1.0,
                             ('medium',   'float16'):      1.6,
                             ('medium',   'int8_float16'): 0.85,
                             ('small',    'float16'):      1.0,
