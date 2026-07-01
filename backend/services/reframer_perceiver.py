@@ -137,6 +137,7 @@ class Perceiver:
         self._prev_hotspot_cy = None
         self._prev_sal_cx = None   # temporal EMA state for the saliency hotspot
         self._prev_sal_cy = None
+        self._saliency_source_counts = {}  # {'u2netp+stack': n, 'spectral+stack': n, ...}
 
         # ════════════════════════════════════════════════════════════════
         #  YOLO-World Auto-Discovery Pass
@@ -470,6 +471,7 @@ class Perceiver:
                 # content type without genre-specific tuning.
                 if not person_bboxes:
                     try:
+                        _used_u2net = False  # saliency-source telemetry (item 8)
                         # Spectral residual: FFT → log amplitude → smooth → residual → IFFT
                         sal_size = 128  # higher res = better object localization
                         sal_gray = cv2.resize(gray_small, (sal_size, sal_size))
@@ -500,6 +502,7 @@ class Perceiver:
                                 _u2 = u2net_saliency(small_bgr, sal_size)
                                 if _u2 is not None:
                                     sal_map = _u2
+                                    _used_u2net = True
                             except Exception:
                                 pass
                         # ── Text/watermark saliency suppression ──
@@ -575,9 +578,18 @@ class Perceiver:
                             self._prev_sal_cy = sal_cy
 
                         if sal_intensity > 0.10:
+                            # Saliency-source telemetry: which model produced
+                            # this hotspot, so an offline reviewer can see when
+                            # u2netp fired vs the spectral stack vs raw spectral.
+                            _sal_src = 'u2netp' if _used_u2net else 'spectral'
+                            if getattr(settings, 'REFRAMER_SALIENCY_STACK', True):
+                                _sal_src += '+stack'
+                            self._saliency_source_counts[_sal_src] = \
+                                self._saliency_source_counts.get(_sal_src, 0) + 1
                             r.saliency_hotspot[time_ms] = {
                                 'cx': sal_cx, 'cy': sal_cy,
                                 'intensity': round(sal_intensity, 4),
+                                'source': _sal_src,
                             }
                     except Exception:
                         pass  # Saliency is optional — never crash the pipeline
@@ -714,6 +726,10 @@ class Perceiver:
                        detection_resolution=f'{det_w}x{det_h}',
                        source_fps=r.fps,
                        duration_sec=round(r.duration_ms / 1000, 2))
+
+        # Expose saliency-source telemetry so the engine can emit a trace
+        # summary (u2netp vs spectral-stack vs spectral usage over the clip).
+        r.saliency_source_counts = dict(self._saliency_source_counts)
 
         return r
 

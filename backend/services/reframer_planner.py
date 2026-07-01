@@ -105,6 +105,7 @@ class Planner:
         self._euro_filter = None
         self._prev_raw_target = None
         self._prev_raw_target_t = None
+        self._filter_trace = {}
 
     def generate(self) -> RenderPlan:
         log = get_logger()
@@ -1258,6 +1259,8 @@ class Planner:
         """
         t_s = t / 1000.0
         raw = int(target_x)
+        _lead_px = 0.0   # telemetry: applied lead-room (px)
+        _v_hat = 0.0     # telemetry: estimated subject velocity (px/s)
 
         # ── (1) Anticipatory lead-room ──
         if getattr(settings, 'REFRAMER_LEAD_ROOM', True) and not switching:
@@ -1270,6 +1273,7 @@ class Planner:
                 dt = t_s - self._prev_raw_target_t
                 if dt > 1e-3:
                     v = (raw - self._prev_raw_target) / dt  # px/s
+                    _v_hat = v
                     # Normalize by a "brisk pan" reference (~1 crop width/sec).
                     v_norm = v / max(1.0, self.crop_w)
                     lead += math.tanh(v_norm) * max_lead
@@ -1284,6 +1288,7 @@ class Planner:
                 except Exception:
                     pass
             lead = max(-max_lead, min(max_lead, lead))
+            _lead_px = lead
             target_x = int(round(raw + lead))
 
         # Record the RAW (pre-lead, pre-filter) target for the next velocity est.
@@ -1292,13 +1297,29 @@ class Planner:
 
         target_x = clamp_x(target_x, self.max_x)
 
+        def _finish(filtered: int, filter_name: str) -> int:
+            # Per-sample filter telemetry, batched to the trace at scene exit
+            # (see _flush_filter_trace) so the inner loop stays clean.
+            if self.tracer.enabled:
+                self._filter_trace[t] = {
+                    'raw_x': raw,
+                    'lead_px': round(float(_lead_px), 1),
+                    'v_hat': round(float(_v_hat), 1),
+                    'filtered_x': int(filtered),
+                    'filter': filter_name,
+                    'yaw': (round(float(anchor_yaw), 3)
+                            if anchor_yaw is not None else None),
+                    'switching': bool(switching),
+                }
+            return filtered
+
         # ── (2) Smooth ──
         if switching:
             # Cut: snap the filter to the new position.
             if self._euro_filter is not None:
                 self._euro_filter.reset()
             self._ema_target = target_x
-            return target_x
+            return _finish(target_x, 'cut')
 
         if getattr(settings, 'REFRAMER_ONE_EURO_FILTER', True):
             if self._euro_filter is None:
@@ -1310,7 +1331,7 @@ class Planner:
                 )
             filtered = clamp_x(int(round(self._euro_filter(target_x, t=t_s))), self.max_x)
             self._ema_target = filtered  # keep legacy state coherent for callers
-            return filtered
+            return _finish(filtered, 'one_euro')
 
         # Legacy fixed-band velocity-adaptive EMA.
         if not hasattr(self, '_ema_target') or self._ema_target is None:
@@ -1328,7 +1349,7 @@ class Planner:
             self._ema_target = clamp_x(
                 int(ema_alpha * target_x + (1 - ema_alpha) * self._ema_target),
                 self.max_x)
-        return self._ema_target
+        return _finish(self._ema_target, 'ema')
 
     def _decide_adaptive(self, start: int, end: int, params: AdaptiveParams,
                          scene_idx: int = -1) -> List[dict]:
@@ -1355,6 +1376,7 @@ class Planner:
         self._euro_filter = None
         self._prev_raw_target = None
         self._prev_raw_target_t = None
+        self._filter_trace = {}  # t_ms -> filter decision detail (trace, item 2/6)
 
         # Build per-track home positions (median cx → crop position)
         track_cxs = {}
@@ -1971,15 +1993,31 @@ class Planner:
         # in one batch at function exit rather than per-append to keep
         # the inner loop clean.
         if self.tracer.enabled:
-            for kf in kfs:
-                self.tracer.event('keyframe_decided',
+            self._emit_keyframe_trace(kfs, scene_idx, params.strategy_label)
+        return kfs
+
+    def _emit_keyframe_trace(self, kfs, scene_idx, strategy_label):
+        """Emit keyframe_decided + target_filter trace events for a scene.
+
+        ``target_filter`` joins the anticipation/smoothing decision on the same
+        ``t_ms`` as its keyframe, so an offline reviewer can see raw vs filtered
+        target, lead-room and estimated velocity behind each committed
+        keyframe. Split out so the instrumentation is directly unit-testable.
+        """
+        for kf in kfs:
+            self.tracer.event('keyframe_decided',
+                              scene_idx=scene_idx,
+                              t_ms=kf['time_ms'],
+                              x=kf['x'],
+                              transition=kf.get('transition', 'cut'),
+                              transition_ms=kf.get('transition_ms', 0),
+                              strategy=strategy_label)
+            detail = self._filter_trace.get(kf['time_ms'])
+            if detail is not None:
+                self.tracer.event('target_filter',
                                   scene_idx=scene_idx,
                                   t_ms=kf['time_ms'],
-                                  x=kf['x'],
-                                  transition=kf.get('transition', 'cut'),
-                                  transition_ms=kf.get('transition_ms', 0),
-                                  strategy=params.strategy_label)
-        return kfs
+                                  **detail)
 
 
     def _validate_face_in_crop(self, kfs: List[dict], start: int, end: int) -> List[dict]:

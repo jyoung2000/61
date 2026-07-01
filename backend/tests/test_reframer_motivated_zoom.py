@@ -7,8 +7,11 @@ from types import SimpleNamespace
 
 sys.modules.setdefault("cv2", types.ModuleType("cv2"))
 
+import os
+import tempfile
+
 from backend.config import settings  # noqa: E402
-from backend.services.reframer_models import interpolate_scale  # noqa: E402
+from backend.services.reframer_models import interpolate_scale, ReframeTracer  # noqa: E402
 from backend.services import reframer_engine  # noqa: E402
 from backend.services.clip_exporter import (  # noqa: E402
     build_zoom_crop_filter, _piecewise_time_expr,
@@ -46,10 +49,16 @@ def test_interpolate_scale_holds_across_cut():
 
 # ── engine motivated-zoom stamping ──
 
+def _tracer():
+    fd, path = tempfile.mkstemp(suffix=".jsonl")
+    os.close(fd)
+    return ReframeTracer(path)
+
+
 def _fake_engine(keyframes, face_timeline, crop_w=200):
     plan = SimpleNamespace(keyframes=keyframes, crop_w=crop_w, max_x=440)
     perception = SimpleNamespace(face_timeline=face_timeline, scene_cuts=[])
-    return SimpleNamespace(plan=plan, perception=perception)
+    return SimpleNamespace(plan=plan, perception=perception, tracer=_tracer())
 
 
 def test_motivated_zoom_stamps_pushin_on_held_speaker():
@@ -74,6 +83,8 @@ def test_motivated_zoom_stamps_pushin_on_held_speaker():
         peak_kf = max((k for k in eng.plan.keyframes if k.get("_zoom")),
                       key=lambda k: k["scale"])
         assert 0 < peak_kf["time_ms"] < 6000
+        # Instrumentation fired (trace coverage guard).
+        assert eng.tracer.counts.get("motivated_zoom") == 1
     finally:
         settings.REFRAMER_MOTIVATED_ZOOM = prev
         settings.REFRAMER_MOTIVATED_ZOOM_MAX = prev_max

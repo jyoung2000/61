@@ -12,10 +12,20 @@ from types import SimpleNamespace
 # Stub cv2 before importing the engine (matches the repo's test convention).
 sys.modules.setdefault("cv2", types.ModuleType("cv2"))
 
+import tempfile
+
 from backend.config import settings  # noqa: E402
 from backend.services import reframer_engine  # noqa: E402
+from backend.services.reframer_models import ReframeTracer  # noqa: E402
 
 Engine = reframer_engine.ReframeEngine
+
+
+def _tracer():
+    fd, path = tempfile.mkstemp(suffix=".jsonl")
+    import os
+    os.close(fd)
+    return ReframeTracer(path)
 
 
 def _fake_engine(keyframes, face_timeline=None, scene_cuts=None,
@@ -26,9 +36,11 @@ def _fake_engine(keyframes, face_timeline=None, scene_cuts=None,
         scene_cuts=scene_cuts or [],
         is_live_action=True,
     )
-    # Attach the static helper the L1 pass calls via ``self``.
+    # Attach the static helper the L1 pass calls via ``self`` + a real tracer
+    # so the tests can assert the new instrumentation fires.
     return SimpleNamespace(plan=plan, perception=perception,
-                           _rdp_indices=Engine._rdp_indices)
+                           _rdp_indices=Engine._rdp_indices,
+                           tracer=_tracer())
 
 
 def test_savgol_reduces_jitter_and_preserves_cut_and_centering():
@@ -56,6 +68,8 @@ def test_savgol_reduces_jitter_and_preserves_cut_and_centering():
         assert kfs[15]["x"] == 90            # cut preserved
         # Jitter on a plain run keyframe is attenuated toward the mean.
         assert abs(kfs[4]["x"] - base) < 15
+        # Instrumentation fired (trace coverage guard).
+        assert eng.tracer.counts.get("savgol_pass") == 1
     finally:
         settings.REFRAMER_SAVGOL_SMOOTHING = prev
 
@@ -98,6 +112,8 @@ def test_l1_rebuilds_holds_and_pan():
         assert out[-1]["x"] >= 260
         # Rebuilt path should be sparse (holds+pan), not one-per-sample.
         assert len(out) < len(sample_times)
+        # Instrumentation fired (trace coverage guard).
+        assert eng.tracer.counts.get("l1_path") == 1
     finally:
         settings.REFRAMER_L1_PATH = prev
 

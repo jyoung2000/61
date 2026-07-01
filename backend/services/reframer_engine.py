@@ -130,6 +130,13 @@ class ReframeEngine:
                           is_live_action=self.perception.is_live_action,
                           detected_language=self.perception.detected_language)
 
+        # No-face saliency source usage over the clip (u2netp vs spectral).
+        _sal_counts = getattr(self.perception, 'saliency_source_counts', {}) or {}
+        if _sal_counts:
+            self.tracer.event('saliency_source',
+                              counts=_sal_counts,
+                              total=sum(_sal_counts.values()))
+
         # Stage 2+3: Classify + Decide
         self.log.log_stage('ENGINE', '═══ STAGE 2+3: CLASSIFY + DECIDE ═══')
         planner = Planner(self.perception, self.ar_w, self.ar_h,
@@ -756,6 +763,12 @@ class ReframeEngine:
                             'scale': 1.0, '_zoom': True})
             last_end = t1
             zooms += 1
+            self.tracer.event('motivated_zoom',
+                              t0_ms=int(t0), t1_ms=int(t1),
+                              hold_x=int(x_hold),
+                              max_scale=round(max_scale, 4),
+                              ramp_ms=RAMP_MS,
+                              reason='held_speaker_pushin')
 
         if inserts:
             kfs.extend(inserts)
@@ -829,6 +842,12 @@ class ReframeEngine:
         if smoothed:
             get_logger().log_stage(
                 'SMOOTH', f'Savitzky-Golay trajectory pass: adjusted {smoothed} keyframes')
+            self.tracer.event('savgol_pass',
+                              runs=len(runs),
+                              keyframes_total=len(kfs),
+                              keyframes_adjusted=smoothed,
+                              window_ms=window_ms,
+                              polyorder=polyorder)
 
     def _apply_l1_camera_path(self):
         """Replace the reactive smoother output with an L1-optimal camera path.
@@ -895,11 +914,19 @@ class ReframeEngine:
                                 'transition': transition,
                                 'transition_ms': transition_ms})
         if new_kfs:
+            _kfs_before = len(self.plan.keyframes)
             new_kfs.sort(key=lambda k: k['time_ms'])
             self.plan.keyframes = new_kfs
             get_logger().log_stage(
                 'SMOOTH', f'L1-optimal camera path: {len(new_kfs)} keyframes '
                 f'from {len(sample_times)} samples across {len(segments)} scenes')
+            self.tracer.event('l1_path',
+                              samples_in=len(sample_times),
+                              scenes=len(segments),
+                              keyframes_before=_kfs_before,
+                              keyframes_out=len(new_kfs),
+                              weights=list(weights),
+                              radius=round(radius, 1))
 
     @staticmethod
     def _rdp_indices(values, epsilon):

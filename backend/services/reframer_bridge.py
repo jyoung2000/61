@@ -657,6 +657,7 @@ def serialize_detection_overlay(perception, reframer_plan=None) -> dict:
                 "cx": _to_int(v.get("cx", 0)),
                 "cy": _to_int(v.get("cy", 0)),
                 "intensity": round(float(v.get("intensity", 0.0) or 0.0), 3),
+                "source": str(v.get("source", "") or "spectral"),
             }
 
     scene_cuts = [int(c) for c in (getattr(perception, "scene_cuts", None) or [])]

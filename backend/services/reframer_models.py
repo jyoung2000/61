@@ -661,6 +661,10 @@ class PerceptionResult:
     # Spectral residual saliency for non-face/non-person frames.
     # Identifies the most visually important region regardless of motion.
     saliency_hotspot: Dict[int, dict] = field(default_factory=dict)
+    # Saliency-source telemetry (item 8): counts of which no-face saliency
+    # source produced each hotspot over the clip, e.g.
+    # {'u2netp+stack': 12, 'spectral+stack': 40}. Emitted to the reframe trace.
+    saliency_source_counts: Dict[str, int] = field(default_factory=dict)
 
     @property
     def is_live_action(self) -> bool:
