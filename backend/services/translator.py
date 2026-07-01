@@ -11,6 +11,7 @@ a dedicated Ollama translation model (OLLAMA_TRANSLATION_MODEL).
 import asyncio
 import json
 import logging
+import re
 from typing import Optional
 
 import httpx
@@ -62,21 +63,75 @@ def _seg_text(s):
     return (s.get("text", "") if isinstance(s, dict) else getattr(s, "text", "")) or ""
 
 
-def fraction_untranslated(segments, target_language: str) -> float:
-    """Fraction of cues still written in CJK script.
+# ── Romaji (transliterated Japanese) detection ───────────────────────────────
+# A model sometimes echoes a hard Japanese line PHONETICALLY in Latin letters
+# ("Katte ippai tsukuritaku naru toko aru ne") instead of translating it. That
+# is untranslated source, but it carries NO CJK script, so the _cjk_ratio check
+# scores it 0% and it ships in the "English" track. A Japanese romaji word
+# decomposes into open (consonant+vowel) mora with optional gemination / long
+# vowels; Latin words with L/Q/V/X, consonant clusters, or final consonants
+# (other than 'n') fail the pattern — which is what separates romaji from English.
+_MORA_WORD = re.compile(
+    r"^(?:"
+    r"(?:[kgsztdnhbpmr]?[kgsztdnhbpmr])?"                       # optional gemination
+    r"(?:ky|gy|sh|ch|ts|ny|hy|by|py|my|ry|dy|[kgsztdnhfbpmyrwj])?"
+    r"[aeiouāēīōū]"
+    r"|n)+$",
+    re.IGNORECASE,
+)
+# Short romaji tokens that are ALSO ordinary English words — never count these as
+# Japanese evidence on their own (keeps English lines from being flagged).
+_ROMAJI_AMBIG = {
+    "a", "i", "o", "no", "to", "na", "ka", "me", "he", "we", "so", "re",
+    "in", "on", "an", "at", "it", "is", "be", "as", "or", "up", "us",
+}
+_JA_SOURCE = {"ja", "jpn", "japanese", "ja-jp"}
+
+
+def _romaji_ja_ratio(text: str) -> float:
+    """Share of a line's word tokens that look like Japanese romaji (mora-only
+    words). ~0 for English, high for a transliterated-Japanese line."""
+    toks = [t for t in re.findall(r"[A-Za-zāēīōū]+", text or "") if len(t) >= 2]
+    if len(toks) < 3:
+        return 0.0
+    jp = 0
+    for t in toks:
+        if t.lower() in _ROMAJI_AMBIG:
+            continue
+        if len(t) >= 3 and _MORA_WORD.match(t):
+            jp += 1
+    return jp / len(toks)
+
+
+def _is_untranslated(text: str, source_language: str = "") -> bool:
+    """True when a line is still in the source language — CJK script (any source)
+    OR, for a Japanese source, transliterated romaji."""
+    if _cjk_ratio(text) > 0.30:
+        return True
+    if ((source_language or "").lower() in _JA_SOURCE
+            and getattr(settings, "TRANSLATION_ROMAJI_DETECT_ENABLED", True)):
+        thr = float(getattr(settings, "TRANSLATION_ROMAJI_DETECT_THRESHOLD", 0.6))
+        if _romaji_ja_ratio(text) >= thr:
+            return True
+    return False
+
+
+def fraction_untranslated(segments, target_language: str, source_language: str = "") -> float:
+    """Fraction of cues still written in the source language.
 
     Meaningful only when translating TO a non-CJK target (English etc.), where
-    any CJK left in the output is untranslated source — and crucially this is
-    judged from the OUTPUT TEXT, not the declared source language, so it still
-    works when the source was detected as ``auto`` (which previously disabled the
-    check and let half-Japanese tracks through). For CJK targets, CJK output is
-    correct, so it returns 0."""
+    any source-language text left in the output is untranslated — and crucially
+    this is judged from the OUTPUT TEXT, not the declared source language, so it
+    still works when the source was detected as ``auto``. Detects CJK script for
+    any source and, when ``source_language`` is Japanese, transliterated romaji
+    too (a line the model spelled out phonetically instead of translating). For
+    CJK targets, CJK output is correct, so it returns 0."""
     if (target_language or "").lower() in _CJK_LANGS:
         return 0.0
     rows = list(segments or [])
     if not rows:
         return 0.0
-    n = sum(1 for s in rows if _cjk_ratio(_seg_text(s)) > 0.30)
+    n = sum(1 for s in rows if _is_untranslated(_seg_text(s), source_language))
     return n / len(rows)
 
 
@@ -295,20 +350,24 @@ async def translate_via_llm(
     # ── Completeness cleanup ────────────────────────────────────────────────
     # The model occasionally echoes a hard line (long narration, song lyrics)
     # untranslated inside an otherwise-valid array — and with a vague/auto source
-    # it does so more often. Re-translate any cue still in CJK script (only when
-    # the target is non-CJK), up to a couple of passes, so NOTHING is left in the
-    # source language.
+    # it does so more often. Re-translate any cue still in the source language
+    # (CJK script OR, for a Japanese source, transliterated romaji — "Katte ippai
+    # tsukuritaku naru toko" left in Latin letters), up to a couple of passes, so
+    # NOTHING is left in the source language. (Runs only when the target is
+    # non-CJK.)
     if (target_language or "").lower() not in _CJK_LANGS:
         for _pass in range(3):
-            idxs = [i for i, s in enumerate(out_segs) if _cjk_ratio(s.text or "") > 0.30]
+            idxs = [i for i, s in enumerate(out_segs)
+                    if _is_untranslated(s.text or "", source_language)]
             if not idxs:
                 break
-            logger.info("LLM translate: re-translating %d cue(s) still in source "
-                        "script (pass %d)", len(idxs), _pass + 1)
+            logger.info("LLM translate: re-translating %d cue(s) still in the "
+                        "source language (pass %d)", len(idxs), _pass + 1)
             redo = await _translate_batch([out_segs[i] for i in idxs])
             for i, tr in zip(idxs, redo):
                 t = (tr or "").strip()
-                if t and _cjk_ratio(t) <= 0.30:
+                # Accept the redo only if it's no longer source-language.
+                if t and not _is_untranslated(t, source_language):
                     if glossary:
                         for k, v in glossary.items():
                             ks, vs = (k or "").strip(), (v or "").strip()
@@ -318,9 +377,9 @@ async def translate_via_llm(
                     out_segs[i] = TranscriptSegment(
                         text=t, start=cur.start, end=cur.end, speaker=cur.speaker)
 
-    logger.info("LLM translation: %d/%d segments → %s (%.0f%% still source-script)",
+    logger.info("LLM translation: %d/%d segments → %s (%.0f%% still source-language)",
                 len(out_segs), total, target_language,
-                100 * fraction_untranslated(out_segs, target_language))
+                100 * fraction_untranslated(out_segs, target_language, source_language))
 
     # ── OPT-IN self-refinement pass (Task 3) ────────────────────────────────
     # A second LOCAL pass that post-edits the model's OWN output for fluency /
@@ -333,7 +392,7 @@ async def translate_via_llm(
             src_texts = [_txt(s) for s in segments]
             if len(src_texts) != len(out_segs):
                 src_texts = None       # alignment lost → skip the source ref
-            before = fraction_untranslated(out_segs, target_language)
+            before = fraction_untranslated(out_segs, target_language, source_language)
             if status_callback:
                 try:
                     r = status_callback("Refining translation for fluency (local)…")
@@ -350,7 +409,7 @@ async def translate_via_llm(
             # Guard: never accept a refine that REINTRODUCES the source language
             # or changes the cue count (same protection as the MTPE post-edit).
             if refined and len(refined) == len(out_segs):
-                after = fraction_untranslated(refined, target_language)
+                after = fraction_untranslated(refined, target_language, source_language)
                 if after <= before + 0.02:
                     out_segs = [
                         r if isinstance(r, TranscriptSegment)
@@ -847,7 +906,7 @@ async def _translate_quality_mode(
     # quality mode is never LESS complete than the speed chain.
     if (target_language or "").lower() not in _CJK_LANGS:
         leftover = [i for i, s in enumerate(llm_out)
-                    if _cjk_ratio(_seg_text(s)) > 0.30]
+                    if _is_untranslated(_seg_text(s), source_language)]
         if leftover:
             logger.info(
                 "Translation quality mode: NLLB backstop filling %d/%d cue(s) the "

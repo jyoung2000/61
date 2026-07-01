@@ -683,6 +683,16 @@ class Settings(BaseSettings):
     # never interactive. Leave OFF unless you accept the wall-clock cost; the
     # deterministic Tasks 1/2/4/5 carry the quality at zero added latency.
     TRANSLATION_LLM_REFINE_PASS: bool = False
+    # Detect transliterated-Japanese (romaji) cues the model spelled out
+    # phonetically instead of translating ("Katte ippai tsukuritaku naru toko").
+    # These carry no CJK script, so the CJK-only completeness check scored them
+    # 0% and shipped them in the English track. Only applied when the SOURCE is
+    # Japanese (romaji patterns overlap with open-syllable Romance languages).
+    TRANSLATION_ROMAJI_DETECT_ENABLED: bool = True
+    # Fraction of a line's word tokens that must look like Japanese mora before
+    # it's treated as untranslated romaji (0.6 cleanly separated real romaji from
+    # English on the audited output).
+    TRANSLATION_ROMAJI_DETECT_THRESHOLD: float = 0.6
     # Per-batch timeout for LLM subtitle translation (a CEILING — never slows the
     # fast path; a fast GPU batch returns in seconds regardless). A small model
     # on a low-VRAM GPU needs far more than the old 5 s/segment / 60 s floor; too
