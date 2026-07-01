@@ -19,7 +19,7 @@ import subprocess
 from backend.services.render_plan import (
     RenderPlan, RenderOp, RenderOpKind, Rect, MotionKeypoint,
 )
-from backend.services.reframer_models import interpolate_x
+from backend.services.reframer_models import interpolate_x, interpolate_scale
 from backend.services.caption_text import strip_cue_timestamps
 
 logger = logging.getLogger("clipai.reframer_bridge")
@@ -150,6 +150,12 @@ def to_fez_render_plan(
             return center_x
         return int(interpolate_x(keyframes, time_ms))
 
+    def scale_at(time_ms: float) -> float:
+        """Motivated-zoom scale at an arbitrary time (1.0 when no zoom)."""
+        if not keyframes:
+            return 1.0
+        return float(interpolate_scale(keyframes, time_ms))
+
     # ── Pass 1 — gap-free [start_sec, end_sec, strategy] segments ──
     raw_scenes = sorted(
         (getattr(reframer_plan, "scenes", None) or []),
@@ -181,16 +187,21 @@ def to_fez_render_plan(
         op_dur = end_sec - start_sec
 
         # Keypoint set: always the two boundaries, plus interior keyframes.
-        kp_by_t = {0.0: x_at(s_ms), round(op_dur, 4): x_at(e_ms)}
+        # Each entry carries (crop_x_px, scale) so the motivated-zoom term
+        # travels with the crop position through the RenderPlan.
+        kp_by_t = {0.0: (x_at(s_ms), scale_at(s_ms)),
+                   round(op_dur, 4): (x_at(e_ms), scale_at(e_ms))}
         for kf in keyframes:
             t_ms = kf.get("time_ms", 0)
             if s_ms < t_ms < e_ms:
-                kp_by_t[round((t_ms - s_ms) / 1000.0, 4)] = kf.get("x", center_x)
+                rel_t = round((t_ms - s_ms) / 1000.0, 4)
+                kp_by_t[rel_t] = (kf.get("x", center_x), scale_at(t_ms))
 
         motion_path = [
             MotionKeypoint(
                 t=t,
-                rect=Rect(x=_clamp01(kp_by_t[t] / src_w), y=cy, w=cw, h=ch),
+                rect=Rect(x=_clamp01(kp_by_t[t][0] / src_w), y=cy, w=cw, h=ch),
+                scale=round(float(kp_by_t[t][1]), 4),
             )
             for t in sorted(kp_by_t)
         ]
@@ -375,6 +386,7 @@ def to_fez_subject_track(perception, reframer_plan) -> list:
         track.append({
             "t": round(_to_int(kf.get("time_ms", 0)) / 1000.0, 3),
             "x": round(center_pct, 2),
+            "scale": round(float(kf.get("scale", 1.0)), 4),
             "source": "reframer",
         })
     return track

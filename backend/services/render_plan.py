@@ -69,6 +69,11 @@ class MotionKeypoint:
     """A keypoint in a motion path for TRACKING_CROP ops."""
     t: float          # seconds relative to the RenderOp's start_sec
     rect: Rect
+    # Motivated-zoom scale term (1.0 = no zoom, >1.0 = punch-in). Travels
+    # alongside the crop rect so the per-keyframe `scale` from the reframer
+    # plan survives the RenderPlan round-trip to the exporter. Absent/legacy
+    # plans deserialize to 1.0.
+    scale: float = 1.0
 
 
 @dataclass

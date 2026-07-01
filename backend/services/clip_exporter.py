@@ -2654,6 +2654,29 @@ def _keyframes_from_cached_render_plan(
     )
 
 
+def _zoom_keyframes_from_cached_render_plan(
+    cached_plan: dict,
+    clip_start: float,
+    clip_end: float,
+) -> list[tuple[float, float]] | None:
+    """Motivated-zoom ``(t_seconds, scale)`` track from a cached RenderPlan.
+
+    Aligned in time with ``_keyframes_from_cached_render_plan`` (both derive
+    from the same windowed samples). Returns ``None`` when the plan carries no
+    non-trivial zoom, so the exporter only activates the zoom crop when a real
+    push-in exists.
+    """
+    from backend.services.render_plan_keyframes import (
+        zoom_keyframes_from_cached_render_plan,
+    )
+    zk = zoom_keyframes_from_cached_render_plan(
+        cached_plan, clip_start=clip_start, clip_end=clip_end,
+    )
+    if not zk or not any(abs(float(s) - 1.0) > 0.01 for _, s in zk):
+        return None
+    return zk
+
+
 def _extract_render_plan_segments(scenes: list):
     """Extract lightweight segment objects from SceneDescription data for the RenderPlan builder.
 
@@ -6497,6 +6520,11 @@ async def export_clip(
         if needs_filters:
             # Build subject keyframes for dynamic crop tracking
             keyframes = None
+            # Parallel motivated-zoom track (item 10), aligned in time with
+            # `keyframes`. Populated only by the cached-RenderPlan source, which
+            # is where the reframer's per-keyframe `scale` survives. None ⇒ no
+            # zoom (plain crop), preserving byte-identical output.
+            zoom_keyframes = None
             _avg_face_y = 50.0
             _avg_face_w = 0.0
             logger.info(
@@ -6652,6 +6680,11 @@ async def export_clip(
                         if _rp_kfs and len(_rp_kfs) >= 2:
                             keyframes = _rp_kfs
                             _using_cached_render_plan_keyframes = True
+                            # Motivated zoom: carry the aligned scale track from
+                            # the same cached plan (None when no real push-in).
+                            zoom_keyframes = _zoom_keyframes_from_cached_render_plan(
+                                _cached_rp_dict, clip_start=start, clip_end=end,
+                            )
                             # This tier skips the dense-detection pass that
                             # normally fills _avg_face_y, so derive vertical
                             # framing from the scenes (only used for crops
@@ -7155,6 +7188,7 @@ async def export_clip(
                     face_y_center=_avg_face_y,
                     face_width_pct=_avg_face_w,
                     use_step_interpolation=_using_frontend_keyframes,
+                    zoom_keyframes=zoom_keyframes,
                 )
 
             # Append text overlay drawtext filters.
