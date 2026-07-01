@@ -371,20 +371,21 @@ class Settings(BaseSettings):
     REFRAMER_MEDIAPIPE_MAR: bool = False
     REFRAMER_MEDIAPIPE_MODEL_PATH: str = ""    # path to face_landmarker.task (blank = auto-discover)
     # u2netp learned salient-object model (4.7 MB ONNX via cv2.dnn) as the
-    # no-face saliency source, spectral stack as fallback. Needs the model
-    # file at REFRAMER_U2NET_MODEL_PATH.
-    REFRAMER_U2NET_SALIENCY: bool = False
-    REFRAMER_U2NET_MODEL_PATH: str = ""        # path to u2netp.onnx (blank = disabled)
+    # no-face saliency source, spectral stack as fallback. Default ON — but it
+    # is a graceful no-op (falls back to the fused spectral stack) until the
+    # model file is present at REFRAMER_U2NET_MODEL_PATH.
+    REFRAMER_U2NET_SALIENCY: bool = True
+    REFRAMER_U2NET_MODEL_PATH: str = ""        # path to u2netp.onnx (blank ⇒ falls back to spectral)
     # L1-optimal camera path (Grundmann 2011) — decomposes the target path into
     # static holds + constant-velocity pans via an LP (scipy.optimize.linprog).
-    # Replaces the reactive smoother output when enabled.
-    REFRAMER_L1_PATH: bool = False
+    # Replaces the reactive smoother output. Default ON.
+    REFRAMER_L1_PATH: bool = True
     REFRAMER_L1_WEIGHTS: str = "1,10,100"      # w1,w2,w3 for |D1|,|D2|,|D3|
     # Motivated zoom — time-varying push-in/pull-out via the dormant
     # motivated_zoom planner, adding a per-keyframe `scale` term rendered as a
-    # time-varying ffmpeg crop. Invasive (schema + interpolator + export +
-    # preview); default OFF.
-    REFRAMER_MOTIVATED_ZOOM: bool = False
+    # time-varying ffmpeg crop. Default ON — a no-op unless the plan actually
+    # carries a non-trivial scale (a detected held-speaker push-in).
+    REFRAMER_MOTIVATED_ZOOM: bool = True
     REFRAMER_MOTIVATED_ZOOM_MAX: float = 1.15  # max push-in scale
 
     # ── Clip generation (Primary AI / VideoLLaMA3) defaults ──
