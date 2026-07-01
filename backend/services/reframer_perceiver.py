@@ -70,6 +70,10 @@ class Perceiver:
         # Track state
         self._next_track_id = 0
         self._active_tracks: List[dict] = []
+        # Persistent person (YOLO subject) tracker — separate id space so
+        # person and face track_ids never collide in the overlay.
+        self._next_person_track_id = 0
+        self._active_person_tracks: List[dict] = []
         self._prev_gray_for_motion = None
         self._prev_frame_for_face_motion = None
 
@@ -131,6 +135,8 @@ class Perceiver:
         recent_raw: List[List[dict]] = []
         self._prev_hotspot_cx = None
         self._prev_hotspot_cy = None
+        self._prev_sal_cx = None   # temporal EMA state for the saliency hotspot
+        self._prev_sal_cy = None
 
         # ════════════════════════════════════════════════════════════════
         #  YOLO-World Auto-Discovery Pass
@@ -453,6 +459,10 @@ class Perceiver:
                             'cx': sx1 + sw // 2, 'cy': sy1 + sh // 2,
                             'area': sw * sh,
                         })
+                    # Assign persistent per-person track_ids (item 1) so the
+                    # preview overlay can interpolate a box between sparse
+                    # samples without cross-fading two different subjects.
+                    persons = self._assign_person_tracks(persons, time_ms)
                     r.person_timeline[time_ms] = persons
 
                 # Spectral residual saliency (pure numpy, ~2ms per frame)
@@ -479,6 +489,19 @@ class Perceiver:
                         sal_max = sal_map.max()
                         if sal_max > 0:
                             sal_map /= sal_max
+                        # ── Learned salient-object base (item 8, gated) ──
+                        # When u2netp is enabled + available, swap the spectral
+                        # edge map for its subject mask (where a human looks,
+                        # not what stands out). Suppression + fusion below still
+                        # apply. Falls back to spectral on any failure.
+                        if getattr(settings, 'REFRAMER_U2NET_SALIENCY', False):
+                            try:
+                                from backend.services.reframer_u2net import u2net_saliency
+                                _u2 = u2net_saliency(small_bgr, sal_size)
+                                if _u2 is not None:
+                                    sal_map = _u2
+                            except Exception:
+                                pass
                         # ── Text/watermark saliency suppression ──
                         # Bottom 15%: subtitles, watermarks, channel logos
                         # Top 5%: letterbox bars, UI chrome
@@ -522,6 +545,15 @@ class Perceiver:
                             sal_max2 = sal_map.max()
                             if sal_max2 > 0:
                                 sal_map /= sal_max2
+                        # ── Fused saliency stack (item 4) ──
+                        # Raw spectral residual latches onto high-frequency
+                        # novelty (logos, text, HUD edges). Fuse it with the
+                        # priors a human camera op actually uses — center bias,
+                        # motion energy, skin/face color — so the argmax lands
+                        # on the likely subject instead of the sharpest edge.
+                        if getattr(settings, 'REFRAMER_SALIENCY_STACK', True):
+                            sal_map = self._fuse_saliency(
+                                sal_map, sal_size, small_bgr, r, time_ms)
                         # Find peak saliency location
                         peak_idx = np.argmax(sal_map)
                         peak_y, peak_x = divmod(peak_idx, sal_size)
@@ -529,6 +561,18 @@ class Perceiver:
                         sal_cx = int(peak_x / sal_size * r.src_w)
                         sal_cy = int(peak_y / sal_size * r.src_h)
                         sal_intensity = float(sal_map[peak_y, peak_x])
+
+                        # ── Temporal smoothing of the saliency hotspot ──
+                        # The spectral map is near-flat, so a raw per-frame
+                        # argmax wanders. EMA the hotspot (as the motion hotspot
+                        # already is) so the no-face crop target stays steady.
+                        if getattr(settings, 'REFRAMER_SALIENCY_STACK', True):
+                            a_sal = 0.35
+                            if getattr(self, '_prev_sal_cx', None) is not None:
+                                sal_cx = int(a_sal * sal_cx + (1 - a_sal) * self._prev_sal_cx)
+                                sal_cy = int(a_sal * sal_cy + (1 - a_sal) * self._prev_sal_cy)
+                            self._prev_sal_cx = sal_cx
+                            self._prev_sal_cy = sal_cy
 
                         if sal_intensity > 0.10:
                             r.saliency_hotspot[time_ms] = {
@@ -826,6 +870,42 @@ class Perceiver:
             if self._embedding_counter % 3 == 0:
                 embedding = self.face_detector.compute_embedding(frame_bgr, face)
 
+            # ── Eye-line anchor + gaze yaw from YuNet landmarks (items 5/6) ──
+            # eye_cx: eye-midpoint x in SOURCE coords — a steadier framing
+            #         anchor than the bbox center (which jitters).
+            # yaw:    signed nose-vs-bbox-center asymmetry in [-1,1] used for
+            #         gaze-based lead-room. Both are best-effort; absent keys
+            #         simply fall back to bbox-center framing / no lead.
+            eye_cx = None
+            yaw = None
+            if 'right_eye' in face and 'left_eye' in face:
+                try:
+                    re = face['right_eye']
+                    le = face['left_eye']
+                    eye_mid_det = (re[0] + le[0]) / 2.0
+                    eye_cx = int(eye_mid_det * inv_scale)
+                except (IndexError, ValueError, TypeError):
+                    eye_cx = None
+            if 'nose' in face and fw > 0:
+                try:
+                    nose_x_det = face['nose'][0]
+                    bbox_center_det = fx + fw / 2.0
+                    offset = (nose_x_det - bbox_center_det) / fw
+                    yaw = max(-1.0, min(1.0, 2.0 * offset))
+                except (IndexError, ValueError, TypeError):
+                    yaw = None
+
+            # ── Optional MediaPipe lips-based MAR (item 5, gated) ──
+            # A true 478-landmark lip open/close signal beats the 5-point MAR
+            # and the pixel-diff proxy for "who is talking". Runs on CPU and
+            # only when explicitly enabled + available; falls back silently.
+            if getattr(settings, 'REFRAMER_MEDIAPIPE_MAR', False):
+                mp_mar = self._mediapipe_mouth_open(frame_bgr, face, inv_scale)
+                if mp_mar is not None:
+                    mouth_motion = mp_mar
+                    saliency = (area_score * 0.3 + motion_score * 0.3
+                                + mouth_motion * 0.4) * max(0.2, det_conf)
+
             result = {
                 'x': src_x, 'y': src_y,
                 'w': src_w, 'h': src_h,
@@ -837,11 +917,118 @@ class Perceiver:
                 'mouth_motion': round(mouth_motion, 4),
                 'saliency': round(saliency, 4),
             }
+            if eye_cx is not None:
+                result['eye_cx'] = eye_cx
+            if yaw is not None:
+                result['yaw'] = round(yaw, 4)
             if embedding is not None:
                 result['embedding'] = embedding
             validated.append(result)
 
         return validated
+
+    def _fuse_saliency(self, sal_map, sal_size, small_bgr, r, time_ms):
+        """Fuse spectral saliency with center / motion / skin priors (item 4).
+
+        All inputs are normalized to [0,1] on the ``sal_size × sal_size`` grid
+        and combined as a weighted sum, then renormalized. This biases the
+        argmax toward where a human looks (center, moving things, skin) instead
+        of the highest-frequency edge (logos, captions, HUD chrome).
+        """
+        try:
+            spectral = sal_map
+            # Cache the static center-prior Gaussian (favor the frame center).
+            cp = getattr(self, '_center_prior_cache', None)
+            if cp is None or cp.shape[0] != sal_size:
+                yy, xx = np.mgrid[0:sal_size, 0:sal_size]
+                cy0 = cx0 = (sal_size - 1) / 2.0
+                sig = sal_size * 0.35
+                cp = np.exp(-((xx - cx0) ** 2 + (yy - cy0) ** 2)
+                            / (2.0 * sig * sig)).astype(np.float32)
+                self._center_prior_cache = cp
+
+            # Skin-color prior (YCrCb thresholds), downsized to the sal grid.
+            skin = None
+            try:
+                ycrcb = cv2.cvtColor(small_bgr, cv2.COLOR_BGR2YCrCb)
+                cr = ycrcb[:, :, 1].astype(np.int32)
+                cb = ycrcb[:, :, 2].astype(np.int32)
+                mask = ((cr >= 135) & (cr <= 180) & (cb >= 85) & (cb <= 135)
+                        ).astype(np.float32)
+                skin = cv2.resize(mask, (sal_size, sal_size),
+                                  interpolation=cv2.INTER_AREA)
+                sk_max = skin.max()
+                if sk_max > 0:
+                    skin /= sk_max
+            except Exception:
+                skin = None
+
+            # Motion-energy prior from the (already EMA'd) motion hotspot.
+            motion = None
+            mh = r.motion_hotspot.get(time_ms)
+            if mh:
+                mx = int(mh['cx'] / max(1, r.src_w) * sal_size)
+                my = int(mh['cy'] / max(1, r.src_h) * sal_size)
+                mx = max(0, min(sal_size - 1, mx))
+                my = max(0, min(sal_size - 1, my))
+                yy, xx = np.mgrid[0:sal_size, 0:sal_size]
+                sig = sal_size * 0.12
+                motion = np.exp(-((xx - mx) ** 2 + (yy - my) ** 2)
+                                / (2.0 * sig * sig)).astype(np.float32)
+                motion *= float(min(1.0, mh.get('intensity', 0.0)))
+
+            fused = 0.50 * spectral + 0.25 * cp
+            if skin is not None:
+                fused = fused + 0.13 * skin
+            if motion is not None:
+                fused = fused + 0.20 * motion
+            fmax = float(fused.max())
+            if fmax > 0:
+                fused /= fmax
+            return fused
+        except Exception:
+            return sal_map
+
+    def _mediapipe_mouth_open(self, frame_bgr, face, inv_scale) -> Optional[float]:
+        """Lips-based mouth-motion via MediaPipe (item 5, gated).
+
+        Crops the detected face from the detection-resolution BGR frame, asks
+        the MediaPipe landmarker for a mouth-open ratio, and returns the
+        frame-to-frame *change* mapped to the same 0-1 range the rest of the
+        pipeline uses for ``mouth_motion`` (speaking = mouth moving). Returns
+        ``None`` on any failure so the caller keeps its existing value.
+        """
+        try:
+            fx, fy, fw, fh = face['x'], face['y'], face['w'], face['h']
+            if fw <= 1 or fh <= 1:
+                return None
+            # Pad a little so lips aren't clipped at the bbox edge.
+            pad_w = int(fw * 0.15)
+            pad_h = int(fh * 0.15)
+            H, W = frame_bgr.shape[:2]
+            x0 = max(0, fx - pad_w)
+            y0 = max(0, fy - pad_h)
+            x1 = min(W, fx + fw + pad_w)
+            y1 = min(H, fy + fh + pad_h)
+            crop = frame_bgr[y0:y1, x0:x1]
+            if crop.size == 0:
+                return None
+            from backend.services.reframer_mediapipe import mouth_open_ratio
+            ratio = mouth_open_ratio(crop)
+            if ratio is None:
+                return None
+            if not hasattr(self, '_prev_mp_mar'):
+                self._prev_mp_mar = {}
+            face_key = (fx // max(1, fw // 2), fy // max(1, fh // 2))
+            prev = self._prev_mp_mar.get(face_key)
+            self._prev_mp_mar[face_key] = ratio
+            if prev is None:
+                # First observation — seed with a small openness-derived value
+                # so a wide-open mouth still reads as some activity.
+                return round(min(1.0, max(0.0, ratio - 0.02) * 2.0), 4)
+            return round(min(1.0, abs(ratio - prev) * 8.0), 4)
+        except Exception:
+            return None
 
     def _temporal_filter(self, recent_raw: List[List[dict]]) -> List[dict]:
         """Confirm faces by requiring persistence across multiple recent samples.
@@ -958,6 +1145,51 @@ class Perceiver:
 
             result.append({**face, 'track_id': track_id})
 
+        return result
+
+    def _assign_person_tracks(self, persons: List[dict], time_ms: int) -> List[dict]:
+        """Greedy centroid tracker for YOLO person/subject boxes (item 1).
+
+        Mirrors ``_assign_tracks`` but for persons, in a separate id space.
+        Matches each detection to the nearest un-used active track within a
+        distance proportional to box width; unmatched detections start a new
+        track. Enables per-``track_id`` box interpolation in the preview.
+        """
+        max_gap_ms = 4000
+        max_link_ratio = 2.5
+        self._active_person_tracks = [
+            t for t in self._active_person_tracks
+            if time_ms - t['last_seen_ms'] < max_gap_ms
+        ]
+        result = []
+        used = set()
+        for p in persons:
+            best = None
+            best_dist = float('inf')
+            for track in self._active_person_tracks:
+                if track['id'] in used:
+                    continue
+                dist = math.hypot(p['cx'] - track['cx'], p['cy'] - track['cy'])
+                max_dist = max(p['w'], track['w']) * max_link_ratio
+                if dist < max_dist and dist < best_dist:
+                    best_dist = dist
+                    best = track
+            if best is not None:
+                tid = best['id']
+                best.update({
+                    'cx': p['cx'], 'cy': p['cy'], 'w': p['w'], 'h': p['h'],
+                    'last_seen_ms': time_ms,
+                })
+                used.add(tid)
+            else:
+                tid = self._next_person_track_id
+                self._next_person_track_id += 1
+                self._active_person_tracks.append({
+                    'id': tid, 'cx': p['cx'], 'cy': p['cy'],
+                    'w': p['w'], 'h': p['h'], 'last_seen_ms': time_ms,
+                })
+                used.add(tid)
+            result.append({**p, 'track_id': tid})
         return result
 
     def _consolidate_tracks_across_cuts(self, r: PerceptionResult):

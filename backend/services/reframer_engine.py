@@ -149,6 +149,14 @@ class ReframeEngine:
         self.plan = smoother.smooth(self.plan)
         self.log.stop_timer('smooth')
 
+        # Stage 4.2: Offline path optimization. We render the whole clip after
+        # the fact, so we can make NON-causal decisions the greedy planner
+        # can't: an L1-optimal camera path (holds + linear pans) and/or a
+        # Savitzky-Golay smoothing pass over the trajectory. Both preserve
+        # hard cuts and _centering-flagged keyframes, and are flag-gated.
+        self._apply_l1_camera_path()
+        self._smooth_trajectory_savgol()
+
         # Stage 4.4: Final eval-aligned face centering. This used to
         # conflict with the in-planner centering passes because BOTH
         # corrected aggressively and re-snapped each other. The current
@@ -669,6 +677,181 @@ class ReframeEngine:
             log.log_stage('SMOOTH',
                 f'Face enforcement ({"live" if self.perception.is_live_action else "non-live"}, '
                 f'min_gap={min_gap_ms}ms): inserted {len(corrections)} corrections')
+
+    def _smooth_trajectory_savgol(self):
+        """Non-causal Savitzky-Golay smoothing over the target-x trajectory.
+
+        We render offline, so we can look at the whole path at once and remove
+        residual jitter with a polynomial-fit low-pass — far gentler than the
+        reactive 6-pass keyframe surgery. Cuts break the signal into runs
+        (never smoothed across a hard cut), and ``_centering``-flagged
+        keyframes keep their corrected x. Flag-gated via REFRAMER_SAVGOL_SMOOTHING.
+        """
+        from backend.config import settings
+        if not getattr(settings, 'REFRAMER_SAVGOL_SMOOTHING', True):
+            return
+        kfs = self.plan.keyframes
+        if len(kfs) < 5:
+            return
+        try:
+            from scipy.signal import savgol_filter
+        except Exception:
+            return
+        max_x = self.plan.max_x
+        polyorder = int(getattr(settings, 'REFRAMER_SAVGOL_POLYORDER', 2))
+        window_ms = int(getattr(settings, 'REFRAMER_SAVGOL_WINDOW_MS', 1200))
+
+        # Split into runs delimited by hard cuts.
+        runs = []
+        cur = []
+        for i, kf in enumerate(kfs):
+            if kf.get('transition') == 'cut' and cur:
+                runs.append(cur)
+                cur = []
+            if kf.get('transition') == 'cut':
+                # A cut is a boundary; it starts its own fresh run.
+                cur = [i]
+            else:
+                cur.append(i)
+        if cur:
+            runs.append(cur)
+
+        smoothed = 0
+        for run in runs:
+            if len(run) < 5:
+                continue
+            xs = np.array([float(kfs[i]['x']) for i in run])
+            times = [kfs[i]['time_ms'] for i in run]
+            span = max(1, times[-1] - times[0])
+            med_dt = span / max(1, len(run) - 1)
+            win = int(round(window_ms / max(1.0, med_dt)))
+            win = min(win, len(run))
+            if win % 2 == 0:
+                win -= 1
+            if win <= polyorder or win < 5:
+                continue
+            try:
+                ys = savgol_filter(xs, win, polyorder)
+            except Exception:
+                continue
+            for local_i, kf_i in enumerate(run):
+                kf = kfs[kf_i]
+                if kf.get('_centering') or kf.get('transition') == 'cut':
+                    continue  # preserve corrected / cut positions exactly
+                kf['x'] = int(clamp_x(int(round(ys[local_i])), max_x))
+                smoothed += 1
+        if smoothed:
+            get_logger().log_stage(
+                'SMOOTH', f'Savitzky-Golay trajectory pass: adjusted {smoothed} keyframes')
+
+    def _apply_l1_camera_path(self):
+        """Replace the reactive smoother output with an L1-optimal camera path.
+
+        Reconstructs a per-sample target from the current keyframes, then
+        solves the Grundmann L1 program per scene (holds + constant-velocity
+        pans) and rebuilds keyframes from the piecewise-linear result. Hard
+        cuts are preserved as scene boundaries. Flag-gated (default OFF).
+        """
+        from backend.config import settings
+        if not getattr(settings, 'REFRAMER_L1_PATH', False):
+            return
+        kfs = self.plan.keyframes
+        if len(kfs) < 4:
+            return
+        try:
+            from backend.services.reframer_l1_camera_path import (
+                solve_l1_path, parse_weights)
+        except Exception:
+            return
+        crop_w = self.plan.crop_w
+        max_x = self.plan.max_x
+        sample_times = sorted(self.perception.face_timeline.keys())
+        if len(sample_times) < 4:
+            return
+        weights = parse_weights(getattr(settings, 'REFRAMER_L1_WEIGHTS', '1,10,100'))
+        radius = max(8.0, crop_w * 0.15)
+
+        # Segment sample times at scene cuts (each scene solved independently
+        # so a cut stays a hard discontinuity).
+        cuts = sorted(set(int(c) for c in (self.perception.scene_cuts or [])))
+        segments = []
+        cur = []
+        cut_ptr = 0
+        cut_set = set(cuts)
+        for t in sample_times:
+            if t in cut_set and cur:
+                segments.append(cur)
+                cur = []
+            cur.append(t)
+        if cur:
+            segments.append(cur)
+
+        new_kfs = []
+        for seg_idx, seg in enumerate(segments):
+            targets = [float(interpolate_x(kfs, t)) for t in seg]
+            path = solve_l1_path(targets, radius, 0.0, float(max_x), weights=weights)
+            if path is None:
+                path = [float(clamp_x(int(v), max_x)) for v in targets]
+            corners = self._rdp_indices(path, epsilon=max(2.0, crop_w * 0.01))
+            for ci, idx in enumerate(corners):
+                t = seg[idx]
+                x = int(clamp_x(int(round(path[idx])), max_x))
+                if ci == 0:
+                    # Scene start: a cut for scenes after the first, else the
+                    # clip's opening keyframe.
+                    transition = 'cut' if seg_idx > 0 else 'cut'
+                    transition_ms = 0
+                else:
+                    prev_t = seg[corners[ci - 1]]
+                    transition = 'ease_in_out'
+                    transition_ms = int(max(0, t - prev_t))
+                new_kfs.append({'time_ms': int(t), 'x': x,
+                                'transition': transition,
+                                'transition_ms': transition_ms})
+        if new_kfs:
+            new_kfs.sort(key=lambda k: k['time_ms'])
+            self.plan.keyframes = new_kfs
+            get_logger().log_stage(
+                'SMOOTH', f'L1-optimal camera path: {len(new_kfs)} keyframes '
+                f'from {len(sample_times)} samples across {len(segments)} scenes')
+
+    @staticmethod
+    def _rdp_indices(values, epsilon):
+        """Ramer-Douglas-Peucker over a value series (index axis) → kept indices.
+
+        The L1 path is piecewise-linear; RDP recovers its corner points, which
+        become the rebuilt keyframes. The horizontal axis is the sample index
+        so the perpendicular-distance tolerance ``epsilon`` is in position
+        units (px). Always keeps the endpoints.
+        """
+        n = len(values)
+        if n <= 2:
+            return list(range(n))
+        keep = [False] * n
+        keep[0] = keep[-1] = True
+        stack = [(0, n - 1)]
+        while stack:
+            lo, hi = stack.pop()
+            if hi <= lo + 1:
+                continue
+            x0, y0 = float(lo), float(values[lo])
+            x1, y1 = float(hi), float(values[hi])
+            dx = x1 - x0
+            dy = y1 - y0
+            denom = math.hypot(dx, dy) or 1.0
+            max_d = -1.0
+            max_i = lo
+            for i in range(lo + 1, hi):
+                # Perpendicular distance from point i to the chord lo→hi.
+                d = abs(dy * (float(i) - x0) - dx * (float(values[i]) - y0)) / denom
+                if d > max_d:
+                    max_d = d
+                    max_i = i
+            if max_d > epsilon:
+                keep[max_i] = True
+                stack.append((lo, max_i))
+                stack.append((max_i, hi))
+        return [i for i in range(n) if keep[i]]
 
     def _fix_gradient_centering(self):
         """Post-pass: fix stuck-at-left scenes using Sobel gradient centering.

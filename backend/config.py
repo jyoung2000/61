@@ -322,6 +322,71 @@ class Settings(BaseSettings):
     # reference-parity framing; set True to restore face-size normalization.
     REFRAMER_FACE_SIZE_ZOOM: bool = False
 
+    # ══════════════════════════════════════════════════════════════════
+    #  Reframer "human camera operator" upgrades (2026 reframing rework)
+    #  Each flag gates one improvement so the tuned baseline path stays
+    #  reachable. Pure-code, low-risk items default ON; anything that
+    #  needs an extra model download or is architecturally invasive
+    #  defaults OFF with graceful fallback to the baseline behavior.
+    # ══════════════════════════════════════════════════════════════════
+    # One-Euro filter replacing the fixed-band velocity-adaptive EMA on the
+    # planner target-x (Casiez 2012). Adapts its cutoff to subject speed:
+    # near-zero lag on fast moves, heavy smoothing when slow — the direct
+    # "smooth AND snappy" lever. Set False to restore the fixed-band EMA.
+    REFRAMER_ONE_EURO_FILTER: bool = True
+    REFRAMER_ONE_EURO_MINCUTOFF: float = 1.0   # Hz — lower = smoother when slow
+    REFRAMER_ONE_EURO_BETA: float = 0.02       # speed coefficient — higher = snappier
+    REFRAMER_ONE_EURO_DCUTOFF: float = 1.0     # Hz — derivative smoothing cutoff
+    # Non-causal Savitzky-Golay pass over the whole target-x trajectory after
+    # the keyframe smoother (we render offline, so lookahead is free). Kills
+    # residual jitter without the reactive 6-pass keyframe surgery. Skips
+    # cuts and _centering-flagged keyframes. Set False to disable.
+    REFRAMER_SAVGOL_SMOOTHING: bool = True
+    REFRAMER_SAVGOL_WINDOW_MS: int = 1200      # smoothing window (ms) on the path
+    REFRAMER_SAVGOL_POLYORDER: int = 2         # polynomial order (2 = quadratic)
+    # Fused saliency stack (spectral residual + center-prior + motion energy +
+    # skin-color prior + temporal persistence) replacing the raw per-frame
+    # spectral peak, plus temporal EMA smoothing of the saliency hotspot so it
+    # stops wandering. Only affects faceless/subjectless frames. False =
+    # baseline raw spectral peak.
+    REFRAMER_SALIENCY_STACK: bool = True
+    # Anticipatory lead-room: bias the crop ahead of a moving subject by a
+    # fraction of crop_w * v̂ (velocity from finite diff), and add gaze-based
+    # lead room via the existing gaze_estimator. Removes the "crop chasing the
+    # subject" lag. False = no lead-room bias.
+    REFRAMER_LEAD_ROOM: bool = True
+    REFRAMER_LEAD_ROOM_MAX_FRAC: float = 0.10  # cap: fraction of crop_w
+    # Eye-line framing anchor: frame on the eye-midpoint x (from YuNet
+    # landmarks) instead of the raw bbox center — a steadier, more human
+    # anchor. False = bbox-center anchor.
+    REFRAMER_EYE_LINE_ANCHOR: bool = True
+    # Velocity-augmented overlay: emit per-box velocity in the detection
+    # overlay so the preview can advect boxes between sparse samples (optical-
+    # flow-style propagation) for smooth 24-30fps preview tracking.
+    REFRAMER_OVERLAY_VELOCITY: bool = True
+    # ── Model-dependent / invasive items (default OFF, graceful fallback) ──
+    # MediaPipe Face Landmarker (478-pt) for a true lips-based MAR mouth-open
+    # signal. Needs the mediapipe wheel + face_landmarker.task model. Falls
+    # back to the YuNet 5-point MAR when unavailable.
+    REFRAMER_MEDIAPIPE_MAR: bool = False
+    REFRAMER_MEDIAPIPE_MODEL_PATH: str = ""    # path to face_landmarker.task (blank = auto-discover)
+    # u2netp learned salient-object model (4.7 MB ONNX via cv2.dnn) as the
+    # no-face saliency source, spectral stack as fallback. Needs the model
+    # file at REFRAMER_U2NET_MODEL_PATH.
+    REFRAMER_U2NET_SALIENCY: bool = False
+    REFRAMER_U2NET_MODEL_PATH: str = ""        # path to u2netp.onnx (blank = disabled)
+    # L1-optimal camera path (Grundmann 2011) — decomposes the target path into
+    # static holds + constant-velocity pans via an LP (scipy.optimize.linprog).
+    # Replaces the reactive smoother output when enabled.
+    REFRAMER_L1_PATH: bool = False
+    REFRAMER_L1_WEIGHTS: str = "1,10,100"      # w1,w2,w3 for |D1|,|D2|,|D3|
+    # Motivated zoom — time-varying push-in/pull-out via the dormant
+    # motivated_zoom planner, adding a per-keyframe `scale` term rendered as a
+    # time-varying ffmpeg crop. Invasive (schema + interpolator + export +
+    # preview); default OFF.
+    REFRAMER_MOTIVATED_ZOOM: bool = False
+    REFRAMER_MOTIVATED_ZOOM_MAX: float = 1.15  # max push-in scale
+
     # ── Clip generation (Primary AI / VideoLLaMA3) defaults ──
     # Exposed in Settings > Clip Generation and overlaid onto the clipper
     # config so the upload pipeline + the regenerate path both honor them.

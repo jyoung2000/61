@@ -26,6 +26,7 @@ from backend.services.reframer_models import (
     ReframeTracer, null_tracer,
 )
 from backend.config import settings
+from backend.services.reframer_oneeuro import OneEuroFilter
 
 logger = logging.getLogger("clipai.reframer_planner")
 
@@ -87,6 +88,23 @@ class Planner:
             self.target_h = round(1920 * ar_h / ar_w)
 
         self.sample_times = sorted(perc.face_timeline.keys())
+        # Effective perception sample rate (Hz) — median spacing of samples.
+        # Used to time the One-Euro filter. Falls back to the video fps / a
+        # sane default when there aren't enough samples to measure.
+        self.sample_fps = 5.0
+        if len(self.sample_times) >= 3:
+            diffs = [b - a for a, b in zip(self.sample_times[:-1], self.sample_times[1:])
+                     if b > a]
+            if diffs:
+                median_dt_ms = sorted(diffs)[len(diffs) // 2]
+                if median_dt_ms > 0:
+                    self.sample_fps = max(0.5, min(60.0, 1000.0 / median_dt_ms))
+
+        # One-Euro filter + anticipation state (per-scene, reset in
+        # _decide_adaptive). Declared here so attribute access is always safe.
+        self._euro_filter = None
+        self._prev_raw_target = None
+        self._prev_raw_target_t = None
 
     def generate(self) -> RenderPlan:
         log = get_logger()
@@ -1213,6 +1231,105 @@ class Planner:
     #  UNIVERSAL DECIDE — One function for all content types
     # ═══════════════════════════════════════════════════════════════════════
 
+    def _anchor_cx(self, f: dict) -> int:
+        """Horizontal framing anchor for a face.
+
+        Returns the eye-midpoint x when the eye-line anchor is enabled and the
+        perceiver stamped an ``eye_cx`` on the face (from YuNet landmarks);
+        otherwise the bounding-box center. The eye-line is both steadier
+        frame-to-frame than the bbox center and the point a human operator
+        actually frames on.
+        """
+        if getattr(settings, 'REFRAMER_EYE_LINE_ANCHOR', True):
+            ex = f.get('eye_cx')
+            if ex is not None:
+                return int(ex)
+        return int(f['cx'])
+
+    def _apply_target_filter(self, target_x: int, t: int, switching: bool,
+                             anchor_yaw: Optional[float]) -> int:
+        """Anticipate + smooth the raw per-sample target-x (items 2 & 6).
+
+        Pipeline: (1) add anticipatory lead-room so the crop leads a moving
+        subject instead of chasing it, then (2) low-pass with either the
+        speed-adaptive One-Euro filter (smooth when still, snappy when fast)
+        or the legacy fixed-band EMA. On a speaker switch the filter is reset
+        so the crop cuts cleanly to the new subject.
+        """
+        t_s = t / 1000.0
+        raw = int(target_x)
+
+        # ── (1) Anticipatory lead-room ──
+        if getattr(settings, 'REFRAMER_LEAD_ROOM', True) and not switching:
+            lead = 0.0
+            max_lead = float(getattr(settings, 'REFRAMER_LEAD_ROOM_MAX_FRAC', 0.10)) \
+                * self.crop_w
+            # Velocity lead: project the crop ahead in the direction the raw
+            # target is already moving. tanh keeps it bounded and smooth.
+            if self._prev_raw_target is not None and self._prev_raw_target_t is not None:
+                dt = t_s - self._prev_raw_target_t
+                if dt > 1e-3:
+                    v = (raw - self._prev_raw_target) / dt  # px/s
+                    # Normalize by a "brisk pan" reference (~1 crop width/sec).
+                    v_norm = v / max(1.0, self.crop_w)
+                    lead += math.tanh(v_norm) * max_lead
+            # Gaze lead: leave room in the direction the subject faces.
+            if anchor_yaw is not None:
+                try:
+                    from backend.services.gaze_estimator import lead_room_offset_px
+                    lead += float(lead_room_offset_px(
+                        float(anchor_yaw), float(self.crop_w),
+                        max_frac=min(0.08, float(getattr(
+                            settings, 'REFRAMER_LEAD_ROOM_MAX_FRAC', 0.10)))))
+                except Exception:
+                    pass
+            lead = max(-max_lead, min(max_lead, lead))
+            target_x = int(round(raw + lead))
+
+        # Record the RAW (pre-lead, pre-filter) target for the next velocity est.
+        self._prev_raw_target = raw
+        self._prev_raw_target_t = t_s
+
+        target_x = clamp_x(target_x, self.max_x)
+
+        # ── (2) Smooth ──
+        if switching:
+            # Cut: snap the filter to the new position.
+            if self._euro_filter is not None:
+                self._euro_filter.reset()
+            self._ema_target = target_x
+            return target_x
+
+        if getattr(settings, 'REFRAMER_ONE_EURO_FILTER', True):
+            if self._euro_filter is None:
+                self._euro_filter = OneEuroFilter(
+                    freq=max(1.0, self.sample_fps),
+                    mincutoff=float(getattr(settings, 'REFRAMER_ONE_EURO_MINCUTOFF', 1.0)),
+                    beta=float(getattr(settings, 'REFRAMER_ONE_EURO_BETA', 0.02)),
+                    dcutoff=float(getattr(settings, 'REFRAMER_ONE_EURO_DCUTOFF', 1.0)),
+                )
+            filtered = clamp_x(int(round(self._euro_filter(target_x, t=t_s))), self.max_x)
+            self._ema_target = filtered  # keep legacy state coherent for callers
+            return filtered
+
+        # Legacy fixed-band velocity-adaptive EMA.
+        if not hasattr(self, '_ema_target') or self._ema_target is None:
+            self._ema_target = target_x
+        else:
+            ema_center_now = self._ema_target + self.crop_w // 2
+            target_center = target_x + self.crop_w // 2
+            dist_pct = abs(target_center - ema_center_now) / max(1, self.crop_w)
+            if dist_pct > 0.30:
+                ema_alpha = 0.55
+            elif dist_pct > 0.15:
+                ema_alpha = 0.40
+            else:
+                ema_alpha = 0.25 if not self.is_live_action else 0.30
+            self._ema_target = clamp_x(
+                int(ema_alpha * target_x + (1 - ema_alpha) * self._ema_target),
+                self.max_x)
+        return self._ema_target
+
     def _decide_adaptive(self, start: int, end: int, params: AdaptiveParams,
                          scene_idx: int = -1) -> List[dict]:
         """Universal keyframe generator — snappy, locked on the active subject.
@@ -1233,6 +1350,11 @@ class Planner:
         # Reset EMA target at scene boundary (each scene starts fresh)
         if hasattr(self, '_ema_target'):
             del self._ema_target
+        # Reset the One-Euro filter + anticipation state at each scene start so
+        # a new scene snaps to its subject instead of easing from the old one.
+        self._euro_filter = None
+        self._prev_raw_target = None
+        self._prev_raw_target_t = None
 
         # Build per-track home positions (median cx → crop position)
         track_cxs = {}
@@ -1333,6 +1455,7 @@ class Planner:
             speech_active = self._is_speech_active(t)
             switching = False
             subject_source = None  # reset each sample
+            anchor_yaw = None      # gaze yaw of the framed face, if any (item 6)
 
             if real_faces:
                 # Score faces using ACCUMULATED mouth motion (who's BEEN speaking)
@@ -1429,6 +1552,9 @@ class Planner:
 
                 face_w = best_face.get('w', 0)
                 face_h = best_face.get('h', 0)
+                # Gaze yaw of the framed face (item 6 lead-room). Perceiver
+                # stamps 'yaw' in [-1,1] from YuNet landmarks when available.
+                anchor_yaw = best_face.get('yaw')
 
                 # ── True-center targeting with full-face containment ──
                 # Goal: the ENTIRE face (plus breathing room) must be inside
@@ -1440,8 +1566,12 @@ class Planner:
                 # face is near the edge of the source frame.
                 edge_margin = max(20, int(face_w * 0.65))
 
-                # Start by centering the crop on the face center
-                center_x = clamp_x(best_face['cx'] - self.crop_w // 2, self.max_x)
+                # Start by centering the crop on the face anchor. With the
+                # eye-line anchor enabled we frame on the eye-midpoint x
+                # (steadier than the jittery bbox center, and closer to how a
+                # human frames — eyes, not box center). Falls back to cx.
+                center_x = clamp_x(self._anchor_cx(best_face) - self.crop_w // 2,
+                                   self.max_x)
 
                 # Compute face edges in source coordinates
                 face_left = best_face['cx'] - face_w // 2
@@ -1684,31 +1814,12 @@ class Planner:
             else:
                 lock_threshold = max(12, int(self.crop_w * 0.20))   # 20% = stable for animated
 
-            # ── Velocity-adaptive EMA on target position ──
-            # When the face is far from the current crop center, use a higher alpha
-            # to snap quickly. When already close, use a low alpha for smooth panning.
-            # This prevents the crop from lagging a second behind a fast-moving subject
-            # while still looking smooth during small adjustments.
-            if not switching:
-                if not hasattr(self, '_ema_target'):
-                    self._ema_target = target_x
-                else:
-                    ema_center_now = self._ema_target + self.crop_w // 2
-                    target_center  = target_x       + self.crop_w // 2
-                    dist_pct = abs(target_center - ema_center_now) / max(1, self.crop_w)
-                    if dist_pct > 0.30:
-                        ema_alpha = 0.55   # far: snap quickly
-                    elif dist_pct > 0.15:
-                        ema_alpha = 0.40   # moderate: track steadily
-                    else:
-                        ema_alpha = 0.25 if not self.is_live_action else 0.30  # close: smooth
-                    self._ema_target = clamp_x(
-                        int(ema_alpha * target_x + (1 - ema_alpha) * self._ema_target),
-                        self.max_x)
-                target_x = self._ema_target
-            else:
-                # On speaker switch: reset EMA to snap immediately
-                self._ema_target = target_x
+            # ── Anticipate + smooth the target position ──
+            # Adds anticipatory lead-room (velocity + gaze) then low-passes
+            # with a speed-adaptive One-Euro filter (or the legacy fixed-band
+            # EMA when disabled). Snaps cleanly on a speaker switch. See
+            # Planner._apply_target_filter.
+            target_x = self._apply_target_filter(target_x, t, switching, anchor_yaw)
 
             # ═══════════════════════════════════════════════════════
             # POST-EMA CENTERING CONSTRAINT (iterative)

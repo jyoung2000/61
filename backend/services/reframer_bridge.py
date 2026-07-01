@@ -57,6 +57,36 @@ def _to_int(v, default=0):
         return default
 
 
+def _attach_track_velocity(timeline: dict) -> None:
+    """Inject per-box vx/vy (source px/sec) from the previous same-track box.
+
+    ``timeline`` maps ``"<time_ms>" -> [box, ...]`` where each box has a
+    ``track_id``, ``cx``, ``cy``. Mutates boxes in place, adding ``vx``/``vy``
+    used by the preview to advect boxes between sparse detections. Boxes with
+    no prior sample (or ``track_id < 0``) get zero velocity.
+    """
+    try:
+        times = sorted(timeline.keys(), key=lambda s: int(s))
+    except (TypeError, ValueError):
+        return
+    prev = {}  # track_id -> (t_ms, cx, cy)
+    for ts in times:
+        t_ms = int(ts)
+        for box in timeline[ts]:
+            tid = box.get("track_id", -1)
+            vx = vy = 0.0
+            if tid is not None and tid >= 0 and tid in prev:
+                pt, pcx, pcy = prev[tid]
+                dt = (t_ms - pt) / 1000.0
+                if dt > 1e-3:
+                    vx = (box.get("cx", 0) - pcx) / dt
+                    vy = (box.get("cy", 0) - pcy) / dt
+            box["vx"] = round(float(vx), 2)
+            box["vy"] = round(float(vy), 2)
+            if tid is not None and tid >= 0:
+                prev[tid] = (t_ms, box.get("cx", 0), box.get("cy", 0))
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  Function 1 — reframer RenderPlan  →  Fez RenderPlan
 # ═══════════════════════════════════════════════════════════════════════════
@@ -558,6 +588,10 @@ def serialize_detection_overlay(perception, reframer_plan=None) -> dict:
                 "track_id": _to_int(f.get("track_id", -1), default=-1),
                 "mouth_motion": round(float(f.get("mouth_motion", 0.0) or 0.0), 3),
                 "source": str(f.get("source", "") or "unknown"),
+                # Eye-line anchor + gaze yaw (items 5/6). Present only when the
+                # detector produced landmarks; the frontend falls back to cx.
+                **({"eye_cx": _to_int(f.get("eye_cx"))} if f.get("eye_cx") is not None else {}),
+                **({"yaw": round(float(f.get("yaw", 0.0) or 0.0), 3)} if f.get("yaw") is not None else {}),
             }
             for f in (faces or [])
         ]
@@ -573,9 +607,25 @@ def serialize_detection_overlay(perception, reframer_plan=None) -> dict:
                 "cx": _to_int(p.get("cx", 0)),
                 "cy": _to_int(p.get("cy", 0)),
                 "class_name": str(p.get("class_name", "") or "person"),
+                # Persistent per-person id (item 1) so the overlay interpolates
+                # a box per subject instead of cross-fading two people.
+                "track_id": _to_int(p.get("track_id", -1), default=-1),
             }
             for p in (persons or [])
         ]
+
+    # ── Per-box velocity for optical-flow-style preview propagation (item 7) ──
+    # Attach vx/vy (source px/sec) to each box from the previous sample of the
+    # same track so the frontend can advect boxes smoothly between (and just
+    # past) sparse detections. Gated so it can be turned off.
+    try:
+        from backend.config import settings as _settings
+        _emit_velocity = bool(getattr(_settings, "REFRAMER_OVERLAY_VELOCITY", True))
+    except Exception:
+        _emit_velocity = True
+    if _emit_velocity:
+        _attach_track_velocity(face_tl)
+        _attach_track_velocity(person_tl)
 
     motion_tl = {}
     for t_ms, v in (getattr(perception, "motion_timeline", None) or {}).items():

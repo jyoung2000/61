@@ -42,6 +42,114 @@ export function findNearestKey(sortedKeys, target, maxDist) {
 const INTERPOLATED_DELTA_MS = 100;
 const FACE_LOOKUP_TOL_MS = 250;
 const SUBJECT_LOOKUP_TOL_MS = 250;
+// How far past the last detection of a track we still advect its box using
+// the emitted per-box velocity (optical-flow-style propagation, item 7).
+const EXTRAPOLATE_MS = 350;
+
+const _lerp = (a, b, u) => a + (b - a) * u;
+
+// Numeric box fields we interpolate; everything else is carried from `from`.
+const _BOX_NUM_FIELDS = ['x', 'y', 'w', 'h', 'cx', 'cy', 'confidence', 'mouth_motion'];
+
+function _lerpBox(from, to, u) {
+  const out = { ...from };
+  for (const k of _BOX_NUM_FIELDS) {
+    if (typeof from[k] === 'number' && typeof to[k] === 'number') {
+      out[k] = _lerp(from[k], to[k], u);
+    }
+  }
+  return out;
+}
+
+// Advect a single box forward from its sample time by dtMs using vx/vy
+// (source px/sec). Used when a track has no bracketing "next" sample.
+function _advectBox(box, dtMs) {
+  const vx = Number(box.vx || 0);
+  const vy = Number(box.vy || 0);
+  if (!vx && !vy) return { ...box };
+  const dt = dtMs / 1000;
+  const dx = vx * dt;
+  const dy = vy * dt;
+  return {
+    ...box,
+    x: (box.x || 0) + dx,
+    y: (box.y || 0) + dy,
+    cx: (box.cx || 0) + dx,
+    cy: (box.cy || 0) + dy,
+  };
+}
+
+/**
+ * Interpolate the boxes of a timeline at time `tMs`, matched by `track_id`.
+ *
+ * Instead of snapping to the nearest sample (which makes boxes teleport every
+ * ~200ms and lag up to 250ms), we find the two bracketing samples and lerp
+ * each track's box between them. Tracks present in only one bracket are
+ * advected with their velocity (up to EXTRAPOLATE_MS) so they still move
+ * smoothly. Boxes without a track_id fall back to nearest-sample selection.
+ *
+ * Returns `{ boxes, interpolated }` where `interpolated` is true when the
+ * boxes are not sitting exactly on a detected sample (drawn dashed).
+ */
+function interpolateBoxes(timeline, sortedKeys, tMs, tolMs) {
+  if (!timeline || !sortedKeys || !sortedKeys.length) {
+    return { boxes: [], interpolated: false };
+  }
+  const idx = lowerBound(sortedKeys, tMs);
+  const prevKey = sortedKeys[idx - 1];
+  const nextKey = sortedKeys[idx];
+  const prevBoxes = prevKey != null ? (timeline[String(prevKey)] || []) : [];
+  const nextBoxes = nextKey != null ? (timeline[String(nextKey)] || []) : [];
+
+  // Exactly on / adjacent to a sample: use it directly (solid).
+  const nearestKey = findNearestKey(sortedKeys, tMs, tolMs);
+  if (nearestKey == null) return { boxes: [], interpolated: false };
+  const onSample = Math.abs(nearestKey - tMs) <= INTERPOLATED_DELTA_MS;
+
+  const keyOf = (b) => (b && b.track_id != null && Number(b.track_id) >= 0
+    ? Number(b.track_id) : null);
+  const prevMap = new Map();
+  const nextMap = new Map();
+  const prevUntracked = [];
+  const nextUntracked = [];
+  for (const b of prevBoxes) { const k = keyOf(b); if (k == null) prevUntracked.push(b); else prevMap.set(k, b); }
+  for (const b of nextBoxes) { const k = keyOf(b); if (k == null) nextUntracked.push(b); else nextMap.set(k, b); }
+
+  const boxes = [];
+  const haveBracket = prevKey != null && nextKey != null
+    && prevKey <= tMs && tMs <= nextKey && nextKey > prevKey;
+  const u = haveBracket ? (tMs - prevKey) / (nextKey - prevKey) : 0;
+
+  const seen = new Set();
+  for (const [k, pb] of prevMap.entries()) {
+    seen.add(k);
+    const nb = nextMap.get(k);
+    if (nb && haveBracket) {
+      boxes.push(_lerpBox(pb, nb, u));
+    } else if (nextKey == null || (tMs - prevKey) <= EXTRAPOLATE_MS) {
+      boxes.push(_advectBox(pb, Math.max(0, tMs - prevKey)));
+    } else {
+      boxes.push({ ...pb });
+    }
+  }
+  // Tracks that only appear in the "next" bracket (just entered frame).
+  for (const [k, nb] of nextMap.entries()) {
+    if (seen.has(k)) continue;
+    if (prevKey == null || (nextKey - tMs) <= EXTRAPOLATE_MS) {
+      boxes.push(_advectBox(nb, -Math.max(0, nextKey - tMs)));
+    } else {
+      boxes.push({ ...nb });
+    }
+  }
+  // Untracked boxes: fall back to whichever bracket sample is nearer.
+  if (prevUntracked.length || nextUntracked.length) {
+    const useNext = nextKey != null
+      && (prevKey == null || Math.abs(nextKey - tMs) < Math.abs(prevKey - tMs));
+    for (const b of (useNext ? nextUntracked : prevUntracked)) boxes.push({ ...b });
+  }
+
+  return { boxes, interpolated: !onSample };
+}
 
 /**
  * ReframePreview — canvas overlay drawn on top of the source <video>.
@@ -171,14 +279,13 @@ export default function ReframePreview({
       ctx.lineTo(cx, offsetY + displayH);
       ctx.stroke();
 
-      // 3) Face boxes via binary-search lookup.
+      // 3) Face boxes — interpolated per track_id between bracketing samples
+      //    so the box tracks smoothly instead of teleporting each sample.
       const tMs = Math.round(video.currentTime * 1000);
-      const faceKey = findNearestKey(sortedKeys.face, tMs, FACE_LOOKUP_TOL_MS);
-      const faces = faceKey != null
-        ? (detectionData?.face_timeline?.[String(faceKey)] || [])
-        : [];
-      const faceInterpolated = faceKey != null
-        && Math.abs(faceKey - tMs) > INTERPOLATED_DELTA_MS;
+      const faceResult = interpolateBoxes(
+        detectionData?.face_timeline, sortedKeys.face, tMs, FACE_LOOKUP_TOL_MS);
+      const faces = faceResult.boxes;
+      const faceInterpolated = faceResult.interpolated;
 
       // Active speaker = highest mouth_motion above a small floor.
       let speakerTrackId = null;
@@ -230,11 +337,11 @@ export default function ReframePreview({
         ctx.fillText(label, fx + 3, labelY + 10);
       }
 
-      // 4) Subject (YOLO) boxes — cyan, with class labels.
-      const personKey = findNearestKey(sortedKeys.person, tMs, SUBJECT_LOOKUP_TOL_MS);
-      const persons = personKey != null
-        ? (detectionData?.person_timeline?.[String(personKey)] || [])
-        : [];
+      // 4) Subject (YOLO) boxes — cyan, with class labels. Interpolated per
+      //    track_id just like faces.
+      const personResult = interpolateBoxes(
+        detectionData?.person_timeline, sortedKeys.person, tMs, SUBJECT_LOOKUP_TOL_MS);
+      const persons = personResult.boxes;
       for (const p of persons) {
         const sx = offsetX + p.x * scaleX;
         const sy = offsetY + p.y * scaleY;
