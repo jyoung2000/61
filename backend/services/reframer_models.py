@@ -427,6 +427,64 @@ def interpolate_x(keyframes: List[dict], time_ms: float) -> int:
     return round(prev_kf['x'] + (next_kf['x'] - prev_kf['x']) * eased)
 
 
+def interpolate_scale(keyframes: List[dict], time_ms: float) -> float:
+    """Canonical zoom/scale resolver (item 10 — motivated zoom).
+
+    Parallel to ``interpolate_x`` but for the optional per-keyframe ``scale``
+    term (1.0 = no zoom, >1.0 = punch-in). Keyframes without a ``scale`` key
+    resolve to 1.0, so this is fully backward-compatible: a plan authored
+    before zoom existed always returns 1.0 and the caller renders at native
+    crop width.
+    """
+    if not keyframes:
+        return 1.0
+
+    def _s(kf):
+        try:
+            v = float(kf.get('scale', 1.0))
+        except (TypeError, ValueError):
+            return 1.0
+        return v if v > 0 else 1.0
+
+    n = len(keyframes)
+    if time_ms <= keyframes[0]['time_ms']:
+        return _s(keyframes[0])
+    if time_ms >= keyframes[-1]['time_ms']:
+        return _s(keyframes[-1])
+
+    prev_idx = 0
+    for i in range(n):
+        if keyframes[i]['time_ms'] <= time_ms:
+            prev_idx = i
+    prev_kf = keyframes[prev_idx]
+    next_idx = prev_idx + 1
+    if next_idx >= n:
+        return _s(prev_kf)
+    next_kf = keyframes[next_idx]
+
+    if next_kf.get('transition', 'cut') == 'cut':
+        return _s(prev_kf) if time_ms < next_kf['time_ms'] else _s(next_kf)
+
+    trans_ms = next_kf.get('transition_ms', 300)
+    if trans_ms <= 0:
+        t_start = prev_kf['time_ms']
+    else:
+        t_start = next_kf['time_ms'] - trans_ms
+    t_end = next_kf['time_ms']
+    if time_ms <= t_start:
+        return _s(prev_kf)
+    if time_ms >= t_end:
+        return _s(next_kf)
+    dur = t_end - t_start
+    if dur <= 0:
+        return _s(next_kf)
+    p = (time_ms - t_start) / dur
+    # Zoom always eases smoothly regardless of the x transition style — a
+    # punch-in should never snap. Use ease_in_out.
+    eased = 4 * p * p * p if p < 0.5 else 1 - (-2 * p + 2) ** 3 / 2
+    return _s(prev_kf) + (_s(next_kf) - _s(prev_kf)) * eased
+
+
 def clamp_x(x: int, max_x: int) -> int:
     return max(0, min(x, max_x))
 

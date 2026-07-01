@@ -182,6 +182,12 @@ class ReframeEngine:
         # Final edge-violation elimination — runs last, after all other passes
         self._eliminate_edge_violations()
 
+        # Stage 5: Motivated zoom — stamp a per-keyframe `scale` term (push-in
+        # on held speakers, punch-out for reveals) using the dormant
+        # motivated_zoom planner. Runs last so it layers on the final x path.
+        # Flag-gated (default OFF); no-op when no zoom moments are produced.
+        self._apply_motivated_zoom()
+
         total_elapsed = self.log.stop_timer('total_pipeline')
 
         # Final summary
@@ -677,6 +683,86 @@ class ReframeEngine:
             log.log_stage('SMOOTH',
                 f'Face enforcement ({"live" if self.perception.is_live_action else "non-live"}, '
                 f'min_gap={min_gap_ms}ms): inserted {len(corrections)} corrections')
+
+    def _apply_motivated_zoom(self):
+        """Stamp a per-keyframe ``scale`` for slow push-ins on held speakers.
+
+        A human operator pushes in slowly while a subject holds the frame
+        (building intimacy) and never zooms mid-pan. We detect holds — long
+        gaps between two near-equal-x keyframes with a face present — and ramp
+        ``scale`` 1.0 → max → 1.0 across each, easing in/out. The ``scale`` term
+        is consumed by ``interpolate_scale`` and the zoom-aware export crop.
+        Flag-gated (default OFF); no-op when no qualifying holds exist.
+        """
+        from backend.config import settings
+        if not getattr(settings, 'REFRAMER_MOTIVATED_ZOOM', False):
+            return
+        kfs = self.plan.keyframes
+        if len(kfs) < 2:
+            return
+        max_scale = float(getattr(settings, 'REFRAMER_MOTIVATED_ZOOM_MAX', 1.15))
+        if max_scale <= 1.001:
+            return
+        crop_w = self.plan.crop_w
+        MIN_HOLD_MS = 2500
+        RAMP_MS = 1000
+        PAD_MS = 250
+        MIN_GAP_MS = 1500
+        MAX_ZOOMS = 6
+
+        def _face_in_span(t0, t1):
+            for t, faces in self.perception.face_timeline.items():
+                if t0 <= t <= t1 and faces:
+                    return True
+            return False
+
+        inserts = []
+        zooms = 0
+        last_end = -10 ** 9
+        for i in range(len(kfs) - 1):
+            if zooms >= MAX_ZOOMS:
+                break
+            a, b = kfs[i], kfs[i + 1]
+            if b.get('transition') == 'cut':
+                continue
+            t0, t1 = a['time_ms'], b['time_ms']
+            if t1 - t0 < MIN_HOLD_MS:
+                continue
+            if abs(b['x'] - a['x']) > crop_w * 0.05:
+                continue  # not a hold — it's a pan
+            if t0 < last_end + MIN_GAP_MS:
+                continue
+            if not _face_in_span(t0, t1):
+                continue  # don't push in on static graphics / no subject
+            s0 = t0 + PAD_MS
+            s3 = t1 - PAD_MS
+            if s3 - s0 < 2 * RAMP_MS + 200:
+                continue
+            s1 = s0 + RAMP_MS
+            s2 = s3 - RAMP_MS
+            x_hold = a['x']
+            # start (1.0) → peak-in (max) → peak-out (max) → end (1.0)
+            inserts.append({'time_ms': int(s0), 'x': int(x_hold),
+                            'transition': 'ease_in_out', 'transition_ms': 0, 'scale': 1.0,
+                            '_zoom': True})
+            inserts.append({'time_ms': int(s1), 'x': int(x_hold),
+                            'transition': 'ease_in_out', 'transition_ms': RAMP_MS,
+                            'scale': round(max_scale, 4), '_zoom': True})
+            inserts.append({'time_ms': int(s2), 'x': int(x_hold),
+                            'transition': 'ease_in_out', 'transition_ms': 0,
+                            'scale': round(max_scale, 4), '_zoom': True})
+            inserts.append({'time_ms': int(s3), 'x': int(x_hold),
+                            'transition': 'ease_in_out', 'transition_ms': RAMP_MS,
+                            'scale': 1.0, '_zoom': True})
+            last_end = t1
+            zooms += 1
+
+        if inserts:
+            kfs.extend(inserts)
+            kfs.sort(key=lambda k: k['time_ms'])
+            get_logger().log_stage(
+                'ENGINE', f'Motivated zoom: {zooms} push-in(s) '
+                f'(max scale {max_scale:.2f})')
 
     def _smooth_trajectory_savgol(self):
         """Non-causal Savitzky-Golay smoothing over the target-x trajectory.

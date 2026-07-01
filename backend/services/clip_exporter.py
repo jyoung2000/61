@@ -3327,6 +3327,79 @@ def _compress_range(
     return result
 
 
+def _piecewise_time_expr(points: list[tuple[float, float]], smooth: bool = True,
+                         max_points: int = 20) -> str:
+    """FFmpeg expression for a piecewise value over time ``t`` (seconds).
+
+    ``points`` is a sorted list of ``(t_seconds, value)``. Builds a nested
+    ``if(lt(t, t_i), ...)`` expression; between knots it either holds the left
+    value (``smooth=False``) or smoothsteps (``3p²−2p³``) to the right value.
+    Downsamples to ``max_points`` knots to keep the expression shallow.
+    """
+    if not points:
+        return "0"
+    pts = list(points)
+    if len(pts) > max_points:
+        step = len(pts) / float(max_points)
+        idxs = sorted(set(int(i * step) for i in range(max_points)) | {len(pts) - 1})
+        pts = [pts[i] for i in idxs]
+    # Build from the last segment backwards.
+    expr = f"{pts[-1][1]:.3f}"
+    for i in range(len(pts) - 1, 0, -1):
+        t0, v0 = pts[i - 1]
+        t1, v1 = pts[i]
+        if t1 <= t0:
+            continue
+        if smooth:
+            # p in [0,1] across [t0,t1]; smoothstep 3p^2-2p^3.
+            p = f"clip((t-{t0:.4f})/{(t1 - t0):.4f},0,1)"
+            seg = f"({v0:.3f}+({v1 - v0:.3f})*((3*({p})*({p}))-(2*({p})*({p})*({p}))))"
+        else:
+            seg = f"{v0:.3f}"
+        expr = f"if(lt(t,{t1:.4f}),{seg},{expr})"
+    # Before the first knot, hold the first value.
+    expr = f"if(lt(t,{pts[0][0]:.4f}),{pts[0][1]:.3f},{expr})"
+    return expr
+
+
+def build_zoom_crop_filter(
+    subject_keyframes: list[tuple[float, int]],
+    zoom_keyframes: list[tuple[float, float]],
+    src_w: int,
+    src_h: int,
+    crop_w0: int,
+    crop_h0: int,
+    y_offset0: int,
+) -> str:
+    """Build a time-varying ``crop=`` filter with motivated zoom (item 10).
+
+    The base crop is ``crop_w0 × crop_h0`` at ``y_offset0``. A per-time zoom
+    factor ``z(t) ≥ 1`` (from ``zoom_keyframes``) shrinks the crop about the
+    subject center, producing a push-in; the following ``scale`` back to the
+    output size enlarges the subject. ``subject_keyframes`` give the subject's
+    horizontal position (0-100%) so the zoomed crop stays centered on them.
+
+    Returns an ffmpeg ``crop=w:h:x:y`` string using the ``t`` / ``in_w`` /
+    ``in_h`` variables. Pure and unit-testable (no ffmpeg invocation).
+    """
+    # Subject center in source pixels over time.
+    centers = [(float(t), _safe_subject_x(sx) / 100.0 * src_w)
+               for (t, sx) in (subject_keyframes or [(0.0, 50)])]
+    center_expr = _piecewise_time_expr(centers, smooth=True)
+    # Zoom factor over time (clamp to >= 1.0 so we only ever punch in here).
+    zpts = [(float(t), max(1.0, float(s))) for (t, s) in (zoom_keyframes or [(0.0, 1.0)])]
+    z_expr = f"max(1.0,{_piecewise_time_expr(zpts, smooth=True)})"
+
+    cw = f"floor(({crop_w0})/({z_expr})/2)*2"
+    ch = f"floor(({crop_h0})/({z_expr})/2)*2"
+    # Keep the subject centered horizontally; keep the base vertical framing
+    # (y_offset0) but re-center the shrink about the base crop's center.
+    x = f"clip(({center_expr})-({cw})/2,0,in_w-({cw}))"
+    base_cy = y_offset0 + crop_h0 / 2.0
+    y = f"clip({base_cy:.2f}-({ch})/2,0,in_h-({ch}))"
+    return f"crop={cw}:{ch}:{x}:{y}"
+
+
 def _build_crop_x_expr(
     keyframes: list[tuple[float, int]],
     max_offset: int,
@@ -4227,6 +4300,7 @@ def _build_filter_chain(
     face_y_center: float = 50.0,
     face_width_pct: float = 0.0,
     use_step_interpolation: bool = False,
+    zoom_keyframes: list[tuple[float, float]] | None = None,
 ) -> tuple[str | None, bool]:
     """Build FFmpeg video filter chain.
 
@@ -4364,8 +4438,27 @@ def _build_filter_chain(
                 f"{src_ratio:.3f}", f"{target_ratio:.3f}", src_w, src_h, crop_w, crop_h, max_x_offset,
             )
 
+            # Motivated zoom (item 10): when enabled and the plan carries a
+            # time-varying scale, render a single zoom-aware crop that both
+            # follows the subject and pushes in. Skips the plain-crop branches.
+            _zoom_active = (
+                getattr(app_settings, "REFRAMER_MOTIVATED_ZOOM", False)
+                and zoom_keyframes
+                and any(abs(float(s) - 1.0) > 0.01 for _, s in zoom_keyframes)
+            )
+            if _zoom_active:
+                _zoom_kf_src = subject_keyframes if subject_keyframes else [(0.0, subject_x)]
+                zoom_crop = build_zoom_crop_filter(
+                    _zoom_kf_src, list(zoom_keyframes),
+                    src_w, src_h, crop_w, crop_h, y_offset,
+                )
+                filters.append(zoom_crop)
+                logger.info(
+                    "[SubjectTracking] MOTIVATED ZOOM crop: %d zoom kfs, base crop=%dx%d",
+                    len(zoom_keyframes), crop_w, crop_h,
+                )
             # Dynamic or static horizontal offset — center subject in frame
-            if subject_keyframes and len(subject_keyframes) > 1:
+            elif subject_keyframes and len(subject_keyframes) > 1:
                 unique_sx = set(kf[1] for kf in subject_keyframes)
                 if len(unique_sx) > 1:
                     # Dynamic crop: time-varying x offset

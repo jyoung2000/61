@@ -347,9 +347,11 @@ export default function ReframePreview({
         const sy = offsetY + p.y * scaleY;
         const sw = p.w * scaleX;
         const sh = p.h * scaleY;
-        ctx.strokeStyle = '#00C8FF';
+        ctx.strokeStyle = personResult.interpolated ? '#3399B8' : '#00C8FF';
         ctx.lineWidth = 1.5;
+        if (personResult.interpolated) ctx.setLineDash([4, 3]);
         ctx.strokeRect(sx, sy, sw, sh);
+        ctx.setLineDash([]);
 
         const cls = String(p.class_name || 'person');
         const lw = ctx.measureText(cls).width;
