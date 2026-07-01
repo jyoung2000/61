@@ -6,10 +6,27 @@ from nvidia-smi (CTranslate2 / Whisper, which torch can't see) — so the panel
 truthfully answers "is the GPU being used" during analysis, not just for Ollama.
 """
 
-from backend.routers.diagnostics import _compute_gpu_usage
+from backend.routers.diagnostics import _compute_gpu_usage, _other_device_bytes
 
 GB = 1024 ** 3
 MB = 1024 ** 2
+
+
+def test_other_device_bytes_attributes_whisper_residency():
+    # nvidia-smi 3.0GB, Ollama 0.5GB, torch 0.2GB → 2.3GB is CTranslate2/Whisper.
+    other = _other_device_bytes(device_used=3 * GB,
+                                vram_used_ollama=500 * MB,
+                                torch_reserved=200 * MB)
+    assert other == 3 * GB - 500 * MB - 200 * MB
+
+
+def test_other_device_bytes_none_when_smi_unavailable():
+    assert _other_device_bytes(None, 500 * MB, 200 * MB) == 0
+
+
+def test_other_device_bytes_floors_at_zero():
+    # Ollama+torch momentarily exceed the sampled device figure (poll jitter).
+    assert _other_device_bytes(1 * GB, 900 * MB, 300 * MB) == 0
 
 
 def test_idle_gpu_not_in_use():

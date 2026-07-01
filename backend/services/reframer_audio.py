@@ -217,11 +217,60 @@ class AudioIntelligence:
     _last_loaded_model_name = None
     _last_loaded_device = None
 
+    # Load-footprint (GB) per (model, compute_type). Mirrors the ``_vram_load_gb``
+    # table used at load time; kept at class scope so the diagnostics panel can
+    # estimate Whisper's GPU residency. faster-whisper is CTranslate2, whose VRAM
+    # lives OUTSIDE torch's allocator — so torch.cuda.memory_reserved() can't see
+    # it and the live gauge needs either nvidia-smi (measured) or this estimate.
+    _VRAM_LOAD_GB = {
+        ('large', 'float16'): 3.0, ('large', 'int8_float16'): 1.6,
+        ('large-v2', 'float16'): 3.0, ('large-v2', 'int8_float16'): 1.6,
+        ('large-v3', 'float16'): 3.0, ('large-v3', 'int8_float16'): 1.6,
+        ('large-v3-turbo', 'float16'): 1.8, ('large-v3-turbo', 'int8_float16'): 1.0,
+        ('kotoba-tech/kotoba-whisper-v2.0-faster', 'float16'): 1.8,
+        ('kotoba-tech/kotoba-whisper-v2.0-faster', 'int8_float16'): 1.0,
+        ('medium', 'float16'): 1.6, ('medium', 'int8_float16'): 0.85,
+        ('small', 'float16'): 1.0, ('small', 'int8_float16'): 0.55,
+        ('base', 'float16'): 0.4, ('base', 'int8_float16'): 0.25,
+        ('tiny', 'float16'): 0.2,
+    }
+
     @classmethod
     def _record_loaded(cls, model_name, device):
         """Stamp the model/device that just loaded (sticky, for the GUI)."""
         cls._last_loaded_model_name = model_name
         cls._last_loaded_device = device
+
+    @classmethod
+    def gpu_residency_estimate(cls) -> dict:
+        """Best-effort Whisper GPU residency for the live VRAM gauge.
+
+        Returns ``{loaded, model, device, on_gpu, est_bytes}``. ``est_bytes`` is
+        a load-footprint estimate (from ``_VRAM_LOAD_GB``) used as a fallback
+        when nvidia-smi can't be reached from the app container (so CTranslate2
+        Whisper VRAM would otherwise be invisible). ``loaded`` reflects whether
+        an engine is currently held in memory (``_cached_engine``); the sticky
+        ``_last_loaded_*`` fields are used only for labelling when idle.
+        """
+        engine_loaded = cls._cached_engine is not None
+        model = cls._cached_model_name or cls._last_loaded_model_name or ""
+        device = (cls._cached_device or cls._last_loaded_device or "")
+        on_gpu = engine_loaded and str(device).startswith("cuda")
+        est_bytes = 0
+        if on_gpu:
+            compute = device.split("_", 1)[1] if "_" in device else "float16"
+            gb = cls._VRAM_LOAD_GB.get((model, compute))
+            if gb is None:
+                # Unknown pairing — bias by whether weights are int8-quantized.
+                gb = 1.6 if "int8" in compute else 3.0
+            est_bytes = int(gb * 1024 ** 3)
+        return {
+            "loaded": engine_loaded,
+            "model": model,
+            "device": device,
+            "on_gpu": on_gpu,
+            "est_bytes": est_bytes,
+        }
 
     @classmethod
     def invalidate_cache(cls, reason: str = ""):

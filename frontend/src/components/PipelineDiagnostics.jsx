@@ -23,7 +23,7 @@ function Spinner() {
 }
 
 // ── VRAM Gauge ──────────────────────────────────────────────────────────
-function VramGauge({ gpu, loadedModels, ollamaAvailable, torchGpu, onUnload, onReleaseGpu, onRestart }) {
+function VramGauge({ gpu, loadedModels, ollamaAvailable, torchGpu, whisperGpu, onUnload, onReleaseGpu, onRestart }) {
   // Ollama offline
   if (ollamaAvailable === false) {
     return (
@@ -80,11 +80,29 @@ function VramGauge({ gpu, loadedModels, ollamaAvailable, torchGpu, onUnload, onR
     return { name: m.name, pct, color: isVision ? MODEL_COLORS.vision : MODEL_COLORS.text, vram: m.vram_bytes };
   });
 
-  // Torch reserved memory segment (orange — the hidden VRAM hog)
+  // Torch reserved memory segment (orange — YOLO / torch-based stages).
+  // NOTE: this is torch's allocator ONLY. faster-whisper is CTranslate2, whose
+  // VRAM lives outside torch and is shown as its own "Whisper" segment below.
   const torchReserved = torchGpu?.reserved_bytes || 0;
   if (torchReserved > 50 * 1024 * 1024) { // Only show if > 50MB
     const torchPct = totalBytes > 0 ? Math.min(100, (torchReserved / totalBytes) * 100) : 0;
-    segments.push({ name: 'Torch/Whisper', pct: torchPct, color: '#f59e0b', vram: torchReserved });
+    segments.push({ name: 'Torch (YOLO)', pct: torchPct, color: '#f59e0b', vram: torchReserved });
+  }
+
+  // Whisper (CTranslate2) segment — torch can't see it, so attribute the
+  // non-torch/non-Ollama device residency to it. Prefer the MEASURED figure
+  // (nvidia-smi minus Ollama/torch); fall back to the load-footprint ESTIMATE
+  // when nvidia-smi is unreachable from the app container.
+  const measuredWhisper = gpu.other_device_bytes || 0;
+  const whisperEst = (whisperGpu && whisperGpu.on_gpu) ? (whisperGpu.est_bytes || 0) : 0;
+  const whisperBytes = measuredWhisper > 100 * 1024 * 1024 ? measuredWhisper : whisperEst;
+  const whisperEstimated = whisperBytes > 0 && measuredWhisper <= 100 * 1024 * 1024;
+  if (whisperBytes > 50 * 1024 * 1024) { // Only show if > 50MB
+    const whisperPct = totalBytes > 0 ? Math.min(100, (whisperBytes / totalBytes) * 100) : 0;
+    const label = whisperGpu?.model
+      ? `Whisper ${whisperGpu.model}${whisperEstimated ? ' (est)' : ''}`
+      : `Whisper (CTranslate2)${whisperEstimated ? ' (est)' : ''}`;
+    segments.push({ name: label, pct: whisperPct, color: '#a855f7', vram: whisperBytes });
   }
 
   return (
@@ -283,6 +301,7 @@ export default function PipelineDiagnostics({ showTestRunner = true } = {}) {
   const [gpuStatus, setGpuStatus] = useState(null);
   const [loadedModels, setLoadedModels] = useState([]);
   const [torchGpu, setTorchGpu] = useState(null);
+  const [whisperGpu, setWhisperGpu] = useState(null);
   const [ollamaAvailable, setOllamaAvailable] = useState(null);
   const [testRunning, setTestRunning] = useState(false);
   const [testPhases, setTestPhases] = useState([]);
@@ -306,6 +325,7 @@ export default function PipelineDiagnostics({ showTestRunner = true } = {}) {
         setGpuStatus(data.gpu);
         setLoadedModels(data.loaded_models || []);
         setTorchGpu(data.torch_gpu || null);
+        setWhisperGpu(data.whisper_gpu || null);
         setOllamaAvailable(data.ollama_available);
       } catch {
         if (active) setOllamaAvailable(false);
@@ -393,6 +413,7 @@ export default function PipelineDiagnostics({ showTestRunner = true } = {}) {
         gpu={gpuStatus}
         loadedModels={loadedModels}
         torchGpu={torchGpu}
+        whisperGpu={whisperGpu}
         ollamaAvailable={ollamaAvailable}
         onUnload={handleUnload}
         onReleaseGpu={handleReleaseGpu}

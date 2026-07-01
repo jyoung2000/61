@@ -94,6 +94,25 @@ def _compute_gpu_usage(
     return vram_used_bytes, gpu_in_use, gpu_poisoned
 
 
+def _other_device_bytes(
+    device_used: int | None,
+    vram_used_ollama: int,
+    torch_reserved: int,
+) -> int:
+    """VRAM on the device that is NOT attributable to Ollama or torch.
+
+    ``nvidia-smi memory.used`` sees every process; subtracting the Ollama
+    models and torch's reserved pool leaves the residency torch can't attribute
+    — dominated during analysis by CTranslate2 / faster-whisper (which the
+    "Torch" segment can never show). Returns 0 when nvidia-smi is unavailable
+    (``device_used is None``) or the subtraction is non-positive (measurement
+    jitter). Pure + unit-tested.
+    """
+    if device_used is None:
+        return 0
+    return max(0, int(device_used) - int(vram_used_ollama) - max(0, int(torch_reserved or 0)))
+
+
 async def _get_gpu_info() -> dict:
     """Get GPU hardware info. Tries Ollama's container first since the app
     container often doesn't have direct GPU access (nvidia-smi/torch CUDA).
@@ -630,6 +649,29 @@ async def get_gpu_status():
         gpu_available=bool(gpu.get("gpu_available")),
     )
 
+    # Non-torch / non-Ollama device residency (measured) — this is where
+    # CTranslate2 / Whisper VRAM shows up, so the gauge can attribute it as its
+    # own segment instead of leaving an unexplained gap under the total.
+    gpu["other_device_bytes"] = _other_device_bytes(
+        device_used, vram_used_ollama, torch_reserved)
+
+    # Whisper GPU residency estimate — the fallback the gauge uses to show a
+    # Whisper segment when nvidia-smi is unreachable (measured is 0 then).
+    whisper_gpu = None
+    try:
+        from backend.services.reframer_audio import AudioIntelligence
+        whisper_gpu = AudioIntelligence.gpu_residency_estimate()
+    except Exception:
+        whisper_gpu = None
+
+    # When nvidia-smi can't be reached (device_used is None), the measured total
+    # can't include CTranslate2 Whisper. Fold the estimate into the total so the
+    # bar fill stays >= the sum of its segments (never override a real reading).
+    if device_used is None and whisper_gpu and whisper_gpu.get("on_gpu"):
+        gpu["vram_used_bytes"] = max(
+            int(gpu.get("vram_used_bytes", 0)),
+            vram_used_ollama + max(0, torch_reserved) + int(whisper_gpu.get("est_bytes", 0)))
+
     # If we now see GPU activity but the cached probe said no GPU, invalidate it.
     if gpu["gpu_in_use"] and not gpu.get("gpu_available"):
         global _gpu_info_cache
@@ -654,6 +696,7 @@ async def get_gpu_status():
         "loaded_models": loaded_models,
         "ollama_available": ollama_available,
         "torch_gpu": torch_gpu,
+        "whisper_gpu": whisper_gpu,
     }
 
 
