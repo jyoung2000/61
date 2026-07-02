@@ -52,16 +52,30 @@ RUN apt-get update && apt-get install -y \
     libgl1-mesa-glx libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-# Install nv-codec-headers for NVENC/NVDEC support
-RUN cd /tmp && \
-    git clone https://git.videolan.org/git/ffmpeg/nv-codec-headers.git && \
-    cd nv-codec-headers && \
-    make install && \
-    cd / && rm -rf /tmp/nv-codec-headers
+# Install nv-codec-headers for NVENC/NVDEC support.
+# Pinned release tarball from the official GitHub mirror with retries —
+# git.videolan.org regularly aborts clones mid-fetch (curl 92 HTTP/2
+# INTERNAL_ERROR / "early EOF"), which killed whole image builds. The
+# videolan git remains as a shallow-clone fallback only. n12.1.14.0
+# matches the CUDA 12.1 runtime this image uses (needs driver >= 530,
+# which any box running torch cu121 already has).
+RUN set -e; cd /tmp; \
+    ( curl --retry 5 --retry-delay 5 --retry-all-errors -fsSL \
+        -o nv-codec-headers.tar.gz \
+        https://github.com/FFmpeg/nv-codec-headers/archive/refs/tags/n12.1.14.0.tar.gz \
+      && tar xf nv-codec-headers.tar.gz ) \
+    || git clone --depth 1 --branch n12.1.14.0 \
+        https://git.videolan.org/git/ffmpeg/nv-codec-headers.git \
+        nv-codec-headers-n12.1.14.0 \
+    || git clone --depth 1 \
+        https://github.com/FFmpeg/nv-codec-headers.git \
+        nv-codec-headers-n12.1.14.0; \
+    make -C nv-codec-headers-n12.1.14.0 install; \
+    cd /; rm -rf /tmp/nv-codec-headers*
 
 # Build FFmpeg with full hardware acceleration
 RUN cd /tmp && \
-    wget -q https://ffmpeg.org/releases/ffmpeg-7.1.tar.xz && \
+    wget -q --tries=5 --waitretry=5 https://ffmpeg.org/releases/ffmpeg-7.1.tar.xz && \
     tar xf ffmpeg-7.1.tar.xz && \
     cd ffmpeg-7.1 && \
     ./configure \
