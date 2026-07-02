@@ -144,6 +144,10 @@ class Settings(BaseSettings):
     # Analysis settings
     WHISPER_MODEL: str = "small"  # Auto-upgraded to large-v3-turbo when GPU detected
     WHISPER_MODEL_USER_SET: bool = False  # True when user explicitly chose a model in UI
+    # Opt-in: auto-upgrade targets distil-large-v3 instead of
+    # large-v3-turbo. distil is English-focused — near large-v3 English
+    # WER at ~2x turbo speed — so only enable on English-only libraries.
+    WHISPER_PREFER_DISTIL_ENGLISH: bool = False
     WHISPER_BEAM_SIZE: int = 5    # beam search for better accuracy (was 1/greedy)
     WHISPER_VAD_FILTER: bool = True    # skip silence — major speedup
     # ── Phase 1 coverage boosters ──
@@ -234,6 +238,31 @@ class Settings(BaseSettings):
     # Temperature fallback ladder — on a degenerate/low-confidence segment
     # Whisper retries at the next temperature instead of emitting the loop.
     WHISPER_TEMPERATURE_FALLBACK: tuple = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
+    # ── VAD tuning + hallucination hardening (audit Phase 3.2) ──
+    # min_silence 300ms catches intra-sentence pauses; speech_pad 150ms
+    # (down from 200) tightens cue in/out points without clipping onsets.
+    WHISPER_VAD_MIN_SILENCE_MS: int = 300
+    WHISPER_VAD_SPEECH_PAD_MS: int = 150
+    # faster-whisper's own silence-gap hallucination guard (skips segments
+    # that follow ≥ this many seconds of silence when the decode is shaky).
+    # Feature-detected in _decoding_kwargs; dropped on older builds.
+    WHISPER_HALLUCINATION_SILENCE_S: float = 2.0
+    # ── Two-pass difficult-segment redecode (audit Phase 3.4) ──
+    # Segments flagged by the hallucination filter, with avg_logprob below
+    # the threshold, or with degenerate word timestamps (batched-inference
+    # word-timing bug) are re-decoded individually with beam_size=8 and
+    # patience, bounded to MAX_FRAC of segments (worst first).
+    WHISPER_REDECODE_ENABLED: bool = True
+    WHISPER_REDECODE_LOGPROB: float = -0.8
+    WHISPER_REDECODE_MAX_FRAC: float = 0.10
+    WHISPER_REDECODE_BEAM: int = 8
+    # ── CTC forced-alignment refinement (audit Phase 3.1) ──
+    # Whisper word timestamps drift 50-200ms; a CTC forced aligner
+    # (torchaudio wav2vec2, <1GB, or the ctc-forced-aligner package when
+    # installed) re-aligns words against the audio so cues snap within
+    # ~1 frame of speech onset/offset. No-op when no aligner backend is
+    # available. GPU is used only when >1.5GB VRAM is free, else CPU.
+    SUBTITLE_FORCED_ALIGN: bool = True
     # ── TACT phantom-hallucination filter (confidence-gated) ──
     # Whisper invents short, low-confidence cues over silence / music — the
     # "Don't let", "So nice", "Hmm." fragments (and repeated verbatim run-ons)

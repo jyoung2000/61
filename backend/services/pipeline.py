@@ -194,6 +194,15 @@ def _build_compute_summary(engine, perception) -> dict:
     return summary
 
 
+def _vram_snapshot(stage: str, job_id=None):
+    """Per-stage VRAM ledger entry (audit Phase 3.5). Never raises."""
+    try:
+        from backend.services.vram_ledger import snapshot
+        snapshot(stage, job_id)
+    except Exception:
+        pass
+
+
 def _log_gpu_memory(job_id: str, label: str):
     """Log current GPU memory state for VRAM debugging."""
     try:
@@ -746,6 +755,7 @@ async def translate_subtitles(segments, source_lang, target_lang, *, video_path=
         try:
             if _resolve_translation_engine(src or "auto", tgt) in ("nllb", "opus-mt"):
                 await _release_whisper_vram(job_id)
+                _vram_snapshot("pre_offline_nmt", job_id)
         except Exception:
             pass
     _nmt_coro = translate_segments_with_fallback(
@@ -3454,6 +3464,7 @@ async def _run_analysis_inner(job_id: str):
         await ensure_gpu_free_before_analysis(job_id)
     except Exception as _pre_err:
         logger.warning("[%s] GPU preflight skipped (error: %s)", job_id, _pre_err)
+    _vram_snapshot("analysis_start", job_id)
     async with _stage_timer(job_id, "metadata"):
         try:
             metadata = await asyncio.wait_for(
@@ -3922,6 +3933,7 @@ async def _run_analysis_inner(job_id: str):
         await ensure_gpu_free_before_whisper(job_id)
     except Exception as _pre_err:
         logger.warning("[%s] pre-Whisper GPU preflight skipped: %s", job_id, _pre_err)
+    _vram_snapshot("pre_whisper", job_id)
 
     # Per-job JSONL trace of every reframe decision. Lands next to
     # render_plan.json / detection_overlay.json so all the reframer
@@ -4100,6 +4112,7 @@ async def _run_analysis_inner(job_id: str):
         else:
             await _release_whisper_vram(job_id)
             _log_gpu_memory(job_id, "post-whisper-release")
+            _vram_snapshot("post_whisper_release", job_id)
 
     _n_face_samples = sum(1 for v in (perception.face_timeline or {}).values() if v)
     logger.info(
@@ -4237,6 +4250,7 @@ async def _run_analysis_inner(job_id: str):
     # jobs. No-ops gracefully when the pyannote embedding backend / HF_TOKEN
     # are absent — the per-job "Speaker N" labels simply stand.
     if _speaker_timeline and transcript:
+        _vram_snapshot("pre_voiceprint", job_id)
         try:
             from backend.services.voiceprint_registry import apply_voiceprint_names
             from backend.services.reframer_bridge import _speaker_label_map

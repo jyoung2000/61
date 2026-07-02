@@ -96,6 +96,11 @@ def _decoding_kwargs(transcribe_callable, condition_on_previous_text=None) -> di
         "temperature": tuple(getattr(
             settings, "WHISPER_TEMPERATURE_FALLBACK",
             (0.0, 0.2, 0.4, 0.6, 0.8, 1.0))),
+        # faster-whisper's silence-gap hallucination guard: a segment that
+        # follows ≥ this many seconds of silence is skipped when the decode
+        # is shaky. Second line of defense stays the TACT filter.
+        "hallucination_silence_threshold": float(getattr(
+            settings, "WHISPER_HALLUCINATION_SILENCE_S", 2.0)),
     }
     try:
         params = inspect.signature(transcribe_callable).parameters
@@ -104,6 +109,42 @@ def _decoding_kwargs(transcribe_callable, condition_on_previous_text=None) -> di
         # kwarg. The caller still sets condition_on_previous_text explicitly.
         return {}
     return {k: v for k, v in desired.items() if k in params}
+
+
+def _vad_parameters() -> dict:
+    """VAD tuning shared by the batched and sequential transcribe calls.
+
+    min_silence 300ms catches brief intra-sentence pauses; speech_pad
+    150ms keeps onsets while tightening cue boundaries (audit Phase 3.2).
+    """
+    return {
+        "min_silence_duration_ms": int(getattr(
+            settings, "WHISPER_VAD_MIN_SILENCE_MS", 300)),
+        "speech_pad_ms": int(getattr(
+            settings, "WHISPER_VAD_SPEECH_PAD_MS", 150)),
+    }
+
+
+def _words_degenerate(words: list, start_sec: float, end_sec: float) -> bool:
+    """True when a segment's word timestamps are unusable — missing for a
+    multi-word text, non-monotonic, or collapsed to zero-width spans.
+    Batched inference on some faster-whisper builds mis-times words; these
+    segments get re-decoded sequentially.
+    """
+    if not words:
+        return False  # no words at all is handled separately (may be legit)
+    prev_end = None
+    zero_width = 0
+    for w in words:
+        ws, we = w.get('start'), w.get('end')
+        if ws is None or we is None or we < ws:
+            return True
+        if prev_end is not None and ws < prev_end - 0.25:
+            return True  # went backwards past tolerance
+        if we - ws < 1e-4:
+            zero_width += 1
+        prev_end = we
+    return zero_width >= max(2, len(words) // 2)
 
 
 def _cross_validate_segments(segments: list) -> list:
@@ -227,6 +268,8 @@ class AudioIntelligence:
         ('large-v2', 'float16'): 3.0, ('large-v2', 'int8_float16'): 1.6,
         ('large-v3', 'float16'): 3.0, ('large-v3', 'int8_float16'): 1.6,
         ('large-v3-turbo', 'float16'): 1.8, ('large-v3-turbo', 'int8_float16'): 1.0,
+        ('distil-large-v3', 'float16'): 1.6, ('distil-large-v3', 'int8_float16'): 0.9,
+        ('distil-large-v3.5', 'float16'): 1.6, ('distil-large-v3.5', 'int8_float16'): 0.9,
         ('kotoba-tech/kotoba-whisper-v2.0-faster', 'float16'): 1.8,
         ('kotoba-tech/kotoba-whisper-v2.0-faster', 'int8_float16'): 1.0,
         ('medium', 'float16'): 1.6, ('medium', 'int8_float16'): 0.85,
@@ -416,6 +459,14 @@ class AudioIntelligence:
             # batched-inference workspace; a runtime OOM still falls back to CPU.
             ('large-v3-turbo','float16'):       1.8,
             ('large-v3-turbo','int8_float16'):  1.0,
+            # distil-large-v3 / v3.5 — full encoder + 2-layer decoder (~756M).
+            # Near-large-v3 English WER at ~2x turbo speed; footprint one
+            # notch under turbo. English-focused — auto-preferred only when
+            # the pipeline language is explicitly English.
+            ('distil-large-v3','float16'):      1.6,
+            ('distil-large-v3','int8_float16'): 0.9,
+            ('distil-large-v3.5','float16'):      1.6,
+            ('distil-large-v3.5','int8_float16'): 0.9,
             # Kotoba-Whisper v2.0 (Japanese-specialized, distilled ~756M) — same
             # footprint class as distil/turbo.
             ('kotoba-tech/kotoba-whisper-v2.0-faster', 'float16'):      1.8,
@@ -720,6 +771,10 @@ class AudioIntelligence:
                             ('large-v3', 'int8_float16'): 1.6,
                             ('large-v3-turbo', 'float16'):      1.8,
                             ('large-v3-turbo', 'int8_float16'): 1.0,
+                            ('distil-large-v3', 'float16'):      1.6,
+                            ('distil-large-v3', 'int8_float16'): 0.9,
+                            ('distil-large-v3.5', 'float16'):      1.6,
+                            ('distil-large-v3.5', 'int8_float16'): 0.9,
                             ('kotoba-tech/kotoba-whisper-v2.0-faster', 'float16'):      1.8,
                             ('kotoba-tech/kotoba-whisper-v2.0-faster', 'int8_float16'): 1.0,
                             ('medium',   'float16'):      1.6,
@@ -767,10 +822,7 @@ class AudioIntelligence:
                     audio_path, batch_size=self._batch_size,
                     language=whisper_lang,
                     beam_size=5, vad_filter=True,
-                    vad_parameters={
-                        "min_silence_duration_ms": 300,
-                        "speech_pad_ms": 200,
-                    },
+                    vad_parameters=_vad_parameters(),
                     word_timestamps=True,
                     no_speech_threshold=_ns_threshold,
                     **_decode,
@@ -800,10 +852,7 @@ class AudioIntelligence:
                 segments_iter, info = self.engine.transcribe(
                     audio_path, language=whisper_lang,
                     beam_size=5, vad_filter=True,
-                    vad_parameters={
-                        "min_silence_duration_ms": 300,
-                        "speech_pad_ms": 200,
-                    },
+                    vad_parameters=_vad_parameters(),
                     word_timestamps=True,
                     no_speech_threshold=_ns_threshold,
                     **_decode,
@@ -904,6 +953,8 @@ class AudioIntelligence:
                     'words': words,
                     'is_hallucination': is_hallucination,
                     'no_speech_prob': round(no_speech_prob, 3),
+                    'avg_logprob': round(float(getattr(
+                        seg, 'avg_logprob', 0.0) or 0.0), 3),
                 }
                 segments.append(seg_entry)
 
@@ -926,6 +977,24 @@ class AudioIntelligence:
                             f'  Transcribing {pct}% — {len(segments)} segments, '
                             f'{elapsed_so_far:.1f}s elapsed, ~{remaining:.0f}s remaining')
                         last_log_pct = pct
+
+            # ── Two-pass difficult-segment redecode (audit Phase 3.4) ──
+            # Hallucination-flagged / low-logprob / degenerate-word-timing
+            # segments get one focused sequential re-decode (beam 8,
+            # patience) before the polish LLM ever sees them. Bounded to
+            # ≤10% of segments, worst first. Non-fatal on any error.
+            if (getattr(settings, "WHISPER_REDECODE_ENABLED", True)
+                    and segments):
+                try:
+                    n_redecoded = self._redecode_difficult_segments(
+                        audio_path, segments, whisper_lang, log)
+                    if n_redecoded:
+                        log.log_stage('AUDIO',
+                            f'Difficult-segment redecode: {n_redecoded} '
+                            'segment(s) re-decoded with beam=8')
+                except Exception as _rd_err:
+                    log.log_stage('AUDIO',
+                        f'Difficult-segment redecode skipped (non-fatal): {_rd_err}')
 
             # ── Gap-fill pass: re-transcribe uncovered runs ──
             # The VAD filter + ``no_speech_threshold`` on the main pass
@@ -1109,6 +1178,25 @@ class AudioIntelligence:
                 speech_seconds=round(len(speech_active) * 0.1, 1),
                 coverage=f'{report["coverage_ratio"]:.1%}')
 
+            # ── CTC forced-alignment refinement (audit Phase 3.1) ──
+            # Snap word (and cue) boundaries to actual speech onset/offset;
+            # Whisper's own word times drift 50-200 ms. Fail-safe no-op when
+            # no aligner backend is available. Runs while the decoded audio
+            # is still on disk; GPU only when >1.5 GB VRAM is free.
+            try:
+                from backend.services.forced_aligner import refine_word_timestamps
+                _fa_stats = refine_word_timestamps(
+                    audio_path, clean_segments, language)
+                if _fa_stats.get('segments_aligned'):
+                    log.log_stage('AUDIO',
+                        f"Forced alignment ({_fa_stats['backend']}): "
+                        f"{_fa_stats['segments_aligned']} segments / "
+                        f"{_fa_stats['words_aligned']} words refined, "
+                        f"mean shift {_fa_stats['mean_shift_ms']}ms")
+            except Exception as _fa_err:
+                log.log_stage('AUDIO',
+                    f'Forced alignment skipped (non-fatal): {_fa_err}')
+
             if on_progress:
                 on_progress(1.0)
 
@@ -1123,6 +1211,121 @@ class AudioIntelligence:
         except Exception as e:
             log.log_error('AUDIO', f'Transcription failed: {e}')
             return {'speech_active': {}, 'segments': [], 'language': ''}
+
+    def _redecode_difficult_segments(
+        self, audio_path: str, segments: list, whisper_lang, log,
+    ) -> int:
+        """Second-chance decode for the hardest segments (audit Phase 3.4).
+
+        Candidates, worst first, bounded to WHISPER_REDECODE_MAX_FRAC of
+        the transcript:
+          * hallucination-flagged segments (the filter may be reacting to a
+            bad decode, not bad audio),
+          * avg_logprob below WHISPER_REDECODE_LOGPROB,
+          * degenerate word timestamps (the batched-inference word-timing
+            failure mode) — these are re-timed by a sequential decode.
+
+        Each candidate is re-decoded individually via ``clip_timestamps``
+        with beam_size=WHISPER_REDECODE_BEAM and patience>1. The original
+        entry is replaced in place only when the redecode is measurably
+        better (higher avg_logprob and not itself a hallucination).
+        Returns the number of segments replaced.
+        """
+        import inspect
+        if self.engine is None:
+            return 0
+        params = {}
+        try:
+            params = inspect.signature(self.engine.transcribe).parameters
+        except (TypeError, ValueError):
+            return 0
+        if 'clip_timestamps' not in params:
+            return 0  # faster-whisper too old for windowed redecode
+
+        logprob_floor = float(getattr(settings, 'WHISPER_REDECODE_LOGPROB', -0.8))
+        max_frac = float(getattr(settings, 'WHISPER_REDECODE_MAX_FRAC', 0.10))
+        beam = int(getattr(settings, 'WHISPER_REDECODE_BEAM', 8))
+
+        def _score(entry):
+            # Lower = worse = redecode first
+            return entry.get('avg_logprob', 0.0)
+
+        candidates = []
+        for i, entry in enumerate(segments):
+            degenerate = _words_degenerate(
+                entry.get('words') or [], entry['start_sec'], entry['end_sec'])
+            if (entry.get('is_hallucination')
+                    or entry.get('avg_logprob', 0.0) < logprob_floor
+                    or degenerate):
+                candidates.append((i, degenerate))
+        if not candidates:
+            return 0
+        budget = max(1, int(len(segments) * max_frac))
+        candidates.sort(key=lambda c: _score(segments[c[0]]))
+        candidates = candidates[:budget]
+
+        _decode = _decoding_kwargs(self.engine.transcribe)
+        # The redecode is the LAST chance before the polish LLM — spend
+        # more search on it than the main pass.
+        extra = {'beam_size': beam}
+        if 'patience' in params:
+            extra['patience'] = 1.5
+
+        replaced = 0
+        for idx, degenerate in candidates:
+            entry = segments[idx]
+            w_start = max(0.0, entry['start_sec'] - 0.2)
+            w_end = entry['end_sec'] + 0.2
+            if w_end - w_start < 0.15:
+                continue
+            try:
+                seg_iter, _info = self.engine.transcribe(
+                    audio_path,
+                    language=whisper_lang,
+                    vad_filter=False,
+                    word_timestamps=True,
+                    clip_timestamps=[w_start, w_end],
+                    **extra,
+                    **_decode,
+                )
+                new_segs = list(seg_iter)
+            except Exception:
+                continue
+            if not new_segs:
+                continue
+            text = ' '.join(sg.text.strip() for sg in new_segs).strip()
+            if not text or _is_boilerplate_hallucination(text):
+                continue
+            new_logprob = min(float(getattr(sg, 'avg_logprob', 0.0) or 0.0)
+                              for sg in new_segs)
+            # Keep the redecode when it is measurably more confident, or
+            # when the original words were unusable (any valid re-timing
+            # beats degenerate timestamps).
+            if not degenerate and new_logprob <= entry.get('avg_logprob', 0.0) + 0.05:
+                continue
+            words = []
+            for sg in new_segs:
+                if getattr(sg, 'words', None):
+                    for w in sg.words:
+                        conf = getattr(w, 'probability', None)
+                        if conf is None:
+                            conf = getattr(w, 'confidence', 1.0) or 1.0
+                        words.append({
+                            'word': w.word.strip(),
+                            'start': round(float(w.start), 3),
+                            'end': round(float(w.end), 3),
+                            'confidence': round(float(conf), 3),
+                        })
+            entry['text'] = text
+            if words:
+                entry['words'] = words
+                entry['start_sec'] = round(words[0]['start'], 3)
+                entry['end_sec'] = round(words[-1]['end'], 3)
+            entry['avg_logprob'] = round(new_logprob, 3)
+            entry['is_hallucination'] = False
+            entry['redecoded'] = True
+            replaced += 1
+        return replaced
 
     def _gap_fill_pass(
         self, audio_path: str, primary_segments: list,
@@ -1523,10 +1726,7 @@ class AudioIntelligence:
                     language=whisper_lang,
                     task='translate',  # ← the key difference
                     beam_size=5, vad_filter=True,
-                    vad_parameters={
-                        "min_silence_duration_ms": 300,
-                        "speech_pad_ms": 200,
-                    },
+                    vad_parameters=_vad_parameters(),
                     word_timestamps=True,
                     no_speech_threshold=float(getattr(
                         settings, "WHISPER_NO_SPEECH_THRESHOLD", 0.4)),

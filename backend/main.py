@@ -443,7 +443,10 @@ async def _startup_preload():
     from backend.config import settings as cfg
     try:
         _cur_whisper = (getattr(cfg, "WHISPER_MODEL", "") or "").lower()
-        _large_tier = {"large-v3-turbo", "large-v3", "large-v2", "large"}
+        # distil-large-v3(.5) count as deliberate large-class picks —
+        # never silently swapped for turbo.
+        _large_tier = {"large-v3-turbo", "large-v3", "large-v2", "large",
+                       "distil-large-v3", "distil-large-v3.5"}
         # Never override a model the user explicitly picked in Settings —
         # WHISPER_MODEL_USER_SET is the flag the dropdown sets on selection, and
         # honoring it here is what stops a deliberate ``small``/``medium`` pick
@@ -471,14 +474,21 @@ async def _startup_preload():
             # If nvidia-smi gave us nothing but the GPU is enabled, upgrade
             # anyway and let the loader's free-VRAM gate fall back if needed.
             if _vram_total_mb == 0 or _vram_total_mb >= 3300:
+                # English-only libraries can opt into distil-large-v3 —
+                # near large-v3 English WER at ~2x turbo speed and a
+                # slightly smaller footprint. Multilingual content keeps
+                # large-v3-turbo (distil is English-focused).
+                _target = ("distil-large-v3"
+                           if getattr(cfg, "WHISPER_PREFER_DISTIL_ENGLISH", False)
+                           else "large-v3-turbo")
                 logger.info(
-                    "Whisper auto-upgrade: %s → large-v3-turbo "
+                    "Whisper auto-upgrade: %s → %s "
                     "(GPU total %s MB; faster + more accurate). "
                     "Disable with WHISPER_AUTO_UPGRADE=false or pin a model in Settings.",
-                    _cur_whisper or "(unset)",
+                    _cur_whisper or "(unset)", _target,
                     _vram_total_mb or "unknown",
                 )
-                cfg.WHISPER_MODEL = "large-v3-turbo"
+                cfg.WHISPER_MODEL = _target
     except Exception as _wu_err:
         logger.warning("Whisper auto-upgrade skipped (non-fatal): %s", _wu_err)
 

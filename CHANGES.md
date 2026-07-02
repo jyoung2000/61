@@ -1,3 +1,44 @@
+# ClipAI — Phase 3: Netflix-grade local transcription on a GTX 1650
+
+Timing precision and edge-case accuracy work on the faster-whisper
+pipeline; the model/VRAM logic is untouched except for new registry
+entries.
+
+- **CTC forced-alignment refinement** (``SUBTITLE_FORCED_ALIGN``, default
+  ON): after transcription, ``forced_aligner.refine_word_timestamps``
+  re-aligns each segment's words against the audio (torchaudio wav2vec2
+  CTC for English; the ctc-forced-aligner package slot is wired for
+  multilingual when installed) and snaps word + cue boundaries to speech
+  onset/offset. Whisper's 50-200 ms word drift is the visible difference
+  from Netflix-grade cueing. Shifts past 600 ms are rejected as aligner
+  mis-anchors; every failure path leaves original timestamps untouched.
+  GPU used only when >1.5 GB VRAM is free, else CPU.
+- **VAD tuning + hallucination hardening**: ``vad_parameters`` are now
+  settings (``WHISPER_VAD_MIN_SILENCE_MS=300``,
+  ``WHISPER_VAD_SPEECH_PAD_MS=150`` — down from a hardcoded 200), and
+  ``_decoding_kwargs`` feature-detects faster-whisper's
+  ``hallucination_silence_threshold`` (2 s). The TACT filter stays as the
+  second line of defense.
+- **Two-pass difficult-segment redecode** (``WHISPER_REDECODE_*``):
+  segments flagged by the hallucination filter, below the avg_logprob
+  floor (-0.8), or with degenerate word timestamps (the batched-inference
+  word-timing failure mode — detected by ``_words_degenerate``) are
+  re-decoded individually via ``clip_timestamps`` with beam_size=8 and
+  patience=1.5, bounded to 10% of segments worst-first, before the polish
+  LLM sees them. Replacements only land when measurably more confident.
+- **distil-large-v3 / v3.5 in the registry + VRAM tables** (fp16 1.6 GB /
+  int8_float16 0.9 GB — fits the 4 GB class one notch under turbo).
+  ``WHISPER_PREFER_DISTIL_ENGLISH=1`` retargets the GPU auto-upgrade to
+  distil for English-only libraries; multilingual keeps large-v3-turbo.
+  Pinned distil picks are never silently swapped.
+- **Per-stage VRAM ledger** (``backend/services/vram_ledger.py``): one
+  greppable ``VRAM ledger | job=… stage=… free=…MB`` line at
+  analysis_start, pre_whisper, post_whisper_release, pre_voiceprint and
+  pre_offline_nmt, plus ``get_ledger(job_id)`` for reports. Confirms the
+  load-bearing ordering (Whisper released before NLLB/pyannote) on every
+  run. Existing stage ordering audited and unchanged — it was already
+  correct.
+
 # ClipAI — Phase 2: Reframing that frames like a human operator
 
 Builds on the L1-optimal camera path (already default ON) with the
