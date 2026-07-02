@@ -1,3 +1,47 @@
+# ClipAI — Phase 2: Reframing that frames like a human operator
+
+Builds on the L1-optimal camera path (already default ON) with the
+behaviors that separate a good auto-reframe from a human one: real
+holds, cuts instead of whip-pans, composition instead of centroid
+chasing, and metrics that make all of it measurable.
+
+- **Deadband/hysteresis on the L1 targets** (``REFRAMER_L1_DEADBAND_FRAC``,
+  2.5% of crop width): subject motion under the deadband snaps to the hold
+  anchor before the solve, so holds come out truly static instead of
+  micro-drifting. Decisive moves re-anchor and pass through unchanged.
+- **Saccade cut-vs-pan** (``REFRAMER_SACCADE_CUT_FRAC``, 38% of crop width):
+  large displacements become ``transition: 'cut'`` keyframes in both the
+  Planner's pan/cut decision (previously live-action only at 20%) and the
+  L1 keyframe rebuild (jump > threshold within 700 ms → cut). The Smoother
+  already exempts cuts from velocity clamping and enforces a post-cut hold.
+- **Vertical eye-line composition** (``REFRAMER_VERTICAL_EYELINE``): when the
+  target is wider than the source (16:9/4:3 outputs), ``crop_y`` places the
+  median subject eye-line (face top + 35% of face height) at 1/3 from the
+  crop top, clamped by headroom, instead of blind vertical centering.
+  Static per clip — per-keyframe y animation remains future work (RenderPlan
+  carries a single ``crop_y``).
+- **Headroom clamps** (``REFRAMER_HEADROOM_MIN_FRAC``, 8% of crop height):
+  ``_validate_face_in_crop`` margins now have an 8%-of-crop-height floor so
+  faces never touch the crop edge.
+- **Adaptive tiled detection** (``REFRAMER_TILED_ADAPTIVE``): the 2x2 tiled
+  YuNet pass — the most expensive detector — now runs only when the largest
+  face found by the cheaper passes is under 4% of frame height (or none was
+  found), which is exactly when it adds recall. YOLO-World person-box fusion
+  for lost faces (torso framing before saliency fallback) already existed in
+  the Planner and is unchanged.
+- **Dense export keypoints** (``REFRAMER_EXPORT_KEYPOINT_HZ``, 10 Hz): the
+  bridge samples eased keyframe transitions at ≥10 Hz before building
+  MotionKeypoints, then prunes collinear samples, so the FFmpeg
+  piecewise-LINEAR x expression reproduces easing without velocity steps
+  while holds stay 2 points.
+- **Stability metrics in the evaluator**: ``ReframeReport`` gains
+  ``jerk_integral`` (30 Hz path, cut-discontinuities excluded, normalized by
+  crop width), ``hold_ratio_pct`` (% of samples with |v| < 2% crop_w/s),
+  ``safe_area_pct`` (best face inside the 10%-inset safe area) and
+  ``cuts_per_minute`` — all printed in the ReframeReport log line so tuning
+  is measurable. Regression tests in
+  ``backend/tests/test_reframer_human_operator.py``.
+
 # ClipAI — Phase 1: NLE preview ↔ export parity (audio, speed, fades, fallback)
 
 The WYSIWYG contract is "same renderFrame() for preview and export".

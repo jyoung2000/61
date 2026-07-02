@@ -73,6 +73,15 @@ class Planner:
             self.crop_w = perc.src_w
             self.crop_h = round(perc.src_w * ar_h / ar_w)
             self.crop_y = max(0, (perc.src_h - self.crop_h) // 2)
+            # Vertical composition: place the subject eye-line at ~1/3 from
+            # the crop top instead of blind centering, clamped so faces keep
+            # a minimum headroom margin. Static per clip (RenderPlan carries
+            # a single crop_y); per-keyframe y animation is future work.
+            if (getattr(settings, 'REFRAMER_VERTICAL_EYELINE', True)
+                    and self.crop_h < perc.src_h):
+                eye_y = self._median_eye_line_y()
+                if eye_y is not None:
+                    self.crop_y = self._compose_crop_y(eye_y)
 
         self.crop_w = min(self.crop_w, perc.src_w)
         self.crop_h = min(self.crop_h, perc.src_h)
@@ -106,6 +115,43 @@ class Planner:
         self._prev_raw_target = None
         self._prev_raw_target_t = None
         self._filter_trace = {}
+
+    def _median_eye_line_y(self) -> Optional[float]:
+        """Median eye-line y (source px) of the dominant face per sample.
+
+        Eye line ≈ face top + 35% of face height. Only confident,
+        reasonably sized faces vote so background/false faces don't drag
+        the composition. Returns None when there's no usable face data
+        (callers keep the centered default).
+        """
+        eye_ys = []
+        for faces in self.p.face_timeline.values():
+            usable = [f for f in faces
+                      if f.get('confidence', 0) >= 0.5 and f.get('h', 0) > 0]
+            if not usable:
+                continue
+            best = max(usable, key=lambda f: f.get('area', 0))
+            eye_ys.append(float(best['y']) + 0.35 * float(best['h']))
+        if len(eye_ys) < 3:
+            return None
+        eye_ys.sort()
+        return eye_ys[len(eye_ys) // 2]
+
+    def _compose_crop_y(self, eye_y: float) -> int:
+        """crop_y that puts ``eye_y`` at 1/3 from the crop top, clamped.
+
+        Clamps keep at least REFRAMER_HEADROOM_MIN_FRAC of crop height
+        between the eye line and the top edge (headroom) and never leave
+        the source frame.
+        """
+        headroom = float(getattr(settings, 'REFRAMER_HEADROOM_MIN_FRAC', 0.08))
+        min_margin = int(self.crop_h * max(0.0, headroom))
+        y = int(round(eye_y - self.crop_h / 3.0))
+        # Eye line must sit at least min_margin below the crop top —
+        # i.e. crop_y ≤ eye_y − min_margin (with 1/3 placement this only
+        # binds for extreme headroom settings, but keep it explicit).
+        y = min(y, int(eye_y) - min_margin)
+        return max(0, min(y, self.p.src_h - self.crop_h))
 
     def generate(self) -> RenderPlan:
         log = get_logger()
@@ -1959,7 +2005,15 @@ class Planner:
                     # transitions.
                     dist_ratio = delta / max(1, self.crop_w)
 
-                    if self.is_live_action and dist_ratio > 0.20:
+                    # Saccade behavior: past ~38% of crop width a human
+                    # editor cuts instead of whip-panning, regardless of
+                    # content type. Live action keeps its tighter 0.20
+                    # threshold. The Smoother's post-cut hold pass gives
+                    # the cut its 1-2 frame settle.
+                    saccade_frac = float(getattr(
+                        settings, 'REFRAMER_SACCADE_CUT_FRAC', 0.38))
+                    if ((self.is_live_action and dist_ratio > 0.20)
+                            or dist_ratio > saccade_frac):
                         kfs.append({'time_ms': t, 'x': target_x,
                                     'transition': 'cut', 'transition_ms': 0})
                         prev_x = target_x
@@ -2020,6 +2074,11 @@ class Planner:
                                   **detail)
 
 
+    def _min_edge_margin(self) -> int:
+        """Minimum face-to-crop-edge margin in px (8% of crop height)."""
+        frac = float(getattr(settings, 'REFRAMER_HEADROOM_MIN_FRAC', 0.08))
+        return int(self.crop_h * max(0.0, frac))
+
     def _validate_face_in_crop(self, kfs: List[dict], start: int, end: int) -> List[dict]:
         """Safety net: ensure faces are FULLY inside the crop, not clipped.
 
@@ -2064,7 +2123,9 @@ class Planner:
                                                f.get('area', 0) * 0.0001
                                               ) * max(0.15, f.get('confidence', 0.5)))
                 face_w = best_face.get('w', 0)
-                margin = max(20, int(face_w * 0.65))
+                # Headroom floor: faces never sit closer to a crop edge
+                # than 8% of crop height (REFRAMER_HEADROOM_MIN_FRAC).
+                margin = max(20, int(face_w * 0.65), self._min_edge_margin())
                 new_x = clamp_x(best_face['cx'] - self.crop_w // 2, self.max_x)
                 # Containment check
                 face_left = best_face['cx'] - face_w // 2
@@ -2085,7 +2146,7 @@ class Planner:
             if face_w < 10:
                 continue  # Too small to worry about clipping
 
-            margin = max(20, int(face_w * 0.5))
+            margin = max(20, int(face_w * 0.5), self._min_edge_margin())
             face_left = best_in_crop['cx'] - face_w // 2
             face_right = best_in_crop['cx'] + face_w // 2
 

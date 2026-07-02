@@ -40,6 +40,7 @@ def _fake_engine(keyframes, face_timeline=None, scene_cuts=None,
     # so the tests can assert the new instrumentation fires.
     return SimpleNamespace(plan=plan, perception=perception,
                            _rdp_indices=Engine._rdp_indices,
+                           _apply_deadband=Engine._apply_deadband,
                            tracer=_tracer())
 
 

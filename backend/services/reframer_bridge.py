@@ -91,6 +91,37 @@ def _attach_track_velocity(timeline: dict) -> None:
 #  Function 1 — reframer RenderPlan  →  Fez RenderPlan
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _prune_collinear_keypoints(kp_by_t: dict, eps_px: float = 1.0,
+                               eps_scale: float = 0.002) -> dict:
+    """Drop keypoints that lie on the straight line between their kept
+    neighbours (within ``eps_px`` for x, ``eps_scale`` for scale).
+
+    Keeps the dense sampling honest: eased moves keep their ≥10 Hz
+    samples, holds and constant-velocity pans collapse back to their
+    endpoints so the FFmpeg expression stays short.
+    """
+    times = sorted(kp_by_t)
+    if len(times) <= 2:
+        return kp_by_t
+    kept = [times[0]]
+    for i in range(1, len(times) - 1):
+        t_prev = kept[-1]
+        # Find the next candidate endpoint (look ahead to the next time)
+        t_next = times[i + 1]
+        t = times[i]
+        x0, s0 = kp_by_t[t_prev]
+        x1, s1 = kp_by_t[t_next]
+        x, s = kp_by_t[t]
+        span = t_next - t_prev
+        frac = (t - t_prev) / span if span > 0 else 0.0
+        lin_x = x0 + (x1 - x0) * frac
+        lin_s = s0 + (s1 - s0) * frac
+        if abs(x - lin_x) > eps_px or abs(s - lin_s) > eps_scale:
+            kept.append(t)
+    kept.append(times[-1])
+    return {t: kp_by_t[t] for t in kept}
+
+
 def to_fez_render_plan(
     reframer_plan,
     perception,
@@ -196,6 +227,27 @@ def to_fez_render_plan(
             if s_ms < t_ms < e_ms:
                 rel_t = round((t_ms - s_ms) / 1000.0, 4)
                 kp_by_t[rel_t] = (kf.get("x", center_x), scale_at(t_ms))
+
+        # Densify: the FFmpeg piecewise-x expression interpolates keypoints
+        # LINEARLY, but interpolate_x eases between keyframes — sparse
+        # keypoints would flatten easing into visible velocity steps. Sample
+        # the eased path at ≥REFRAMER_EXPORT_KEYPOINT_HZ, then drop samples
+        # that are already on the linear hull so holds stay 2 points.
+        try:
+            from backend.config import settings as _settings
+            _kp_hz = float(getattr(_settings, 'REFRAMER_EXPORT_KEYPOINT_HZ', 10.0))
+        except Exception:
+            _kp_hz = 10.0
+        if _kp_hz > 0 and op_dur > 0:
+            step = 1.0 / _kp_hz
+            t = step
+            while t < op_dur - step / 2:
+                rel_t = round(t, 4)
+                if rel_t not in kp_by_t:
+                    kp_by_t[rel_t] = (x_at(s_ms + t * 1000.0),
+                                      scale_at(s_ms + t * 1000.0))
+                t += step
+            kp_by_t = _prune_collinear_keypoints(kp_by_t)
 
         motion_path = [
             MotionKeypoint(

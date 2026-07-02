@@ -39,6 +39,12 @@ class ReframeReport:
     transition_decisiveness: float = 0.0  # 0-100 (are moves committed, not drifty?)
     motion_budget: float = 0.0           # 0-100 (total movement reasonable?)
 
+    # Stability metrics (audit Phase 2.7) — measurable tuning targets
+    jerk_integral: float = 0.0           # Σ|Δaccel| of the 30 Hz path, in crop-widths/s² (lower = smoother)
+    hold_ratio_pct: float = 0.0          # % of 30 Hz samples with |velocity| < 2% crop_w/s (higher = calmer)
+    safe_area_pct: float = 0.0           # % of face-present seconds with best face inside the 10%-inset safe area
+    cuts_per_minute: float = 0.0         # hard cuts per minute of output
+
     # Per-second detail (not persisted on the job — used to derive scores)
     second_scores: List[dict] = field(default_factory=list)
 
@@ -51,6 +57,7 @@ class ReframeReport:
     seconds_face_in_crop: int = 0
     seconds_best_face_in_crop: int = 0
     seconds_face_centered: int = 0
+    seconds_face_safe_area: int = 0
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -155,6 +162,12 @@ class ReframeEvaluator:
                 if crop_left <= best_face["cx"] <= crop_right:
                     best_face_in_crop = True
                     report.seconds_best_face_in_crop += 1
+                    # Safe area: crop inset 10% of crop width per side —
+                    # the region a broadcast editor keeps subjects inside.
+                    safe_inset = crop_w // 10
+                    if (crop_left + safe_inset <= best_face["cx"]
+                            <= crop_right - safe_inset):
+                        report.seconds_face_safe_area += 1
                     center_left = crop_left + crop_w // 3
                     center_right = crop_left + (2 * crop_w) // 3
                     face_centered = center_left <= best_face["cx"] <= center_right
@@ -276,6 +289,56 @@ class ReframeEvaluator:
         edge_violations = sum(1 for s in report.second_scores if s["edge_violation"])
         report.edge_violation_pct = edge_violations / max(1, report.total_seconds) * 100
 
+        # ── Stability metrics (audit Phase 2.7) ──
+        # Resample the FINAL path at 30 Hz — per-second sampling hides
+        # intra-second motion, and these numbers exist to make L1/deadband
+        # tuning measurable.
+        report.safe_area_pct = (
+            report.seconds_face_safe_area / report.seconds_with_faces * 100
+            if report.seconds_with_faces > 0 else 100.0)
+
+        HZ = 30.0
+        n_samples = int(report.total_seconds * HZ)
+        if n_samples >= 4 and keyframes:
+            dt = 1.0 / HZ
+            xs = [clamp_x(interpolate_x(keyframes, int(i * 1000 / HZ)), max_x)
+                  for i in range(n_samples)]
+            # Exclude cut discontinuities from the derivative chain — a cut
+            # is an intentional jump, not path roughness.
+            cut_jump = crop_w * 0.3
+            vels, accs = [], []
+            for i in range(1, n_samples):
+                dx = xs[i] - xs[i - 1]
+                vels.append(None if abs(dx) > cut_jump else dx / dt)
+            for i in range(1, len(vels)):
+                if vels[i] is None or vels[i - 1] is None:
+                    accs.append(None)
+                else:
+                    accs.append((vels[i] - vels[i - 1]) / dt)
+            jerk_sum = 0.0
+            for i in range(1, len(accs)):
+                if accs[i] is not None and accs[i - 1] is not None:
+                    jerk_sum += abs(accs[i] - accs[i - 1])
+            # Normalize by crop width so the number compares across
+            # resolutions/aspects; units ≈ crop-widths/s² accumulated.
+            report.jerk_integral = round(jerk_sum * dt / crop_w, 3)
+
+            hold_thresh = crop_w * 0.02  # |v| < 2% crop_w per second = holding
+            valid_vels = [v for v in vels if v is not None]
+            if valid_vels:
+                report.hold_ratio_pct = round(
+                    sum(1 for v in valid_vels if abs(v) < hold_thresh)
+                    / len(valid_vels) * 100, 1)
+            else:
+                report.hold_ratio_pct = 100.0
+        else:
+            report.hold_ratio_pct = 100.0
+
+        n_cuts = sum(1 for kf in keyframes[1:]
+                     if kf.get('transition') == 'cut')
+        minutes = max(1e-6, report.total_seconds / 60.0)
+        report.cuts_per_minute = round(n_cuts / minutes, 2)
+
         # ── Watchability — does this feel like a human editor made it? ──
 
         still_thresh = crop_w * 0.05  # 5% of crop width = essentially still
@@ -358,12 +421,15 @@ class ReframeEvaluator:
             "face_cov=%.1f%% saliency=%.1f%% centering=%.1f%% | "
             "stability=%.1f cut_coh=%.1f edge_viol=%.1f%% | "
             "hold=%.1f decisive=%.1f motion_budget=%.1f watchability=%.1f | "
+            "jerk=%.3f hold_ratio=%.1f%% safe_area=%.1f%% cuts/min=%.2f | "
             "problems HIGH=%d MED=%d LOW=%d",
             report.grade, report.overall_score,
             report.face_coverage_pct, report.saliency_accuracy_pct, report.centering_pct,
             report.stability_score, report.cut_coherence_score, report.edge_violation_pct,
             report.hold_quality, report.transition_decisiveness,
             report.motion_budget, report.watchability_score,
+            report.jerk_integral, report.hold_ratio_pct,
+            report.safe_area_pct, report.cuts_per_minute,
             sum(1 for p in report.problems if p.get('severity') == 'HIGH'),
             sum(1 for p in report.problems if p.get('severity') == 'MED'),
             sum(1 for p in report.problems if p.get('severity') == 'LOW'),

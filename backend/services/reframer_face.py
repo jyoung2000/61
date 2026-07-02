@@ -608,8 +608,27 @@ class FaceDetector:
                 if person_bboxes:
                     all_faces.extend(
                         self._detect_yolo_assisted_yunet(frame_bgr, conf, person_bboxes))
-                # 3. Tiled YuNet (recovers faces in wide group shots)
-                all_faces.extend(self._detect_yunet_tiled(frame_bgr, conf))
+                # 3. Tiled YuNet (recovers faces in wide group shots).
+                # Adaptive trigger: the 2x2 tiled pass is the most
+                # expensive detector, and it only adds recall for SMALL
+                # faces. Run it when the largest face found so far is
+                # under ~4% of frame height (or nothing was found at
+                # all) — i.e. exactly when full-frame YuNet is likely to
+                # be missing small/profile faces.
+                run_tiled = True
+                try:
+                    from backend.config import settings as _settings
+                    if getattr(_settings, 'REFRAMER_TILED_ADAPTIVE', True):
+                        min_frac = float(getattr(
+                            _settings, 'REFRAMER_TILED_MIN_FACE_FRAC', 0.04))
+                        frame_h = frame_bgr.shape[0]
+                        biggest_h = max(
+                            (f.get('h', 0) for f in all_faces), default=0)
+                        run_tiled = biggest_h < frame_h * min_frac
+                except Exception:
+                    pass
+                if run_tiled:
+                    all_faces.extend(self._detect_yunet_tiled(frame_bgr, conf))
 
                 # ── 4a. Positive gate: keep faces inside person bboxes ──
                 if person_bboxes:

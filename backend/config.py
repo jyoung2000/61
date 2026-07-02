@@ -381,6 +381,32 @@ class Settings(BaseSettings):
     # Replaces the reactive smoother output. Default ON.
     REFRAMER_L1_PATH: bool = True
     REFRAMER_L1_WEIGHTS: str = "1,10,100"      # w1,w2,w3 for |D1|,|D2|,|D3|
+    # Deadband/hysteresis applied to the L1 targets: subject motion under
+    # this fraction of crop width does NOT move the camera (holds stay
+    # truly static instead of micro-drifting after the L1 solve).
+    REFRAMER_L1_DEADBAND_FRAC: float = 0.025
+    # Saccade behavior: displacements above this fraction of crop width
+    # become a hard cut instead of a whip-pan (human editors cut, not pan,
+    # for large re-frames). Applies in the Planner's pan/cut decision and
+    # when keyframes are rebuilt from the L1 path.
+    REFRAMER_SACCADE_CUT_FRAC: float = 0.38
+    # Vertical composition: when the target is WIDER than the source
+    # (16:9/4:3 outputs, letterboxed sources) place the subject eye-line
+    # at ~1/3 from the crop top instead of blind vertical centering.
+    # No-op when the crop uses full source height.
+    REFRAMER_VERTICAL_EYELINE: bool = True
+    # Minimum face-to-crop-edge margin as a fraction of crop height.
+    REFRAMER_HEADROOM_MIN_FRAC: float = 0.08
+    # Minimum keypoint density (Hz) for the export motion path. Eased
+    # keyframe transitions are sampled at this rate so the FFmpeg
+    # piecewise-LINEAR x expression can't produce visible velocity steps.
+    REFRAMER_EXPORT_KEYPOINT_HZ: float = 10.0
+    # Adaptive tiled face detection: run the (expensive) 2x2 tiled YuNet
+    # pass only when the largest face found so far is smaller than
+    # REFRAMER_TILED_MIN_FACE_FRAC of frame height (or no face at all).
+    # Set to false to restore the always-tiled behavior.
+    REFRAMER_TILED_ADAPTIVE: bool = True
+    REFRAMER_TILED_MIN_FACE_FRAC: float = 0.04
     # Motivated zoom — time-varying push-in/pull-out via the dormant
     # motivated_zoom planner, adding a per-keyframe `scale` term rendered as a
     # time-varying ffmpeg crop. Default ON — a no-op unless the plan actually

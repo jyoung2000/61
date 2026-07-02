@@ -891,9 +891,21 @@ class ReframeEngine:
         if cur:
             segments.append(cur)
 
+        # Deadband/hysteresis: subject motion under this many px does not
+        # move the camera. Applied to the L1 *targets* so holds come out
+        # of the solver truly static instead of chasing micro-drift.
+        deadband_px = max(0.0, float(getattr(
+            settings, 'REFRAMER_L1_DEADBAND_FRAC', 0.025)) * crop_w)
+        # Saccade threshold: a rebuilt move larger than this within a
+        # short window becomes a cut (humans cut, they don't whip-pan).
+        saccade_px = float(getattr(
+            settings, 'REFRAMER_SACCADE_CUT_FRAC', 0.38)) * crop_w
+        SACCADE_WINDOW_MS = 700
+
         new_kfs = []
         for seg_idx, seg in enumerate(segments):
             targets = [float(interpolate_x(kfs, t)) for t in seg]
+            targets = self._apply_deadband(targets, deadband_px)
             path = solve_l1_path(targets, radius, 0.0, float(max_x), weights=weights)
             if path is None:
                 path = [float(clamp_x(int(v), max_x)) for v in targets]
@@ -908,8 +920,15 @@ class ReframeEngine:
                     transition_ms = 0
                 else:
                     prev_t = seg[corners[ci - 1]]
-                    transition = 'ease_in_out'
-                    transition_ms = int(max(0, t - prev_t))
+                    prev_x = new_kfs[-1]['x'] if new_kfs else x
+                    dt = int(max(0, t - prev_t))
+                    if (abs(x - prev_x) > saccade_px
+                            and dt <= SACCADE_WINDOW_MS):
+                        transition = 'cut'
+                        transition_ms = 0
+                    else:
+                        transition = 'ease_in_out'
+                        transition_ms = dt
                 new_kfs.append({'time_ms': int(t), 'x': x,
                                 'transition': transition,
                                 'transition_ms': transition_ms})
@@ -926,7 +945,31 @@ class ReframeEngine:
                               keyframes_before=_kfs_before,
                               keyframes_out=len(new_kfs),
                               weights=list(weights),
-                              radius=round(radius, 1))
+                              radius=round(radius, 1),
+                              deadband_px=round(deadband_px, 1),
+                              saccade_px=round(saccade_px, 1))
+
+    @staticmethod
+    def _apply_deadband(targets, deadband_px):
+        """Hysteresis pre-pass on the L1 targets.
+
+        Walks the target series holding an anchor; targets within
+        ``deadband_px`` of the anchor snap TO the anchor, so sub-deadband
+        subject motion produces exactly-flat solver input (a genuinely
+        static hold). A move beyond the deadband re-anchors, so decisive
+        moves pass through unchanged.
+        """
+        if deadband_px <= 0 or not targets:
+            return targets
+        out = []
+        anchor = targets[0]
+        for v in targets:
+            if abs(v - anchor) < deadband_px:
+                out.append(anchor)
+            else:
+                anchor = v
+                out.append(v)
+        return out
 
     @staticmethod
     def _rdp_indices(values, epsilon):
