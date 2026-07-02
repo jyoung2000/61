@@ -283,14 +283,32 @@ class FaceDetector:
             else:
                 os.environ.pop('CUDA_VISIBLE_DEVICES', None)
 
-        # ── Haar fallback (always works) ──
+        # ── Haar fallback ──
+        # Haar is the LAST-RESORT tier — a failure to build it must never
+        # kill an analysis where YuNet/YOLO loaded fine. The observed
+        # failure mode is a mixed OpenCV install (ultralytics pulling
+        # opencv-python over the pinned opencv-python-headless leaves a
+        # cv2 where SOME symbols resolve and others — like
+        # CascadeClassifier — don't). All Haar call sites tolerate None.
         if self.tier == 'none':
             self.tier = 'haar'
             log.log_stage('PERCEIVE', 'Face detector: Haar cascade (fallback)')
-        self._haar_face = cv2.CascadeClassifier(
-            cv2.data.haarcascades + 'haarcascade_frontalface_alt2.xml')
-        self._haar_eye = cv2.CascadeClassifier(
-            cv2.data.haarcascades + 'haarcascade_eye.xml')
+        try:
+            self._haar_face = cv2.CascadeClassifier(
+                cv2.data.haarcascades + 'haarcascade_frontalface_alt2.xml')
+            self._haar_eye = cv2.CascadeClassifier(
+                cv2.data.haarcascades + 'haarcascade_eye.xml')
+        except Exception as e:
+            self._haar_face = None
+            self._haar_eye = None
+            if self.tier == 'haar':
+                self.tier = 'none'
+            log.log_stage('PERCEIVE',
+                f'Haar cascade unavailable ({str(e)[:90]}) — continuing '
+                'without the Haar fallback tier. If this says '
+                "\"module 'cv2' has no attribute\", the container has a "
+                'mixed OpenCV install (opencv-python + '
+                'opencv-python-headless) — rebuild the image.')
 
         # ── SFace face recognizer (37MB ONNX, for track identity matching) ──
         # Used by track consolidation to match faces across scene cuts and
@@ -1478,6 +1496,8 @@ class FaceDetector:
 
     def _detect_yolo_assisted_haar(self, frame_bgr, conf) -> List[dict]:
         """Use YOLO to find people, then run relaxed Haar inside each person's head region."""
+        if self._haar_face is None:
+            return []
         h, w = frame_bgr.shape[:2]
         # _yolo_predict() routes to self._yolo_device — no caller device override.
         results = self._yolo_predict(
@@ -1532,6 +1552,8 @@ class FaceDetector:
     def _detect_haar_relaxed(self, frame_bgr) -> List[dict]:
         """Full-frame Haar with relaxed parameters — catches more faces at the
         cost of slightly more false positives. Skin check filters the worst."""
+        if self._haar_face is None:
+            return []
         h, w = frame_bgr.shape[:2]
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
         eq = cv2.equalizeHist(gray)
@@ -1567,6 +1589,8 @@ class FaceDetector:
 
     def _detect_haar(self, frame_bgr) -> List[dict]:
         """Haar cascade with skin tone validation. Eye check is advisory, not mandatory."""
+        if self._haar_face is None:
+            return []
         h, w = frame_bgr.shape[:2]
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
         eq = cv2.equalizeHist(gray)
@@ -1593,7 +1617,7 @@ class FaceDetector:
 
             # Eye check: if eyes found → higher confidence, if not → still accept
             conf = 0.5
-            if fw > min_face * 1.3:
+            if fw > min_face * 1.3 and self._haar_eye is not None:
                 eye_roi = gray[fy:fy + int(fh * 0.6), fx:fx + fw]
                 if eye_roi.size > 0:
                     eyes = self._haar_eye.detectMultiScale(

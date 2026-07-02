@@ -103,6 +103,17 @@ RUN pip install --no-cache-dir \
     python3 -c "import mediapipe; print(f'MediaPipe {mediapipe.__version__} installed')" && \
     python3 -c "import mediapipe.python.solutions.face_mesh; print('FaceMesh available')"
 
+# ── Single-OpenCV guarantee (see Dockerfile.gpu for the full story) ──────
+# ultralytics can drag in the GUI opencv-python next to the pinned headless
+# build; the mixed cv2/ directory loses symbols (CascadeClassifier). Purge
+# everything, reinstall the one pinned headless build LAST, verify.
+RUN pip uninstall -y opencv-python opencv-contrib-python opencv-python-headless opencv-contrib-python-headless || true && \
+    pip install --no-cache-dir --force-reinstall --no-deps opencv-python-headless==4.10.0.84 && \
+    python3 -c "import cv2; assert hasattr(cv2, 'CascadeClassifier') and hasattr(cv2, 'FaceDetectorYN'), 'broken cv2'; print('cv2', cv2.__version__, 'OK')"
+
+# ultralytics must NEVER pip-install packages at runtime.
+ENV YOLO_AUTOINSTALL=false
+
 # Download YuNet model for face detection fallback (~350KB, one-time)
 # Download lbpcascade_animeface for v2 Phase 6 anime face detection (~110KB)
 RUN mkdir -p /app/backend/models && \

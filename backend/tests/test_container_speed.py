@@ -128,3 +128,33 @@ def test_u2netp_autodiscovery_paths():
     src = inspect.getsource(reframer_u2net)
     assert "u2netp.onnx" in src
     assert "/data/models/u2netp.onnx" in src
+
+
+# ── Haar fallback resilience (post-deploy fix) ──────────────────────────
+# A GTX 1650 run died at 15% with "module 'cv2' has no attribute
+# 'CascadeClassifier'" (mixed OpenCV install: ultralytics pulled GUI
+# opencv-python over the pinned headless build). Haar is the LAST-RESORT
+# detector — its init failing must never kill an analysis where
+# YuNet/YOLO loaded fine.
+
+def test_haar_init_is_fail_safe_and_call_sites_tolerate_none():
+    import inspect
+    from backend.services import reframer_face
+    src = inspect.getsource(reframer_face)
+    # init wrapped
+    assert "Haar cascade unavailable" in src
+    # every Haar detect function bails out on a missing cascade
+    for fn_name in ("_detect_yolo_assisted_haar", "_detect_haar_relaxed",
+                    "_detect_haar"):
+        fn_src = inspect.getsource(getattr(reframer_face.FaceDetector, fn_name))
+        assert "self._haar_face is None" in fn_src, fn_name
+
+
+def test_detect_haar_returns_empty_without_cascade():
+    from backend.services.reframer_face import FaceDetector
+    fd = FaceDetector.__new__(FaceDetector)
+    fd._haar_face = None
+    fd._haar_eye = None
+    assert fd._detect_haar(object()) == []
+    assert fd._detect_haar_relaxed(object()) == []
+    assert fd._detect_yolo_assisted_haar(object(), 0.4) == []

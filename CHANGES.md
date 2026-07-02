@@ -1,3 +1,32 @@
+# ClipAI — Fix: analysis died at 15% with "cv2 has no attribute CascadeClassifier"
+
+First run on the rebuilt image failed at the FACES stage:
+``module 'cv2' has no attribute 'CascadeClassifier'`` — while YuNet
+(``cv2.FaceDetectorYN``) had loaded fine seconds earlier. That split
+symptom is a MIXED OpenCV install: ultralytics declares the GUI
+``opencv-python`` as a dependency, and with the unpinned
+``opencv-python-headless>=4.8.0`` + ``ultralytics>=8.0.0`` a fresh image
+build can end up with two distributions sharing one ``cv2/`` directory,
+where some symbols resolve and others don't.
+
+Fixed in two layers:
+
+- **Image hygiene** — both Dockerfiles now purge every opencv
+  distribution and force-reinstall the single pinned
+  ``opencv-python-headless==4.10.0.84`` as the LAST pip layer, then FAIL
+  THE BUILD if ``CascadeClassifier``/``FaceDetectorYN`` are missing.
+  ``YOLO_AUTOINSTALL=false`` stops ultralytics from pip-installing
+  anything at runtime (which would overwrite cv2 mid-process on the
+  first YOLO import). requirements.txt pins opencv exactly and bounds
+  ultralytics ``<9``. **Rebuild the image to pick this up**
+  (``./deploy.sh``).
+- **Code resilience** — Haar is the last-resort detector tier; its init
+  is now wrapped so a broken cascade logs one clear line (naming the
+  mixed-OpenCV cause) instead of killing an analysis where YuNet + YOLO
+  are healthy. All Haar call sites (``_detect_haar``,
+  ``_detect_haar_relaxed``, ``_detect_yolo_assisted_haar``, eye check)
+  tolerate the missing cascade.
+
 # ClipAI — Phase 5: Container speed & efficiency
 
 - **Perception decode no longer seeks every sample.** The sampler's seek

@@ -23,12 +23,17 @@ psutil>=5.9.0
 # mediapipe installed separately in Dockerfile (protobuf conflict with torch/pyannote)
 numpy>=1.24.0
 scipy>=1.10.0
-opencv-python-headless>=4.8.0
+# Pinned EXACTLY: a mixed/upgraded OpenCV is how the container ends up with
+# `module 'cv2' has no attribute 'CascadeClassifier'` at runtime. The
+# Dockerfiles force-reinstall this same pin as the last pip layer.
+opencv-python-headless==4.10.0.84
 # v4.1: ultralytics (YOLOv8n) backend for object_detector /
 # person_detector. Without this, PersonDetector silently falls back to
 # backend=none → person_body anchor source produces 0 anchors on
 # faceless frames and the camera drifts onto background motion.
-ultralytics>=8.0.0
+# Bounded: ultralytics declares GUI opencv-python as a dep — newer majors may
+# change that handling; the Dockerfile purge layer keeps cv2 canonical either way.
+ultralytics>=8.0.0,<9
 mcp>=1.8.0
 # pyannote.audio 4.x requires torchaudio>=2.8 → torch>=2.8, which makes pip
 # UPGRADE torch to 2.12 (a huge CPU/cu13 wheel from the default index) during

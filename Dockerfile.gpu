@@ -182,6 +182,23 @@ RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     python3 -c "import nvidia.cudnn; print(nvidia.cudnn.__path__[0] + '/lib')" >> /etc/ld.so.conf.d/nvidia-pip.conf && \
     ldconfig
 
+# ── Single-OpenCV guarantee ──────────────────────────────────────────────
+# ultralytics declares `opencv-python` (the GUI build) as a dependency, so
+# the requirements install can end up with BOTH opencv-python and
+# opencv-python-headless sharing one cv2/ directory. That mixed install is
+# how a runtime ends up with `module 'cv2' has no attribute
+# 'CascadeClassifier'` while other cv2 symbols still resolve. Purge every
+# opencv distribution and force-reinstall the single pinned headless build
+# LAST so its files are authoritative, then fail the build if core symbols
+# are missing.
+RUN pip3 uninstall -y opencv-python opencv-contrib-python opencv-python-headless opencv-contrib-python-headless || true && \
+    pip3 install --no-cache-dir --force-reinstall --no-deps opencv-python-headless==4.10.0.84 && \
+    python3 -c "import cv2; assert hasattr(cv2, 'CascadeClassifier') and hasattr(cv2, 'FaceDetectorYN'), 'broken cv2'; print('cv2', cv2.__version__, 'OK (CascadeClassifier + FaceDetectorYN present)')"
+
+# ultralytics must NEVER pip-install packages at runtime (it would overwrite
+# the pinned OpenCV mid-process on the first YOLO import).
+ENV YOLO_AUTOINSTALL=false
+
 # Download YuNet model for face detection fallback (~350KB, one-time)
 # Download SFace recognition model for identity embeddings (~2MB, one-time)
 # Download lbpcascade_animeface for v2 Phase 6 anime face detection (~110KB)
