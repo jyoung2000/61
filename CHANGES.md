@@ -1,3 +1,51 @@
+# ClipAI — Phase 1: NLE preview ↔ export parity (audio, speed, fades, fallback)
+
+The WYSIWYG contract is "same renderFrame() for preview and export".
+Video honored it; audio and time-mapping did not. All fixed in the
+client export engine, with the divergences that remain (server-side)
+documented in a generated checklist.
+
+- **Client export audio was fundamentally broken (silent).**
+  ``ExportEngine._extractAudio`` called ``createMediaElementSource()`` on an
+  ``OfflineAudioContext`` — unsupported everywhere; browsers throw and the
+  catch block silently skipped every clip. Rewritten to fetch + ``decodeAudioData``
+  each clip's media (cached per asset) and schedule ``AudioBufferSourceNode``s
+  with ``start(when, offset, duration)`` derived from ``clip.start``,
+  ``clip.trimStart`` and the export range.
+- **Per-clip speed now exports.** Frame stepping and audio scheduling both map
+  timeline→source time as ``trimStart + (t − start) × speed`` (shared
+  ``timelineToSourceTime`` helper); audio speed uses
+  ``AudioBufferSourceNode.playbackRate``. Parity test asserts 2× source-frame
+  correspondence.
+- **Audio fades/ramps now export.** ``buildGainAutomation`` schedules gain
+  automation matching ``fadeIn``/``fadeOut`` exactly like RenderEngine's
+  opacity fade math (same elapsed/fadeIn formula), including mid-fade export
+  ranges and overlapping-fade sampling.
+- **Muted means muted.** ``clip.muted`` and ``track.audioMuted`` (with legacy
+  ``track.muted`` fallback) are excluded from export audio; previously the
+  clone was force-unmuted.
+- **MediaRecorder fallback is now gated.** The real-time fallback (dropped
+  frames, word-highlight drift) requires explicit user confirmation via
+  ``onFallbackRequired``; which path ran is recorded in ``lastExportMeta`` and
+  passed to ``onComplete``.
+- **Shared active-word timing module.** The "MUST match exactly" constants +
+  word-index algorithm duplicated across ``RenderEngine`` and
+  ``SubtitleOverlay`` (and the constants in ``ClipPreview``) now live in ONE
+  module, ``frontend/src/utils/activeWordTiming.js``.
+- **Gaming blurfill preview matched to export.** Canvas used ``blur(20px)``
+  with no darkening vs FFmpeg ``gblur=sigma=50,eq=brightness=-0.1`` — now
+  ``blur(50px) brightness(0.9)``, the same equivalence renderPlanRenderer uses.
+- **Safari canvas filters detected.** ``RenderEngine.supportsCanvasFilter()``
+  probes ``ctx.filter`` support and warns once instead of silently rendering
+  effects unfiltered.
+- **Effects coverage checklist + parity harness.**
+  ``frontend/src/utils/featureParityMatrix.js`` enumerates every panel-exposed
+  property with its status per render path (enforced by
+  ``featureParityMatrix.test.js``); ``scripts/generate-parity-checklist.mjs``
+  generates ``docs/parity-checklist.md``; ``scripts/parity_harness.py``
+  compares client vs server renders frame-by-frame (SSIM + subtitle
+  bounding-box deltas) on hosts with FFmpeg.
+
 # ClipAI — Honest build label + no stale "Exporting clips" on reconnect
 
 Two cosmetic fixes:

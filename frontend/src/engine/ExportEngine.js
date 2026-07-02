@@ -17,8 +17,78 @@
  *   internally using the same algorithm as SubtitleOverlay.
  *
  * Fallback: If WebCodecs unavailable, uses canvas.captureStream() + MediaRecorder.
+ * The fallback records in REAL TIME (dropped frames and word-highlight
+ * timing can diverge from the stepped WebCodecs path), so it only runs
+ * after the ``onFallbackRequired`` callback confirms the reduced-fidelity
+ * export with the user. Which path actually ran is recorded in
+ * ``lastExportMeta`` and passed to ``onComplete``.
  * If FFmpeg.wasm fails, falls back to server-side export.
  */
+
+/**
+ * Map timeline time → source (media) time for a clip, honoring both
+ * trim and per-clip speed. Preview applies speed via
+ * ``element.playbackRate``; export must apply the same mapping when
+ * seeking frames and scheduling audio, or a 2× clip exports at 1×.
+ *
+ * source_time = trimStart + (timeline_time - clip.start) * speed
+ */
+export function timelineToSourceTime(clip, timelineTime) {
+  const speed = clip.speed || 1;
+  return (clip.trimStart || 0) + (timelineTime - clip.start) * speed;
+}
+
+/**
+ * Gain envelope for a clip at a timeline time — the audio twin of the
+ * opacity fade math in RenderEngine._renderClip (elapsed/fadeIn,
+ * remaining/fadeOut), so audible fades match the visual ones.
+ * Returns the multiplier applied on top of clip.volume.
+ */
+export function fadeGainAt(clip, timelineTime) {
+  let v = 1;
+  const clipDur = clip.end - clip.start;
+  const elapsed = timelineTime - clip.start;
+  if (clip.fadeIn > 0 && elapsed < clip.fadeIn) {
+    v *= Math.max(0, elapsed / clip.fadeIn);
+  }
+  if (clip.fadeOut > 0 && (clipDur - elapsed) < clip.fadeOut) {
+    v *= Math.max(0, (clipDur - elapsed) / clip.fadeOut);
+  }
+  return v;
+}
+
+/**
+ * Build the piecewise-linear gain automation points for a clip within
+ * an export range. Returns [{time, value}] in OFFLINE-CONTEXT seconds
+ * (0 = export start), ready for setValueAtTime/linearRampToValueAtTime.
+ * Where fadeIn and fadeOut overlap the product is quadratic, so the
+ * overlap is sampled densely (20 ms) to stay faithful.
+ */
+export function buildGainAutomation(clip, exportStart, exportEnd) {
+  const base = clip.muted ? 0 : (clip.volume ?? 1.0);
+  const t0 = Math.max(clip.start, exportStart);
+  const t1 = Math.min(clip.end, exportEnd);
+  if (t1 <= t0) return [];
+
+  const fadeIn = Math.max(0, clip.fadeIn || 0);
+  const fadeOut = Math.max(0, clip.fadeOut || 0);
+  const points = new Set([t0, t1]);
+  if (fadeIn > 0) points.add(Math.min(t1, Math.max(t0, clip.start + fadeIn)));
+  if (fadeOut > 0) points.add(Math.min(t1, Math.max(t0, clip.end - fadeOut)));
+
+  // Dense sampling only where the two fades overlap (non-linear region)
+  const overlapStart = clip.end - fadeOut;
+  const overlapEnd = clip.start + fadeIn;
+  if (fadeIn > 0 && fadeOut > 0 && overlapStart < overlapEnd) {
+    const s = Math.max(t0, overlapStart);
+    const e = Math.min(t1, overlapEnd);
+    for (let t = s; t < e; t += 0.02) points.add(t);
+  }
+
+  return [...points]
+    .sort((a, b) => a - b)
+    .map((t) => ({ time: t - exportStart, value: base * fadeGainAt(clip, t) }));
+}
 
 export default class ExportEngine {
   constructor(renderEngine, options = {}) {
@@ -33,6 +103,13 @@ export default class ExportEngine {
     this.onProgress = options.onProgress || null;
     this.onError = options.onError || null;
     this.onComplete = options.onComplete || null;
+    // Called before falling back to the real-time MediaRecorder path.
+    // Must return (or resolve to) true to proceed — the fallback is
+    // reduced-fidelity (dropped frames, word-highlight drift) and needs
+    // explicit user confirmation. No callback = fallback refused.
+    this.onFallbackRequired = options.onFallbackRequired || null;
+    // Metadata about the last export: which encode path ran, fps, timing.
+    this.lastExportMeta = null;
   }
 
   /**
@@ -124,54 +201,95 @@ export default class ExportEngine {
   }
 
   /**
-   * Extract audio from media elements using OfflineAudioContext.
-   * Renders all audio tracks to a single WAV buffer.
+   * Extract audio by decoding each clip's media and scheduling
+   * AudioBufferSourceNodes into an OfflineAudioContext.
+   *
+   * The previous implementation called createMediaElementSource() on an
+   * OfflineAudioContext — MediaElement sources are NOT supported on
+   * offline contexts (browsers throw or render silence), so every
+   * client export was silent. Decoded buffers are the only reliable
+   * offline path, and they let us honor per-clip speed
+   * (AudioBufferSourceNode.playbackRate), trim, volume, mute and
+   * fadeIn/fadeOut gain automation exactly like the preview.
    *
    * @param {number} startTime - Start of export range
    * @param {number} endTime - End of export range
    * @param {Array} clips - Clip items
    * @param {Map} mediaElements - Media element map
+   * @param {Array} [tracks] - Track definitions (for audioMuted)
    * @returns {Blob|null} - WAV blob or null if no audio
    */
-  async _extractAudio(startTime, endTime, clips, mediaElements) {
+  async _extractAudio(startTime, endTime, clips, mediaElements, tracks) {
     try {
       const duration = endTime - startTime;
       const sampleRate = 44100;
-      const numSamples = Math.ceil(duration * sampleRate);
+      const numSamples = Math.max(1, Math.ceil(duration * sampleRate));
 
-      // Find audio-producing clips (video and audio types)
+      const trackAudioMuted = (trackId) => {
+        const track = (tracks || []).find(t => t.id === trackId);
+        if (!track) return false;
+        // audioMuted is the explicit field; legacy ``muted`` falls back
+        // to it (same resolution RenderEngine uses for visibility).
+        return track.audioMuted !== undefined ? !!track.audioMuted : !!track.muted;
+      };
+
+      // Audio-producing clips overlapping the range. Muted in preview
+      // must mean muted in export — drop clip-muted and track-muted here.
       const audioClips = clips.filter(c =>
         (c.type === 'video' || c.type === 'audio') &&
-        c.end > startTime && c.start < endTime
+        c.end > startTime && c.start < endTime &&
+        !c.muted && !trackAudioMuted(c.trackId)
       );
 
       if (audioClips.length === 0) return null;
 
       const offlineCtx = new OfflineAudioContext(2, numSamples, sampleRate);
 
+      let scheduled = 0;
       for (const clip of audioClips) {
-        const mediaEl = mediaElements?.get(clip.mediaRef || clip.id);
-        if (!mediaEl || !(mediaEl instanceof HTMLVideoElement || mediaEl instanceof HTMLAudioElement)) continue;
-
         try {
-          // Clone the media element for offline rendering
-          const cloneEl = mediaEl.cloneNode(true);
-          cloneEl.muted = false;
-          cloneEl.volume = 1.0;
+          const buffer = await this._getDecodedAudio(clip, mediaElements, offlineCtx);
+          if (!buffer) continue;
 
-          const source = offlineCtx.createMediaElementSource(cloneEl);
+          const speed = clip.speed || 1;
+          const tlStart = Math.max(clip.start, startTime);
+          const tlEnd = Math.min(clip.end, endTime);
+          if (tlEnd <= tlStart) continue;
+
+          const source = offlineCtx.createBufferSource();
+          source.buffer = buffer;
+          source.playbackRate.value = speed;
+
           const gainNode = offlineCtx.createGain();
-          gainNode.gain.value = clip.volume ?? 1.0;
+          const automation = buildGainAutomation(clip, startTime, endTime);
+          if (automation.length > 0) {
+            gainNode.gain.setValueAtTime(automation[0].value, Math.max(0, automation[0].time));
+            for (let i = 1; i < automation.length; i++) {
+              gainNode.gain.linearRampToValueAtTime(
+                automation[i].value, Math.max(0, automation[i].time));
+            }
+          } else {
+            gainNode.gain.value = clip.muted ? 0 : (clip.volume ?? 1.0);
+          }
+
           source.connect(gainNode);
           gainNode.connect(offlineCtx.destination);
 
-          // Seek to the right position
-          const clipOffset = Math.max(0, startTime - clip.start);
-          cloneEl.currentTime = (clip.trimStart || 0) + clipOffset;
+          // start(when, offset, duration): offset/duration are in
+          // BUFFER seconds (unscaled by playbackRate), when is in
+          // context seconds — so source time uses the speed-mapped
+          // helper and duration is timeline duration × speed.
+          const when = tlStart - startTime;
+          const sourceOffset = Math.max(0, timelineToSourceTime(clip, tlStart));
+          const sourceDur = (tlEnd - tlStart) * speed;
+          source.start(when, sourceOffset, sourceDur);
+          scheduled++;
         } catch {
-          // Media element may not support offline rendering — skip
+          // Skip clips whose media can't be fetched/decoded
         }
       }
+
+      if (scheduled === 0) return null;
 
       const audioBuffer = await offlineCtx.startRendering();
 
@@ -181,6 +299,33 @@ export default class ExportEngine {
       // Audio extraction failed — export will be silent
       return null;
     }
+  }
+
+  /**
+   * Fetch + decode a clip's media into an AudioBuffer, cached per
+   * mediaRef so multiple clips of the same asset decode once.
+   */
+  async _getDecodedAudio(clip, mediaElements, ctx) {
+    const key = clip.mediaRef || clip.id;
+    if (!this._audioBufferCache) this._audioBufferCache = new Map();
+    if (this._audioBufferCache.has(key)) return this._audioBufferCache.get(key);
+
+    const mediaEl = mediaElements?.get(key);
+    const url = clip.src || mediaEl?.currentSrc || mediaEl?.src;
+    let buffer = null;
+    if (url) {
+      try {
+        const res = await fetch(url);
+        if (res.ok) {
+          const data = await res.arrayBuffer();
+          buffer = await ctx.decodeAudioData(data);
+        }
+      } catch {
+        buffer = null;
+      }
+    }
+    this._audioBufferCache.set(key, buffer);
+    return buffer;
   }
 
   /**
@@ -260,9 +405,25 @@ export default class ExportEngine {
     const exportFPS = ExportEngine.computeOptimalFPS(clips, settings, this.fps);
 
     if (!ExportEngine.isWebCodecsAvailable()) {
-      // Fallback to MediaRecorder
+      // MediaRecorder fallback records in real time — reduced fidelity.
+      // Require explicit confirmation instead of silently degrading.
+      let confirmed = false;
+      try {
+        confirmed = this.onFallbackRequired ? await this.onFallbackRequired() : false;
+      } catch {
+        confirmed = false;
+      }
+      if (!confirmed) {
+        this.renderEngine._exportMode = false;
+        this.onError?.(
+          'WebCodecs is not available and the reduced-fidelity real-time ' +
+          'fallback was not confirmed. Use Server Export instead.');
+        return null;
+      }
+      console.info('[ExportEngine] Export path: mediarecorder (reduced fidelity, user-confirmed)');
       return this._exportWithMediaRecorder(startTime, endTime, tracks, clips, settings, mediaElements, exportFPS);
     }
+    console.info('[ExportEngine] Export path: webcodecs (frame-stepped)');
 
     const totalFrames = Math.ceil((endTime - startTime) * exportFPS);
     const frameDuration = 1_000_000 / exportFPS; // microseconds
@@ -336,7 +497,9 @@ export default class ExportEngine {
               time >= c.start && time < c.end
             );
             if (clip) {
-              const clipTime = (clip.trimStart || 0) + (time - clip.start);
+              // Speed-aware mapping — a 2× clip must step through source
+              // frames twice as fast (same formula as audio scheduling).
+              const clipTime = timelineToSourceTime(clip, time);
               if (Math.abs(mediaEl.currentTime - clipTime) > 0.02) {
                 mediaEl.currentTime = clipTime;
                 // Wait for seek
@@ -379,7 +542,13 @@ export default class ExportEngine {
 
       // Extract audio
       this.onProgress?.(78);
-      const audioBlob = await this._extractAudio(startTime, endTime, clips, mediaElements);
+      const audioBlob = await this._extractAudio(startTime, endTime, clips, mediaElements, tracks);
+      this.lastExportMeta = {
+        path: 'webcodecs',
+        fps: exportFPS,
+        frames: totalFrames,
+        hasAudio: !!audioBlob,
+      };
 
       // Try to mux to MP4 via FFmpeg.wasm
       this.onProgress?.(85);
@@ -417,7 +586,8 @@ export default class ExportEngine {
 
             this.onProgress?.(100);
             const mp4Blob = new Blob([mp4Data.buffer], { type: 'video/mp4' });
-            this.onComplete?.(mp4Blob);
+            this.lastExportMeta.container = 'mp4';
+            this.onComplete?.(mp4Blob, this.lastExportMeta);
             return mp4Blob;
           } catch {
             // FFmpeg failed, return WebM
@@ -427,7 +597,8 @@ export default class ExportEngine {
 
       // Return WebM if MP4 conversion failed
       this.onProgress?.(100);
-      this.onComplete?.(webmBlob);
+      this.lastExportMeta.container = 'webm';
+      this.onComplete?.(webmBlob, this.lastExportMeta);
       return webmBlob;
 
     } catch (err) {
@@ -463,7 +634,14 @@ export default class ExportEngine {
         recorder.onstop = () => {
           const blob = new Blob(chunks, { type: 'video/webm' });
           this.onProgress?.(100);
-          this.onComplete?.(blob);
+          this.lastExportMeta = {
+            path: 'mediarecorder',
+            fps,
+            container: 'webm',
+            hasAudio: false,
+            reducedFidelity: true,
+          };
+          this.onComplete?.(blob, this.lastExportMeta);
           resolve(blob);
         };
 
@@ -514,6 +692,7 @@ export default class ExportEngine {
    */
   async destroy() {
     this.cancel();
+    if (this._audioBufferCache) this._audioBufferCache.clear();
     if (this._ffmpeg) {
       try {
         this._ffmpeg.terminate();

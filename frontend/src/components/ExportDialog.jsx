@@ -353,7 +353,15 @@ export default function ExportDialog({
       height: exportH,
       onProgress: setProgress,
       onError: (msg) => { setError(msg); setIsExporting(false); },
-      onComplete: (blob) => {
+      // WebCodecs missing → MediaRecorder records in real time with
+      // possible dropped frames / word-highlight drift. Ask first.
+      onFallbackRequired: () => window.confirm(
+        'WebCodecs is not available in this browser. Continue with a ' +
+        'reduced-fidelity real-time export? (May drop frames; audio is ' +
+        'not included. Server Export is recommended.)'
+      ),
+      onComplete: (blob, meta) => {
+        if (meta) console.info('[ExportDialog] Export completed via', meta.path, meta);
         setIsExporting(false);
         setProgress(100);
         // Download the blob

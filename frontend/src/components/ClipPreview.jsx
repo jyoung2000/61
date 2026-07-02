@@ -1,5 +1,6 @@
 import React, { useRef, useState, useEffect, useMemo, useCallback } from 'react';
 import { processKeyframes, getCropXForTime, isDynamic, safeSubjectX, subjectXToCenterPct, computeLayoutAtTime, computeFaceYCenter, faceYToCenterPct } from '../utils/subjectTracking';
+import { BASE_OVERHEAD_S, ANTICIPATION_S, AUDIO_BUFFER_S, PUNCT_PAUSE, FAST_WORDS } from '../utils/activeWordTiming';
 import ReframeDebugOverlay from './ReframeDebugOverlay';
 import useTimelineStore from '../stores/timelineStore';
 import { outlineTextShadow } from '../utils/textOutline';
@@ -122,19 +123,16 @@ function hexToRgba(hex, opacity) {
 //  2. Punctuation-aware pauses (commas, periods, etc.)
 //  3. Character-proportional duration with natural speech weighting
 //  4. Anticipation offset so highlight leads audio for perceptual sync
-const _BASE_OVERHEAD_S = 0.04;   // minimum gap between words
-const _ANTICIPATION_S  = 0.10;   // perceptual lead — highlight leads audio
-const _AUDIO_BUFFER_S  = 0.12;   // compensate for browser audio output lag
+// Constants imported from the shared module so this preview can never
+// drift from SubtitleOverlay / RenderEngine (client export). The word-
+// index algorithm below intentionally stays local: ClipPreview's word
+// timestamps are always clip-relative by construction.
+const _BASE_OVERHEAD_S = BASE_OVERHEAD_S;
+const _ANTICIPATION_S  = ANTICIPATION_S;
+const _AUDIO_BUFFER_S  = AUDIO_BUFFER_S;
+const _PUNCT_PAUSE = PUNCT_PAUSE;
 
-// Extra pause added AFTER a word that ends with punctuation
-const _PUNCT_PAUSE = { ',': 0.15, ';': 0.16, ':': 0.12, '.': 0.22, '!': 0.22, '?': 0.24, '\u2014': 0.12, '\u2013': 0.10 };
-
-// Function words are spoken ~25% faster in natural speech
-const _FAST_WORDS = new Set([
-  'the', 'a', 'an', 'to', 'in', 'on', 'at', 'of', 'for',
-  'and', 'but', 'or', 'is', 'was', 'are', 'were', 'it',
-  'its', 'this', 'that',
-]);
+const _FAST_WORDS = FAST_WORDS;
 
 // Compute per-speaker words-per-second from the clip's transcript segments.
 // Returns a Map<speaker, wps>.  Called once per clip, not per frame.

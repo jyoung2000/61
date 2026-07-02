@@ -44,125 +44,14 @@ const VARIABLE_WEIGHT_FONTS = new Set([
   'Nunito', 'Oswald', 'Playfair Display',
 ]);
 
-const DEFAULT_SPEAKER_PALETTE = [
-  '#00D9FF', '#F59E0B', '#10B981', '#A78BFA', '#EF4444', '#EC4899',
-  '#06B6D4', '#8B5CF6', '#F97316', '#14B8A6', '#E879F9', '#84CC16',
-  '#FB7185', '#38BDF8', '#FBBF24', '#34D399', '#C084FC', '#F472B6',
-  '#22D3EE', '#A3E635', '#FB923C', '#2DD4BF', '#818CF8', '#F87171',
-];
-
-const FONT_SIZE_MAP = { small: 22, medium: 30, large: 40 };
-const REF_W = 1920;
-const REF_H = 1080;
-
-// ── Active word timing constants (MUST match SubtitleOverlay exactly) ────
-const _BASE_OVERHEAD_S = 0.04;
-const _ANTICIPATION_S  = 0.10;
-const _AUDIO_BUFFER_S  = 0.12;
-const _PUNCT_PAUSE = { ',': 0.15, ';': 0.16, ':': 0.12, '.': 0.22, '!': 0.22, '?': 0.24, '\u2014': 0.12, '\u2013': 0.10 };
-const _FAST_WORDS = new Set([
-  'the', 'a', 'an', 'to', 'in', 'on', 'at', 'of', 'for',
-  'and', 'but', 'or', 'is', 'was', 'are', 'were', 'it',
-  'its', 'this', 'that',
-]);
-
-/**
- * Compute the active word index for a subtitle segment at a given time.
- * This is the SAME algorithm used by SubtitleOverlay's getCurrentWordIndex
- * to guarantee 1:1 parity between preview and export.
- */
-function computeActiveWordIndex(segment, relativeTime, speakerRates) {
-  const text = segment?.subtitleText || segment?.text || '';
-  if (!text) return -1;
-  const words = text.split(/\s+/).filter(Boolean);
-  if (words.length <= 1) return words.length === 1 ? 0 : -1;
-
-  // Use word-level timestamps if available.
-  //
-  // Coordinate-agnostic compare: word timestamps may be **timeline-
-  // absolute** (the convention Whisper produces) or **clip-relative**
-  // (some legacy paths offset them). We auto-detect by checking
-  // whether the first word's start lies inside the segment's
-  // [start, end] window. The active-word HIGHLIGHT then uses the
-  // same convention as the segment, eliminating the
-  // ``preview ≠ export`` drift the audit flagged.
-  if (segment.words && segment.words.length === words.length) {
-    const w0 = segment.words[0];
-    const wordsAreClipRelative = w0.start < segment.start - 0.01;
-    const baseT = wordsAreClipRelative
-      ? (relativeTime - segment.start)
-      : relativeTime;
-    // Match the preview's per-speaker rate-scaled anticipation
-    // (SubtitleOverlay.getCurrentWordIndex word-ts branch). Without
-    // this, the canvas export highlights at fixed 0.10s anticipation
-    // while the preview scales by speaker rate — slow speakers got
-    // an early highlight in preview but a late one in export.
-    const speakerWpsW = (speakerRates && speakerRates[segment.speaker]) || 3.0;
-    const rateScaleW = Math.max(0.6, Math.min(1.6, 3.0 / speakerWpsW));
-    const anticipationW = _ANTICIPATION_S * rateScaleW;
-    const adjusted = baseT + anticipationW - _AUDIO_BUFFER_S;
-    if (adjusted < w0.start) return -1;
-    for (let i = 0; i < segment.words.length; i++) {
-      if (adjusted < segment.words[i].end) return i;
-    }
-    return segment.words.length - 1;
-  }
-
-  // Proportional timing fallback (matches SubtitleOverlay exactly)
-  const totalChars = words.reduce((sum, w) => sum + w.length, 0);
-  if (totalChars === 0) return -1;
-  const segDuration = segment.end - segment.start;
-  const speakerWps = (speakerRates && speakerRates[segment.speaker]) || 3.0;
-  const rateScale = Math.max(0.6, Math.min(1.6, 3.0 / speakerWps));
-  const anticipation = _ANTICIPATION_S * rateScale;
-  const elapsed = (relativeTime - segment.start) + anticipation - _AUDIO_BUFFER_S;
-  if (elapsed < 0) return -1;
-
-  const punctPauses = words.map((w) => {
-    const last = w[w.length - 1];
-    return (_PUNCT_PAUSE[last] || 0) * rateScale;
-  });
-  const totalPunct = punctPauses.reduce((a, b) => a + b, 0);
-  const baseOverhead = _BASE_OVERHEAD_S * rateScale * words.length;
-  const totalPause = baseOverhead + totalPunct;
-  const charTime = Math.max(segDuration - totalPause, segDuration * 0.45);
-  const pauseScale = (segDuration - charTime) / Math.max(totalPause, 0.01);
-
-  let t = 0;
-  for (let i = 0; i < words.length; i++) {
-    const charDur = charTime * (words[i].length / totalChars);
-    const pause = (_BASE_OVERHEAD_S * rateScale + punctPauses[i]) * pauseScale;
-    let wordDur = charDur + pause;
-    const stripped = words[i].toLowerCase().replace(/[.,!?;:\u2014\u2013]+$/, '');
-    if (_FAST_WORDS.has(stripped)) wordDur *= 0.75;
-    if (i === 0) wordDur *= 1.15;
-    else if (i === words.length - 1) wordDur *= 1.10;
-    if (elapsed < t + wordDur) return i;
-    t += wordDur;
-  }
-  return words.length - 1;
-}
-
-/**
- * Compute per-speaker word rates from subtitle segments.
- * Matches SubtitleOverlay's computeSpeakerRates exactly.
- */
-function computeSpeakerRates(segments) {
-  const stats = {};
-  for (const seg of segments) {
-    const wc = (seg.text || seg.subtitleText || '').split(/\s+/).filter(Boolean).length;
-    const dur = seg.end - seg.start;
-    if (dur <= 0 || wc === 0) continue;
-    if (!stats[seg.speaker]) stats[seg.speaker] = { words: 0, time: 0 };
-    stats[seg.speaker].words += wc;
-    stats[seg.speaker].time += dur;
-  }
-  const rates = {};
-  for (const [sp, s] of Object.entries(stats)) {
-    rates[sp] = s.time > 0 ? s.words / s.time : 3.0;
-  }
-  return rates;
-}
+// Active-word timing + speaker palette live in ONE shared module so the
+// DOM preview (SubtitleOverlay) and this canvas compositor can never
+// drift apart. See utils/activeWordTiming.js for the algorithm docs.
+import {
+  DEFAULT_SPEAKER_PALETTE,
+  computeSpeakerRates,
+  getCurrentWordIndex as computeActiveWordIndex,
+} from '../utils/activeWordTiming';
 
 /**
  * Get speaker color matching SubtitleOverlay's getSpeakerColor logic.
@@ -503,7 +392,20 @@ export default class RenderEngine {
     // Build filter string from clip effects
     const filterStr = this._buildFilterString(clip.effects);
     if (filterStr) {
-      ctx.filter = filterStr;
+      // Safari ignores ctx.filter — warn once instead of silently
+      // rendering unfiltered (the export would not match other browsers
+      // or the server render). Server Export applies effects via FFmpeg.
+      if (!this.supportsCanvasFilter()) {
+        if (!this._warnedNoFilter) {
+          this._warnedNoFilter = true;
+          console.warn(
+            '[RenderEngine] This browser does not support canvas filters ' +
+            '(ctx.filter). Clip effects will not render in preview or ' +
+            'client export — use Server Export for filtered clips.');
+        }
+      } else {
+        ctx.filter = filterStr;
+      }
     }
 
     switch (clip.type) {
@@ -756,7 +658,12 @@ export default class RenderEngine {
       const fillX = (tw - fillW) / 2;
       const fillY = (th - fillH) / 2;
       offCtx.drawImage(mediaEl, fillX, fillY, fillW, fillH);
-      ctx.filter = 'blur(20px)';
+      // Match the server blurfill exactly: gblur=sigma=50 +
+      // eq=brightness=-0.1 (layout_filters.build_blur_fill_filter).
+      // CSS blur(50px) ↔ gblur sigma=50 is the same equivalence
+      // renderPlanRenderer.js uses; the old blur(20px) with no
+      // darkening was visibly sharper/brighter than the export.
+      ctx.filter = 'blur(50px) brightness(0.9)';
       ctx.drawImage(off, 0, 0);
       ctx.filter = 'none';
       ctx.restore();
@@ -1203,7 +1110,7 @@ export default class RenderEngine {
 
   _renderClipDirect(ctx, clip, currentTime, settings, mediaElements) {
     const filterStr = this._buildFilterString(clip.effects);
-    if (filterStr) ctx.filter = filterStr;
+    if (filterStr && this.supportsCanvasFilter()) ctx.filter = filterStr;
     if (clip.type === 'video') this._renderVideo(ctx, clip, currentTime, settings, mediaElements);
     else if (clip.type === 'image' || clip.type === 'overlay') this._renderImage(ctx, clip, mediaElements);
     ctx.filter = 'none';
@@ -1218,7 +1125,7 @@ export default class RenderEngine {
     // letterboxing, which made every transition snap to a different
     // composition than the surrounding frames.
     const filterStr = this._buildFilterString(clip.effects);
-    if (filterStr) targetCtx.filter = filterStr;
+    if (filterStr && this.supportsCanvasFilter()) targetCtx.filter = filterStr;
     try {
       if (clip.type === 'video') {
         this._renderVideo(targetCtx, clip, currentTime, settings, mediaElements);
@@ -1232,6 +1139,23 @@ export default class RenderEngine {
     } finally {
       targetCtx.filter = 'none';
     }
+  }
+
+  /**
+   * True when the 2D context honors ``ctx.filter`` (Safari does not).
+   * Cached per engine; probing is a simple property round-trip.
+   */
+  supportsCanvasFilter() {
+    if (this._filterSupport === undefined) {
+      try {
+        const probe = document.createElement('canvas').getContext('2d');
+        probe.filter = 'blur(1px)';
+        this._filterSupport = probe.filter === 'blur(1px)';
+      } catch {
+        this._filterSupport = false;
+      }
+    }
+    return this._filterSupport;
   }
 
   _buildFilterString(effects) {

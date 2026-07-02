@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { outlineTextShadow } from '../utils/textOutline';
 import { spokenWindow, isSpokenAt } from '../utils/subtitleTiming';
+import { DEFAULT_SPEAKER_PALETTE, computeSpeakerRates, getCurrentWordIndex } from '../utils/activeWordTiming';
 import useTimelineStore from '../stores/timelineStore';
 
 // ── Backend-matching constants (ass_generator.py / clip_exporter.py) ──────
@@ -46,107 +47,9 @@ function registerFontFace(fontName, url) {
   document.head.appendChild(style);
 }
 
-const DEFAULT_SPEAKER_PALETTE = [
-  '#00D9FF', '#F59E0B', '#10B981', '#A78BFA', '#EF4444', '#EC4899',
-  '#06B6D4', '#8B5CF6', '#F97316', '#14B8A6', '#E879F9', '#84CC16',
-  '#FB7185', '#38BDF8', '#FBBF24', '#34D399', '#C084FC', '#F472B6',
-  '#22D3EE', '#A3E635', '#FB923C', '#2DD4BF', '#818CF8', '#F87171',
-];
-
-// ── Active word timing (matches ClipPreview) ────────────────────────────
-const _BASE_OVERHEAD_S = 0.04;
-const _ANTICIPATION_S  = 0.10;
-const _AUDIO_BUFFER_S  = 0.12;
-const _PUNCT_PAUSE = { ',': 0.15, ';': 0.16, ':': 0.12, '.': 0.22, '!': 0.22, '?': 0.24, '\u2014': 0.12, '\u2013': 0.10 };
-const _FAST_WORDS = new Set([
-  'the', 'a', 'an', 'to', 'in', 'on', 'at', 'of', 'for',
-  'and', 'but', 'or', 'is', 'was', 'are', 'were', 'it',
-  'its', 'this', 'that',
-]);
-
-function computeSpeakerRates(segments) {
-  const stats = {};
-  for (const seg of segments) {
-    const wc = (seg.text || seg.subtitleText || '').split(/\s+/).filter(Boolean).length;
-    const dur = seg.end - seg.start;
-    if (dur <= 0 || wc === 0) continue;
-    if (!stats[seg.speaker]) stats[seg.speaker] = { words: 0, time: 0 };
-    stats[seg.speaker].words += wc;
-    stats[seg.speaker].time += dur;
-  }
-  const rates = {};
-  for (const [sp, s] of Object.entries(stats)) {
-    rates[sp] = s.time > 0 ? s.words / s.time : 3.0;
-  }
-  return rates;
-}
-
-function getCurrentWordIndex(segment, relativeTime, speakerRates) {
-  const text = segment?.subtitleText || segment?.text || '';
-  if (!text) return -1;
-  const words = text.split(/\s+/).filter(Boolean);
-  if (words.length <= 1) return words.length === 1 ? 0 : -1;
-
-  // Shared speaker-rate scaling — applies to *both* branches below so
-  // the word-timestamp path and the estimation path give consistent
-  // results for fast/slow speakers. (The old code hardcoded +0.10 in
-  // the word-timestamp branch, which is correct only for the 3.0 wps
-  // reference speaker; fast speakers over-anticipated and slow
-  // speakers under-anticipated.) This also matches the backend
-  // ``_net_offset = anticipation - _AUDIO_BUFFER_S`` formula in
-  // ``backend/services/ass_generator.py``.
-  const speakerWps = (speakerRates && speakerRates[segment.speaker]) || 3.0;
-  const rateScale = Math.max(0.6, Math.min(1.6, 3.0 / speakerWps));
-  const anticipation = _ANTICIPATION_S * rateScale;
-
-  if (segment.words && segment.words.length === words.length) {
-    // Coordinate-agnostic compare: word timestamps may be timeline-
-    // absolute (Whisper's native output) or clip-relative (legacy).
-    // Detect which and feed the same coordinate system as the words
-    // so preview and the canvas RenderEngine agree on highlighting.
-    const w0 = segment.words[0];
-    const wordsAreClipRelative = w0.start < segment.start - 0.01;
-    const baseT = wordsAreClipRelative
-      ? (relativeTime - segment.start)
-      : relativeTime;
-    const adjusted = baseT + anticipation - _AUDIO_BUFFER_S;
-    if (adjusted < w0.start) return -1;
-    for (let i = 0; i < segment.words.length; i++) {
-      if (adjusted < segment.words[i].end) return i;
-    }
-    return segment.words.length - 1;
-  }
-
-  const totalChars = words.reduce((sum, w) => sum + w.length, 0);
-  if (totalChars === 0) return -1;
-  const segDuration = segment.end - segment.start;
-  const elapsed = (relativeTime - segment.start) + anticipation - _AUDIO_BUFFER_S;
-  if (elapsed < 0) return -1;
-
-  const punctPauses = words.map((w) => {
-    const last = w[w.length - 1];
-    return (_PUNCT_PAUSE[last] || 0) * rateScale;
-  });
-  const totalPunct = punctPauses.reduce((a, b) => a + b, 0);
-  const baseOverhead = _BASE_OVERHEAD_S * rateScale * words.length;
-  const totalPause = baseOverhead + totalPunct;
-  const charTime = Math.max(segDuration - totalPause, segDuration * 0.45);
-  const pauseScale = (segDuration - charTime) / Math.max(totalPause, 0.01);
-
-  let t = 0;
-  for (let i = 0; i < words.length; i++) {
-    const charDur = charTime * (words[i].length / totalChars);
-    const pause = (_BASE_OVERHEAD_S * rateScale + punctPauses[i]) * pauseScale;
-    let wordDur = charDur + pause;
-    const stripped = words[i].toLowerCase().replace(/[.,!?;:\u2014\u2013]+$/, '');
-    if (_FAST_WORDS.has(stripped)) wordDur *= 0.75;
-    if (i === 0) wordDur *= 1.15;
-    else if (i === words.length - 1) wordDur *= 1.10;
-    if (elapsed < t + wordDur) return i;
-    t += wordDur;
-  }
-  return words.length - 1;
-}
+// Active-word timing constants, speaker palette, per-speaker rates and
+// the word-index algorithm are shared with RenderEngine (preview AND
+// client export) via ONE module — see utils/activeWordTiming.js.
 
 function splitSegmentsByMaxWords(segments, maxWords) {
   if (!maxWords || maxWords <= 0) return segments;
