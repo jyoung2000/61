@@ -4021,24 +4021,55 @@ async def _run_analysis_inner(job_id: str):
     # returns None and the engine transcribes the raw audio unchanged.
     # Skipped entirely on a resumed run (the transcript is already restored).
     _vocals_path = None
+    _vocals_future = None
+    _vs_executor = None
     if not _resumed_from_checkpoint and getattr(settings, "VOCAL_SEPARATION_ENABLED", False):
         try:
             from backend.services.vocal_separator import separate_vocals, is_available
             if is_available():
-                async with _stage_timer(job_id, "vocal_separation"):
-                    _vocals_path = await asyncio.to_thread(
-                        separate_vocals, video_path,
-                        os.path.join(job_dir, "demucs"),
-                        model=getattr(settings, "VOCAL_SEPARATION_MODEL", "htdemucs"),
-                        device=getattr(settings, "VOCAL_SEPARATION_DEVICE", "auto"),
-                        segment=int(getattr(settings, "VOCAL_SEPARATION_SEGMENT", 7)),
-                        timeout=int(getattr(settings, "VOCAL_SEPARATION_TIMEOUT", 1800)),
-                    )
-                logger.info(
-                    "[%s] Vocal separation: %s", job_id,
-                    f"transcribing isolated vocals ({os.path.basename(_vocals_path)})"
-                    if _vocals_path else "no output — transcribing full audio",
+                _vs_kwargs = dict(
+                    model=getattr(settings, "VOCAL_SEPARATION_MODEL", "htdemucs"),
+                    device=getattr(settings, "VOCAL_SEPARATION_DEVICE", "auto"),
+                    segment=int(getattr(settings, "VOCAL_SEPARATION_SEGMENT", 7)),
+                    timeout=int(getattr(settings, "VOCAL_SEPARATION_TIMEOUT", 1800)),
                 )
+                # Concurrency (audit Phase 5.5): Demucs and the visual
+                # perception pass use different resources most of the run,
+                # so overlap them — the perceiver blocks on the future only
+                # when it reaches transcription. Gated to GPUs with >=6 GB
+                # total VRAM: on a 4 GB card Demucs-on-GPU + YOLO-on-GPU
+                # would fight for the budget, so small cards keep the
+                # proven sequential order (whole GPU per stage).
+                _vs_concurrent = bool(getattr(
+                    settings, "VOCAL_SEPARATION_CONCURRENT", True))
+                if _vs_concurrent:
+                    try:
+                        from backend.services.vram_ledger import _query_vram
+                        _vram = _query_vram()
+                        if _vram is not None and _vram[1] < 6000:
+                            _vs_concurrent = False
+                    except Exception:
+                        _vs_concurrent = False
+                if _vs_concurrent:
+                    import concurrent.futures as _cf
+                    _vs_executor = _cf.ThreadPoolExecutor(
+                        max_workers=1, thread_name_prefix="vocal-sep")
+                    _vocals_future = _vs_executor.submit(
+                        separate_vocals, video_path,
+                        os.path.join(job_dir, "demucs"), **_vs_kwargs)
+                    logger.info(
+                        "[%s] Vocal separation started CONCURRENT with "
+                        "perception (GPU has headroom)", job_id)
+                else:
+                    async with _stage_timer(job_id, "vocal_separation"):
+                        _vocals_path = await asyncio.to_thread(
+                            separate_vocals, video_path,
+                            os.path.join(job_dir, "demucs"), **_vs_kwargs)
+                    logger.info(
+                        "[%s] Vocal separation: %s", job_id,
+                        f"transcribing isolated vocals ({os.path.basename(_vocals_path)})"
+                        if _vocals_path else "no output — transcribing full audio",
+                    )
             else:
                 logger.info(
                     "[%s] VOCAL_SEPARATION_ENABLED but demucs not installed "
@@ -4049,15 +4080,33 @@ async def _run_analysis_inner(job_id: str):
                 job_id, _vs_err)
             _vocals_path = None
 
+    if _vocals_future is not None:
+        _vs_timeout = int(getattr(settings, "VOCAL_SEPARATION_TIMEOUT", 1800)) + 120
+
+        def _await_vocals():
+            # Runs on the engine's worker thread right before transcription
+            try:
+                return _vocals_future.result(timeout=_vs_timeout)
+            except Exception as _e:
+                logger.warning(
+                    "[%s] Concurrent vocal separation failed (%s) — "
+                    "transcribing full audio", job_id, _e)
+                return None
+        _engine_stem = _await_vocals
+    else:
+        _engine_stem = _vocals_path
+
     if not _resumed_from_checkpoint:
         engine = ReframeEngine(video_path, sample_fps=_sample_fps,
                                aspect_ratio="9:16", trace_path=_trace_path,
                                source_language=_engine_source_lang,
-                               transcribe_audio_path=_vocals_path)
+                               transcribe_audio_path=_engine_stem)
         async with _stage_timer(job_id, "reframer_analysis"):
             reframer_plan = await asyncio.to_thread(engine.analyze, _engine_progress)
         perception = engine.perception
         _log_gpu_memory(job_id, "post-reframer")
+        if _vs_executor is not None:
+            _vs_executor.shutdown(wait=False)
 
         # Checkpoint the (expensive) engine output so a failed/interrupted run
         # can RESUME here next time — skipping detection + transcription —

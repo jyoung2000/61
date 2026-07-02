@@ -110,7 +110,11 @@ RUN mkdir -p /app/backend/models && \
     "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx" && \
     curl --retry 4 --retry-delay 5 --retry-all-errors -fsSL \
     -o /app/backend/models/lbpcascade_animeface.xml \
-    "https://github.com/nagadomi/lbpcascade_animeface/raw/master/lbpcascade_animeface.xml"
+    "https://github.com/nagadomi/lbpcascade_animeface/raw/master/lbpcascade_animeface.xml" && \
+    curl -sL -o /app/backend/models/face_recognition_sface_2021dec.onnx \
+    "https://github.com/opencv/opencv_zoo/raw/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx" && \
+    curl -sL -o /app/backend/models/u2netp.onnx \
+    "https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2netp.onnx"
 
 # v4.1: pre-download YOLOv8n weights for PersonDetector / ObjectDetector
 # (~5.5MB). object_detector.py looks at /data/models/yolov8n.pt first,

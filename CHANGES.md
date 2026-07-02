@@ -1,3 +1,47 @@
+# ClipAI — Phase 5: Container speed & efficiency
+
+- **Perception decode no longer seeks every sample.** The sampler's seek
+  threshold was ``gap > 5`` frames — at 5 fps sampling of 30 fps video
+  the gap is exactly 6, so EVERY sample did a ``CAP_PROP_POS_FRAMES``
+  seek, and on long-GOP H.264 each seek re-decodes from the previous
+  keyframe. Sequential ``grab()`` (decode-skip) now covers gaps up to
+  ``REFRAMER_SEEK_GAP_FRAMES`` (60 ≈ 2x a typical GOP); only genuinely
+  large jumps seek. ``scripts/bench_perception_decode.py`` measures
+  seek-vs-grab-vs-piped-ffmpeg (± NVDEC) on a real fixture so the piped
+  decoder can be promoted if it wins on your content — run it on the
+  30-min 1080p fixture and record the numbers.
+- **NVENC tuned for the TU117 (GTX 1650)**: ``-spatial_aq 1
+  -temporal_aq 1`` on all NVENC encodes (pure quality win at equal
+  bitrate, supported since Kepler), ``-bf 0`` on the HEVC 4K path (the
+  1650's Volta-gen NVENC has no HEVC B-frames), and a speed/quality
+  toggle ``GPU_NVENC_PRESET`` (p1..p7, default p5, persisted in
+  Settings). The GPU→CPU retry already strips these flags. ``-rc vbr
+  -cq N -b:v 0`` was already in place. Full-GPU filter pipelines
+  (``-hwaccel_output_format cuda`` + scale_cuda) stay out for now — the
+  current filter graphs run CPU-side filters (subtitles/overlays) that
+  would force a download mid-graph.
+- **Models pre-baked into the image**: u2netp.onnx (learned saliency) is
+  now downloaded at build time in BOTH Dockerfiles and auto-discovered
+  from ``backend/models/`` / ``/data/models/`` — no more manual
+  ``REFRAMER_U2NET_MODEL_PATH``. The CPU image also gains the SFace
+  embedding model (the GPU image already had it; YuNet/YOLOv8n/Demucs/
+  animeface were already baked). torch==2.5.1/torchaudio==2.5.1 pins
+  verified in both images (guards the pyannote upgrade path); pip runs
+  --no-cache-dir throughout.
+- **Vocal separation runs concurrent with perception**
+  (``VOCAL_SEPARATION_CONCURRENT``, default on): Demucs starts before the
+  engine and the perceiver blocks on its future only when it reaches
+  transcription, so separation gets the visual pass's wall time for
+  free. Auto-degrades to the proven sequential order on GPUs under 6 GB
+  total — the 4 GB budget is never shared between Demucs and YOLO.
+- **Not done (documented follow-ups)**: extracting VLM/thumbnail frames
+  from the perception decode stream (single-decode architecture) — the
+  VLM path wants higher-resolution frames at scene-change timestamps, so
+  sharing the 640x360 detection stream trades quality for speed and
+  needs measurement first; and streaming polish batches during
+  transcription (requires cross-thread segment streaming out of the
+  perceiver). Both are scoped in the audit and remain open.
+
 # ClipAI — Phase 4: Cloud transcription + a real subtitle-polish model picker
 
 There was no cloud STT path — transcription was local-only, and polish

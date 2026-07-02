@@ -59,6 +59,19 @@ class _U2NetSaliency:
             path = ""
         if not path:
             path = os.environ.get("CLIPAI_U2NET_MODEL_PATH", "")
+        if not path:
+            # Auto-discover the image-baked copy (audit Phase 5.4 — the
+            # Dockerfiles now pre-bake u2netp.onnx so learned saliency
+            # works out of the box instead of requiring a manual path).
+            for candidate in (
+                os.path.join(os.path.dirname(__file__), "..", "models", "u2netp.onnx"),
+                "/app/backend/models/u2netp.onnx",
+                "/data/models/u2netp.onnx",
+            ):
+                candidate = os.path.abspath(candidate)
+                if os.path.exists(candidate):
+                    path = candidate
+                    break
         if not path or not os.path.exists(path):
             logger.info("u2netp model not found (path=%r); learned saliency disabled", path)
             cls._disabled = True

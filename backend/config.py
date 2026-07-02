@@ -322,6 +322,10 @@ class Settings(BaseSettings):
     VOCAL_SEPARATION_DEVICE: str = "auto"       # auto | cuda | cpu
     VOCAL_SEPARATION_SEGMENT: int = 7           # demucs --segment (CUDA VRAM cap)
     VOCAL_SEPARATION_TIMEOUT: int = 1800        # seconds, hard ceiling per pass
+    # Overlap Demucs with the visual perception pass (audit Phase 5.5).
+    # Auto-degrades to the sequential order on GPUs under 6 GB total so a
+    # 4 GB card never runs Demucs and YOLO at the same time.
+    VOCAL_SEPARATION_CONCURRENT: bool = True
     FRAME_SAMPLE_RATE: int = 10        # seconds between frames (lower=more detail, slower)
     MAX_CLIP_CANDIDATES: int = 12
 
@@ -450,6 +454,12 @@ class Settings(BaseSettings):
     # Set to false to restore the always-tiled behavior.
     REFRAMER_TILED_ADAPTIVE: bool = True
     REFRAMER_TILED_MIN_FACE_FRAC: float = 0.04
+    # Perception decode: sequential grab() is used for frame gaps up to
+    # this many frames; only larger jumps hard-seek (CAP_PROP_POS_FRAMES
+    # re-decodes from the previous keyframe on long-GOP H.264). ~2x a
+    # typical GOP. The old gap>5 threshold seeked on EVERY sample at
+    # 5 fps sampling of 30 fps video.
+    REFRAMER_SEEK_GAP_FRAMES: int = 60
     # Motivated zoom — time-varying push-in/pull-out via the dormant
     # motivated_zoom planner, adding a per-keyframe `scale` term rendered as a
     # time-varying ffmpeg crop. Default ON — a no-op unless the plan actually
@@ -564,6 +574,9 @@ class Settings(BaseSettings):
     GPU_VENDOR_OVERRIDE: str = ""            # Empty = auto-detect; "nvidia", "intel", "amd", "apple" to force
     GPU_HWDECODE_ENABLED: bool = True        # Use GPU for video decoding (NVDEC/DXVA2/VAAPI/VideoToolbox)
     GPU_HEVC_FOR_4K: bool = True             # Use HEVC encoder for 4K exports when available
+    # NVENC preset p1 (fastest) .. p7 (best quality); the speed/quality
+    # toggle for GPU exports. p5 = historical default.
+    GPU_NVENC_PRESET: str = "p5"
     GPU_DEVICE_INDEX: str = ""               # SERVER FFmpeg CUDA device index ("0" etc.). Empty = auto. NEVER set from the browser/phone client report — the client's GPU is irrelevant server-side. With NVIDIA_VISIBLE_DEVICES pinned to the 1650's UUID, index 0 in-container is always the 1650.
 
     # Pre-analysis GPU memory preflight.

@@ -785,22 +785,42 @@ def _gpu_encode_args(quality_preset: dict, export_quality: str = "1080p") -> lis
             encoder, gpu.get("gpu_name", "NVIDIA GPU"),
             gpu_device or "auto", crf, export_quality,
         )
+        # NVENC preset: p1 (fastest) ... p7 (best quality). p5 is the
+        # historical default; GPU_NVENC_PRESET exposes the speed/quality
+        # toggle (e.g. p4 for faster exports on a GTX 1650, p6/p7 when
+        # quality matters more than wall clock).
+        nvenc_preset = (getattr(app_settings, "GPU_NVENC_PRESET", "p5")
+                        or "p5").strip().lower()
+        if nvenc_preset not in {f"p{i}" for i in range(1, 8)}:
+            nvenc_preset = "p5"
+        # Adaptive quantization is a pure quality win at the same bitrate
+        # on every NVENC generation (spends bits on detailed/moving
+        # regions). Supported back to Kepler — safe on the 1650's
+        # Volta-gen NVENC. The CPU-fallback path already strips these.
+        aq_args = ["-spatial_aq", "1", "-temporal_aq", "1"]
         if use_hevc:
             return device_args + [
                 "-c:v", "hevc_nvenc",
-                "-preset", "p5",
+                "-preset", nvenc_preset,
                 "-rc", "vbr",
                 "-cq", str(max(crf - 2, 0)),  # HEVC CQ is slightly different
                 "-b:v", "0",
+                *aq_args,
+                # Volta-generation NVENC (GTX 1650 TU117) has no HEVC
+                # B-frame support — request none so the encoder can't
+                # error out; newer cards lose a little compression here
+                # but 4K HEVC exports stay universally safe.
+                "-bf", "0",
                 "-pix_fmt", "yuv420p",
                 "-tag:v", "hvc1",  # Apple/browser compatibility
             ]
         return device_args + [
             "-c:v", "h264_nvenc",
-            "-preset", "p5",
+            "-preset", nvenc_preset,
             "-rc", "vbr",
             "-cq", str(crf),
             "-b:v", "0",
+            *aq_args,
             "-pix_fmt", "yuv420p",
         ]
     elif gpu["encoder"] == "h264_vaapi":

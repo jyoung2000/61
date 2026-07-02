@@ -258,17 +258,26 @@ class Perceiver:
             if self.cancelled:
                 break
 
-            # Smart frame reading: sequential read when samples are close together,
-            # seek only when jumping more than 5 frames ahead
+            # Smart frame reading: sequential grab() for anything up to
+            # ~2x a typical GOP, hard-seek only for genuinely large jumps.
+            #
+            # The old threshold was gap > 5 — but at 5 fps sampling on a
+            # 30 fps video the gap is exactly 6, so EVERY sample seeked.
+            # On long-GOP H.264 each CAP_PROP_POS_FRAMES seek re-decodes
+            # from the previous keyframe (~the whole GOP), making the
+            # perception pass decode each GOP repeatedly. grab() skips
+            # frames without full decode (no color convert / no return),
+            # which is far cheaper than a seek for these small gaps.
             target_frame = int(time_ms / 1000.0 * r.fps)
             current_pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
             gap = target_frame - current_pos
+            seek_gap = int(getattr(settings, 'REFRAMER_SEEK_GAP_FRAMES', 60))
 
-            if gap < 0 or gap > 5:
-                # Need to seek — we're behind or too far ahead
+            if gap < 0 or gap > seek_gap:
+                # Behind (shouldn't happen) or a genuinely large jump
                 cap.set(cv2.CAP_PROP_POS_FRAMES, min(target_frame, r.total_frames - 1))
             elif gap > 1:
-                # Skip a few frames by grabbing without decoding
+                # Skip forward by grabbing without decoding
                 for _ in range(gap - 1):
                     cap.grab()
 
@@ -654,12 +663,22 @@ class Perceiver:
         self._release_perception_models()
 
         # ── Audio intelligence (Whisper transcription) ──
+        # transcribe_audio_path may be a zero-arg callable (the pipeline's
+        # concurrent vocal-separation handle, audit Phase 5.5): resolve it
+        # HERE — after the visual pass — so Demucs got the perception
+        # stage's wall time for free. A plain string path passes through.
+        _stem_path = self.transcribe_audio_path
+        if callable(_stem_path):
+            try:
+                _stem_path = _stem_path()
+            except Exception:
+                _stem_path = None
         if self.audio_intel.try_load():
             audio_result = self.audio_intel.transcribe(
                 self.path, r.duration_ms,
                 language=self.source_language,
                 on_progress=on_progress,
-                audio_path_override=self.transcribe_audio_path)
+                audio_path_override=_stem_path)
             r.speech_active = audio_result.get('speech_active', {})
             r.transcript_segments = audio_result.get('segments', [])
             r.detected_language = audio_result.get('language', '')
