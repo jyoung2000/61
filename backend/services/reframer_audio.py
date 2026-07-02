@@ -610,7 +610,16 @@ class AudioIntelligence:
         """Transcribe the video's audio track.
         Optimized for speed: beam_size=1 (greedy), larger batch_size."""
         if not self.available:
-            return {'speech_active': {}, 'segments': [], 'language': ''}
+            # A configured cloud provider can still transcribe without a
+            # local faster-whisper install.
+            try:
+                from backend.services.cloud_transcription import (
+                    provider_selected, cloud_available)
+                _cloud_ok = provider_selected() != 'local' and cloud_available()
+            except Exception:
+                _cloud_ok = False
+            if not _cloud_ok:
+                return {'speech_active': {}, 'segments': [], 'language': ''}
 
         log = get_logger()
         log.start_timer('transcribe')
@@ -709,6 +718,40 @@ class AudioIntelligence:
 
             audio_size = os.path.getsize(audio_path)
             log.log_stage('AUDIO', f'Audio extracted: {audio_size/1048576:.1f} MB')
+
+            # ── Cloud transcription provider (audit Phase 4.1) ──
+            # TRANSCRIPTION_PROVIDER=groq|openai runs the primary pass in
+            # the cloud; output is mapped to the local segment schema and
+            # flows through the SAME post chain (hallucination filter →
+            # repetition/clamp → forced alignment → downstream polish +
+            # formatter). Any failure falls straight through to local.
+            try:
+                from backend.services.cloud_transcription import (
+                    provider_selected, cloud_available, transcribe_cloud)
+                if provider_selected() != 'local':
+                    if cloud_available():
+                        log.log_stage('AUDIO',
+                            f'Cloud transcription: provider={provider_selected()}')
+                        _cloud = transcribe_cloud(audio_path, whisper_lang)
+                        if _cloud:
+                            _result = self._finalize_cloud_transcription(
+                                _cloud, audio_path, duration_ms, log, on_progress)
+                            if _result is not None:
+                                if _own_audio:
+                                    try:
+                                        os.remove(audio_path)
+                                    except Exception:
+                                        pass
+                                return _result
+                        log.log_stage('AUDIO',
+                            'Cloud transcription failed — falling back to local Whisper')
+                    else:
+                        log.log_stage('AUDIO',
+                            f'TRANSCRIPTION_PROVIDER={provider_selected()} set but no '
+                            'API key configured — using local Whisper')
+            except Exception as _ct_err:
+                log.log_stage('AUDIO',
+                    f'Cloud transcription error ({_ct_err}) — using local Whisper')
 
             # ── Language-detection guard for vocal-stem overrides ──
             # An isolated vocal stem can fool Whisper's auto language detection:
@@ -1211,6 +1254,95 @@ class AudioIntelligence:
         except Exception as e:
             log.log_error('AUDIO', f'Transcription failed: {e}')
             return {'speech_active': {}, 'segments': [], 'language': ''}
+
+    def _finalize_cloud_transcription(self, cloud: dict, audio_path: str,
+                                      duration_ms: int, log, on_progress) -> Optional[dict]:
+        """Run cloud STT output through the same post chain as local.
+
+        Applies the hallucination filter, repetition-loop drop, end clamp
+        and forced alignment, then builds speech_active + a coverage
+        ledger in the local result schema. Returns None if everything was
+        filtered out (caller falls back to local).
+        """
+        segments = cloud.get('segments') or []
+        language = cloud.get('language') or 'unknown'
+        duration_sec = (duration_ms or 0) / 1000.0
+        if not duration_sec and segments:
+            duration_sec = max(s['end_sec'] for s in segments)
+
+        # Hallucination filter — same checks as the local loop
+        for entry in segments:
+            text = entry.get('text') or ''
+            if _is_boilerplate_hallucination(text):
+                entry['is_hallucination'] = True
+            if entry.get('no_speech_prob', 0.0) > 0.7 and text:
+                entry['is_hallucination'] = True
+
+        try:
+            segments = _drop_repetition_loops(segments)
+        except Exception:
+            pass
+        try:
+            from backend.services.transcript_dedup import clamp_segments_to_duration
+            if duration_sec:
+                segments, _ = clamp_segments_to_duration(
+                    segments, duration_sec, start_key='start_sec', end_key='end_sec')
+        except Exception:
+            pass
+        if not segments:
+            return None
+
+        # Forced alignment — same refinement as local (also gives word
+        # timing to providers that return none, e.g. gpt-4o-transcribe)
+        try:
+            from backend.services.forced_aligner import refine_word_timestamps
+            _fa = refine_word_timestamps(audio_path, segments, language)
+            if _fa.get('segments_aligned'):
+                log.log_stage('AUDIO',
+                    f"Forced alignment ({_fa['backend']}): "
+                    f"{_fa['segments_aligned']} cloud segments refined")
+        except Exception:
+            pass
+
+        segments = _cross_validate_segments(
+            [s for s in segments if not s.get('is_hallucination')])
+
+        speech_active = {}
+        for entry in segments:
+            s0 = (int(entry['start_sec'] * 1000) // 100) * 100
+            s1 = int(entry['end_sec'] * 1000) + 100
+            for t in range(s0, s1, 100):
+                speech_active[t] = True
+
+        ledger = CoverageLedger(bin_width_ms=20,
+                                duration_ms=int(duration_sec * 1000))
+        for t in range(0, int(duration_sec * 1000), 20):
+            ledger.bins[t] = LedgerBin(status='uncovered')
+        for entry in segments:
+            for w in entry.get('words') or [{'start': entry['start_sec'],
+                                             'end': entry['end_sec'],
+                                             'confidence': 0.9}]:
+                for t in range(int(w['start'] * 1000), int(w['end'] * 1000), 20):
+                    if t in ledger.bins:
+                        ledger.bins[t] = LedgerBin(
+                            status='covered_speech',
+                            source=f"cloud_{cloud.get('provider', '')}",
+                            confidence=w.get('confidence', 0.9))
+
+        log.log_stage('AUDIO',
+            f"Cloud transcription complete ({cloud.get('provider')}/"
+            f"{cloud.get('model')}): {len(segments)} segments, "
+            f"language={language}")
+        if on_progress:
+            on_progress(1.0)
+        return {
+            'speech_active': speech_active,
+            'segments': segments,
+            'language': language,
+            'coverage_ledger': ledger,
+            'audio_events': [],
+            'transcription_provider': cloud.get('provider'),
+        }
 
     def _redecode_difficult_segments(
         self, audio_path: str, segments: list, whisper_lang, log,

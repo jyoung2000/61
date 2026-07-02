@@ -549,6 +549,11 @@ def _resolve_polish_model_override(orchestrator) -> Optional[str]:
     end-to-end, while the editorial model stays reserved for SEO + summaries.
     Returns None (→ editorial model, legacy behavior) when the flag is off or no
     separate translation model is configured."""
+    # Explicit polish model (the "Recommended for subtitle polish" picker,
+    # audit Phase 4.2) outranks the translation-model default.
+    explicit = (getattr(settings, "SUBTITLE_POLISH_MODEL", "") or "").strip()
+    if explicit:
+        return explicit
     if not getattr(settings, "SUBTITLE_POLISH_USES_TRANSLATION_MODEL", True):
         return None
     return _resolve_translation_model_override(orchestrator)

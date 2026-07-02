@@ -316,6 +316,50 @@ _CONTENT_TYPE_VISION_OVERRIDES = {
 }
 
 
+# ── Subtitle-polish model shortlist (audit Phase 4.2) ────────────────────
+# Curated, ORDERED list of models known to be strong at constrained
+# editing: strict instruction-following, JSON/format discipline (the
+# polish prompt demands exact segment counts + word budgets) and
+# multilingual competence. This is DATA, not code — refresh it as models
+# come and go; the /providers/models/recommended?role=subtitle_polish
+# endpoint intersects it with the live OpenRouter /models list at request
+# time, so a retired id simply drops out of the recommendations.
+#
+# tier: "free" (zero-cost ids), "efficient" (cheap, high quality/$),
+#       "premium" (best available quality).
+SUBTITLE_POLISH_SHORTLIST = [
+    # ── premium — frontier editing-class models ──
+    {"id": "anthropic/claude-sonnet-4.5", "tier": "premium",
+     "rationale": "Best-in-class constrained editing; follows segment-count and word-budget rules exactly; strong multilingual."},
+    {"id": "openai/gpt-5.2", "tier": "premium",
+     "rationale": "Frontier instruction-following and format discipline; excellent on noisy ASR input."},
+    {"id": "google/gemini-3-pro-preview", "tier": "premium",
+     "rationale": "Frontier multilingual editing; very strong on CJK subtitle polish."},
+    {"id": "google/gemini-2.5-pro", "tier": "premium",
+     "rationale": "Stable fallback premium tier; reliable JSON discipline and multilingual quality."},
+    # ── efficient — cheap, high quality-per-dollar ──
+    {"id": "anthropic/claude-haiku-4.5", "tier": "efficient",
+     "rationale": "Small frontier model; near-Sonnet edit fidelity at a fraction of the cost."},
+    {"id": "google/gemini-2.5-flash", "tier": "efficient",
+     "rationale": "Fast, cheap, multilingual; holds segment alignment well on long batches."},
+    {"id": "openai/gpt-5-mini", "tier": "efficient",
+     "rationale": "Strong constrained-editing discipline at mini-tier pricing."},
+    {"id": "deepseek/deepseek-chat-v3.1", "tier": "efficient",
+     "rationale": "Excellent edit quality per dollar; good on technical vocabulary."},
+    {"id": "qwen/qwen3-30b-a3b-instruct", "tier": "efficient",
+     "rationale": "Strong multilingual (esp. CJK) editing at very low cost."},
+    # ── free — zero-cost ids (availability fluctuates) ──
+    {"id": "deepseek/deepseek-chat-v3.1:free", "tier": "free",
+     "rationale": "Best free-tier edit fidelity when available."},
+    {"id": "qwen/qwen3-30b-a3b-instruct:free", "tier": "free",
+     "rationale": "Solid free multilingual polish, CJK-aware."},
+    {"id": "mistralai/mistral-small-3.1-24b-instruct:free", "tier": "free",
+     "rationale": "Reliable free fallback; decent format discipline."},
+    {"id": "google/gemma-3-27b-it:free", "tier": "free",
+     "rationale": "Free fallback; acceptable on English-only polish."},
+]
+
+
 def select_primary_model_for_content(content_type, preset_default: str) -> str:
     """Return the vision model id to use for a given content type.
 

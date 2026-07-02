@@ -1,3 +1,42 @@
+# ClipAI — Phase 4: Cloud transcription + a real subtitle-polish model picker
+
+There was no cloud STT path — transcription was local-only, and polish
+shared the general translation/editorial model. Both fixed.
+
+- **Cloud transcription providers** (``TRANSCRIPTION_PROVIDER=local|groq|
+  openai``, new ``backend/services/cloud_transcription.py``): Groq
+  ``whisper-large-v3-turbo`` (word timestamps) and OpenAI ``whisper-1`` /
+  ``gpt-4o-transcribe`` (no word timestamps — the Phase 3 forced aligner
+  re-times them). Cloud output is mapped to the exact local segment
+  schema and flows through the SAME post chain — hallucination filter,
+  repetition-loop drop, end clamp, forced alignment, then the usual
+  polish + formatter — so quality rules are uniform across providers.
+  Custom vocabulary is injected as the provider prompt. Any API failure
+  falls back to local Whisper automatically; a configured cloud provider
+  also works when faster-whisper isn't installed locally. Selector +
+  OpenAI key field in Settings > Subtitle Quality.
+- **"Recommended for subtitle polish"** — new
+  ``GET /api/providers/models/recommended/subtitle-polish``: a curated,
+  ordered shortlist (``SUBTITLE_POLISH_SHORTLIST`` in
+  ``openrouter_provider.py`` — data, not code) of models strong at
+  constrained editing, intersected at request time with the live
+  OpenRouter /models list (availability + pricing + context length),
+  returning the top pick per tier (free/efficient/premium) with a
+  one-line rationale and $/1M-token cost. Surfaced in
+  ``SubtitleQualitySettings.jsx`` with a refresh button.
+- **Built-in polish benchmark** (``backend/services/polish_benchmark.py``
+  + ``POST /api/providers/models/polish-benchmark``): 20 canned
+  Whisper-medium-style error segments with gold corrections run through
+  ``transcript_polisher``'s own prompt via ``model_override``; scores
+  exact-fix rate + format compliance (segment count, ±15% word budget).
+  Scores persist in ``polish_benchmark_scores.json`` and measured winners
+  outrank the static shortlist order in the recommendation. "Test" button
+  per model in the UI.
+- **``SUBTITLE_POLISH_MODEL``** pins polishing to the selected model —
+  ``_resolve_polish_model_override`` prefers it over the
+  translation-model default, so polish stops sharing the general model
+  once a pick is made. Persisted via user_settings.json.
+
 # ClipAI — Phase 3: Netflix-grade local transcription on a GTX 1650
 
 Timing precision and edge-case accuracy work on the faster-whisper

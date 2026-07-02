@@ -33,6 +33,20 @@ class Settings(BaseSettings):
     GEMINI_USE_NATIVE_VIDEO: bool = False
     GROQ_API_KEY: str = ""
     GROQ_EDITORIAL_MODEL: str = ""             # blank → "llama-3.3-70b-versatile"
+    OPENAI_API_KEY: str = ""                   # for TRANSCRIPTION_PROVIDER=openai
+    # ── Cloud transcription (audit Phase 4.1) ──
+    # local (faster-whisper, default) | groq | openai. Cloud output flows
+    # through the SAME post chain (hallucination filter → forced alignment
+    # → polish → formatter) and falls back to local automatically on any
+    # API failure. Custom vocabulary is injected as the provider prompt.
+    TRANSCRIPTION_PROVIDER: str = "local"
+    GROQ_TRANSCRIBE_MODEL: str = "whisper-large-v3-turbo"
+    OPENAI_TRANSCRIBE_MODEL: str = "whisper-1"  # or gpt-4o-transcribe (no word timestamps — forced alignment re-times)
+    # ── Subtitle polish model (audit Phase 4.2) ──
+    # Explicit model for transcript polishing (e.g. an OpenRouter id from
+    # the "Recommended for subtitle polish" picker). Takes precedence over
+    # SUBTITLE_POLISH_USES_TRANSLATION_MODEL. Blank = legacy behavior.
+    SUBTITLE_POLISH_MODEL: str = ""
 
     # Ollama — Primary AI (video/vision) + Editorial AI (scoring/summary).
     # Defaults are sized to fit a 4GB GTX 1650 so the same image runs

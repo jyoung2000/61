@@ -76,6 +76,10 @@ _PERSISTABLE_KEYS = [
     # Transcript polishing toggles.
     "TRANSCRIPT_POLISHING_ENABLED", "TRANSCRIPT_POLISHING_BATCH_SIZE",
     "TRANSCRIPT_FILLER_REMOVAL", "TRANSCRIPT_SENTENCE_REPAIR",
+    # Dedicated subtitle-polish model (audit Phase 4.2) + cloud STT provider.
+    "SUBTITLE_POLISH_MODEL",
+    "TRANSCRIPTION_PROVIDER", "OPENAI_API_KEY",
+    "GROQ_TRANSCRIBE_MODEL", "OPENAI_TRANSCRIBE_MODEL",
     # Sentence-aware resegmentation toggle.
     "SENTENCE_SEGMENTATION_ENABLED",
     # Voiceprint registry (cross-job speaker naming). The registry itself
@@ -115,7 +119,7 @@ _PERSISTABLE_KEYS = [
 # API key fields specifically (used to filter out placeholder values)
 _API_KEY_FIELDS = {
     "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "GROQ_API_KEY",
-    "HF_AUTH_TOKEN", "REPLICATE_API_KEY",
+    "HF_AUTH_TOKEN", "REPLICATE_API_KEY", "OPENAI_API_KEY",
     # Translation cloud NMT secrets.
     "GOOGLE_TRANSLATE_API_KEY", "DEEPL_API_KEY",
     # Cloud client secrets — same "never overwrite with blank" rule.
@@ -1564,6 +1568,126 @@ async def recommended_models():
         "free_vision_count": total_free_vision,
         "free_text_count": total_free_text,
     }
+
+
+POLISH_BENCH_PATH = os.path.join(_DATA_DIR, "polish_benchmark_scores.json")
+
+
+def _load_polish_scores() -> dict:
+    try:
+        with open(POLISH_BENCH_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_polish_scores(scores: dict) -> None:
+    try:
+        with open(POLISH_BENCH_PATH, "w") as f:
+            json.dump(scores, f, indent=2)
+    except Exception as e:
+        logger.warning("Could not persist polish benchmark scores: %s", e)
+
+
+@router.get("/providers/models/recommended/subtitle-polish")
+async def recommended_subtitle_polish_models():
+    """Recommended models for the transcript-polish role (audit Phase 4.2).
+
+    Intersects the curated SUBTITLE_POLISH_SHORTLIST (ordered, data-only)
+    with the live OpenRouter /models list — availability, current pricing
+    and context length — and returns the top pick per tier with a
+    one-line rationale and $/1M-token cost. Measured benchmark scores
+    (see /providers/models/polish-benchmark) outrank the static ordering.
+    """
+    if not _key_is_set(settings.OPENROUTER_API_KEY):
+        return {"models": [], "error": "OpenRouter API key not configured"}
+    all_models = await _fetch_openrouter_models()
+    if all_models is None:
+        return {"models": [], "error": "Failed to fetch models from OpenRouter"}
+
+    from backend.services.providers.openrouter_provider import (
+        SUBTITLE_POLISH_SHORTLIST)
+    by_id = {m["id"]: m for m in all_models}
+    scores = _load_polish_scores()
+
+    available = []
+    for rank, entry in enumerate(SUBTITLE_POLISH_SHORTLIST):
+        live = by_id.get(entry["id"])
+        if not live:
+            continue
+        pricing = live.get("pricing", {}) or {}
+        try:
+            prompt_pm = float(pricing.get("prompt", "0")) * 1_000_000
+            completion_pm = float(pricing.get("completion", "0")) * 1_000_000
+        except (ValueError, TypeError):
+            prompt_pm = completion_pm = 0.0
+        bench = scores.get(entry["id"]) or {}
+        available.append({
+            "id": entry["id"],
+            "name": live.get("name", entry["id"]),
+            "tier": entry["tier"],
+            "rationale": entry["rationale"],
+            "context_length": live.get("context_length", 0),
+            "prompt_cost_per_1m": round(prompt_pm, 3),
+            "completion_cost_per_1m": round(completion_pm, 3),
+            "cost_display": ("FREE" if prompt_pm == 0 and completion_pm == 0
+                             else f"${prompt_pm:.2f} / ${completion_pm:.2f} per 1M tok"),
+            "benchmark": bench or None,
+            "_rank": rank,
+        })
+
+    # Top pick per tier: measured benchmark winners outrank static order.
+    def _sort_key(m):
+        b = m.get("benchmark") or {}
+        # exact_fix_rate in [0,1]; measured models sort above unmeasured
+        return (-(b.get("exact_fix_rate", -1)), m["_rank"])
+
+    top_per_tier = {}
+    for tier in ("free", "efficient", "premium"):
+        tier_models = sorted(
+            (m for m in available if m["tier"] == tier), key=_sort_key)
+        if tier_models:
+            top_per_tier[tier] = tier_models[0]["id"]
+
+    for m in available:
+        m["recommended"] = top_per_tier.get(m["tier"]) == m["id"]
+        m.pop("_rank", None)
+
+    return {
+        "models": available,
+        "top_per_tier": top_per_tier,
+        "selected": (getattr(settings, "SUBTITLE_POLISH_MODEL", "") or None),
+    }
+
+
+@router.post("/providers/models/polish-benchmark")
+async def run_polish_benchmark(payload: dict):
+    """Run the built-in ~20-segment polish benchmark against one model.
+
+    Body: {"model": "<openrouter id>"}. Scores exact-fix rate and format
+    compliance via transcript_polisher's own prompt, persists the result
+    so the recommendation endpoint can prefer measured winners.
+    """
+    model_id = (payload or {}).get("model", "").strip()
+    if not model_id:
+        return {"error": "model is required"}
+    try:
+        from backend.services.polish_benchmark import run_benchmark
+        result = await run_benchmark(model_id)
+    except Exception as e:
+        logger.warning("Polish benchmark failed for %s: %s", model_id, e)
+        return {"error": f"Benchmark failed: {e}", "model": model_id}
+    if result.get("error"):
+        return result
+    scores = _load_polish_scores()
+    scores[model_id] = {
+        "exact_fix_rate": result["exact_fix_rate"],
+        "format_compliance": result["format_compliance"],
+        "cases": result["cases"],
+        "timestamp": int(time.time()),
+    }
+    _save_polish_scores(scores)
+    return result
 
 
 def _short_name(model_data: dict) -> str:
@@ -3681,6 +3805,15 @@ def _subtitle_quality_state() -> dict:
         "deepl_configured": bool(
             (getattr(settings, "DEEPL_API_KEY", "") or "").strip()
         ),
+        # Dedicated subtitle-polish model + cloud STT provider (Phase 4)
+        "subtitle_polish_model": str(getattr(settings, "SUBTITLE_POLISH_MODEL", "") or ""),
+        "transcription_provider": str(getattr(settings, "TRANSCRIPTION_PROVIDER", "local") or "local"),
+        "openai_configured": bool(
+            (getattr(settings, "OPENAI_API_KEY", "") or "").strip()
+        ),
+        "groq_configured": bool(
+            (getattr(settings, "GROQ_API_KEY", "") or "").strip()
+        ),
     }
 
 
@@ -3705,6 +3838,9 @@ class SaveSubtitleQualityRequest(BaseModel):
     audio_music_detection: Optional[bool] = None
     google_translate_api_key: Optional[str] = None
     deepl_api_key: Optional[str] = None
+    subtitle_polish_model: Optional[str] = None
+    transcription_provider: Optional[str] = None
+    openai_api_key: Optional[str] = None
 
 
 _VALID_TRANSLATION_ENGINES = {"auto", "llm", "nllb", "opus-mt", "fugumt", "google", "deepl", "whisper"}
@@ -3772,6 +3908,15 @@ async def save_subtitle_quality(req: SaveSubtitleQualityRequest):
         settings.GOOGLE_TRANSLATE_API_KEY = req.google_translate_api_key.strip()
     if req.deepl_api_key is not None and req.deepl_api_key.strip():
         settings.DEEPL_API_KEY = req.deepl_api_key.strip()
+    if req.subtitle_polish_model is not None:
+        # Blank explicitly clears the pin (back to translation-model default)
+        settings.SUBTITLE_POLISH_MODEL = req.subtitle_polish_model.strip()
+    if req.transcription_provider is not None:
+        prov = (req.transcription_provider or "").strip().lower()
+        if prov in ("local", "groq", "openai"):
+            settings.TRANSCRIPTION_PROVIDER = prov
+    if req.openai_api_key is not None and req.openai_api_key.strip():
+        settings.OPENAI_API_KEY = req.openai_api_key.strip()
     _invalidate_status_cache()
     _persist_user_settings()
     return {"status": "saved", **_subtitle_quality_state()}
