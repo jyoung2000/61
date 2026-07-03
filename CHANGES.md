@@ -1,3 +1,57 @@
+# ClipAI — Polish that can't silently die, snappy preview, real YOLO-World classes
+
+Driven by the 2026-07-03 run logs: every polish batch of both jobs failed
+("All providers failed"), romaji shipped in the English track, YOLO-World
+ran on generic COCO classes, the editor scrubbed against a raw long-GOP
+file, and bridge_conversion spent 167s on per-scene thumbnail seeks.
+
+- **Polish reliability (local + cloud).** The first batch gets a 3x
+  cold-load timeout (capped 300s) — the flat 90s expired during Ollama's
+  partial-offload model load, struck the circuit breaker 3x and killed
+  polish for the whole job. When the local chain still fails, the batch
+  retries via OpenRouter (``SUBTITLE_POLISH_CLOUD_FALLBACK``, only when a
+  key is configured; ``SUBTITLE_POLISH_CLOUD_MODEL`` or the shortlist's
+  top efficient pick). A pinned OpenRouter polish model now routes
+  straight to the cloud instead of failing through an Ollama-only chain.
+  The same cloud net backs the per-cue untranslated-recovery pass.
+  Ollama keep_alive raised 30s → 5m (explicit gpu_preflight eviction
+  already protects the GPU stages; the short value only added the
+  cold-load churn that blew the timeouts).
+- **Netflix-consistency auto-glossary**
+  (``SUBTITLE_POLISH_AUTO_GLOSSARY``): recurring capitalized names are
+  clustered by fuzzy similarity (Zeks/Zecks/Zeck → Zechs, most frequent
+  variant wins) and pinned in the polish prompt alongside the custom
+  vocabulary, so names render identically in every cue.
+- **Romaji gate.** The per-cue cleanup now SELECTS romaji cues (it
+  filtered on CJK ratio only, so "Nametotte ageru kara." was never even
+  considered), rejects romaji echoed back by the model, and the detector
+  handles mixed romaji/English lines (max over head/tail token windows)
+  plus distinctive particle evidence (desu/masu/-chan/kudasai...).
+  Detection now also applies to auto-detected sources at a stricter 0.75
+  bar — declared non-Japanese sources are still exempt. Verified against
+  all six shipped romaji lines with zero English false positives.
+- **CLIP for YOLO-World** — both images install the ultralytics CLIP fork
+  (+ ftfy/regex, --no-deps so torch pins hold) and pre-bake the ViT-B/32
+  text encoder. Fixes "set_classes failed: No module named 'clip'": the
+  open-vocabulary classes (person/head/face/character/mecha...) now
+  actually apply instead of silently degrading to COCO — the biggest
+  subject-detection accuracy lever in the log.
+- **Preview proxy for long-GOP sources.** ``_needs_preview`` now
+  triggers on sparse keyframes (median interval > 3s over the first
+  minute) and missing faststart — the two things that actually make
+  scrubbing snappy — not just codec/size/bitrate. Stream-copy is
+  forbidden when the GOP is sparse (it would copy the problem into the
+  "preview"). The proxy builds with NVENC first (seconds on a GTX 1650)
+  falling back to libx264, and is now kicked off EARLY in the pipeline
+  (right after metadata) so the editor plays the dense-GOP proxy even
+  while analysis is running. Preview filename bumped v3 → v4 so stale
+  "no preview needed" sentinels re-evaluate.
+- **Single-decode scene thumbnails.** ``to_fez_scenes`` extracts ALL
+  scene thumbnails in one ffmpeg select-filter pass (chunked at 200)
+  instead of one seek per scene; the per-scene seek remains only as a
+  fallback for missed frames. On the 128-min run this stage measured
+  167s for 224 scenes.
+
 # ClipAI — Fix: analysis died at 15% with "cv2 has no attribute CascadeClassifier"
 
 First run on the rebuilt image failed at the FACES stage:

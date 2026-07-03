@@ -297,6 +297,63 @@ def to_fez_render_plan(
 #  Function 2 — PerceptionResult  →  Fez SceneDescription dicts
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _extract_thumbnails_batch(video_path: str, timestamps: list,
+                              out_paths: list) -> int:
+    """Extract MANY scene thumbnails in ONE decode pass.
+
+    The old path ran one `ffmpeg -ss` per scene — 224 scenes ≈ 224 seeks
+    ≈ minutes of bridge_conversion (167s measured on the 128-min run).
+    A single pass with a select filter decodes the file once and writes
+    every thumbnail. Timestamps must be ascending (scene starts are).
+    Returns the number of thumbnails written; the caller falls back to
+    per-scene extraction for any that are missing.
+    """
+    import tempfile
+
+    written = 0
+    CHUNK = 200  # practical select-filter size limit
+    for c0 in range(0, len(timestamps), CHUNK):
+        ts_chunk = timestamps[c0:c0 + CHUNK]
+        path_chunk = out_paths[c0:c0 + CHUNK]
+        clauses = "+".join(
+            f"between(t,{max(0.0, t):.3f},{max(0.0, t) + 0.05:.3f})"
+            for t in ts_chunk)
+        tmpdir = tempfile.mkdtemp(prefix="scene_thumbs_")
+        pattern = os.path.join(tmpdir, "t_%06d.jpg")
+        try:
+            proc = subprocess.run(
+                ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                 "-i", video_path,
+                 "-vf", f"select='{clauses}'",
+                 "-vsync", "vfr", "-q:v", "4", "-an",
+                 pattern],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=max(120, int(len(ts_chunk) * 2)), check=False,
+            )
+            produced = sorted(
+                f for f in os.listdir(tmpdir) if f.endswith(".jpg"))
+            # select emits frames in timestamp order — a 1:1 map when the
+            # count matches. On a mismatch (overlapping windows, decode
+            # hiccup) keep what aligns from the front; the caller's
+            # fallback covers the rest.
+            for src_name, dst in zip(produced, path_chunk):
+                try:
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    os.replace(os.path.join(tmpdir, src_name), dst)
+                    written += 1
+                except OSError:
+                    pass
+        except Exception as exc:  # ffmpeg missing / timeout — non-fatal
+            logger.warning("batch thumbnail pass failed: %s", exc)
+        finally:
+            try:
+                import shutil as _sh
+                _sh.rmtree(tmpdir, ignore_errors=True)
+            except Exception:
+                pass
+    return written
+
+
 def _extract_thumbnail(video_path: str, timestamp: float, out_path: str) -> bool:
     """Best-effort single-frame grab via FFmpeg. Returns True on success."""
     try:
@@ -352,6 +409,20 @@ def to_fez_scenes(perception, reframer_plan, video_path: str, frames_dir: str) -
         dur_ms = int((getattr(perception, "duration_ms", 0) or 0))
         scenes_src = [{"start_ms": 0, "end_ms": dur_ms, "strategy": "adaptive"}]
 
+    # Single-decode thumbnail pre-pass (audit Phase 5.2 follow-up): all
+    # scene thumbnails from ONE ffmpeg run instead of a seek per scene.
+    _thumb_paths = [os.path.join(frames_dir, f"scene_{i:04d}.jpg")
+                    for i in range(len(scenes_src))]
+    _thumb_ts = [max(0.0, _to_int(sc.get("start_ms", 0)) / 1000.0)
+                 for sc in scenes_src]
+    try:
+        _n_batch = _extract_thumbnails_batch(video_path, _thumb_ts, _thumb_paths)
+        if _n_batch:
+            logger.info("scene thumbnails: %d/%d via single-decode batch",
+                        _n_batch, len(scenes_src))
+    except Exception as _bt_err:
+        logger.warning("scene thumbnail batch skipped: %s", _bt_err)
+
     out = []
     for i, sc in enumerate(scenes_src):
         start_ms = _to_int(sc.get("start_ms", 0))
@@ -397,7 +468,10 @@ def to_fez_scenes(perception, reframer_plan, video_path: str, frames_dir: str) -
             precise_y = _clamp(faces[0].get("cy", src_h / 2) / src_h * 100, 0, 100)
 
         thumb = os.path.join(frames_dir, f"scene_{i:04d}.jpg")
-        _extract_thumbnail(video_path, ts, thumb)
+        if not (os.path.exists(thumb) and os.path.getsize(thumb) > 0):
+            # Batch pass missed this one (mismatch/decode hiccup) — the
+            # old per-scene seek is the fallback, not the default.
+            _extract_thumbnail(video_path, ts, thumb)
 
         out.append({
             "timestamp": ts,

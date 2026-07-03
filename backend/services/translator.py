@@ -88,10 +88,19 @@ _ROMAJI_AMBIG = {
 _JA_SOURCE = {"ja", "jpn", "japanese", "ja-jp"}
 
 
-def _romaji_ja_ratio(text: str) -> float:
-    """Share of a line's word tokens that look like Japanese romaji (mora-only
-    words). ~0 for English, high for a transliterated-Japanese line."""
-    toks = [t for t in re.findall(r"[A-Za-zāēīōū]+", text or "") if len(t) >= 2]
+# Distinctive Japanese function words / honorifics in romaji. These are
+# near-zero-frequency in English text, so 2+ hits is strong evidence even
+# when the mora ratio is diluted by a half-translated (mixed) line.
+_ROMAJI_HINTS = re.compile(
+    r"\b(?:desu|masu|kudasai|arigatou?|gomen(?:asai)?|sensei|senpai|"
+    r"onee|onii|chan|kun|sama|kawaii|sugoi|hontou?|nani|chotto|dame|"
+    r"yatta|daijoubu|itadakimasu|oishii|kimochi|urusai|baka|"
+    r"n[' ]?da(?:yo|ne)?|ndesho|mashita|shite(?:ru)?|nakute|kedo)\b",
+    re.IGNORECASE,
+)
+
+
+def _romaji_token_stats(toks: list) -> float:
     if len(toks) < 3:
         return 0.0
     jp = 0
@@ -103,15 +112,47 @@ def _romaji_ja_ratio(text: str) -> float:
     return jp / len(toks)
 
 
+def _romaji_ja_ratio(text: str) -> float:
+    """Share of word tokens that look like Japanese romaji (mora-only words).
+
+    ~0 for English, high for a transliterated-Japanese line. MIXED lines —
+    a romaji run welded to an English half ("... kara puru Repeating it
+    all") — dilute the full-line ratio below any safe threshold, so this
+    also scores the first and last 8-token windows and returns the MAX:
+    a line that starts or ends with a solid romaji run is still flagged.
+    """
+    toks = [t for t in re.findall(r"[A-Za-zāēīōū]+", text or "") if len(t) >= 2]
+    if len(toks) < 3:
+        return 0.0
+    full = _romaji_token_stats(toks)
+    if len(toks) <= 8:
+        return full
+    return max(full,
+               _romaji_token_stats(toks[:8]),
+               _romaji_token_stats(toks[-8:]))
+
+
 def _is_untranslated(text: str, source_language: str = "") -> bool:
     """True when a line is still in the source language — CJK script (any source)
     OR, for a Japanese source, transliterated romaji."""
     if _cjk_ratio(text) > 0.30:
         return True
-    if ((source_language or "").lower() in _JA_SOURCE
-            and getattr(settings, "TRANSLATION_ROMAJI_DETECT_ENABLED", True)):
+    src = (source_language or "").lower()
+    if (getattr(settings, "TRANSLATION_ROMAJI_DETECT_ENABLED", True)
+            and (src in _JA_SOURCE or src in ("", "auto", "unknown"))):
+        # For auto/unknown sources the mora pattern alone could false-flag
+        # simple English ("see you"), so an unknown source needs BOTH a
+        # slightly higher ratio and no other signal — while distinctive
+        # romaji function words (desu/masu/kudasai/-chan…) count as strong
+        # corroboration at a lower ratio for any source.
         thr = float(getattr(settings, "TRANSLATION_ROMAJI_DETECT_THRESHOLD", 0.6))
-        if _romaji_ja_ratio(text) >= thr:
+        if src not in _JA_SOURCE:
+            thr = max(thr, 0.75)
+        ratio = _romaji_ja_ratio(text)
+        if ratio >= thr:
+            return True
+        hints = len(_ROMAJI_HINTS.findall(text or ""))
+        if hints >= 2 and ratio >= thr * 0.6:
             return True
     return False
 

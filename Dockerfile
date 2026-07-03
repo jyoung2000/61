@@ -103,6 +103,21 @@ RUN pip install --no-cache-dir \
     python3 -c "import mediapipe; print(f'MediaPipe {mediapipe.__version__} installed')" && \
     python3 -c "import mediapipe.python.solutions.face_mesh; print('FaceMesh available')"
 
+
+# ── CLIP text encoder for YOLO-World open-vocabulary detection ──────────
+# ultralytics' set_classes() needs the `clip` package to encode class
+# prompts ("person, head, face, character, mecha…"). Without it the run
+# logs "set_classes failed: No module named 'clip'" and subject detection
+# silently degrades to generic COCO classes — observed on the 2026-07-03
+# runs. Install from a pinned tarball (no git needed), --no-deps so the
+# torch/torchvision pins stay untouched (ftfy/regex are CLIP's only
+# missing deps), then pre-bake the ViT-B/32 weights (~340MB) so the first
+# analysis doesn't stall on a download.
+RUN pip install --no-cache-dir ftfy regex && \
+    pip install --no-cache-dir --no-deps \
+        "clip @ https://github.com/ultralytics/CLIP/archive/refs/heads/main.tar.gz" && \
+    python3 -c "import clip; clip.load('ViT-B/32', device='cpu'); print('CLIP ViT-B/32 baked')"
+
 # ── Single-OpenCV guarantee (see Dockerfile.gpu for the full story) ──────
 # ultralytics can drag in the GUI opencv-python next to the pinned headless
 # build; the mixed cv2/ directory loses symbols (CascadeClassifier). Purge

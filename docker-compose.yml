@@ -94,7 +94,11 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=${CLIPAI_GPU_ID:-GPU-08b18de7-af3b-aa16-9b88-d214ab78711c}
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
-      - OLLAMA_KEEP_ALIVE=30s
+      # 5m (was 30s): the pipeline explicitly evicts Ollama models before
+      # each GPU stage (gpu_preflight), so a short keep_alive only added
+      # cold-load churn BETWEEN polish/translation batches — the cold load
+      # is what blew the polish timeout and killed the polish stage.
+      - OLLAMA_KEEP_ALIVE=5m
       - OLLAMA_MAX_LOADED_MODELS=1
       - OLLAMA_NUM_PARALLEL=1
       # Force Ollama to use all available GPU layers

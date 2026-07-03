@@ -196,6 +196,21 @@ RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     python3 -c "import nvidia.cudnn; print(nvidia.cudnn.__path__[0] + '/lib')" >> /etc/ld.so.conf.d/nvidia-pip.conf && \
     ldconfig
 
+
+# ── CLIP text encoder for YOLO-World open-vocabulary detection ──────────
+# ultralytics' set_classes() needs the `clip` package to encode class
+# prompts ("person, head, face, character, mecha…"). Without it the run
+# logs "set_classes failed: No module named 'clip'" and subject detection
+# silently degrades to generic COCO classes — observed on the 2026-07-03
+# runs. Install from a pinned tarball (no git needed), --no-deps so the
+# torch/torchvision pins stay untouched (ftfy/regex are CLIP's only
+# missing deps), then pre-bake the ViT-B/32 weights (~340MB) so the first
+# analysis doesn't stall on a download.
+RUN pip3 install --no-cache-dir ftfy regex && \
+    pip3 install --no-cache-dir --no-deps \
+        "clip @ https://github.com/ultralytics/CLIP/archive/refs/heads/main.tar.gz" && \
+    python3 -c "import clip; clip.load('ViT-B/32', device='cpu'); print('CLIP ViT-B/32 baked')"
+
 # ── Single-OpenCV guarantee ──────────────────────────────────────────────
 # ultralytics declares `opencv-python` (the GUI build) as a dependency, so
 # the requirements install can end up with BOTH opencv-python and

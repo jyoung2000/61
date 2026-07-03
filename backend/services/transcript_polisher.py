@@ -695,6 +695,81 @@ def _parse_polished_response(response: str, expected: int) -> Optional[list[Opti
     return out
 
 
+# ── Cloud fallback for the polish LLM (Netflix-quality reliability) ────────
+# The observed failure mode on the GTX 1650 box: an Ollama-only provider
+# chain where the local model cold-loads (partial offload) slower than the
+# batch timeout → 3 strikes → circuit breaker degrades Ollama for 15 min →
+# EVERY polish batch fails and the raw draft ships unpolished. When the user
+# has configured an OpenRouter key, that is explicit cloud intent — use it
+# as the safety net so polish quality never silently drops to zero.
+
+_cloud_polish_provider = None  # cached OpenRouterProvider
+
+
+def _cloud_polish_available() -> bool:
+    if not bool(getattr(settings, "SUBTITLE_POLISH_CLOUD_FALLBACK", True)):
+        return False
+    return bool((getattr(settings, "OPENROUTER_API_KEY", "") or "").strip())
+
+
+def _resolve_cloud_polish_model() -> str:
+    """The OpenRouter model the cloud path polishes on.
+
+    Order: SUBTITLE_POLISH_MODEL (when it's an OpenRouter-style id) →
+    SUBTITLE_POLISH_CLOUD_MODEL → the first "efficient"-tier entry of the
+    curated shortlist (strong constrained editing at low cost).
+    """
+    pinned = (getattr(settings, "SUBTITLE_POLISH_MODEL", "") or "").strip()
+    if pinned and "/" in pinned:
+        return pinned
+    explicit = (getattr(settings, "SUBTITLE_POLISH_CLOUD_MODEL", "") or "").strip()
+    if explicit and "/" in explicit:
+        return explicit
+    try:
+        from backend.services.providers.openrouter_provider import (
+            SUBTITLE_POLISH_SHORTLIST)
+        for entry in SUBTITLE_POLISH_SHORTLIST:
+            if entry.get("tier") == "efficient":
+                return entry["id"]
+    except Exception:
+        pass
+    return "google/gemini-2.5-flash"
+
+
+async def _cloud_polish_completion(full_prompt: str, timeout: float) -> Optional[str]:
+    """Direct OpenRouter completion for polish, bypassing the provider chain.
+
+    Used (a) as the fallback when the local chain fails, and (b) as the
+    primary path when SUBTITLE_POLISH_MODEL pins an OpenRouter model but the
+    active chain is Ollama-only. Returns None on any failure — callers keep
+    their existing fail-soft behavior.
+    """
+    global _cloud_polish_provider
+    if not _cloud_polish_available():
+        return None
+    model = _resolve_cloud_polish_model()
+    try:
+        if _cloud_polish_provider is None:
+            from backend.services.providers.openrouter_provider import (
+                OpenRouterProvider)
+            _cloud_polish_provider = OpenRouterProvider()
+        prov = _cloud_polish_provider
+        prev_model = prov._editorial_model
+        try:
+            prov._editorial_model = model
+            result = await asyncio.wait_for(
+                prov.text_complete(full_prompt, timeout=int(timeout)),
+                timeout=timeout,
+            )
+        finally:
+            prov._editorial_model = prev_model
+        logger.info("polish cloud fallback succeeded via OpenRouter %s", model)
+        return result
+    except Exception as e:
+        logger.warning("polish cloud fallback via %s failed: %s", model, e)
+        return None
+
+
 async def _polish_batch(
     orchestrator,
     batch: list[dict],
@@ -706,6 +781,7 @@ async def _polish_batch(
     source_texts: Optional[list[str]] = None,
     mode: str = "asr",
     model_override: Optional[str] = None,
+    cloud_direct: bool = False,
 ) -> Optional[list[Optional[str]]]:
     """Polish a single batch via the polish LLM.
 
@@ -723,12 +799,26 @@ async def _polish_batch(
         source_texts=source_texts, mode=mode)
     system_prompt = _SYSTEM_PROMPT_TRANSLATION if mode == "translation" else _SYSTEM_PROMPT
     full_prompt = f"[SYSTEM]\n{system_prompt}\n\n[USER]\n{user_prompt}"
-    try:
-        response = await orchestrator.text_completion(
-            full_prompt, timeout=timeout, model_override=model_override)
-    except Exception as e:
-        logger.warning("transcript polishing: LLM call failed: %s", e)
-        return None
+    response = None
+    if cloud_direct:
+        # SUBTITLE_POLISH_MODEL pins an OpenRouter model — go straight to the
+        # cloud instead of feeding an OpenRouter id to an Ollama-only chain
+        # (which fails every batch and then falls back here anyway).
+        response = await _cloud_polish_completion(full_prompt, timeout)
+        if response is None:
+            return None
+    else:
+        try:
+            response = await orchestrator.text_completion(
+                full_prompt, timeout=timeout, model_override=model_override)
+        except Exception as e:
+            logger.warning("transcript polishing: LLM call failed: %s", e)
+            # Local chain exhausted (timeout / circuit breaker / offline
+            # chain with Ollama degraded). Cloud safety net — quality must
+            # not silently drop to an unpolished draft.
+            response = await _cloud_polish_completion(full_prompt, timeout)
+            if response is None:
+                return None
     polished = _parse_polished_response(response, expected=len(batch))
     if polished is None:
         logger.warning(
@@ -897,6 +987,66 @@ async def polish_source_before_translation(
     return polished
 
 
+def derive_entity_glossary(texts: Iterable[str], max_terms: int = 16,
+                           min_count: int = 3) -> list[str]:
+    """Auto-derive a canonical proper-noun list from the transcript itself.
+
+    Netflix-grade subs render a name the SAME way in every cue; small-model
+    drafts drift ("Zeks"/"Zecks"/"Zeck", "Riley"/"Rilina"/"Lilina"). This
+    clusters recurring capitalized tokens by fuzzy similarity (same initial,
+    difflib ratio ≥ 0.75), picks the most frequent variant as canonical, and
+    returns the canonicals so the polish prompt can pin them. Data-only
+    heuristic — no LLM call. Sentence-initial words only count when they
+    also appear capitalized mid-sentence (drops This/The/Yes noise).
+    """
+    import difflib
+    from collections import Counter
+
+    mid_counts: Counter = Counter()
+    all_counts: Counter = Counter()
+    word_re = re.compile(r"[A-Za-z][a-z]+(?:-[A-Za-z][a-z]+)?")
+    for text in texts:
+        tokens = re.findall(r"\S+", text or "")
+        for pos, raw in enumerate(tokens):
+            m = word_re.fullmatch(raw.strip('.,!?;:"()[]—-'))
+            if not m:
+                continue
+            w = m.group(0)
+            if not w[0].isupper() or len(w) < 3:
+                continue
+            all_counts[w] += 1
+            if pos > 0:
+                mid_counts[w] += 1
+
+    # Candidates must recur AND appear mid-sentence at least once.
+    cands = [w for w, c in all_counts.items()
+             if c >= min_count and mid_counts.get(w, 0) >= 1]
+    cands.sort(key=lambda w: -all_counts[w])
+
+    canonicals: list[str] = []
+    used: set = set()
+    for w in cands:
+        if w in used:
+            continue
+        cluster = [w]
+        for other in cands:
+            if other in used or other == w:
+                continue
+            if other[0].lower() != w[0].lower():
+                continue
+            if difflib.SequenceMatcher(None, w.lower(), other.lower()).ratio() >= 0.75:
+                cluster.append(other)
+        for c in cluster:
+            used.add(c)
+        # Canonical = most frequent variant; only worth pinning when the
+        # name actually recurs (a cluster total under min_count is noise).
+        if sum(all_counts[c] for c in cluster) >= min_count:
+            canonicals.append(max(cluster, key=lambda c: all_counts[c]))
+        if len(canonicals) >= max_terms:
+            break
+    return canonicals
+
+
 async def correct_transcript(
     segments: Iterable,
     orchestrator=None,
@@ -953,6 +1103,21 @@ async def correct_transcript(
         except Exception:
             glossary_terms = None
 
+    # Merge an auto-derived proper-noun list so recurring names render
+    # consistently even without a user-maintained vocabulary. The custom
+    # vocabulary (user-authored) always wins order-wise.
+    if bool(getattr(settings, "SUBTITLE_POLISH_AUTO_GLOSSARY", True)):
+        try:
+            auto_terms = derive_entity_glossary(
+                (_coerce_segment(x).get("text", "") for x in seg_list))
+            existing = {t.lower() for t in (glossary_terms or [])}
+            merged = list(glossary_terms or []) + [
+                t for t in auto_terms if t.lower() not in existing]
+            if merged:
+                glossary_terms = merged
+        except Exception:
+            pass
+
     if batch_size is None:
         batch_size = max(1, int(getattr(settings, "TRANSCRIPT_POLISHING_BATCH_SIZE", 15)))
     # CJK: smaller batches because dense glyphs make the model lose count.
@@ -977,6 +1142,10 @@ async def correct_transcript(
     preserve_mode = getattr(settings, "TRANSCRIPT_PRESERVE_WORDS", True)
     len_max_ratio = 1.5 if preserve_mode else 3.0
     len_min_ratio = 0.6 if preserve_mode else 0.3
+    # An OpenRouter-style pinned polish model on a local-only chain would
+    # fail per batch before falling back — route it straight to the cloud.
+    cloud_direct = bool(model_override and "/" in model_override
+                        and _cloud_polish_available())
     for idx, batch_pairs in enumerate(batches):
         batch = [pair[0] for pair in batch_pairs]
         # Sliding 3-segment context windows (separate from the
@@ -992,11 +1161,19 @@ async def correct_transcript(
             _bs = idx * batch_size
             batch_src = source_texts[_bs: _bs + len(batch)]
 
+        # Cold-load timeout scaling: on a 4 GB card the FIRST batch often
+        # pays a multi-minute Ollama partial-offload model load. The old
+        # flat 90s timeout expired during that load, struck the circuit
+        # breaker three times and killed polish for the whole job. Give
+        # the first batch 3x (capped at 300s); later batches (model warm)
+        # keep the base timeout.
+        _batch_timeout = (min(300.0, timeout_per_batch * 3)
+                          if idx == 0 else timeout_per_batch)
         polished_texts = await _polish_batch(
             orchestrator, batch, ctx_before, ctx_after,
-            language=language, timeout=timeout_per_batch,
+            language=language, timeout=_batch_timeout,
             glossary_terms=glossary_terms, source_texts=batch_src, mode=mode,
-            model_override=model_override,
+            model_override=model_override, cloud_direct=cloud_direct,
         )
 
         for i, (view, orig_obj) in enumerate(batch_pairs):

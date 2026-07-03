@@ -47,6 +47,17 @@ class Settings(BaseSettings):
     # the "Recommended for subtitle polish" picker). Takes precedence over
     # SUBTITLE_POLISH_USES_TRANSLATION_MODEL. Blank = legacy behavior.
     SUBTITLE_POLISH_MODEL: str = ""
+    # Cloud safety net for polishing: when the local chain fails a polish
+    # batch (Ollama cold-load timeout / circuit breaker / offline chain),
+    # retry the batch via OpenRouter — but ONLY when an OpenRouter key is
+    # configured (explicit cloud intent). Off = strictly local polish.
+    SUBTITLE_POLISH_CLOUD_FALLBACK: bool = True
+    # Model for that cloud path. Blank = SUBTITLE_POLISH_MODEL when it's an
+    # OpenRouter id, else the first efficient-tier shortlist entry.
+    SUBTITLE_POLISH_CLOUD_MODEL: str = ""
+    # Auto-derive a proper-noun glossary from the transcript itself so
+    # recurring names render consistently (Zechs, not Zeks/Zecks/Zeck).
+    SUBTITLE_POLISH_AUTO_GLOSSARY: bool = True
 
     # Ollama — Primary AI (video/vision) + Editorial AI (scoring/summary).
     # Defaults are sized to fit a 4GB GTX 1650 so the same image runs

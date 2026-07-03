@@ -88,6 +88,9 @@ _PREVIEW_MAX_BITRATE_KBPS = 6000
 # within one keyframe of any scrub target instead of jumping 4–10 s
 # at a time the way factory-default libx264 does.
 _PREVIEW_KEYFRAME_INTERVAL_SEC = 2.0
+# Sources whose OWN keyframe spacing exceeds this build a preview even if
+# codec/size/bitrate are fine — scrub responsiveness is the point.
+_PREVIEW_MAX_KEYINT_SEC = 3.0
 
 
 @dataclass
@@ -103,6 +106,12 @@ class _ProbeResult:
     # bitrate and the field is simply absent — we treat that as
     # "unknown, don't base decisions on it".
     bitrate_kbps: int
+    # Median keyframe interval (seconds) sampled from the first minute;
+    # 0.0 = unknown. Long-GOP web rips (5-10s+) are the reason scrubbing
+    # "doesn't load" — every seek decodes from a distant keyframe.
+    keyframe_interval_s: float = 0.0
+    # True when the moov atom precedes mdat (progressive/faststart).
+    faststart: bool = True
 
 
 def _parse_fps(rate: str) -> float:
@@ -116,6 +125,85 @@ def _parse_fps(rate: str) -> float:
         return float(rate)
     except (ValueError, ZeroDivisionError):
         return 0.0
+
+
+def _probe_keyframe_interval(source_path: str) -> float:
+    """Median keyframe spacing (s) over the first 60s. 0.0 = unknown.
+
+    Uses ``-skip_frame nokey`` so only keyframes are decoded — this is a
+    metadata-speed pass, not a full decode.
+    """
+    try:
+        proc = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-skip_frame", "nokey",
+                "-select_streams", "v:0",
+                "-show_entries", "frame=pts_time",
+                "-of", "csv=p=0",
+                "-read_intervals", "%+60",
+                source_path,
+            ],
+            capture_output=True, text=True, timeout=20,
+        )
+        if proc.returncode != 0 or not proc.stdout:
+            return 0.0
+        times = []
+        for line in proc.stdout.strip().splitlines():
+            tok = line.strip().rstrip(",")
+            if not tok or tok == "N/A":
+                continue
+            try:
+                times.append(float(tok))
+            except ValueError:
+                continue
+        if len(times) < 2:
+            # 0-1 keyframes in a whole minute — that IS a sparse GOP.
+            return 60.0 if times else 0.0
+        gaps = sorted(b - a for a, b in zip(times[:-1], times[1:]) if b > a)
+        return gaps[len(gaps) // 2] if gaps else 0.0
+    except (subprocess.SubprocessError, OSError):
+        return 0.0
+
+
+def _probe_faststart(source_path: str) -> bool:
+    """True when the MP4/MOV moov atom precedes mdat (streams progressively).
+
+    Scans top-level atoms in the first few MB without decoding. Non-MP4
+    containers return True (the concept doesn't apply). Unknown → True so
+    we never force a rebuild off a failed sniff.
+    """
+    ext = os.path.splitext(source_path)[1].lower()
+    if ext not in (".mp4", ".mov", ".m4v"):
+        return True
+    try:
+        size = os.path.getsize(source_path)
+        with open(source_path, "rb") as fh:
+            pos = 0
+            hops = 0
+            while pos < size and hops < 32:
+                fh.seek(pos)
+                header = fh.read(8)
+                if len(header) < 8:
+                    return True
+                atom_size = int.from_bytes(header[:4], "big")
+                atom_type = header[4:8]
+                if atom_type == b"moov":
+                    return True
+                if atom_type == b"mdat":
+                    return False
+                if atom_size == 1:  # 64-bit extended size
+                    ext_size = fh.read(8)
+                    if len(ext_size) < 8:
+                        return True
+                    atom_size = int.from_bytes(ext_size, "big")
+                if atom_size < 8:
+                    return True
+                pos += atom_size
+                hops += 1
+    except OSError:
+        return True
+    return True
 
 
 def _probe(source_path: str) -> Optional[_ProbeResult]:
@@ -187,6 +275,8 @@ def _probe(source_path: str) -> Optional[_ProbeResult]:
         height=height,
         fps=fps,
         bitrate_kbps=bitrate_kbps,
+        keyframe_interval_s=_probe_keyframe_interval(source_path),
+        faststart=_probe_faststart(source_path),
     )
 
 
@@ -214,6 +304,16 @@ def _needs_preview(source_path: str, probe: _ProbeResult) -> bool:
         return True
     if probe.bitrate_kbps and probe.bitrate_kbps > _PREVIEW_MAX_BITRATE_KBPS * 1.2:
         return True
+    # Long-GOP sources (web rips routinely carry 5-10s+ keyframe spacing)
+    # are technically "browser-compatible" but scrub terribly: every seek
+    # makes the <video> element fetch + decode from a distant keyframe, so
+    # the player looks frozen. The preview profile's 2s GOP is the fix —
+    # this trigger is why it now applies to plain low-res H.264 MP4s too.
+    if probe.keyframe_interval_s and probe.keyframe_interval_s > _PREVIEW_MAX_KEYINT_SEC:
+        return True
+    # moov-after-mdat can't start playing until the tail is fetched.
+    if not probe.faststart:
+        return True
     return False
 
 
@@ -228,7 +328,7 @@ def _preview_path_for(source_path: str) -> str:
     playback smoothness improves on the next request.
     """
     directory = os.path.dirname(source_path) or "."
-    return os.path.join(directory, "browser_preview.v3.mp4")
+    return os.path.join(directory, "browser_preview.v4.mp4")
 
 
 def _none_marker_for(source_path: str) -> str:
@@ -308,10 +408,16 @@ def _should_copy_video(probe: _ProbeResult) -> bool:
         return False
     if probe.bitrate_kbps and probe.bitrate_kbps > _PREVIEW_MAX_BITRATE_KBPS * 1.2:
         return False
+    # Stream-copy would carry the sparse GOP into the preview — the exact
+    # thing the keyint trigger exists to fix. Faststart-only rebuilds may
+    # still copy (the remux itself repositions moov).
+    if probe.keyframe_interval_s and probe.keyframe_interval_s > _PREVIEW_MAX_KEYINT_SEC:
+        return False
     return True
 
 
-def _build_ffmpeg_cmd(source_path: str, target_path: str, probe: _ProbeResult) -> list[str]:
+def _build_ffmpeg_cmd(source_path: str, target_path: str, probe: _ProbeResult,
+                      encoder: str = "libx264") -> list[str]:
     """Build the FFmpeg command that produces the browser preview.
 
     Strategy:
@@ -364,20 +470,36 @@ def _build_ffmpeg_cmd(source_path: str, target_path: str, probe: _ProbeResult) -
         video_filters.append(
             f"scale='min({_PREVIEW_MAX_WIDTH},iw)':-2"
         )
-        video_opts = [
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-tune", "fastdecode",
-            "-profile:v", "main",
-            "-level", "4.0",
-            "-crf", "23",
-            "-maxrate", f"{_PREVIEW_MAX_BITRATE_KBPS}k",
-            "-bufsize", f"{_PREVIEW_MAX_BITRATE_KBPS * 2}k",
-            "-g", str(gop),
-            "-keyint_min", str(gop),
-            "-sc_threshold", "0",
-            "-pix_fmt", "yuv420p",
-        ]
+        if encoder == "h264_nvenc":
+            # NVENC preview: same 2s GOP contract, hardware-fast (a 640x360
+            # source re-encodes in seconds on a GTX 1650). Caller falls back
+            # to libx264 if this command fails (GPU busy / no NVENC).
+            video_opts = [
+                "-c:v", "h264_nvenc",
+                "-preset", "p3",
+                "-rc", "vbr",
+                "-cq", "26",
+                "-b:v", "0",
+                "-maxrate", f"{_PREVIEW_MAX_BITRATE_KBPS}k",
+                "-bufsize", f"{_PREVIEW_MAX_BITRATE_KBPS * 2}k",
+                "-g", str(gop),
+                "-pix_fmt", "yuv420p",
+            ]
+        else:
+            video_opts = [
+                "-c:v", "libx264",
+                "-preset", "veryfast",
+                "-tune", "fastdecode",
+                "-profile:v", "main",
+                "-level", "4.0",
+                "-crf", "23",
+                "-maxrate", f"{_PREVIEW_MAX_BITRATE_KBPS}k",
+                "-bufsize", f"{_PREVIEW_MAX_BITRATE_KBPS * 2}k",
+                "-g", str(gop),
+                "-keyint_min", str(gop),
+                "-sc_threshold", "0",
+                "-pix_fmt", "yuv420p",
+            ]
 
     audio_opts: list[str]
     if probe.has_audio:
@@ -583,13 +705,33 @@ def ensure_browser_preview(source_path: str) -> str:
                 os.remove(tmp_path)
         except OSError:
             pass
-        cmd = _build_ffmpeg_cmd(source_path, tmp_path, probe)
+        # NVENC first when the GPU toggle is on and we're re-encoding —
+        # a preview build during/around analysis must be seconds, not
+        # minutes of CPU x264 contending with the pipeline. Any NVENC
+        # failure (GPU busy, no encoder) silently falls back to x264.
+        use_nvenc = False
+        if not _should_copy_video(probe):
+            try:
+                from backend.config import settings as _settings
+                use_nvenc = bool(getattr(_settings, "GPU_ACCELERATION_ENABLED", False))
+            except Exception:
+                use_nvenc = False
         logger.info(
-            "browser_preview: building %s from %s (video=%s, audio=%s)",
+            "browser_preview: building %s from %s (video=%s, audio=%s, nvenc=%s)",
             target_path, source_path, probe.video_codec, probe.audio_codec,
+            use_nvenc,
         )
         t0 = time.time()
-        ok = _run_ffmpeg(cmd, tmp_path)
+        ok = False
+        if use_nvenc:
+            ok = _run_ffmpeg(
+                _build_ffmpeg_cmd(source_path, tmp_path, probe,
+                                  encoder="h264_nvenc"), tmp_path)
+            if not ok:
+                logger.info("browser_preview: NVENC build failed — falling back to libx264")
+        if not ok:
+            ok = _run_ffmpeg(
+                _build_ffmpeg_cmd(source_path, tmp_path, probe), tmp_path)
         if not ok:
             return source_path
         try:

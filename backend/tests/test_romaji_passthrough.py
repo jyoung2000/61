@@ -56,11 +56,19 @@ def test_english_not_flagged_even_with_japanese_source():
         assert not _is_untranslated(line, "ja"), line
 
 
-def test_romaji_not_flagged_without_japanese_source():
-    # Unknown/auto source → don't apply romaji detection (avoid false positives).
-    assert not _is_untranslated(ROMAJI[0], "")
-    # Romance-language source with open syllables must never trip it.
+def test_romaji_detection_on_unknown_source_uses_stricter_bar():
+    # CONTRACT CHANGE (2026-07-03 shipped-romaji fix): an unknown/auto
+    # source no longer disables romaji detection — the two logged runs
+    # shipped romaji precisely because detection was source-gated. It
+    # now applies with a STRICTER ratio (0.75+) so unambiguous romaji is
+    # caught while ordinary English can't trip it.
+    assert _is_untranslated(ROMAJI[0], "")       # unmistakable romaji
+    for line in ENGLISH:
+        assert not _is_untranslated(line, ""), line
+    # A DECLARED non-Japanese source still never applies romaji checks —
+    # open-syllable Romance languages must not trip it.
     assert not _is_untranslated("nada mas la vida", "es")
+    assert not _is_untranslated(ROMAJI[0], "es")
 
 
 def test_cjk_still_flagged_any_source():
@@ -72,5 +80,6 @@ def test_fraction_untranslated_counts_romaji_for_ja_source():
     segs = [{"text": t} for t in (ROMAJI[:2] + ENGLISH[:2])]  # 2 romaji, 2 english
     # Japanese source → romaji counted → 50%.
     assert abs(fraction_untranslated(segs, "en", "ja") - 0.5) < 1e-6
-    # No source declared → CJK-only → 0% (romaji not counted).
-    assert fraction_untranslated(segs, "en") == 0.0
+    # Unknown source → strong romaji still counted (stricter bar), so the
+    # untranslated fraction is honest even when detection returned "auto".
+    assert fraction_untranslated(segs, "en") > 0.0

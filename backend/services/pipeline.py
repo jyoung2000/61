@@ -802,7 +802,7 @@ async def _llm_cleanup_untranslated(segments, source_lang, target_lang,
         return segments
     try:
         from backend.services.translator import (
-            _cjk_ratio, _CJK_LANGS, fraction_untranslated,
+            _cjk_ratio, _CJK_LANGS, fraction_untranslated, _is_untranslated,
         )
         from backend.models import TranscriptSegment
     except Exception:
@@ -815,7 +815,12 @@ async def _llm_cleanup_untranslated(segments, source_lang, target_lang,
         return (s.get("text", "") if isinstance(s, dict) else getattr(s, "text", "")) or ""
 
     try:
-        leftover_idx = [i for i, s in enumerate(segments) if _cjk_ratio(_txt(s)) > 0.30]
+        # _is_untranslated covers BOTH CJK script and (for Japanese sources)
+        # transliterated ROMAJI — the old _cjk_ratio-only filter never even
+        # selected romaji cues ("Nametotte ageru kara.") for cleanup, so they
+        # shipped in the English track.
+        leftover_idx = [i for i, s in enumerate(segments)
+                        if _is_untranslated(_txt(s), source_lang)]
         if not leftover_idx:
             return segments
 
@@ -881,10 +886,22 @@ async def _llm_cleanup_untranslated(segments, source_lang, target_lang,
                     f"notes, do not repeat the original.\n\n{src_text}")
                 # ``except Exception`` only — a real cancel (CancelledError, a
                 # BaseException) still propagates and stops the run.
+                resp = None
                 try:
                     resp = await orchestrator.text_completion(
                         prompt, timeout=60, job_id=job_id or "", skip_circuit_breaker=True)
                 except Exception:
+                    resp = None
+                if resp is None:
+                    # Local chain dead (the exact state that shipped romaji
+                    # last run) — same cloud safety net polish uses.
+                    try:
+                        from backend.services.transcript_polisher import (
+                            _cloud_polish_completion)
+                        resp = await _cloud_polish_completion(prompt, 60)
+                    except Exception:
+                        resp = None
+                if resp is None:
                     _cache[src_text] = ""
                     continue
                 t = (resp or "").strip().strip('"').strip()
@@ -894,8 +911,9 @@ async def _llm_cleanup_untranslated(segments, source_lang, target_lang,
                     if low.startswith(_pref):
                         t = t[len(_pref):].strip()
                         break
-                if not t or _cjk_ratio(t) > 0.30:
-                    _cache[src_text] = ""  # echoed source / failed → keep FuguMT cue
+                if not t or _is_untranslated(t, source_lang):
+                    # echoed source (CJK OR romaji) / failed → keep existing cue
+                    _cache[src_text] = ""
                     continue
                 _cache[src_text] = t
             elif t == "":  # previously attempted and failed
@@ -3486,6 +3504,28 @@ async def _run_analysis_inner(job_id: str):
     # silently defaults to 1920x1080 — breaking AutoFlip / reframe
     # pixel math for every non-FullHD source (4K, 720p, vertical
     # phone clips, etc.).
+    # ── Early browser-preview build ──
+    # Build the scrub-friendly preview proxy NOW (2s GOP + faststart, NVENC
+    # when available) instead of lazily after analysis. The lazy path is
+    # blocked while the job is analyzing (is_job_analyzing guard in
+    # serve_file), which is exactly when the user opens the player — so
+    # without this the editor scrubs against the raw long-GOP source for
+    # the whole run. Fire-and-forget; failures just mean the lazy path
+    # builds it later.
+    try:
+        from backend.services.browser_preview import ensure_browser_preview
+
+        async def _early_preview(path=video_path, jid=job_id):
+            try:
+                out = await asyncio.to_thread(ensure_browser_preview, path)
+                logger.info("[%s] Early browser preview ready: %s", jid,
+                            os.path.basename(out) if out else "(source)")
+            except Exception as _bp_err:
+                logger.info("[%s] Early browser preview skipped: %s", jid, _bp_err)
+        asyncio.create_task(_early_preview())
+    except Exception:
+        pass
+
     if not metadata.get("width") or not metadata.get("height"):
         try:
             res = str(metadata.get("resolution") or "")
