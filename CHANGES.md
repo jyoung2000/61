@@ -1,3 +1,47 @@
+# ClipAI — Bridge off the event loop; windowed thumbnails; extract-band + refinement label fixes
+
+The 2026-07-03 21:32 run (first on build 720e347) confirmed the duplication
+fix — 403 persisted cues, zero phantom copies — and the new phase labels, and
+exposed the next layer:
+
+- **Bridge conversion no longer freezes the pipeline.** ``to_fez_*`` ran
+  synchronously ON the event loop; when it took 480s the browser got nothing
+  from 34m14s→42m15s and the 60% CONVERT update only arrived when the bridge
+  finished, with an 8-minute-stale heartbeat clock. The whole bridge now runs
+  in a worker thread (``asyncio.to_thread``) so heartbeats + WS updates keep
+  flowing.
+- **Batch scene thumbnails are decode-windowed.** The single-pass select
+  filter used a bare ``-i`` — every chunk decoded from t=0, so the tail chunk
+  of a 128-min source decoded ~110 minutes of video it discarded and hit the
+  flat 120s timeout, degrading to ~224 per-scene seeks (most of the 480s).
+  Each chunk now seeks (``-ss`` before ``-i``) to its own time window with
+  select windows rebased to the seek point, and the timeout scales with the
+  windowed span.
+- **Post-bridge phases are labeled.** Speaker fusion + the multi-minute
+  source polish ran under the stale "render plan conversion" heartbeat; a 61%
+  update now names them ("source transcript polish").
+- **EXTRACT band is forward-only.** Frame (8-9%) and audio-precondition
+  (9-14%) callbacks share one percent floor, killing the visible 13%→8%
+  regressions of the interleaved messages.
+- **No more "Transcribing (100%)" during refinement.** The gap-fill pass
+  re-emits transcription fractions; after the ``transcript_refine`` /
+  ``diarization`` phase hints those are latched to the current phase's
+  message instead of resurrecting the Whisper progress line.
+- **LLM preamble strip.** One shipped cue read "Sure, here is the
+  translation:\n\nNothing really matters." — ``strip_llm_preamble`` now
+  removes chatty preambles + Translation:/English: labels in both the batch
+  translate parse and the per-cue recovery path (never stripping a line to
+  empty).
+
+Run-213250 audit: transcript clean (403 cues, only a genuine repeated
+"Amazing."); polish again 51/155 via the cloud fallback (21 rescues); romaji
+recovery 11/17 flagged cues; translated readability grade A (95.9);
+ReframeReport steady at grade B 89.8 (identical metrics to the previous run —
+same source, deterministic pipeline). Remaining known gaps: ~8 short
+mixed-romaji lines still shipped ("Goi nurete…", "Shii desho") — flagged but
+the recovery model echoed them; and the reframer face-sampling rate remains
+the top reframing-quality lever.
+
 # ClipAI — Kill the transcript-duplication corruption; truthful progress labels
 
 Driven by the 2026-07-03 05:36 run (build c704bef) audit: the pipeline

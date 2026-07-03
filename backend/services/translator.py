@@ -193,6 +193,33 @@ _LLM_LANG_NAMES = {
 }
 
 
+_PREAMBLE_RE = re.compile(
+    r"^(?:sure[,!.]?\s*|okay[,!.]?\s*|certainly[,!.]?\s*)?"
+    r"here(?:'s| is)\s+(?:the\s+|your\s+)?(?:english\s+)?translation\s*[:\-—]*\s*",
+    re.IGNORECASE,
+)
+
+
+def strip_llm_preamble(text: str) -> str:
+    """Remove a chatty assistant preamble from a translated line.
+
+    Shipped artifact this kills (2026-07-03 21:32 run, cue 37:23):
+    ``"Sure, here is the translation:\\n\\nNothing really matters."`` — the
+    model prefixed its answer instead of answering bare. Also strips plain
+    ``Translation:`` / ``English:`` label prefixes.
+    """
+    t = (text or "").strip()
+    t2 = _PREAMBLE_RE.sub("", t).strip()
+    low = t2.lower()
+    for pref in ("translation:", "english:", "translation -", "english -",
+                 "translation —", "english —"):
+        if low.startswith(pref):
+            t2 = t2[len(pref):].strip()
+            break
+    # Never strip a line down to nothing — keep the original then.
+    return t2 if t2 else t
+
+
 def _parse_json_array(response: str, expected: int) -> Optional[list[str]]:
     """Parse the LLM's ``["...", "..."]`` reply into exactly ``expected`` strings."""
     import re
@@ -242,7 +269,7 @@ def _parse_json_array(response: str, expected: int) -> Optional[list[str]]:
             return None
     if any(_LEAK.search(s) for s in out):
         return None
-    return out
+    return [strip_llm_preamble(s) for s in out]
 
 
 async def translate_via_llm(

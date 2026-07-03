@@ -315,20 +315,35 @@ def _extract_thumbnails_batch(video_path: str, timestamps: list,
     for c0 in range(0, len(timestamps), CHUNK):
         ts_chunk = timestamps[c0:c0 + CHUNK]
         path_chunk = out_paths[c0:c0 + CHUNK]
+        # Window the decode to this chunk's time span. A bare `-i` +
+        # select decodes from t=0 every chunk — on a 128-min source the
+        # tail chunk (timestamps ~6600-7650s) meant decoding ~110 minutes
+        # of video it would throw away, blowing the timeout (observed:
+        # the 2026-07-03 21:32 run's batch pass died at 120s and degraded
+        # to 224 per-scene seeks ≈ 8 minutes of bridge_conversion).
+        # `-ss` BEFORE `-i` is a fast keyframe seek and rebases frame
+        # timestamps so t≈0 at the seek point — offset the between()
+        # windows to match. A margin absorbs the seek landing early.
+        seek = max(0.0, min(max(0.0, t) for t in ts_chunk) - 2.0)
+        span = max(max(0.0, t) for t in ts_chunk) - seek + 1.0
         clauses = "+".join(
-            f"between(t,{max(0.0, t):.3f},{max(0.0, t) + 0.05:.3f})"
+            f"between(t,{max(0.0, t) - seek:.3f},{max(0.0, t) - seek + 0.05:.3f})"
             for t in ts_chunk)
         tmpdir = tempfile.mkdtemp(prefix="scene_thumbs_")
         pattern = os.path.join(tmpdir, "t_%06d.jpg")
         try:
             proc = subprocess.run(
                 ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                 "-ss", f"{seek:.3f}", "-t", f"{span:.3f}",
                  "-i", video_path,
                  "-vf", f"select='{clauses}'",
                  "-vsync", "vfr", "-q:v", "4", "-an",
                  pattern],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                timeout=max(120, int(len(ts_chunk) * 2)), check=False,
+                # Decode wall time scales with the windowed span, not the
+                # thumbnail count — budget ~6s of decode per minute of
+                # window (GTX1650-class boxes decode 480p H.264 ~10x RT).
+                timeout=max(120, int(span / 60.0 * 6) + 60), check=False,
             )
             produced = sorted(
                 f for f in os.listdir(tmpdir) if f.endswith(".jpg"))

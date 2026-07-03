@@ -905,12 +905,13 @@ async def _llm_cleanup_untranslated(segments, source_lang, target_lang,
                     _cache[src_text] = ""
                     continue
                 t = (resp or "").strip().strip('"').strip()
-                low = t.lower()
-                for _pref in ("translation:", "english:", "translation -",
-                              "english -", "translation —", "english —"):
-                    if low.startswith(_pref):
-                        t = t[len(_pref):].strip()
-                        break
+                # Chatty-preamble strip ("Sure, here is the translation: …")
+                # + the plain Translation:/English: label prefixes.
+                try:
+                    from backend.services.translator import strip_llm_preamble
+                    t = strip_llm_preamble(t)
+                except Exception:
+                    pass
                 if not t or _is_untranslated(t, source_lang):
                     # echoed source (CJK OR romaji) / failed → keep existing cue
                     _cache[src_text] = ""
@@ -3709,9 +3710,17 @@ async def _run_analysis_inner(job_id: str):
     _est_frame_rate = settings.FRAME_SAMPLE_RATE
     _est_total_frames = max(50, int(metadata["duration"] / _est_frame_rate)) if metadata["duration"] > 0 else 100
 
+    # Frame + audio extraction interleave their updates in the same 8-14%
+    # band but track DIFFERENT completions, so the bar visibly jumped
+    # backwards (audio at 13% → next frame message at 8%). Share one
+    # forward-only floor: messages alternate freely, percent never regresses.
+    _extract_pct_floor = [8]
+
     async def _frame_progress(frames_so_far: int):
         extraction_pct = min(1.0, frames_so_far / _est_total_frames)
         pct = 8 + int(extraction_pct * 6)  # 8% to 14%
+        pct = max(pct, _extract_pct_floor[0])
+        _extract_pct_floor[0] = pct
         await _update_progress(
             job_id, JobStatus.EXTRACTING_FRAMES, pct,
             f"Extracted {frames_so_far} frames so far{size_note}...",
@@ -3726,6 +3735,8 @@ async def _run_analysis_inner(job_id: str):
         # progress keeps the message accurate and resets the stuck-timer.
         f = max(0.0, min(1.0, fraction))
         pct = 8 + int(f * 6)  # same 8-14% band as frames
+        pct = max(pct, _extract_pct_floor[0])
+        _extract_pct_floor[0] = pct
         await _update_progress(
             job_id, JobStatus.EXTRACTING_FRAMES, pct,
             f"Preconditioning audio for transcription… ({int(f * 100)}%)",
@@ -3863,6 +3874,7 @@ async def _run_analysis_inner(job_id: str):
     _engine_phase = ['faces']  # mutable cell: 'faces' | 'whisper_pending' | 'whisper'
     _whisper_t0 = [0.0]
     _last_emitted_pct = [15]   # monotonic floor for the ANALYZING_SCENES band
+    _hint_latch = ['']         # last phase hint seen ('transcript_refine'/'diarization')
 
     def _engine_progress(*pargs):
         """Thread-safe progress relay from the (blocking) reframer engine.
@@ -3897,10 +3909,26 @@ async def _run_analysis_inner(job_id: str):
             msg = "Refining transcript (redecode + gap-fill + alignment)..."
             hb_label = "transcript refinement"
             _engine_phase[0] = 'whisper'   # % framework: transcription band done
+            _hint_latch[0] = hint
         elif hint == 'diarization':
             pct_int = 57
             msg = "Speaker diarization + voice matching..."
             hb_label = "speaker diarization"
+            _hint_latch[0] = hint
+        elif _hint_latch[0]:
+            # A plain-fraction callback AFTER a phase hint is the gap-fill /
+            # redecode pass re-reporting audio time — rendering it as
+            # "Transcribing audio with Whisper (100%)" six minutes into
+            # refinement (observed) reads as the pipeline going backwards.
+            # Keep the latched phase's message instead.
+            if _hint_latch[0] == 'diarization':
+                pct_int = 57
+                msg = "Speaker diarization + voice matching..."
+                hb_label = "speaker diarization"
+            else:
+                pct_int = 56
+                msg = "Refining transcript (redecode + gap-fill + alignment)..."
+                hb_label = "transcript refinement"
         else:
             # Phase detection: face detection reports 0→1, then Whisper
             # restarts from 0. Detect the restart by watching for frac≥1
@@ -4277,21 +4305,33 @@ async def _run_analysis_inner(job_id: str):
         heartbeat_label="render plan conversion",
     )
     async with _stage_timer(job_id, "bridge_conversion"):
-        render_plan = to_fez_render_plan(
-            reframer_plan, perception,
-            src_w=source_width, src_h=source_height,
-            target_w=1080, target_h=1920,
-            fps=video_fps, total_duration=video_duration,
-        )
-        scenes = to_fez_scenes(
-            perception, reframer_plan,
-            video_path=video_path, frames_dir=frames_dir,
-        )
-        transcript = to_fez_transcript(
-            perception.transcript_segments,
-            getattr(perception, "speaker_timeline", None),
-        )
-        subject_track = to_fez_subject_track(perception, reframer_plan)
+        # Run the whole bridge OFF the event loop. to_fez_scenes decodes
+        # scene thumbnails with ffmpeg (minutes on a 2-hour source when the
+        # batch pass degrades to per-scene seeks) and running it inline froze
+        # the loop: no heartbeats, and the 60% update above only REACHED the
+        # browser when the bridge finished — the observed "silent 34m→42m,
+        # then CONVERT appears with an 8m-stale clock" from the 2026-07-03
+        # 21:32 run.
+        def _run_bridge():
+            rp = to_fez_render_plan(
+                reframer_plan, perception,
+                src_w=source_width, src_h=source_height,
+                target_w=1080, target_h=1920,
+                fps=video_fps, total_duration=video_duration,
+            )
+            sc = to_fez_scenes(
+                perception, reframer_plan,
+                video_path=video_path, frames_dir=frames_dir,
+            )
+            tr = to_fez_transcript(
+                perception.transcript_segments,
+                getattr(perception, "speaker_timeline", None),
+            )
+            st = to_fez_subject_track(perception, reframer_plan)
+            return rp, sc, tr, st
+
+        render_plan, scenes, transcript, subject_track = (
+            await asyncio.to_thread(_run_bridge))
 
     # Loud, visible signal when transcription came back empty. Without a
     # transcript the pipeline silently skips subtitle translation AND produces
@@ -4341,6 +4381,15 @@ async def _run_analysis_inner(job_id: str):
         job_id, _bg_source or "auto", _bg_target or "(none)",
         "translate-then-polish in target language" if _will_translate
         else "polish in source language (no translation)",
+    )
+
+    # The bridge is done — say so. Without this the keepalive kept reading
+    # "render plan conversion" (with an ever-growing clock) through speaker
+    # fusion + the multi-minute source polish that follow.
+    await _update_progress(
+        job_id, JobStatus.ANALYZING_SCENES, 61,
+        "Fusing speakers + polishing the source transcript...",
+        heartbeat_label="source transcript polish",
     )
 
     # ── Speaker fusion (Task 2): overlap voting + mid-segment splits +
