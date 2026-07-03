@@ -474,13 +474,30 @@ export default function VideoEditor({
     });
     if (cues.length === 0) return;
     let mismatch = 0, cjkLeak = 0;
+    const idxSeen = new Set();
+    let idxDupes = 0;
     for (const s of cues) {
       const txt = (s.subtitleText || '').trim();
       const t = transcript[s.transcriptIndex];
       if (!t || (t.text || '').trim() !== txt) mismatch++;
       if (!targetIsCjk && _veCjkRatio(txt) > 0.30) cjkLeak++;
+      if (Number.isInteger(s.transcriptIndex)) {
+        if (idxSeen.has(s.transcriptIndex)) idxDupes++;
+        else idxSeen.add(s.transcriptIndex);
+      }
     }
-    if (mismatch >= Math.ceil(cues.length / 2) || cjkLeak > 0) {
+    // Union signatures: the same transcript row materialized as multiple
+    // timeline cues (stacked generations from a double backfill / stale
+    // restore), or far more cues than the transcript rows that overlap this
+    // window. A track like that must never feed the reverse-sync — it is
+    // exactly what corrupted the stored transcript into 117 lines × ~3
+    // copies at shifted times. Rebuild from the clean transcript.
+    const windowRows = transcript.filter(
+      (t) => t && t.end > clipStart && t.start < effectiveEnd).length;
+    const unionSuspect =
+      idxDupes >= Math.max(3, cues.length * 0.05)
+      || (windowRows > 0 && cues.length > windowRows * 1.25 + 5);
+    if (mismatch >= Math.ceil(cues.length / 2) || cjkLeak > 0 || unionSuspect) {
       rebuildSubtitlesFromTranscript({
         subtitleSegments: transcript,
         clipStart,

@@ -1021,6 +1021,15 @@ class AudioIntelligence:
                             f'{elapsed_so_far:.1f}s elapsed, ~{remaining:.0f}s remaining')
                         last_log_pct = pct
 
+            # Phase hint: the per-segment loop above tracks audio time, so a
+            # video whose speech ends early leaves the bar frozen at e.g. 79%
+            # while redecode + gap-fill + alignment run for minutes. Tell the
+            # pipeline the transcription band is done and refinement started.
+            if on_progress:
+                try:
+                    on_progress(1.0, 'transcript_refine')
+                except TypeError:
+                    on_progress(1.0)   # legacy single-arg callback
             # ── Two-pass difficult-segment redecode (audit Phase 3.4) ──
             # Hallucination-flagged / low-logprob / degenerate-word-timing
             # segments get one focused sequential re-decode (beam 8,

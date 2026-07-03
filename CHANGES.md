@@ -1,3 +1,58 @@
+# ClipAI — Kill the transcript-duplication corruption; truthful progress labels
+
+Driven by the 2026-07-03 05:36 run (build c704bef) audit: the pipeline
+persisted a CLEAN 406-cue translated transcript, but the downloaded track had
+625 cues with 117 lines repeated ~3x each at timestamps minutes apart (one
+phantom family at a constant ~+19min offset, another splayed further). The
+writer was the NLE reverse-sync: a timeline holding stacked stale generations
+of the same subtitle cues replaced the canonical transcript wholesale. The
+existing dedup passes can't catch that shape — ``drop_scattered_duplicates``
+fires at 4+ occurrences, ``collapse_repeated_runs`` needs CONSECUTIVE runs;
+the phantoms were 3x and interleaved with real dialogue.
+
+- **Union-write guard (backend).** ``PUT /jobs/{id}/transcript`` now rejects
+  (409) a replace that is much bigger than the stored track (>25% and >15
+  cues) AND much more text-duplicated (+10 points of duplicate-text share) —
+  the stale-union signature. Genuine edits (splits, merges, denser imports)
+  pass: they change counts modestly or add NEW text, not hundreds of verbatim
+  copies. ``clean_and_sort_segments`` additionally drops verbatim duplicates
+  at the same position (a double-backfilled track). ``detect_union_write`` in
+  ``backend/services/transcript_sync.py``; tests in
+  ``backend/tests/test_transcript_union_guard.py``.
+- **The union can no longer form (frontend).**
+  ``addSubtitlesFromTranscript`` is idempotent — it replaces the subtitle
+  track instead of stacking a second generation when a double effect-fire or
+  an IndexedDB restore races the empty-track check. The VideoEditor
+  stale-track sync now also rebuilds on the union signatures themselves:
+  duplicate ``transcriptIndex`` values among cues, or a cue count far above
+  the transcript rows overlapping the clip window (the old "half the texts
+  mismatch" test stays below threshold on a fresh+stale union, which is
+  exactly how 625 survived). The reverse-sync PUT mirrors the backend guard
+  (count blowup + duplicate-share) so a corrupt track is never even sent —
+  this also keeps NLE subtitle elements 1:1 with the transcript's length and
+  text unless the user actually edited them.
+- **Truthful per-step progress.** The engine progress relay accepts phase
+  hints and the perceiver/audio stages emit them at the two long dark
+  stretches from the run report: ``transcript_refine`` when the Whisper
+  segment loop ends (the bar used to freeze at "Transcribing 79%" through
+  minutes of redecode + gap-fill + alignment) and ``diarization`` before the
+  speaker pass (8 minutes of silence labeled "scene analysis"). Emitted
+  percent is now forward-only (interleaved precondition/extract callbacks
+  made the bar jump backwards), and the 15%/57%/60% pipeline updates carry
+  explicit heartbeat labels ("face + motion detection", "speaker analysis
+  wrap-up", "render plan conversion") so keepalives name the real work with
+  a freshly-reset elapsed clock instead of "scene analysis — 8m 5s elapsed".
+
+Run-073154 audit vs the previous run (983c5d0), same video: polish went 0/155
+→ 51/155 segments improved (every local batch still failed on the degraded
+Ollama chain, but the cloud fallback rescued 19/19 batches via
+anthropic/claude-haiku-4.5); romaji cleanup recovered 8/13 flagged cues and
+zero romaji lines shipped; the early preview proxy was ready 2 minutes into
+the run (before analysis started); redecode re-decoded 8 difficult segments;
+translated readability graded A (96.3). ReframeReport held steady at grade B
+(overall 89.8, face coverage 94.5%, hold 77.4%, safe-area 87.1%, 2.14
+cuts/min; HIGH problems 125 → 117).
+
 # ClipAI — Polish that can't silently die, snappy preview, real YOLO-World classes
 
 Driven by the 2026-07-03 run logs: every polish batch of both jobs failed

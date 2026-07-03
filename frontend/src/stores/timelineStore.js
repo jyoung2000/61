@@ -1243,6 +1243,15 @@ const useTimelineStore = create(
         const newItems = buildSubtitleItems({
           subtitleSegments, clipStart, clipEnd, duration,
         });
+        // Idempotent by construction: replace any existing subtitle items
+        // instead of stacking a second generation on top. Callers gate on
+        // "no subtitle items yet", but a race (double effect fire, an
+        // IndexedDB restore landing between check and set) could stack 2-3
+        // generations of the same cues — which overlap resolution then
+        // splays across the timeline and the reverse-sync writes into the
+        // canonical transcript as hundreds of duplicated lines at shifted
+        // times (the 406→625-cue corruption).
+        state.items = state.items.filter(it => it.type !== 'subtitle');
         state.items.push(...newItems);
         // Refresh the "original subtitles" snapshot used by the reset
         // button so reset still works after a backfill.

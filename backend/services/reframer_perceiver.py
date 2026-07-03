@@ -686,6 +686,15 @@ class Perceiver:
             r.audio_events = audio_result.get('audio_events', {})
 
         # ── Speaker diarization (audio-based) ──
+        # Phase hint: diarization can run for many minutes with no per-item
+        # progress; the hint lets the pipeline label the bar + heartbeat
+        # "speaker diarization" instead of leaving a stale "transcription"
+        # message on screen through the whole pass.
+        if on_progress:
+            try:
+                on_progress(1.0, 'diarization')
+            except TypeError:
+                on_progress(1.0)   # legacy single-arg callback
         if self.diarizer.try_load():
             r.speaker_timeline = self.diarizer.diarize(self.path, r.duration_ms)
 

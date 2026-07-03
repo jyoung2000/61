@@ -1049,13 +1049,32 @@ async def replace_transcript(job_id: str, req: BulkTranscriptReplaceRequest):
 
     # Coerce + sort the incoming segments chronologically. Drop blank /
     # backwards cues so a corrupt timeline edit can't poison the transcript.
-    from backend.services.transcript_sync import clean_and_sort_segments
+    from backend.services.transcript_sync import (
+        clean_and_sort_segments, detect_union_write)
     rows = clean_and_sort_segments(req.segments)
 
     target = (req.target or "translated").strip().lower()
     # Only write the translated track when one already exists; otherwise the
     # edit belongs to the original transcript.
     use_translated = target == "translated" and bool(job.translated_transcript)
+
+    # Union-write guard: refuse a replace that looks like a stale NLE timeline
+    # union (fresh cues + phantom copies of the same lines at shifted times)
+    # rather than a real edit. This is the write that turned a clean 406-cue
+    # track into a 625-cue duplicated transcript (117 texts ~3x each) on the
+    # 2026-07-03 run. A 409 tells the frontend to rebuild its subtitle track
+    # from the stored transcript instead of pushing the corrupt one again.
+    stored = job.translated_transcript if use_translated else job.transcript
+    is_union, union_reason = detect_union_write(rows, stored or [])
+    if is_union:
+        logger.warning("[%s] REJECTED transcript replace (%s): %s",
+                       job_id, "translated" if use_translated else "original",
+                       union_reason)
+        raise HTTPException(
+            status_code=409,
+            detail=f"Transcript replace rejected: {union_reason}. "
+                   "Rebuild the timeline subtitles from the transcript and retry.")
+
     if use_translated:
         await database.update_job_status(job_id, translated_transcript=rows)
     else:

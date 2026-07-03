@@ -3862,6 +3862,7 @@ async def _run_analysis_inner(job_id: str):
 
     _engine_phase = ['faces']  # mutable cell: 'faces' | 'whisper_pending' | 'whisper'
     _whisper_t0 = [0.0]
+    _last_emitted_pct = [15]   # monotonic floor for the ANALYZING_SCENES band
 
     def _engine_progress(*pargs):
         """Thread-safe progress relay from the (blocking) reframer engine.
@@ -3869,6 +3870,13 @@ async def _run_analysis_inner(job_id: str):
         The Perceiver reports a 0.0-1.0 fraction; map it onto 15-58% of the
         overall pipeline bar, derive an ETA from the observed rate, and
         schedule the async update on the event loop.
+
+        A second positional arg is an optional PHASE HINT emitted at the
+        sub-stages that used to go dark for minutes (post-transcribe
+        refinement, speaker diarization). With a hint we label the bar and
+        the heartbeat with the real work instead of leaving a stale
+        "transcription — Xm elapsed" (or worse, "scene analysis") on screen
+        through an 8-minute diarization pass.
         """
         frac = 0.0
         if pargs:
@@ -3879,44 +3887,66 @@ async def _run_analysis_inner(job_id: str):
         if frac > 1.5:          # tolerate a 0-100 percentage just in case
             frac /= 100.0
         frac = max(0.0, min(1.0, frac))
+        hint = str(pargs[1]) if len(pargs) > 1 and pargs[1] else ""
 
-        # Phase detection: face detection reports 0→1, then Whisper
-        # restarts from 0. Detect the restart by watching for frac≥1
-        # then a new call with frac<0.5.
-        if _engine_phase[0] == 'faces' and frac >= 0.999:
-            _engine_phase[0] = 'whisper_pending'
-        elif _engine_phase[0] == 'whisper_pending' and frac < 0.5:
-            _engine_phase[0] = 'whisper'
-            _whisper_t0[0] = _time.monotonic()
+        pct_int = None
+        msg = ""
+        hb_label = ""
+        if hint == 'transcript_refine':
+            pct_int = 56
+            msg = "Refining transcript (redecode + gap-fill + alignment)..."
+            hb_label = "transcript refinement"
+            _engine_phase[0] = 'whisper'   # % framework: transcription band done
+        elif hint == 'diarization':
+            pct_int = 57
+            msg = "Speaker diarization + voice matching..."
+            hb_label = "speaker diarization"
+        else:
+            # Phase detection: face detection reports 0→1, then Whisper
+            # restarts from 0. Detect the restart by watching for frac≥1
+            # then a new call with frac<0.5.
+            if _engine_phase[0] == 'faces' and frac >= 0.999:
+                _engine_phase[0] = 'whisper_pending'
+            elif _engine_phase[0] == 'whisper_pending' and frac < 0.5:
+                _engine_phase[0] = 'whisper'
+                _whisper_t0[0] = _time.monotonic()
 
-        phase = _engine_phase[0]
-        elapsed = _time.monotonic() - _perceive_t0
+            phase = _engine_phase[0]
+            elapsed = _time.monotonic() - _perceive_t0
 
-        # ``hb_label`` names the actual sub-phase so the heartbeat (which fires
-        # during the long stretches where the % stalls — e.g. Whisper's post-VAD
-        # merge) reads "Still processing... (transcription — Xm)" instead of the
-        # misleading "scene analysis".
-        if phase == 'faces':
-            pct_int = int(15 + frac * 27)  # 15% → 42%
-            pct_int = max(15, min(42, pct_int))
-            msg = f"Detecting faces + motion analysis ({int(frac * 100)}%)"
-            hb_label = "face + motion detection"
-            if frac >= 0.02 and elapsed > 15:
-                eta = elapsed * (1.0 - frac) / max(frac, 0.01)
-                msg += f" — {_fmt_eta(eta)} left"
-        elif phase == 'whisper_pending':
-            pct_int = 42
-            msg = "Releasing face detection models — freeing GPU for Whisper..."
-            hb_label = "transcription"
-        else:  # whisper
-            pct_int = int(42 + frac * 14)  # 42% → 56%
-            pct_int = max(42, min(56, pct_int))
-            w_elapsed = _time.monotonic() - _whisper_t0[0]
-            msg = f"Transcribing audio with Whisper ({int(frac * 100)}%)"
-            hb_label = "transcription"
-            if frac >= 0.02 and w_elapsed > 5:
-                eta = w_elapsed * (1.0 - frac) / max(frac, 0.01)
-                msg += f" — {_fmt_eta(eta)} left"
+            # ``hb_label`` names the actual sub-phase so the heartbeat (which
+            # fires during the long stretches where the % stalls — e.g.
+            # Whisper's post-VAD merge) reads "Still processing...
+            # (transcription — Xm)" instead of the misleading "scene analysis".
+            if phase == 'faces':
+                pct_int = int(15 + frac * 27)  # 15% → 42%
+                pct_int = max(15, min(42, pct_int))
+                msg = f"Detecting faces + motion analysis ({int(frac * 100)}%)"
+                hb_label = "face + motion detection"
+                if frac >= 0.02 and elapsed > 15:
+                    eta = elapsed * (1.0 - frac) / max(frac, 0.01)
+                    msg += f" — {_fmt_eta(eta)} left"
+            elif phase == 'whisper_pending':
+                pct_int = 42
+                msg = "Releasing face detection models — freeing GPU for Whisper..."
+                hb_label = "transcription"
+            else:  # whisper
+                pct_int = int(42 + frac * 14)  # 42% → 56%
+                pct_int = max(42, min(56, pct_int))
+                w_elapsed = _time.monotonic() - _whisper_t0[0]
+                msg = f"Transcribing audio with Whisper ({int(frac * 100)}%)"
+                hb_label = "transcription"
+                if frac >= 0.02 and w_elapsed > 5:
+                    eta = w_elapsed * (1.0 - frac) / max(frac, 0.01)
+                    msg += f" — {_fmt_eta(eta)} left"
+
+        # Forward-only: interleaved callbacks (concurrent audio precondition
+        # vs face sampling; a late straggler after a phase flip) used to make
+        # the bar jump BACKWARDS in the activity log. Clamp to the highest
+        # percent already shown; the message still updates so sub-phase text
+        # stays truthful.
+        pct_int = max(int(pct_int), _last_emitted_pct[0])
+        _last_emitted_pct[0] = pct_int
 
         try:
             asyncio.run_coroutine_threadsafe(
@@ -3959,6 +3989,7 @@ async def _run_analysis_inner(job_id: str):
     await _update_progress(
         job_id, JobStatus.ANALYZING_SCENES, 15,
         "Starting reframer analysis (faces, transcription, motion)...",
+        heartbeat_label="face + motion detection",
     )
 
     # Re-state GPU status now that the page is reliably subscribed (the
@@ -4178,7 +4209,8 @@ async def _run_analysis_inner(job_id: str):
 
     await _update_progress(
         job_id, JobStatus.ANALYZING_SCENES, 57,
-        "Running speaker diarization + audio correlation...",
+        "Finalizing speaker analysis + freeing GPU memory...",
+        heartbeat_label="speaker analysis wrap-up",
     )
     # Whisper ran inside the Perceiver. Normally free its VRAM now (before the
     # VLM/summary stage). EXCEPTION: when this job will do a Whisper-native
@@ -4242,6 +4274,7 @@ async def _run_analysis_inner(job_id: str):
     await _update_progress(
         job_id, JobStatus.ANALYZING_SCENES, 60,
         "Converting analysis into render plan + scenes...",
+        heartbeat_label="render plan conversion",
     )
     async with _stage_timer(job_id, "bridge_conversion"):
         render_plan = to_fez_render_plan(

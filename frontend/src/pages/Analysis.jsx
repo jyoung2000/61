@@ -697,6 +697,33 @@ export default function Analysis() {
         // incoming save 2–14%"). Block any meaningful increase instead.
         if (dF > cF + 0.05) return;
       }
+      // Union guard (mirrors the backend's detect_union_write): a genuine
+      // subtitle edit never adds 25%+ more cues than the stored track, and
+      // never adds hundreds of verbatim COPIES of existing lines. A derived
+      // list that does is a stale timeline union (stacked backfill
+      // generations splayed by overlap resolution) — writing it is what
+      // turned a clean 406-cue transcript into 625 cues with 117 lines
+      // repeated ~3x at shifted times. Skip the write; the stale-track sync
+      // effect rebuilds the timeline from the clean transcript instead.
+      if (current.length > 0
+          && derived.length > Math.max(current.length * 1.25, current.length + 15)) {
+        const dupShare = (rows) => {
+          const counts = new Map();
+          let total = 0;
+          for (const s of rows) {
+            const t = String((s && (s.text ?? s.subtitleText)) || '')
+              .toLowerCase().replace(/\s+/g, ' ').trim();
+            if (t.length < 8 || t.startsWith('[')) continue;
+            total++;
+            counts.set(t, (counts.get(t) || 0) + 1);
+          }
+          if (!total) return 0;
+          let dup = 0;
+          for (const n of counts.values()) if (n > 1) dup += n;
+          return dup / total;
+        };
+        if (dupShare(derived) >= dupShare(current) + 0.10) return;
+      }
       const target = usingTranslated ? 'translated' : 'original';
       try {
         const res = await fetch(`/api/jobs/${jobId}/transcript`, {

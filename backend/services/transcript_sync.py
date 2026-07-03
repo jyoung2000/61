@@ -38,7 +38,82 @@ def clean_and_sort_segments(segments: list) -> list[dict]:
             continue
         coerced.append(seg)
     coerced.sort(key=lambda x: (x.start, x.end))
-    return [s.model_dump() for s in coerced]
+    # Drop verbatim duplicates at the SAME position (same normalized text and
+    # ~same start) — the signature of a subtitle track that was backfilled
+    # twice into the same timeline. Duplicates at different times are handled
+    # by detect_union_write at the endpoint (they need the stored track to
+    # judge), never here — real dialogue genuinely repeats lines.
+    deduped: list[TranscriptSegment] = []
+    seen: set = set()
+    for seg in coerced:
+        key = (round(seg.start, 1), _norm_cue_text(seg.text))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(seg)
+    return [s.model_dump() for s in deduped]
+
+
+def _norm_cue_text(text: str) -> str:
+    """Lowercased, whitespace-collapsed cue text for duplicate comparison."""
+    return " ".join((text or "").lower().split())
+
+
+def _duplicate_text_share(rows: list, min_chars: int = 8) -> float:
+    """Fraction of cues whose normalized text also appears on ANOTHER cue.
+
+    Short interjections ("Yeah.", "Okay.") legitimately recur in real
+    dialogue, so only lines of ``min_chars``+ characters count. Accepts
+    dicts or models; timing is ignored — this measures pure text-level
+    duplication across the track.
+    """
+    texts = []
+    for s in rows or []:
+        t = s.get("text") if isinstance(s, dict) else getattr(s, "text", "")
+        norm = _norm_cue_text(t)
+        if len(norm) >= min_chars and not norm.startswith("["):
+            texts.append(norm)
+    if not texts:
+        return 0.0
+    from collections import Counter
+    counts = Counter(texts)
+    dup = sum(n for n in counts.values() if n > 1)
+    return dup / len(texts)
+
+
+def detect_union_write(incoming: list, stored: list) -> tuple[bool, str]:
+    """Detect a "stale-union" transcript replace before it poisons storage.
+
+    The observed corruption (job 77198bd0, 2026-07-03 run): the NLE
+    reverse-sync PUT a timeline holding the fresh subtitle track PLUS stale
+    generations of the same cues at shifted times — the stored track went
+    406 clean cues → 625 with 117 texts repeated ~3x each at timestamps
+    minutes apart (one phantom family at a constant +19min offset, another
+    splayed by overlap resolution). A genuine user edit never looks like
+    that: splits/merges change the count modestly and produce NEW text
+    fragments, not hundreds of verbatim copies of existing lines.
+
+    Signature required (BOTH must hold):
+      * the incoming track is much bigger than the stored one
+        (>25% AND >15 cues more), and
+      * the incoming track's duplicate-text share is well above the stored
+        track's (+10 points) — i.e. the extra cues are copies, not content.
+
+    Returns ``(is_union, reason)``. Fail-open: an empty/absent stored track
+    can't be poisoned, so anything is allowed then.
+    """
+    inc_n = len(incoming or [])
+    st_n = len(stored or [])
+    if st_n == 0 or inc_n <= max(int(st_n * 1.25), st_n + 15):
+        return False, ""
+    inc_share = _duplicate_text_share(incoming)
+    st_share = _duplicate_text_share(stored)
+    if inc_share >= st_share + 0.10:
+        return True, (
+            f"incoming {inc_n} cues vs stored {st_n} with duplicate-text "
+            f"share {inc_share:.0%} vs {st_share:.0%} — looks like a stale "
+            "timeline union, not an edit")
+    return False, ""
 
 
 def is_editor_state_corrupt(state: dict) -> tuple[bool, str]:
