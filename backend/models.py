@@ -253,6 +253,11 @@ class JobResult(BaseModel):
     provider_used: dict = {}  # {task: model_name}
     created_at: str = ""
     updated_at: str = ""
+    # Liveness signal, distinct from updated_at: stamped ~once a minute by
+    # the pipeline heartbeat even during long silent stages, so revive can
+    # tell "long Whisper pass" apart from "dead run" within minutes instead
+    # of the old 30/120-minute updated_at guesses.
+    heartbeat_at: str = ""
     analysis_started_at: Optional[str] = None  # ISO timestamp when analysis began
     analysis_duration_seconds: Optional[float] = None  # total wall-clock time for analysis
     summary: Optional[VideoSummary] = None

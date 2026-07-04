@@ -705,33 +705,15 @@ _NON_TERMINAL_STATUSES = {
 }
 
 
-def _job_age_seconds(job) -> Optional[float]:
-    """Seconds since the job's ``updated_at``; ``None`` when unparseable.
-
-    A live run stamps ``updated_at`` on every progress write, so a large age
-    means no worker is advancing this job (the run died) — the signal that makes
-    periodic recovery safe to act without ever touching an in-flight run."""
-    ts = (getattr(job, "updated_at", "") or "").strip()
-    if not ts:
-        return None
-    try:
-        from datetime import datetime, timezone
-        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return (datetime.now(timezone.utc) - dt).total_seconds()
-    except Exception:
-        return None
-
-
-def _is_stale(job, stale_after_s: float) -> bool:
-    """True when the job hasn't been written for ``stale_after_s`` (or has no
-    timestamp). ``stale_after_s <= 0`` means 'no staleness requirement' — used at
-    startup, where every worker thread is already dead."""
-    if stale_after_s <= 0:
-        return True
-    age = _job_age_seconds(job)
-    return age is None or age >= stale_after_s
+# Staleness math lives in backend.services.job_liveness so the reconcile
+# contract stays unit-testable without fastapi/uvicorn. It considers the
+# freshest of updated_at AND heartbeat_at (the pipeline heartbeat persists
+# the latter ~once a minute even through long silent stages), which is what
+# makes the tight thresholds below safe.
+from backend.services.job_liveness import (  # noqa: E402
+    is_stale as _is_stale,
+    job_age_seconds as _job_age_seconds,
+)
 
 
 def _has_complete_results(job) -> bool:
@@ -818,14 +800,77 @@ async def _recover_stale_jobs(
     return completed, failed
 
 
+# With the persisted heartbeat (~60s cadence) a job with no liveness signal
+# for these windows is genuinely dead — the old updated_at-only thresholds
+# (30 min / 2 h) existed because long silent stages produced no DB writes.
+_RECONCILE_COMPLETE_STALE_S = 600    # 10 min: finished work, lost COMPLETE write
+_RECONCILE_RESUME_STALE_S = 900      # 15 min: dead mid-run → revive in-session
+
+
+async def _resume_stale_jobs(stale_s: float) -> tuple[int, int]:
+    """Mid-session revive: re-queue result-less jobs whose run died while the
+    server stayed up (worker task crashed, OOM-killed subprocess, …) — the case
+    startup recovery never sees. Same attempt cap + queue as startup auto-resume;
+    when auto-resume is disabled (or the cap is hit) the job is FAILED so the UI
+    shows a re-analysable error instead of an eternal spinner.
+
+    Returns ``(resumed, failed)``."""
+    import backend.database as _db
+    resumed = failed = 0
+    for job in await _db.list_jobs(include_unowned=True, light=True):
+        if job.status not in _NON_TERMINAL_STATUSES:
+            continue
+        if _has_complete_results(job):
+            continue  # the complete-branch of _recover_stale_jobs owns these
+        if not _is_stale(job, stale_s):
+            continue
+        if job.job_id in _resume_queue:
+            continue  # already queued — don't double-bump the attempt counter
+        attempts = int(getattr(job, "resume_attempts", 0) or 0)
+        if _auto_resume_enabled() and attempts < _MAX_AUTO_RESUME_ATTEMPTS:
+            await _db.update_job_status(
+                job.job_id, status="queued", progress=0,
+                resume_attempts=attempts + 1,
+                progress_message="Run stalled — resuming from checkpoint…",
+            )
+            try:
+                _schedule_resume(job.job_id)
+                resumed += 1
+                logger.warning(
+                    "Revive: job %s went silent in '%s' — re-queued "
+                    "(attempt %d/%d)",
+                    job.job_id, job.status, attempts + 1,
+                    _MAX_AUTO_RESUME_ATTEMPTS)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Revive: failed to schedule %s: %s", job.job_id, exc)
+        else:
+            await _db.update_job_status(
+                job.job_id, status="failed", progress=0,
+                progress_message=(
+                    "Analysis interrupted — please re-analyse"
+                    if not _auto_resume_enabled() else
+                    f"Analysis interrupted — auto-resume gave up after "
+                    f"{attempts} attempt(s). Re-analyse to retry."),
+            )
+            failed += 1
+            logger.warning(
+                "Revive: job %s stuck in '%s' with no results — marked FAILED",
+                job.job_id, job.status)
+    return resumed, failed
+
+
 async def _reconcile_finished_jobs() -> int:
-    """Back-compat shim: periodic reconcile-to-complete, staleness-guarded so it
-    never completes an in-flight run. Also fails jobs stuck with no results for a
-    very long time. Returns the count marked COMPLETE."""
+    """Periodic reconcile: complete stale finished jobs, then revive (or fail)
+    stale dead runs. Staleness rides the persisted heartbeat, so it never
+    touches an in-flight run. Returns the count marked COMPLETE."""
     completed, _failed = await _recover_stale_jobs(
-        complete_stale_s=1800,   # 30 min: a live run writes progress well inside this
-        fail_stale_s=7200,       # 2 h: only a truly dead, result-less run
+        complete_stale_s=_RECONCILE_COMPLETE_STALE_S,
+        fail_stale_s=None,   # result-less jobs are handled by the revive pass
     )
+    try:
+        await _resume_stale_jobs(_RECONCILE_RESUME_STALE_S)
+    except Exception as exc:  # noqa: BLE001 — revive must never break the loop
+        logger.warning("Stale-job revive pass failed (non-fatal): %s", exc)
     return completed
 
 

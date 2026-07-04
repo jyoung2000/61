@@ -117,3 +117,50 @@ def test_complete_job_not_reprocessed(tmp_job_store):
         return await _reconcile_finished_jobs()
 
     assert _aiorun(scenario()) == 0
+
+
+# ── Liveness math (heartbeat-aware staleness, fix 5) ─────────────────────
+
+def test_job_age_uses_freshest_of_updated_and_heartbeat():
+    from datetime import datetime, timedelta, timezone
+    from types import SimpleNamespace
+    from backend.services.job_liveness import job_age_seconds, is_stale
+
+    now = datetime.now(timezone.utc)
+    old = (now - timedelta(minutes=45)).isoformat()
+    fresh = (now - timedelta(seconds=30)).isoformat()
+
+    # Long silent stage: no progress writes for 45 min, but the heartbeat
+    # stamped 30s ago — the job is ALIVE and must not look stale.
+    j = SimpleNamespace(updated_at=old, heartbeat_at=fresh)
+    age = job_age_seconds(j)
+    assert age is not None and age < 60
+    assert is_stale(j, 600) is False
+
+    # Dead run: both signals old.
+    dead = SimpleNamespace(updated_at=old, heartbeat_at=old)
+    assert is_stale(dead, 600) is True
+
+    # Legacy job without the heartbeat field at all.
+    legacy = SimpleNamespace(updated_at=fresh)
+    assert is_stale(legacy, 600) is False
+
+    # No signals at all → treated as stale (recoverable), never crashes.
+    blank = SimpleNamespace(updated_at="", heartbeat_at="")
+    assert job_age_seconds(blank) is None
+    assert is_stale(blank, 600) is True
+
+    # stale_after_s <= 0 = no staleness requirement (startup semantics).
+    assert is_stale(j, 0) is True
+
+
+def test_heartbeat_at_field_persists(tmp_job_store):
+    """heartbeat_at travels through update_job_status kwargs like any field."""
+    async def run():
+        await db.save_job(JobResult(
+            job_id="hb1", filename="v.mp4", file_path="/tmp/v.mp4", status=JobStatus.TRANSCRIBING,
+            progress=40))
+        await db.update_job_status("hb1", heartbeat_at="2026-07-04T12:00:00+00:00")
+        return await db.load_job("hb1")
+    loaded = _aiorun(run())
+    assert loaded.heartbeat_at == "2026-07-04T12:00:00+00:00"

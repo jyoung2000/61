@@ -1276,10 +1276,16 @@ async def _await_source_hash(job_id: str, task, video_path: str) -> str:
 class _PipelineHeartbeat:
     """Emits keepalive messages when no real progress update has been sent."""
 
-    def __init__(self, job_id: str, interval: float = 15.0):
+    def __init__(self, job_id: str, interval: float = 15.0,
+                 persist_interval: float = 60.0):
         self.job_id = job_id
         self.interval = interval
+        # DB liveness stamps are much sparser than WS keepalives — one tiny
+        # write a minute is enough for revive to detect a dead run in
+        # minutes, without adding real write load.
+        self.persist_interval = persist_interval
         self.last_emit = _time.monotonic()
+        self._last_persist = _time.monotonic()
         self.current_stage = ""
         self.stage_start = _time.monotonic()
         self._task: asyncio.Task | None = None
@@ -1308,6 +1314,21 @@ class _PipelineHeartbeat:
                         "message": msg,
                     })
                     self.last_emit = _time.monotonic()
+                # Persist liveness (~1/min) so revive can distinguish a long
+                # silent stage from a dead run. heartbeat_at is a dedicated
+                # field — progress values/messages are never touched, so this
+                # can't clobber real progress (the reason the WS keepalive
+                # deliberately skipped the DB).
+                if _time.monotonic() - self._last_persist >= self.persist_interval:
+                    self._last_persist = _time.monotonic()
+                    try:
+                        from datetime import datetime as _dt, timezone as _tz
+                        await database.update_job_status(
+                            self.job_id,
+                            heartbeat_at=_dt.now(_tz.utc).isoformat(),
+                        )
+                    except Exception:
+                        pass  # liveness is best-effort — never break a run
         except asyncio.CancelledError:
             pass
 
