@@ -85,7 +85,22 @@ For each type (dissolve, fade, wipe left/right, slide left/right, zoom):
       shades the preview; overlay warnings appear in the QA block
 - [ ] OS "reduce motion" enabled: no dialog scale-in, no playhead glide
 
-## 7. Phone / tablet (390×844 and 820×1180)
+## 7. Final-polish spot checks
+
+- [ ] Hover each transport button (back 5s / play / forward 5s / mute /
+      fullscreen) and the timeline toolbar (zoom, Fit, Snap, Ripple):
+      styled tooltips appear after ~400 ms with kbd chips (Space, J, L,
+      M, ⇧Z, N, \); moving between adjacent buttons re-shows instantly
+- [ ] Effects panel: drag any value readout to scrub (Shift = coarse,
+      Alt = fine); a changed control shows the dot and clicking its
+      label resets just that control; one ⌘Z undoes a whole drag
+- [ ] iOS Safari: open the fullscreen lightbox — the frame fills the
+      visible screen exactly with the toolbar BOTH expanded and
+      collapsed (no cropped bottom edge, no scroll); the bottom-sheet
+      inspector's handle stays reachable with the keyboard open, and
+      scrolling inside the sheet never rubber-bands the page
+
+## 8. Phone / tablet (390×844 and 820×1180)
 
 - [ ] Timeline renders compact lanes; tapping a track header expands
       that lane
