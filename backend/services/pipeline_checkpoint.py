@@ -21,9 +21,23 @@ planner (which has already run by checkpoint time); see the note by
 ``_INT_KEYED_FIELDS``.
 
 Validity is gated on a *signature* (source SHA + sample-fps + aspect ratio +
-source language + vocal-separation setting + a planner-flag fingerprint), so a
-stale checkpoint is never silently reused after the source or the analysis
-settings change.
+source language + vocal-separation setting + a planner-flag fingerprint +
+ASR model), so a stale checkpoint is never silently reused after the source
+or the analysis settings change.
+
+FUTURE — mid-engine (sub-stage) resume, designed but deliberately not built
+yet: the engine checkpoint is written only AFTER the whole engine finishes,
+so a death during Whisper still re-runs the visual pass. The clean seam is
+in ``Perceiver.run()`` right before the "Audio intelligence" section, where
+every visual field on the PerceptionResult (face/motion timelines, scene
+cuts, saliency, consolidated tracks) is final. Implementing it requires
+splitting ``run()`` into ``_visual_pass(r)`` / ``_audio_pass(r)`` and adding
+a signature-gated ``visual.json`` sub-checkpoint restored before the visual
+pass — mechanical, but it restructures the guarded perception pipeline and
+must be landed with a real end-to-end engine run to verify (cv2/YOLO/Whisper
+are not available in the CI sandbox). Post-engine stages already have their
+own resume layer (see :mod:`stage_checkpoints`), which removes most of the
+re-paid wall clock on resume today.
 """
 
 from __future__ import annotations
@@ -47,8 +61,31 @@ logger = logging.getLogger(__name__)
 CHECKPOINT_VERSION = 3
 
 _PERCEPTION_FILE = "engine_perception.json"
+# Compressed variant (gzip'd orjson) — the perception payload is multi-MB
+# (per-second timelines) and /data/uploads commonly sits on a parity array,
+# so compressing cuts the fsync'd write AND the verify-after-save reload by
+# ~5x. Loaders accept either name, so pre-existing plain checkpoints keep
+# working; the plan/meta files stay plain (RenderPlan.load reads the plan).
+_PERCEPTION_FILE_GZ = "engine_perception.json.gz"
 _PLAN_FILE = "engine_plan.json"
 _META_FILE = "engine_meta.json"
+
+# Shared, content-addressed engine cache: the same three files keyed by
+# (source SHA, signature hash) instead of job id. Re-uploading a video (or
+# duplicating a job) hits this and skips detection + transcription entirely
+# — the signature already carries exactly the validity semantics needed.
+_SHARED_CACHE_ROOT = "/data/uploads/_engine_cache"
+
+
+def _signature_hash(signature: dict) -> str:
+    import hashlib
+    canon = json.dumps(signature or {}, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canon.encode("utf-8")).hexdigest()[:16]
+
+
+def shared_cache_dir(signature: dict) -> str:
+    sha = (signature or {}).get("source_sha") or ""
+    return os.path.join(_SHARED_CACHE_ROOT, sha[:16] or "_", _signature_hash(signature))
 
 # Timeline fields whose keys are integers (time_ms, or track_id for the
 # speaker map). JSON stringifies dict keys on write — these are restored to
@@ -306,11 +343,19 @@ def _save_sync(job_id: str, perception, reframer_plan, signature: dict,
     # fastjson (orjson when installed) encodes the multi-MB perception/plan
     # payloads several times faster than stdlib json; _json_safe has already
     # normalized keys to str/int, which both encoders stringify identically.
+    import gzip
     _atomic_write(
-        os.path.join(d, _PERCEPTION_FILE),
-        fastjson.dumps_bytes(_json_safe(_serialize_perception(perception)),
-                             default=_numpy_safe_default),
+        os.path.join(d, _PERCEPTION_FILE_GZ),
+        gzip.compress(
+            fastjson.dumps_bytes(_json_safe(_serialize_perception(perception)),
+                                 default=_numpy_safe_default),
+            compresslevel=5),
     )
+    # Drop a stale plain-format twin so the loader can't prefer old data.
+    try:
+        os.unlink(os.path.join(d, _PERCEPTION_FILE))
+    except OSError:
+        pass
     _atomic_write(
         os.path.join(d, _PLAN_FILE),
         fastjson.dumps_bytes(_json_safe(asdict(reframer_plan)),
@@ -333,6 +378,28 @@ def _save_sync(job_id: str, perception, reframer_plan, signature: dict,
         raise RuntimeError(
             "verify-after-save failed — the checkpoint just written does not "
             "reload with a matching signature (resume would not work)")
+    # Mirror into the shared content-addressed cache so OTHER jobs on the
+    # same source + config skip the engine too. Hardlink when the volume
+    # allows (free), copy otherwise; best-effort — the per-job checkpoint
+    # above is the durability guarantee.
+    try:
+        import shutil
+        shared = shared_cache_dir(signature)
+        if (signature or {}).get("source_sha"):
+            os.makedirs(shared, exist_ok=True)
+            for name in (_PERCEPTION_FILE_GZ, _PLAN_FILE, _META_FILE):
+                src_p = os.path.join(d, name)
+                dst_p = os.path.join(shared, name)
+                try:
+                    os.unlink(dst_p)
+                except OSError:
+                    pass
+                try:
+                    os.link(src_p, dst_p)
+                except OSError:
+                    shutil.copy2(src_p, dst_p)
+    except Exception as _share_err:  # noqa: BLE001 — sharing is opportunistic
+        logger.info("Shared engine-cache mirror skipped: %s", _share_err)
     return True
 
 
@@ -375,35 +442,72 @@ async def save_engine_checkpoint(
         return False
 
 
-def _load_sync(job_id: str, expected_signature: dict):
-    d = checkpoint_dir(job_id)
-    meta_path = os.path.join(d, _META_FILE)
-    perception_path = os.path.join(d, _PERCEPTION_FILE)
-    plan_path = os.path.join(d, _PLAN_FILE)
-    present = {p: os.path.isfile(p) for p in (meta_path, perception_path, plan_path)}
+def _read_perception_bytes(directory: str) -> Optional[bytes]:
+    """Perception payload from ``directory`` — gz preferred, plain legacy."""
+    import gzip
+    gz = os.path.join(directory, _PERCEPTION_FILE_GZ)
+    if os.path.isfile(gz):
+        with open(gz, "rb") as f:
+            return gzip.decompress(f.read())
+    plain = os.path.join(directory, _PERCEPTION_FILE)
+    if os.path.isfile(plain):
+        with open(plain, "rb") as f:
+            return f.read()
+    return None
+
+
+def _probe_dir(directory: str, expected_signature: dict, label: str):
+    """Try to load a full checkpoint from ``directory``. Returns the parsed
+    (meta, perception_bytes, plan_path) or None (with reason logging)."""
+    meta_path = os.path.join(directory, _META_FILE)
+    plan_path = os.path.join(directory, _PLAN_FILE)
+    has_perception = (os.path.isfile(os.path.join(directory, _PERCEPTION_FILE_GZ))
+                      or os.path.isfile(os.path.join(directory, _PERCEPTION_FILE)))
+    present = {"meta": os.path.isfile(meta_path),
+               "plan": os.path.isfile(plan_path),
+               "perception": has_perception}
     if not all(present.values()):
-        missing = [os.path.basename(p) for p, ok in present.items() if not ok]
+        missing = [k for k, ok in present.items() if not ok]
         # A wholly-absent checkpoint is the normal first-run / source-changed
         # case — stay quiet. A PARTIAL one (some files, not all) is a real
         # problem (interrupted write, manual deletion) worth flagging.
         if any(present.values()):
             logger.warning(
-                "[%s] Engine checkpoint incomplete — missing %s; re-running engine",
-                job_id, missing)
+                "Engine checkpoint at %s incomplete — missing %s", label, missing)
         return None
 
     with open(meta_path, "r", encoding="utf-8") as f:
         meta = json.load(f)
     if not _signatures_match(meta.get("signature") or {}, expected_signature):
         logger.info(
-            "[%s] Engine checkpoint present but signature differs (%s) — "
-            "re-running engine", job_id,
+            "Engine checkpoint at %s present but signature differs (%s)",
+            label,
             _signature_diff(meta.get("signature") or {}, expected_signature))
         return None
+    payload = _read_perception_bytes(directory)
+    if payload is None:
+        return None
+    return meta, payload, plan_path
+
+
+def _load_sync(job_id: str, expected_signature: dict):
+    # Per-job checkpoint first; on a miss, the shared content-addressed
+    # cache — another job (or a previous upload of the same file) may have
+    # already paid for the engine under this exact signature.
+    hit = _probe_dir(checkpoint_dir(job_id), expected_signature, f"job {job_id}")
+    if hit is None and (expected_signature or {}).get("source_sha"):
+        shared = shared_cache_dir(expected_signature)
+        hit = _probe_dir(shared, expected_signature, f"shared cache {shared}")
+        if hit is not None:
+            logger.info(
+                "[%s] Engine checkpoint served from the SHARED cache — another "
+                "job already analyzed this source with this config", job_id)
+    if hit is None:
+        return None
+    meta, perception_bytes, plan_path = hit
 
     from backend.services import fastjson
-    with open(perception_path, "rb") as f:
-        perception = _deserialize_perception(fastjson.loads(f.read()))
+    perception = _deserialize_perception(fastjson.loads(perception_bytes))
 
     from backend.services.reframer_models import RenderPlan
     reframer_plan = RenderPlan.load(plan_path)

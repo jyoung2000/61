@@ -333,3 +333,54 @@ def test_missing_checkpoint_returns_none(tmp_path, monkeypatch):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+# ── Compressed perception + shared cache (fix 7/8) ──────────────────────
+
+def test_read_perception_prefers_gz_and_falls_back_to_plain(tmp_path):
+    import gzip
+    d = tmp_path / "ck"
+    d.mkdir()
+    (d / "engine_perception.json").write_bytes(b'{"src_w": 1}')
+    assert pc._read_perception_bytes(str(d)) == b'{"src_w": 1}'
+    # gz twin wins when both exist (the writer removes the plain twin, but
+    # the loader must prefer fresh-over-stale regardless)
+    (d / "engine_perception.json.gz").write_bytes(gzip.compress(b'{"src_w": 2}'))
+    assert pc._read_perception_bytes(str(d)) == b'{"src_w": 2}'
+    assert pc._read_perception_bytes(str(tmp_path / "missing")) is None
+
+
+def test_probe_dir_gates_on_signature(tmp_path):
+    import gzip, json as _json
+    d = tmp_path / "ck"
+    d.mkdir()
+    sig = pc.checkpoint_signature(source_sha="abc", source_language="en",
+                                  sample_fps=5.0, aspect_ratio="9:16")
+    (d / "engine_meta.json").write_text(_json.dumps({"signature": sig, "audio": {}}))
+    (d / "engine_plan.json").write_text("{}")
+    (d / "engine_perception.json.gz").write_bytes(gzip.compress(b'{"src_w": 640}'))
+
+    hit = pc._probe_dir(str(d), sig, "test")
+    assert hit is not None
+    meta, payload, plan_path = hit
+    assert payload == b'{"src_w": 640}'
+    assert plan_path.endswith("engine_plan.json")
+
+    other = pc.checkpoint_signature(source_sha="abc", source_language="ja",
+                                    sample_fps=5.0, aspect_ratio="9:16")
+    assert pc._probe_dir(str(d), other, "test") is None
+    # Partial checkpoint (missing plan) is rejected
+    (d / "engine_plan.json").unlink()
+    assert pc._probe_dir(str(d), sig, "test") is None
+
+
+def test_shared_cache_dir_is_content_addressed():
+    a = pc.checkpoint_signature(source_sha="a" * 64, source_language="en",
+                                sample_fps=5.0, aspect_ratio="9:16")
+    b = pc.checkpoint_signature(source_sha="a" * 64, source_language="ja",
+                                sample_fps=5.0, aspect_ratio="9:16")
+    da, db = pc.shared_cache_dir(a), pc.shared_cache_dir(b)
+    assert da != db                      # different config → different slot
+    assert da.startswith(pc._SHARED_CACHE_ROOT)
+    assert ("a" * 16) in da              # sha prefix keys the family
+    assert pc.shared_cache_dir(a) == da  # deterministic
