@@ -59,6 +59,7 @@
 | Active word background opacity (`activeWordBgOpacity`) | ClipSettingsPanel | ✅ | ✅ | ✅ |  |
 | Active word background radius (`activeWordBgRadius`) | ClipSettingsPanel | ✅ | ✅ | ⚠️ | Same ASS box-radius approximation as subtitleBgRadius. |
 | Active word outline color (`activeWordOutlineColor`) | ClipSettingsPanel | ✅ | ✅ | ✅ |  |
+| Export quality (720p/1080p/1440p/4K) (`exportQuality`) | ClipSettingsPanel | — | ✅ | ✅ | Quality list + per-aspect dims live in defaultSettings.js (EXPORT_QUALITIES / EXPORT_DIMS_BY_QUALITY) mirroring backend ASPECT_RATIO_DIMS_BY_QUALITY — dialog, panel and server share one table (fixes the 1440p offered-but-exported-as-1080p bug). Quality names the shortest side for portrait/square aspects on every path. |
 | Layout mode (auto/single/split) (`layoutMode`) | ClipSettingsPanel | ✅ | ✅ | ✅ |  |
 | Gaming layouts (fullscreen/blurfill/wide_zoom) (`gamingLayoutMode`) | ClipSettingsPanel | ✅ | ✅ | ✅ | Blurfill blur now matches server exactly: CSS blur(50px) brightness(0.9) ↔ gblur=sigma=50,eq=brightness=-0.1. |
 | Subject tracking crop (keyframes) (`subjectTracking`) | ClipSettingsPanel | ✅ | ✅ | ✅ | Same keyframe pipeline injected via RenderEngine.setSubjectTrackingFns; server renders the RenderPlan. |

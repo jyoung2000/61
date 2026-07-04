@@ -195,7 +195,7 @@ class SEOResponse(BaseModel):
 class BatchExportRequest(BaseModel):
     clip_ids: list[int] = Field(default=[], description="Clip IDs to export. Empty = export all clips.")
     aspect_ratio: str = Field(default="9:16", description="Aspect ratio: 16:9, 9:16, 1:1, 4:5")
-    export_quality: str = Field(default="1080p", description="Quality: 720p, 1080p, 4k")
+    export_quality: str = Field(default="1080p", description="Quality: 720p, 1080p, 1440p, 4k")
     subtitles_enabled: bool = True
     subtitle_settings: Optional[SubtitleSettings] = None
     generate_seo: bool = Field(default=False, description="Also generate SEO for each clip")
@@ -312,7 +312,7 @@ class PipelineRequest(BaseModel):
     min_duration: float = Field(default=15, ge=1, description="Minimum clip duration in seconds")
     max_duration: float = Field(default=90, ge=1, description="Maximum clip duration in seconds")
     aspect_ratio: str = Field(default="9:16", description="Export aspect ratio: 16:9, 9:16, 1:1, 4:5")
-    export_quality: str = Field(default="1080p", description="Export quality: 720p, 1080p, 4k")
+    export_quality: str = Field(default="1080p", description="Export quality: 720p, 1080p, 1440p, 4k")
     subtitles_enabled: bool = Field(default=True, description="Burn subtitles into exported clips")
     subtitle_settings: Optional[SubtitleSettings] = Field(default=None, description="Custom subtitle styling")
     auto_select: str = Field(default="top", description="'top' = export highest viral_score, 'all' = export all")

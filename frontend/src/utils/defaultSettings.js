@@ -96,8 +96,46 @@ export const TRANSITION_RANGES = {
 /** Volume slider — 0..1 internally, 0..100 in any UI label. */
 export const VOLUME_RANGE = { min: 0, max: 1, step: 0.01 };
 
-/** Export quality presets — keep the dialog and the panel in sync. */
-export const EXPORT_QUALITIES = ['720p', '1080p', '4k'];
+/**
+ * Export quality presets — SINGLE source for the dialog, the settings
+ * panel, and client-export dimensions. ``EXPORT_QUALITY_PRESETS`` and
+ * ``EXPORT_DIMS_BY_QUALITY`` mirror the backend tables in
+ * ``clip_exporter.py`` (QUALITY_PRESETS / ASPECT_RATIO_DIMS_BY_QUALITY)
+ * so the dialog can never offer a quality the server silently downgrades
+ * (the 1440p bug: dialog offered it, server exported 1080p).
+ */
+export const EXPORT_QUALITIES = ['720p', '1080p', '1440p', '4k'];
+
+export const EXPORT_QUALITY_PRESETS = {
+  '720p':  { label: '720p',  w: 1280, h: 720,  bitrate: 4_000_000 },
+  '1080p': { label: '1080p', w: 1920, h: 1080, bitrate: 8_000_000 },
+  '1440p': { label: '1440p', w: 2560, h: 1440, bitrate: 16_000_000 },
+  '4k':    { label: '4K',    w: 3840, h: 2160, bitrate: 35_000_000 },
+};
+
+/**
+ * Output dimensions per quality × aspect ratio — exact mirror of the
+ * backend ``ASPECT_RATIO_DIMS_BY_QUALITY`` table. Quality names the
+ * SHORTEST side for non-16:9 aspects (e.g. 9:16 @ 1080p → 1080×1920),
+ * matching the server convention, so client and server exports of the
+ * same clip have identical pixel dimensions.
+ */
+export const EXPORT_DIMS_BY_QUALITY = {
+  '720p':  { '16:9': [1280, 720],  '9:16': [720, 1280],  '1:1': [720, 720],   '4:5': [720, 900] },
+  '1080p': { '16:9': [1920, 1080], '9:16': [1080, 1920], '1:1': [1080, 1080], '4:5': [1080, 1350] },
+  '1440p': { '16:9': [2560, 1440], '9:16': [1440, 2560], '1:1': [1440, 1440], '4:5': [1440, 1800] },
+  '4k':    { '16:9': [3840, 2160], '9:16': [2160, 3840], '1:1': [2160, 2160], '4:5': [2160, 2700] },
+};
+
+/**
+ * Resolve export dimensions for a quality + optional aspect ratio.
+ * Falls back to the 16:9 preset dims when the aspect is unknown.
+ */
+export function getExportDims(quality, aspectRatio) {
+  const table = EXPORT_DIMS_BY_QUALITY[quality] || EXPORT_DIMS_BY_QUALITY['1080p'];
+  const dims = (aspectRatio && table[aspectRatio]) || table['16:9'];
+  return { w: dims[0], h: dims[1] };
+}
 
 /**
  * Single-source vertical-position alias table.

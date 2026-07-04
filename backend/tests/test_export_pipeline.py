@@ -3329,6 +3329,71 @@ def test_quality_applied_all_aspect_ratio_combinations():
                     )
 
 
+# ---------------------------------------------------------------------------
+# 1440p end-to-end (parity fix: dialog offered 1440p, server exported 1080p)
+# ---------------------------------------------------------------------------
+
+# Canonical quality × aspect output dims. This is the SAME table as
+# frontend/src/utils/defaultSettings.js EXPORT_DIMS_BY_QUALITY — if you
+# change one, change both (and the parity matrix note for exportQuality).
+EXPECTED_DIMS = {
+    "720p":  {"16:9": (1280, 720),  "9:16": (720, 1280),  "1:1": (720, 720),   "4:5": (720, 900)},
+    "1080p": {"16:9": (1920, 1080), "9:16": (1080, 1920), "1:1": (1080, 1080), "4:5": (1080, 1350)},
+    "1440p": {"16:9": (2560, 1440), "9:16": (1440, 2560), "1:1": (1440, 1440), "4:5": (1440, 1800)},
+    "4k":    {"16:9": (3840, 2160), "9:16": (2160, 3840), "1:1": (2160, 2160), "4:5": (2160, 2700)},
+}
+
+
+def test_quality_tables_share_keys():
+    """Every quality tier is present in ALL three backend tables.
+
+    Guards against the 1440p bug class: a quality existing in one table
+    but silently falling back to 1080p in another.
+    """
+    assert set(QUALITY_PRESETS) == set(EXPECTED_DIMS)
+    assert set(QUALITY_MAX_HEIGHT) == set(EXPECTED_DIMS)
+    assert set(ASPECT_RATIO_DIMS_BY_QUALITY) == set(EXPECTED_DIMS)
+
+
+def test_output_dims_every_quality_and_aspect():
+    """_compute_video_out_dims returns the canonical dims for every combo."""
+    from backend.services.clip_exporter import _compute_video_out_dims
+
+    for quality, aspects in EXPECTED_DIMS.items():
+        for ar, (exp_w, exp_h) in aspects.items():
+            got = _compute_video_out_dims(1920, 1080, ar, quality)
+            assert got == (exp_w, exp_h), (
+                f"{quality} {ar}: expected {exp_w}x{exp_h}, got {got[0]}x{got[1]}"
+            )
+
+
+def test_filter_chain_scales_every_quality_and_aspect():
+    """The actual FFmpeg filter string carries the canonical scale dims."""
+    for quality, aspects in EXPECTED_DIMS.items():
+        for ar, (exp_w, exp_h) in aspects.items():
+            vf, _, _ = _build_filter_chain(ar, 1920, 1080, None, export_quality=quality)
+            assert vf is not None, f"{quality} {ar}: expected a filter chain"
+            assert f"scale={exp_w}:{exp_h}" in vf, (
+                f"{quality} {ar}: expected scale={exp_w}:{exp_h} in '{vf}'"
+            )
+
+
+def test_1440p_no_aspect_scales_to_1440():
+    """Without an aspect ratio, 1440p scales a 1080p source up to 1440-high."""
+    vf, _, _ = _build_filter_chain(None, 1920, 1080, None, export_quality="1440p")
+    assert vf is not None and ":1440" in vf, f"expected height 1440 scale, got: {vf}"
+
+    # A 1440-high source needs no scaling at all
+    vf_same, _, _ = _build_filter_chain(None, 2560, 1440, None, export_quality="1440p")
+    assert vf_same is None, f"expected stream copy for same-height source, got: {vf_same}"
+
+
+def test_1440p_crf_matches_1080p_tier():
+    """1440p sits on the same CRF rung as 1080p/4k (18), not the 720p rung."""
+    assert QUALITY_PRESETS["1440p"]["crf"] == QUALITY_PRESETS["1080p"]["crf"]
+    assert QUALITY_MAX_HEIGHT["1440p"] == 1440
+
+
 # ===========================================================================
 # MAIN
 # ===========================================================================

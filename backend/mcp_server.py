@@ -102,7 +102,7 @@ TOOLS = [
                 "start": {"type": "number", "description": "Start time in seconds"},
                 "end": {"type": "number", "description": "End time in seconds"},
                 "aspect_ratio": {"type": "string", "description": "Aspect ratio: 16:9, 9:16, 1:1, 4:5", "default": "9:16"},
-                "export_quality": {"type": "string", "description": "Quality: 720p, 1080p, 4k", "default": "1080p"},
+                "export_quality": {"type": "string", "description": "Quality: 720p, 1080p, 1440p, 4k", "default": "1080p"},
                 "subtitles_enabled": {"type": "boolean", "description": "Burn subtitles into video", "default": True},
                 "clip_title": {"type": "string", "description": "Optional title for the exported file"},
             },

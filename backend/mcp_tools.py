@@ -312,7 +312,7 @@ def register_tools(mcp):
             job_id: The job ID.
             clip_index: The clip ID to export.
             aspect_ratio: Target ratio: "9:16", "1:1", "16:9", "4:5".
-            export_quality: Quality: "720p", "1080p", "4k".
+            export_quality: Quality: "720p", "1080p", "1440p", "4k".
             subtitles_enabled: Burn subtitles into the video.
 
         Returns:

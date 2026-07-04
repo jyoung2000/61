@@ -2043,6 +2043,7 @@ def _verify_centering_math(
 QUALITY_PRESETS = {
     "720p":  {"crf": 20, "preset": "fast"},
     "1080p": {"crf": 18, "preset": "fast"},
+    "1440p": {"crf": 18, "preset": "fast"},
     "4k":    {"crf": 18, "preset": "fast"},
 }
 
@@ -2060,6 +2061,12 @@ ASPECT_RATIO_DIMS_BY_QUALITY = {
         "1:1":  (1080, 1080),
         "4:5":  (1080, 1350),
     },
+    "1440p": {
+        "16:9": (2560, 1440),
+        "9:16": (1440, 2560),
+        "1:1":  (1440, 1440),
+        "4:5":  (1440, 1800),
+    },
     "4k": {
         "16:9": (3840, 2160),
         "9:16": (2160, 3840),
@@ -2075,6 +2082,7 @@ ASPECT_RATIO_DIMS = ASPECT_RATIO_DIMS_BY_QUALITY["1080p"]
 QUALITY_MAX_HEIGHT = {
     "720p": 720,
     "1080p": 1080,
+    "1440p": 1440,
     "4k": 2160,
 }
 

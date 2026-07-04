@@ -6,6 +6,8 @@ import {
   DEFAULT_CLIP_SETTINGS,
   SUBTITLE_RANGES,
   SPEED_OPTIONS,
+  EXPORT_QUALITIES,
+  EXPORT_QUALITY_PRESETS,
   offsetVFromPosition,
   positionFromOffsetV,
 } from '../utils/defaultSettings';
@@ -627,11 +629,10 @@ export default function ClipSettingsPanel({ speakers, speakerNames, videoResolut
               <div style={sectionStyle}>
                 <span style={labelStyle}>Default Export Quality</span>
                 <div style={radioGroupStyle}>
-                  {[
-                    { value: '720p', label: '720p' },
-                    { value: '1080p', label: '1080p' },
-                    { value: '4k', label: '4K' },
-                  ].map((q) => (
+                  {EXPORT_QUALITIES.map((id) => ({
+                    value: id,
+                    label: EXPORT_QUALITY_PRESETS[id].label,
+                  })).map((q) => (
                     <button
                       key={q.value}
                       onClick={() => update('exportQuality', q.value)}

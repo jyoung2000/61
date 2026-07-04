@@ -140,6 +140,11 @@ export const FEATURE_PARITY = [
   { key: 'activeWordOutlineColor', label: 'Active word outline color', panel: 'ClipSettingsPanel',
     preview: 'ok', clientExport: 'ok', serverExport: 'ok' },
 
+  // ── Export quality ───────────────────────────────────────────────
+  { key: 'exportQuality', label: 'Export quality (720p/1080p/1440p/4K)', panel: 'ClipSettingsPanel',
+    preview: 'na', clientExport: 'ok', serverExport: 'ok',
+    notes: 'Quality list + per-aspect dims live in defaultSettings.js (EXPORT_QUALITIES / EXPORT_DIMS_BY_QUALITY) mirroring backend ASPECT_RATIO_DIMS_BY_QUALITY — dialog, panel and server share one table (fixes the 1440p offered-but-exported-as-1080p bug). Quality names the shortest side for portrait/square aspects on every path.' },
+
   // ── Layout / reframing ───────────────────────────────────────────
   { key: 'layoutMode', label: 'Layout mode (auto/single/split)', panel: 'ClipSettingsPanel',
     preview: 'ok', clientExport: 'ok', serverExport: 'ok' },
@@ -171,6 +176,7 @@ export const REQUIRED_KEYS = [
   'activeWordEnabled', 'activeWordColor', 'activeWordBgColor',
   'activeWordBgOpacity', 'activeWordBgRadius', 'activeWordOutlineColor',
   'layoutMode', 'gamingLayoutMode', 'subjectTracking',
+  'exportQuality',
 ];
 
 export const VALID_STATUSES = new Set(['ok', 'partial', 'gap', 'na']);

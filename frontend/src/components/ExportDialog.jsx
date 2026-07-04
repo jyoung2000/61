@@ -3,20 +3,13 @@ import ExportEngine from '../engine/ExportEngine';
 import useTimelineStore from '../stores/timelineStore';
 import { runSubtitleQA } from '../utils/subtitleQA';
 import { buildOverlayPayload, buildVideoEffectsPayload, mapSubtitleSettings } from '../utils/buildExportPayload';
+import { EXPORT_QUALITIES, EXPORT_QUALITY_PRESETS, getExportDims } from '../utils/defaultSettings';
 
-const QUALITY_PRESETS = [
-  { id: '720p', label: '720p', w: 1280, h: 720, bitrate: 4_000_000 },
-  { id: '1080p', label: '1080p', w: 1920, h: 1080, bitrate: 8_000_000 },
-  { id: '1440p', label: '1440p', w: 2560, h: 1440, bitrate: 16_000_000 },
-  { id: '4k', label: '4K', w: 3840, h: 2160, bitrate: 35_000_000 },
-];
-
-const ASPECT_DIMS = {
-  '16:9': { w: 1920, h: 1080 },
-  '9:16': { w: 1080, h: 1920 },
-  '1:1': { w: 1080, h: 1080 },
-  '4:5': { w: 1080, h: 1350 },
-};
+// Derived from the shared quality tables in defaultSettings.js — the
+// dialog can't drift from the panel or the backend dims again.
+// Exported so exportQuality.test.js can assert the dialog offers exactly
+// EXPORT_QUALITIES.
+export const QUALITY_PRESETS = EXPORT_QUALITIES.map((id) => ({ id, ...EXPORT_QUALITY_PRESETS[id] }));
 
 // Tiny labelled-number tile used by the cost/quota preview row.
 function CostStat({ label, value, sub }) {
@@ -140,15 +133,7 @@ export default function ExportDialog({
   };
 
   const subtitleQA = useMemo(() => {
-    const preset = QUALITY_PRESETS.find(p => p.id === quality) || QUALITY_PRESETS[1];
-    let exportW = preset.w;
-    let exportH = preset.h;
-    if (aspectRatio && ASPECT_DIMS[aspectRatio]) {
-      const dims = ASPECT_DIMS[aspectRatio];
-      const scale = preset.h / dims.h;
-      exportW = Math.round(dims.w * scale);
-      exportH = Math.round(dims.h * scale);
-    }
+    const { w: exportW, h: exportH } = getExportDims(quality, aspectRatio);
     const syncInfo = transcript ? { transcript, clipStart: startTime, clipEnd: endTime } : undefined;
     const trackingInfo = scenes?.length ? {
       scenes, clipStart: startTime, clipEnd: endTime,
@@ -336,15 +321,8 @@ export default function ExportDialog({
     setProgress(0);
 
     const preset = QUALITY_PRESETS.find(p => p.id === quality) || QUALITY_PRESETS[1];
-    let exportW = preset.w;
-    let exportH = preset.h;
-
-    if (aspectRatio && ASPECT_DIMS[aspectRatio]) {
-      const dims = ASPECT_DIMS[aspectRatio];
-      const scale = preset.h / dims.h;
-      exportW = Math.round(dims.w * scale);
-      exportH = Math.round(dims.h * scale);
-    }
+    // Shared quality × aspect table — identical pixel dims to server export.
+    const { w: exportW, h: exportH } = getExportDims(quality, aspectRatio);
 
     const engine = new ExportEngine(renderEngine, {
       fps: exportFPS,
