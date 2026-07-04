@@ -147,7 +147,7 @@ function SubtitleProperties({ item, update, settings, onSettingsChange, customFo
     <>
       {/* Subtitle Text (per-item) */}
       <div className="ve-properties__section">
-        <label className="ve-properties__label">Subtitle Text</label>
+        <label className="ve-properties__label">Subtitle text</label>
         <textarea
           value={item.subtitleText || ''}
           onChange={(e) => update('subtitleText', e.target.value)}
@@ -164,7 +164,7 @@ function SubtitleProperties({ item, update, settings, onSettingsChange, customFo
 
       {/* Font Settings */}
       <div className="ve-properties__section">
-        <label className="ve-properties__label">Subtitle Font</label>
+        <label className="ve-properties__label">Subtitle font</label>
         <div className="ve-properties__row">
           <div className="ve-properties__field" style={{ flex: 2 }}>
             <span className="ve-properties__field-label">Family</span>
@@ -789,20 +789,20 @@ export default function PropertiesPanel({ compact = false, settings = null, onSe
               onClick={() => splitCropSegment(selectedCropSeg.id, playhead)}
               style={{ padding: '4px 10px', fontSize: 11, background: 'var(--bg-elevated)', color: 'var(--text-secondary)', border: '1px solid var(--border)', borderRadius: 4, cursor: 'pointer' }}
             >
-              Split at Playhead
+              Split at playhead
             </button>
             <button
               onClick={() => mergeCropWithNext(selectedCropSeg.id)}
               style={{ padding: '4px 10px', fontSize: 11, background: 'var(--bg-elevated)', color: 'var(--text-secondary)', border: '1px solid var(--border)', borderRadius: 4, cursor: 'pointer' }}
             >
-              Merge with Next
+              Merge with next
             </button>
             {selectedCropSeg.isManualOverride && (
               <button
                 onClick={() => resetCropSegment(selectedCropSeg.id, selectedCropSeg.originalCropX)}
                 style={{ padding: '4px 10px', fontSize: 11, background: 'var(--bg-elevated)', color: '#06B6D4', border: '1px solid var(--border)', borderRadius: 4, cursor: 'pointer' }}
               >
-                Reset to Auto
+                Reset to auto
               </button>
             )}
           </div>
@@ -871,6 +871,7 @@ export default function PropertiesPanel({ compact = false, settings = null, onSe
         <button
           className="ve-properties__delete"
           onClick={() => { if (!isLocked) removeItem(item.id); }}
+          aria-label={isLocked ? 'Cannot delete — track is locked' : 'Delete item'}
           title={isLocked ? 'Cannot delete — track is locked' : 'Delete item'}
           disabled={isLocked}
           style={isLocked ? { opacity: 0.3, cursor: 'not-allowed' } : undefined}
@@ -917,7 +918,7 @@ export default function PropertiesPanel({ compact = false, settings = null, onSe
       {isOverlay && (
         <div className="ve-properties__section">
           <div style={{ display: 'flex', alignItems: 'center' }}>
-            <label className="ve-properties__label" style={{ marginBottom: 0 }}>Position & Size</label>
+            <label className="ve-properties__label" style={{ marginBottom: 0 }}>Position & size</label>
             {(hasChanged(item.position, DEFAULTS.position) ||
               hasChanged(item.size, DEFAULTS.size[item.type] || DEFAULTS.size.other) ||
               (item.transform?.rotation || 0) !== DEFAULTS.rotation) && (
@@ -945,7 +946,7 @@ export default function PropertiesPanel({ compact = false, settings = null, onSe
               }}
               title="Reset video to fill viewport"
             >
-              Reset to Fill
+              Reset to fill
             </button>
           )}
         </div>
@@ -1070,7 +1071,7 @@ export default function PropertiesPanel({ compact = false, settings = null, onSe
         <>
           {/* Text Content */}
           <div className="ve-properties__section">
-            <label className="ve-properties__label">Text Content</label>
+            <label className="ve-properties__label">Text content</label>
             <textarea
               value={item.textContent || ''}
               onChange={(e) => update('textContent', e.target.value)}
@@ -1148,7 +1149,7 @@ export default function PropertiesPanel({ compact = false, settings = null, onSe
           {/* Outline & Shadow */}
           <div className="ve-properties__section">
             <label className="ve-properties__label" onClick={() => toggleSection('textOutline')} style={{ cursor: 'pointer' }}>
-              Outline & Shadow {expandedSections.textOutline === false ? '▸' : '▾'}
+              Outline & shadow {expandedSections.textOutline === false ? '▸' : '▾'}
             </label>
             {expandedSections.textOutline !== false && (
               <>
@@ -1171,7 +1172,7 @@ export default function PropertiesPanel({ compact = false, settings = null, onSe
           {/* Background Box */}
           <div className="ve-properties__section">
             <label className="ve-properties__label" onClick={() => toggleSection('textBg')} style={{ cursor: 'pointer' }}>
-              Background Box {expandedSections.textBg === false ? '▸' : '▾'}
+              Background box {expandedSections.textBg === false ? '▸' : '▾'}
             </label>
             {expandedSections.textBg !== false && (
               <>
@@ -1212,7 +1213,7 @@ export default function PropertiesPanel({ compact = false, settings = null, onSe
       {tab === 'shape' && item.type === 'shape' && (
         <>
           <div className="ve-properties__section">
-            <label className="ve-properties__label">Shape Type</label>
+            <label className="ve-properties__label">Shape type</label>
             <div className="ve-properties__speed-pills">
               {SHAPE_TYPES.map(s => (
                 <button
@@ -1313,7 +1314,7 @@ export default function PropertiesPanel({ compact = false, settings = null, onSe
       {/* ── Clip Settings (apply global settings to this timeline item) ── */}
       {tab === 'clip' && (item.type === 'video') && settings && (
         <div className="ve-properties__section">
-          <label className="ve-properties__label">Clip Settings</label>
+          <label className="ve-properties__label">Clip settings</label>
           <p style={{ fontSize: 10, color: 'var(--ve-text-muted, #888)', margin: '0 0 8px', lineHeight: 1.4 }}>
             Apply your subtitle and export settings from the main editor to this clip.
           </p>
@@ -1326,7 +1327,7 @@ export default function PropertiesPanel({ compact = false, settings = null, onSe
                 });
               }}
             >
-              Apply Current Settings
+              Apply current settings
             </button>
             {item.clipSettings && (
               <span style={{ fontSize: 9, color: 'var(--ve-accent, #0A84FF)', fontFamily: 'var(--ve-font-mono, monospace)' }}>

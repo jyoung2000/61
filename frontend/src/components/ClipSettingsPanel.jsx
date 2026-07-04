@@ -599,7 +599,7 @@ export default function ClipSettingsPanel({ speakers, speakerNames, videoResolut
 
               {/* Layout Mode */}
               <div style={sectionStyle}>
-                <span style={labelStyle}>Layout Mode</span>
+                <span style={labelStyle}>Layout mode</span>
                 <div style={radioGroupStyle}>
                   {[
                     { value: 'auto', label: 'Auto', desc: 'Automatically detect optimal layout' },
@@ -627,7 +627,7 @@ export default function ClipSettingsPanel({ speakers, speakerNames, videoResolut
 
               {/* Export Quality */}
               <div style={sectionStyle}>
-                <span style={labelStyle}>Default Export Quality</span>
+                <span style={labelStyle}>Default export quality</span>
                 <div style={radioGroupStyle}>
                   {EXPORT_QUALITIES.map((id) => ({
                     value: id,
@@ -646,7 +646,7 @@ export default function ClipSettingsPanel({ speakers, speakerNames, videoResolut
 
               {/* Playback Volume */}
               <div style={sectionStyle}>
-                <span style={labelStyle}>Playback Volume</span>
+                <span style={labelStyle}>Playback volume</span>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                   <button
                     onClick={() => update('playbackVolume', settings.playbackVolume > 0 ? 0 : 100)}

@@ -4322,7 +4322,7 @@ export default function VideoEditor({
               <rect x="1" y="10" width="22" height="4" rx="1" />
               <rect x="1" y="17" width="22" height="4" rx="1" />
             </svg>
-            {showMultiTrack ? 'Hide Multi-Track' : 'Multi-Track Editor'}
+            {showMultiTrack ? 'Hide multi-track' : 'Multi-track editor'}
           </button>
           {showMultiTrack && (
             <>
@@ -4330,13 +4330,13 @@ export default function VideoEditor({
                 className={`ve-multitrack-toggle__btn ve-multitrack-toggle__btn--sub${showMediaLibrary ? ' ve-multitrack-toggle__btn--active' : ''}`}
                 onClick={(e) => { e.stopPropagation(); setShowMediaLibrary(v => !v); }}
               >
-                {showMediaLibrary ? 'Hide Media' : 'Media Library'}
+                {showMediaLibrary ? 'Hide media' : 'Media library'}
               </button>
               <button
                 className={`ve-multitrack-toggle__btn ve-multitrack-toggle__btn--sub${showProperties ? ' ve-multitrack-toggle__btn--active' : ''}`}
                 onClick={(e) => { e.stopPropagation(); setShowProperties(v => !v); }}
               >
-                {showProperties ? 'Hide Properties' : 'Properties'}
+                {showProperties ? 'Hide properties' : 'Properties'}
               </button>
             </>
           )}
@@ -4383,7 +4383,7 @@ export default function VideoEditor({
             {showMediaLibrary && (
               <div className="ve-multitrack__sidebar ve-multitrack__sidebar--left">
                 <div className="ve-multitrack__sidebar-header">
-                  <span>Media Library</span>
+                  <span>Media library</span>
                   <button
                     className="ve-btn"
                     onClick={() => setShowMediaLibrary(false)}

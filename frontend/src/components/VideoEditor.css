@@ -12,7 +12,9 @@
   --ve-trim-color: var(--accent-cyan, #0A84FF);
   --ve-trim-dimmed: rgba(0, 0, 0, 0.40);
   --ve-text: var(--text-primary, #1D1D1F);
-  --ve-text-muted: var(--text-muted, rgba(60, 60, 67, 0.55));
+  /* 0.75 alpha = 5.0:1 on the light chrome bg (0.55 was 2.98:1 — below
+     the 4.5:1 body-text floor). Dark override below is 5.9:1 already. */
+  --ve-text-muted: rgba(60, 60, 67, 0.75);
   --ve-btn-hover: rgba(0, 0, 0, 0.05);
   --ve-btn-active: rgba(0, 0, 0, 0.09);
   --ve-track-bg: rgba(0, 0, 0, 0.05);
@@ -3995,4 +3997,19 @@ input.ve-timecode--input {
 .ve-multitrack__rail-icon {
   font-size: 14px;
   color: var(--ve-text-muted);
+}
+
+/* ═══ Focus visibility (Phase 4) ═══
+   Keyboard focus always gets a glow ring on editor chrome. Never
+   remove outlines without a replacement. */
+.ve-container button:focus-visible,
+.ve-container [tabindex]:focus-visible,
+.ve-container input:focus-visible,
+.ve-container select:focus-visible,
+.ve-bottom-sheet button:focus-visible,
+.ve-context-menu button:focus-visible,
+.ve-palette button:focus-visible,
+.ve-cheatsheet button:focus-visible {
+  outline: 2px solid var(--glow-color);
+  outline-offset: 1px;
 }

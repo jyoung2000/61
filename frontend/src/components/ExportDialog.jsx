@@ -364,12 +364,12 @@ export default function ExportDialog({
 
     // Client-side export
     if (needsServerForPitch) {
-      setError('This clip uses a preserve-pitch speed change, which browser export cannot render faithfully. Switched to Server Export — press Export again.');
+      setError('This clip uses a preserve-pitch speed change, which browser export cannot render faithfully. Switched to server export — press Export again.');
       setExportMode('server');
       return;
     }
     if (!renderEngine) {
-      setError('Client-side export is not available in this browser. Use Server Export.');
+      setError('Client-side export is not available in this browser. Use server export.');
       return;
     }
 
@@ -392,7 +392,7 @@ export default function ExportDialog({
       onFallbackRequired: () => window.confirm(
         'WebCodecs is not available in this browser. Continue with a ' +
         'reduced-fidelity real-time export? (May drop frames; audio is ' +
-        'not included. Server Export is recommended.)'
+        'not included. Server export is recommended.)'
       ),
       onComplete: (blob, meta) => {
         if (meta) console.info('[ExportDialog] Export completed via', meta.path, meta);
@@ -441,8 +441,8 @@ export default function ExportDialog({
   return (
     <div className="ve-export-dialog" onClick={(e) => e.stopPropagation()}>
       <div className="ve-export-dialog__header">
-        <span className="ve-export-dialog__title">Export Video</span>
-        <button className="ve-export-dialog__close" onClick={onClose}>✕</button>
+        <span className="ve-export-dialog__title">Export video</span>
+        <button className="ve-export-dialog__close" onClick={onClose} aria-label="Close export dialog">✕</button>
       </div>
 
       {/* Export mode toggle */}
@@ -457,7 +457,7 @@ export default function ExportDialog({
             <circle cx="6" cy="6" r="1" fill="currentColor" />
             <circle cx="6" cy="18" r="1" fill="currentColor" />
           </svg>
-          Server Export
+          Server export
         </button>
         <button
           className={`ve-export-dialog__mode-btn${exportMode === 'client' ? ' ve-export-dialog__mode-btn--active' : ''}`}
@@ -470,7 +470,7 @@ export default function ExportDialog({
             <line x1="8" y1="21" x2="16" y2="21" />
             <line x1="12" y1="17" x2="12" y2="21" />
           </svg>
-          Browser Export {!canClientExport && '(N/A)'}
+          Browser export {!canClientExport && '(unavailable)'}
         </button>
       </div>
 

@@ -2550,6 +2550,7 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
         <button
           className="ve-btn"
           onClick={() => setZoom(Math.max(0.01, zoom - 0.2))}
+          aria-label="Zoom out"
           title="Zoom out"
           style={{ fontSize: 12, padding: '2px 6px', minWidth: 24, minHeight: 24 }}
         >
@@ -2567,6 +2568,7 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
         <button
           className="ve-btn"
           onClick={() => setZoom(Math.min(10, zoom + 0.2))}
+          aria-label="Zoom in"
           title="Zoom in"
           style={{ fontSize: 12, padding: '2px 6px', minWidth: 24, minHeight: 24 }}
         >
