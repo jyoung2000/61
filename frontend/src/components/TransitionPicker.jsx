@@ -1,5 +1,6 @@
 import React, { useCallback } from 'react';
 import useTimelineStore from '../stores/timelineStore';
+import ScrubInput from './ScrubInput';
 import { TRANSITION_RANGES } from '../utils/defaultSettings';
 
 const TRANSITION_TYPES = [
@@ -88,6 +89,16 @@ export default function TransitionPicker({ itemId, onClose }) {
                 {d}s
               </button>
             ))}
+            <ScrubInput
+              value={currentDuration}
+              min={TRANSITION_RANGES.duration.min}
+              max={TRANSITION_RANGES.duration.max}
+              step={TRANSITION_RANGES.duration.step}
+              unit="s"
+              defaultValue={0.5}
+              onChange={setDuration}
+              ariaLabel="Transition duration"
+            />
           </div>
         </div>
       )}

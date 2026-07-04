@@ -1,3 +1,4 @@
+import ScrubInput from './ScrubInput';
 import React, { useEffect, useState } from 'react';
 
 // Self-contained Settings section for subtitle readability rules,
@@ -280,10 +281,11 @@ export default function SubtitleQualitySettings() {
           </div>
           <div style={{ flex: '1 1 160px' }}>
             <label style={labelStyle}>Max chars/line</label>
-            <input
-              type="number" min={20} max={60} style={inputStyle}
+            <ScrubInput
               value={form.subtitle_max_chars_per_line}
-              onChange={(e) => set('subtitle_max_chars_per_line', Number(e.target.value))}
+              min={20} max={60} step={1}
+              onChange={(v) => set('subtitle_max_chars_per_line', v)}
+              ariaLabel="Max characters per line"
               disabled={!form.subtitle_cps_enforcement}
             />
           </div>
@@ -411,10 +413,11 @@ export default function SubtitleQualitySettings() {
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 12, marginBottom: 10 }}>
           <div style={{ flex: '1 1 160px' }}>
             <label style={labelStyle}>Context window (segments)</label>
-            <input
-              type="number" min={0} max={20} style={inputStyle}
+            <ScrubInput
               value={form.translation_context_window}
-              onChange={(e) => set('translation_context_window', Number(e.target.value))}
+              min={0} max={20} step={1}
+              onChange={(v) => set('translation_context_window', v)}
+              ariaLabel="Translation context window"
             />
           </div>
           <div style={{ flex: '1 1 230px', display: 'flex', alignItems: 'center', gap: 8 }}>

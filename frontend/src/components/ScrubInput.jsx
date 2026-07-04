@@ -52,6 +52,7 @@ export default function ScrubInput({
   onChange,
   ariaLabel,
   className = '',
+  disabled = false,
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState('');
@@ -81,7 +82,7 @@ export default function ScrubInput({
   };
 
   const onPointerDown = (e) => {
-    if (editing) return;
+    if (editing || disabled) return;
     e.currentTarget.setPointerCapture?.(e.pointerId);
     gestureRef.current = { startX: e.clientX, startValue: value ?? 0, moved: false };
     undoRef.current.onPointerDown();
@@ -111,7 +112,7 @@ export default function ScrubInput({
   };
 
   const onKeyDown = (e) => {
-    if (editing) return;
+    if (editing || disabled) return;
     if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return;
     e.preventDefault();
     const dir = e.key === 'ArrowUp' ? 1 : -1;
@@ -148,7 +149,8 @@ export default function ScrubInput({
       aria-valuenow={Number.isFinite(value) ? value : undefined}
       aria-valuemin={min}
       aria-valuemax={max}
-      className={`ve-scrub${dragging ? ' ve-scrub--dragging' : ''}${changed ? ' ve-scrub--changed' : ''} ${className}`}
+      aria-disabled={disabled || undefined}
+      className={`ve-scrub${dragging ? ' ve-scrub--dragging' : ''}${changed ? ' ve-scrub--changed' : ''}${disabled ? ' ve-scrub--disabled' : ''} ${className}`}
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}

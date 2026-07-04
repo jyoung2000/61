@@ -4013,3 +4013,9 @@ input.ve-timecode--input {
   outline: 2px solid var(--glow-color);
   outline-offset: 1px;
 }
+
+.ve-scrub--disabled {
+  opacity: 0.4;
+  cursor: default;
+  pointer-events: none;
+}

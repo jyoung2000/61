@@ -2,6 +2,7 @@ import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { outlineTextShadow } from '../utils/textOutline';
 import { sanitizeSubtitleSettings } from '../utils/sanitizeJob';
 import useResponsive from '../hooks/useResponsive';
+import ScrubInput from './ScrubInput';
 import {
   DEFAULT_CLIP_SETTINGS,
   SUBTITLE_RANGES,
@@ -424,30 +425,6 @@ export default function ClipSettingsPanel({ speakers, speakerNames, videoResolut
     flexWrap: 'wrap',
   };
 
-  const numInputStyle = {
-    width: 48,
-    padding: '2px 4px',
-    fontSize: 12,
-    fontFamily: 'var(--font-mono)',
-    background: 'var(--bg-elevated)',
-    color: 'var(--accent-cyan)',
-    border: '1px solid var(--border)',
-    borderRadius: 'var(--radius-sm)',
-    outline: 'none',
-    textAlign: 'center',
-  };
-
-  const radioBtnStyle = (active) => ({
-    padding: '5px 12px',
-    fontSize: 12,
-    background: active ? 'var(--accent-cyan-dim)' : 'var(--bg-elevated)',
-    color: active ? 'var(--accent-cyan)' : 'var(--text-secondary)',
-    border: `1px solid ${active ? 'var(--accent-cyan)' : 'var(--border)'}`,
-    borderRadius: 'var(--radius-sm)',
-    cursor: 'pointer',
-    fontWeight: active ? 600 : 400,
-  });
-
   return (
     <div style={{
       background: 'var(--bg-panel)',
@@ -588,7 +565,7 @@ export default function ClipSettingsPanel({ speakers, speakerNames, videoResolut
                     <button
                       key={ar.label}
                       onClick={() => update('aspectRatio', ar.value)}
-                      style={radioBtnStyle(settings.aspectRatio === ar.value)}
+                      className={`ve-csp-pill${(settings.aspectRatio === ar.value) ? ' ve-csp-pill--active' : ''}`}
                       title={ar.desc}
                     >
                       {ar.label}
@@ -610,9 +587,9 @@ export default function ClipSettingsPanel({ speakers, speakerNames, videoResolut
                     <button
                       key={lm.value}
                       onClick={() => update('layoutMode', lm.value)}
-                      style={radioBtnStyle(
+                      className={`ve-csp-pill${(
                         (settings.layoutMode || 'auto') === lm.value
-                      )}
+                      ) ? ' ve-csp-pill--active' : ''}`}
                       title={lm.desc}
                       disabled={
                         (lm.value === 'split' || lm.value === 'pip') &&
@@ -636,7 +613,7 @@ export default function ClipSettingsPanel({ speakers, speakerNames, videoResolut
                     <button
                       key={q.value}
                       onClick={() => update('exportQuality', q.value)}
-                      style={radioBtnStyle(settings.exportQuality === q.value)}
+                      className={`ve-csp-pill${(settings.exportQuality === q.value) ? ' ve-csp-pill--active' : ''}`}
                     >
                       {q.label}
                     </button>
@@ -716,7 +693,7 @@ export default function ClipSettingsPanel({ speakers, speakerNames, videoResolut
                     <button
                       key={s.value}
                       onClick={() => update('playbackSpeed', s.value)}
-                      style={radioBtnStyle((settings.playbackSpeed ?? 1.0) === s.value)}
+                      className={`ve-csp-pill${((settings.playbackSpeed ?? 1.0) === s.value) ? ' ve-csp-pill--active' : ''}`}
                     >
                       {s.label}
                     </button>
@@ -846,17 +823,21 @@ export default function ClipSettingsPanel({ speakers, speakerNames, videoResolut
                       <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
                         <input
                           type="range"
-                          min="12"
-                          max="72"
-                          value={Math.min(72, Math.max(12, typeof settings.subtitleSize === 'number' ? settings.subtitleSize : (FONT_SIZE_MAP[settings.subtitleSize] || 30)))}
+                          min={SUBTITLE_RANGES.size.min}
+                          max={SUBTITLE_RANGES.size.max}
+                          step={SUBTITLE_RANGES.size.step}
+                          value={Math.min(SUBTITLE_RANGES.size.max, Math.max(SUBTITLE_RANGES.size.min, typeof settings.subtitleSize === 'number' ? settings.subtitleSize : (FONT_SIZE_MAP[settings.subtitleSize] || 30)))}
                           onChange={(e) => update('subtitleSize', parseInt(e.target.value))}
                           style={{ flex: 1, accentColor: 'var(--accent-cyan)' }}
                         />
-                        <input
-                          type="number"
+                        <ScrubInput
                           value={typeof settings.subtitleSize === 'number' ? settings.subtitleSize : (FONT_SIZE_MAP[settings.subtitleSize] || 30)}
-                          onChange={(e) => { const v = parseInt(e.target.value); if (!isNaN(v) && v > 0) update('subtitleSize', v); }}
-                          style={numInputStyle}
+                          min={SUBTITLE_RANGES.size.min}
+                          max={SUBTITLE_RANGES.size.max}
+                          step={SUBTITLE_RANGES.size.step}
+                          defaultValue={DEFAULT_CLIP_SETTINGS.subtitleSize}
+                          onChange={(v) => update('subtitleSize', v)}
+                          ariaLabel="Font size"
                         />
                       </div>
                       <div style={radioGroupStyle}>
@@ -864,7 +845,7 @@ export default function ClipSettingsPanel({ speakers, speakerNames, videoResolut
                           <button
                             key={s.value}
                             onClick={() => update('subtitleSize', s.value)}
-                            style={radioBtnStyle(settings.subtitleSize === s.value)}
+                            className={`ve-csp-pill${(settings.subtitleSize === s.value) ? ' ve-csp-pill--active' : ''}`}
                           >
                             {s.label}
                           </button>
@@ -880,7 +861,7 @@ export default function ClipSettingsPanel({ speakers, speakerNames, videoResolut
                           <button
                             key={w.value}
                             onClick={() => update('subtitleFontWeight', w.value)}
-                            style={radioBtnStyle(normalizeWeight(settings.subtitleFontWeight) === w.value)}
+                            className={`ve-csp-pill${(normalizeWeight(settings.subtitleFontWeight) === w.value) ? ' ve-csp-pill--active' : ''}`}
                           >
                             {w.label}
                           </button>
@@ -942,16 +923,19 @@ export default function ClipSettingsPanel({ speakers, speakerNames, videoResolut
                           <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 4 }}>Opacity</div>
                           <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                             <input
-                              type="range" min="0" max="100" step="5"
-                              value={Math.min(100, Math.max(0, settings.subtitleOutlineOpacity))}
+                              type="range" min={SUBTITLE_RANGES.outlineOpacity.min} max={SUBTITLE_RANGES.outlineOpacity.max} step={SUBTITLE_RANGES.outlineOpacity.step}
+                              value={Math.min(SUBTITLE_RANGES.outlineOpacity.max, Math.max(SUBTITLE_RANGES.outlineOpacity.min, settings.subtitleOutlineOpacity))}
                               onChange={(e) => update('subtitleOutlineOpacity', parseInt(e.target.value))}
                               style={{ flex: 1, accentColor: 'var(--accent-cyan)' }}
                             />
-                            <input
-                              type="number"
+                            <ScrubInput
                               value={settings.subtitleOutlineOpacity}
-                              onChange={(e) => { const v = parseInt(e.target.value); if (!isNaN(v)) update('subtitleOutlineOpacity', v); }}
-                              style={numInputStyle}
+                              min={SUBTITLE_RANGES.outlineOpacity.min}
+                              max={SUBTITLE_RANGES.outlineOpacity.max}
+                              step={SUBTITLE_RANGES.outlineOpacity.step}
+                              defaultValue={DEFAULT_CLIP_SETTINGS.subtitleOutlineOpacity}
+                              onChange={(v) => update('subtitleOutlineOpacity', v)}
+                              ariaLabel="Outline opacity"
                             />
                           </div>
                         </div>
@@ -959,16 +943,19 @@ export default function ClipSettingsPanel({ speakers, speakerNames, videoResolut
                           <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 4 }}>Thickness</div>
                           <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                             <input
-                              type="range" min="0" max="10" step="1"
-                              value={Math.min(10, Math.max(0, settings.subtitleOutlineWidth))}
+                              type="range" min={SUBTITLE_RANGES.outlineWidth.min} max={SUBTITLE_RANGES.outlineWidth.max} step={SUBTITLE_RANGES.outlineWidth.step}
+                              value={Math.min(SUBTITLE_RANGES.outlineWidth.max, Math.max(SUBTITLE_RANGES.outlineWidth.min, settings.subtitleOutlineWidth))}
                               onChange={(e) => update('subtitleOutlineWidth', parseInt(e.target.value))}
                               style={{ flex: 1, accentColor: 'var(--accent-cyan)' }}
                             />
-                            <input
-                              type="number"
+                            <ScrubInput
                               value={settings.subtitleOutlineWidth}
-                              onChange={(e) => { const v = parseInt(e.target.value); if (!isNaN(v)) update('subtitleOutlineWidth', v); }}
-                              style={numInputStyle}
+                              min={SUBTITLE_RANGES.outlineWidth.min}
+                              max={SUBTITLE_RANGES.outlineWidth.max}
+                              step={SUBTITLE_RANGES.outlineWidth.step}
+                              defaultValue={DEFAULT_CLIP_SETTINGS.subtitleOutlineWidth}
+                              onChange={(v) => update('subtitleOutlineWidth', v)}
+                              ariaLabel="Outline thickness"
                             />
                           </div>
                         </div>
@@ -990,7 +977,7 @@ export default function ClipSettingsPanel({ speakers, speakerNames, videoResolut
                                 update('subtitlePosition', p.value);
                                 update('subtitleOffsetV', offsetVFromPosition(p.value));
                               }}
-                              style={radioBtnStyle(activePos === p.value)}
+                              className={`ve-csp-pill${(activePos === p.value) ? ' ve-csp-pill--active' : ''}`}
                             >
                               {p.label}
                             </button>
@@ -1035,16 +1022,19 @@ export default function ClipSettingsPanel({ speakers, speakerNames, videoResolut
                       <div style={{ fontSize: 13, color: 'var(--text-primary)', marginBottom: 6 }}>Max Width</div>
                       <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                         <input
-                          type="range" min="20" max="100" step="5"
+                          type="range" min={SUBTITLE_RANGES.maxWidth.min} max={SUBTITLE_RANGES.maxWidth.max} step={SUBTITLE_RANGES.maxWidth.step}
                           value={Math.min(100, Math.max(20, settings.subtitleMaxWidth))}
                           onChange={(e) => update('subtitleMaxWidth', parseInt(e.target.value))}
                           style={{ flex: 1, accentColor: 'var(--accent-cyan)' }}
                         />
-                        <input
-                          type="number"
+                        <ScrubInput
                           value={settings.subtitleMaxWidth}
-                          onChange={(e) => { const v = parseInt(e.target.value); if (!isNaN(v) && v > 0) update('subtitleMaxWidth', v); }}
-                          style={numInputStyle}
+                          min={SUBTITLE_RANGES.maxWidth.min}
+                          max={SUBTITLE_RANGES.maxWidth.max}
+                          step={SUBTITLE_RANGES.maxWidth.step}
+                          defaultValue={DEFAULT_CLIP_SETTINGS.subtitleMaxWidth}
+                          onChange={(v) => update('subtitleMaxWidth', v)}
+                          ariaLabel="Max width"
                         />
                       </div>
                     </div>
@@ -1068,19 +1058,17 @@ export default function ClipSettingsPanel({ speakers, speakerNames, videoResolut
                           }}
                           style={{ flex: 1, accentColor: 'var(--accent-cyan)' }}
                         />
-                        <input
-                          type="number"
+                        <ScrubInput
+                          value={settings.subtitleOffsetV}
                           min={SUBTITLE_RANGES.offsetV.min}
                           max={SUBTITLE_RANGES.offsetV.max}
-                          value={settings.subtitleOffsetV}
-                          onChange={(e) => {
-                            const v = parseInt(e.target.value);
-                            if (Number.isNaN(v)) return;
-                            const clamped = Math.min(SUBTITLE_RANGES.offsetV.max, Math.max(SUBTITLE_RANGES.offsetV.min, v));
-                            update('subtitleOffsetV', clamped);
-                            update('subtitlePosition', positionFromOffsetV(clamped));
+                          step={SUBTITLE_RANGES.offsetV.step}
+                          defaultValue={DEFAULT_CLIP_SETTINGS.subtitleOffsetV}
+                          onChange={(v) => {
+                            update('subtitleOffsetV', v);
+                            update('subtitlePosition', positionFromOffsetV(v));
                           }}
-                          style={numInputStyle}
+                          ariaLabel="Vertical offset"
                         />
                       </div>
                     </div>
@@ -1127,18 +1115,14 @@ export default function ClipSettingsPanel({ speakers, speakerNames, videoResolut
                               onChange={(e) => update('subtitleMaxWords', parseInt(e.target.value))}
                               style={{ flex: 1, accentColor: 'var(--accent-cyan)' }}
                             />
-                            <input
-                              type="number"
+                            <ScrubInput
+                              value={settings.subtitleMaxWords}
                               min={Math.max(1, SUBTITLE_RANGES.maxWords.min)}
                               max={SUBTITLE_RANGES.maxWords.max}
-                              value={settings.subtitleMaxWords}
-                              onChange={(e) => {
-                                const v = parseInt(e.target.value);
-                                if (Number.isNaN(v)) return;
-                                const clamped = Math.min(SUBTITLE_RANGES.maxWords.max, Math.max(1, v));
-                                update('subtitleMaxWords', clamped);
-                              }}
-                              style={numInputStyle}
+                              step={SUBTITLE_RANGES.maxWords.step}
+                              defaultValue={DEFAULT_CLIP_SETTINGS.subtitleMaxWords}
+                              onChange={(v) => update('subtitleMaxWords', v)}
+                              ariaLabel="Max words per cue"
                             />
                           </div>
                         </div>
@@ -1235,16 +1219,19 @@ export default function ClipSettingsPanel({ speakers, speakerNames, videoResolut
                                 <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 4 }}>Opacity</div>
                                 <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                                   <input
-                                    type="range" min="0" max="100" step="5"
+                                    type="range" min={SUBTITLE_RANGES.bgOpacity.min} max={SUBTITLE_RANGES.bgOpacity.max} step={SUBTITLE_RANGES.bgOpacity.step}
                                     value={Math.min(100, Math.max(0, settings.activeWordBgOpacity))}
                                     onChange={(e) => update('activeWordBgOpacity', parseInt(e.target.value))}
                                     style={{ flex: 1, accentColor: 'var(--accent-cyan)' }}
                                   />
-                                  <input
-                                    type="number"
+                                  <ScrubInput
                                     value={settings.activeWordBgOpacity}
-                                    onChange={(e) => { const v = parseInt(e.target.value); if (!isNaN(v)) update('activeWordBgOpacity', v); }}
-                                    style={numInputStyle}
+                                    min={SUBTITLE_RANGES.bgOpacity.min}
+                                    max={SUBTITLE_RANGES.bgOpacity.max}
+                                    step={SUBTITLE_RANGES.bgOpacity.step}
+                                    defaultValue={DEFAULT_CLIP_SETTINGS.activeWordBgOpacity}
+                                    onChange={(v) => update('activeWordBgOpacity', v)}
+                                    ariaLabel="Active word background opacity"
                                   />
                                 </div>
                               </div>
@@ -1252,16 +1239,19 @@ export default function ClipSettingsPanel({ speakers, speakerNames, videoResolut
                                 <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 4 }}>Radius</div>
                                 <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                                   <input
-                                    type="range" min="0" max="20" step="1"
+                                    type="range" min={SUBTITLE_RANGES.bgRadius.min} max={SUBTITLE_RANGES.bgRadius.max} step={SUBTITLE_RANGES.bgRadius.step}
                                     value={Math.min(20, Math.max(0, settings.activeWordBgRadius ?? 4))}
                                     onChange={(e) => update('activeWordBgRadius', parseInt(e.target.value))}
                                     style={{ flex: 1, accentColor: 'var(--accent-cyan)' }}
                                   />
-                                  <input
-                                    type="number"
+                                  <ScrubInput
                                     value={settings.activeWordBgRadius ?? 4}
-                                    onChange={(e) => { const v = parseInt(e.target.value); if (!isNaN(v)) update('activeWordBgRadius', v); }}
-                                    style={numInputStyle}
+                                    min={SUBTITLE_RANGES.bgRadius.min}
+                                    max={SUBTITLE_RANGES.bgRadius.max}
+                                    step={SUBTITLE_RANGES.bgRadius.step}
+                                    defaultValue={DEFAULT_CLIP_SETTINGS.activeWordBgRadius}
+                                    onChange={(v) => update('activeWordBgRadius', v)}
+                                    ariaLabel="Active word background radius"
                                   />
                                 </div>
                               </div>
@@ -1387,16 +1377,19 @@ export default function ClipSettingsPanel({ speakers, speakerNames, videoResolut
                             <div style={{ fontSize: 13, color: 'var(--text-primary)', marginBottom: 6 }}>Opacity</div>
                             <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                               <input
-                                type="range" min="0" max="100" step="5"
+                                type="range" min={SUBTITLE_RANGES.bgOpacity.min} max={SUBTITLE_RANGES.bgOpacity.max} step={SUBTITLE_RANGES.bgOpacity.step}
                                 value={Math.min(100, Math.max(0, settings.subtitleBgOpacity))}
                                 onChange={(e) => update('subtitleBgOpacity', parseInt(e.target.value))}
                                 style={{ flex: 1, accentColor: 'var(--accent-cyan)' }}
                               />
-                              <input
-                                type="number"
+                              <ScrubInput
                                 value={settings.subtitleBgOpacity}
-                                onChange={(e) => { const v = parseInt(e.target.value); if (!isNaN(v)) update('subtitleBgOpacity', v); }}
-                                style={numInputStyle}
+                                min={SUBTITLE_RANGES.bgOpacity.min}
+                                max={SUBTITLE_RANGES.bgOpacity.max}
+                                step={SUBTITLE_RANGES.bgOpacity.step}
+                                defaultValue={DEFAULT_CLIP_SETTINGS.subtitleBgOpacity}
+                                onChange={(v) => update('subtitleBgOpacity', v)}
+                                ariaLabel="Background opacity"
                               />
                             </div>
                           </div>
@@ -1406,16 +1399,19 @@ export default function ClipSettingsPanel({ speakers, speakerNames, videoResolut
                             </div>
                             <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                               <input
-                                type="range" min="0" max="20" step="1"
+                                type="range" min={SUBTITLE_RANGES.bgRadius.min} max={SUBTITLE_RANGES.bgRadius.max} step={SUBTITLE_RANGES.bgRadius.step}
                                 value={Math.min(20, Math.max(0, settings.subtitleBgRadius))}
                                 onChange={(e) => update('subtitleBgRadius', parseInt(e.target.value))}
                                 style={{ flex: 1, accentColor: 'var(--accent-cyan)' }}
                               />
-                              <input
-                                type="number"
+                              <ScrubInput
                                 value={settings.subtitleBgRadius}
-                                onChange={(e) => { const v = parseInt(e.target.value); if (!isNaN(v)) update('subtitleBgRadius', v); }}
-                                style={numInputStyle}
+                                min={SUBTITLE_RANGES.bgRadius.min}
+                                max={SUBTITLE_RANGES.bgRadius.max}
+                                step={SUBTITLE_RANGES.bgRadius.step}
+                                defaultValue={DEFAULT_CLIP_SETTINGS.subtitleBgRadius}
+                                onChange={(v) => update('subtitleBgRadius', v)}
+                                ariaLabel="Background radius"
                               />
                             </div>
                           </div>

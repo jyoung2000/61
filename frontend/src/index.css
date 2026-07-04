@@ -658,3 +658,34 @@ input[type="range"]:focus::-webkit-slider-thumb {
 .card-hover .clip-delete-btn:hover {
   opacity: 1 !important;
 }
+
+/* ═══ Clip-settings segmented pills (shared panel, all pages) ═══
+   Replaces the panel's inline radioBtnStyle() helper — same segmented
+   pattern as the editor inspector tabs, app-token colors. */
+.ve-csp-pill {
+  padding: 5px 12px;
+  font-size: 12px;
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-weight: 400;
+  transition: all var(--dur-fast) var(--ease-out-quart);
+}
+
+.ve-csp-pill:hover {
+  border-color: var(--accent-cyan);
+}
+
+.ve-csp-pill--active {
+  background: var(--accent-cyan-dim);
+  color: var(--accent-cyan);
+  border-color: var(--accent-cyan);
+  font-weight: 600;
+}
+
+.ve-csp-pill:focus-visible {
+  outline: 2px solid var(--glow-color);
+  outline-offset: 1px;
+}
