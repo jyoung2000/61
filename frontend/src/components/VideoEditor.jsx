@@ -4167,7 +4167,7 @@ export default function VideoEditor({
         {/* Right: volume + speed + fullscreen */}
         <div className="ve-controls__right">
           {/* Volume — segment-aware */}
-          <div className={`ve-volume${isMobile ? '' : ''}`} onClick={(e) => e.stopPropagation()}>
+          <div className="ve-volume" onClick={(e) => e.stopPropagation()}>
             <button className="ve-btn" onClick={toggleMute} title={effectiveSegment ? `${effectiveSegment.muted ? 'Unmute' : 'Mute'} segment` : isMuted ? 'Unmute (M)' : 'Mute (M)'}>
               <VolumeIcon />
             </button>

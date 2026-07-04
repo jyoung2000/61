@@ -23,6 +23,8 @@
   --ve-dropdown-bg: rgba(255, 255, 255, 0.95);
   --ve-dropdown-shadow: 0 8px 32px rgba(0, 0, 0, 0.15);
   --ve-warning: var(--accent-orange, #FF9F0A);
+  --ve-success: var(--accent-green, #30D158);
+  --ve-danger: var(--accent-red, #FF375F);
 
   position: relative;
   background: var(--bg-elevated, #f0f0f4);
@@ -2714,6 +2716,138 @@ input.ve-timecode--input {
   margin-top: 4px !important;
   color: var(--ve-warning, #FF9F0A);
 }
+
+/* ── Cost / quota preview ─────────────────────────── */
+.ve-export-dialog__cost {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 8px;
+  margin-top: 12px;
+  padding: 10px 12px;
+  background: var(--bg-elevated, rgba(255, 255, 255, 0.04));
+  border: 1px solid var(--border, rgba(255, 255, 255, 0.08));
+  border-radius: 8px;
+}
+
+.ve-export-dialog__cost--server {
+  grid-template-columns: repeat(3, 1fr);
+}
+
+.ve-export-dialog__stat {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.ve-export-dialog__stat-label {
+  font-size: 10px;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+}
+
+.ve-export-dialog__stat-value {
+  font-size: 14px;
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.ve-export-dialog__stat-sub {
+  font-size: 10px;
+  color: var(--text-secondary);
+}
+
+.ve-export-dialog__fps-note {
+  font-size: 11px;
+  color: var(--ve-accent);
+  margin-top: 4px !important;
+}
+
+/* ── Subtitle QA report ───────────────────────────── */
+.ve-export-dialog__qa {
+  margin: 8px 16px;
+  padding: 8px 12px;
+  border-radius: 6px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--ve-text);
+  border: 1px solid transparent;
+}
+
+.ve-export-dialog__qa--ok {
+  background: rgba(48, 209, 88, 0.12);
+  border-color: rgba(48, 209, 88, 0.3);
+}
+
+.ve-export-dialog__qa--warn {
+  background: rgba(255, 159, 10, 0.12);
+  border-color: rgba(255, 159, 10, 0.3);
+}
+
+.ve-export-dialog__qa--error {
+  background: rgba(255, 55, 95, 0.12);
+  border-color: rgba(255, 55, 95, 0.3);
+}
+
+.ve-export-dialog__qa-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.ve-export-dialog__qa-head--spaced {
+  margin-bottom: 4px;
+}
+
+.ve-export-dialog__qa-icon {
+  font-size: 13px;
+}
+
+.ve-export-dialog__qa-title {
+  font-weight: 600;
+}
+
+.ve-export-dialog__qa-confidence {
+  font-size: 10px;
+  padding-left: 20px;
+  margin-bottom: 2px;
+}
+
+.ve-export-dialog__qa-confidence--high { color: var(--ve-success, #30D158); }
+.ve-export-dialog__qa-confidence--medium { color: var(--ve-warning, #FF9F0A); }
+.ve-export-dialog__qa-confidence--low { color: var(--ve-danger, #FF375F); }
+
+.ve-export-dialog__qa-check {
+  margin-top: 4px;
+  padding-left: 8px;
+}
+
+.ve-export-dialog__qa-check-head {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.ve-export-dialog__qa-check-icon {
+  font-size: 10px;
+}
+
+.ve-export-dialog__qa-check-icon--ok { color: var(--ve-success, #30D158); }
+.ve-export-dialog__qa-check-icon--warn { color: var(--ve-warning, #FF9F0A); }
+.ve-export-dialog__qa-check-icon--error { color: var(--ve-danger, #FF375F); }
+
+.ve-export-dialog__qa-check-name {
+  font-weight: 500;
+}
+
+.ve-export-dialog__qa-issue {
+  padding-left: 18px;
+  font-size: 10px;
+}
+
+.ve-export-dialog__qa-issue--warn { color: var(--ve-warning, #FF9F0A); }
+.ve-export-dialog__qa-issue--error { color: var(--ve-danger, #FF375F); }
 
 .ve-export-dialog__progress {
   margin-bottom: 12px;

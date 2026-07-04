@@ -57,7 +57,7 @@ export default function EffectsPanel({ compact = false }) {
       </div>
 
       {EFFECT_CONTROLS.map((ctrl) => {
-        const value = effects[ctrl.key] ?? (ctrl.key === 'brightness' || ctrl.key === 'contrast' || ctrl.key === 'saturation' ? 0 : 0);
+        const value = effects[ctrl.key] ?? 0;
         return (
           <div key={ctrl.key} className="ve-effects__control">
             <div className="ve-effects__control-header">

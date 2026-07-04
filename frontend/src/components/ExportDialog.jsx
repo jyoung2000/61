@@ -14,14 +14,10 @@ export const QUALITY_PRESETS = EXPORT_QUALITIES.map((id) => ({ id, ...EXPORT_QUA
 // Tiny labelled-number tile used by the cost/quota preview row.
 function CostStat({ label, value, sub }) {
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0 }}>
-      <span style={{ fontSize: 10, color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: 0.6 }}>
-        {label}
-      </span>
-      <span style={{ fontSize: 14, color: 'var(--text-primary)', fontWeight: 600 }}>{value}</span>
-      {sub && (
-        <span style={{ fontSize: 10, color: 'var(--text-secondary)' }}>{sub}</span>
-      )}
+    <div className="ve-export-dialog__stat">
+      <span className="ve-export-dialog__stat-label">{label}</span>
+      <span className="ve-export-dialog__stat-value">{value}</span>
+      {sub && <span className="ve-export-dialog__stat-sub">{sub}</span>}
     </div>
   );
 }
@@ -444,17 +440,7 @@ export default function ExportDialog({
       {/* Cost / quota preview ─ informational only ─────────────── */}
       {costEstimate && (
         <div
-          className="ve-export-dialog__cost"
-          style={{
-            display: 'grid',
-            gridTemplateColumns: exportMode === 'server' ? 'repeat(3, 1fr)' : 'repeat(2, 1fr)',
-            gap: 8,
-            marginTop: 12,
-            padding: '10px 12px',
-            background: 'var(--bg-elevated, rgba(255,255,255,0.04))',
-            border: '1px solid var(--border, rgba(255,255,255,0.08))',
-            borderRadius: 8,
-          }}
+          className={`ve-export-dialog__cost${exportMode === 'server' ? ' ve-export-dialog__cost--server' : ''}`}
         >
           <CostStat
             label="Estimated size"
@@ -489,7 +475,7 @@ export default function ExportDialog({
           </p>
         )}
         {exportFPS > 30 && (
-          <p style={{ fontSize: 11, color: 'var(--ve-accent, #0A84FF)', marginTop: 4 }}>
+          <p className="ve-export-dialog__fps-note">
             FPS boosted to {exportFPS}fps for smooth active word highlighting.
           </p>
         )}
@@ -514,46 +500,37 @@ export default function ExportDialog({
       )}
 
       {/* Subtitle QA Report */}
-      <div style={{
-        margin: '8px 16px',
-        padding: '8px 12px',
-        borderRadius: 6,
-        fontSize: 11,
-        lineHeight: 1.5,
-        background: subtitleQA.valid
-          ? (subtitleQA.warnings.length > 0 ? 'rgba(255, 159, 10, 0.12)' : 'rgba(48, 209, 88, 0.12)')
-          : 'rgba(255, 55, 95, 0.12)',
-        border: `1px solid ${subtitleQA.valid
-          ? (subtitleQA.warnings.length > 0 ? 'rgba(255, 159, 10, 0.3)' : 'rgba(48, 209, 88, 0.3)')
-          : 'rgba(255, 55, 95, 0.3)'}`,
-        color: 'var(--ve-text, #fff)',
-      }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: subtitleQA.errors.length + subtitleQA.warnings.length > 0 ? 4 : 0 }}>
-          <span style={{ fontSize: 13 }}>{subtitleQA.valid ? (subtitleQA.warnings.length > 0 ? '⚠' : '✓') : '✕'}</span>
-          <span style={{ fontWeight: 600 }}>Export QA: {subtitleQA.summary}</span>
+      <div className={`ve-export-dialog__qa ${!subtitleQA.valid
+        ? 've-export-dialog__qa--error'
+        : subtitleQA.warnings.length > 0
+          ? 've-export-dialog__qa--warn'
+          : 've-export-dialog__qa--ok'}`}
+      >
+        <div className={`ve-export-dialog__qa-head${subtitleQA.errors.length + subtitleQA.warnings.length > 0 ? ' ve-export-dialog__qa-head--spaced' : ''}`}>
+          <span className="ve-export-dialog__qa-icon">{subtitleQA.valid ? (subtitleQA.warnings.length > 0 ? '⚠' : '✓') : '✕'}</span>
+          <span className="ve-export-dialog__qa-title">Export QA: {subtitleQA.summary}</span>
         </div>
         {subtitleQA.confidence && (
-          <div style={{ fontSize: 10, paddingLeft: 20, marginBottom: 2, color: subtitleQA.confidence === 'high' ? '#30D158' : subtitleQA.confidence === 'medium' ? '#FF9F0A' : '#FF375F' }}>
+          <div className={`ve-export-dialog__qa-confidence ve-export-dialog__qa-confidence--${subtitleQA.confidence}`}>
             Preview-to-export match confidence: {subtitleQA.confidence}
             {subtitleQA.confidence === 'high' && ' — exported video will look exactly like preview'}
           </div>
         )}
         {/* Per-check breakdown */}
         {subtitleQA.checks && subtitleQA.checks.map((check, ci) => {
-          const hasIssues = check.errors.length > 0 || check.warnings.length > 0;
+          const level = check.errors.length > 0 ? 'error' : check.warnings.length > 0 ? 'warn' : 'ok';
           const icon = check.errors.length > 0 ? '✕' : check.warnings.length > 0 ? '⚠' : '✓';
-          const iconColor = check.errors.length > 0 ? '#FF375F' : check.warnings.length > 0 ? '#FF9F0A' : '#30D158';
           return (
-            <div key={ci} style={{ marginTop: ci > 0 ? 4 : 2, paddingLeft: 8 }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-                <span style={{ color: iconColor, fontSize: 10 }}>{icon}</span>
-                <span style={{ fontWeight: 500 }}>{check.name}</span>
+            <div key={ci} className="ve-export-dialog__qa-check">
+              <div className="ve-export-dialog__qa-check-head">
+                <span className={`ve-export-dialog__qa-check-icon ve-export-dialog__qa-check-icon--${level}`}>{icon}</span>
+                <span className="ve-export-dialog__qa-check-name">{check.name}</span>
               </div>
               {check.errors.map((e, i) => (
-                <div key={`ce-${ci}-${i}`} style={{ color: '#FF375F', paddingLeft: 18, fontSize: 10 }}>• {e}</div>
+                <div key={`ce-${ci}-${i}`} className="ve-export-dialog__qa-issue ve-export-dialog__qa-issue--error">• {e}</div>
               ))}
               {check.warnings.map((w, i) => (
-                <div key={`cw-${ci}-${i}`} style={{ color: '#FF9F0A', paddingLeft: 18, fontSize: 10 }}>• {w}</div>
+                <div key={`cw-${ci}-${i}`} className="ve-export-dialog__qa-issue ve-export-dialog__qa-issue--warn">• {w}</div>
               ))}
             </div>
           );
