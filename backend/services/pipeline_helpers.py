@@ -319,6 +319,7 @@ async def _maybe_use_cached_extraction(
     frames_dir: str,
     audio_path: str,
     expected_sha: str,
+    precomputed_sha: "str | None" = None,
 ):
     """Return cached ``(frames, scene_cut_timestamps)`` if the source
     hasn't changed, else ``None``.
@@ -327,6 +328,11 @@ async def _maybe_use_cached_extraction(
     images to be present, and the source SHA-256 to match the value
     recorded on the job. Falls back to a fresh extract on any
     mismatch — *never* silently uses stale data.
+
+    ``precomputed_sha`` lets the pipeline pass the digest from its
+    background hash task (started right after metadata extraction) so the
+    source file is hashed exactly once per run; when ``None`` the probe
+    hashes internally exactly as before (standalone-caller fallback).
     """
     if not expected_sha:
         return None
@@ -343,8 +349,11 @@ async def _maybe_use_cached_extraction(
     if len(frame_files) < 5:
         return None
 
-    # Compare hashes off the event loop.
-    actual_sha = await asyncio.to_thread(_hash_file_sha256, video_path)
+    # Use the pipeline's pre-started hash when available; otherwise compare
+    # hashes off the event loop (the legacy path).
+    actual_sha = precomputed_sha
+    if not actual_sha:
+        actual_sha = await asyncio.to_thread(_hash_file_sha256, video_path)
     if not actual_sha or actual_sha != expected_sha:
         return None
 

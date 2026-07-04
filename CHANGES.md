@@ -1,3 +1,115 @@
+# ClipAI — Speed & efficiency pass (quality-neutral): I/O amplification, redundant decode/hash passes, event-loop stalls
+
+Every change is quality-neutral by construction: same frames at the same
+timestamps, same Whisper parameters, same thresholds, same pipeline order.
+The wins are write amplification, duplicate full-file reads, second decode
+passes, and serialization on the event loop. All new behavior is fail-soft
+(any error falls back to the previous code path) and every knob lives in
+`backend/config.py`.
+
+- **Task 1 — job.json write amplification** (`database.py`). Every
+  `update_job_status` used to round-trip the FULL multi-MB job.json through
+  disk (read → parse → Pydantic-validate → dump → pretty-print → atomic
+  rewrite) for every ~1-3 s progress tick — hundreds of multi-MB cycles per
+  job competing with ffmpeg/Whisper. Now: (1a) an mtime-checked, LRU-bounded
+  (8 jobs) in-memory cache of parsed `JobResult`s serves reads and is updated
+  with a re-validated object on every save; (1b) progress-only updates
+  (progress/message, unchanged non-terminal status) mutate the cache
+  immediately — readers and the WebSocket stay real-time — but persist at most
+  once per `JOB_PROGRESS_FLUSH_INTERVAL` (default 2.0 s) with a guaranteed
+  trailing flush; status changes, field writes, terminal statuses and
+  whole-object saves write through unchanged, so a crash costs ≤~2 s of
+  progress-bar position; (1c) job.json is written compact (`JOB_JSON_PRETTY`
+  default False restores indent=2 for debugging). The atomic-write, per-job
+  lock, `protect_terminal` and save-guard semantics are preserved exactly
+  (guard-adjusted saves invalidate the cache instead of caching a divergent
+  object; the direct `_persist_complete_job` writer invalidates it
+  explicitly). Expected: removes hundreds of multi-MB JSON round trips and
+  most steady-state disk churn per job.
+- **Task 2 — source hashing off the critical path** (`pipeline.py`,
+  `pipeline_helpers.py`). The post-extraction `await _hash_file_sha256`
+  (full sequential read, 10-60 s on multi-GB array sources) blocked the
+  engine start, and re-analyze runs hashed AGAIN inside the cache probe. One
+  background hash task now starts right after metadata extraction (the page
+  cache absorbs the read while ffmpeg streams the same bytes);
+  `_maybe_use_cached_extraction` accepts the precomputed digest (hashing
+  internally only for standalone callers); the DB `source_sha256`, the local
+  copy and the engine-checkpoint signature all consume the single result.
+  Exactly one full-file hash per run, fully overlapped with extraction; the
+  task is cancelled and swallowed on failure/cancellation. Expected: 10-60 s
+  recovered per fresh run, up to double on re-analyze.
+- **Task 3 — PTS probe folded into the primary extraction pass**
+  (`frame_extractor.py`). `_bulk_probe_pts` ran a SECOND ffmpeg decode over
+  every extracted JPEG and was skipped above 240 frames. The extraction
+  filter graphs now end in `,showinfo` (after `format=`, reporting exactly
+  the frames written) and the extraction run's own stderr yields the ordered
+  `pts_time` list — no extra decode, no ≤240 cap, count-mismatch falls back
+  to the rough estimates for the unmatched tail. Bonus correctness fix found
+  while verifying parity: the old probe fed the JPEG SEQUENCE through
+  ffmpeg's image2 demuxer, which returns sequence timestamps (0.00, 0.04,
+  0.08 …) rather than source pts — so ≤240-frame jobs got corrupted
+  timestamps and every frame was tagged a scene cut (`gap < rate*0.7`). All
+  jobs now carry exact source timestamps — never worse, usually strictly
+  better. Expected: one full decode pass over all extracted JPEGs removed
+  (seconds to tens of seconds per job) + correct scene-cut identification.
+- **Task 4 — sidecar JSON dumps off the event loop** (`pipeline.py`).
+  `render_plan.json` and `detection_overlay.json` (tens of MB on long
+  sources — full face/person timelines) were built and `json.dump`-ed
+  synchronously on the event loop, freezing heartbeats and WS broadcasts for
+  seconds around the 60-62 % band. Both are now built + serialized inside
+  `asyncio.to_thread` with the same try/except + log lines.
+- **Task 5 — fail-soft hardware decode for the Perceiver**
+  (`reframer_perceiver.py`, `REFRAMER_CV2_HWACCEL` default True). The
+  Perceiver's `cv2.VideoCapture` open now requests FFmpeg
+  `VIDEO_ACCELERATION_ANY` (guarded by `hasattr`); if the hw capture fails
+  to open, its first read fails, or it can't rewind to frame 0, it is
+  released and the plain software constructor is used. Only WHERE decoding
+  happens changes — seeks, grab()/read() and returned BGR frames are
+  identical (parity-tested). The winning path is logged at the PERCEIVE
+  stage (`decode=hw(any)` / `decode=sw`). Expected: meaningful decode
+  offload on long videos where OpenCV's FFmpeg build supports hwaccel.
+- **Task 6 — cached saliency meshgrids** (`reframer_perceiver.py`). The
+  speaker-bump block and the `_fuse_saliency` motion prior rebuilt
+  `np.mgrid[0:sal_size, 0:sal_size]` on every no-face sample (thousands per
+  run on gameplay/anime). One cached `(yy, xx)` pair per `sal_size` (same
+  pattern as `_center_prior_cache`); identical numerics, pure allocation
+  removal.
+- **Task 7 — OPT-IN fix: `_prev_frame_for_face_motion`**
+  (`REFRAMER_FIX_PREV_FRAME_MOTION` default **False** — the one change that
+  is NOT output-identical when enabled). Legacy code updates the previous-
+  frame reference INSIDE the per-face loop, so the 2nd+ face in a frame
+  always scores motion/mouth_motion 0 (multi-face speaker detection
+  degraded) and zero-face frames never update the reference (stale,
+  seconds-old comparisons after face-less stretches). With the flag on, the
+  reference is captured once at entry, used for all faces, and updated
+  exactly once per sample including the zero-face path. Flag off is
+  byte-identical to legacy (locked in by tests).
+- **Task 8 — orjson with strict stdlib fallback**
+  (`backend/services/fastjson.py`, wired into job.json save/load, engine
+  checkpoint save/load, and the Task-4 sidecars; `orjson>=3.9` added to
+  `requirements.txt`, installed by both Dockerfiles via `-r
+  requirements.txt`). Compact separators, `OPT_NON_STR_KEYS` (matches
+  stdlib's int-key stringification for the checkpoint timelines),
+  `OPT_SERIALIZE_NUMPY` plus the existing `_numpy_safe_default` net; on
+  ImportError (or any orjson-specific reject) it falls back to stdlib with
+  identical semantics. Human-facing pretty output stays on stdlib json.
+  Expected: several-× faster encode/parse on every persist/load of the
+  multi-MB payloads, lowering steady-state CPU contention with the
+  CPU-bound stages.
+
+New settings: `JOB_PROGRESS_FLUSH_INTERVAL` (2.0), `JOB_JSON_PRETTY`
+(False), `REFRAMER_CV2_HWACCEL` (True), `REFRAMER_FIX_PREV_FRAME_MOTION`
+(False).
+
+Tests: `tests/test_perf_speedups.py` (cache/debounce/compact, hash-once,
+fastjson round-trips + fallback, checkpoint round-trip),
+`tests/test_reframer_perf.py` (hw-decode fallback + hw/sw frame parity,
+meshgrid numerics, prev-frame flag on/off), and
+`backend/tests/test_bulk_pts_probe.py` rewritten for the in-pass showinfo
+parsing (parser unit test, error-extraction with showinfo noise, ffmpeg
+end-to-end pts check). Existing persistence-race / save-guard / recovery /
+checkpoint tests all pass unchanged.
+
 # ClipAI — 100%-target-language transcripts, user-accurate reframe grades, denser subject tracking
 
 Implements the full run-13 assessment: language purity + coherence, per-clip

@@ -279,6 +279,11 @@ def _build_scene_filter(rate: int) -> str:
     raise the threshold to avoid scene detection overwhelming the interval cap.
     Standard rate=10 uses threshold 0.3.
     rate=30+ uses threshold 0.45 (only major scene changes).
+
+    The trailing ``showinfo`` (after ``format=``, so it reports the frames
+    actually written) prints each selected frame's ``pts_time`` to stderr —
+    that's how :func:`extract_frames` gets exact timestamps from the primary
+    extraction pass, with no second decode over the JPEGs.
     """
     if rate >= 30:
         threshold = 0.45  # Only major scene changes for long videos
@@ -291,17 +296,57 @@ def _build_scene_filter(rate: int) -> str:
         f"select='gt(scene\\,{threshold})+isnan(prev_selected_t)"
         f"+gte(t-prev_selected_t\\,{rate})',"
         f"scale='min(1024\\,iw)':'min(576\\,ih)':force_original_aspect_ratio=decrease,"
-        f"format=pix_fmts=yuvj420p"
+        f"format=pix_fmts=yuvj420p,showinfo"
     )
 
 
 def _build_interval_filter(rate: int) -> str:
-    """Build a simple interval-only filter (no scene detection)."""
+    """Build a simple interval-only filter (no scene detection).
+
+    Ends with ``showinfo`` for the same pts_time capture as
+    :func:`_build_scene_filter`.
+    """
     return (
         f"select='isnan(prev_selected_t)+gte(t-prev_selected_t\\,{rate})',"
         f"scale='min(1024\\,iw)':'min(576\\,ih)':force_original_aspect_ratio=decrease,"
-        f"format=pix_fmts=yuvj420p"
+        f"format=pix_fmts=yuvj420p,showinfo"
     )
+
+
+_SHOWINFO_PTS_RE = None
+
+
+def _parse_showinfo_pts(stderr_bytes: bytes) -> list[float]:
+    """Parse the ordered ``pts_time`` values showinfo printed to stderr.
+
+    One line per frame the filter graph actually emitted, e.g.::
+
+        [Parsed_showinfo_3 @ 0x...] n:  12 pts: 184320 pts_time:12.0 ...
+
+    Returns the values in extraction (chronological) order; empty list on
+    any parse problem so callers keep their rough-timestamp fallback.
+    """
+    global _SHOWINFO_PTS_RE
+    if not stderr_bytes:
+        return []
+    try:
+        import re
+        if _SHOWINFO_PTS_RE is None:
+            _SHOWINFO_PTS_RE = re.compile(r"pts_time:([\d.]+)")
+        text = stderr_bytes.decode(errors="replace")
+        out: list[float] = []
+        for line in text.splitlines():
+            if "showinfo" not in line:
+                continue
+            m = _SHOWINFO_PTS_RE.search(line)
+            if m:
+                try:
+                    out.append(float(m.group(1)))
+                except ValueError:
+                    return []
+        return out
+    except Exception:
+        return []
 
 
 def _get_gpu_decode_args() -> list[str]:
@@ -315,58 +360,6 @@ def _get_gpu_decode_args() -> list[str]:
     except Exception as e:
         logger.warning("GPU decode args failed (falling back to CPU): %s", e)
         return []
-
-
-async def _bulk_probe_pts(jpg_dir: str, count: int) -> list[float | None]:
-    """Run one ffmpeg pass over the extracted JPGs and parse pts_time
-    for every frame from the showinfo filter's stderr output.
-
-    Returns a list of length ``count``, with ``None`` for any frame
-    whose pts couldn't be parsed (caller falls back to the rough
-    timestamp already on the FrameData).
-
-    This replaces the previous per-frame ffprobe-spawn loop — each
-    spawn cost ~30-80ms of subprocess overhead, so collapsing to a
-    single ffmpeg pass recovers ~5-15s on every job with >50 frames.
-    """
-    if count == 0:
-        return []
-    # Globbing the jpg sequence is faster than feeding individual files
-    # because ffmpeg only opens one demuxer.
-    cmd = [
-        "ffmpeg", "-y",
-        "-pattern_type", "glob",
-        "-i", os.path.join(jpg_dir, "frame_*.jpg"),
-        "-vf", "showinfo",
-        "-f", "null", "-",
-    ]
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-    except (asyncio.TimeoutError, Exception) as e:
-        logger.warning("Bulk PTS probe failed (%s); falling back to per-frame", e)
-        return [None] * count
-
-    text = stderr.decode(errors="replace")
-    # showinfo lines look like:
-    # [Parsed_showinfo_0 @ 0x...] n: 0   pts: 0       pts_time:0
-    import re
-    pts_values: list[float | None] = []
-    for line in text.splitlines():
-        m = re.search(r"pts_time:([\d.]+)", line)
-        if m:
-            try:
-                pts_values.append(float(m.group(1)))
-            except ValueError:
-                pts_values.append(None)
-    # Pad / truncate to match expected count.
-    if len(pts_values) < count:
-        pts_values.extend([None] * (count - len(pts_values)))
-    return pts_values[:count]
 
 
 async def _run_ffmpeg_extraction(
@@ -699,22 +692,30 @@ async def extract_frames(
             timestamp = idx * rate
         all_frames.append(FrameData(timestamp=float(timestamp), path=path))
 
-    # Refine timestamps using a single ffmpeg pass with the showinfo
-    # filter. The previous implementation spawned one ffprobe process
-    # per frame (up to 200 concurrently); this collapses those spawns
-    # into one subprocess that emits every frame's pts_time on stderr.
-    if len(all_frames) <= 240:
-        try:
-            pts_results = await _bulk_probe_pts(output_dir, len(all_frames))
+    # Refine timestamps from the extraction pass itself: the filter graphs end
+    # in ``showinfo``, so the successful attempt's stderr already carries one
+    # ``pts_time`` per written frame. This replaces the old second ffmpeg
+    # decode over the extracted JPEGs (and its ≤240-frame cap — exact
+    # timestamps now cost nothing, so every frame count gets them). On a
+    # count mismatch the unmatched tail keeps the rough estimates above.
+    try:
+        pts_results = _parse_showinfo_pts(stderr)
+        if pts_results:
             for frame, pts in zip(all_frames, pts_results):
-                if isinstance(pts, float):
-                    frame.timestamp = pts
-        except Exception as e:
-            logger.warning("Could not refine frame timestamps: %s", e)
-    else:
-        logger.info(
-            "Skipping bulk PTS refinement for %d frames (>240)", len(all_frames),
-        )
+                frame.timestamp = float(pts)
+            if len(pts_results) != len(all_frames):
+                logger.info(
+                    "showinfo pts count (%d) != extracted frame count (%d) — "
+                    "kept rough timestamps for the unmatched tail",
+                    len(pts_results), len(all_frames),
+                )
+        else:
+            logger.info(
+                "No showinfo pts in extraction stderr — keeping rough timestamps "
+                "for %d frames", len(all_frames),
+            )
+    except Exception as e:
+        logger.warning("Could not refine frame timestamps: %s", e)
 
     # ── Smart frame capping: preserve scene-change frames ──
     # Scene-change frames have irregular spacing (not multiples of rate).

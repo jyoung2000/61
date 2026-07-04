@@ -4,11 +4,14 @@ import os
 import shutil
 import asyncio
 import tempfile
+import time
+from collections import OrderedDict
 from typing import Optional
 
 import aiofiles
 
 from backend.models import JobResult, TranscriptSegment
+from backend.services import fastjson
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +40,102 @@ def _get_lock(job_id: str) -> asyncio.Lock:
     if job_id not in _file_locks:
         _file_locks[job_id] = asyncio.Lock()
     return _file_locks[job_id]
+
+
+# ── In-memory job cache + coalesced progress persistence ────────────
+#
+# Every ``update_job_status`` used to round-trip the FULL job.json through
+# disk: read → json.loads → Pydantic-validate → mutate → model_dump →
+# json.dumps → atomic rewrite. After the analysis save that file carries the
+# full transcript, scenes, subject track and clips (multiple MB), and progress
+# callbacks fire every ~1-3 s through extraction / the engine relay /
+# translation / the clipper — hundreds of multi-MB parse+serialize+write
+# cycles per job, competing with ffmpeg/Whisper for CPU and thrashing disk.
+#
+# Three cooperating mechanisms fix that without touching the atomic-write /
+# per-job-lock / protect_terminal / save-guard semantics:
+#   * ``_job_cache`` — an mtime-checked LRU of parsed ``JobResult`` objects,
+#     keyed by the canonical job.json PATH (so tests that monkeypatch
+#     ``_job_dir`` can never alias entries across directories). All writers go
+#     through this module under the same per-job lock; the mtime check
+#     additionally protects against out-of-band edits of job.json on disk.
+#   * progress-only debounce — updates that change nothing but
+#     ``progress`` / ``progress_message`` (and a same-value ``status``) mutate
+#     the cached object immediately (readers see fresh progress) but persist
+#     to disk at most once per ``JOB_PROGRESS_FLUSH_INTERVAL`` seconds, with a
+#     guaranteed trailing flush. Anything else — field writes, status changes,
+#     terminal statuses, whole-object saves — writes through unchanged, so
+#     crash recovery loses at most ~2 s of progress-bar position.
+#   * compact JSON via ``fastjson`` (orjson when installed) — pretty output
+#     is available behind ``JOB_JSON_PRETTY`` for debugging.
+#
+# Everything here is fail-soft: any error falls back to the exact previous
+# load-from-disk / write-through path.
+
+_JOB_CACHE_MAX = 8
+# path -> (JobResult, st_mtime_ns of the file the object mirrors)
+_job_cache: "OrderedDict[str, tuple[JobResult, int]]" = OrderedDict()
+# paths whose cached object carries progress not yet persisted to disk
+_dirty_jobs: set[str] = set()
+# path -> monotonic time of the last disk persist
+_last_flush: dict[str, float] = {}
+# path -> scheduled trailing-flush task
+_pending_flush_tasks: dict[str, asyncio.Task] = {}
+
+
+def _progress_flush_interval() -> float:
+    try:
+        from backend.config import settings
+        return float(getattr(settings, "JOB_PROGRESS_FLUSH_INTERVAL", 2.0) or 0.0)
+    except Exception:
+        return 2.0
+
+
+def _job_json_pretty() -> bool:
+    try:
+        from backend.config import settings
+        return bool(getattr(settings, "JOB_JSON_PRETTY", False))
+    except Exception:
+        return False
+
+
+def _cache_put(path: str, job: JobResult, mtime_ns: int) -> None:
+    try:
+        _job_cache[path] = (job, mtime_ns)
+        _job_cache.move_to_end(path)
+        while len(_job_cache) > _JOB_CACHE_MAX:
+            _evicted, _ = _job_cache.popitem(last=False)
+            _dirty_jobs.discard(_evicted)
+            _last_flush.pop(_evicted, None)
+    except Exception:
+        pass
+
+
+def _invalidate_job_cache(job_id: str) -> None:
+    """Drop a job's cache entry (deletion, or an out-of-band direct write
+    like the pipeline's ``_persist_complete_job``). Safe to call anytime."""
+    try:
+        path = _job_path(job_id)
+        _job_cache.pop(path, None)
+        _dirty_jobs.discard(path)
+        _last_flush.pop(path, None)
+        task = _pending_flush_tasks.pop(path, None)
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+    except Exception:
+        pass
+
+
+def _reset_job_cache_for_tests() -> None:
+    for _t in list(_pending_flush_tasks.values()):
+        try:
+            _t.cancel()
+        except Exception:
+            pass
+    _pending_flush_tasks.clear()
+    _job_cache.clear()
+    _dirty_jobs.clear()
+    _last_flush.clear()
 
 
 def _job_dir(job_id: str) -> str:
@@ -118,8 +217,18 @@ async def _save_job_unlocked(job: JobResult, *, _preserve_terminal_status: bool 
                     setattr(job, _tk, _coerce_segments(_rows))
                 except Exception:
                     pass
-        return job.model_dump(mode="json")
-    data = await asyncio.to_thread(_coerce_and_dump)
+        dumped = job.model_dump(mode="json")
+        # Re-validate the dump for the cache: callers assign raw strings /
+        # dicts to fields (Pydantic does NOT validate plain assignment), and
+        # before the cache existed every reader got a freshly-validated object
+        # from disk. Caching this round-tripped model preserves exactly those
+        # read semantics (status enums, nested models) at no extra I/O.
+        try:
+            revalidated = JobResult(**dumped)
+        except Exception:
+            revalidated = None
+        return dumped, revalidated
+    data, _cacheable_job = await asyncio.to_thread(_coerce_and_dump)
 
     # ── Anti-clobber guard (whole-object save_job path only) ────────────
     # A load → modify → save_job with a job captured just before a newer write
@@ -135,12 +244,18 @@ async def _save_job_unlocked(job: JobResult, *, _preserve_terminal_status: bool 
     # ``update_job_status`` skips this — it loads fresh under the lock (so it
     # never carries a stale translation) and its protect_terminal logic already
     # governs status — which also avoids a re-read on every progress write.
+    # When a guard below rewrites ``data`` (keeping on-disk fields the incoming
+    # object lost), the in-memory ``job`` no longer mirrors what lands on disk
+    # — so the cache entry is invalidated instead of updated (next load
+    # re-parses the guarded on-disk copy, exactly as before the cache existed).
+    _guard_adjusted = False
     if _preserve_terminal_status:
         try:
             if os.path.exists(path):
                 with open(path, "r", encoding="utf-8") as _cf:
                     _cur = json.load(_cf)
                 if (_cur.get("translated_transcript") or []) and not (data.get("translated_transcript") or []):
+                    _guard_adjusted = True
                     data["translated_transcript"] = _cur["translated_transcript"]
                     logger.warning(
                         "Save guard [%s]: kept %d existing translated_transcript "
@@ -156,6 +271,7 @@ async def _save_job_unlocked(job: JobResult, *, _preserve_terminal_status: bool 
                     if (_cur.get("transcript_readability")
                             and _cur.get("transcript_readability")
                             != data.get("transcript_readability")):
+                        _guard_adjusted = True
                         data["transcript_readability"] = _cur["transcript_readability"]
                         logger.warning(
                             "Save guard [%s]: kept existing transcript_readability — "
@@ -179,6 +295,7 @@ async def _save_job_unlocked(job: JobResult, *, _preserve_terminal_status: bool 
                         _cur_frac = fraction_untranslated(_cur_tt, _tgt)
                         _new_frac = fraction_untranslated(_new_tt, _tgt)
                         if _new_frac > _cur_frac + 0.02:
+                            _guard_adjusted = True
                             data["translated_transcript"] = _cur_tt
                             if _cur.get("transcript_readability"):
                                 data["transcript_readability"] = _cur["transcript_readability"]
@@ -199,6 +316,7 @@ async def _save_job_unlocked(job: JobResult, *, _preserve_terminal_status: bool 
                 # the existing summary whenever the incoming save lacks one; a real
                 # re-analysis writes a NEW non-empty summary, which still wins.
                 if _cur.get("summary") and not data.get("summary"):
+                    _guard_adjusted = True
                     data["summary"] = _cur["summary"]
                     logger.warning(
                         "Save guard [%s]: kept existing summary — incoming save had "
@@ -206,6 +324,7 @@ async def _save_job_unlocked(job: JobResult, *, _preserve_terminal_status: bool 
                 _cur_status = str(_cur.get("status", "") or "").lower()
                 _new_status = str(data.get("status", "") or "").lower()
                 if _cur_status in _TERMINAL_STATUSES and _new_status not in _TERMINAL_STATUSES:
+                    _guard_adjusted = True
                     data["status"] = _cur.get("status")
                     if "progress" in _cur:
                         data["progress"] = _cur.get("progress")
@@ -229,14 +348,20 @@ async def _save_job_unlocked(job: JobResult, *, _preserve_terminal_status: bool 
             pass
 
     # Encode off the event loop too (a multi-MB job dict is slow to stringify).
-    content = await asyncio.to_thread(
-        json.dumps, data, indent=2, default=_numpy_safe_default)
+    # Compact by default (fastjson → orjson when installed); pretty output is
+    # a debugging aid behind JOB_JSON_PRETTY.
+    if _job_json_pretty():
+        payload = (await asyncio.to_thread(
+            json.dumps, data, indent=2, default=_numpy_safe_default)).encode("utf-8")
+    else:
+        payload = await asyncio.to_thread(
+            fastjson.dumps_bytes, data, _numpy_safe_default)
     # Atomic write: write to temp file then rename to prevent readers
     # from seeing a truncated/empty file during concurrent access.
     fd, tmp_path = tempfile.mkstemp(dir=directory, suffix=".tmp")
     try:
-        async with aiofiles.open(fd, "w", closefd=True) as f:
-            await f.write(content)
+        async with aiofiles.open(fd, "wb", closefd=True) as f:
+            await f.write(payload)
         os.replace(tmp_path, path)
     except BaseException:
         # Clean up temp file on any failure
@@ -245,6 +370,27 @@ async def _save_job_unlocked(job: JobResult, *, _preserve_terminal_status: bool 
         except OSError:
             pass
         raise
+
+    # ── Cache upkeep (fail-soft: a failure here only costs a re-parse) ──
+    try:
+        _dirty_jobs.discard(path)
+        _last_flush[path] = time.monotonic()
+        _pending = _pending_flush_tasks.get(path)
+        if (_pending is not None and _pending is not asyncio.current_task()
+                and not _pending.done()):
+            # A write-through supersedes any scheduled trailing flush.
+            _pending_flush_tasks.pop(path, None)
+            _pending.cancel()
+        if _guard_adjusted or _cacheable_job is None:
+            # Disk carries guard-restored fields the in-memory object lost
+            # (or re-validation failed) — don't cache a divergent object;
+            # the next load re-parses the file.
+            _job_cache.pop(path, None)
+        else:
+            _cache_put(path, _cacheable_job, os.stat(path).st_mtime_ns)
+    except Exception as _cache_err:
+        logger.info("job cache update skipped for %s: %s", job.job_id, _cache_err)
+        _job_cache.pop(path, None)
 
 
 async def _load_job_unlocked(job_id: str) -> Optional[JobResult]:
@@ -256,8 +402,27 @@ async def _load_job_unlocked(job_id: str) -> Optional[JobResult]:
     path = _job_path(job_id)
     if not os.path.exists(path):
         return None
+    # Cache probe: serve the parsed object when the file hasn't changed since
+    # it was cached (we hold the per-job lock; every writer in this module
+    # updates or invalidates the entry, and the mtime check catches direct
+    # writers like _persist_complete_job and manual on-disk edits).
     try:
-        async with aiofiles.open(path, "r") as f:
+        cached = _job_cache.get(path)
+        if cached is not None:
+            if os.stat(path).st_mtime_ns == cached[1]:
+                _job_cache.move_to_end(path)
+                return cached[0]
+            _job_cache.pop(path, None)
+            _dirty_jobs.discard(path)
+    except Exception:
+        pass
+    try:
+        stat_before = None
+        try:
+            stat_before = os.stat(path).st_mtime_ns
+        except OSError:
+            pass
+        async with aiofiles.open(path, "rb") as f:
             content = await f.read()
         if not content.strip():
             logger.warning("Empty job.json for %s, treating as not found", job_id)
@@ -268,7 +433,12 @@ async def _load_job_unlocked(job_id: str) -> Optional[JobResult]:
         # loop — which surfaces as "Connection lost" in the UI and every other
         # request hanging while a transcript "loads forever". load_job runs on
         # every poll, so this is the hot path.
-        return await asyncio.to_thread(lambda: JobResult(**json.loads(content)))
+        job = await asyncio.to_thread(lambda: JobResult(**fastjson.loads(content)))
+        # mtime captured BEFORE the read: if the file changed mid-read the
+        # cached mtime won't match the file's next stat and we re-parse.
+        if job is not None and stat_before is not None:
+            _cache_put(path, job, stat_before)
+        return job
     except (json.JSONDecodeError, Exception) as e:
         logger.warning("Failed to load job %s: %s", job_id, e)
         return None
@@ -433,6 +603,7 @@ async def delete_job(job_id: str) -> bool:
             except OSError:
                 pass
 
+        _invalidate_job_cache(job_id)
         shutil.rmtree(directory, ignore_errors=True)
         # Also clean up exported clips / output files
         output_dir = f"/data/outputs/{job_id}"
@@ -462,6 +633,99 @@ def _status_value(status) -> str:
     if status is None:
         return ""
     return (status.value if hasattr(status, "value") else str(status)).lower()
+
+
+def _classify_progress_only(cur_status: str, incoming_status, kwargs: dict) -> bool:
+    """True when an ``update_job_status`` call changes nothing but progress.
+
+    Progress-only ⇔ no extra fields, the status (when provided) equals the
+    current one, and neither side is terminal. Terminal writes and field
+    writes must always hit disk immediately.
+    """
+    if kwargs:
+        return False
+    if cur_status in _TERMINAL_STATUSES:
+        return False
+    if incoming_status is not None:
+        if incoming_status != cur_status:
+            return False
+        if incoming_status in _TERMINAL_STATUSES:
+            return False
+    return True
+
+
+def _schedule_trailing_flush(job_id: str, path: str, delay: float) -> bool:
+    """Arm the trailing flush for a debounced progress write.
+
+    Returns False when a task can't be scheduled (no running loop) so the
+    caller falls back to an immediate write-through.
+    """
+    existing = _pending_flush_tasks.get(path)
+    if existing is not None and not existing.done():
+        return True  # one pending flush is enough — it writes the LATEST state
+
+    async def _flush_later():
+        try:
+            await asyncio.sleep(max(0.05, delay))
+            async with _get_lock(job_id):
+                if path not in _dirty_jobs:
+                    return
+                entry = _job_cache.get(path)
+                if entry is None:
+                    _dirty_jobs.discard(path)
+                    return
+                await _save_job_unlocked(entry[0])
+        except asyncio.CancelledError:
+            pass  # superseded by a write-through, or the job was deleted
+        except Exception as exc:
+            logger.warning("[%s] trailing progress flush failed: %s", job_id, exc)
+        finally:
+            if _pending_flush_tasks.get(path) is asyncio.current_task():
+                _pending_flush_tasks.pop(path, None)
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    try:
+        _pending_flush_tasks[path] = loop.create_task(_flush_later())
+        return True
+    except Exception:
+        return False
+
+
+def _maybe_defer_progress_write(job: JobResult) -> bool:
+    """Debounce a progress-only persist. Caller holds the per-job lock and has
+    already mutated ``job`` (which must be the cached object, so readers see
+    the fresh progress immediately).
+
+    Returns True when the disk write was deferred (a trailing flush is armed),
+    False when the caller must write through now.
+    """
+    try:
+        interval = _progress_flush_interval()
+        if interval <= 0:
+            return False
+        path = _job_path(job.job_id)
+        entry = _job_cache.get(path)
+        if entry is None or entry[0] is not job:
+            # Can't guarantee readers see this object — write through.
+            return False
+        last = _last_flush.get(path)
+        if last is None:
+            return False
+        now = time.monotonic()
+        elapsed = now - last
+        if elapsed >= interval:
+            return False
+        if not _schedule_trailing_flush(job.job_id, path, interval - elapsed):
+            return False
+        _dirty_jobs.add(path)
+        return True
+    except Exception as exc:
+        logger.info("[%s] progress debounce skipped (%s); writing through",
+                    getattr(job, "job_id", "?"), exc)
+        return False
 
 
 def _cjk_heavy_text(text: str) -> bool:
@@ -537,7 +801,11 @@ async def update_job_status(
                 return job
 
         if status is not None:
-            job.status = status
+            # Same-value writes keep the existing (validated) attribute so a
+            # debounced update can't swap the cached enum for a raw string;
+            # the serialized value is identical either way.
+            if incoming_status != cur_status:
+                job.status = status
         if progress is not None:
             # Don't tick a finished job's bar backwards on a late
             # field-only update that happens to carry an old progress value.
@@ -581,5 +849,12 @@ async def update_job_status(
         for key, value in kwargs.items():
             if hasattr(job, key):
                 setattr(job, key, value)
+        # Progress-only updates (no field changes, no status change, neither
+        # side terminal) are debounced: the cached object above already carries
+        # the new progress for every reader; disk sees it at most once per
+        # JOB_PROGRESS_FLUSH_INTERVAL with a guaranteed trailing flush.
+        if (_classify_progress_only(cur_status, incoming_status, kwargs)
+                and _maybe_defer_progress_write(job)):
+            return job
         await _save_job_unlocked(job)
         return job

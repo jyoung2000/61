@@ -5,6 +5,10 @@ websockets==12.0
 pydantic>=2.7.2,<3.0.0
 pydantic-settings>=2.5.2
 httpx==0.27.2
+# Fast JSON for the job.json / engine-checkpoint hot paths (multi-MB payloads
+# serialized on every persist). Optional at runtime: backend/services/fastjson.py
+# falls back to stdlib json with identical semantics when orjson is absent.
+orjson>=3.9
 # Fernet encryption for cloud storage OAuth tokens at rest. See
 # backend/app/cloud/crypto.py and docs/cloud-storage/RECON.md.
 cryptography>=42.0.0

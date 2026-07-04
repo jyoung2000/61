@@ -77,13 +77,78 @@ class Perceiver:
         self._prev_gray_for_motion = None
         self._prev_frame_for_face_motion = None
 
+    def _sal_meshgrid(self, sal_size: int):
+        """Cached ``(yy, xx) = np.mgrid[0:sal_size, 0:sal_size]``.
+
+        The speaker-bump block in ``run()`` and the motion prior in
+        ``_fuse_saliency`` rebuilt this pair on every no-face sample —
+        thousands of allocations per run on gameplay/anime content. Same
+        pattern as ``_center_prior_cache``; the arrays are only ever read.
+        Identical numerics.
+        """
+        mg = getattr(self, '_sal_meshgrid_cache', None)
+        if mg is None or mg[0].shape[0] != sal_size:
+            yy, xx = np.mgrid[0:sal_size, 0:sal_size]
+            mg = (yy, xx)
+            self._sal_meshgrid_cache = mg
+        return mg
+
+    def _open_capture(self, log) -> "cv2.VideoCapture":
+        """Open the source video, preferring hardware-accelerated decode.
+
+        CPU-decoding the full source is the dominant non-Whisper cost of the
+        perception band on long videos. When ``REFRAMER_CV2_HWACCEL`` is on
+        (and this OpenCV build exposes the knob), ask the FFmpeg backend for
+        ``VIDEO_ACCELERATION_ANY``. This changes only WHERE decoding happens:
+        grab()/retrieve()/CAP_PROP_POS_FRAMES seeks and the returned BGR
+        frames behave identically, so all downstream sampling/tracking logic
+        is untouched.
+
+        Fail-soft: if the hw-accel capture can't open, its first read fails,
+        or it can't be rewound to frame 0, it is released and the plain
+        software constructor is used — exactly the previous behavior.
+        The winning path is recorded on ``self._decode_path``
+        (``hw(any)`` / ``sw``) and logged at the PERCEIVE stage.
+        """
+        self._decode_path = 'sw'
+        if (getattr(settings, 'REFRAMER_CV2_HWACCEL', True)
+                and hasattr(cv2, 'CAP_PROP_HW_ACCELERATION')
+                and hasattr(cv2, 'VIDEO_ACCELERATION_ANY')):
+            hw_cap = None
+            try:
+                hw_cap = cv2.VideoCapture(
+                    self.path, cv2.CAP_FFMPEG,
+                    [cv2.CAP_PROP_HW_ACCELERATION, cv2.VIDEO_ACCELERATION_ANY])
+                if hw_cap is not None and hw_cap.isOpened():
+                    ret, probe = hw_cap.read()
+                    if (ret and probe is not None
+                            and hw_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                            and int(hw_cap.get(cv2.CAP_PROP_POS_FRAMES)) == 0):
+                        self._decode_path = 'hw(any)'
+                        log.log_stage('PERCEIVE', 'VideoCapture decode=hw(any) '
+                                      '(FFmpeg VIDEO_ACCELERATION_ANY)')
+                        return hw_cap
+                if hw_cap is not None:
+                    hw_cap.release()
+            except Exception as hw_err:
+                logger.info("hw-accel VideoCapture unavailable (%s); "
+                            "falling back to software decode", hw_err)
+                try:
+                    if hw_cap is not None:
+                        hw_cap.release()
+                except Exception:
+                    pass
+        cap = cv2.VideoCapture(self.path)
+        log.log_stage('PERCEIVE', 'VideoCapture decode=sw')
+        return cap
+
     def run(self, on_progress: Callable = None) -> PerceptionResult:
         log = get_logger()
         log.start_timer('perceive')
         log.log_stage('PERCEIVE', f'Starting analysis: {self.path}',
                        sample_fps=self.sample_fps)
 
-        cap = cv2.VideoCapture(self.path)
+        cap = self._open_capture(log)
         if not cap.isOpened():
             log.log_error('PERCEIVE', f'Cannot open: {self.path}')
             raise FileNotFoundError(f"Cannot open: {self.path}")
@@ -552,7 +617,7 @@ class Perceiver:
                             sp_y_sal = int(sp_cy / max(1, r.src_h) * sal_size)
                             sp_x_sal = max(0, min(sal_size - 1, sp_x_sal))
                             sp_y_sal = max(0, min(sal_size - 1, sp_y_sal))
-                            yy, xx = np.mgrid[0:sal_size, 0:sal_size]
+                            yy, xx = self._sal_meshgrid(sal_size)
                             sigma = sal_size * 0.10
                             bump = np.exp(
                                 -((xx - sp_x_sal) ** 2 + (yy - sp_y_sal) ** 2)
@@ -817,6 +882,19 @@ class Perceiver:
         with pixel-diff fallback for non-YuNet detections."""
         raw_faces = self.face_detector.detect(frame_bgr)
 
+        # ── REFRAMER_FIX_PREV_FRAME_MOTION (opt-in, changes outputs) ──
+        # Legacy behavior assigns self._prev_frame_for_face_motion INSIDE the
+        # per-face loop below, so (a) the 2nd+ face in a frame compares the
+        # current gray against itself (motion/mouth_motion always 0 —
+        # degrading multi-face speaker detection) and (b) zero-face frames
+        # never update the reference (the next comparison spans a stale,
+        # seconds-old frame). With the flag on, the previous-frame reference
+        # is captured once at entry, used for ALL faces, and updated exactly
+        # once per sample (including the zero-face path). Default OFF keeps
+        # legacy outputs byte-identical.
+        _fix_prev = bool(getattr(settings, 'REFRAMER_FIX_PREV_FRAME_MOTION', False))
+        _entry_prev = self._prev_frame_for_face_motion
+
         validated = []
         for face in raw_faces:
             fx, fy, fw, fh = face['x'], face['y'], face['w'], face['h']
@@ -835,7 +913,8 @@ class Perceiver:
             has_landmarks = 'right_mouth' in face and 'left_mouth' in face and 'nose' in face
             used_landmark_mar = False
 
-            if has_landmarks and self._prev_frame_for_face_motion is not None:
+            _prev_ref = _entry_prev if _fix_prev else self._prev_frame_for_face_motion
+            if has_landmarks and _prev_ref is not None:
                 try:
                     rm = face['right_mouth']
                     lm = face['left_mouth']
@@ -866,8 +945,8 @@ class Perceiver:
                 except (IndexError, ValueError, TypeError):
                     pass
 
-            if self._prev_frame_for_face_motion is not None:
-                prev_g = self._prev_frame_for_face_motion
+            if _prev_ref is not None:
+                prev_g = _prev_ref
                 try:
                     cur_roi = gray[fy:fy+fh, fx:fx+fw]
                     prev_roi = prev_g[fy:fy+fh, fx:fx+fw]
@@ -896,7 +975,8 @@ class Perceiver:
                 except (IndexError, ValueError, cv2.error):
                     pass
 
-            self._prev_frame_for_face_motion = gray  # reuse, don't copy
+            if not _fix_prev:
+                self._prev_frame_for_face_motion = gray  # reuse, don't copy (legacy: per-face)
 
             inv_scale = 1.0 / scale
             src_x = int(fx * inv_scale)
@@ -978,6 +1058,11 @@ class Perceiver:
                 result['embedding'] = embedding
             validated.append(result)
 
+        if _fix_prev:
+            # Update ONCE per sample — every call, including zero-face frames,
+            # so the reference never goes stale across face-less stretches.
+            self._prev_frame_for_face_motion = gray  # reuse, don't copy
+
         return validated
 
     def _fuse_saliency(self, sal_map, sal_size, small_bgr, r, time_ms):
@@ -993,7 +1078,7 @@ class Perceiver:
             # Cache the static center-prior Gaussian (favor the frame center).
             cp = getattr(self, '_center_prior_cache', None)
             if cp is None or cp.shape[0] != sal_size:
-                yy, xx = np.mgrid[0:sal_size, 0:sal_size]
+                yy, xx = self._sal_meshgrid(sal_size)
                 cy0 = cx0 = (sal_size - 1) / 2.0
                 sig = sal_size * 0.35
                 cp = np.exp(-((xx - cx0) ** 2 + (yy - cy0) ** 2)
@@ -1024,7 +1109,7 @@ class Perceiver:
                 my = int(mh['cy'] / max(1, r.src_h) * sal_size)
                 mx = max(0, min(sal_size - 1, mx))
                 my = max(0, min(sal_size - 1, my))
-                yy, xx = np.mgrid[0:sal_size, 0:sal_size]
+                yy, xx = self._sal_meshgrid(sal_size)
                 sig = sal_size * 0.12
                 motion = np.exp(-((xx - mx) ** 2 + (yy - my) ** 2)
                                 / (2.0 * sig * sig)).astype(np.float32)

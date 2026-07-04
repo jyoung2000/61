@@ -14,6 +14,7 @@ import httpx
 from backend.config import settings
 from backend.models import JobResult, JobStatus, FrameData, VideoSummary
 from backend import database
+from backend.services import fastjson
 from backend.services.frame_extractor import (
     get_video_metadata,
     extract_frames,
@@ -1110,6 +1111,58 @@ from backend.services.pipeline_helpers import (  # noqa: E402
 )
 from backend.services import pipeline_checkpoint  # noqa: E402
 
+# ── Background source-hash tasks (one per running job) ──────────────
+# The SHA-256 of the source used to be computed ON the critical path (a full
+# sequential read — 10-60 s for multi-GB files on array storage) after a fresh
+# extraction, and AGAIN inside the re-analyze cache probe. The pipeline now
+# starts one background hash task right after metadata extraction (it reads
+# the same file ffmpeg is about to read, so the page cache absorbs most of the
+# cost) and every consumer awaits that single task. Registered per job so
+# ``run_analysis``'s cleanup can cancel a straggler on failure/cancellation.
+_bg_hash_tasks: dict[str, asyncio.Task] = {}
+
+
+def _start_source_hash_task(job_id: str, video_path: str) -> "asyncio.Task | None":
+    """Kick off the background SHA-256 of ``video_path``. Fail-soft: returns
+    ``None`` on any error and the callers fall back to hashing inline."""
+    try:
+        task = asyncio.create_task(asyncio.to_thread(_hash_file_sha256, video_path))
+
+        def _swallow(t: asyncio.Task):
+            # Retrieve the result so a cancelled/failed straggler never logs
+            # "exception was never retrieved".
+            try:
+                t.exception()
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        task.add_done_callback(_swallow)
+        _bg_hash_tasks[job_id] = task
+        return task
+    except Exception as _hash_start_err:
+        logger.info("[%s] background source hash not started (%s); "
+                    "falling back to inline hashing", job_id, _hash_start_err)
+        return None
+
+
+async def _await_source_hash(job_id: str, task, video_path: str) -> str:
+    """Await the background hash (or hash inline when it's absent/failed).
+    Returns "" when the file can't be read — same contract as
+    ``_hash_file_sha256``."""
+    if task is not None:
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if not task.cancelled():
+                raise  # WE were cancelled — propagate; the task keeps its result
+            logger.info("[%s] background source hash was cancelled; rehashing inline",
+                        job_id)
+        except Exception as _hash_err:
+            logger.info("[%s] background source hash failed (%s); rehashing inline",
+                        job_id, _hash_err)
+    return await asyncio.to_thread(_hash_file_sha256, video_path)
+
+
 # ── Pipeline heartbeat — prevents >15s gaps in progress updates ──────
 class _PipelineHeartbeat:
     """Emits keepalive messages when no real progress update has been sent."""
@@ -1369,9 +1422,16 @@ async def _persist_complete_job(job_id: str, fields: dict) -> bool:
                             setattr(job, _k, _v)
                     try:
                         data = job.model_dump(mode="json")
-                        content = _json.dumps(
-                            data, indent=2,
-                            default=getattr(database, "_numpy_safe_default", None))
+                        if getattr(settings, "JOB_JSON_PRETTY", False):
+                            payload = _json.dumps(
+                                data, indent=2,
+                                default=getattr(database, "_numpy_safe_default", None),
+                            ).encode("utf-8")
+                        else:
+                            from backend.services import fastjson as _fastjson
+                            payload = _fastjson.dumps_bytes(
+                                data,
+                                default=getattr(database, "_numpy_safe_default", None))
                     except Exception as _ser:
                         logger.error(
                             "[%s] finalize attempt %d: serialization failed: %r",
@@ -1380,8 +1440,8 @@ async def _persist_complete_job(job_id: str, fields: dict) -> bool:
                     _os.makedirs(_os.path.dirname(path), exist_ok=True)
                     fd, tmp = _tf.mkstemp(dir=_os.path.dirname(path), suffix=".tmp")
                     try:
-                        with _os.fdopen(fd, "w", encoding="utf-8") as _f:
-                            _f.write(content)
+                        with _os.fdopen(fd, "wb") as _f:
+                            _f.write(payload)
                         _os.replace(tmp, path)
                     finally:
                         try:
@@ -1389,6 +1449,14 @@ async def _persist_complete_job(job_id: str, fields: dict) -> bool:
                                 _os.unlink(tmp)
                         except OSError:
                             pass
+                    # This bypassed database._save_job_unlocked, so its job
+                    # cache would otherwise keep serving the pre-COMPLETE
+                    # object wherever mtime granularity is too coarse to
+                    # catch the direct write. Drop the entry explicitly.
+                    try:
+                        database._invalidate_job_cache(job_id)
+                    except Exception:
+                        pass
                 # Verify against the raw bytes (no model layer, no await),
                 # still under the lock so no writer can interleave.
                 disk_status = ""
@@ -3161,6 +3229,11 @@ async def run_analysis(job_id: str):
             _heartbeats.pop(job_id, None)
             _cancel_events.pop(job_id, None)
             _finalizing_jobs.discard(job_id)
+            # Cancel a straggling background source-hash task (normal runs
+            # awaited + consumed it long before this).
+            _hash_straggler = _bg_hash_tasks.pop(job_id, None)
+            if _hash_straggler is not None and not _hash_straggler.done():
+                _hash_straggler.cancel()
             # Even when the job didn't finish cleanly, persist whatever
             # stage timings + warnings we collected so the UI can show
             # where it died. Best-effort: any DB error is logged but
@@ -3606,6 +3679,13 @@ async def _run_analysis_inner(job_id: str):
     except Exception:
         pass
 
+    # ── Background source hash (off the critical path) ──
+    # Starts now — while ffmpeg is about to stream the same bytes for frame +
+    # audio extraction, so the page cache absorbs most of this read. Awaited
+    # by the cache probe (re-analyze) and the post-extraction SHA persist;
+    # exactly one full-file hash per run either way.
+    _hash_task = _start_source_hash_task(job_id, video_path)
+
     if not metadata.get("width") or not metadata.get("height"):
         try:
             res = str(metadata.get("resolution") or "")
@@ -3836,12 +3916,20 @@ async def _run_analysis_inner(job_id: str):
     cached_extraction = None
     if not _force_reextract:
         try:
+            _expected_sha = getattr(job, "source_sha256", "") or ""
+            # Only a re-analyze (recorded SHA present) needs the digest to
+            # compare — await the background hash there. A fresh upload skips
+            # straight to extraction while the hash keeps running alongside.
+            _probe_sha = None
+            if _expected_sha:
+                _probe_sha = await _await_source_hash(job_id, _hash_task, video_path)
             cached_extraction = await _maybe_use_cached_extraction(
                 job_id=job_id,
                 video_path=video_path,
                 frames_dir=frames_dir,
                 audio_path=audio_path,
-                expected_sha=getattr(job, "source_sha256", "") or "",
+                expected_sha=_expected_sha,
+                precomputed_sha=_probe_sha,
             )
         except Exception as _ce:
             logger.info("[%s] Cache probe failed (%s); falling back to fresh extract", job_id, _ce)
@@ -3899,11 +3987,11 @@ async def _run_analysis_inner(job_id: str):
             _write_extraction_manifest(frames_dir, frames, scene_cut_timestamps)
         except Exception:
             pass
-        # Hash the source AFTER the first successful extract so re-analyze
-        # runs can skip re-extracting. Hashing is best-effort and runs in
-        # a thread so it doesn't block the event loop.
+        # Persist the source SHA so re-analyze runs can skip re-extracting.
+        # The digest comes from the background task started at metadata time
+        # (it ran concurrently with the extraction above); best-effort.
         try:
-            _sha = await asyncio.to_thread(_hash_file_sha256, video_path)
+            _sha = await _await_source_hash(job_id, _hash_task, video_path)
             if _sha:
                 await database.update_job_status(job_id, source_sha256=_sha)
                 _source_sha256_local = _sha
@@ -4839,9 +4927,16 @@ async def _run_analysis_inner(job_id: str):
 
     # JobResult has no render_plan field, so persist the plan as a sidecar
     # JSON the /api/jobs/{id}/render_plan endpoint can serve to the NLE editor.
+    # Built + serialized in a worker thread: these sidecars reach tens of MB on
+    # long sources, and a synchronous json.dump froze heartbeats and WebSocket
+    # broadcasts for seconds.
     try:
-        with open(os.path.join(job_dir, "render_plan.json"), "w") as _rpf:
-            json.dump(render_plan.to_dict(), _rpf)
+        def _write_render_plan_sidecar():
+            _payload = fastjson.dumps_bytes(
+                render_plan.to_dict(), default=database._numpy_safe_default)
+            with open(os.path.join(job_dir, "render_plan.json"), "wb") as _rpf:
+                _rpf.write(_payload)
+        await asyncio.to_thread(_write_render_plan_sidecar)
         logger.info("[%s] render_plan.json written (%d ops)", job_id, len(render_plan.ops))
     except Exception as _rpe:
         logger.warning("[%s] render_plan.json write failed: %s", job_id, _rpe)
@@ -4867,14 +4962,20 @@ async def _run_analysis_inner(job_id: str):
     # VideoEditor canvas overlay can draw spatial boxes that match the
     # render plan. Served by /api/jobs/{id}/detection_overlay.
     try:
-        overlay_data = serialize_detection_overlay(perception, reframer_plan)
-        with open(os.path.join(job_dir, "detection_overlay.json"), "w") as _odf:
-            json.dump(overlay_data, _odf)
+        def _write_overlay_sidecar():
+            # Build AND serialize in the thread — the overlay carries full
+            # face/person timelines (tens of MB on a 2-hour source).
+            _overlay = serialize_detection_overlay(perception, reframer_plan)
+            _payload = fastjson.dumps_bytes(
+                _overlay, default=database._numpy_safe_default)
+            with open(os.path.join(job_dir, "detection_overlay.json"), "wb") as _odf:
+                _odf.write(_payload)
+            return (len(_overlay.get("face_timeline", {})),
+                    len(_overlay.get("person_timeline", {})))
+        _face_n, _person_n = await asyncio.to_thread(_write_overlay_sidecar)
         logger.info(
             "[%s] detection_overlay.json written (%d face samples, %d person samples)",
-            job_id,
-            len(overlay_data.get("face_timeline", {})),
-            len(overlay_data.get("person_timeline", {})),
+            job_id, _face_n, _person_n,
         )
     except Exception as _ovre:
         logger.warning("[%s] detection_overlay.json write failed: %s", job_id, _ovre)

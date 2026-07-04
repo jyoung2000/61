@@ -254,12 +254,14 @@ def _deserialize_perception(d: dict):
     return p
 
 
-def _atomic_write(path: str, content: str) -> None:
+def _atomic_write(path: str, content) -> None:
+    """Durably write ``content`` (str or bytes) to ``path`` via tmp+rename."""
     directory = os.path.dirname(path)
     os.makedirs(directory, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=directory, suffix=".tmp")
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
+        _mode = "wb" if isinstance(content, (bytes, bytearray)) else "w"
+        with os.fdopen(fd, _mode, **({} if _mode == "wb" else {"encoding": "utf-8"})) as f:
             f.write(content)
             # Flush to disk before the rename so an abrupt container kill (the
             # crash mode this whole module exists for) can't leave the file's
@@ -287,18 +289,23 @@ def _atomic_write(path: str, content: str) -> None:
 def _save_sync(job_id: str, perception, reframer_plan, signature: dict,
                audio_meta: dict) -> bool:
     from dataclasses import asdict
+    from backend.services import fastjson
     d = checkpoint_dir(job_id)
     # _json_safe() before dumps so a stray un-serializable key/value (numpy,
     # set, Path) can't make the whole save raise — see _json_safe's docstring.
     # default= is kept as a last-ditch net for anything _json_safe missed.
+    # fastjson (orjson when installed) encodes the multi-MB perception/plan
+    # payloads several times faster than stdlib json; _json_safe has already
+    # normalized keys to str/int, which both encoders stringify identically.
     _atomic_write(
         os.path.join(d, _PERCEPTION_FILE),
-        json.dumps(_json_safe(_serialize_perception(perception)),
-                   default=_numpy_safe_default),
+        fastjson.dumps_bytes(_json_safe(_serialize_perception(perception)),
+                             default=_numpy_safe_default),
     )
     _atomic_write(
         os.path.join(d, _PLAN_FILE),
-        json.dumps(_json_safe(asdict(reframer_plan)), default=_numpy_safe_default),
+        fastjson.dumps_bytes(_json_safe(asdict(reframer_plan)),
+                             default=_numpy_safe_default),
     )
     # Meta last: its presence is the "checkpoint is complete + valid" marker,
     # so a crash between the perception/plan writes never yields a half
@@ -385,8 +392,9 @@ def _load_sync(job_id: str, expected_signature: dict):
             _signature_diff(meta.get("signature") or {}, expected_signature))
         return None
 
-    with open(perception_path, "r", encoding="utf-8") as f:
-        perception = _deserialize_perception(json.load(f))
+    from backend.services import fastjson
+    with open(perception_path, "rb") as f:
+        perception = _deserialize_perception(fastjson.loads(f.read()))
 
     from backend.services.reframer_models import RenderPlan
     reframer_plan = RenderPlan.load(plan_path)

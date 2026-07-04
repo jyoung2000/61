@@ -345,6 +345,18 @@ class Settings(BaseSettings):
     FRAME_SAMPLE_RATE: int = 10        # seconds between frames (lower=more detail, slower)
     MAX_CLIP_CANDIDATES: int = 12
 
+    # ── job.json persistence (write-amplification control) ──
+    # Progress-only updates (progress %, progress_message, unchanged status)
+    # mutate the in-memory job cache immediately but persist to disk at most
+    # once per this many seconds, with a guaranteed trailing flush. Status
+    # changes, field writes and terminal statuses always write through, so a
+    # crash loses at most ~this much progress-bar position. 0 disables the
+    # debounce (every update writes through — the pre-cache behavior).
+    JOB_PROGRESS_FLUSH_INTERVAL: float = 2.0
+    # job.json is written compact (via orjson when installed). Flip on for
+    # human-readable indent=2 output when debugging job records by hand.
+    JOB_JSON_PRETTY: bool = False
+
     # ── Reframer perception sampling (face/motion detection speed) ──
     # The Perceiver's face-detection cost scales with the number of frames
     # sampled. These cap the total samples on long videos. Lowering
@@ -476,6 +488,21 @@ class Settings(BaseSettings):
     # typical GOP. The old gap>5 threshold seeked on EVERY sample at
     # 5 fps sampling of 30 fps video.
     REFRAMER_SEEK_GAP_FRAMES: int = 60
+    # Ask OpenCV's FFmpeg backend for hardware-accelerated decode
+    # (VIDEO_ACCELERATION_ANY) when opening the Perceiver's VideoCapture.
+    # Decode is the dominant non-Whisper cost of the perception band on long
+    # videos; hw decode changes only WHERE decoding happens — grab()/read()/
+    # seeks and the returned BGR frames are identical. Fail-soft: if the
+    # hw-accel capture can't open or its first read fails, the Perceiver
+    # silently reopens with the plain software constructor.
+    REFRAMER_CV2_HWACCEL: bool = True
+    # OPT-IN bug fix (changes outputs — improves them): update the previous-
+    # frame reference for face motion ONCE PER SAMPLE instead of inside the
+    # per-face loop. With the legacy behavior, the 2nd+ face in a frame always
+    # scores motion/mouth_motion = 0 (its "previous" frame is the current one)
+    # and a face-less stretch leaves the reference seconds stale. Default OFF
+    # to preserve byte-identical legacy outputs.
+    REFRAMER_FIX_PREV_FRAME_MOTION: bool = False
     # Motivated zoom — time-varying push-in/pull-out via the dormant
     # motivated_zoom planner, adding a per-keyframe `scale` term rendered as a
     # time-varying ffmpeg crop. Default ON — a no-op unless the plan actually
