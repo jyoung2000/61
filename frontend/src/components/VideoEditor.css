@@ -3277,3 +3277,119 @@ input.ve-timecode--input {
     display: none;
   }
 }
+
+/* ═══ ScrubInput + InspectorRow (pro inspector ergonomics) ═══ */
+.ve-scrub {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 2px;
+  min-width: 44px;
+  padding: 3px 6px;
+  font-size: 10px;
+  font-family: var(--font-mono, monospace);
+  background: var(--ve-track-bg);
+  border: 1px solid var(--ve-track-border);
+  border-radius: 3px;
+  color: var(--ve-text);
+  cursor: ew-resize;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
+  transition: border-color var(--dur-fast) var(--ease-out-quart);
+}
+
+.ve-scrub:hover {
+  border-color: var(--ve-accent);
+}
+
+.ve-scrub:focus-visible {
+  outline: 2px solid var(--glow-color);
+  outline-offset: 1px;
+}
+
+.ve-scrub--dragging {
+  border-color: var(--ve-accent);
+  color: var(--ve-accent);
+}
+
+.ve-scrub--changed {
+  color: var(--ve-accent);
+}
+
+.ve-scrub--editing {
+  min-width: 44px;
+  width: 60px;
+  padding: 3px 6px;
+  font-size: 10px;
+  font-family: var(--font-mono, monospace);
+  background: var(--ve-track-bg);
+  border: 1px solid var(--ve-accent);
+  border-radius: 3px;
+  color: var(--ve-text);
+  outline: none;
+  cursor: text;
+}
+
+.ve-scrub__unit {
+  font-size: 9px;
+  color: var(--ve-text-muted);
+}
+
+.ve-inspector-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 26px;
+}
+
+.ve-inspector-row__label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 0;
+  font-size: 10px;
+  color: var(--ve-text-muted);
+  background: none;
+  border: none;
+  cursor: default;
+  text-align: left;
+}
+
+.ve-inspector-row__label--changed {
+  color: var(--ve-text);
+  cursor: pointer;
+}
+
+.ve-inspector-row__label:disabled {
+  cursor: default;
+}
+
+.ve-inspector-row__dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--ve-accent);
+  opacity: 0;
+  transition: opacity var(--dur-fast) var(--ease-out-quart);
+}
+
+.ve-inspector-row__dot--visible {
+  opacity: 1;
+}
+
+.ve-inspector-row__reset {
+  font-size: 10px;
+  color: var(--ve-text-muted);
+}
+
+.ve-inspector-row__label--changed:hover .ve-inspector-row__reset {
+  color: var(--ve-accent);
+}
+
+.ve-inspector-row__control {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}

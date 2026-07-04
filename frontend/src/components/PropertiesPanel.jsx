@@ -13,6 +13,7 @@ import {
   TYPE_LABELS,
 } from '../utils/trackPresets';
 import { undoCoalesceHandlers } from '../utils/undoCoalesce';
+import ScrubInput from './ScrubInput';
 
 const SPEED_PRESETS = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 4.0];
 const FONT_OPTIONS = [
@@ -82,20 +83,8 @@ function formatTime(s) {
   return `${m}:${sec.toString().padStart(2, '0')}.${ms.toString().padStart(2, '0')}`;
 }
 
-/* Reusable slider row with editable number input */
-function SliderRow({ label, value, min, max, step = 1, unit = '', onChange }) {
-  const [editing, setEditing] = useState(false);
-  const [editVal, setEditVal] = useState('');
-  const displayVal = typeof value === 'number' ? (Number.isInteger(value) ? String(value) : value.toFixed(1)) : String(value);
-
-  const commitEdit = () => {
-    setEditing(false);
-    const parsed = parseFloat(editVal);
-    if (!isNaN(parsed)) {
-      onChange(Math.max(min, Math.min(max, parsed)));
-    }
-  };
-
+/* Reusable slider row with a scrubbable, type-in number readout */
+function SliderRow({ label, value, min, max, step = 1, unit = '', defaultValue, onChange }) {
   return (
     <div className="ve-properties__slider-row">
       <span className="ve-properties__field-label" style={{ minWidth: 55 }}>{label}</span>
@@ -105,39 +94,28 @@ function SliderRow({ label, value, min, max, step = 1, unit = '', onChange }) {
         {...undoCoalesceHandlers()}
         className="ve-properties__slider"
       />
-      {editing ? (
-        <input
-          type="number"
-          min={min} max={max} step={step}
-          value={editVal}
-          onChange={(e) => setEditVal(e.target.value)}
-          onBlur={commitEdit}
-          onKeyDown={(e) => { if (e.key === 'Enter') commitEdit(); if (e.key === 'Escape') setEditing(false); }}
-          autoFocus
-          className="ve-properties__slider-value ve-properties__slider-value--editing"
-        />
-      ) : (
-        <span
-          className="ve-properties__slider-value ve-properties__slider-value--clickable"
-          onClick={() => { setEditVal(displayVal); setEditing(true); }}
-          title="Click to type a value"
-        >
-          {displayVal}{unit}
-        </span>
-      )}
+      <ScrubInput
+        value={value}
+        min={min} max={max} step={step} unit={unit}
+        defaultValue={defaultValue}
+        onChange={onChange}
+        ariaLabel={label}
+      />
     </div>
   );
 }
 
-/* Reusable number field */
-function NumField({ label, value, min, max, step = 1, onChange }) {
+/* Reusable number field — scrubbable (drag to adjust, click to type) */
+function NumField({ label, value, min, max, step = 1, unit = '', defaultValue, onChange }) {
   return (
     <div className="ve-properties__field">
       <span className="ve-properties__field-label">{label}</span>
-      <input
-        type="number" min={min} max={max} step={step} value={value}
-        onChange={(e) => onChange(parseFloat(e.target.value) || 0)}
-        className="ve-properties__input"
+      <ScrubInput
+        value={value}
+        min={min} max={max} step={step} unit={unit}
+        defaultValue={defaultValue}
+        onChange={onChange}
+        ariaLabel={label}
       />
     </div>
   );
