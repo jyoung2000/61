@@ -422,3 +422,65 @@ function getExpectedTrackType(itemType) {
   if (itemType === 'subtitle') return 'subtitle';
   return 'overlay'; // text, shape, image, overlay
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// Settings → export coverage audit (parity task 1.5)
+// ─────────────────────────────────────────────────────────────────────
+
+/**
+ * DEFAULT_CLIP_SETTINGS keys that are legitimately NOT part of the
+ * subtitle_settings export mapping. Every entry documents where the
+ * value goes instead (or why it never leaves the client). A key that is
+ * neither here nor covered by mapSubtitleSettings fails the coverage
+ * audit — that's the exact bug class where a panel grows a control the
+ * export silently ignores.
+ */
+export const NON_SUBTITLE_SETTING_KEYS = {
+  clipCount: 'clip-generation param — consumed by /generate-clips, not a render setting',
+  minDuration: 'clip-generation param',
+  maxDuration: 'clip-generation param',
+  aspectRatio: 'sent as top-level aspect_ratio in ExportRequest',
+  subtitlesEnabled: 'sent as top-level subtitles_enabled / global_subtitles_enabled',
+  exportQuality: 'sent as top-level export_quality',
+  playbackVolume: 'preview-only playback preference; export volume comes from buildPlaybackPayload',
+  playbackSpeed: 'preview-only playback preference; export speed comes from buildPlaybackPayload',
+};
+
+/** Produce a value guaranteed to differ from `value` for diff-probing. */
+function perturbValue(value) {
+  if (typeof value === 'number') return value + 1;
+  if (typeof value === 'boolean') return !value;
+  if (typeof value === 'string') {
+    return value === '#123456' ? '#654321' : '#123456';
+  }
+  if (value && typeof value === 'object') return { __qa_probe__: '#123456' };
+  return '#123456'; // null/undefined defaults
+}
+
+/**
+ * Audit that every subtitle-rendering key in `defaults` actually reaches
+ * the export mapping: perturbing the key must change `mapFn`'s output.
+ *
+ * Returns { covered, missing, staleExemptions }:
+ *   covered         — keys whose perturbation changed the mapping output
+ *   missing         — keys with NO effect on the mapping and NO exemption (bugs!)
+ *   staleExemptions — exempted keys that DO affect the mapping (tighten the list)
+ */
+export function auditSubtitleSettingsCoverage(defaults, mapFn) {
+  const covered = [];
+  const missing = [];
+  const staleExemptions = [];
+  const base = JSON.stringify(mapFn({ ...defaults }));
+
+  for (const key of Object.keys(defaults)) {
+    const probed = JSON.stringify(
+      mapFn({ ...defaults, [key]: perturbValue(defaults[key]) }));
+    const affectsMapping = probed !== base;
+    const exempted = key in NON_SUBTITLE_SETTING_KEYS;
+
+    if (affectsMapping && exempted) staleExemptions.push(key);
+    else if (affectsMapping) covered.push(key);
+    else if (!exempted) missing.push(key);
+  }
+  return { covered, missing, staleExemptions };
+}
