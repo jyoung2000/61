@@ -134,9 +134,11 @@ class Settings(BaseSettings):
     # ── GPU-first model selection: prefer a fitting quant over CPU offload ──
     # On a card too small for the configured translation/polish model (e.g.
     # qwen3:4b-q4 on a 4 GB GTX 1650, which OOMs and spills ~half its layers to
-    # the CPU), auto-substitute a SMALLER-QUANT build of the SAME model
-    # (qwen3:4b-…-q3_K_M) that runs FULLY on the GPU — only when that build is
-    # already installed on the Ollama host. The CPU is a genuine last resort;
+    # the CPU), auto-substitute a SMALLER-QUANT build of the SAME model that
+    # runs FULLY on the GPU — only when that build is already installed on the
+    # Ollama host. (Note: not every quant exists in the registry — e.g.
+    # qwen3:4b-instruct-2507 publishes only q4_K_M/q8_0/fp16 — which is why
+    # this only ever selects among installed builds.) The CPU is a genuine last resort;
     # running fully on the GPU at a slightly lower quant is far faster than
     # running a higher quant half on the CPU. Off = keep the configured tag and
     # let the partial-offload ladder spill to CPU (legacy behavior).

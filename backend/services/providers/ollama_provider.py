@@ -772,13 +772,20 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                         settings, "OLLAMA_GPU_BASELINE_RESERVE_GB", 1.2))
                     _head = float(getattr(settings, "OLLAMA_GPU_KV_HEADROOM_GB", 0.55))
                     if _w is not None and (_w + _head) > _budget:
-                        _base = model_name.rsplit("-", 1)[0] if "-q" in model_name.lower() else model_name
+                        # Don't fabricate a quant tag — many models publish only a
+                        # few quants (qwen3:4b-instruct-2507 has q4_K_M/q8_0/fp16,
+                        # no q3), so a guessed `-q3_K_M` pull 404s. Point at the
+                        # registry tag list instead.
+                        _family = model_name.split(":", 1)[0]
                         logger.warning(
                             "Translation model %s (~%.1fGB) won't fit fully on a "
                             "%.1fGB GPU and will spill layers to the CPU (slow). "
-                            "Install a smaller quant to keep it GPU-resident, e.g. "
-                            "`ollama pull %s-q3_K_M`.",
-                            model_name, _w, total_vram, _base)
+                            "Install a smaller published quant of the same model to "
+                            "keep it GPU-resident (see "
+                            "https://ollama.com/library/%s/tags for available "
+                            "quants), or set OLLAMA_TRANSLATION_MODEL to a smaller "
+                            "model.",
+                            model_name, _w, total_vram, _family)
         except Exception as exc:  # never let model selection break a run
             logger.info("GPU-fit model selection skipped for %s (%s)", model_name, exc)
         self._gpu_fit_cache[model_name] = chosen
