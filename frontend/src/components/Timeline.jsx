@@ -6,6 +6,7 @@ import {
   getCachedThumbnail,
 } from '../utils/filmstrip';
 import ContextMenu from './ContextMenu';
+import Tooltip from './Tooltip';
 import useResponsive from '../hooks/useResponsive';
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -463,7 +464,7 @@ function TimecodeInput({ playhead, onSeek }) {
     return (
       <button
         className="ve-multi-timeline__tc"
-        title="Current timecode — click to jump to a specific time (H:MM:SS.mmm)"
+        aria-label="Current timecode — click to jump to a specific time"
         onClick={() => {
           setValue(formatTimeMs(playhead || 0));
           setEditing(true);
@@ -2547,15 +2548,15 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
     <div ref={containerRef} className="ve-multi-timeline" style={{ position: 'relative', height: '100%' }}>
       {/* Toolbar row */}
       <div className="ve-multi-timeline__toolbar">
-        <button
-          className="ve-btn"
-          onClick={() => setZoom(Math.max(0.01, zoom - 0.2))}
-          aria-label="Zoom out"
-          title="Zoom out"
-          style={{ fontSize: 12, padding: '2px 6px', minWidth: 24, minHeight: 24 }}
-        >
-          -
-        </button>
+        <Tooltip label="Zoom out">
+          <button
+            className="ve-btn"
+            onClick={() => setZoom(Math.max(0.01, zoom - 0.2))}
+            style={{ fontSize: 12, padding: '2px 6px', minWidth: 24, minHeight: 24 }}
+          >
+            -
+          </button>
+        </Tooltip>
         <input
           type="range"
           min="0.01"
@@ -2565,39 +2566,42 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
           onChange={(e) => setZoom(parseFloat(e.target.value))}
           className="ve-multi-timeline__zoom-slider"
         />
-        <button
-          className="ve-btn"
-          onClick={() => setZoom(Math.min(10, zoom + 0.2))}
-          aria-label="Zoom in"
-          title="Zoom in"
-          style={{ fontSize: 12, padding: '2px 6px', minWidth: 24, minHeight: 24 }}
-        >
-          +
-        </button>
-        <button
-          className="ve-btn"
-          onClick={zoomToFit}
-          title="Fit entire video in view (⇧Z)"
-          style={{ fontSize: 10, padding: '2px 8px', minWidth: 'auto', minHeight: 24, fontWeight: 600 }}
-        >
-          Fit
-        </button>
-        <button
-          className={`ve-btn${snapEnabled ? ' ve-btn--active-snap' : ''}`}
-          onClick={toggleSnap}
-          title={`Snap: ${snapEnabled ? 'ON' : 'OFF'} (N)`}
-          style={{ fontSize: 10, padding: '2px 6px', minWidth: 'auto', minHeight: 24 }}
-        >
-          Snap {snapEnabled ? 'ON' : 'OFF'}
-        </button>
-        <button
-          className={`ve-btn${rippleEnabled ? ' ve-btn--active-ripple' : ''}`}
-          onClick={toggleRipple}
-          title={`Ripple edit: ${rippleEnabled ? 'ON' : 'OFF'} (\\)  —  trimming pulls or pushes downstream clips so cuts stay aligned`}
-          style={{ fontSize: 10, padding: '2px 6px', minWidth: 'auto', minHeight: 24 }}
-        >
-          Ripple {rippleEnabled ? 'ON' : 'OFF'}
-        </button>
+        <Tooltip label="Zoom in">
+          <button
+            className="ve-btn"
+            onClick={() => setZoom(Math.min(10, zoom + 0.2))}
+            style={{ fontSize: 12, padding: '2px 6px', minWidth: 24, minHeight: 24 }}
+          >
+            +
+          </button>
+        </Tooltip>
+        <Tooltip actionId="zoom-to-fit">
+          <button
+            className="ve-btn"
+            onClick={zoomToFit}
+            style={{ fontSize: 10, padding: '2px 8px', minWidth: 'auto', minHeight: 24, fontWeight: 600 }}
+          >
+            Fit
+          </button>
+        </Tooltip>
+        <Tooltip label={`Snapping ${snapEnabled ? 'on' : 'off'}`} kbd="N">
+          <button
+            className={`ve-btn${snapEnabled ? ' ve-btn--active-snap' : ''}`}
+            onClick={toggleSnap}
+            style={{ fontSize: 10, padding: '2px 6px', minWidth: 'auto', minHeight: 24 }}
+          >
+            Snap {snapEnabled ? 'ON' : 'OFF'}
+          </button>
+        </Tooltip>
+        <Tooltip label={`Ripple edit ${rippleEnabled ? 'on' : 'off'} — trims move downstream clips`} kbd="\\">
+          <button
+            className={`ve-btn${rippleEnabled ? ' ve-btn--active-ripple' : ''}`}
+            onClick={toggleRipple}
+            style={{ fontSize: 10, padding: '2px 6px', minWidth: 'auto', minHeight: 24 }}
+          >
+            Ripple {rippleEnabled ? 'ON' : 'OFF'}
+          </button>
+        </Tooltip>
         {/* Numeric timecode entry — click the display, type a time,
             press Enter to seek. Accepts H:MM:SS.mmm, M:SS.mmm, SS.mmm,
             and SSSS (raw seconds). */}
@@ -2765,7 +2769,7 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
                     <span
                       onDoubleClick={(e) => { e.stopPropagation(); setRenamingTrackId(track.id); }}
                       style={{ cursor: 'text', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}
-                      title="Double-click to rename"
+                      aria-label="Double-click to rename"
                     >
                       {track.name}
                     </span>
@@ -2793,7 +2797,7 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
                         onSubtitleVisibilityChange(!(track.visible !== false));
                       }
                     }}
-                    title={isHidden ? `Show ${track.name} in preview` : `Hide ${track.name} from preview (still in export)`}
+                    aria-label={isHidden ? `Show ${track.name} in preview` : `Hide ${track.name} from preview (still in export)`}
                     className="ve-multi-timeline__track-ctrl"
                     style={{
                       background: 'none', border: 'none', cursor: 'pointer',
@@ -2818,7 +2822,7 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
                   {/* Mute toggle */}
                   <button
                     onClick={(e) => { e.stopPropagation(); toggleTrackMute(track.id); }}
-                    title={track.muted ? `Unmute ${track.name}` : `Mute ${track.name}`}
+                    aria-label={track.muted ? `Unmute ${track.name}` : `Mute ${track.name}`}
                     className="ve-multi-timeline__track-ctrl"
                     style={{
                       background: 'none', border: 'none', cursor: 'pointer',
@@ -2832,7 +2836,7 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
                   {/* Lock toggle */}
                   <button
                     onClick={(e) => { e.stopPropagation(); toggleTrackLock(track.id); }}
-                    title={track.locked ? `Unlock ${track.name}` : `Lock ${track.name}`}
+                    aria-label={track.locked ? `Unlock ${track.name}` : `Lock ${track.name}`}
                     className="ve-multi-timeline__track-ctrl"
                     style={{
                       background: 'none', border: 'none', cursor: 'pointer',
@@ -2860,7 +2864,7 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
                         e.stopPropagation();
                         resetSubtitleTimings();
                       }}
-                      title="Reset all subtitles to original timing from transcript"
+                      aria-label="Reset all subtitles to original timing from transcript"
                       className="ve-multi-timeline__track-ctrl"
                       style={{
                         background: 'none', border: 'none', cursor: 'pointer',
@@ -2917,7 +2921,7 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
                     background: swatchColor,
                     marginTop: trackIdx === 0 ? RULER_HEIGHT + 3 : TRACK_GAP - 1,
                   }}
-                  title={`${track.name} — jump to track`}
+                  aria-label={`${track.name} — jump to track`}
                   onClick={(e) => {
                     e.stopPropagation();
                     const wrap = e.currentTarget.closest('.ve-multi-timeline__canvas-wrap');

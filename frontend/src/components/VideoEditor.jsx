@@ -18,6 +18,7 @@ import EffectsPanel from './EffectsPanel';
 import TransitionPicker from './TransitionPicker';
 import ExportDialog from './ExportDialog';
 import CommandPalette from './CommandPalette';
+import Tooltip from './Tooltip';
 import ShortcutCheatSheet from './ShortcutCheatSheet';
 import PanelDivider, { usePanelSize } from './PanelDivider';
 import SafeZoneOverlay from './SafeZoneOverlay';
@@ -3168,9 +3169,11 @@ export default function VideoEditor({
         <div className="ve-header">
           <span className="ve-header__title">{title || 'Clip Preview'}</span>
           {onClose && (
-            <button className="ve-header__close" onClick={onClose} title="Close">
-              <Icon.Close />
-            </button>
+            <Tooltip label="Close">
+              <button className="ve-header__close" onClick={onClose}>
+                <Icon.Close />
+              </button>
+            </Tooltip>
           )}
         </div>
       )}
@@ -3224,15 +3227,15 @@ export default function VideoEditor({
       >
         {/* Lightbox close button — only visible in fullscreen */}
         {isFullscreen && (
-          <button
-            type="button"
-            className="ve-lightbox-close"
-            onClick={(e) => { e.stopPropagation(); setIsFullscreen(false); }}
-            title="Exit fullscreen (Esc)"
-            aria-label="Exit fullscreen"
-          >
-            <Icon.Close />
-          </button>
+          <Tooltip label="Exit fullscreen" kbd="Esc" side="bottom">
+            <button
+              type="button"
+              className="ve-lightbox-close"
+              onClick={(e) => { e.stopPropagation(); setIsFullscreen(false); }}
+            >
+              <Icon.Close />
+            </button>
+          </Tooltip>
         )}
         <div
           ref={stageRef}
@@ -3456,7 +3459,7 @@ export default function VideoEditor({
                   transition: 'all 0.15s ease',
                   whiteSpace: 'nowrap',
                 }}
-                title={opt.value ? `${opt.value} crop` : 'Original aspect ratio'}
+                aria-label={opt.value ? `${opt.value} crop` : 'Original aspect ratio'}
               >
                 {opt.value && (
                   <svg width="12" height="12" viewBox="0 0 16 16" fill="none" style={{ opacity: 0.7 }}>
@@ -3804,13 +3807,14 @@ export default function VideoEditor({
             flexWrap: 'wrap', fontSize: 10,
           }}>
             {hasTrim && (
-              <button
-                onClick={(e) => { e.stopPropagation(); addSegment(); }}
-                className="ve-segment-chip ve-segment-chip--add"
-                title="Save current selection as a segment"
-              >
-                + Add Segment
-              </button>
+              <Tooltip label="Save current selection as a segment">
+                <button
+                  onClick={(e) => { e.stopPropagation(); addSegment(); }}
+                  className="ve-segment-chip ve-segment-chip--add"
+                >
+                  + Add Segment
+                </button>
+              </Tooltip>
             )}
             {segments.map(seg => {
               const isSelected = selectedSegmentId === seg.id;
@@ -3862,7 +3866,7 @@ export default function VideoEditor({
                   }
                 }}
                 className="ve-segment-chip ve-segment-chip--action"
-                title="Split segment at playhead (S)"
+                aria-label="Split segment at playhead"
               >
                 Split at Playhead
               </button>
@@ -3914,7 +3918,7 @@ export default function VideoEditor({
                       setEditingSegLabel(seg.id);
                       setTimeout(() => segLabelInputRef.current?.select(), 0);
                     }}
-                    title="Click to rename"
+                    aria-label="Click to rename"
                   >
                     {String(seg.label || 'Segment')}
                   </span>
@@ -3984,7 +3988,7 @@ export default function VideoEditor({
                       setTimeout(() => setDeleteConfirmId(null), 2000);
                     }
                   }}
-                  title={deleteConfirmId === seg.id ? 'Click again to confirm' : 'Remove segment'}
+                  aria-label={deleteConfirmId === seg.id ? 'Click again to confirm' : 'Remove segment'}
                 >
                   {deleteConfirmId === seg.id ? 'Remove?' : '×'}
                 </button>
@@ -4108,7 +4112,7 @@ export default function VideoEditor({
                     border: '2px solid var(--border, #ddd)',
                     borderRadius: 6, cursor: 'pointer', background: 'none',
                   }}
-                  title={`Color for ${displayName}`}
+                  aria-label={`Color for ${displayName}`}
                 />
                 <span style={{
                   color: 'var(--ve-text)', fontSize: 12, fontWeight: 500,
@@ -4128,17 +4132,23 @@ export default function VideoEditor({
       >
         {/* Transport row: centered on all devices */}
         <div className="ve-controls__transport">
-          <button className="ve-btn" onClick={(e) => { e.stopPropagation(); skipTime(-5); }} title="Back 5s (J)" disabled={!videoReady}>
-            <Icon.SkipBack />
-          </button>
+          <Tooltip label="Back 5s" kbd="J">
+            <button className="ve-btn" onClick={(e) => { e.stopPropagation(); skipTime(-5); }} disabled={!videoReady}>
+              <Icon.SkipBack />
+            </button>
+          </Tooltip>
 
-          <button className="ve-btn ve-btn--play" onClick={(e) => { e.stopPropagation(); togglePlay(); }} title="Play/Pause (Space)" disabled={!videoReady}>
-            {playing ? <Icon.Pause /> : <Icon.Play />}
-          </button>
+          <Tooltip actionId="play-pause">
+            <button className="ve-btn ve-btn--play" onClick={(e) => { e.stopPropagation(); togglePlay(); }} disabled={!videoReady}>
+              {playing ? <Icon.Pause /> : <Icon.Play />}
+            </button>
+          </Tooltip>
 
-          <button className="ve-btn" onClick={(e) => { e.stopPropagation(); skipTime(5); }} title="Forward 5s (L)" disabled={!videoReady}>
-            <Icon.SkipForward />
-          </button>
+          <Tooltip label="Forward 5s" kbd="L">
+            <button className="ve-btn" onClick={(e) => { e.stopPropagation(); skipTime(5); }} disabled={!videoReady}>
+              <Icon.SkipForward />
+            </button>
+          </Tooltip>
 
           {editingTimecode ? (
             <input
@@ -4176,7 +4186,7 @@ export default function VideoEditor({
                 setEditingTimecode(true);
                 setTimeout(() => timecodeInputRef.current?.select(), 0);
               }}
-              title="Click to type a time"
+              aria-label="Click to type a time"
             >
               {showTimecodeRemaining
                 ? `-${formatTimecode(Math.max(0, effectiveDuration - mediaToWallClock(elapsed)))}`
@@ -4191,16 +4201,18 @@ export default function VideoEditor({
         <div className="ve-controls__center">
           {hasTrim && (
             trimApplied ? (
-              <span className="ve-trim-applied" title="Trim applied to preview and export">
+              <span className="ve-trim-applied" aria-label="Trim applied to preview and export">
                 <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
                   <polyline points="20 6 9 17 4 12" />
                 </svg>
                 Trim Applied · {formatTimeShort(effectiveDuration)}
               </span>
             ) : (
-              <button className="ve-apply-trim" onClick={(e) => { e.stopPropagation(); handleApplyTrim(); }} title="Apply trim to preview and export">
-                Apply Trim · {formatTimeShort(effectiveDuration)}
-              </button>
+              <Tooltip label="Apply trim to preview and export">
+                <button className="ve-apply-trim" onClick={(e) => { e.stopPropagation(); handleApplyTrim(); }}>
+                  Apply Trim · {formatTimeShort(effectiveDuration)}
+                </button>
+              </Tooltip>
             )
           )}
         </div>
@@ -4209,9 +4221,14 @@ export default function VideoEditor({
         <div className="ve-controls__right">
           {/* Volume — segment-aware */}
           <div className="ve-volume" onClick={(e) => e.stopPropagation()}>
-            <button className="ve-btn" onClick={toggleMute} title={effectiveSegment ? `${effectiveSegment.muted ? 'Unmute' : 'Mute'} segment` : isMuted ? 'Unmute (M)' : 'Mute (M)'}>
-              <VolumeIcon />
-            </button>
+            <Tooltip
+              label={effectiveSegment ? `${effectiveSegment.muted ? 'Unmute' : 'Mute'} segment` : isMuted ? 'Unmute' : 'Mute'}
+              kbd={effectiveSegment ? undefined : 'M'}
+            >
+              <button className="ve-btn" onClick={toggleMute}>
+                <VolumeIcon />
+              </button>
+            </Tooltip>
             <div className="ve-volume__slider-wrap">
               {(() => {
                 const dispVol = displaySegment ? (displaySegment.muted ? 0 : displaySegment.volume) : (isMuted ? 0 : volume);
@@ -4254,13 +4271,14 @@ export default function VideoEditor({
             const dispSpeed = displaySegment ? (displaySegment.speed || 1.0) : speed;
             return (
             <div className="ve-speed" onClick={(e) => e.stopPropagation()}>
-              <button
-                className={`ve-speed__btn${dispSpeed !== 1.0 ? ' ve-speed__btn--active' : ''}`}
-                onClick={() => setShowSpeedMenu((v) => !v)}
-                title={displaySegment ? 'Segment playback speed' : 'Playback speed'}
-              >
-                {dispSpeed}x
-              </button>
+              <Tooltip label={displaySegment ? 'Segment playback speed' : 'Playback speed'}>
+                <button
+                  className={`ve-speed__btn${dispSpeed !== 1.0 ? ' ve-speed__btn--active' : ''}`}
+                  onClick={() => setShowSpeedMenu((v) => !v)}
+                >
+                  {dispSpeed}x
+                </button>
+              </Tooltip>
               {showSpeedMenu && (
                 <div className="ve-speed__dropdown" onClick={(e) => e.stopPropagation()}>
                   {SPEED_PRESETS.map((p) => (
@@ -4296,9 +4314,11 @@ export default function VideoEditor({
           )}
 
           {/* Fullscreen */}
-          <button className="ve-btn" onClick={(e) => { e.stopPropagation(); toggleFullscreen(); }} title="Fullscreen">
-            {isFullscreen ? <Icon.ExitFullscreen /> : <Icon.Fullscreen />}
-          </button>
+          <Tooltip label={isFullscreen ? 'Exit fullscreen' : 'Fullscreen'}>
+            <button className="ve-btn" onClick={(e) => { e.stopPropagation(); toggleFullscreen(); }}>
+              {isFullscreen ? <Icon.ExitFullscreen /> : <Icon.Fullscreen />}
+            </button>
+          </Tooltip>
         </div>
       </div>
 
@@ -4315,7 +4335,7 @@ export default function VideoEditor({
                 return !v;
               });
             }}
-            title={isProcessing ? 'Available after analysis completes' : 'Toggle multi-track timeline editor'}
+            aria-label={isProcessing ? 'Available after analysis completes' : 'Toggle multi-track timeline editor'}
           >
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               <rect x="1" y="3" width="22" height="4" rx="1" />
@@ -4425,16 +4445,16 @@ export default function VideoEditor({
             {/* Tablet: collapsed icon rail (3.2) — tap to re-expand */}
             {showProperties && !isMobile && isTablet && railCollapsed && (
               <div className="ve-multitrack__rail-collapsed">
-                <button
-                  className="ve-btn"
-                  onClick={() => setRailCollapsed(false)}
-                  aria-label="Expand inspector"
-                  title="Expand inspector"
-                >
-                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                    <path d="M15 18l-6-6 6-6" />
-                  </svg>
-                </button>
+                <Tooltip label="Expand inspector">
+                  <button
+                    className="ve-btn"
+                    onClick={() => setRailCollapsed(false)}
+                  >
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M15 18l-6-6 6-6" />
+                    </svg>
+                  </button>
+                </Tooltip>
                 <span className="ve-multitrack__rail-icon" aria-hidden="true">⚙</span>
               </div>
             )}

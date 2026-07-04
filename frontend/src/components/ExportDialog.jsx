@@ -463,7 +463,7 @@ export default function ExportDialog({
           className={`ve-export-dialog__mode-btn${exportMode === 'client' ? ' ve-export-dialog__mode-btn--active' : ''}`}
           onClick={() => setExportMode('client')}
           disabled={!canClientExport}
-          title={canClientExport ? 'Export in browser' : 'WebCodecs not available in this browser'}
+          aria-label={canClientExport ? 'Export in browser' : 'WebCodecs not available in this browser'}
         >
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
             <rect x="2" y="3" width="20" height="14" rx="2" />
