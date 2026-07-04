@@ -3,6 +3,8 @@ import useTimelineStore, { getMaxItemDuration } from '../stores/timelineStore';
 import {
   SUBTITLE_RANGES,
   TRANSITION_RANGES,
+  EXPORT_QUALITIES,
+  EXPORT_QUALITY_PRESETS,
   offsetVFromPosition,
   positionFromOffsetV,
 } from '../utils/defaultSettings';
@@ -565,6 +567,30 @@ function ResetButton({ onClick, label = 'Reset' }) {
   );
 }
 
+/* Inspector tabs shown per selection type — context-sensitive so a text
+   item gets its Text tab, an audio item its Audio tab, etc. */
+const INSPECTOR_TABS_BY_TYPE = {
+  video: ['clip', 'effects', 'audio'],
+  audio: ['clip', 'audio'],
+  text: ['clip', 'text', 'effects'],
+  shape: ['clip', 'shape', 'effects'],
+  image: ['clip', 'effects'],
+  overlay: ['clip', 'effects'],
+  subtitle: ['clip', 'subtitles'],
+};
+
+const INSPECTOR_TAB_LABELS = {
+  clip: 'Clip',
+  text: 'Text',
+  shape: 'Shape',
+  subtitles: 'Subtitles',
+  effects: 'Effects',
+  audio: 'Audio',
+};
+
+const TAB_STORAGE_KEY = 'clipai_inspector_tab';
+const SECTIONS_STORAGE_KEY = 'clipai_inspector_sections';
+
 export default function PropertiesPanel({ compact = false, settings = null, onSettingsChange = null }) {
   const selectedItemId = useTimelineStore((s) => s.selectedItemId);
   const items = useTimelineStore((s) => s.items);
@@ -572,7 +598,18 @@ export default function PropertiesPanel({ compact = false, settings = null, onSe
   const updateItem = useTimelineStore((s) => s.updateItem);
   const removeItem = useTimelineStore((s) => s.removeItem);
   const mediaLibrary = useTimelineStore((s) => s.mediaLibrary);
-  const [expandedSections, setExpandedSections] = useState({});
+  // Collapsible group open/closed state — persisted so the inspector
+  // remembers how the user left it across sessions.
+  const [expandedSections, setExpandedSections] = useState(() => {
+    try {
+      return JSON.parse(localStorage.getItem(SECTIONS_STORAGE_KEY)) || {};
+    } catch { return {}; }
+  });
+  const [activeTab, setActiveTab] = useState(() => {
+    try {
+      return localStorage.getItem(TAB_STORAGE_KEY) || 'clip';
+    } catch { return 'clip'; }
+  });
 
   const item = useMemo(
     () => items.find((i) => i.id === selectedItemId) || null,
@@ -603,7 +640,16 @@ export default function PropertiesPanel({ compact = false, settings = null, onSe
     [item, updateItem, isLocked],
   );
 
-  const toggleSection = (name) => setExpandedSections(prev => ({ ...prev, [name]: !prev[name] }));
+  const toggleSection = (name) => setExpandedSections(prev => {
+    const next = { ...prev, [name]: prev[name] === false ? true : false };
+    try { localStorage.setItem(SECTIONS_STORAGE_KEY, JSON.stringify(next)); } catch { /* private mode */ }
+    return next;
+  });
+
+  const selectTab = useCallback((tab) => {
+    setActiveTab(tab);
+    try { localStorage.setItem(TAB_STORAGE_KEY, tab); } catch { /* private mode */ }
+  }, []);
 
   // Fetch custom uploaded fonts from the backend and inject @font-face rules
   // so both the dropdown and the canvas preview can use them.
@@ -767,7 +813,7 @@ export default function PropertiesPanel({ compact = false, settings = null, onSe
     return (
       <div className="ve-properties ve-properties--empty">
         <span className="ve-properties__placeholder">
-          Select a timeline item to edit properties
+          Select a clip to edit
         </span>
       </div>
     );
@@ -784,6 +830,21 @@ export default function PropertiesPanel({ compact = false, settings = null, onSe
     overlay: 'Overlay', shape: 'Shape', subtitle: 'Subtitle',
   };
 
+  // Context header name: prefer real content over the bare type
+  const itemDisplayName = (
+    (item.type === 'text' && (item.textContent || '').trim().slice(0, 28))
+    || (item.type === 'subtitle' && (item.subtitleText || '').trim().slice(0, 28))
+    || ((item.mediaSrc || item.mediaRef || '').split('/').pop())
+    || item.name
+    || TYPE_LABELS_MAP[item.type]
+    || item.type
+  );
+
+  // Context-sensitive tabs; clamp the persisted tab to what this
+  // selection type actually offers.
+  const availableTabs = INSPECTOR_TABS_BY_TYPE[item.type] || ['clip'];
+  const tab = availableTabs.includes(activeTab) ? activeTab : 'clip';
+
   return (
     <div className={`ve-properties${compact ? ' ve-properties--compact' : ''}`}>
       {/* QA warning if track/type mismatch detected */}
@@ -795,11 +856,13 @@ export default function PropertiesPanel({ compact = false, settings = null, onSe
           QA: {trackTypeMismatch}
         </div>
       )}
-      {/* Header */}
-      <div className="ve-properties__header">
+      {/* Sticky context header — who is selected, at a glance */}
+      <div className="ve-properties__header ve-properties__header--sticky">
         <span className="ve-properties__type-badge" data-type={item.type}>
           {TYPE_LABELS_MAP[item.type] || item.type}
         </span>
+        <span className="ve-properties__item-name" title={itemDisplayName}>{itemDisplayName}</span>
+        <span className="ve-properties__item-duration">{formatTime(duration)}</span>
         {isLocked && (
           <span style={{ fontSize: 11, color: 'var(--danger, #ef4444)', marginLeft: 4, display: 'flex', alignItems: 'center', gap: 3 }}>
             🔒 Locked
@@ -816,9 +879,27 @@ export default function PropertiesPanel({ compact = false, settings = null, onSe
         </button>
       </div>
 
+      {/* Segmented tab control */}
+      {availableTabs.length > 1 && (
+        <div className="ve-properties__tabs" role="tablist" aria-label="Inspector sections">
+          {availableTabs.map((t) => (
+            <button
+              key={t}
+              role="tab"
+              aria-selected={tab === t}
+              className={`ve-properties__tab${tab === t ? ' ve-properties__tab--active' : ''}`}
+              onClick={() => selectTab(t)}
+            >
+              {INSPECTOR_TAB_LABELS[t]}
+            </button>
+          ))}
+        </div>
+      )}
+
       {/* Preset Bar */}
       <PresetBar item={item} updateItem={updateItem} settings={settings} onSettingsChange={onSettingsChange} />
 
+      {tab === 'clip' && (<>
       {/* ── Timing ── */}
       <div className="ve-properties__section">
         <label className="ve-properties__label">Timing</label>
@@ -883,9 +964,10 @@ export default function PropertiesPanel({ compact = false, settings = null, onSe
           <NumField label="Fade Out" value={item.fadeOut || 0} min={0} max={duration} step={0.1} onChange={(v) => update('fadeOut', v)} />
         </div>
       </div>
+      </>)}
 
       {/* ── Volume (video & audio) ── */}
-      {isMediaClip && (
+      {tab === 'audio' && isMediaClip && (
         <div className="ve-properties__section">
           <div style={{ display: 'flex', alignItems: 'center' }}>
             <label className="ve-properties__label" style={{ marginBottom: 0 }}>Audio</label>
@@ -898,7 +980,7 @@ export default function PropertiesPanel({ compact = false, settings = null, onSe
       )}
 
       {/* ── Speed (video & audio) ── */}
-      {isMediaClip && (
+      {tab === 'audio' && isMediaClip && (
         <div className="ve-properties__section">
           <div style={{ display: 'flex', alignItems: 'center' }}>
             <label className="ve-properties__label" style={{ marginBottom: 0 }}>Speed</label>
@@ -933,7 +1015,7 @@ export default function PropertiesPanel({ compact = false, settings = null, onSe
       )}
 
       {/* ── Opacity (all visual items) ── */}
-      {isVisual && (
+      {tab === 'clip' && isVisual && (
         <div className="ve-properties__section">
           <div style={{ display: 'flex', alignItems: 'center' }}>
             <label className="ve-properties__label" style={{ marginBottom: 0 }}>Opacity</label>
@@ -946,7 +1028,7 @@ export default function PropertiesPanel({ compact = false, settings = null, onSe
       )}
 
       {/* ── Effects (all visual items) ── */}
-      {(item.type === 'video' || item.type === 'text' || item.type === 'shape' || item.type === 'image' || item.type === 'overlay') && (
+      {tab === 'effects' && (item.type === 'video' || item.type === 'text' || item.type === 'shape' || item.type === 'image' || item.type === 'overlay') && (
         <div className="ve-properties__section">
           <div style={{ display: 'flex', alignItems: 'center' }}>
             <label className="ve-properties__label" onClick={() => toggleSection('effects')} style={{ cursor: 'pointer', marginBottom: 0 }}>
@@ -984,7 +1066,7 @@ export default function PropertiesPanel({ compact = false, settings = null, onSe
       {/* ══════════════════════════════════════════════
           TEXT STYLING — comprehensive controls
          ══════════════════════════════════════════════ */}
-      {item.type === 'text' && (
+      {tab === 'text' && item.type === 'text' && (
         <>
           {/* Text Content */}
           <div className="ve-properties__section">
@@ -1127,7 +1209,7 @@ export default function PropertiesPanel({ compact = false, settings = null, onSe
       {/* ══════════════════════════════════════════════
           SHAPE STYLING — comprehensive controls
          ══════════════════════════════════════════════ */}
-      {item.type === 'shape' && (
+      {tab === 'shape' && item.type === 'shape' && (
         <>
           <div className="ve-properties__section">
             <label className="ve-properties__label">Shape Type</label>
@@ -1163,7 +1245,7 @@ export default function PropertiesPanel({ compact = false, settings = null, onSe
       {/* ══════════════════════════════════════════════
           IMAGE/OVERLAY — media controls
          ══════════════════════════════════════════════ */}
-      {(item.type === 'image' || item.type === 'overlay') && (
+      {tab === 'clip' && (item.type === 'image' || item.type === 'overlay') && (
         <div className="ve-properties__section">
           <label className="ve-properties__label">Media</label>
           {item.mediaSrc || item.mediaRef ? (
@@ -1179,12 +1261,12 @@ export default function PropertiesPanel({ compact = false, settings = null, onSe
       )}
 
       {/* ── Subtitle — edits the global SubtitleOverlay (Subs On) settings ── */}
-      {item.type === 'subtitle' && (
+      {tab === 'subtitles' && item.type === 'subtitle' && (
         <SubtitleProperties item={item} update={update} settings={settings} onSettingsChange={onSettingsChange} customFonts={customFonts} />
       )}
 
       {/* ── Transition ── */}
-      {(item.type === 'video' || item.type === 'image') && (
+      {tab === 'clip' && (item.type === 'video' || item.type === 'image') && (
         <div className="ve-properties__section">
           <label className="ve-properties__label">Transition</label>
           <div className="ve-properties__row">
@@ -1229,7 +1311,7 @@ export default function PropertiesPanel({ compact = false, settings = null, onSe
       )}
 
       {/* ── Clip Settings (apply global settings to this timeline item) ── */}
-      {(item.type === 'video') && settings && (
+      {tab === 'clip' && (item.type === 'video') && settings && (
         <div className="ve-properties__section">
           <label className="ve-properties__label">Clip Settings</label>
           <p style={{ fontSize: 10, color: 'var(--ve-text-muted, #888)', margin: '0 0 8px', lineHeight: 1.4 }}>
@@ -1264,9 +1346,9 @@ export default function PropertiesPanel({ compact = false, settings = null, onSe
                 }}
                 className="ve-properties__select"
               >
-                <option value="720p">720p</option>
-                <option value="1080p">1080p</option>
-                <option value="4k">4K</option>
+                {EXPORT_QUALITIES.map((q) => (
+                  <option key={q} value={q}>{EXPORT_QUALITY_PRESETS[q].label}</option>
+                ))}
               </select>
             </div>
           </div>
