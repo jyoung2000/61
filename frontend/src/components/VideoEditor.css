@@ -3767,3 +3767,55 @@ input.ve-timecode--input {
   font-size: 11px;
   color: var(--ve-text);
 }
+
+/* ═══ Resizable panel dividers (2.5) ═══ */
+.ve-panel-divider {
+  flex-shrink: 0;
+  position: relative;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  transition: background var(--dur-fast) var(--ease-out-quart);
+  touch-action: none;
+}
+
+.ve-panel-divider--vertical {
+  width: 7px;
+  margin: 0 -3px;   /* overlap neighbors so the layout doesn't widen */
+  cursor: col-resize;
+}
+
+.ve-panel-divider--horizontal {
+  height: 7px;
+  margin: -3px 0;
+  cursor: row-resize;
+}
+
+.ve-panel-divider:hover,
+.ve-panel-divider:focus-visible {
+  background: var(--glow-color);
+  outline: none;
+}
+
+.ve-panel-divider__grip {
+  border-radius: 2px;
+  background: var(--ve-chrome-border);
+  transition: background var(--dur-fast) var(--ease-out-quart);
+}
+
+.ve-panel-divider--vertical .ve-panel-divider__grip {
+  width: 3px;
+  height: 32px;
+}
+
+.ve-panel-divider--horizontal .ve-panel-divider__grip {
+  height: 3px;
+  width: 32px;
+}
+
+.ve-panel-divider:hover .ve-panel-divider__grip,
+.ve-panel-divider:focus-visible .ve-panel-divider__grip {
+  background: var(--ve-accent);
+}

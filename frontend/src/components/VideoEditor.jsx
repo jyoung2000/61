@@ -19,6 +19,7 @@ import TransitionPicker from './TransitionPicker';
 import ExportDialog from './ExportDialog';
 import CommandPalette from './CommandPalette';
 import ShortcutCheatSheet from './ShortcutCheatSheet';
+import PanelDivider, { usePanelSize } from './PanelDivider';
 import InteractiveOverlay from './InteractiveOverlay';
 import MarqueeSelection from './MarqueeSelection';
 import { hexToRgbString } from '../utils/colorUtils';
@@ -283,7 +284,16 @@ export default function VideoEditor({
   // Optional RenderPlan for backend slot identity (Phase D)
   renderPlan = null,
 }) {
-  const { isMobile } = useResponsive();
+  const { isMobile, isTablet } = useResponsive();
+  const viewportClass = isMobile ? 'mobile' : isTablet ? 'tablet' : 'desktop';
+
+  // Resizable panel sizes — persisted per viewport class (2.5)
+  const [inspectorW, setInspectorW, resetInspectorW] = usePanelSize({
+    key: 'inspector_w', viewportClass, defaultSize: 280, min: 220, max: 480,
+  });
+  const [timelineH, setTimelineH, resetTimelineH] = usePanelSize({
+    key: 'timeline_h', viewportClass, defaultSize: 320, min: 160, max: 640,
+  });
 
   // ── Multi-track editor state ──────────────────────
   // Default to open on desktop so multi-track edits are immediately visible
@@ -4341,8 +4351,23 @@ export default function VideoEditor({
             </div>
           </div>
 
+          {/* Preview ↔ timeline height divider (desktop/tablet only) */}
+          {!isMobile && (
+            <PanelDivider
+              orientation="horizontal"
+              size={timelineH}
+              onResize={setTimelineH}
+              onReset={resetTimelineH}
+              sign={-1}
+              ariaLabel="Resize timeline height"
+            />
+          )}
+
           {/* Main content area */}
-          <div className="ve-multitrack__content">
+          <div
+            className="ve-multitrack__content"
+            style={isMobile ? undefined : { height: timelineH, flex: 'none' }}
+          >
             {/* Media Library Sidebar */}
             {showMediaLibrary && (
               <div className="ve-multitrack__sidebar ve-multitrack__sidebar--left">
@@ -4376,8 +4401,21 @@ export default function VideoEditor({
             </div>
 
             {/* Right Sidebar: Properties + Effects + Transitions stacked */}
+            {showProperties && !isMobile && (
+              <PanelDivider
+                orientation="vertical"
+                size={inspectorW}
+                onResize={setInspectorW}
+                onReset={resetInspectorW}
+                sign={-1}
+                ariaLabel="Resize inspector width"
+              />
+            )}
             {showProperties && (
-              <div className="ve-multitrack__sidebar ve-multitrack__sidebar--right">
+              <div
+                className="ve-multitrack__sidebar ve-multitrack__sidebar--right"
+                style={isMobile ? undefined : { width: inspectorW, maxWidth: inspectorW }}
+              >
                 <div className="ve-multitrack__sidebar-header">
                   <span>Properties</span>
                   <button
