@@ -880,14 +880,34 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
             ctx.drawImage(cached, tx - thumbW / 2, y + 4, thumbW, innerH);
             ctx.globalAlpha = 1;
             ctx.restore();
-          } else if (!scheduledRedraw) {
-            // Fire one async generation per draw — they share a cache
-            // so subsequent draws hit. We schedule a redraw via the
-            // shared invalidate ref so the latest ``draw`` fn is used.
-            scheduledRedraw = true;
-            ensureThumbnail(mediaSrc, t, thumbW, innerH)
-              .then(() => requestRedrawRef.current && requestRedrawRef.current())
-              .catch(() => {});
+          } else {
+            // Skeleton shimmer while the tile generates — a moving
+            // diagonal highlight instead of flat gray, so "loading"
+            // reads differently from "empty clip".
+            ctx.save();
+            ctx.beginPath();
+            ctx.roundRect(clipX, y + 4, clipW, innerH, rr - 1);
+            ctx.clip();
+            const phase = ((performance.now() / 1200) % 1) * (thumbW * 2);
+            const gx = tx - thumbW / 2 - thumbW + phase;
+            const grad = ctx.createLinearGradient(gx, 0, gx + thumbW, 0);
+            grad.addColorStop(0, 'rgba(255,255,255,0.00)');
+            grad.addColorStop(0.5, 'rgba(255,255,255,0.08)');
+            grad.addColorStop(1, 'rgba(255,255,255,0.00)');
+            ctx.fillStyle = grad;
+            ctx.fillRect(tx - thumbW / 2, y + 4, thumbW, innerH);
+            ctx.restore();
+            if (!scheduledRedraw) {
+              // Fire one async generation per draw — they share a cache
+              // so subsequent draws hit. We schedule a redraw via the
+              // shared invalidate ref so the latest ``draw`` fn is used.
+              scheduledRedraw = true;
+              ensureThumbnail(mediaSrc, t, thumbW, innerH)
+                .then(() => requestRedrawRef.current && requestRedrawRef.current())
+                .catch(() => {});
+              // Keep the shimmer moving while tiles generate
+              setTimeout(() => requestRedrawRef.current && requestRedrawRef.current(), 120);
+            }
           }
         }
       }
@@ -963,23 +983,30 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
       //   * Hovered  → translucent handles so the user knows where to
       //                grab without committing to a click.
       if (clipW > 24 && (isSelected || isHovered)) {
-        const handleW = isSelected ? HANDLE_WIDTH_HOVER : HANDLE_WIDTH;
+        // Hovering directly over an edge fattens + brightens THAT handle
+        // so the 14px grab zone has a visible affordance before commit.
+        const hoverEdge = isHovered ? hoverRef.current.edge : null;
+        const handleWFor = (edge) => (isSelected || hoverEdge === edge)
+          ? HANDLE_WIDTH_HOVER : HANDLE_WIDTH;
+        const alphaFor = (edge) => isSelected ? 0.92 : (hoverEdge === edge ? 0.85 : 0.45);
         const handleY = bodyY + 3;
         const handleH = bodyH - 6;
-        const handleAlpha = isSelected ? 0.92 : 0.45;
         const handleRR = 2;
         ctx.fillStyle = '#FFFFFF';
-        ctx.globalAlpha = handleAlpha;
         // Left handle
+        const handleW = handleWFor('left');
+        ctx.globalAlpha = alphaFor('left');
         ctx.beginPath();
         ctx.roundRect(clipX, handleY, handleW, handleH, handleRR);
         ctx.fill();
         // Right handle — anchored to the right edge of the visible clip,
         // not the off-screen x2, so it stays grabbable when the clip is
         // partially scrolled out.
-        const rightHandleX = Math.min(clipX + clipW - handleW, x2 - handleW);
+        const rHandleW = handleWFor('right');
+        const rightHandleX = Math.min(clipX + clipW - rHandleW, x2 - rHandleW);
+        ctx.globalAlpha = alphaFor('right');
         ctx.beginPath();
-        ctx.roundRect(rightHandleX, handleY, handleW, handleH, handleRR);
+        ctx.roundRect(rightHandleX, handleY, rHandleW, handleH, handleRR);
         ctx.fill();
         // Grip notch — two short vertical lines on each handle so the
         // user reads them as "drag here" the same way a Mac window
@@ -990,7 +1017,7 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
           const notchH = Math.min(10, handleH - 4);
           const notchY = handleY + (handleH - notchH) / 2;
           ctx.fillRect(clipX + handleW / 2 - 1, notchY, 1, notchH);
-          ctx.fillRect(rightHandleX + handleW / 2 - 1, notchY, 1, notchH);
+          ctx.fillRect(rightHandleX + rHandleW / 2 - 1, notchY, 1, notchH);
         }
         ctx.globalAlpha = 1;
       }
@@ -2181,15 +2208,49 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
   }, []);
 
   // ── Zoom via Ctrl+Wheel ────────────────────────────────────────────────────
-  const onWheel = useCallback((e) => {
-    if (e.ctrlKey || e.metaKey) {
-      e.preventDefault();
-      const delta = e.deltaY > 0 ? -0.1 : 0.1;
-      setZoom(zoom + delta);
-    } else {
-      setScrollX(scrollX + e.deltaX + (e.shiftKey ? e.deltaY : 0));
-    }
-  }, [zoom, scrollX, setZoom, setScrollX]);
+  // Ctrl/⌘ + wheel (and trackpad pinch, which browsers deliver as
+  // ctrlKey wheel events) zooms CENTERED ON THE CURSOR: the timeline
+  // time under the pointer stays put while the scale changes around it.
+  // Multiplicative steps keep pinch (many tiny deltas) and wheel
+  // (coarse deltas) feeling identical. Attached as a NATIVE non-passive
+  // listener — React root wheel listeners are passive, so
+  // e.preventDefault() there can't stop browser page-zoom.
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return undefined;
+    const handler = (e) => {
+      const { zoom: curZoom, scrollX: curScrollX } = useTimelineStore.getState();
+      if (e.ctrlKey || e.metaKey) {
+        e.preventDefault();
+        const rect = canvas.getBoundingClientRect();
+        const cursorPx = Math.max(0, e.clientX - rect.left - LABEL_WIDTH);
+        const anchorTime = (curScrollX + cursorPx) / (basePPS * curZoom);
+        const factor = Math.exp(-e.deltaY * 0.01);
+        const newZoom = Math.max(0.01, Math.min(10, curZoom * factor));
+        setZoom(newZoom);
+        setScrollX(Math.max(0, anchorTime * basePPS * newZoom - cursorPx));
+      } else {
+        setScrollX(Math.max(0, curScrollX + e.deltaX + (e.shiftKey ? e.deltaY : 0)));
+      }
+    };
+    canvas.addEventListener('wheel', handler, { passive: false });
+    return () => canvas.removeEventListener('wheel', handler);
+  }, [basePPS, setZoom, setScrollX]);
+
+  // ── Double-click a clip → zoom to fill the view with it (2.7) ──
+  const onCanvasDoubleClick = useCallback((e) => {
+    const hit = hitTestItem(e.clientX, e.clientY);
+    if (!hit?.item) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const { start, end } = hit.item;
+    const span = Math.max(0.1, end - start);
+    const availableWidth = canvas.getBoundingClientRect().width - LABEL_WIDTH;
+    // 10% breathing room either side
+    const fitZoom = Math.max(0.01, Math.min(10, availableWidth / (span * 1.2 * basePPS)));
+    setZoom(fitZoom);
+    setScrollX(Math.max(0, (start - span * 0.1) * basePPS * fitZoom));
+  }, [hitTestItem, basePPS, setZoom, setScrollX]);
 
   // ── Drop from media library ────────────────────────────────────────────────
   const onDrop = useCallback((e) => {
@@ -2486,6 +2547,11 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
                   setDragOverTrackIdx(null);
                 }}
                 onDragEnd={() => { setDragTrackIdx(null); setDragOverTrackIdx(null); }}
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  setContextMenu({ kind: 'track', x: e.clientX, y: e.clientY, trackId: track.id });
+                }}
                 style={{
                   height: TRACK_HEIGHT,
                   marginBottom: TRACK_GAP,
@@ -2675,7 +2741,7 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
           onPointerDown={onPointerDown}
           onPointerMove={onPointerMove}
         onPointerLeave={onPointerLeave}
-        onWheel={onWheel}
+        onDoubleClick={onCanvasDoubleClick}
         onDrop={onDrop}
         onDragOver={onDragOver}
         onContextMenu={onContextMenu}
