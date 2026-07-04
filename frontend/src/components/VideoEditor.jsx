@@ -289,10 +289,12 @@ export default function VideoEditor({
   const { isMobile, isTablet } = useResponsive();
   const viewportClass = isMobile ? 'mobile' : isTablet ? 'tablet' : 'desktop';
 
-  // Resizable panel sizes — persisted per viewport class (2.5)
+  // Resizable panel sizes — persisted per viewport class (2.5).
+  // Tablet default is a 320px rail (3.2), collapsible to an icon strip.
   const [inspectorW, setInspectorW, resetInspectorW] = usePanelSize({
-    key: 'inspector_w', viewportClass, defaultSize: 280, min: 220, max: 480,
+    key: 'inspector_w', viewportClass, defaultSize: isTablet ? 320 : 280, min: 220, max: 480,
   });
+  const [railCollapsed, setRailCollapsed] = useState(false);
   const [timelineH, setTimelineH, resetTimelineH] = usePanelSize({
     key: 'timeline_h', viewportClass, defaultSize: 320, min: 160, max: 640,
   });
@@ -4420,16 +4422,45 @@ export default function VideoEditor({
                 ariaLabel="Resize inspector width"
               />
             )}
-            {showProperties && !isMobile && (
+            {/* Tablet: collapsed icon rail (3.2) — tap to re-expand */}
+            {showProperties && !isMobile && isTablet && railCollapsed && (
+              <div className="ve-multitrack__rail-collapsed">
+                <button
+                  className="ve-btn"
+                  onClick={() => setRailCollapsed(false)}
+                  aria-label="Expand inspector"
+                  title="Expand inspector"
+                >
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M15 18l-6-6 6-6" />
+                  </svg>
+                </button>
+                <span className="ve-multitrack__rail-icon" aria-hidden="true">⚙</span>
+              </div>
+            )}
+            {showProperties && !isMobile && !(isTablet && railCollapsed) && (
               <div
                 className="ve-multitrack__sidebar ve-multitrack__sidebar--right"
                 style={{ width: inspectorW, maxWidth: inspectorW }}
               >
                 <div className="ve-multitrack__sidebar-header">
                   <span>Properties</span>
+                  {isTablet && (
+                    <button
+                      className="ve-btn"
+                      onClick={() => setRailCollapsed(true)}
+                      aria-label="Collapse inspector to icons"
+                      style={{ minWidth: 24, minHeight: 24, fontSize: 12 }}
+                    >
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M9 18l6-6-6-6" />
+                      </svg>
+                    </button>
+                  )}
                   <button
                     className="ve-btn"
                     onClick={() => setShowProperties(false)}
+                    aria-label="Close properties"
                     style={{ minWidth: 24, minHeight: 24, fontSize: 12 }}
                   >
                     ✕
