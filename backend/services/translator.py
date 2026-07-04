@@ -716,10 +716,14 @@ def _parse_translation_response(response: str) -> list:
 
 async def _ensure_ollama_model(model: str) -> bool:
     """Check if the Ollama model exists locally; pull it if not."""
-    host = settings.OLLAMA_HOST
+    from backend.services import ollama_registry
+    active = await ollama_registry.pick_host()
+    host = active.url if active else settings.OLLAMA_HOST
+    _headers = ollama_registry.auth_headers(active)
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
-            resp = await client.post(f"{host}/api/show", json={"model": model})
+            resp = await client.post(f"{host}/api/show", json={"model": model},
+                                     headers=_headers)
             if resp.status_code == 200:
                 return True
     except Exception:
@@ -732,6 +736,7 @@ async def _ensure_ollama_model(model: str) -> bool:
             resp = await client.post(
                 f"{host}/api/pull",
                 json={"name": model},
+                headers=_headers,
             )
             if resp.status_code == 200:
                 logger.info("Successfully pulled translation model: %s", model)
@@ -804,7 +809,14 @@ async def _translate_batch_via_ollama(
     explicit num_gpu, Ollama's auto-scheduler frequently placed the model on the
     CPU after Whisper released VRAM.
     """
-    host = settings.OLLAMA_HOST
+    from backend.services import ollama_registry
+    _active = await ollama_registry.pick_host(required_model=model)
+    if _active is None:
+        # No host has the model (or none probed online) — fall back to the
+        # priority-order primary and let the per-request handling decide.
+        _active = next(iter(ollama_registry.enabled_hosts()), None)
+    host = _active.url if _active else settings.OLLAMA_HOST
+    _headers = ollama_registry.auth_headers(_active)
     base_options = {
         "num_ctx": int(num_ctx),
         "temperature": 0.3,
@@ -828,8 +840,11 @@ async def _translate_batch_via_ollama(
 
     ladder = _translation_gpu_ladder(model)
     last_status_err: Optional[Exception] = None
+    _host_hops = 0
     async with httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=15.0)) as client:
-        for i, n_gpu in enumerate(ladder):
+        i = 0
+        while i < len(ladder):
+            n_gpu = ladder[i]
             is_last = i == len(ladder) - 1
             options = dict(base_options)
             # num_gpu=99 → all layers on GPU (Ollama caps at the real count);
@@ -852,11 +867,25 @@ async def _translate_batch_via_ollama(
                         "stream": False,
                         "options": options,
                     },
+                    headers=_headers,
                 )
                 if resp.status_code == 500 and _is_ollama_oom(resp.text) and not is_last:
                     logger.warning(
                         "Ollama translation OOM at num_gpu=%s — stepping down to %s "
                         "(partial GPU offload)", n_gpu, ladder[i + 1])
+                    i += 1
+                    continue
+                if resp.status_code == 503 and _host_hops == 0:
+                    # A saturated Companion proxy asks us to wait — honor
+                    # Retry-After once, then the failover path takes over.
+                    try:
+                        _wait = min(15.0, max(0.5, float(
+                            resp.headers.get("Retry-After", "2"))))
+                    except (TypeError, ValueError):
+                        _wait = 2.0
+                    logger.info("Ollama translation host busy (503) — retrying in %.1fs", _wait)
+                    await asyncio.sleep(_wait)
+                    _host_hops += 1
                     continue
                 resp.raise_for_status()
                 data = resp.json()
@@ -869,6 +898,24 @@ async def _translate_batch_via_ollama(
                     logger.debug("Ollama translation ran with num_gpu=%s (model=%s)",
                                  n_gpu, model)
                 return data.get("message", {}).get("content", "")
+            except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+                # Host down mid-translation — mark it unhealthy and restart
+                # the ladder on the next registry host.
+                if _active is not None:
+                    ollama_registry.mark_unhealthy(
+                        _active, f"{type(e).__name__}: {str(e)[:100]}")
+                _next = await ollama_registry.pick_host()
+                if _host_hops < 4 and _next is not None and _next.url != host:
+                    logger.warning(
+                        "Ollama translation failover: %s unreachable — switching "
+                        "to '%s' (%s)", host, _next.name, _next.url)
+                    _active = _next
+                    host = _next.url
+                    _headers = ollama_registry.auth_headers(_active)
+                    _host_hops += 1
+                    i = 0
+                    continue
+                raise
             except httpx.HTTPStatusError as e:
                 last_status_err = e
                 body = ""
@@ -880,6 +927,7 @@ async def _translate_batch_via_ollama(
                     logger.warning(
                         "Ollama translation OOM at num_gpu=%s — stepping down to %s",
                         n_gpu, ladder[i + 1])
+                    i += 1
                     continue
                 raise
     if last_status_err is not None:

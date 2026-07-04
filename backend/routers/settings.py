@@ -54,6 +54,11 @@ _PERSISTABLE_KEYS = [
     "OPENROUTER_PRESET", "OPENROUTER_PRIMARY_MODEL", "OPENROUTER_EDITORIAL_MODEL",
     "OPENROUTER_SUMMARY_MODEL", "OPENROUTER_TRANSLATION_MODEL",
     "OLLAMA_PRIMARY_MODEL", "OLLAMA_EDITORIAL_MODEL", "OLLAMA_TRANSLATION_MODEL",
+    # Multi-host Ollama registry (JSON array; order = priority). The legacy
+    # OLLAMA_HOST field is deliberately NOT persisted — it stays env-owned
+    # for env-only deployments and is re-synced from the registry primary at
+    # startup when OLLAMA_HOSTS is set (see main.py startup).
+    "OLLAMA_HOSTS",
     "WHISPER_MODEL", "WHISPER_MODEL_USER_SET", "WHISPER_BEAM_SIZE",
     "WHISPER_VAD_FILTER", "FRAME_SAMPLE_RATE", "WHISPER_AUTO_UPGRADE",
     # Reframer perception sampling (face-detection speed).
@@ -609,17 +614,28 @@ async def provider_status():
 
     statuses = {}
 
-    # Ollama
+    # Ollama — every registry host, probed in parallel. "connected" when ANY
+    # enabled host is online (a dead primary with a live fallback still
+    # serves jobs via automatic failover). The legacy top-level fields keep
+    # reporting the first online host so existing UI/consumers don't break.
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(f"{settings.OLLAMA_HOST}/api/tags")
-            resp.raise_for_status()
-            data = resp.json()
-            models = [m["name"] for m in data.get("models", [])]
+        from backend.services import ollama_registry
+        host_statuses = await ollama_registry.registry_status()
+        online = [h for h in host_statuses if h["online"] and h["enabled"]]
+        if online:
             statuses["ollama"] = {
                 "status": "connected",
-                "models_loaded": models,
-                "host": settings.OLLAMA_HOST,
+                "models_loaded": online[0]["models"],
+                "host": online[0]["url"],
+                "active_host_name": online[0]["name"],
+                "hosts": host_statuses,
+            }
+        else:
+            statuses["ollama"] = {
+                "status": "offline",
+                "error": (host_statuses[0]["error"] if host_statuses
+                          else "no Ollama hosts configured"),
+                "hosts": host_statuses,
             }
     except Exception as e:
         statuses["ollama"] = {"status": "offline", "error": str(e)}
@@ -903,24 +919,39 @@ async def _test_openrouter():
 
 
 async def _test_ollama():
+    from backend.services import ollama_registry
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(f"{settings.OLLAMA_HOST}/api/tags")
-            resp.raise_for_status()
-            data = resp.json()
-            models = [m["name"] for m in data.get("models", [])]
-
-            has_vision = any(
-                "moondream" in m or "llava" in m or "bakllava" in m
-                for m in models
-            )
+        active = await ollama_registry.pick_host()
+        if active is None:
             return {
-                "status": "connected",
-                "message": f"Ollama connected with {len(models)} model(s) loaded.",
-                "models": models,
-                "has_primary_model": has_vision,
-                "host": settings.OLLAMA_HOST,
+                "status": "offline",
+                "message": (f"Cannot reach any Ollama host "
+                            f"(primary: {settings.OLLAMA_HOST})"),
+                "hosts": await ollama_registry.registry_status(),
             }
+        status = await ollama_registry.probe(active, force=True)
+        if not status.online:
+            return {
+                "status": "offline",
+                "message": (f"Cannot reach Ollama at {active.url}: "
+                            f"{status.error or 'no response'}"),
+            }
+        models = status.models
+
+        has_vision = any(
+            "moondream" in m or "llava" in m or "bakllava" in m
+            for m in models
+        )
+        return {
+            "status": "connected",
+            "message": (f"Ollama connected with {len(models)} model(s) loaded "
+                        f"(host: {active.name})."),
+            "models": models,
+            "has_primary_model": has_vision,
+            "host": active.url,
+            "host_name": active.name,
+            "hosts": await ollama_registry.registry_status(),
+        }
     except Exception as e:
         return {
             "status": "offline",
@@ -1250,7 +1281,9 @@ def _pull_ollama_models_background(models: list[str] | None = None):
 
     def _do_pull():
         import httpx as _httpx
-        host = settings.OLLAMA_HOST
+        from backend.services import ollama_registry
+        host = ollama_registry.primary_url() or settings.OLLAMA_HOST
+        _headers = ollama_registry.headers_for_url(host)
         try:
             for model in models:
                 _ollama_pull_state["current"] = model
@@ -1259,6 +1292,7 @@ def _pull_ollama_models_background(models: list[str] | None = None):
                     resp = _httpx.post(
                         f"{host}/api/pull",
                         json={"name": model},
+                        headers=_headers,
                         timeout=_httpx.Timeout(connect=10, read=1800, write=10, pool=10),
                     )
                     if resp.status_code == 200:
@@ -2224,8 +2258,11 @@ async def available_models():
     if "ollama" in settings.active_provider_chain:
         _ollama_seen_ids: set[str] = set()
         try:
+            from backend.services import ollama_registry
+            _tags_url = f"{ollama_registry.primary_url() or settings.OLLAMA_HOST}/api/tags"
             async with httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.get(f"{settings.OLLAMA_HOST}/api/tags")
+                resp = await client.get(_tags_url,
+                                        headers=ollama_registry.headers_for_url(_tags_url))
                 if resp.status_code == 200:
                     ollama_data = resp.json()
                     for m in ollama_data.get("models", []):
@@ -4156,8 +4193,11 @@ def _editorial_models_groq() -> list:
 async def _editorial_models_ollama() -> list:
     """Query Ollama for installed models, filter to known vision tags."""
     try:
+        from backend.services import ollama_registry
+        _tags_url = f"{ollama_registry.primary_url() or settings.OLLAMA_HOST}/api/tags"
         async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(f"{settings.OLLAMA_HOST}/api/tags")
+            resp = await client.get(_tags_url,
+                                    headers=ollama_registry.headers_for_url(_tags_url))
             resp.raise_for_status()
             data = resp.json()
     except Exception as e:

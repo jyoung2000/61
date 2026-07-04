@@ -241,6 +241,36 @@ async def _startup_seed_auth():
 
 
 @app.on_event("startup")
+async def _startup_sync_ollama_registry():
+    """Sync the legacy ``OLLAMA_HOST`` with the multi-host registry primary.
+
+    ``OLLAMA_HOSTS`` (persisted, drag-and-drop ordered in Settings) is the
+    source of truth when set; many call sites still read ``OLLAMA_HOST``
+    directly, so point it at the registry's primary once per boot. When
+    ``OLLAMA_HOSTS`` is empty this is a no-op — env-only deployments keep
+    their configured single host untouched.
+    """
+    from backend.config import settings as cfg
+    try:
+        from backend.services import ollama_registry
+        if (cfg.OLLAMA_HOSTS or "").strip():
+            primary = ollama_registry.primary_host()
+            if primary and primary.url != cfg.OLLAMA_HOST:
+                logger.info("Ollama registry: primary is '%s' (%s) — syncing OLLAMA_HOST",
+                            primary.name, primary.url)
+                cfg.OLLAMA_HOST = primary.url
+            hosts = ollama_registry.get_hosts()
+            logger.info(
+                "Ollama registry: %d host(s) configured: %s",
+                len(hosts),
+                ", ".join(f"{h.name}{' (disabled)' if not h.enabled else ''}"
+                          for h in hosts) or "(none)",
+            )
+    except Exception as e:
+        logger.warning("Ollama registry sync failed (non-fatal): %s", e)
+
+
+@app.on_event("startup")
 async def _startup_preload():
     """Auto-detect GPU and preload Whisper model at startup."""
     from backend.config import settings as cfg
@@ -541,7 +571,9 @@ async def _startup_preload():
 
         def _pull_ollama_models():
             import httpx
-            host = cfg.OLLAMA_HOST
+            from backend.services import ollama_registry
+            host = ollama_registry.primary_url() or cfg.OLLAMA_HOST
+            _headers = ollama_registry.headers_for_url(host)
             if _ollama_is_primary:
                 # Ollama is primary — pull all configured models + extras.
                 # (Translation no longer uses Ollama — it runs offline via
@@ -561,6 +593,7 @@ async def _startup_preload():
                     resp = httpx.post(
                         f"{host}/api/pull",
                         json={"name": model},
+                        headers=_headers,
                         timeout=httpx.Timeout(connect=10, read=1800, write=10, pool=10),
                     )
                     if resp.status_code == 200:

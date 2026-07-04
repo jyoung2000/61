@@ -225,7 +225,12 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
     """Local Ollama provider - always available as final fallback."""
 
     def __init__(self):
-        self._host = settings.OLLAMA_HOST
+        from backend.services import ollama_registry
+        # The active host comes from the multi-host registry (index 0 =
+        # primary). With OLLAMA_HOSTS unset this resolves to the legacy
+        # settings.OLLAMA_HOST value, byte-identical to the old behavior.
+        # ``_failover_host`` re-points it mid-job when the active host dies.
+        self._host = ollama_registry.primary_url() or settings.OLLAMA_HOST
         self._primary_model = _normalize_ollama_model(settings.OLLAMA_PRIMARY_MODEL)
         # Capture the configured default so ``apply_primary_model_override``
         # can revert when ``content_type`` is None.
@@ -240,9 +245,20 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
         # can be extremely slow (llava:7b on CPU = 3-5 min per vision frame).
         # Per-request timeouts in _call_vision and _call_text override this
         # for their specific needs.
+        # Every request picks up the matching registry host's bearer token
+        # (the GPU Companion proxy requires one) plus the X-ClipAI-* job
+        # headers via this hook — one place instead of 20 call sites.
+        async def _attach_registry_headers(request: httpx.Request):
+            try:
+                for k, v in ollama_registry.headers_for_url(str(request.url)).items():
+                    request.headers.setdefault(k, v)
+            except Exception:
+                pass
+
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(600.0, connect=15.0),
             limits=httpx.Limits(max_connections=4, max_keepalive_connections=2),
+            event_hooks={"request": [_attach_registry_headers]},
         )
         # Track whether we need CPU-only mode due to VRAM constraints.
         # ``_force_cpu`` is sticky within a model, but it must NOT leak across
@@ -253,6 +269,9 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
         # on the GPU.
         self._force_cpu: bool = False
         self._force_cpu_model: Optional[str] = None
+        # Last (requested, substituted, host_name) model swap made because the
+        # active host lacked the configured model — surfaced in job telemetry.
+        self._last_model_substitution: Optional[tuple] = None
         # Remembers the GPU layer count (num_gpu) that last loaded a model
         # successfully, so later calls start at the known-good rung of the
         # partial-offload ladder instead of re-OOMing at num_gpu=99 every time.
@@ -272,6 +291,77 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
     async def close(self):
         """Close the shared HTTP client. Call when provider is no longer needed."""
         await self._client.aclose()
+
+    # ── Multi-host registry: failover + model substitution ──────────────
+
+    @property
+    def active_host_label(self) -> str:
+        """Human label of the host currently serving this provider (for
+        stage-timing / 'which device ran this' display)."""
+        from backend.services import ollama_registry
+        host = ollama_registry.find_host_for_url(self._host)
+        return host.name if host else self._host
+
+    async def _failover_host(self, exc: Exception) -> bool:
+        """Mark the active host unhealthy after a connection-level failure
+        and switch to the next healthy registry host in priority order.
+
+        Returns True when a switch happened (caller retries the same
+        request), False when no other host is available (caller raises and
+        the AI_FALLBACK_CHAIN takes over exactly as before).
+        """
+        from backend.services import ollama_registry
+        current = ollama_registry.find_host_for_url(self._host)
+        if current is not None:
+            ollama_registry.mark_unhealthy(
+                current, f"{type(exc).__name__}: {str(exc)[:100]}")
+        replacement = await ollama_registry.pick_host()
+        if replacement is None or replacement.url == self._host:
+            return False
+        logger.warning(
+            "Ollama failover: host %s is unreachable — switching to '%s' (%s)",
+            self._host, replacement.name, replacement.url,
+        )
+        self._host = replacement.url
+        # Per-host state must not leak across machines: the fallback may
+        # have a different GPU, different models resident, different limits.
+        self._gpu_available = None
+        self._vram_checked = False
+        self._force_cpu = False
+        self._force_cpu_model = None
+        self._capabilities_detected = False
+        self._gpu_layers_good.clear()
+        self._gpu_fit_cache.clear()
+        return True
+
+    async def _resolve_model_for_active_host(self, requested: str, kind: str) -> str:
+        """Best model for the active host: the requested one when installed,
+        else the top installed entry of the substitution ladder.
+
+        Only active when a multi-host registry is explicitly configured
+        (OLLAMA_HOSTS set) — single-host deployments keep the legacy
+        404 → provider-fallback behavior unchanged.
+        """
+        if not (getattr(settings, "OLLAMA_HOSTS", "") or "").strip():
+            return requested
+        from backend.services import ollama_registry
+        host = ollama_registry.find_host_for_url(self._host)
+        if host is None:
+            return requested
+        try:
+            status = await ollama_registry.probe(host)
+        except Exception:
+            return requested
+        if not status.online:
+            return requested
+        model, substituted = ollama_registry.resolve_model_for_host(
+            status, requested, kind)
+        if substituted:
+            logger.warning(
+                "Ollama host '%s' lacks %r — substituting %r for this call",
+                host.name, requested, model)
+            self._last_model_substitution = (requested, model, host.name)
+        return model
 
     def apply_primary_model_override(self, content_type) -> str:
         """Swap the active vision model based on ``content_type`` (Phase 2 parity).
@@ -1081,17 +1171,24 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
         else:
             vision_timeout = 60.0   # GPU: moondream takes 4-5s/frame, 60s is generous
 
-        num_gpu = self._get_num_gpu(self._primary_model)
+        # Multi-host registry: use the best model the ACTIVE host actually
+        # has (no-op when OLLAMA_HOSTS is unset — legacy behavior preserved).
+        vision_model = await self._resolve_model_for_active_host(
+            self._primary_model, "vision")
+
+        num_gpu = self._get_num_gpu(vision_model)
 
         # Determine if model supports format: "json" reliably.
         # moondream supports it well. Larger llava models may not.
-        vision_lower = self._primary_model.lower()
+        vision_lower = vision_model.lower()
         use_json_format = "moondream" in vision_lower
 
-        for attempt in range(2):  # At most 2 attempts: GPU then CPU
+        attempt = 0
+        host_hops = 0
+        while attempt < 2:  # At most 2 attempts per host: GPU then CPU
             try:
                 options = {
-                    "num_ctx": self._get_effective_ctx(self._primary_model),
+                    "num_ctx": self._get_effective_ctx(vision_model),
                     "num_gpu": 99,  # Force all layers on GPU (Ollama caps at actual count)
                     "num_thread": 4,
                 }
@@ -1101,7 +1198,7 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                     logger.info("Retrying vision call with num_gpu=0 (CPU-only) after OOM")
 
                 payload = {
-                    "model": self._primary_model,
+                    "model": vision_model,
                     "messages": [
                         {
                             "role": "user",
@@ -1133,26 +1230,53 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                     if self._is_oom_error(error_text) and attempt == 0:
                         logger.warning(
                             "Ollama vision CUDA OOM (model=%s) — clearing VRAM and retrying on GPU. Error: %s",
-                            self._primary_model, error_text[:200],
+                            vision_model, error_text[:200],
                         )
                         # Clear all models (likely text model still resident) and retry on GPU
                         await self.clear_vram()
                         await asyncio.sleep(3)
                         self._force_cpu = False
-                        options["num_gpu"] = self._get_num_gpu(self._primary_model)
+                        options["num_gpu"] = self._get_num_gpu(vision_model)
+                        attempt += 1
                         continue
                     # Non-OOM 500 or second attempt 500 — raise
                     response.raise_for_status()
+
+                # A saturated GPU Companion proxy answers 503 + Retry-After
+                # (one whisper/LLM job at a time). Honor it once, then let the
+                # failover path move to the next host.
+                if response.status_code == 503 and host_hops == 0:
+                    _wait = 2.0
+                    try:
+                        _wait = min(15.0, max(0.5, float(
+                            response.headers.get("Retry-After", "2"))))
+                    except (TypeError, ValueError):
+                        pass
+                    logger.info("Ollama host busy (503) — retrying vision call in %.1fs", _wait)
+                    await asyncio.sleep(_wait)
+                    host_hops += 1
+                    continue
 
                 response.raise_for_status()
                 data = response.json()
                 self._total_tokens += data.get("prompt_eval_count", 0) + data.get("eval_count", 0)
                 return data.get("message", {}).get("content", "")
 
+            except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+                # Host down mid-job — walk the registry to the next host and
+                # retry the SAME attempt there (fresh GPU, fresh ladder).
+                if host_hops < 4 and await self._failover_host(e):
+                    host_hops += 1
+                    vision_model = await self._resolve_model_for_active_host(
+                        self._primary_model, "vision")
+                    attempt = 0
+                    continue
+                raise ProviderError(
+                    f"Ollama unreachable on all configured hosts: {e}")
             except httpx.TimeoutException:
                 raise ProviderError(
                     f"Ollama vision timeout after {vision_timeout}s "
-                    f"(model={self._primary_model}) — consider using a smaller model"
+                    f"(model={vision_model}) — consider using a smaller model"
                 )
             except httpx.HTTPStatusError as e:
                 error_text = e.response.text[:500] if e.response else ""
@@ -1161,20 +1285,23 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                         "Ollama vision HTTP error with OOM pattern — retrying CPU-only: %s",
                         error_text[:200],
                     )
-                    self._note_oom_force_cpu(self._primary_model)
+                    self._note_oom_force_cpu(vision_model)
                     await asyncio.sleep(3)
+                    attempt += 1
                     continue
                 raise ProviderError(f"Ollama vision error: {e}")
             except Exception as e:
                 error_str = str(e)
                 if self._is_oom_error(error_str) and attempt == 0:
                     logger.warning("Ollama vision OOM — retrying CPU-only: %s", error_str[:200])
-                    self._note_oom_force_cpu(self._primary_model)
+                    self._note_oom_force_cpu(vision_model)
                     await asyncio.sleep(3)
+                    attempt += 1
                     continue
                 raise ProviderError(f"Ollama vision error: {e}")
+            attempt += 1
 
-        raise ProviderError(f"Ollama vision failed after 2 attempts (model={self._primary_model})")
+        raise ProviderError(f"Ollama vision failed after 2 attempts (model={vision_model})")
 
     async def _call_text(self, prompt: str, system: str = "", max_tokens: int = 4096,
                          timeout: float = 90.0, json_mode: bool = False,
@@ -1225,8 +1352,13 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
         if any(0 < r < 99 for r in gpu_ladder):
             _num_batch = int(getattr(settings, "OLLAMA_TRANSLATION_GPU_NUM_BATCH", 128))
 
+        # Multi-host registry: use the best model the ACTIVE host actually
+        # has (no-op when OLLAMA_HOSTS is unset — legacy behavior preserved).
+        text_model = await self._resolve_model_for_active_host(
+            self._editorial_model, "text")
+
         payload = {
-            "model": self._editorial_model,
+            "model": text_model,
             "messages": messages,
             "stream": True,
             "options": {
@@ -1262,7 +1394,10 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
             stall_timeout, gpu_ladder,
         )
 
-        for attempt, _n_gpu in enumerate(gpu_ladder):
+        attempt = 0
+        host_hops = 0
+        while attempt < len(gpu_ladder):
+            _n_gpu = gpu_ladder[attempt]
             is_last_rung = attempt == len(gpu_ladder) - 1
             try:
                 # Walk the GPU ladder: each rung offloads fewer layers to the GPU
@@ -1292,7 +1427,7 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                             logger.warning(
                                 "Ollama text OOM (model=%s, num_gpu=%s) — stepping down "
                                 "to num_gpu=%s (%s): %s",
-                                self._editorial_model, _n_gpu, next_gpu,
+                                text_model, _n_gpu, next_gpu,
                                 "CPU-only" if next_gpu == 0 else "partial GPU offload",
                                 error_text[:200],
                             )
@@ -1300,7 +1435,7 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                             # model force-CPU (so the stall timeout widens); a
                             # partial-GPU step keeps the model on the GPU.
                             if next_gpu == 0:
-                                self._note_oom_force_cpu(self._editorial_model)
+                                self._note_oom_force_cpu(text_model)
                             # Clear residual VRAM (a vision model may still be
                             # resident) before the next, smaller attempt.
                             try:
@@ -1308,11 +1443,26 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                             except Exception:
                                 pass
                             await asyncio.sleep(3)
+                            attempt += 1
                             continue
                         raise ProviderError(
-                            f"Ollama text HTTP 500 (model={self._editorial_model}): "
+                            f"Ollama text HTTP 500 (model={text_model}): "
                             f"{error_text[:200]}"
                         )
+
+                    # A saturated GPU Companion proxy answers 503 with a
+                    # Retry-After — honor it once, then fail over.
+                    if response.status_code == 503 and host_hops == 0:
+                        _wait = 2.0
+                        try:
+                            _wait = min(15.0, max(0.5, float(
+                                response.headers.get("Retry-After", "2"))))
+                        except (TypeError, ValueError):
+                            pass
+                        logger.info("Ollama host busy (503) — retrying text call in %.1fs", _wait)
+                        await asyncio.sleep(_wait)
+                        host_hops += 1
+                        continue
 
                     # Any other non-2xx (e.g. 404 when the model tag is
                     # not pulled, 400 for malformed payloads): consume
@@ -1326,16 +1476,16 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                             logger.warning(
                                 "Ollama text model %r not found (HTTP 404). "
                                 "Ensure the model is pulled: `ollama pull %s`. Body: %s",
-                                self._editorial_model, self._editorial_model, error_text[:200],
+                                text_model, text_model, error_text[:200],
                             )
                             raise ProviderError(
-                                f"Ollama text model {self._editorial_model!r} is not pulled "
-                                f"(HTTP 404). Run `ollama pull {self._editorial_model}` or pick "
+                                f"Ollama text model {text_model!r} is not pulled "
+                                f"(HTTP 404). Run `ollama pull {text_model}` or pick "
                                 "a model that's already downloaded."
                             )
                         raise ProviderError(
                             f"Ollama text HTTP {response.status_code} "
-                            f"(model={self._editorial_model}): {error_text[:200]}"
+                            f"(model={text_model}): {error_text[:200]}"
                         )
 
                     response.raise_for_status()
@@ -1370,14 +1520,14 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
 
                 # This rung loaded successfully — remember it so later calls for
                 # this model start here instead of re-OOMing at num_gpu=99.
-                self._remember_gpu_layers(self._editorial_model, _n_gpu)
+                self._remember_gpu_layers(text_model, _n_gpu)
                 if _n_gpu == 0:
                     logger.info(
                         "Ollama text ran on CPU (model=%s) — GPU offload exhausted",
-                        self._editorial_model)
+                        text_model)
 
                 if not result:
-                    logger.warning("Ollama streaming returned empty response for model=%s", self._editorial_model)
+                    logger.warning("Ollama streaming returned empty response for model=%s", text_model)
                 else:
                     logger.debug(
                         "Ollama streaming complete: %d chars, %d prompt_tokens, %d eval_tokens",
@@ -1387,12 +1537,25 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                     # Record speed measurement for dynamic timeout calculation
                     if total_eval_tokens > 0 and token_count > 0:
                         record_speed_measurement(
-                            self._editorial_model, total_prompt_tokens, total_eval_tokens,
+                            text_model, total_prompt_tokens, total_eval_tokens,
                             token_count / 12.0  # rough elapsed estimate
                         )
 
                 return result
 
+            except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+                # Host down mid-job — walk the registry to the next host and
+                # restart the offload ladder there (different GPU, different fit).
+                if host_hops < 4 and await self._failover_host(e):
+                    host_hops += 1
+                    text_model = await self._resolve_model_for_active_host(
+                        self._editorial_model, "text")
+                    payload["model"] = text_model
+                    gpu_ladder = self._text_gpu_ladder(text_model)
+                    attempt = 0
+                    continue
+                raise ProviderError(
+                    f"Ollama unreachable on all configured hosts: {e}")
             except httpx.ReadTimeout:
                 # Attempt overload recovery before giving up
                 if attempt == 0:
@@ -1400,15 +1563,16 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                         "Ollama text stalled (no data for %.0fs) — attempting overload recovery",
                         stall_timeout,
                     )
-                    recovered = await self.recover_from_overload(self._editorial_model)
+                    recovered = await self.recover_from_overload(text_model)
                     if recovered:
+                        attempt += 1
                         continue  # Retry with recovered model
                 raise ProviderError(
                     f"Ollama text stalled (no data for {stall_timeout:.0f}s) — "
-                    f"model={self._editorial_model}, the model may be overloaded"
+                    f"model={text_model}, the model may be overloaded"
                 )
             except httpx.TimeoutException:
-                raise ProviderError(f"Ollama text timeout after {effective_timeout:.0f}s (model={self._editorial_model})")
+                raise ProviderError(f"Ollama text timeout after {effective_timeout:.0f}s (model={text_model})")
             except httpx.HTTPStatusError as e:
                 # e.response may be a streaming response that hasn't been
                 # consumed yet. Accessing ``.text`` directly raises
@@ -1443,20 +1607,21 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                     await self.clear_vram()
                     await asyncio.sleep(3)
                     if next_gpu == 0:
-                        self._note_oom_force_cpu(self._editorial_model)
+                        self._note_oom_force_cpu(text_model)
+                    attempt += 1
                     continue
                 # OOM on the last (CPU) rung or a non-OOM error.
                 if self._is_oom_error(error_text):
                     logger.warning("Ollama text OOM persists at the lowest rung — falling back to CPU")
-                    self._note_oom_force_cpu(self._editorial_model)
+                    self._note_oom_force_cpu(text_model)
                 if status_code == 404:
                     raise ProviderError(
-                        f"Ollama text model {self._editorial_model!r} is not pulled "
-                        f"(HTTP 404). Run `ollama pull {self._editorial_model}` or pick "
+                        f"Ollama text model {text_model!r} is not pulled "
+                        f"(HTTP 404). Run `ollama pull {text_model}` or pick "
                         "a model that's already downloaded."
                     )
                 raise ProviderError(
-                    f"Ollama HTTP {status_code} (model={self._editorial_model}): {error_text[:200]}"
+                    f"Ollama HTTP {status_code} (model={text_model}): {error_text[:200]}"
                 )
             except Exception as e:
                 error_str = str(e)
@@ -1470,13 +1635,14 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                     await self.clear_vram()
                     await asyncio.sleep(3)
                     if next_gpu == 0:
-                        self._note_oom_force_cpu(self._editorial_model)
+                        self._note_oom_force_cpu(text_model)
+                    attempt += 1
                     continue
                 raise ProviderError(f"Ollama text error ({type(e).__name__}): {e}")
 
         raise ProviderError(
             f"Ollama text failed after {len(gpu_ladder)} attempts "
-            f"(model={self._editorial_model})")
+            f"(model={text_model})")
 
     async def text_complete(self, prompt: str, max_tokens: int = 4096, timeout: int | None = None,
                             json_mode: bool = False) -> str:

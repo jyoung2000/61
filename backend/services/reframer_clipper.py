@@ -2329,9 +2329,15 @@ class OllamaJudge:
             "stream": False,
             "options": {"temperature": 0.3, "num_predict": 1024},
         }).encode()
+        _headers = {"Content-Type": "application/json"}
+        try:
+            from backend.services import ollama_registry
+            _headers.update(ollama_registry.headers_for_url(f"{self.host}/api/chat"))
+        except Exception:
+            pass
         req = urllib.request.Request(
             f"{self.host}/api/chat", data=payload,
-            headers={"Content-Type": "application/json"}, method='POST',
+            headers=_headers, method='POST',
         )
         # Local inference can be slow; Ollama needs the longer ceiling.
         resp = urllib.request.urlopen(req, timeout=120)

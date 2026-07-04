@@ -66,6 +66,15 @@ class Settings(BaseSettings):
     # Whisper VRAM before the VLM stage, so each gets the GPU in turn.
     # On 6GB+ GPUs switch Primary AI to llava:7b (or larger) in Settings.
     OLLAMA_HOST: str = "http://ollama:11434"
+    # Multi-host Ollama registry (remote GPU sharing). JSON array of
+    # {"id","name","url","token","enabled"} — ARRAY ORDER IS PRIORITY:
+    # index 0 is the primary, the rest are ordered fallbacks with automatic
+    # failover (see backend/services/ollama_registry.py). Host URLs may
+    # include a base path (the GPU Companion proxy exposes Ollama at
+    # http://<desktop>:11500/ollama) and an optional per-host bearer token.
+    # Blank → a one-entry registry is synthesized from OLLAMA_HOST above, so
+    # env-only / Unraid-template deployments keep working unchanged.
+    OLLAMA_HOSTS: str = ""
     OLLAMA_PRIMARY_MODEL: str = "moondream:1.8b"
     # EDITORIAL model (summaries, SEO, clip scoring, transcript polish). Kept at
     # the 3B class because it must run on the GPU for the per-clip SEO / summary

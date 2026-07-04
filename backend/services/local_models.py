@@ -338,7 +338,12 @@ async def list_ollama_models(timeout: float = 4.0) -> list[str]:
     if not host:
         return []
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        from backend.services import ollama_registry
+        _headers = ollama_registry.headers_for_url(host)
+    except Exception:
+        _headers = {}
+    try:
+        async with httpx.AsyncClient(timeout=timeout, headers=_headers) as client:
             resp = await client.get(f"{host}/api/tags")
             resp.raise_for_status()
             data = resp.json() or {}

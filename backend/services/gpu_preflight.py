@@ -144,7 +144,12 @@ async def _evict_all_ollama_models(host: str, job_id: str) -> dict:
         "vram_freed_mb": 0,
         "failed": [],
     }
-    async with httpx.AsyncClient(timeout=15.0) as client:
+    try:
+        from backend.services import ollama_registry
+        _headers = ollama_registry.headers_for_url(host)
+    except Exception:
+        _headers = {}
+    async with httpx.AsyncClient(timeout=15.0, headers=_headers) as client:
         loaded = await _list_ollama_loaded_models(client, host)
         if not loaded:
             logger.info("[%s] preflight: no Ollama models currently loaded", job_id)
@@ -259,10 +264,26 @@ async def ensure_gpu_free_before_analysis(job_id: str) -> dict:
         "ollama_host": host,
     }
 
-    if host:
+    # Evict only hosts that share THIS server's GPU. A remote host (a
+    # Companion-shared desktop 4070) has its own VRAM — unloading its
+    # models frees nothing locally and just costs it a multi-GB reload.
+    _evict_host = host
+    try:
+        from backend.services import ollama_registry
+        _local = [h.url for h in ollama_registry.enabled_hosts()
+                  if ollama_registry.is_local_gpu_host(h.url)]
+        _evict_host = _local[0] if _local else ""
+        if host and not _evict_host:
+            logger.info(
+                "[%s] preflight: Ollama host(s) are remote GPUs — skipping "
+                "eviction (their VRAM is not this server's)", job_id)
+    except Exception:
+        pass
+
+    if _evict_host:
         try:
             ollama_stats = await asyncio.wait_for(
-                _evict_all_ollama_models(host, job_id), timeout=20.0,
+                _evict_all_ollama_models(_evict_host, job_id), timeout=20.0,
             )
             stats["ollama"] = ollama_stats
         except asyncio.TimeoutError:
@@ -271,9 +292,11 @@ async def ensure_gpu_free_before_analysis(job_id: str) -> dict:
         except Exception as e:
             logger.warning("[%s] preflight: Ollama eviction error: %s", job_id, e)
             stats["ollama"] = {"error": str(e)}
-    else:
+    elif not host:
         logger.debug("[%s] preflight: no OLLAMA_HOST configured — skipping Ollama eviction", job_id)
         stats["ollama"] = {"skipped": True, "reason": "no OLLAMA_HOST"}
+    else:
+        stats["ollama"] = {"skipped": True, "reason": "remote GPU host"}
 
     stats["torch_freed_mb"] = _release_local_torch_vram(job_id)
 
@@ -328,7 +351,16 @@ async def ensure_gpu_free_before_whisper(job_id: str) -> dict:
 
     # Re-evict Ollama in case the editorial AI auto-loaded a model during
     # perceive (it shouldn't — perceive is local-only — but be safe).
+    # Same local-GPU-only rule as the analysis preflight: remote hosts
+    # (Companion-shared desktops) keep their models resident.
     host = (getattr(settings, "OLLAMA_HOST", "") or "").rstrip("/")
+    try:
+        from backend.services import ollama_registry
+        _local = [h.url for h in ollama_registry.enabled_hosts()
+                  if ollama_registry.is_local_gpu_host(h.url)]
+        host = _local[0] if _local else ""
+    except Exception:
+        pass
     if host:
         try:
             ollama_stats = await asyncio.wait_for(

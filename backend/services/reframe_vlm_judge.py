@@ -77,8 +77,11 @@ def _extract_cropped_frame(video_path: str, t: float, crop_w: int, crop_h: int,
 async def _ask_vlm(client, model: str, image_b64: str) -> Optional[bool]:
     """One YES/NO framing judgment. None on failure/ambiguity."""
     try:
+        from backend.services import ollama_registry
+        _url = f"{settings.OLLAMA_HOST.rstrip('/')}/api/generate"
         resp = await client.post(
-            f"{settings.OLLAMA_HOST.rstrip('/')}/api/generate",
+            _url,
+            headers=ollama_registry.headers_for_url(_url),
             json={
                 "model": model,
                 "prompt": _PROMPT,

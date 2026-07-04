@@ -143,25 +143,38 @@ async def _openrouter_model_exists(model_id: str, timeout: float = 8.0) -> bool 
 
 
 def _probe_ollama_reachable(timeout: float = 1.5) -> bool:
-    """Cheap synchronous TCP ping of the Ollama daemon.
+    """Cheap synchronous TCP ping of the Ollama daemon(s).
 
-    Returns True iff a TCP connection to ``settings.OLLAMA_HOST`` opens
-    within ``timeout`` seconds. Used by the orchestrator to skip
-    Ollama on jobs where the daemon is not running, instead of
-    waiting for the first HTTP call to time out (which can take
-    30+ seconds and cascade through every batch).
+    Returns True iff a TCP connection to ANY enabled host in the Ollama
+    registry (falling back to ``settings.OLLAMA_HOST`` when no registry is
+    configured) opens within ``timeout`` seconds. Used by the orchestrator
+    to skip Ollama on jobs where no daemon is running, instead of waiting
+    for the first HTTP call to time out (which can take 30+ seconds and
+    cascade through every batch). With fallback hosts configured, a dead
+    primary alone no longer disqualifies Ollama — the provider fails over.
     """
     import socket
     from urllib.parse import urlparse
+
+    candidates: list[str] = []
     try:
-        host_url = getattr(settings, "OLLAMA_HOST", "") or ""
-        parsed = urlparse(host_url if "://" in host_url else f"http://{host_url}")
-        host = parsed.hostname or "127.0.0.1"
-        port = parsed.port or 11434
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
-    except (OSError, ValueError):
-        return False
+        from backend.services import ollama_registry
+        candidates = [h.url for h in ollama_registry.enabled_hosts()]
+    except Exception:
+        pass
+    if not candidates:
+        candidates = [getattr(settings, "OLLAMA_HOST", "") or ""]
+
+    for host_url in candidates:
+        try:
+            parsed = urlparse(host_url if "://" in host_url else f"http://{host_url}")
+            host = parsed.hostname or "127.0.0.1"
+            port = parsed.port or 11434
+            with socket.create_connection((host, port), timeout=timeout):
+                return True
+        except (OSError, ValueError):
+            continue
+    return False
 
 
 class AIOrchestrator:
@@ -345,10 +358,19 @@ class AIOrchestrator:
 
                 elif pname == "ollama":
                     import httpx
-                    async with httpx.AsyncClient(timeout=5.0) as client:
-                        resp = await client.head(f"{settings.OLLAMA_HOST}")
-                        if resp.status_code != 200:
-                            return ("", f"⚠ Ollama returned HTTP {resp.status_code}")
+                    from backend.services import ollama_registry
+                    # Walk the registry in priority order — a dead primary
+                    # with a live fallback is a WARNING, not a failure (the
+                    # provider fails over per-request).
+                    active = await ollama_registry.pick_host()
+                    if active is None:
+                        return ("", "⚠ No Ollama host is reachable "
+                                    "(all registry hosts offline)")
+                    _hosts = ollama_registry.enabled_hosts()
+                    _host_note = ""
+                    if _hosts and active.id != _hosts[0].id:
+                        _host_note = (f" — primary '{_hosts[0].name}' is offline; "
+                                      f"using fallback '{active.name}'")
                     # ── Vision-model existence check ──
                     # ``/api/show`` returns 404 if the model isn't
                     # pulled. Avoids 30s of batch failures on first
@@ -363,8 +385,9 @@ class AIOrchestrator:
                                 bare_id = bare_id[len("ollama/"):]
                             async with httpx.AsyncClient(timeout=8.0) as client:
                                 ping = await client.post(
-                                    f"{settings.OLLAMA_HOST}/api/show",
+                                    ollama_registry.join_url(active.url, "/api/show"),
                                     json={"model": bare_id},
+                                    headers=ollama_registry.auth_headers(active),
                                 )
                                 if ping.status_code == 404:
                                     return (
@@ -377,7 +400,8 @@ class AIOrchestrator:
                                     )
                     except Exception:
                         pass
-                    return (f"✓ {model_info} — Ollama connected", None)
+                    return (f"✓ {model_info} — Ollama connected "
+                            f"(host: {active.name}){_host_note}", None)
 
                 elif pname == "gemini":
                     if not settings.GEMINI_API_KEY:
