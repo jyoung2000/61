@@ -600,6 +600,11 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
   playheadRef.current = playhead;
   const ppsRef = useRef(pps);
   ppsRef.current = pps;
+  // Drawn playhead position — trails the real playhead through a ~120 ms
+  // ease on programmatic jumps (Home/End/ruler click) so the needle
+  // glides instead of teleporting. Playback ticks and scrubs stay 1:1.
+  const displayPlayheadRef = useRef(playhead);
+  const glideRafRef = useRef(0);
 
   // ── Scrub-flush state lives on refs, not effect-local variables ──
   // The playhead drag effect previously stored ``_scrubRaf`` and
@@ -1175,8 +1180,10 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
     }
 
     // ── Playhead ──
-    // Read from ref for smooth rAF-driven updates (avoids stale closure)
-    const phX = contentLeft + playheadRef.current * pps - sx;
+    // Read from ref for smooth rAF-driven updates (avoids stale closure).
+    // The needle draws at the eased display position; the timecode bubble
+    // always shows the REAL playhead so no fake frames are displayed.
+    const phX = contentLeft + displayPlayheadRef.current * pps - sx;
     if (phX >= contentLeft && phX <= canvasW) {
       // Playhead line with subtle glow
       ctx.save();
@@ -1333,6 +1340,35 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
   // AND running the rAF loop. Two redraw mechanisms stacked.
   // The rAF loop below is now the SINGLE source of repaint during
   // playback; ``playhead`` is read off ``playheadRef`` inside ``draw``.
+
+  // ── Playhead seek glide (motion polish 2.6) ──
+  // Programmatic jumps ease the DRAWN needle over ~120 ms. During
+  // playback the rAF loop below repaints, so this effect only syncs the
+  // display value; while paused it also requests the repaint. Scrub-size
+  // deltas (< 0.2 s) and prefers-reduced-motion track 1:1.
+  useEffect(() => {
+    const from = displayPlayheadRef.current;
+    const to = playhead;
+    cancelAnimationFrame(glideRafRef.current);
+    const reduceMotion = typeof window !== 'undefined' && window.matchMedia
+      && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    if (isPlaying || reduceMotion || Math.abs(to - from) < 0.2) {
+      displayPlayheadRef.current = to;
+      if (!isPlaying) draw();
+      return undefined;
+    }
+    const DUR = 120;
+    const start = performance.now();
+    const easeOutQuart = (t) => 1 - Math.pow(1 - t, 4);
+    const step = (now) => {
+      const p = Math.min(1, (now - start) / DUR);
+      displayPlayheadRef.current = from + (to - from) * easeOutQuart(p);
+      draw();
+      if (p < 1) glideRafRef.current = requestAnimationFrame(step);
+    };
+    glideRafRef.current = requestAnimationFrame(step);
+    return () => cancelAnimationFrame(glideRafRef.current);
+  }, [playhead, isPlaying, draw]);
 
   // Continuous redraw during playback. Throttled to ~30 Hz so a long
   // timeline doesn't repaint at full display refresh.

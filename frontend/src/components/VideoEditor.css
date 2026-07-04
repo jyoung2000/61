@@ -104,7 +104,7 @@
   border-radius: 4px;
   color: var(--ve-text-muted);
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition: all var(--dur-fast) var(--ease-out-quart);
   flex-shrink: 0;
 }
 .ve-header__close:hover {
@@ -207,7 +207,7 @@
   cursor: pointer;
   backdrop-filter: blur(20px) saturate(1.6);
   -webkit-backdrop-filter: blur(20px) saturate(1.6);
-  transition: background 0.15s ease, transform 0.15s ease;
+  transition: background var(--dur-fast) var(--ease-out-quart), transform var(--dur-fast) var(--ease-out-quart);
 }
 .ve-lightbox-close:hover {
   background: rgba(255, 255, 255, 0.18);
@@ -457,7 +457,7 @@
 /* ── Segment overlay on timeline ──────────────────── */
 
 .ve-timeline__segment {
-  transition: background 0.15s ease, border-color 0.15s ease;
+  transition: background var(--dur-fast) var(--ease-out-quart), border-color var(--dur-fast) var(--ease-out-quart);
   border-radius: 2px;
 }
 .ve-timeline__segment--selected {
@@ -625,7 +625,7 @@
   color: var(--ve-text);
   cursor: pointer;
   border-radius: 4px;
-  transition: all 0.15s ease;
+  transition: all var(--dur-fast) var(--ease-out-quart);
   padding: 4px;
   min-width: 32px;
   min-height: 32px;
@@ -710,7 +710,7 @@ input.ve-timecode--input {
   border-radius: 6px;
   cursor: pointer;
   white-space: nowrap;
-  transition: all 0.15s ease;
+  transition: all var(--dur-fast) var(--ease-out-quart);
 }
 .ve-apply-trim:hover {
   background: rgba(10, 132, 255, 0.18);
@@ -836,7 +836,7 @@ input.ve-timecode--input {
   font-weight: 500;
   border-radius: 4px;
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition: all var(--dur-fast) var(--ease-out-quart);
   white-space: nowrap;
 }
 .ve-speed__btn:hover {
@@ -1019,7 +1019,7 @@ input.ve-timecode--input {
   border: 1.5px solid var(--border, #ddd);
   border-radius: var(--radius-xs, 4px);
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition: all var(--dur-fast) var(--ease-out-quart);
   white-space: nowrap;
 }
 .ve-segment-chip:hover {
@@ -1193,7 +1193,7 @@ input.ve-timecode--input {
   font-weight: 700;
   border-radius: 4px;
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition: all var(--dur-fast) var(--ease-out-quart);
   min-width: 24px;
 }
 .ve-segment-inspector__delete:hover {
@@ -1287,7 +1287,7 @@ input.ve-timecode--input {
   color: var(--ve-text-muted);
   border-radius: 10px;
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition: all var(--dur-fast) var(--ease-out-quart);
 }
 .ve-segment-inspector__speed-pill:hover {
   background: var(--ve-btn-hover);
@@ -1335,7 +1335,7 @@ input.ve-timecode--input {
   border: none;
   border-radius: 4px;
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition: all var(--dur-fast) var(--ease-out-quart);
 }
 .ve-segment-inspector__done:hover {
   filter: brightness(1.1);
@@ -1452,7 +1452,7 @@ input.ve-timecode--input {
   border-radius: 4px;
   cursor: pointer;
   font-size: 12px;
-  transition: all 0.15s ease;
+  transition: all var(--dur-fast) var(--ease-out-quart);
 }
 .ve-error__retry:hover {
   background: var(--ve-btn-active);
@@ -1487,7 +1487,7 @@ input.ve-timecode--input {
   border: 1px solid var(--ve-track-border);
   border-radius: 4px;
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition: all var(--dur-fast) var(--ease-out-quart);
   white-space: nowrap;
 }
 .ve-multitrack-toggle__btn:hover {
@@ -1649,7 +1649,7 @@ input.ve-timecode--input {
   background: var(--ve-track-bg);
   color: var(--ve-text-muted);
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition: all var(--dur-fast) var(--ease-out-quart);
   white-space: nowrap;
 }
 .ve-btn--small:hover {
@@ -1693,7 +1693,7 @@ input.ve-timecode--input {
   cursor: pointer;
   margin: 0;
   padding: 0;
-  transition: background 0.15s ease;
+  transition: background var(--dur-fast) var(--ease-out-quart);
 }
 .ve-multi-timeline__zoom-slider:hover {
   background: rgba(127, 127, 127, 0.25);
@@ -1768,7 +1768,7 @@ input.ve-timecode--input {
   border-radius: 5px;
   border: 2px solid transparent;
   background-clip: padding-box;
-  transition: background 0.15s ease;
+  transition: background var(--dur-fast) var(--ease-out-quart);
 }
 .ve-multi-timeline__canvas-wrap::-webkit-scrollbar-thumb:hover {
   background: rgba(127, 127, 127, 0.55);
@@ -1859,7 +1859,7 @@ input.ve-timecode--input {
   border: 1px solid var(--accent-cyan, #0A84FF);
   border-radius: 4px;
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition: all var(--dur-fast) var(--ease-out-quart);
 }
 .ve-media-uploader__add-btn:hover {
   background: rgba(10, 132, 255, 0.18);
@@ -1871,7 +1871,7 @@ input.ve-timecode--input {
   padding: 16px 12px;
   text-align: center;
   cursor: pointer;
-  transition: all 0.2s ease;
+  transition: all var(--dur-base) var(--ease-out-quart);
   background: transparent;
 }
 .ve-media-uploader__dropzone:hover,
@@ -1968,7 +1968,7 @@ input.ve-timecode--input {
   border: 1px solid var(--ve-chrome-border);
   border-radius: 4px;
   cursor: grab;
-  transition: all 0.15s ease;
+  transition: all var(--dur-fast) var(--ease-out-quart);
   position: relative;
 }
 .ve-media-uploader__item-delete {
@@ -2079,7 +2079,7 @@ input.ve-timecode--input {
   font-size: 11px;
   border-radius: 3px;
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition: all var(--dur-fast) var(--ease-out-quart);
 }
 .ve-properties__delete:hover {
   background: rgba(255, 59, 48, 0.1);
@@ -2227,7 +2227,7 @@ input.ve-timecode--input {
   color: var(--ve-text-muted);
   border-radius: 10px;
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition: all var(--dur-fast) var(--ease-out-quart);
 }
 .ve-properties__speed-pill:hover {
   background: var(--ve-btn-hover);
@@ -2250,7 +2250,7 @@ input.ve-timecode--input {
   border: none;
   border-radius: 5px;
   cursor: pointer;
-  transition: opacity 0.15s ease;
+  transition: opacity var(--dur-fast) var(--ease-out-quart);
 }
 .ve-properties__preset-btn:hover {
   opacity: 0.85;
@@ -2370,7 +2370,7 @@ input.ve-timecode--input {
   color: var(--ve-text-muted);
   cursor: pointer;
   font-size: 11px;
-  transition: all 0.15s ease;
+  transition: all var(--dur-fast) var(--ease-out-quart);
   min-height: 28px;
 }
 
@@ -2400,6 +2400,7 @@ input.ve-timecode--input {
 /* ── Effects Panel ───────────────────────────────────── */
 .ve-effects {
   padding: 8px;
+  animation: ve-pop-in 180ms var(--ease-out-quart);
 }
 
 .ve-effects--empty {
@@ -2494,6 +2495,7 @@ input.ve-timecode--input {
   border: 1px solid var(--ve-chrome-border);
   box-shadow: var(--ve-dropdown-shadow);
   min-width: 200px;
+  animation: ve-pop-in 180ms var(--ease-out-quart);
 }
 
 .ve-transition-picker__header {
@@ -2535,7 +2537,7 @@ input.ve-timecode--input {
   border: 1px solid transparent;
   border-radius: 6px;
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition: all var(--dur-fast) var(--ease-out-quart);
 }
 
 .ve-transition-picker__item:hover {
@@ -2591,6 +2593,19 @@ input.ve-timecode--input {
 }
 
 /* ── Export Dialog ────────────────────────────────────── */
+/* Shared dialog/panel entrance: scale 0.98→1 + fade, 180 ms.
+   prefers-reduced-motion clamps this to 1 ms via the global rule. */
+@keyframes ve-pop-in {
+  from { opacity: 0; transform: scale(0.98); }
+  to { opacity: 1; transform: scale(1); }
+}
+
+/* Variant for elements whose base transform is a centering translate. */
+@keyframes ve-pop-in-centered {
+  from { opacity: 0; transform: translate(-50%, -50%) scale(0.98); }
+  to { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+}
+
 .ve-export-dialog {
   position: fixed;
   top: 50%;
@@ -2605,6 +2620,7 @@ input.ve-timecode--input {
   max-width: 440px;
   z-index: 10000;
   backdrop-filter: blur(20px);
+  animation: ve-pop-in-centered 180ms var(--ease-out-quart);
 }
 
 .ve-export-dialog__header {
@@ -2649,7 +2665,7 @@ input.ve-timecode--input {
   font-size: 11px;
   font-weight: 600;
   color: var(--ve-text);
-  transition: all 0.15s ease;
+  transition: all var(--dur-fast) var(--ease-out-quart);
 }
 
 .ve-export-dialog__mode-btn--active {
@@ -2692,7 +2708,7 @@ input.ve-timecode--input {
   border-radius: 6px;
   cursor: pointer;
   color: var(--ve-text);
-  transition: all 0.15s ease;
+  transition: all var(--dur-fast) var(--ease-out-quart);
 }
 
 .ve-export-dialog__quality-pill--active {
@@ -2897,7 +2913,7 @@ input.ve-timecode--input {
   border-radius: 8px;
   cursor: pointer;
   border: none;
-  transition: all 0.15s ease;
+  transition: all var(--dur-fast) var(--ease-out-quart);
 }
 
 .ve-export-dialog__btn--primary {
@@ -3007,7 +3023,7 @@ input.ve-timecode--input {
   );
 }
 .ve-multi-timeline__track-ctrl {
-  transition: opacity 0.15s ease, background-color 0.12s ease, transform 0.12s ease;
+  transition: opacity var(--dur-fast) var(--ease-out-quart), background-color var(--dur-fast) var(--ease-out-quart), transform var(--dur-fast) var(--ease-out-quart);
   flex-shrink: 0;
   display: inline-flex;
   align-items: center;
@@ -3074,7 +3090,7 @@ input.ve-timecode--input {
   border-bottom: 2px solid transparent;
   color: var(--ve-text-muted);
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition: all var(--dur-fast) var(--ease-out-quart);
 }
 
 .ve-editor-sidebar__tab--active {
@@ -3099,7 +3115,7 @@ input.ve-timecode--input {
   font-size: 11px;
   font-weight: 600;
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition: all var(--dur-fast) var(--ease-out-quart);
 }
 
 .ve-export-btn:hover {
