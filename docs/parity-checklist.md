@@ -19,8 +19,8 @@
 | Clip volume (`volume`) | PropertiesPanel | ✅ | ✅ | ✅ |  |
 | Clip / track audio mute (`muted`) | PropertiesPanel | ✅ | ✅ | ✅ | Client export honors clip.muted and track.audioMuted since the decoded-buffer audio rewrite. |
 | Per-clip playback speed (`speed`) | PropertiesPanel | ✅ | ✅ | ⚠️ | Client export maps time as trimStart+(t-start)*speed for frames and uses AudioBufferSourceNode.playbackRate for audio (varispeed: pitch shifts, matching preview element.playbackRate). Server uses setpts+atempo (pitch-preserving) — audible pitch differs from preview at speeds far from 1x. |
-| Fade in (video opacity + audio gain) (`fadeIn`) | PropertiesPanel | ✅ | ✅ | ⚠️ | Client export schedules matching gain automation on the offline audio context. Server applies visual fade via video_effects.fade_in; audio fade on the server path is not yet implemented. |
-| Fade out (video opacity + audio gain) (`fadeOut`) | PropertiesPanel | ✅ | ✅ | ⚠️ | Same as fadeIn. |
+| Fade in (video opacity + audio gain) (`fadeIn`) | PropertiesPanel | ✅ | ✅ | ✅ | Client export schedules matching gain automation on the offline audio context. Server ramps audio with afade (linear, output-time, serial filters multiply on overlap — same semantics as fadeGainAt) and scales the visual fade duration by speed so both ramps last fadeIn/fadeOut output seconds. Audio overlays with fade_in/fade_out get their own afade chain. |
+| Fade out (video opacity + audio gain) (`fadeOut`) | PropertiesPanel | ✅ | ✅ | ✅ | Same as fadeIn. On the per-segment-speed server path, clip-wide fades apply to the boundary segments in source time (matching that path’s video fades). |
 | Position (x/y %) (`position`) | PropertiesPanel | ✅ | ✅ | ✅ |  |
 | Size (w/h %) (`size`) | PropertiesPanel | ✅ | ✅ | ✅ |  |
 | Rotation (`transform.rotation`) | PropertiesPanel | ✅ | ✅ | ✅ |  |

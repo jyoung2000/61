@@ -3394,6 +3394,49 @@ def test_1440p_crf_matches_1080p_tier():
     assert QUALITY_MAX_HEIGHT["1440p"] == 1440
 
 
+# ---------------------------------------------------------------------------
+# Audio fades on the server path (parity fix 1.2)
+# ---------------------------------------------------------------------------
+
+
+def test_audio_fade_filters_match_preview_semantics():
+    """afade strings mirror fadeGainAt(): linear, output-time, multiplicative."""
+    from backend.services.clip_exporter import _audio_fade_filters
+
+    assert _audio_fade_filters(1.5, 0, 10) == ["afade=t=in:st=0:d=1.500"]
+    assert _audio_fade_filters(0, 2, 10) == ["afade=t=out:st=8.000:d=2.000"]
+    # Both fades → two serial afade filters (serial gains multiply, the
+    # same overlap behavior exportParity.test.js pins for the client path)
+    assert _audio_fade_filters(1, 1, 5) == [
+        "afade=t=in:st=0:d=1.000",
+        "afade=t=out:st=4.000:d=1.000",
+    ]
+    # fade_out longer than the clip → negative start reproduces the
+    # preview's mid-ramp start (gain=dur/fade_out at t=0, silence at end)
+    assert _audio_fade_filters(0, 8, 5) == ["afade=t=out:st=-3.000:d=8.000"]
+    # zero/None-safe
+    assert _audio_fade_filters(0, 0, 10) == []
+    assert _audio_fade_filters(None, None, 10) == []
+    # No known duration → fade-out skipped rather than misplaced
+    assert _audio_fade_filters(0, 2, 0) == []
+
+
+def test_video_fade_duration_scales_with_speed():
+    """Video fades run pre-setpts (source time); at 2x speed a 1s output
+    ramp needs 2s of source frames. speed=1 stays byte-identical."""
+    fx = {"fade_in": 1.0, "fade_out": 1.0}
+
+    vf2, _, _ = _build_filter_chain(
+        None, 1920, 1080, None, video_effects=dict(fx), clip_duration=10.0, speed=2.0)
+    assert "fade=t=in:st=0:d=2.000" in vf2
+    assert "fade=t=out:st=8.000:d=2.000" in vf2
+
+    vf1, _, _ = _build_filter_chain(
+        None, 1920, 1080, None, video_effects=dict(fx), clip_duration=10.0)
+    assert "fade=t=in:st=0:d=1.000" in vf1
+    assert "fade=t=out:st=9.000:d=1.000" in vf1
+
+
 # ===========================================================================
 # MAIN
 # ===========================================================================

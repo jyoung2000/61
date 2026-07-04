@@ -3790,6 +3790,31 @@ def _atempo_chain(spd: float) -> str:
     return ",".join(parts)
 
 
+def _audio_fade_filters(fade_in: float, fade_out: float, out_duration: float) -> list[str]:
+    """Build afade filters matching the preview's fadeGainAt() ramps.
+
+    Both ramps are LINEAR (afade's default triangular curve) in
+    OUTPUT-timeline seconds — the same time base the preview element and
+    the client export's gain automation use — so place these AFTER any
+    atempo in the chain. Serial afade filters multiply, matching the
+    multiplicative overlap behavior pinned by exportParity.test.js.
+
+    When fade_out exceeds the clip duration the start time goes negative
+    on purpose: FFmpeg evaluates it fine and it reproduces the preview's
+    mid-ramp start (gain = out_duration/fade_out at t=0, reaching 0 at
+    the clip end) instead of never reaching silence.
+    """
+    parts: list[str] = []
+    fade_in = max(0.0, float(fade_in or 0))
+    fade_out = max(0.0, float(fade_out or 0))
+    if fade_in > 0:
+        parts.append(f"afade=t=in:st=0:d={fade_in:.3f}")
+    if fade_out > 0 and out_duration > 0:
+        st = out_duration - fade_out
+        parts.append(f"afade=t=out:st={st:.3f}:d={fade_out:.3f}")
+    return parts
+
+
 def _build_speed_timeline(
     segments: list[dict],
     clip_dur: float,
@@ -4357,7 +4382,8 @@ def _build_filter_chain(
     face_width_pct: float = 0.0,
     use_step_interpolation: bool = False,
     zoom_keyframes: list[tuple[float, float]] | None = None,
-) -> tuple[str | None, bool]:
+    speed: float = 1.0,
+) -> tuple[str | None, bool, str]:
     """Build FFmpeg video filter chain.
 
     Always crops to fill the target aspect ratio (no blur-background).
@@ -4372,7 +4398,13 @@ def _build_filter_chain(
     video_path / start_time: used for cropdetect to remove baked-in
     black bars (pillarboxing/letterboxing) from the source video.
 
-    Returns (filter_string, is_complex_graph).
+    speed: the global playback speed applied AFTER this chain via
+    setpts. Fade filters here run in pre-setpts source time, so their
+    durations are multiplied by ``speed`` — after retiming, the on-screen
+    ramp lasts exactly fade_in/fade_out OUTPUT seconds, matching the
+    preview and the client export.
+
+    Returns (filter_string, is_complex_graph, subtitle_filter).
     """
     # Determine if quality requires resolution scaling (even without aspect ratio)
     target_h = QUALITY_MAX_HEIGHT.get(export_quality, 1080)
@@ -4739,12 +4771,15 @@ def _build_filter_chain(
                     f":y=ih/2-{src_h}/2-({src_h}*{oy_pct:.4f})"
                 )
 
-        # Fade in/out on main video
+        # Fade in/out on main video. Durations are scaled to source time
+        # (× speed) so the post-setpts output ramp matches the preview.
+        _spd = speed if speed and speed > 0 else 1.0
         if vid_fade_in > 0:
-            filters.append(f"fade=t=in:st=0:d={vid_fade_in:.3f}")
+            filters.append(f"fade=t=in:st=0:d={vid_fade_in * _spd:.3f}")
         if vid_fade_out > 0 and clip_duration > 0:
-            fade_out_start = max(0, clip_duration - vid_fade_out)
-            filters.append(f"fade=t=out:st={fade_out_start:.3f}:d={vid_fade_out:.3f}")
+            _fo_src = vid_fade_out * _spd
+            fade_out_start = max(0, clip_duration - _fo_src)
+            filters.append(f"fade=t=out:st={fade_out_start:.3f}:d={_fo_src:.3f}")
 
         logger.info(
             "Video effects applied: brightness=%.1f contrast=%.1f saturation=%.1f "
@@ -7253,6 +7288,10 @@ async def export_clip(
                     face_width_pct=_avg_face_w,
                     use_step_interpolation=_using_frontend_keyframes,
                     zoom_keyframes=zoom_keyframes,
+                    # Per-segment speed retimes each segment separately, so the
+                    # single global scaling doesn't apply there (fades stay in
+                    # clip-relative source time on that path).
+                    speed=speed if (has_speed and not has_seg_speed) else 1.0,
                 )
 
             # Append text overlay drawtext filters.
@@ -7395,12 +7434,24 @@ async def export_clip(
 
                 # --- Audio chain (only if audio exists) ---
                 if _has_audio:
+                    # Clip-wide fades land on the boundary segments, in the
+                    # same pre-atempo source-time base as the video fades this
+                    # path bakes into vf — audio and video ramps stay in sync.
+                    _psg_fade_in = float((video_effects or {}).get("fade_in", 0) or 0)
+                    _psg_fade_out = float((video_effects or {}).get("fade_out", 0) or 0)
                     for i, tl in enumerate(timeline):
                         seg_dur = tl["end"] - tl["start"]
                         chain = (
                             f"[{i}:a]atrim=duration={seg_dur:.3f}"
                             f",asetpts=PTS-STARTPTS"
                         )
+                        if i == 0 and _psg_fade_in > 0:
+                            chain += f",afade=t=in:st=0:d={_psg_fade_in:.3f}"
+                        if i == n - 1 and _psg_fade_out > 0:
+                            chain += (
+                                f",afade=t=out:st={seg_dur - _psg_fade_out:.3f}"
+                                f":d={_psg_fade_out:.3f}"
+                            )
                         if abs(tl["speed"] - 1.0) > 0.001:
                             chain += f",{_atempo_chain(tl['speed'])}"
                         seg_vol = 0.0 if tl["muted"] else tl["volume"]
@@ -7545,6 +7596,15 @@ async def export_clip(
                         seg_vol = 0.0 if seg.get("muted", False) else seg.get("volume", 1.0)
                         expr = f"if(between(t\\,{seg_start:.3f}\\,{seg_end:.3f})\\,{seg_vol:.4f}\\,{expr})"
                     af_parts.append(f"volume='{expr}':eval=frame")
+                # --- Audio fades matching the visual fade (parity 1.2) ---
+                # The preview and client export ramp audio gain alongside the
+                # video fade (fadeGainAt / buildGainAutomation); mirror that
+                # here with afade in OUTPUT time (placed after atempo).
+                _fade_in_s = float((video_effects or {}).get("fade_in", 0) or 0)
+                _fade_out_s = float((video_effects or {}).get("fade_out", 0) or 0)
+                if _fade_in_s > 0 or _fade_out_s > 0:
+                    _out_dur = (end - start) / speed if has_speed else (end - start)
+                    af_parts.extend(_audio_fade_filters(_fade_in_s, _fade_out_s, _out_dur))
                 af = ",".join(af_parts) if af_parts else None
 
                 # --- Overlay integration for global path ---
