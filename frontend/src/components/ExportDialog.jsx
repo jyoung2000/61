@@ -5,6 +5,7 @@ import { runSubtitleQA } from '../utils/subtitleQA';
 import { buildOverlayPayload, buildVideoEffectsPayload, buildPlaybackPayload, mapSubtitleSettings } from '../utils/buildExportPayload';
 import { EXPORT_QUALITIES, EXPORT_QUALITY_PRESETS, getExportDims } from '../utils/defaultSettings';
 import { PLATFORM_PRESETS } from '../utils/safeZones';
+import { CloseIcon } from './icons';
 
 // Derived from the shared quality tables in defaultSettings.js — the
 // dialog can't drift from the panel or the backend dims again.
@@ -442,7 +443,7 @@ export default function ExportDialog({
     <div className="ve-export-dialog" onClick={(e) => e.stopPropagation()}>
       <div className="ve-export-dialog__header">
         <span className="ve-export-dialog__title">Export video</span>
-        <button className="ve-export-dialog__close" onClick={onClose} aria-label="Close export dialog">✕</button>
+        <button className="ve-export-dialog__close" onClick={onClose} aria-label="Close export dialog"><CloseIcon /></button>
       </div>
 
       {/* Export mode toggle */}
@@ -516,7 +517,7 @@ export default function ExportDialog({
           )}
         </div>
         {activePlatform && aspectOverride && aspectOverride !== aspectRatio && (
-          <p className="ve-export-dialog__notice" style={{ fontSize: 10 }}>
+          <p className="ve-export-dialog__notice ve-export-dialog__notice--small">
             Exporting as {aspectOverride} for {activePlatform.label} (editor aspect unchanged).
           </p>
         )}

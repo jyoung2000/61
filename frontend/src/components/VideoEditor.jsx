@@ -4405,11 +4405,11 @@ export default function VideoEditor({
                 <div className="ve-multitrack__sidebar-header">
                   <span>Media library</span>
                   <button
-                    className="ve-btn"
+                    className="ve-header__close"
                     onClick={() => setShowMediaLibrary(false)}
-                    style={{ minWidth: 24, minHeight: 24, fontSize: 12 }}
+                    aria-label="Close media library"
                   >
-                    ✕
+                    <Icon.Close />
                   </button>
                 </div>
                 <MediaUploader jobId={jobId} />
@@ -4478,12 +4478,11 @@ export default function VideoEditor({
                     </button>
                   )}
                   <button
-                    className="ve-btn"
+                    className="ve-header__close"
                     onClick={() => setShowProperties(false)}
                     aria-label="Close properties"
-                    style={{ minWidth: 24, minHeight: 24, fontSize: 12 }}
                   >
-                    ✕
+                    <Icon.Close />
                   </button>
                 </div>
                 <EditorErrorBoundary name="Properties" compact>
@@ -4495,7 +4494,7 @@ export default function VideoEditor({
                   <div className="ve-multitrack__sidebar-section">
                     <div className="ve-multitrack__sidebar-header">
                       <span>Effects</span>
-                      <button className="ve-btn" onClick={() => setShowEffectsPanel(false)} style={{ minWidth: 24, minHeight: 24, fontSize: 12 }}>✕</button>
+                      <button className="ve-header__close" onClick={() => setShowEffectsPanel(false)} aria-label="Close effects"><Icon.Close /></button>
                     </div>
                     <EditorErrorBoundary name="Effects" compact>
                       <EffectsPanel />
@@ -4508,7 +4507,7 @@ export default function VideoEditor({
                   <div className="ve-multitrack__sidebar-section">
                     <div className="ve-multitrack__sidebar-header">
                       <span>Transitions</span>
-                      <button className="ve-btn" onClick={() => setShowTransitions(false)} style={{ minWidth: 24, minHeight: 24, fontSize: 12 }}>✕</button>
+                      <button className="ve-header__close" onClick={() => setShowTransitions(false)} aria-label="Close transitions"><Icon.Close /></button>
                     </div>
                     <TransitionPicker />
                   </div>

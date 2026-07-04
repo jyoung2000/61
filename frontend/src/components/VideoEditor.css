@@ -2721,6 +2721,10 @@ input.ve-timecode--input {
   color: var(--ve-warning, #FF9F0A);
 }
 
+.ve-export-dialog__notice--small {
+  font-size: 10px;
+}
+
 /* ── Cost / quota preview ─────────────────────────── */
 .ve-export-dialog__cost {
   display: grid;

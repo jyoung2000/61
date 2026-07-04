@@ -5,6 +5,7 @@
 import React, { useMemo } from 'react';
 import { createPortal } from 'react-dom';
 import { EDITOR_ACTIONS } from '../utils/editorActions';
+import { CloseIcon } from './icons';
 
 export default function ShortcutCheatSheet({ open, onClose }) {
   const groups = useMemo(() => {
@@ -28,7 +29,7 @@ export default function ShortcutCheatSheet({ open, onClose }) {
       <div className="ve-cheatsheet" role="dialog" aria-label="Keyboard shortcuts" tabIndex={-1}>
         <div className="ve-cheatsheet__header">
           <span className="ve-cheatsheet__title">Keyboard shortcuts</span>
-          <button className="ve-cheatsheet__close" onClick={onClose} aria-label="Close shortcuts">✕</button>
+          <button className="ve-cheatsheet__close" onClick={onClose} aria-label="Close shortcuts"><CloseIcon /></button>
         </div>
         <div className="ve-cheatsheet__grid">
           {groups.map(([category, actions]) => (
