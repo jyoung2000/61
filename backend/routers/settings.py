@@ -2741,6 +2741,119 @@ async def put_vocabulary(req: SaveVocabularyRequest):
     }
 
 
+# ── Multi-host Ollama registry (remote GPU sharing) ──────────────
+#
+# Array order IS priority: index 0 = primary, the rest = ordered
+# fallbacks. The Settings UI reorders with drag-and-drop and persists
+# immediately through PUT. All probing happens server-side — the
+# browser must never probe a host directly (CORS / mixed content).
+
+
+class OllamaHostEntry(BaseModel):
+    id: Optional[str] = None
+    name: str = ""
+    url: str
+    # None = keep the stored token for this id (so edits don't force
+    # re-entering secrets); "" = explicitly clear it.
+    token: Optional[str] = None
+    enabled: bool = True
+
+
+class SaveOllamaHostsRequest(BaseModel):
+    hosts: list[OllamaHostEntry]
+
+
+class TestOllamaHostRequest(BaseModel):
+    url: str
+    token: str = ""
+
+
+@router.get("/settings/ollama-hosts")
+async def get_ollama_hosts():
+    """The ordered host registry with live per-host status (server-probed)."""
+    from backend.services import ollama_registry
+    return {
+        "hosts": await ollama_registry.registry_status(),
+        "legacy_host": settings.OLLAMA_HOST,
+        "migrated": not bool((settings.OLLAMA_HOSTS or "").strip()),
+    }
+
+
+@router.put("/settings/ollama-hosts")
+async def put_ollama_hosts(req: SaveOllamaHostsRequest):
+    """Replace the registry (order = priority) and persist immediately.
+
+    Called on every drag-and-drop reorder, add, edit, toggle, and delete.
+    Tokens: a ``null`` token keeps the stored secret for that host id; an
+    empty string clears it. Tokens are never echoed back — the status
+    payload only reports ``has_token``.
+    """
+    import uuid as _uuid
+    from backend.services import ollama_registry
+    existing_tokens = {h.id: h.token for h in ollama_registry.get_hosts()}
+    hosts = []
+    for entry in req.hosts:
+        url = (entry.url or "").strip()
+        if not url:
+            continue
+        host_id = (entry.id or "").strip() or _uuid.uuid4().hex[:8]
+        token = entry.token
+        if token is None:
+            token = existing_tokens.get(host_id, "")
+        hosts.append(ollama_registry.OllamaHost(
+            id=host_id,
+            name=(entry.name or "").strip() or url,
+            url=url,
+            token=token,
+            enabled=bool(entry.enabled),
+        ))
+    ollama_registry.save_hosts(hosts)
+    _invalidate_status_cache()
+    logger.info(
+        "Ollama host registry saved: %s",
+        " > ".join(f"{h.name}{'' if h.enabled else ' (disabled)'}" for h in hosts)
+        or "(empty)",
+    )
+    return {
+        "status": "saved",
+        "hosts": await ollama_registry.registry_status(force=True),
+        "primary": hosts[0].name if hosts else None,
+    }
+
+
+@router.post("/settings/ollama-hosts/test")
+async def test_ollama_host(req: TestOllamaHostRequest):
+    """Server-side probe of one host URL (+ optional token) for the Add/Edit
+    dialog's Test button. Returns online/offline, models, and version."""
+    from backend.services import ollama_registry
+    url = (req.url or "").strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="url is required")
+    candidate = ollama_registry.OllamaHost(
+        id="__test__", name="test", url=url, token=req.token or "")
+    status = await ollama_registry.probe(candidate, force=True)
+    # Never cache the throwaway probe under the sentinel id.
+    ollama_registry._probe_cache.pop("__test__", None)
+    version = ""
+    if status.online:
+        try:
+            async with httpx.AsyncClient(timeout=3.0) as client:
+                vresp = await client.get(
+                    ollama_registry.join_url(url, "/api/version"),
+                    headers=ollama_registry.auth_headers(candidate))
+                if vresp.status_code == 200:
+                    version = (vresp.json() or {}).get("version", "")
+        except Exception:
+            pass
+    return {
+        "online": status.online,
+        "models": status.models,
+        "latency_ms": status.latency_ms,
+        "version": version,
+        "error": status.error,
+    }
+
+
 # ── Voiceprint registry (cross-job speaker naming) ───────────────
 
 @router.get("/settings/voiceprints")
