@@ -277,9 +277,14 @@ class Perceiver:
                 # Behind (shouldn't happen) or a genuinely large jump
                 cap.set(cv2.CAP_PROP_POS_FRAMES, min(target_frame, r.total_frames - 1))
             elif gap > 1:
-                # Skip forward by grabbing without decoding
-                for _ in range(gap - 1):
-                    cap.grab()
+                # Skip forward by grabbing without decoding — but bridge the
+                # gap with LIGHTWEIGHT TRACKING when the last sample had
+                # faces. At 0.14-0.23 samples/s on long videos the camera
+                # path is pure interpolation for up to 7s between looks; LK
+                # optical flow on a few of the already-grabbed frames turns
+                # those blind stretches into real subject positions (the
+                # dominant source of HIGH face_missing problems).
+                self._track_through_gap(cap, gap, r, det_w, det_h, det_scale)
 
             ret, frame = cap.read()
             if not ret:
@@ -303,6 +308,10 @@ class Perceiver:
             # Track assignment
             tracked = self._assign_tracks(confirmed, time_ms)
             r.face_timeline[time_ms] = tracked
+
+            # State for the inter-sample LK tracker (bridges the next gap).
+            self._last_gray_small = gray_small
+            self._last_sample_ms = time_ms
 
             # ── Cache dominant-speaker position for saliency biasing ──
             # When the speaker's face momentarily drops out of detection
@@ -1073,6 +1082,121 @@ class Perceiver:
             return round(min(1.0, abs(ratio - prev) * 8.0), 4)
         except Exception:
             return None
+
+    def _track_through_gap(self, cap, gap: int, r, det_w: int, det_h: int,
+                           det_scale: float) -> None:
+        """Bridge the inter-sample gap with LK optical-flow face tracking.
+
+        The sampling loop grab()s ``gap-1`` frames between detection samples
+        without decoding them. When the previous sample had faces, retrieve a
+        few of those frames (up to REFRAMER_TRACK_POINTS_PER_GAP, ~evenly
+        spaced), track each face's box forward with pyramidal Lucas-Kanade on
+        the downscaled grays, and append the tracked positions to
+        ``r.face_timeline`` (marked ``tracked: True``, confidence decayed).
+        Detection cost is unchanged — grab() already decoded these frames;
+        this adds only a retrieve + resize + sparse LK per tracked frame.
+        Fail-soft: any error degrades to the plain grab() skip.
+        """
+        n_skip = gap - 1
+        if n_skip <= 0:
+            return
+        prev_gray = getattr(self, '_last_gray_small', None)
+        last_ms = getattr(self, '_last_sample_ms', None)
+        prev_faces = (r.face_timeline.get(last_ms) or []) if last_ms is not None else []
+        max_retrieves = int(getattr(settings, 'REFRAMER_TRACK_POINTS_PER_GAP', 3))
+        if (not bool(getattr(settings, 'REFRAMER_INTER_SAMPLE_TRACKING', True))
+                or prev_gray is None or not prev_faces or max_retrieves <= 0):
+            for _ in range(n_skip):
+                cap.grab()
+            return
+
+        # Working boxes in detection space.
+        cur = []
+        for f in prev_faces:
+            try:
+                cur.append({
+                    'src': f,
+                    'x': float(f['x']) * det_scale,
+                    'y': float(f['y']) * det_scale,
+                    'w': float(f['w']) * det_scale,
+                    'h': float(f['h']) * det_scale,
+                })
+            except (KeyError, TypeError, ValueError):
+                continue
+        if not cur:
+            for _ in range(n_skip):
+                cap.grab()
+            return
+
+        stride = max(1, (n_skip + max_retrieves) // (max_retrieves + 1))
+        fps = max(1e-6, float(getattr(r, 'fps', 0) or 0))
+        for j in range(n_skip):
+            if not cap.grab():
+                return
+            if (j + 1) % stride != 0 or not cur:
+                continue
+            # Tracking is opportunistic — any failure just skips this frame;
+            # the grab loop above stays authoritative so the read position
+            # is never left short of the next sample.
+            try:
+                ok, frame2 = cap.retrieve()
+                if not ok or frame2 is None:
+                    continue
+                small2 = cv2.resize(frame2, (det_w, det_h),
+                                    interpolation=cv2.INTER_LINEAR)
+                gray2 = cv2.cvtColor(small2, cv2.COLOR_BGR2GRAY)
+                t_ms = int(cap.get(cv2.CAP_PROP_POS_FRAMES) / fps * 1000.0)
+                moved = []
+                entries = []
+                for fbox in cur:
+                    # 3x3 point grid inside the box — median flow is robust
+                    # to a few bad correspondences.
+                    xs = np.linspace(fbox['x'] + fbox['w'] * 0.2,
+                                     fbox['x'] + fbox['w'] * 0.8, 3)
+                    ys = np.linspace(fbox['y'] + fbox['h'] * 0.2,
+                                     fbox['y'] + fbox['h'] * 0.8, 3)
+                    pts = np.array([[[px, py]] for py in ys for px in xs],
+                                   dtype=np.float32)
+                    p1, st, _err = cv2.calcOpticalFlowPyrLK(
+                        prev_gray, gray2, pts, None,
+                        winSize=(21, 21), maxLevel=2)
+                    if p1 is None or st is None:
+                        continue
+                    good = st.reshape(-1) == 1
+                    if int(good.sum()) < 5:
+                        continue  # lost the subject — stop tracking this box
+                    deltas = (p1 - pts).reshape(-1, 2)[good]
+                    dx = float(np.median(deltas[:, 0]))
+                    dy = float(np.median(deltas[:, 1]))
+                    fbox['x'] += dx
+                    fbox['y'] += dy
+                    ncx = fbox['x'] + fbox['w'] / 2.0
+                    ncy = fbox['y'] + fbox['h'] / 2.0
+                    if not (0 <= ncx < det_w and 0 <= ncy < det_h):
+                        continue  # walked out of frame
+                    moved.append(fbox)
+                    src = fbox['src']
+                    entry = {k: v for k, v in src.items()
+                             if k not in ('x', 'y', 'w', 'h', 'cx', 'cy',
+                                          'confidence', 'tracked')}
+                    entry.update({
+                        'x': int(fbox['x'] / det_scale),
+                        'y': int(fbox['y'] / det_scale),
+                        'w': int(fbox['w'] / det_scale),
+                        'h': int(fbox['h'] / det_scale),
+                        'cx': int(ncx / det_scale),
+                        'cy': int(ncy / det_scale),
+                        'confidence': round(
+                            float(src.get('confidence', 0.5)) * 0.9, 3),
+                        'tracked': True,
+                    })
+                    entries.append(entry)
+                cur = moved
+                prev_gray = gray2
+                if entries and t_ms not in r.face_timeline:
+                    r.face_timeline[t_ms] = entries
+            except Exception:
+                continue
 
     def _temporal_filter(self, recent_raw: List[List[dict]]) -> List[dict]:
         """Confirm faces by requiring persistence across multiple recent samples.

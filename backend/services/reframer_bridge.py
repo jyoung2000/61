@@ -181,6 +181,24 @@ def to_fez_render_plan(
             return center_x
         return int(interpolate_x(keyframes, time_ms))
 
+    def y_at(time_ms: float) -> int:
+        """Crop-y in source pixels at an arbitrary time.
+
+        Keyframes may carry a per-scene ``y`` (the planner's per-scene
+        eye-line); hold the most recent one (vertical framing steps at scene
+        boundaries — a vertical pan mid-scene would read as drift). Falls
+        back to the plan's single crop_y for plans predating per-scene y.
+        """
+        best = None
+        for kf in keyframes:
+            if kf.get("time_ms", 0) <= time_ms and kf.get("y") is not None:
+                best = kf["y"]
+            elif kf.get("time_ms", 0) > time_ms:
+                break
+        if best is None:
+            return crop_y
+        return max(0, min(int(best), src_h - crop_h))
+
     def scale_at(time_ms: float) -> float:
         """Motivated-zoom scale at an arbitrary time (1.0 when no zoom)."""
         if not keyframes:
@@ -249,10 +267,14 @@ def to_fez_render_plan(
                 t += step
             kp_by_t = _prune_collinear_keypoints(kp_by_t)
 
+        # Vertical framing for this op: the per-scene eye-line y at the op's
+        # midpoint (constant within an op — scenes are the ops). Falls back
+        # to the plan-wide crop_y when the planner didn't tag y.
+        op_cy = _clamp01(y_at((s_ms + e_ms) / 2.0) / src_h)
         motion_path = [
             MotionKeypoint(
                 t=t,
-                rect=Rect(x=_clamp01(kp_by_t[t][0] / src_w), y=cy, w=cw, h=ch),
+                rect=Rect(x=_clamp01(kp_by_t[t][0] / src_w), y=op_cy, w=cw, h=ch),
                 scale=round(float(kp_by_t[t][1]), 4),
             )
             for t in sorted(kp_by_t)

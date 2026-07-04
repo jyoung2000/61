@@ -45,6 +45,17 @@ class ReframeReport:
     safe_area_pct: float = 0.0           # % of face-present seconds with best face inside the 10%-inset safe area
     cuts_per_minute: float = 0.0         # hard cuts per minute of output
 
+    # User-perception metrics: viewers judge by the WORST stretch, not the
+    # mean, and a lost subject dominates everything else.
+    p10_window_score: float = 100.0      # 10th-percentile 30s-window face score (worst-moments)
+    high_problems_per_min: float = 0.0   # HIGH-severity problem density
+    grade_uncapped: str = ''             # grade before the HIGH-density cap (when capped)
+    vlm_framing_pct: Optional[float] = None  # VLM spot-check: % of sampled frames judged well-framed
+
+    # Evaluation window (whole video by default; a clip slice when set)
+    window_start_sec: int = 0
+    window_end_sec: int = 0
+
     # Per-second detail (not persisted on the job — used to derive scores)
     second_scores: List[dict] = field(default_factory=list)
 
@@ -63,6 +74,21 @@ class ReframeReport:
         return asdict(self)
 
 
+_GRADE_ORDER = ['A', 'B', 'C', 'D', 'F']
+
+
+def _grade_for(score: float) -> str:
+    if score >= 90:
+        return 'A'
+    if score >= 75:
+        return 'B'
+    if score >= 60:
+        return 'C'
+    if score >= 40:
+        return 'D'
+    return 'F'
+
+
 class ReframeEvaluator:
     """Automated quality auditor for a reframed video."""
 
@@ -70,14 +96,28 @@ class ReframeEvaluator:
         self.plan = plan
         self.perc = perception
 
-    def run(self, on_progress: Optional[Callable] = None) -> ReframeReport:
+    def run(self, on_progress: Optional[Callable] = None,
+            start_sec: int = 0, end_sec: Optional[int] = None,
+            quiet: bool = False) -> ReframeReport:
+        """Grade the plan over ``[start_sec, end_sec)``.
+
+        Defaults to the whole video. A window slice is how per-clip grading
+        works — viewers only ever see the exported clips, so a face_missing
+        in a region no clip covers should not move the headline number.
+        ``quiet`` demotes the log lines (per-clip calls would spam INFO).
+        """
         report = ReframeReport()
         duration_ms = (
             getattr(self.plan, "duration_ms", 0)
             or getattr(self.perc, "duration_ms", 0)
             or 0
         )
-        report.total_seconds = int(duration_ms / 1000.0)
+        _video_secs = int(duration_ms / 1000.0)
+        start_sec = max(0, int(start_sec))
+        end_sec = _video_secs if end_sec is None else min(int(end_sec), _video_secs)
+        report.window_start_sec = start_sec
+        report.window_end_sec = end_sec
+        report.total_seconds = max(0, end_sec - start_sec)
         if report.total_seconds == 0:
             return report
 
@@ -120,10 +160,10 @@ class ReframeEvaluator:
         prev_x = None
         x_deltas: List[float] = []
         cut_intervals: List[int] = []
-        last_cut_sec = 0
+        last_cut_sec = start_sec
 
         # ── Evaluate every second ──
-        for sec in range(report.total_seconds):
+        for sec in range(start_sec, end_sec):
             time_ms = sec * 1000
             crop_x = clamp_x(interpolate_x(keyframes, time_ms), max_x)
 
@@ -248,7 +288,7 @@ class ReframeEvaluator:
                 })
 
             if on_progress and sec % 10 == 0:
-                on_progress(sec / report.total_seconds)
+                on_progress((sec - start_sec) / report.total_seconds)
 
         # ── Compute scores ──
 
@@ -301,7 +341,8 @@ class ReframeEvaluator:
         n_samples = int(report.total_seconds * HZ)
         if n_samples >= 4 and keyframes:
             dt = 1.0 / HZ
-            xs = [clamp_x(interpolate_x(keyframes, int(i * 1000 / HZ)), max_x)
+            xs = [clamp_x(interpolate_x(
+                      keyframes, int(start_sec * 1000 + i * 1000 / HZ)), max_x)
                   for i in range(n_samples)]
             # Exclude cut discontinuities from the derivative chain — a cut
             # is an intentional jump, not path roughness.
@@ -335,7 +376,8 @@ class ReframeEvaluator:
             report.hold_ratio_pct = 100.0
 
         n_cuts = sum(1 for kf in keyframes[1:]
-                     if kf.get('transition') == 'cut')
+                     if kf.get('transition') == 'cut'
+                     and start_sec * 1000 <= kf.get('time_ms', 0) < end_sec * 1000)
         minutes = max(1e-6, report.total_seconds / 60.0)
         report.cuts_per_minute = round(n_cuts / minutes, 2)
 
@@ -401,29 +443,58 @@ class ReframeEvaluator:
             + (100 - report.edge_violation_pct) * 0.05
         )
 
-        if report.overall_score >= 90:
-            report.grade = 'A'
-        elif report.overall_score >= 75:
-            report.grade = 'B'
-        elif report.overall_score >= 60:
-            report.grade = 'C'
-        elif report.overall_score >= 40:
-            report.grade = 'D'
+        report.grade = _grade_for(report.overall_score)
+
+        # ── Worst-moments score (p10 of 30s windows) ──
+        # A mean of 89.8 with a hundred HIGH problems reads "B" to the math
+        # and "it keeps losing her" to a viewer — humans judge by the worst
+        # stretch. Score each 30s window by its face-tracking success and
+        # report the 10th percentile.
+        WIN = 30
+        win_scores: List[float] = []
+        for w0 in range(0, len(report.second_scores), WIN):
+            chunk = report.second_scores[w0:w0 + WIN]
+            if not chunk:
+                continue
+            good = sum(1 for s in chunk
+                       if s["n_faces"] == 0 or s["face_in_crop"])
+            win_scores.append(good / len(chunk) * 100.0)
+        report.p10_window_score = (
+            round(float(np.percentile(win_scores, 10)), 1)
+            if win_scores else 100.0)
+
+        # ── HIGH-density grade cap ──
+        # A clip that repeatedly LOSES its subject must not grade above C on
+        # the strength of its averages.
+        _high_n = sum(1 for p in report.problems if p.get('severity') == 'HIGH')
+        report.high_problems_per_min = round(_high_n / minutes, 2)
+        report.grade_uncapped = report.grade
+        if report.high_problems_per_min > 4.0:
+            _cap = 'D'
+        elif report.high_problems_per_min > 1.5:
+            _cap = 'C'
         else:
-            report.grade = 'F'
+            _cap = None
+        if _cap and _GRADE_ORDER.index(report.grade) < _GRADE_ORDER.index(_cap):
+            report.grade = _cap
 
         if on_progress:
             on_progress(1.0)
 
         # Full metric log — every axis visible in one grep
-        logger.info(
-            "ReframeReport | grade=%s overall=%.1f | "
+        _log = logger.debug if quiet else logger.info
+        _log(
+            "ReframeReport | grade=%s%s overall=%.1f p10_window=%.1f high/min=%.2f | "
             "face_cov=%.1f%% saliency=%.1f%% centering=%.1f%% | "
             "stability=%.1f cut_coh=%.1f edge_viol=%.1f%% | "
             "hold=%.1f decisive=%.1f motion_budget=%.1f watchability=%.1f | "
             "jerk=%.3f hold_ratio=%.1f%% safe_area=%.1f%% cuts/min=%.2f | "
             "problems HIGH=%d MED=%d LOW=%d",
-            report.grade, report.overall_score,
+            report.grade,
+            (f" (uncapped {report.grade_uncapped})"
+             if report.grade != report.grade_uncapped else ""),
+            report.overall_score, report.p10_window_score,
+            report.high_problems_per_min,
             report.face_coverage_pct, report.saliency_accuracy_pct, report.centering_pct,
             report.stability_score, report.cut_coherence_score, report.edge_violation_pct,
             report.hold_quality, report.transition_decisiveness,
@@ -435,7 +506,7 @@ class ReframeEvaluator:
             sum(1 for p in report.problems if p.get('severity') == 'LOW'),
         )
         # Log each HIGH problem with its timestamp and keyframe bracket
-        for p in report.problems:
+        for p in ([] if quiet else report.problems):
             if p.get('severity') == 'HIGH':
                 logger.warning(
                     "  [t=%ds] %s: %s (crop_x=%s face_cx=%s kf_before=%s kf_after=%s)",
@@ -467,3 +538,67 @@ class ReframeEvaluator:
                 best_d = d
                 best_t = t
         return best_t if best_d < 1000 else None
+
+
+def _clip_get(clip, key, default=None):
+    if isinstance(clip, dict):
+        return clip.get(key, default)
+    return getattr(clip, key, default)
+
+
+def evaluate_per_clip(plan: RenderPlan, perception: PerceptionResult,
+                      clips: list) -> tuple[list, Optional[dict]]:
+    """Grade each exported clip's time window; return (pairs, aggregate).
+
+    ``pairs`` is ``[(clip, ReframeReport), ...]``; ``aggregate`` is a
+    duration-weighted summary dict (or None with no gradable clips). This is
+    the USER-facing number: viewers only watch the exported clips, so the
+    whole-video report (which includes never-exported regions) stays a
+    diagnostic while this aggregate is the headline.
+    """
+    import math
+
+    pairs = []
+    tw = 0.0
+    wsum = 0.0
+    for clip in clips or []:
+        try:
+            start = float(_clip_get(clip, "start_time", 0.0) or 0.0)
+            end = float(_clip_get(clip, "end_time", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if end - start < 1.0:
+            continue
+        rep = ReframeEvaluator(plan, perception).run(
+            start_sec=int(start), end_sec=int(math.ceil(end)), quiet=True)
+        if rep.total_seconds <= 0:
+            continue
+        pairs.append((clip, rep))
+        d = end - start
+        tw += d
+        wsum += rep.overall_score * d
+    if not pairs or tw <= 0:
+        return pairs, None
+
+    weighted = wsum / tw
+    worst_clip, worst_rep = min(pairs, key=lambda cr: cr[1].overall_score)
+    clip_scores = [rep.overall_score for _, rep in pairs]
+    aggregate = {
+        "clips_graded": len(pairs),
+        "weighted_score": round(weighted, 1),
+        "grade": _grade_for(weighted),
+        "p10_clip_score": round(float(np.percentile(clip_scores, 10)), 1),
+        "worst_clip_id": _clip_get(worst_clip, "id"),
+        "worst_clip_score": round(worst_rep.overall_score, 1),
+        "worst_clip_grade": worst_rep.grade,
+        "clips_below_c": sum(1 for s in clip_scores if s < 60),
+    }
+    logger.info(
+        "ClipReframeReport | clips=%d weighted=%.1f grade=%s p10_clip=%.1f | "
+        "worst clip=%s score=%.1f (%s) | below_C=%d",
+        aggregate["clips_graded"], aggregate["weighted_score"],
+        aggregate["grade"], aggregate["p10_clip_score"],
+        aggregate["worst_clip_id"], aggregate["worst_clip_score"],
+        aggregate["worst_clip_grade"], aggregate["clips_below_c"],
+    )
+    return pairs, aggregate

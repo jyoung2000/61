@@ -170,6 +170,9 @@ def _coerce_segment(seg) -> dict:
         "end": getattr(seg, "end", getattr(seg, "end_sec", 0.0)),
         "text": getattr(seg, "text", "") or "",
         "speaker": getattr(seg, "speaker", "") or "",
+        # ASR confidence rides along so the polish prompt can mark lines the
+        # model may rewrite more freely vs. lines it must preserve.
+        "avg_logprob": getattr(seg, "avg_logprob", None),
         "_obj": seg,  # round-trip the original object for re-emission
     }
 
@@ -582,6 +585,7 @@ def _build_user_prompt(
         return "\n".join(lines) + "\n\n"
 
     batch_items = []
+    _any_low_conf = False
     for i, s in enumerate(batch):
         t = (s.get("text") or "").strip()
         item = {"index": i, "text": t}
@@ -591,13 +595,34 @@ def _build_user_prompt(
             src_line = (source_texts[i] or "").strip()
             if src_line:
                 item["source"] = src_line
+        # Confidence marks: a low Whisper avg_logprob means the ASR was
+        # GUESSING ("Hand kimchi", "mandarind fruit") — tell the model which
+        # lines it may rewrite toward contextual sense vs. which it must
+        # preserve near-verbatim. Threshold matches the redecode trigger.
+        try:
+            _lp = s.get("avg_logprob")
+            if _lp is not None and float(_lp) < float(
+                    getattr(settings, "WHISPER_REDECODE_LOGPROB", -0.8)):
+                item["asr_confidence"] = "low"
+                _any_low_conf = True
+        except (TypeError, ValueError):
+            pass
         batch_items.append(item)
+
+    conf_note = ""
+    if _any_low_conf:
+        conf_note = (
+            'Segments marked "asr_confidence": "low" are unreliable speech '
+            "recognition — if such a line reads as nonsense, rewrite it into "
+            "what was most plausibly said given the surrounding context. "
+            "Unmarked lines are reliable: preserve their wording.\n\n")
 
     prompt = (
         f"{lang_hint}"
         f"{_ctx_block('PREVIOUS CONTEXT', context_before)}"
         f"{_ctx_block('FOLLOWING CONTEXT', context_after)}"
         f"OPERATIONS TO APPLY:\n{rules_block}\n\n"
+        f"{conf_note}"
         f"SEGMENTS TO POLISH (return EXACTLY {len(batch_items)} strings, one per segment, in order):\n"
         f"{json.dumps(batch_items, ensure_ascii=False, indent=2)}\n\n"
         f"Output ONLY a JSON array of {len(batch_items)} polished strings. "

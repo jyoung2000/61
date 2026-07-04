@@ -153,6 +153,31 @@ class Planner:
         y = min(y, int(eye_y) - min_margin)
         return max(0, min(y, self.p.src_h - self.crop_h))
 
+    def _scene_crop_y(self, s_start: int, s_end: int) -> Optional[int]:
+        """Per-scene eye-line crop_y (source px) — None without face data.
+
+        Same composition rule as the global eye-line, but measured over ONE
+        scene's samples so the vertical framing follows the subject (a
+        standing shot and a lying-down shot get different crop_y instead of
+        one video-wide compromise). Only meaningful for sub-full-height
+        crops (1:1, 4:5, horizontal-from-vertical); 9:16 from 16:9 keeps
+        full height and never calls this.
+        """
+        eye_ys = []
+        for t, faces in self.p.face_timeline.items():
+            if not (s_start <= t < s_end):
+                continue
+            usable = [f for f in faces
+                      if f.get('confidence', 0) >= 0.5 and f.get('h', 0) > 0]
+            if not usable:
+                continue
+            best = max(usable, key=lambda f: f.get('area', 0))
+            eye_ys.append(float(best['y']) + 0.35 * float(best['h']))
+        if len(eye_ys) < 3:
+            return None
+        eye_ys.sort()
+        return self._compose_crop_y(eye_ys[len(eye_ys) // 2])
+
     def generate(self) -> RenderPlan:
         log = get_logger()
         log.start_timer('plan')
@@ -258,6 +283,16 @@ class Planner:
             signals = self._measure_scene_signals(s_start, s_end, global_signals)
             params = self._derive_params(signals)
             kfs = self._decide_adaptive(s_start, s_end, params, scene_idx=i)
+            # Per-scene vertical eye-line (sub-full-height crops only): tag
+            # this scene's keyframes with a scene-local crop_y so the bridge
+            # can animate vertical framing per scene instead of holding the
+            # single video-wide crop_y for the whole timeline.
+            if (self.crop_h < self.p.src_h
+                    and getattr(settings, 'REFRAMER_PER_SCENE_EYELINE', True)):
+                _scene_y = self._scene_crop_y(s_start, s_end)
+                if _scene_y is not None:
+                    for _kf in kfs:
+                        _kf['y'] = _scene_y
             all_kf.extend(kfs)
             plan.strategy_log.append({
                 'time_range': [s_start, s_end],

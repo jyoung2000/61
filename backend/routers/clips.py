@@ -240,6 +240,32 @@ async def export_clip_endpoint(
                         req.clip_id, _label, _src[:80],
                     )
 
+    # ── Operator-correction telemetry (reframe-grade ground truth) ──
+    # Every crop segment the user manually pinned before export is a spot the
+    # auto-reframe wasn't good enough. Persist the count on the clip's
+    # reframe_report so corrections-per-clip is queryable, and log a stable
+    # tracer line for offline calibration of the evaluator's weights.
+    if int(getattr(req, "manual_crop_overrides", 0) or 0) > 0:
+        logger.info(
+            "[%s] REFRAME-CORRECTION clip=%s manual_crop_overrides=%d "
+            "(operator ground truth)",
+            job_id, req.clip_id, req.manual_crop_overrides)
+        try:
+            for _c in (job.clips or []):
+                _cid = _c.get("id") if isinstance(_c, dict) else getattr(_c, "id", None)
+                if _cid is not None and int(_cid) == int(req.clip_id):
+                    _rr = dict((_c.get("reframe_report") if isinstance(_c, dict)
+                                else getattr(_c, "reframe_report", None)) or {})
+                    _rr["operator_corrections"] = int(req.manual_crop_overrides)
+                    if isinstance(_c, dict):
+                        _c["reframe_report"] = _rr
+                    else:
+                        _c.reframe_report = _rr
+                    await database.save_job(job)
+                    break
+        except Exception as _oc_err:
+            logger.debug("operator-correction persist skipped: %s", _oc_err)
+
     # ISSUE 14: Warn when export request is missing expected editor data.
     # If the clip was edited but the request has no effects/overlays, the
     # export won't match the preview.

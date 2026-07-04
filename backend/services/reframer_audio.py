@@ -34,6 +34,44 @@ from backend.services.hallucination_filter import (
 )
 
 
+# Languages whose native script is CJK — the wrong-script hallucination gate
+# only applies to these (Latin-script languages can't distinguish "wrong
+# script" from normal text).
+_CJK_SCRIPT_LANGS = {"ja", "zh", "ko", "japanese", "chinese", "korean",
+                     "yue", "zh-cn", "zh-tw", "ja-jp", "ko-kr"}
+
+
+def _wrong_script_for_language(text: str, language) -> bool:
+    """True when a cue's script contradicts the PINNED source language.
+
+    With ``language='ja'`` faster-whisper is forced to decode Japanese, so a
+    segment that comes back as a long run of pure-Latin prose ("See you next
+    time in the video.") is a hallucination over music/silence, not speech.
+    Conservative on purpose: 4+ words, ≥60% Latin letters, <10% CJK — short
+    interjections, loanwords, and mixed romaji fragments inside real speech
+    never trip it. No-op when the language isn't pinned CJK.
+    """
+    lang = (str(language or "")).strip().lower()
+    if lang not in _CJK_SCRIPT_LANGS:
+        return False
+    t = (text or "").strip()
+    if not t or len(t.split()) < 4:
+        return False
+    latin = cjk = letters = 0
+    for ch in t:
+        o = ord(ch)
+        if ("a" <= ch.lower() <= "z"):
+            latin += 1
+            letters += 1
+        elif (0x3040 <= o <= 0x30FF or 0x3400 <= o <= 0x9FFF
+              or 0xAC00 <= o <= 0xD7A3 or 0xF900 <= o <= 0xFAFF):
+            cjk += 1
+            letters += 1
+    if letters == 0:
+        return False
+    return (latin / letters) >= 0.60 and (cjk / letters) < 0.10
+
+
 def _vocab_bias_kwargs(transcribe_callable, language: str) -> dict:
     """Build the custom-vocabulary biasing kwargs for a Whisper transcribe call.
 
@@ -971,6 +1009,20 @@ class AudioIntelligence:
                                 if repeats >= 3:
                                     is_hallucination = True
                                     break
+
+                # 3b. Wrong-script gate (language pinned to a CJK source):
+                #     decoding is forced to the selected language, so a cue
+                #     that comes back as a long run of pure-Latin prose is a
+                #     hallucination, not speech ("See you next time in the
+                #     video." over a musical outro). Conservative: needs a
+                #     pinned CJK language, 4+ words, ≥60% Latin letters and
+                #     <10% expected-script characters. Short interjections
+                #     and mixed lines (loanwords, romaji fragments inside
+                #     real speech) are untouched.
+                if (not is_hallucination and text
+                        and getattr(settings, "WHISPER_SCRIPT_FILTER", True)
+                        and _wrong_script_for_language(text, whisper_lang)):
+                    is_hallucination = True
 
                 # 4. TACT confidence gate — the key phantom filter.
                 #    Whisper invents short, low-confidence cues over the long

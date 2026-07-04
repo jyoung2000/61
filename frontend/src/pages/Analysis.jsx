@@ -1677,6 +1677,12 @@ export default function Analysis() {
       const { cropSegments } = useTimelineStore.getState();
       const kfs = buildExportSubjectKeyframes(editorSubjectKeyframes, cropSegments);
       if (kfs) exportBody.subject_keyframes = kfs;
+      // Operator-correction telemetry: every manually pinned crop segment is
+      // ground truth that the auto-reframe missed there — the backend logs it
+      // and stores corrections-per-clip on the reframe report.
+      const overrides = (cropSegments || []).filter(
+        (s) => s.isManualOverride && Number.isFinite(s.cropX));
+      if (overrides.length > 0) exportBody.manual_crop_overrides = overrides.length;
     }
 
     encoding.startExport(jobId, clip.id, clip.title || `Clip ${clip.id}`, exportBody);

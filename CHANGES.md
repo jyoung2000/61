@@ -1,3 +1,87 @@
+# ClipAI — 100%-target-language transcripts, user-accurate reframe grades, denser subject tracking
+
+Implements the full run-13 assessment: language purity + coherence, per-clip
+"what the viewer actually sees" grading, and the detection-density /
+vertical-framing reframing builds.
+
+## Transcript: entirely in the selected language, contextually coherent
+- **Verified purity loop.** The per-cue recovery now escalates ECHO failures
+  (not just exceptions) to the cloud polish model — run 13 shipped 6/17
+  flagged romaji cues because qwen2.5:3b echoed them back and the cloud net
+  only caught thrown errors. Every candidate is validated (preamble-stripped,
+  re-run through the romaji/CJK detector) before acceptance, and any cue
+  still impure after recovery lands in the job warnings with its timestamp —
+  a visible defect instead of a silent one.
+- **The English track finally gets polished.** On the LLM-translate path the
+  post-edit was deliberately skipped ("the LLM translation is final"), so
+  claude-haiku polished the Japanese source while the English viewers read
+  shipped raw — typos ("bigdest", "Pantss") and word-salad ("Hand kimchi")
+  included. ``correct_transcript(mode="translation")`` now runs on the
+  translated track too (``TRANSLATION_POLISH_LLM_OUTPUT``), source-aligned
+  when cue counts match, fenced by the existing never-reintroduce-source
+  purity guard.
+- **ASR-confidence marks.** Whisper's per-segment ``avg_logprob`` rides into
+  the polish prompt: lines under the redecode threshold are tagged
+  ``"asr_confidence": "low"`` with an instruction that nonsense there may be
+  rewritten toward context while unmarked (reliable) lines are preserved.
+- **Wrong-script hallucination gate** (``WHISPER_SCRIPT_FILTER``): with the
+  source pinned/confidently-detected CJK, a 4+-word all-Latin cue ("See you
+  next time in the video." over a musical outro) is quarantined like the
+  other TACT filters. Conservative: mixed romaji/Japanese lines untouched.
+
+## Reframe grading that matches what a user would say
+- **Per-clip grades + clip-weighted headline.** ``evaluate_per_clip`` slices
+  the evaluator to each exported clip's window (evaluator ``run()`` now takes
+  ``start_sec``/``end_sec``); every clip carries its own
+  ``reframe_report`` (grade, score, p10, HIGH density) and the job report
+  gains ``clip_weighted`` — the duration-weighted aggregate over what
+  viewers actually watch. A face_missing in a never-exported region no
+  longer moves the headline.
+- **Worst-moments scoring.** ``p10_window_score`` (10th-percentile 30s
+  window) reports the stretches users remember; the letter grade is CAPPED
+  at C above 1.5 HIGH problems/min and at D above 4/min — a clip that keeps
+  losing its subject can't grade B on its averages (``grade_uncapped``
+  preserves the raw letter).
+- **VLM spot-check** (``REFRAME_VLM_SPOTCHECK``): ~12 cropped frames sampled
+  across the exported clips are judged by the local vision model ("is the
+  main subject well-framed?") → ``vlm_framing_pct``, a human-proxy
+  calibration signal reported alongside the geometric metrics, never blended
+  into the grade (VLM availability must not change grading).
+- **Operator corrections as ground truth.** Clip exports now carry
+  ``manual_crop_overrides`` (how many crop segments the user manually
+  pinned); the backend logs a stable ``REFRAME-CORRECTION`` tracer line and
+  persists ``operator_corrections`` onto the clip's reframe report —
+  corrections-per-clip is the metric that converges on the user's judgment.
+
+## Reframing: denser tracking, self-repair, per-scene vertical framing
+- **Inter-sample LK tracking** (``REFRAMER_INTER_SAMPLE_TRACKING``): between
+  sparse detection samples the perceiver already grab()-decodes every frame;
+  now it retrieves ~3 of them per gap and tracks the last sample's face
+  boxes forward with pyramidal Lucas-Kanade (median flow over a 3×3 point
+  grid, confidence-decayed, ``tracked: True``). A 0.14 Hz face timeline
+  becomes effectively several-Hz for near-zero decode cost — directly
+  attacking the largest HIGH-problem class (interpolation drift).
+- **Problem-driven repair** (``REFRAMER_PROBLEM_REPAIR``): before the
+  bridge, a quiet evaluation localizes HIGH face_missing windows; YuNet
+  re-detects densely inside just those (no VRAM), fresh samples join the
+  face timeline, and corrective keyframes pull the crop back onto the
+  confirmed face (min-gap 1.2s, capped windows). The evaluator stops being
+  a report and becomes a repair loop; the post-run ReframeReport shows the
+  post-repair numbers.
+- **Per-scene vertical eye-line** (``REFRAMER_PER_SCENE_EYELINE``): the
+  planner tags each scene's keyframes with a scene-local ``y`` (same 1/3
+  eye-line + headroom rule, measured per scene); the bridge emits it on
+  each op's motion-path rects, and the clip exporter's cached-plan tier
+  reads the plan's vertical framing at the clip midpoint instead of the
+  coarse scene average. Sub-full-height crops (1:1, 4:5) now follow the
+  subject vertically scene-by-scene instead of one video-wide compromise.
+- **Live-action classifier fix.** Run 13's live content graded
+  "animated/other" because faces show in only ~60% of samples (turned away,
+  intimate angles) — under the flat 70% bar. 40-70% coverage now counts as
+  live action when corroborated by a PERSISTENT track (one YuNet track
+  visible across ≥15% of samples), which anime/gaming essentially never
+  produces.
+
 # ClipAI — Bridge off the event loop; windowed thumbnails; extract-band + refinement label fixes
 
 The 2026-07-03 21:32 run (first on build 720e347) confirmed the duplication

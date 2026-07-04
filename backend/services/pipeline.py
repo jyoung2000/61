@@ -886,34 +886,39 @@ async def _llm_cleanup_untranslated(segments, source_lang, target_lang,
                     f"notes, do not repeat the original.\n\n{src_text}")
                 # ``except Exception`` only — a real cancel (CancelledError, a
                 # BaseException) still propagates and stops the run.
+
+                def _validate(raw):
+                    """Strip + verify a candidate translation; '' when unusable."""
+                    v = (raw or "").strip().strip('"').strip()
+                    try:
+                        from backend.services.translator import strip_llm_preamble
+                        v = strip_llm_preamble(v)
+                    except Exception:
+                        pass
+                    if not v or _is_untranslated(v, source_lang):
+                        return ""
+                    return v
+
                 resp = None
                 try:
                     resp = await orchestrator.text_completion(
                         prompt, timeout=60, job_id=job_id or "", skip_circuit_breaker=True)
                 except Exception:
                     resp = None
-                if resp is None:
-                    # Local chain dead (the exact state that shipped romaji
-                    # last run) — same cloud safety net polish uses.
+                t = _validate(resp)
+                if not t:
+                    # Local chain dead OR it echoed the source back (the 21:32
+                    # run: 6/17 flagged cues shipped because qwen2.5:3b echoed
+                    # romaji and the cloud net only caught EXCEPTIONS, not
+                    # echoes). Any unusable local answer escalates to the
+                    # cloud polish model — these are a handful of cues.
                     try:
                         from backend.services.transcript_polisher import (
                             _cloud_polish_completion)
-                        resp = await _cloud_polish_completion(prompt, 60)
+                        t = _validate(await _cloud_polish_completion(prompt, 60))
                     except Exception:
-                        resp = None
-                if resp is None:
-                    _cache[src_text] = ""
-                    continue
-                t = (resp or "").strip().strip('"').strip()
-                # Chatty-preamble strip ("Sure, here is the translation: …")
-                # + the plain Translation:/English: label prefixes.
-                try:
-                    from backend.services.translator import strip_llm_preamble
-                    t = strip_llm_preamble(t)
-                except Exception:
-                    pass
-                if not t or _is_untranslated(t, source_lang):
-                    # echoed source (CJK OR romaji) / failed → keep existing cue
+                        t = ""
+                if not t:
                     _cache[src_text] = ""
                     continue
                 _cache[src_text] = t
@@ -937,6 +942,34 @@ async def _llm_cleanup_untranslated(segments, source_lang, target_lang,
             "[%s] LLM cleanup recovered %d/%d cue(s); %.0f%% source-script remaining",
             job_id, _fixed, len(leftover_idx),
             100 * fraction_untranslated(segments, target_lang))
+
+        # ── Verified purity: anything STILL flagged is a visible defect, not
+        # a silent one. Re-scan the touched cues; survivors get logged with
+        # their timestamps into the job warnings so the user sees exactly
+        # which lines shipped impure instead of discovering them in the SRT.
+        try:
+            _still = [
+                i for i in leftover_idx
+                if _is_untranslated(_txt(segments[i]), source_lang)
+            ]
+            if _still:
+                def _fmt(i):
+                    s = segments[i]
+                    st = float((s.get("start") if isinstance(s, dict)
+                                else getattr(s, "start", 0)) or 0)
+                    return f"[{int(st // 60)}:{int(st % 60):02d}] {_txt(s)[:40]}"
+                _listing = "; ".join(_fmt(i) for i in _still[:8])
+                if len(_still) > 8:
+                    _listing += f"; +{len(_still) - 8} more"
+                _record_pipeline_warning(
+                    job_id,
+                    f"{len(_still)} subtitle cue(s) could not be fully converted "
+                    f"to the target language: {_listing}")
+                logger.warning(
+                    "[%s] Purity check: %d cue(s) still source-language after "
+                    "recovery: %s", job_id, len(_still), _listing)
+        except Exception:
+            pass
         return segments
     except Exception as _e:  # noqa: BLE001 — cleanup is best-effort
         logger.info("[%s] LLM leftover cleanup skipped (%s)", job_id, _e)
@@ -2546,15 +2579,61 @@ async def _background_post_processing(
             if not getattr(settings, "AI_TRANSCRIPT_CORRECTION", True):
                 logger.info("[%s] AI post-edit skipped (AI_TRANSCRIPT_CORRECTION off) — "
                             "keeping NMT draft", job_id)
-            elif _used_llm:
-                # The editorial LLM TRANSLATED the source directly — its output is
-                # already clean, complete target-language text. Re-running the
-                # post-edit (which compares each line against the SOURCE) was
-                # reverting good translations back to the source language (a perfect
-                # 0%-Japanese LLM result came back ~40% Japanese). The LLM
-                # translation is final; skip the post-edit.
+            elif _used_llm and not bool(getattr(
+                    settings, "TRANSLATION_POLISH_LLM_OUTPUT", True)):
+                # Legacy behavior (flag off): treat the LLM translation as final.
                 logger.info("[%s] AI post-edit skipped — the LLM produced the "
-                            "translation directly (no post-edit needed)", job_id)
+                            "translation directly (TRANSLATION_POLISH_LLM_OUTPUT "
+                            "off)", job_id)
+            elif _used_llm:
+                # The 4B local translator's raw output IS the track viewers
+                # read, and it ships typos ("bigdest", "Pantss") and word-salad
+                # ("Hand kimchi") — the 21:32 run's polish only ever touched
+                # the JAPANESE source. Run the translation-mode polish on the
+                # ENGLISH track too. The historical revert-to-source failure
+                # (an older post-edit comparing against the source) is fenced
+                # twice: source_texts only attach when counts align 1:1, and
+                # the fraction_untranslated guard below rejects any polish
+                # that raises the source-script share.
+                logger.info(
+                    "[%s] AI post-edit START on LLM-translated text (lang=%s, "
+                    "%d segments%s)",
+                    job_id, target_lang, len(translated),
+                    ", source-aligned" if _src_texts is not None else "")
+                try:
+                    _pol = await asyncio.wait_for(
+                        _mtpe(
+                            translated, orchestrator,
+                            job_id=job_id, language=target_lang,
+                            source_texts=_src_texts, source_language=source_lang,
+                            mode="translation",
+                            model_override=_resolve_polish_model_override(orchestrator),
+                        ),
+                        timeout=max(600, len(translated) * 8),
+                    )
+                    if _pol:
+                        from backend.services.translator import fraction_untranslated
+                        _before = fraction_untranslated(translated, target_lang)
+                        _after = fraction_untranslated(_pol, target_lang)
+                        if _after > _before + 0.02:
+                            logger.warning(
+                                "[%s] AI post-edit reintroduced source language "
+                                "(%.0f%% → %.0f%% source-script) — keeping the "
+                                "pre-edit translation", job_id,
+                                100 * _before, 100 * _after)
+                        else:
+                            translated = _pol
+                            logger.info(
+                                "[%s] AI post-edit DONE on LLM-translated text",
+                                job_id)
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "[%s] AI post-edit on LLM output timed out — keeping "
+                        "the raw LLM translation", job_id)
+                except Exception as _pe_err:
+                    logger.warning(
+                        "[%s] AI post-edit on LLM output failed (%s) — keeping "
+                        "the raw LLM translation", job_id, _pe_err)
             elif (not _used_whisper_native
                   and bool(getattr(settings, "OFFLINE_TRANSLATION_MTPE_ENABLED", True))
                   and (getattr(settings, "OLLAMA_HOST", "") or "").strip()
@@ -4297,6 +4376,32 @@ async def _run_analysis_inner(job_id: str):
     except Exception:
         pass
 
+    # ── Problem-driven repair (evaluate → re-detect → correct) ──
+    # The evaluator localizes every HIGH face_missing second; re-detect
+    # densely inside just those windows (YuNet on downscaled frames, no
+    # VRAM) and insert corrective keyframes. Runs BEFORE the bridge so the
+    # corrected plan is what exports, overlays and per-clip grades see; the
+    # post-run ReframeReport then shows the post-repair numbers.
+    cancel_check()
+    try:
+        if bool(getattr(settings, "REFRAMER_PROBLEM_REPAIR", True)):
+            await _update_progress(
+                job_id, JobStatus.ANALYZING_SCENES, 59,
+                "Repairing flagged reframe windows (dense re-detection)...",
+                heartbeat_label="reframe repair",
+            )
+            from backend.services.reframer_repair import repair_high_problem_windows
+            _repair_stats = await asyncio.to_thread(
+                repair_high_problem_windows, video_path, reframer_plan, perception)
+            if _repair_stats.get("keyframes_inserted"):
+                logger.info(
+                    "[%s] Reframe repair: %d corrective keyframe(s) across %d "
+                    "window(s), %d dense detection sample(s) added",
+                    job_id, _repair_stats["keyframes_inserted"],
+                    _repair_stats["windows"], _repair_stats["samples_added"])
+    except Exception as _rr_err:
+        logger.warning("[%s] Reframe repair skipped: %s", job_id, _rr_err)
+
     # ── Bridge — convert reframer output into Fez data contracts ──
     cancel_check()
     await _update_progress(
@@ -5165,6 +5270,56 @@ async def _run_analysis_inner(job_id: str):
                     "or rate-limited)", job_id,
                 )
             logger.info("[%s] Clip extraction produced %d clips", job_id, len(clips))
+
+            # ── Per-clip reframe grading (user-accurate headline) ──
+            # Viewers only watch the exported clips: grade each clip's window
+            # and attach it, then log the duration-weighted aggregate — the
+            # number that actually tracks what a user sees. The whole-video
+            # ReframeReport (computed earlier) remains the diagnostic.
+            if clips:
+                try:
+                    from backend.services.reframe_evaluator import evaluate_per_clip
+                    _pairs, _clip_agg = await asyncio.to_thread(
+                        evaluate_per_clip, reframer_plan, perception, clips)
+                    for _c, _rep in _pairs:
+                        _c.reframe_report = {
+                            "grade": _rep.grade,
+                            "grade_uncapped": _rep.grade_uncapped,
+                            "overall_score": round(_rep.overall_score, 1),
+                            "p10_window_score": _rep.p10_window_score,
+                            "high_problems_per_min": _rep.high_problems_per_min,
+                            "face_coverage_pct": round(_rep.face_coverage_pct, 1),
+                            "problems_high": sum(
+                                1 for p in _rep.problems
+                                if p.get("severity") == "HIGH"),
+                        }
+                    # VLM spot-check: a human-proxy framing judgment on ~12
+                    # cropped frames sampled from the exported clips. Kept as
+                    # a SEPARATE calibration signal (vlm_framing_pct), never
+                    # blended into the geometric score — a run with the VLM
+                    # unavailable must grade identically to one with it.
+                    _vlm_pct = None
+                    try:
+                        from backend.services.reframe_vlm_judge import (
+                            vlm_spotcheck_framing)
+                        _vlm_pct = await vlm_spotcheck_framing(
+                            video_path, reframer_plan, clips)
+                    except Exception as _vj_err:
+                        logger.info("[%s] VLM spot-check skipped: %s",
+                                    job_id, _vj_err)
+                    if _clip_agg and reframe_report is not None:
+                        # The clip-weighted aggregate becomes part of the
+                        # persisted job report (headline for the UI). The
+                        # whole-video report was saved before clip extraction,
+                        # so re-persist with the aggregate attached.
+                        reframe_report["clip_weighted"] = _clip_agg
+                        if _vlm_pct is not None:
+                            reframe_report["vlm_framing_pct"] = _vlm_pct
+                        await database.update_job_status(
+                            job_id, reframe_report=reframe_report)
+                except Exception as _cg_err:
+                    logger.warning("[%s] Per-clip reframe grading skipped: %s",
+                                   job_id, _cg_err)
         except asyncio.TimeoutError:
             logger.warning(
                 "[%s] Clip detection exceeded %ds — continuing without clips "

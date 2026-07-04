@@ -684,7 +684,24 @@ class PerceptionResult:
 
         # Live-action: ≥70% of samples have faces
         # (anime/gaming typically <30%, sports <10%)
-        return face_pct >= 0.70
+        if face_pct >= 0.70:
+            return True
+        # Corroborated live-action: 40-70% face coverage PLUS at least one
+        # PERSISTENT track. Live footage where faces regularly turn away or
+        # leave frame (vlogs, intimate scenes, handheld) sat at ~60% and got
+        # routed "animated/other" — but a single YuNet track visible across
+        # ≥15% of all samples is a real, recurring human; anime/gaming
+        # almost never produces one (YuNet barely fires on drawn faces, and
+        # what fires doesn't persist).
+        if face_pct >= 0.40:
+            track_counts: Dict[int, int] = {}
+            for faces in self.face_timeline.values():
+                for tid in {f.get('track_id', -1) for f in faces}:
+                    if tid >= 0:
+                        track_counts[tid] = track_counts.get(tid, 0) + 1
+            if track_counts and max(track_counts.values()) >= 0.15 * total:
+                return True
+        return False
 
 
 # ═══════════════════════════════════════════════════════════════════════════

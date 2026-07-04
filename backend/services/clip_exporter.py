@@ -6705,11 +6705,42 @@ async def export_clip(
                             zoom_keyframes = _zoom_keyframes_from_cached_render_plan(
                                 _cached_rp_dict, clip_start=start, clip_end=end,
                             )
+                            # Vertical framing (sub-full-height crops only):
+                            # prefer the cached plan's own rect.y at the clip
+                            # midpoint — the planner's per-scene eye-line —
+                            # over the coarse scene-average fallback below.
+                            # rect.y is the crop TOP as a fraction of source
+                            # height with the eye-line at 1/3 from the top,
+                            # so the face-y proxy is y + h/3.
+                            _rp_y_from_plan = False
+                            try:
+                                _mid_sec = (start + end) / 2.0
+                                for _yop in (_cached_rp_dict.get("ops") or []):
+                                    if not (_yop.get("start_sec", 0) <= _mid_sec
+                                            <= _yop.get("end_sec", 0)):
+                                        continue
+                                    _ymp = _yop.get("motion_path") or []
+                                    _yrect = (_ymp[0].get("rect") if _ymp
+                                              else None) or _yop.get("primary_rect")
+                                    if _yrect and float(_yrect.get("h", 1.0)) < 0.999:
+                                        _avg_face_y = min(90.0, max(10.0, (
+                                            float(_yrect.get("y", 0.0))
+                                            + float(_yrect.get("h", 1.0)) / 3.0
+                                        ) * 100.0))
+                                        _rp_y_from_plan = True
+                                        logger.info(
+                                            "[SubjectTracking] clip %s: vertical "
+                                            "framing from cached RenderPlan "
+                                            "(face_y≈%.0f%% at t=%.1fs)",
+                                            clip_id, _avg_face_y, _mid_sec)
+                                    break
+                            except Exception:
+                                pass
                             # This tier skips the dense-detection pass that
                             # normally fills _avg_face_y, so derive vertical
                             # framing from the scenes (only used for crops
                             # shorter than full height, e.g. 1:1 / 4:5).
-                            if subject_scenes:
+                            if subject_scenes and not _rp_y_from_plan:
                                 _rp_face_ys = []
                                 for _s in subject_scenes:
                                     if hasattr(_s, 'face_positions') and _s.face_positions:

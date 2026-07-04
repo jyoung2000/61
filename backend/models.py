@@ -545,6 +545,10 @@ class ExportRequest(BaseModel):
     pip_size_pct: float = 25.0          # For PIP mode
     hook_text: str = ""  # Text overlay for the opening frame
     subject_keyframes: Optional[list[dict]] = None  # Frontend-computed [{time, x}] for export crop parity
+    # Operator-correction telemetry: how many crop segments the user MANUALLY
+    # overrode before exporting. Ground truth for reframe-grade calibration —
+    # every manual pin is a place the auto-reframe wasn't good enough.
+    manual_crop_overrides: int = 0
 
 
 class FullVideoExportRequest(BaseModel):

@@ -281,6 +281,11 @@ class Settings(BaseSettings):
     WHISPER_REDECODE_LOGPROB: float = -0.8
     WHISPER_REDECODE_MAX_FRAC: float = 0.10
     WHISPER_REDECODE_BEAM: int = 8
+    # Wrong-script hallucination gate: with the source language pinned (or
+    # confidently detected) as CJK, a 4+-word cue of ≥60% Latin letters and
+    # <10% CJK is a decode hallucination over music/silence, not speech —
+    # quarantine it like the other TACT filters.
+    WHISPER_SCRIPT_FILTER: bool = True
     # ── CTC forced-alignment refinement (audit Phase 3.1) ──
     # Whisper word timestamps drift 50-200ms; a CTC forced aligner
     # (torchaudio wav2vec2, <1GB, or the ctc-forced-aligner package when
@@ -588,6 +593,30 @@ class Settings(BaseSettings):
     # NVENC preset p1 (fastest) .. p7 (best quality); the speed/quality
     # toggle for GPU exports. p5 = historical default.
     GPU_NVENC_PRESET: str = "p5"
+    # ── Detection density (audit follow-up) ──
+    # Inter-sample LK tracking: bridge the gaps between sparse detection
+    # samples by tracking the last sample's face boxes with pyramidal
+    # Lucas-Kanade on a few of the frames grab() already decoded. Turns a
+    # 0.14 Hz face timeline into an effectively several-Hz one for ~zero
+    # decode cost. POINTS_PER_GAP = tracked frames per inter-sample gap.
+    REFRAMER_INTER_SAMPLE_TRACKING: bool = True
+    REFRAMER_TRACK_POINTS_PER_GAP: int = 3
+    # Problem-driven repair: after planning, re-detect densely inside the
+    # evaluator's HIGH face_missing windows (YuNet-only, no VRAM) and insert
+    # corrective keyframes before the bridge/export sees the plan.
+    REFRAMER_PROBLEM_REPAIR: bool = True
+    REFRAMER_REPAIR_MAX_WINDOWS: int = 40
+    # Per-scene vertical eye-line (sub-full-height crops: 1:1, 4:5, …): each
+    # scene's keyframes carry a scene-local crop_y; the bridge animates
+    # vertical framing per scene and exports read it at the clip midpoint.
+    REFRAMER_PER_SCENE_EYELINE: bool = True
+    # ── User-accurate reframe grading ──
+    # VLM spot-check: sample cropped frames from the exported clips and ask
+    # the local vision model "is the main subject well-framed?" — a
+    # human-proxy calibration signal reported as vlm_framing_pct alongside
+    # the geometric metrics (never blended into the grade). 0 frames = off.
+    REFRAME_VLM_SPOTCHECK: bool = True
+    REFRAME_VLM_FRAMES: int = 12
     GPU_DEVICE_INDEX: str = ""               # SERVER FFmpeg CUDA device index ("0" etc.). Empty = auto. NEVER set from the browser/phone client report — the client's GPU is irrelevant server-side. With NVIDIA_VISIBLE_DEVICES pinned to the 1650's UUID, index 0 in-container is always the 1650.
 
     # Pre-analysis GPU memory preflight.
@@ -665,6 +694,11 @@ class Settings(BaseSettings):
     # restore the pure translate-then-polish behavior. The full readability
     # reflow still runs on the translated text.
     TRANSLATION_POLISH_SOURCE_FIRST: bool = True
+    # Polish the LLM-translated TARGET track too (mode=translation MTPE with
+    # the cloud fallback). Historically skipped ("the LLM translation is
+    # final"), which shipped the 4B translator's raw typos and word-salad
+    # untouched — the source polish never touches the English viewers read.
+    TRANSLATION_POLISH_LLM_OUTPUT: bool = True
     TRANSCRIPT_FILLER_REMOVAL: bool = False     # remove um, uh, like, you know
     TRANSCRIPT_SENTENCE_REPAIR: bool = True     # fix run-on/fragmented sentences
     # Default ON: tells the polisher to keep every spoken word and only
