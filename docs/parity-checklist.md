@@ -72,6 +72,8 @@ between the client canvas export and the server FFmpeg export, run the
 frame-compare harness on a machine with FFmpeg (e.g. the Unraid host):
 
 ```bash
+make parity CLIENT=client_export.mp4 SERVER=server_export.mp4
+# equivalent to:
 python scripts/parity_harness.py client_export.mp4 server_export.mp4 \
     --timestamps 1.0 2.5 5.0 --ssim-threshold 0.90
 ```
