@@ -1808,36 +1808,6 @@ input.ve-timecode--input {
   transform: scaleX(1.4);
 }
 
-.ve-multi-timeline__context-menu {
-  position: absolute;
-  background: var(--ve-dropdown-bg);
-  border: 1px solid var(--ve-chrome-border);
-  border-radius: 6px;
-  padding: 4px;
-  z-index: 20;
-  min-width: 120px;
-  box-shadow: var(--ve-dropdown-shadow);
-  backdrop-filter: blur(20px) saturate(1.8);
-  -webkit-backdrop-filter: blur(20px) saturate(1.8);
-}
-
-.ve-multi-timeline__context-menu button {
-  display: block;
-  width: 100%;
-  padding: 6px 10px;
-  border: none;
-  background: transparent;
-  color: var(--ve-text);
-  font-size: 11px;
-  text-align: left;
-  border-radius: 4px;
-  cursor: pointer;
-  transition: all 0.1s ease;
-}
-.ve-multi-timeline__context-menu button:hover {
-  background: var(--ve-btn-hover);
-}
-
 /* ── Media Uploader ─────────────────────────────────── */
 
 .ve-media-uploader {
@@ -3462,4 +3432,126 @@ input.ve-timecode--input {
 .ve-properties__tab:focus-visible {
   outline: 2px solid var(--glow-color);
   outline-offset: -1px;
+}
+
+/* ═══ ContextMenu (shared right-click menu, 2.3) ═══ */
+.ve-context-menu {
+  position: fixed;
+  z-index: 10001;
+  min-width: 180px;
+  padding: 4px;
+  background: var(--ve-dropdown-bg);
+  border: 1px solid var(--ve-chrome-border);
+  border-radius: 8px;
+  box-shadow: var(--ve-dropdown-shadow);
+  backdrop-filter: blur(20px) saturate(1.8);
+  -webkit-backdrop-filter: blur(20px) saturate(1.8);
+  outline: none;
+  animation: ve-pop-in 140ms var(--ease-out-quart);
+}
+
+.ve-context-menu__item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 5px 8px;
+  font-size: 11px;
+  color: var(--ve-text);
+  background: none;
+  border: none;
+  border-radius: 5px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.ve-context-menu__item--focused,
+.ve-context-menu__item:hover:not(:disabled) {
+  background: var(--ve-accent);
+  color: #fff;
+}
+
+.ve-context-menu__item--focused .ve-context-menu__kbd,
+.ve-context-menu__item:hover:not(:disabled) .ve-context-menu__kbd {
+  color: rgba(255, 255, 255, 0.8);
+}
+
+.ve-context-menu__item:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.ve-context-menu__item--danger {
+  color: var(--ve-danger, #FF375F);
+}
+
+.ve-context-menu__item--danger.ve-context-menu__item--focused,
+.ve-context-menu__item--danger:hover:not(:disabled) {
+  background: var(--ve-danger, #FF375F);
+  color: #fff;
+}
+
+.ve-context-menu__check {
+  width: 12px;
+  flex-shrink: 0;
+  font-size: 10px;
+}
+
+.ve-context-menu__label {
+  flex: 1;
+  white-space: nowrap;
+}
+
+.ve-context-menu__kbd {
+  font-family: var(--font-mono, monospace);
+  font-size: 9px;
+  color: var(--ve-text-muted);
+  background: none;
+  border: none;
+}
+
+.ve-context-menu__separator {
+  height: 1px;
+  margin: 4px 6px;
+  background: var(--ve-chrome-border);
+}
+
+.ve-context-menu__heading {
+  padding: 4px 8px 2px;
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--ve-text-muted);
+}
+
+/* Mobile long-press action sheet variant */
+.ve-context-menu--sheet {
+  left: 0;
+  right: 0;
+  top: auto;
+  bottom: 0;
+  min-width: 0;
+  border-radius: 14px 14px 0 0;
+  padding: 6px 10px calc(10px + var(--safe-bottom, 0px));
+  animation: ve-sheet-up 220ms var(--ease-out-quart);
+}
+
+.ve-context-menu--sheet .ve-context-menu__item {
+  padding: 12px 10px;   /* ≥44px touch target */
+  font-size: 14px;
+}
+
+.ve-context-menu__grabber {
+  width: 36px;
+  height: 4px;
+  margin: 2px auto 8px;
+  border-radius: 2px;
+  background: var(--ve-text-muted);
+  opacity: 0.4;
+}
+
+@keyframes ve-sheet-up {
+  from { transform: translateY(24px); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
 }

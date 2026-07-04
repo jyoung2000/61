@@ -5,6 +5,7 @@ import {
   ensureThumbnail,
   getCachedThumbnail,
 } from '../utils/filmstrip';
+import ContextMenu from './ContextMenu';
 
 // ── Constants ────────────────────────────────────────────────────────────────
 // Track sizing modeled after Premiere Pro / DaVinci Resolve / VEED — a clear
@@ -1559,14 +1560,31 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
     if (!canvas) return;
     const rect = canvas.getBoundingClientRect();
 
-    // Right-click context menu
+    // Right-click context menu — clip menu over lanes, track menu over
+    // the header column (both rendered by the shared ContextMenu).
     if (e.button === 2) {
       e.preventDefault();
+      const px = e.clientX - rect.left;
+      const mouseY = e.clientY - rect.top;
+      if (px < LABEL_WIDTH && mouseY > RULER_HEIGHT) {
+        const trackIdx = Math.floor((mouseY - RULER_HEIGHT) / (TRACK_HEIGHT + TRACK_GAP));
+        const track = useTimelineStore.getState().tracks[trackIdx];
+        if (track) {
+          setContextMenu({ kind: 'track', x: e.clientX, y: e.clientY, trackId: track.id });
+          return;
+        }
+      }
       const time = getTimeFromX(e.clientX);
       const hit = hitTestItem(e.clientX, e.clientY);
+      if (hit?.item) {
+        // Right-click selects like every commercial NLE, so the menu
+        // and the inspector agree about the target.
+        setSelectedItemId(hit.item.id);
+      }
       setContextMenu({
-        x: e.clientX - rect.left,
-        y: e.clientY - rect.top,
+        kind: 'item',
+        x: e.clientX,
+        y: e.clientY,
         time,
         item: hit?.item || null,
       });
@@ -2204,47 +2222,100 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
   // ── Context menu ───────────────────────────────────────────────────────────
   const onContextMenu = useCallback((e) => e.preventDefault(), []);
 
-  const handleContextAction = useCallback((action) => {
-    if (!contextMenu) return;
-    const { time, item } = contextMenu;
-    // Block destructive actions on locked tracks
-    if (item) {
-      const itemTrack = tracks.find((t) => t.id === item.trackId);
-      if (itemTrack?.locked && (action === 'split' || action === 'delete' || action === 'duplicate')) {
-        setContextMenu(null);
-        return;
-      }
-    }
-    switch (action) {
-      case 'split':
-        if (item) splitItem(item.id, time);
-        break;
-      case 'delete':
-        if (item) removeItem(item.id);
-        break;
-      case 'duplicate':
-        if (item) useTimelineStore.getState().duplicateItem(item.id);
-        break;
-      case 'group': {
-        const ids = useTimelineStore.getState().selectedItemIds;
-        if (ids.length >= 2) groupItems(ids);
-        break;
-      }
-      case 'ungroup': {
-        const ids = useTimelineStore.getState().selectedItemIds;
-        if (ids.length > 0) ungroupItems(ids);
-        break;
-      }
-    }
-    setContextMenu(null);
-  }, [contextMenu, splitItem, removeItem, tracks, groupItems, ungroupItems]);
+  // Build the shared ContextMenu item list for the current target.
+  // Fresh store reads keep the entries in sync with live state.
+  const contextMenuItems = useMemo(() => {
+    if (!contextMenu) return [];
+    const store = useTimelineStore.getState();
 
-  useEffect(() => {
-    if (!contextMenu) return;
-    const close = () => setContextMenu(null);
-    window.addEventListener('click', close);
-    return () => window.removeEventListener('click', close);
-  }, [contextMenu]);
+    if (contextMenu.kind === 'track') {
+      const track = store.tracks.find((t) => t.id === contextMenu.trackId);
+      if (!track) return [];
+      const audioMuted = track.audioMuted !== undefined ? !!track.audioMuted : !!track.muted;
+      const hidden = track.videoVisible !== undefined ? !track.videoVisible : track.visible === false;
+      const audible = (t) => t.type === 'audio' || t.type === 'video';
+      const soloed = audible(track) && !audioMuted
+        && store.tracks.filter((t) => audible(t) && t.id !== track.id)
+          .every((t) => (t.audioMuted !== undefined ? !!t.audioMuted : !!t.muted));
+      return [
+        { heading: track.name || track.id },
+        {
+          id: 'rename', label: 'Rename…', onSelect: () => {
+            const name = window.prompt('Track name', track.name || '');
+            if (name != null && name.trim()) store.updateTrack(track.id, { name: name.trim() });
+          },
+        },
+        { separator: true },
+        { id: 'mute', label: 'Mute', checked: audioMuted, disabled: !audible(track), onSelect: () => store.toggleTrackMute(track.id) },
+        {
+          id: 'solo', label: 'Solo', checked: soloed, disabled: !audible(track), onSelect: () => {
+            // Solo = this track audible, every other A/V track muted.
+            // Toggling solo off restores everything audible.
+            for (const t of store.tracks) {
+              if (!audible(t)) continue;
+              const isMuted = t.audioMuted !== undefined ? !!t.audioMuted : !!t.muted;
+              const shouldMute = soloed ? false : t.id !== track.id;
+              if (isMuted !== shouldMute) store.toggleTrackMute(t.id);
+            }
+          },
+        },
+        { id: 'hide', label: hidden ? 'Show' : 'Hide', onSelect: () => store.toggleTrackVisibility(track.id) },
+        { separator: true },
+        { id: 'delete-track', label: 'Delete track', danger: true, disabled: track.locked, onSelect: () => store.removeTrack(track.id) },
+      ];
+    }
+
+    const { item, time } = contextMenu;
+    if (!item) return [];
+    const itemTrack = store.tracks.find((t) => t.id === item.trackId);
+    const locked = !!itemTrack?.locked;
+    const isMedia = item.type === 'video' || item.type === 'audio';
+    const canTransition = item.type === 'video' || item.type === 'image';
+    const entries = [
+      { id: 'split-playhead', label: 'Split at playhead', kbd: 'S', disabled: locked || store.playhead <= item.start || store.playhead >= item.end, onSelect: () => splitItem(item.id, store.playhead) },
+      { id: 'split-here', label: 'Split here', disabled: locked || time <= item.start || time >= item.end, onSelect: () => splitItem(item.id, time) },
+      { id: 'duplicate', label: 'Duplicate', kbd: '⌘D', disabled: locked, onSelect: () => store.duplicateItem(item.id) },
+      { separator: true },
+      {
+        id: 'ripple-delete', label: 'Ripple delete', disabled: locked, danger: true, onSelect: () => {
+          const dur = item.end - item.start;
+          removeItem(item.id);
+          useTimelineStore.getState().rippleShiftAfter(item.end - 0.001, -dur, [item.id]);
+        },
+      },
+      { id: 'delete', label: 'Delete', kbd: '⌫', disabled: locked, danger: true, onSelect: () => removeItem(item.id) },
+    ];
+    if (isMedia) {
+      entries.push({ separator: true });
+      entries.push({ id: 'mute-item', label: 'Mute clip', checked: !!item.muted, disabled: locked, onSelect: () => updateItem(item.id, { muted: !item.muted }) });
+      entries.push({ heading: 'Speed' });
+      for (const s of [0.5, 1.0, 1.5, 2.0]) {
+        entries.push({
+          id: `speed-${s}`, label: `${s}×`, checked: (item.speed ?? 1) === s, disabled: locked,
+          onSelect: () => updateItem(item.id, { speed: s }),
+        });
+      }
+    }
+    if (canTransition) {
+      entries.push({ separator: true });
+      entries.push({
+        id: 'transition',
+        label: item.transition ? 'Remove transition' : 'Add transition (dissolve)',
+        disabled: locked,
+        onSelect: () => updateItem(item.id, {
+          transition: item.transition ? null : { type: 'dissolve', duration: 0.5 },
+        }),
+      });
+    }
+    if (selectedItemIds.length >= 2) {
+      entries.push({ separator: true });
+      entries.push({ id: 'group', label: 'Group selected', kbd: '⌘G', onSelect: () => groupItems(useTimelineStore.getState().selectedItemIds) });
+    }
+    if (item.groupId) {
+      entries.push({ id: 'ungroup', label: 'Ungroup', onSelect: () => ungroupItems(useTimelineStore.getState().selectedItemIds) });
+    }
+    return entries;
+  }, [contextMenu, selectedItemIds, splitItem, removeItem, updateItem, groupItems, ungroupItems]);
 
   // ── Compute canvas height ──────────────────────────────────────────────────
   const canvasHeight = RULER_HEIGHT + tracks.length * (TRACK_HEIGHT + TRACK_GAP) + 12;
@@ -2668,29 +2739,13 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
       />
 
       {/* Context menu */}
-      {contextMenu && (
-        <div
-          className="ve-multi-timeline__context-menu"
-          style={{ left: contextMenu.x, top: contextMenu.y }}
-        >
-          {contextMenu.item ? (
-            <>
-              <button onClick={() => handleContextAction('split')}>Split at cursor</button>
-              <button onClick={() => handleContextAction('delete')}>Delete</button>
-              <button onClick={() => handleContextAction('duplicate')}>Duplicate</button>
-              {selectedItemIds.length >= 2 && (
-                <button onClick={() => handleContextAction('group')}>Group Selected</button>
-              )}
-              {contextMenu.item.groupId && (
-                <button onClick={() => handleContextAction('ungroup')}>Ungroup</button>
-              )}
-            </>
-          ) : (
-            <div style={{ padding: '4px 8px', fontSize: 10, color: 'var(--ve-text-muted)' }}>
-              No item selected
-            </div>
-          )}
-        </div>
+      {contextMenu && contextMenuItems.length > 0 && (
+        <ContextMenu
+          x={contextMenu.x}
+          y={contextMenu.y}
+          items={contextMenuItems}
+          onClose={() => setContextMenu(null)}
+        />
       )}
     </div>
   );

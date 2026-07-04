@@ -1,5 +1,6 @@
 import React, { useState, useRef, useCallback, useMemo, useEffect } from 'react';
 import useTimelineStore from '../stores/timelineStore';
+import ContextMenu from './ContextMenu';
 
 /**
  * InteractiveOverlay renders selectable, draggable, resizable, and rotatable
@@ -51,6 +52,49 @@ export default function InteractiveOverlay({ currentTime = 0, clipStart = 0, con
     return new Set(items.filter((it) => lockedTrackIds.has(it.trackId)).map((it) => it.id));
   }, [items, tracks]);
 
+  // Right-click menu on preview overlay items (shared ContextMenu)
+  const [overlayMenu, setOverlayMenu] = useState(null);
+
+  const overlayMenuItems = useMemo(() => {
+    if (!overlayMenu) return [];
+    const store = useTimelineStore.getState();
+    const item = store.items.find((i) => i.id === overlayMenu.itemId);
+    if (!item) return [];
+    const trackIdx = store.tracks.findIndex((t) => t.id === item.trackId);
+    const track = store.tracks[trackIdx];
+    const locked = !!track?.locked;
+    // Z-order in the preview follows track order — bring forward/backward
+    // swaps this item's track with the adjacent overlay track so preview,
+    // client export and server compositing all agree on the new order.
+    const canSwap = (dir) => {
+      const target = store.tracks[trackIdx + dir];
+      return !!target && target.type === 'overlay' && track?.type === 'overlay';
+    };
+    const swap = (dir) => store.reorderTracks(trackIdx, trackIdx + dir);
+    return [
+      { id: 'forward', label: 'Bring forward', disabled: locked || !canSwap(-1), onSelect: () => swap(-1) },
+      { id: 'backward', label: 'Send backward', disabled: locked || !canSwap(1), onSelect: () => swap(1) },
+      { separator: true },
+      { id: 'duplicate', label: 'Duplicate', kbd: '⌘D', disabled: locked, onSelect: () => store.duplicateItem(item.id) },
+      {
+        id: 'reset-transform', label: 'Reset transform', disabled: locked,
+        onSelect: () => {
+          const defSize = item.type === 'video' ? { w: 100, h: 100 }
+            : item.type === 'text' ? { w: 35, h: 12 }
+            : item.type === 'shape' ? { w: 40, h: 30 }
+            : { w: 30, h: 30 };
+          store.updateItem(item.id, {
+            position: { x: 50, y: 50 },
+            size: defSize,
+            transform: { ...(item.transform || {}), rotation: 0 },
+          });
+        },
+      },
+      { separator: true },
+      { id: 'delete', label: 'Delete', kbd: '⌫', danger: true, disabled: locked, onSelect: () => store.removeItem(item.id) },
+    ];
+  }, [overlayMenu]);
+
   if (visible.length === 0) return null;
 
   return (
@@ -88,8 +132,22 @@ export default function InteractiveOverlay({ currentTime = 0, clipStart = 0, con
           onUpdate={(updates) => updateItem(item.id, updates)}
           setItemPositions={setItemPositions}
           onInteraction={onInteraction}
+          onContextMenu={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            setSelectedItemId(item.id);
+            setOverlayMenu({ itemId: item.id, x: e.clientX, y: e.clientY });
+          }}
         />
       ))}
+      {overlayMenu && overlayMenuItems.length > 0 && (
+        <ContextMenu
+          x={overlayMenu.x}
+          y={overlayMenu.y}
+          items={overlayMenuItems}
+          onClose={() => setOverlayMenu(null)}
+        />
+      )}
     </div>
   );
 }
@@ -120,6 +178,7 @@ function InteractiveElement({
   onUpdate,
   setItemPositions,
   onInteraction,
+  onContextMenu,
 }) {
   const [isHovered, setIsHovered] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
@@ -198,6 +257,8 @@ function InteractiveElement({
 
   // ── DRAG ──────────────────────────────────────────────
   const handleDragStart = useCallback((e) => {
+    // Right-button goes to the context menu, not a drag
+    if (e.button === 2) return;
     e.stopPropagation();
     e.preventDefault();
     onSelect(e);
@@ -724,6 +785,7 @@ function InteractiveElement({
       onPointerDown={isEditing ? undefined : handleDragStart}
       onClick={handleClick}
       onDoubleClick={handleDoubleClick}
+      onContextMenu={onContextMenu}
       onPointerEnter={() => setIsHovered(true)}
       onPointerLeave={() => setIsHovered(false)}
     >
