@@ -4349,6 +4349,9 @@ async def _run_analysis_inner(job_id: str):
             f"{getattr(settings, 'VOCAL_SEPARATION_MODEL', 'htdemucs')}"
         ),
         planner_fingerprint=_planner_fingerprint(),
+        # Configured ASR model — switching Whisper models must invalidate the
+        # saved transcript instead of silently reusing it on resume.
+        asr_model=str(getattr(settings, "WHISPER_MODEL", "small") or "small"),
     )
     _force_reanalyze = os.environ.get(
         "CLIPAI_FORCE_REANALYZE", "").lower() in ("1", "true", "yes")

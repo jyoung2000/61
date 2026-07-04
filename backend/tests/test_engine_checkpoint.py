@@ -104,6 +104,25 @@ def test_signature_includes_planner_fingerprint():
     assert pc._signatures_match(base, other) is False
 
 
+def test_signature_includes_asr_model():
+    """v3: switching Whisper models must invalidate the checkpoint — the old
+    transcript came from a different model and would be silently reused."""
+    small = pc.checkpoint_signature(source_sha="abc", source_language="en",
+                                    sample_fps=5.0, aspect_ratio="9:16",
+                                    asr_model="small")
+    large = pc.checkpoint_signature(source_sha="abc", source_language="en",
+                                    sample_fps=5.0, aspect_ratio="9:16",
+                                    asr_model="large-v3-turbo")
+    assert pc._signatures_match(small, large) is False
+    assert pc._signatures_match(small, small) is True
+    # Model names normalize case so config-vs-UI casing can't split the cache
+    mixed = pc.checkpoint_signature(source_sha="abc", source_language="en",
+                                    sample_fps=5.0, aspect_ratio="9:16",
+                                    asr_model="Small")
+    assert pc._signatures_match(small, mixed) is True
+    assert "asr_model" in pc._signature_diff(small, large)
+
+
 def test_signature_diff_names_the_differing_field():
     a = pc.checkpoint_signature(source_sha="abc123def456xyz", source_language="en",
                                 sample_fps=5.0, aspect_ratio="9:16")

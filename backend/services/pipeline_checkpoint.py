@@ -42,7 +42,9 @@ logger = logging.getLogger(__name__)
 # v2: invalidates checkpoints written before the transcribe-reuses-audio.wav
 # fix — those could carry an empty (timed-out) transcript that a resume would
 # otherwise keep reusing.
-CHECKPOINT_VERSION = 2
+# v3: the ASR model joins the signature — switching Whisper models used to
+# silently reuse the previous model's transcript on resume.
+CHECKPOINT_VERSION = 3
 
 _PERCEPTION_FILE = "engine_perception.json"
 _PLAN_FILE = "engine_plan.json"
@@ -161,10 +163,16 @@ def checkpoint_signature(
     aspect_ratio: str,
     vocal_sep_key: str = "",
     planner_fingerprint: str = "",
+    asr_model: str = "",
 ) -> dict:
     """Identity of the engine inputs. A reload only happens when the saved
     signature matches the one the current run would produce — otherwise the
-    cached perception/plan no longer describe this source/config."""
+    cached perception/plan no longer describe this source/config.
+
+    asr_model: the CONFIGURED Whisper model (settings.WHISPER_MODEL at run
+    start). Without it, switching models silently reused the old model's
+    transcript on resume — a quality hole, not just a staleness one.
+    """
     return {
         "version": CHECKPOINT_VERSION,
         "source_sha": source_sha or "",
@@ -173,6 +181,7 @@ def checkpoint_signature(
         "aspect_ratio": (aspect_ratio or "9:16").strip(),
         "vocal_sep_key": vocal_sep_key or "",
         "planner_fingerprint": planner_fingerprint or "",
+        "asr_model": (asr_model or "").strip().lower(),
     }
 
 
