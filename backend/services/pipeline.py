@@ -1219,6 +1219,7 @@ from backend.services.pipeline_helpers import (  # noqa: E402
     translation_progress_pct,
 )
 from backend.services import pipeline_checkpoint  # noqa: E402
+from backend.services import stage_checkpoints  # noqa: E402
 
 # ── Background source-hash tasks (one per running job) ──────────────
 # The SHA-256 of the source used to be computed ON the critical path (a full
@@ -2520,6 +2521,55 @@ async def _background_post_processing(
         target_name = SUPPORTED_LANGUAGES.get(target_lang, target_lang)
         source_name = SUPPORTED_LANGUAGES.get(source_lang, source_lang) if source_lang else "auto-detected"
         _result["target_name"] = target_name
+
+        # ── Translation stage checkpoint (RESUME) ──
+        # Keyed on the EXACT source cues being translated (hash of timing +
+        # text) plus languages and the configured translation models — so an
+        # edited transcript, a different Whisper model, or a model switch all
+        # re-translate, while a crash after translation (mid-clips / mid-
+        # export) resumes without re-paying the LLM pass.
+        _tr_signature = {
+            "src_hash": stage_checkpoints.transcript_hash(transcript),
+            "source_lang": source_lang or "auto",
+            "target_lang": target_lang,
+            "models": (
+                f"ollama={getattr(settings, 'OLLAMA_TRANSLATION_MODEL', '')};"
+                f"openrouter={getattr(settings, 'OPENROUTER_TRANSLATION_MODEL', '')};"
+                f"polish_tm={getattr(settings, 'SUBTITLE_POLISH_USES_TRANSLATION_MODEL', True)}"
+            ),
+        }
+        _tr_ckpt = await stage_checkpoints.load_stage_checkpoint(
+            job_id, "translation", signature=_tr_signature)
+        if _tr_ckpt and _tr_ckpt.get("segments"):
+            _restored = _tr_ckpt["segments"]
+            logger.info(
+                "[%s] RESUME: restored translated transcript from stage "
+                "checkpoint (%d segments) — skipping translate + polish",
+                job_id, len(_restored))
+            _record_pipeline_warning(
+                job_id,
+                "Resumed translation from a saved checkpoint — reused the "
+                "previous run's translated subtitles.")
+            _upd = {"translated_transcript": _restored}
+            if _tr_ckpt.get("readability") is not None:
+                _upd["transcript_readability"] = _tr_ckpt["readability"]
+            await database.update_job_status(job_id, **_upd)
+            await broadcast_ws(job_id, {
+                "type": "background_task",
+                "task": "subtitle_translation",
+                "status": "complete",
+                "message": (f"Subtitles restored from checkpoint "
+                            f"({len(_restored)} segments)"),
+            })
+            await _set_translation_status(job_id, "translated", None)
+            _result.update(
+                translated=True,
+                source_transcript=_as_dicts(transcript),
+                target_transcript=_restored,
+                seo_transcript=_restored,
+            )
+            return _result
+
         logger.info("[%s] Subtitle translation: %s → %s (%d segments)",
                     job_id, source_name, target_name, len(transcript))
         # ── Cross-video contamination trace ──────────────────────────────────
@@ -3205,6 +3255,13 @@ async def _background_post_processing(
 
             # Visible, persisted success state (Task 3) + outcome contract.
             await _set_translation_status(job_id, "translated", None)
+            # Stage checkpoint: the FINAL (translated + polished + resegmented
+            # + deduped) cues — a resume re-persists these instead of re-paying
+            # the whole translate chain. Best-effort.
+            await stage_checkpoints.save_stage_checkpoint(
+                job_id, "translation",
+                {"segments": _translated_out, "readability": _tr_readability},
+                signature=_tr_signature)
             _result.update(
                 translated=True,
                 source_transcript=_as_dicts(transcript),

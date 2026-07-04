@@ -3412,7 +3412,8 @@ class ClipExtractor:
                     f"{len(judge_candidates)} candidates...")
                 self._run_editorial_judge(
                     judge, judge_candidates,
-                    lambda p: on_progress(0.60 + p * 0.25) if on_progress else None
+                    lambda p: on_progress(0.60 + p * 0.25) if on_progress else None,
+                    judge_label=judge_label,
                 )
 
         if on_progress:
@@ -3483,7 +3484,8 @@ class ClipExtractor:
         return None
 
     def _run_editorial_judge(self, judge, candidates: List[ClipCandidate],
-                             on_progress: Callable = None):
+                             on_progress: Callable = None,
+                             judge_label: str = ""):
         """Send each candidate to the cloud judge for scoring.
 
         Safety nets:
@@ -3498,6 +3500,11 @@ class ClipExtractor:
         MAX_JUDGE_WORKERS = 5
         MAX_TOTAL_FAILURES = 3
         BUDGET_S = 240
+        # Durable verdict cache: a resume/re-analyze replays previous verdicts
+        # instead of re-paying (rate-limited) judge calls — and ships the SAME
+        # clips the interrupted run would have.
+        verdict_cache = _JudgeVerdictCache(self.video_path, judge_label)
+        cache_hits = [0]
         loop_start = _time.monotonic()
         failure_lock = threading.Lock()
         failure_count = [0]
@@ -3505,6 +3512,11 @@ class ClipExtractor:
 
         def _judge_one(args):
             idx, c = args
+            cached = verdict_cache.get(c)
+            if cached is not None:
+                with failure_lock:
+                    cache_hits[0] += 1
+                return idx, c, cached  # replay: no keyframes, no LLM call
             with failure_lock:
                 if failure_count[0] >= MAX_TOTAL_FAILURES:
                     return idx, c, None  # circuit breaker tripped
@@ -3531,6 +3543,8 @@ class ClipExtractor:
                     failure_count[0] += 1
                 else:
                     failure_count[0] = 0  # reset on success
+            # Cache BEFORE any trim mutation shifts the window key.
+            verdict_cache.put(c, result)
             return idx, c, result
 
         with _cf.ThreadPoolExecutor(max_workers=MAX_JUDGE_WORKERS) as executor:
@@ -3616,6 +3630,13 @@ class ClipExtractor:
                                         trim, c.start_s, c.end_s)
                     except Exception:
                         pass
+
+        # Persist new verdicts so the next resume/re-analyze replays them.
+        verdict_cache.flush()
+        if cache_hits[0]:
+            logger.info(
+                "Editorial judge: %d/%d verdict(s) replayed from cache "
+                "(skipped LLM calls)", cache_hits[0], total)
 
         if on_progress:
             on_progress(1.0)
@@ -3797,6 +3818,70 @@ class ClipExtractor:
 # repeating it dozens of times (the "every clip exports twice" symptom when
 # Ollama is holding the 4 GB GPU). Reset at the start of each export run.
 _gpu_encode_unavailable = threading.Event()
+
+
+class _JudgeVerdictCache:
+    """Durable per-candidate judge verdicts, keyed by (window, transcript
+    slice, judge spec).
+
+    The editorial judge is the slowest, most rate-limited part of clip
+    detection (external LLM calls behind a 429 circuit breaker). Without
+    this cache, every revive/resume — and every re-analyze of the same
+    source — re-paid the full judge pass AND could produce different
+    verdicts than the run that died (a resume changing which clips ship).
+    Cache hits skip the call and reproduce the original verdict exactly.
+
+    Lives beside the engine checkpoint: <job>/checkpoint/judge_verdicts.json.
+    Thread-safe (the judge pool judges candidates concurrently); flushed
+    once per judge pass via the same atomic write the checkpoints use.
+    """
+
+    def __init__(self, video_path: str, judge_label: str):
+        self.path = os.path.join(
+            os.path.dirname(video_path), "checkpoint", "judge_verdicts.json")
+        self.judge_label = judge_label or ""
+        self._lock = threading.Lock()
+        self._dirty = False
+        self._verdicts: dict = {}
+        try:
+            if os.path.isfile(self.path):
+                with open(self.path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                # A different judge spec means different verdicts — start over.
+                if data.get("judge") == self.judge_label:
+                    self._verdicts = dict(data.get("verdicts") or {})
+        except Exception as exc:  # noqa: BLE001 — cache is best-effort
+            logger.warning("Judge verdict cache unreadable (%s) — starting empty", exc)
+
+    @staticmethod
+    def key(c) -> str:
+        import hashlib
+        raw = f"{c.start_s:.1f}|{c.end_s:.1f}|{(c.transcript_slice or '')[:2000]}"
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+    def get(self, c):
+        with self._lock:
+            v = self._verdicts.get(self.key(c))
+        return dict(v) if isinstance(v, dict) else None
+
+    def put(self, c, result: dict) -> None:
+        if not isinstance(result, dict) or "error" in result:
+            return  # only successful verdicts are worth replaying
+        with self._lock:
+            self._verdicts[self.key(c)] = result
+            self._dirty = True
+
+    def flush(self) -> None:
+        with self._lock:
+            if not self._dirty:
+                return
+            payload = {"judge": self.judge_label, "verdicts": self._verdicts}
+            self._dirty = False
+        try:
+            from backend.services.pipeline_checkpoint import _atomic_write
+            _atomic_write(self.path, json.dumps(payload))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Judge verdict cache flush failed (%s)", exc)
 
 
 def _export_clip(video_path: str, output_path: str,
