@@ -210,6 +210,39 @@ export function buildOverlayPayload({ timelineItems, mediaLibrary, clipStart, tr
  * @param {Array} timelineItems
  * @returns {Object|null} video_effects object or null if no effects
  */
+/**
+ * Effective playback fields (volume / speed / preserve_pitch) for the
+ * main A/V pair. The a1 audio item and video item properties (set via
+ * the Properties panel) take priority over the store's global values —
+ * the same precedence rule the preview uses.
+ *
+ * Returns only the fields that differ from defaults, ready to spread
+ * into the ExportRequest payload.
+ *
+ * @param {Object} params
+ * @param {Array}  params.items   - Items from useTimelineStore
+ * @param {number} params.volume  - Store global volume (0..100)
+ * @param {number} params.speed   - Store global speed
+ */
+export function buildPlaybackPayload({ items, volume = 100, speed = 1.0 }) {
+  const videoItem = items.find((it) => it.type === 'video');
+  const a1AudioItem = items.find((it) => it.type === 'audio' && it.trackId === 'a1');
+  const effectiveVol = a1AudioItem?.volume ?? videoItem?.volume ?? (volume / 100);
+  const effectiveSpeed = a1AudioItem?.speed ?? videoItem?.speed ?? speed;
+  const preservePitch = !!(a1AudioItem?.preservePitch ?? videoItem?.preservePitch ?? false);
+
+  const out = {};
+  if (Math.abs(effectiveVol - 1.0) > 0.001) out.volume = effectiveVol;
+  if (Math.abs(effectiveSpeed - 1.0) > 0.001) {
+    out.speed = effectiveSpeed;
+    // Only meaningful with a speed change; default (absent) = varispeed,
+    // matching the preview element and the client export's
+    // AudioBufferSourceNode.playbackRate.
+    if (preservePitch) out.preserve_pitch = true;
+  }
+  return out;
+}
+
 export function buildVideoEffectsPayload(timelineItems) {
   const videoItem = timelineItems.find(it => it.type === 'video');
   if (!videoItem) return null;

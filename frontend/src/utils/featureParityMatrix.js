@@ -35,8 +35,11 @@ export const FEATURE_PARITY = [
     preview: 'ok', clientExport: 'ok', serverExport: 'ok',
     notes: 'Client export honors clip.muted and track.audioMuted since the decoded-buffer audio rewrite.' },
   { key: 'speed', label: 'Per-clip playback speed', panel: 'PropertiesPanel',
-    preview: 'ok', clientExport: 'ok', serverExport: 'partial',
-    notes: 'Client export maps time as trimStart+(t-start)*speed for frames and uses AudioBufferSourceNode.playbackRate for audio (varispeed: pitch shifts, matching preview element.playbackRate). Server uses setpts+atempo (pitch-preserving) — audible pitch differs from preview at speeds far from 1x.' },
+    preview: 'ok', clientExport: 'ok', serverExport: 'ok',
+    notes: 'All three paths agree via the per-clip preservePitch flag (default false = varispeed). Preview sets element.preservesPitch explicitly (browsers default it to true), client export uses AudioBufferSourceNode.playbackRate (varispeed), server uses asetrate+aresample for varispeed or an atempo chain when preservePitch is on. Preserve-pitch browser exports are routed to the server with a dialog notice (no faithful JS time-stretch).' },
+  { key: 'preservePitch', label: 'Preserve pitch on speed change', panel: 'PropertiesPanel',
+    preview: 'ok', clientExport: 'partial', serverExport: 'ok',
+    notes: 'Preview: element.preservesPitch (+webkit/moz prefixes). Server: atempo chain. Client export cannot time-stretch faithfully (AudioBufferSourceNode is varispeed-only), so the export dialog routes preserve-pitch clips to server export with a notice. Audio overlays keep pitch-preserving atempo for their own speed field (legacy behavior).' },
   { key: 'fadeIn', label: 'Fade in (video opacity + audio gain)', panel: 'PropertiesPanel',
     preview: 'ok', clientExport: 'ok', serverExport: 'ok',
     notes: 'Client export schedules matching gain automation on the offline audio context. Server ramps audio with afade (linear, output-time, serial filters multiply on overlap — same semantics as fadeGainAt) and scales the visual fade duration by speed so both ramps last fadeIn/fadeOut output seconds. Audio overlays with fade_in/fade_out get their own afade chain.' },
@@ -162,7 +165,8 @@ export const FEATURE_PARITY = [
  * properties can't silently skip the checklist.
  */
 export const REQUIRED_KEYS = [
-  'start', 'end', 'opacity', 'volume', 'muted', 'speed', 'fadeIn', 'fadeOut',
+  'start', 'end', 'opacity', 'volume', 'muted', 'speed', 'preservePitch',
+  'fadeIn', 'fadeOut',
   'position', 'size', 'transform.rotation', 'transition',
   'effects.brightness', 'effects.contrast', 'effects.saturation',
   'effects.blur', 'effects.hueRotate', 'effects.sepia',

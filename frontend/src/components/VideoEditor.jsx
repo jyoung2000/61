@@ -20,6 +20,7 @@ import ExportDialog from './ExportDialog';
 import InteractiveOverlay from './InteractiveOverlay';
 import MarqueeSelection from './MarqueeSelection';
 import { hexToRgbString } from '../utils/colorUtils';
+import { applyPreservesPitch } from '../utils/preservesPitch';
 import { runEditorQA, autoFixTrackCompatibility } from '../utils/editorQA';
 import './VideoEditor.css';
 
@@ -856,6 +857,16 @@ export default function VideoEditor({
     }
   }, [a1AudioItem]);
 
+  // ── Pitch behavior for speed changes ────────────────
+  // Browsers default preservesPitch to true; ClipAI's default is
+  // varispeed (false) so preview matches both export paths. The a1 audio
+  // item takes priority over the video item, same as the export payload.
+  const previewPreservePitch = a1AudioItem?.preservePitch
+    ?? videoTimelineItem?.preservePitch ?? false;
+  useEffect(() => {
+    applyPreservesPitch(videoRef.current, previewPreservePitch);
+  }, [previewPreservePitch]);
+
   // Reverse sync: write VideoEditor volume/speed back to the video timeline item
   // AND the a1 audio item so the PropertiesPanel stays in sync with the playback controls.
   useEffect(() => {
@@ -1468,6 +1479,10 @@ export default function VideoEditor({
       if (video.currentTime === 0 && clipStart > 0) {
         video.currentTime = clipStart;
       }
+      // Browsers default preservesPitch=true; ClipAI defaults to
+      // varispeed so preview pitch matches both export paths. (The
+      // preservePitch effect re-applies this when the item toggles.)
+      applyPreservesPitch(video, previewPreservePitch);
     };
     const onCanPlay = () => {
       setVideoReady(true);
@@ -2216,6 +2231,7 @@ export default function VideoEditor({
       audio.preload = 'auto';
       audio.volume = Math.min(1, Math.max(0, item.volume ?? 1));
       audio.playbackRate = item.speed ?? 1;
+      applyPreservesPitch(audio, item.preservePitch);
       audio.addEventListener('error', () => {
         console.warn(`[AudioOverlay] Failed to load audio for item ${item.id}: ${url}`);
         // If blob URL was revoked (page reload), try mediaRef backend URL

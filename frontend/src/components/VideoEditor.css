@@ -22,6 +22,7 @@
   --ve-slider-track: rgba(0, 0, 0, 0.12);
   --ve-dropdown-bg: rgba(255, 255, 255, 0.95);
   --ve-dropdown-shadow: 0 8px 32px rgba(0, 0, 0, 0.15);
+  --ve-warning: var(--accent-orange, #FF9F0A);
 
   position: relative;
   background: var(--bg-elevated, #f0f0f4);
@@ -2707,6 +2708,11 @@ input.ve-timecode--input {
 
 .ve-export-dialog__info p {
   margin: 0;
+}
+
+.ve-export-dialog__notice {
+  margin-top: 4px !important;
+  color: var(--ve-warning, #FF9F0A);
 }
 
 .ve-export-dialog__progress {

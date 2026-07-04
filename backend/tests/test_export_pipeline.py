@@ -3437,6 +3437,44 @@ def test_video_fade_duration_scales_with_speed():
     assert "fade=t=out:st=9.000:d=1.000" in vf1
 
 
+# ---------------------------------------------------------------------------
+# Speed pitch behavior (parity fix 1.4)
+# ---------------------------------------------------------------------------
+
+
+def test_varispeed_chain_strings():
+    """asetrate relabels at sr*speed, aresample restores the encoder rate."""
+    from backend.services.clip_exporter import _varispeed_chain
+
+    assert _varispeed_chain(2.0, 48000) == "asetrate=96000,aresample=48000"
+    assert _varispeed_chain(0.5, 44100) == "asetrate=22050,aresample=44100"
+    assert _varispeed_chain(1.25, 48000) == "asetrate=60000,aresample=48000"
+
+
+def test_speed_audio_chain_branches():
+    """preserve_pitch picks atempo; default varispeed; probe-failure falls
+    back to atempo instead of breaking the export."""
+    from backend.services.clip_exporter import _speed_audio_chain
+
+    # Default (varispeed) — pitch shifts, matching preview + client export
+    assert _speed_audio_chain(2.0, False, 48000) == "asetrate=96000,aresample=48000"
+    # Preserve pitch — atempo chain (2.0 fits one atempo)
+    assert _speed_audio_chain(2.0, True, 48000) == "atempo=2.0000"
+    # Extreme speeds chain multiple atempo stages
+    assert _speed_audio_chain(3.0, True, 48000) == "atempo=2.0,atempo=1.5000"
+    # Unknown sample rate → atempo fallback (never an empty/broken filter)
+    assert _speed_audio_chain(2.0, False, None) == "atempo=2.0000"
+
+
+def test_export_request_preserve_pitch_field():
+    from backend.models import ExportRequest
+
+    req = ExportRequest(start=0, end=10, clip_id=1)
+    assert req.preserve_pitch is False  # varispeed default matches preview
+    req2 = ExportRequest(start=0, end=10, clip_id=1, preserve_pitch=True)
+    assert req2.preserve_pitch is True
+
+
 # ===========================================================================
 # MAIN
 # ===========================================================================

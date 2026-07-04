@@ -529,6 +529,10 @@ class ExportRequest(BaseModel):
     # VideoEditor params — applied during FFmpeg export
     volume: float = 1.0              # 0.0 to 2.0 gain
     speed: float = 1.0               # 0.25 to 4.0 playback speed
+    # False (default) = varispeed: pitch shifts with speed, matching the
+    # preview element and the client export's AudioBufferSourceNode.
+    # True = pitch-preserving atempo chain.
+    preserve_pitch: bool = False
     trim_start_offset: float = 0.0   # Seconds trimmed from clip start
     trim_end_offset: float = 0.0     # Seconds trimmed from clip end
     segments: list[SegmentSettings] = []  # Per-segment volume/subtitle overrides

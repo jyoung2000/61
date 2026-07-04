@@ -939,6 +939,18 @@ export default function PropertiesPanel({ compact = false, settings = null, onSe
               </button>
             ))}
           </div>
+          {/* Varispeed (default) shifts pitch with speed, like tape;
+              preserve keeps the original pitch. Applies to preview and
+              both export paths (browser export routes to server). */}
+          <div className="ve-properties__speed-pills" style={{ marginTop: 6 }}>
+            <button
+              className={`ve-properties__speed-pill${item.preservePitch ? ' ve-properties__speed-pill--active' : ''}`}
+              onClick={() => update('preservePitch', !item.preservePitch)}
+              aria-pressed={!!item.preservePitch}
+            >
+              Preserve pitch
+            </button>
+          </div>
         </div>
       )}
 

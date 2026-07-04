@@ -3790,6 +3790,53 @@ def _atempo_chain(spd: float) -> str:
     return ",".join(parts)
 
 
+def _varispeed_chain(spd: float, sample_rate: int) -> str:
+    """Build a varispeed (pitch-shifting) speed filter for a given rate.
+
+    asetrate relabels the stream at sample_rate*speed (raising/lowering
+    pitch exactly like the preview element with preservesPitch=false and
+    the client export's AudioBufferSourceNode.playbackRate), then
+    aresample brings the stream back to the original rate so the encoder
+    sees a standard rate.
+    """
+    return f"asetrate={int(round(sample_rate * spd))},aresample={int(sample_rate)}"
+
+
+async def _probe_audio_sample_rate(video_path: str) -> int | None:
+    """Return the first audio stream's sample rate, or None."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "quiet", "-select_streams", "a:0",
+            "-show_entries", "stream=sample_rate", "-of", "csv=p=0",
+            video_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out, _ = await proc.communicate()
+        rate = int(out.decode().strip().splitlines()[0])
+        return rate if rate > 0 else None
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _speed_audio_chain(spd: float, preserve_pitch: bool, sample_rate: int | None) -> str:
+    """Pick the audio retiming filter for a speed change.
+
+    preserve_pitch=True → atempo chain (pitch constant).
+    preserve_pitch=False → varispeed via asetrate+aresample (pitch shifts,
+    matching preview/client export). Falls back to atempo with a warning
+    when the sample rate couldn't be probed, so the export never breaks.
+    """
+    if preserve_pitch:
+        return _atempo_chain(spd)
+    if sample_rate:
+        return _varispeed_chain(spd, sample_rate)
+    logger.warning(
+        "Varispeed requested but audio sample rate unknown — "
+        "falling back to pitch-preserving atempo (pitch will differ from preview)")
+    return _atempo_chain(spd)
+
+
 def _audio_fade_filters(fade_in: float, fade_out: float, out_duration: float) -> list[str]:
     """Build afade filters matching the preview's fadeGainAt() ramps.
 
@@ -6021,6 +6068,7 @@ async def export_clip(
     export_quality: str = "1080p",
     volume: float = 1.0,
     speed: float = 1.0,
+    preserve_pitch: bool = False,
     segments: list | None = None,
     global_subtitles_enabled: bool | None = None,
     video_effects: dict | None = None,
@@ -6048,7 +6096,10 @@ async def export_clip(
         subject_x if None or insufficient data.
 
     volume: Audio gain (0.0 to 2.0, default 1.0). Applied via -af volume filter.
-    speed: Playback speed (0.25 to 4.0, default 1.0). Applied via setpts + atempo.
+    speed: Playback speed (0.25 to 4.0, default 1.0). Applied via setpts + audio
+        retiming. preserve_pitch picks the audio algorithm: False (default) =
+        varispeed via asetrate+aresample (pitch shifts with speed, matching the
+        preview element and the client export); True = pitch-preserving atempo.
 
     progress_callback: optional async callable(message: str) for status updates.
     """
@@ -7439,6 +7490,9 @@ async def export_clip(
                     # path bakes into vf — audio and video ramps stay in sync.
                     _psg_fade_in = float((video_effects or {}).get("fade_in", 0) or 0)
                     _psg_fade_out = float((video_effects or {}).get("fade_out", 0) or 0)
+                    _psg_sr = None
+                    if not preserve_pitch:
+                        _psg_sr = await _probe_audio_sample_rate(video_path)
                     for i, tl in enumerate(timeline):
                         seg_dur = tl["end"] - tl["start"]
                         chain = (
@@ -7453,7 +7507,10 @@ async def export_clip(
                                 f":d={_psg_fade_out:.3f}"
                             )
                         if abs(tl["speed"] - 1.0) > 0.001:
-                            chain += f",{_atempo_chain(tl['speed'])}"
+                            _seg_af = _speed_audio_chain(
+                                tl["speed"], preserve_pitch, _psg_sr)
+                            if _seg_af:
+                                chain += f",{_seg_af}"
                         seg_vol = 0.0 if tl["muted"] else tl["volume"]
                         if abs(seg_vol - 1.0) > 0.001 or tl["muted"]:
                             chain += f",volume={seg_vol:.4f}"
@@ -7573,12 +7630,15 @@ async def export_clip(
                 elif has_speed:
                     vf = f"setpts={1.0/speed}*PTS"
 
-                # --- Audio filter chain: atempo + volume ---
+                # --- Audio filter chain: speed retiming + volume ---
                 af_parts: list[str] = []
                 if has_speed:
-                    atempo = _atempo_chain(speed)
-                    if atempo:
-                        af_parts.append(atempo)
+                    _sr = None
+                    if not preserve_pitch:
+                        _sr = await _probe_audio_sample_rate(video_path)
+                    speed_af = _speed_audio_chain(speed, preserve_pitch, _sr)
+                    if speed_af:
+                        af_parts.append(speed_af)
                 if has_volume:
                     if not has_segments:
                         af_parts.append(f"volume={volume:.2f}")

@@ -2,7 +2,7 @@ import React, { useState, useCallback, useRef, useMemo, useEffect } from 'react'
 import ExportEngine from '../engine/ExportEngine';
 import useTimelineStore from '../stores/timelineStore';
 import { runSubtitleQA } from '../utils/subtitleQA';
-import { buildOverlayPayload, buildVideoEffectsPayload, mapSubtitleSettings } from '../utils/buildExportPayload';
+import { buildOverlayPayload, buildVideoEffectsPayload, buildPlaybackPayload, mapSubtitleSettings } from '../utils/buildExportPayload';
 import { EXPORT_QUALITIES, EXPORT_QUALITY_PRESETS, getExportDims } from '../utils/defaultSettings';
 
 // Derived from the shared quality tables in defaultSettings.js — the
@@ -70,6 +70,15 @@ export default function ExportDialog({
   // Run subtitle QA validation
   const timelineItems = useTimelineStore((s) => s.items);
   const timelineMediaLibrary = useTimelineStore((s) => s.mediaLibrary);
+
+  // Preserve-pitch speed changes can't be rendered faithfully by the
+  // browser path (AudioBufferSourceNode.playbackRate is varispeed-only,
+  // and a phase-vocoder time-stretch in JS is out of scope) — those
+  // exports are routed to the server.
+  const needsServerForPitch = useMemo(
+    () => !!buildPlaybackPayload(useTimelineStore.getState()).preserve_pitch,
+    [timelineItems],
+  );
 
   // Compute optimal FPS (may be boosted for active word highlighting)
   const exportFPS = useMemo(() => {
@@ -183,16 +192,10 @@ export default function ExportDialog({
         }
       }
 
-      // Pull volume, speed, trim, segments from timeline store.
-      // The a1 audio item and video item properties (set via the Properties panel)
-      // take priority over the store's global volume/speed values.
+      // Pull volume, speed (+ preserve_pitch), trim, segments from the
+      // timeline store via the shared payload builder.
       const storeState = useTimelineStore.getState();
-      const videoItem = storeState.items.find(it => it.type === 'video');
-      const a1AudioItem = storeState.items.find(it => it.type === 'audio' && it.trackId === 'a1');
-      const effectiveVol = a1AudioItem?.volume ?? videoItem?.volume ?? (storeState.volume / 100);
-      const effectiveSpeed = a1AudioItem?.speed ?? videoItem?.speed ?? storeState.speed;
-      if (Math.abs(effectiveVol - 1.0) > 0.001) exportPayload.volume = effectiveVol;
-      if (Math.abs(effectiveSpeed - 1.0) > 0.001) exportPayload.speed = effectiveSpeed;
+      Object.assign(exportPayload, buildPlaybackPayload(storeState));
       if (storeState.trimStartOffset > 0) exportPayload.trim_start_offset = storeState.trimStartOffset;
       if (storeState.trimEndOffset > 0) exportPayload.trim_end_offset = storeState.trimEndOffset;
       if (storeState.segments?.length > 0) {
@@ -312,8 +315,13 @@ export default function ExportDialog({
     }
 
     // Client-side export
+    if (needsServerForPitch) {
+      setError('This clip uses a preserve-pitch speed change, which browser export cannot render faithfully. Switched to Server Export — press Export again.');
+      setExportMode('server');
+      return;
+    }
     if (!renderEngine) {
-      setError('Client-side export is not yet available. Please use Server Export.');
+      setError('Client-side export is not available in this browser. Use Server Export.');
       return;
     }
 
@@ -370,7 +378,7 @@ export default function ExportDialog({
     exportMode, quality, renderEngine, tracks, clips, settings, mediaElements,
     startTime, endTime, aspectRatio, onServerExport, onClose, subtitleQA,
     jobId, clipId, clipTitle, timelineMediaLibrary, transcript, exportFPS,
-    scenes, sourceWidth, sourceHeight, subjectX,
+    scenes, sourceWidth, sourceHeight, subjectX, needsServerForPitch,
   ]);
 
   const handleCancel = useCallback(() => {
@@ -474,6 +482,11 @@ export default function ExportDialog({
           <p>Export will be processed on the server using FFmpeg with full quality encoding.</p>
         ) : (
           <p>Export directly in your browser using WebCodecs. Faster for short clips, no server needed.</p>
+        )}
+        {needsServerForPitch && exportMode === 'client' && (
+          <p className="ve-export-dialog__notice">
+            This clip uses a preserve-pitch speed change — browser export renders audio varispeed only. Server export will be used for faithful pitch.
+          </p>
         )}
         {exportFPS > 30 && (
           <p style={{ fontSize: 11, color: 'var(--ve-accent, #0A84FF)', marginTop: 4 }}>
