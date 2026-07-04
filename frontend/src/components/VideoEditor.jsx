@@ -21,6 +21,7 @@ import CommandPalette from './CommandPalette';
 import ShortcutCheatSheet from './ShortcutCheatSheet';
 import PanelDivider, { usePanelSize } from './PanelDivider';
 import SafeZoneOverlay from './SafeZoneOverlay';
+import BottomSheet from './BottomSheet';
 import InteractiveOverlay from './InteractiveOverlay';
 import MarqueeSelection from './MarqueeSelection';
 import { hexToRgbString } from '../utils/colorUtils';
@@ -297,13 +298,9 @@ export default function VideoEditor({
   });
 
   // ── Multi-track editor state ──────────────────────
-  // Default to open on desktop so multi-track edits are immediately visible
-  const [showMultiTrack, setShowMultiTrack] = useState(() => {
-    const w = typeof window !== 'undefined' ? window.innerWidth : 1024;
-    // Open by default on tablet+ (≥768px), collapsed on phone (<768px).
-    // Phone users can toggle open via the Multi-Track Editor button.
-    return w >= 768;
-  });
+  // Open by default on EVERY viewport (3.1): phones get the touch-first
+  // compact-lane timeline + bottom-sheet inspector instead of no editor.
+  const [showMultiTrack, setShowMultiTrack] = useState(true);
   const [showMediaLibrary, setShowMediaLibrary] = useState(false);
   const [showProperties, setShowProperties] = useState(false);
   const [showExportDialog, setShowExportDialog] = useState(false);
@@ -4423,10 +4420,10 @@ export default function VideoEditor({
                 ariaLabel="Resize inspector width"
               />
             )}
-            {showProperties && (
+            {showProperties && !isMobile && (
               <div
                 className="ve-multitrack__sidebar ve-multitrack__sidebar--right"
-                style={isMobile ? undefined : { width: inspectorW, maxWidth: inspectorW }}
+                style={{ width: inspectorW, maxWidth: inspectorW }}
               >
                 <div className="ve-multitrack__sidebar-header">
                   <span>Properties</span>
@@ -4469,6 +4466,20 @@ export default function VideoEditor({
             )}
           </div>
         </div>
+      )}
+
+      {/* ── Mobile inspector: bottom sheet reusing the tabbed panel ── */}
+      {showMultiTrack && showProperties && isMobile && (
+        <BottomSheet title="Inspector" onClose={() => setShowProperties(false)}>
+          <EditorErrorBoundary name="Properties" compact>
+            <PropertiesPanel compact settings={settings} onSettingsChange={onSettingsChange} />
+          </EditorErrorBoundary>
+          {showEffectsPanel && (
+            <EditorErrorBoundary name="Effects" compact>
+              <EffectsPanel />
+            </EditorErrorBoundary>
+          )}
+        </BottomSheet>
       )}
 
       {/* ── Export Dialog ── */}

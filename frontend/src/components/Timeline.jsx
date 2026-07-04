@@ -6,13 +6,42 @@ import {
   getCachedThumbnail,
 } from '../utils/filmstrip';
 import ContextMenu from './ContextMenu';
+import useResponsive from '../hooks/useResponsive';
 
 // ── Constants ────────────────────────────────────────────────────────────────
 // Track sizing modeled after Premiere Pro / DaVinci Resolve / VEED — a clear
 // gap between lanes reads as "stacked cards" instead of "one giant grid",
 // which makes drag targets and selection states much easier to parse.
 const TRACK_HEIGHT = 56;
+// Mobile: lanes collapse to a slim bar; tapping a track header expands
+// ONE lane at a time back to full height (see laneHeightsFor).
+const COMPACT_TRACK_HEIGHT = 28;
 const TRACK_GAP = 6;
+
+/** Per-track lane heights. Desktop: uniform. Mobile: compact except the
+ * expanded lane. Pure so hit-tests and draw share the exact math. */
+function laneHeightsFor(tracks, isMobile, expandedTrackId) {
+  return tracks.map((t) => (
+    !isMobile || t.id === expandedTrackId ? TRACK_HEIGHT : COMPACT_TRACK_HEIGHT
+  ));
+}
+
+function laneTop(laneHs, idx) {
+  let y = RULER_HEIGHT;
+  for (let i = 0; i < idx; i++) y += (laneHs[i] ?? TRACK_HEIGHT) + TRACK_GAP;
+  return y;
+}
+
+function laneIndexFromY(laneHs, y) {
+  if (y < RULER_HEIGHT) return -1;
+  let top = RULER_HEIGHT;
+  for (let i = 0; i < laneHs.length; i++) {
+    const bottom = top + laneHs[i] + TRACK_GAP;
+    if (y < bottom) return i;
+    top = bottom;
+  }
+  return -1;
+}
 const LABEL_WIDTH = 140;
 const HANDLE_WIDTH = 4;          // slim resting state
 const HANDLE_WIDTH_HOVER = 8;    // fattened on hover for an easy grab
@@ -524,6 +553,18 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
   const tracks = useTimelineStore((s) => s.tracks);
   const items = useTimelineStore((s) => s.items);
   const cropSegments = useTimelineStore((s) => s.cropSegments);
+
+  // ── Mobile compact lanes (3.1) ──
+  // Phones render slim lanes; tapping a track header expands one lane
+  // at a time. laneHsRef feeds draw + hit tests (which read via refs).
+  const { isMobile: isMobileViewport } = useResponsive();
+  const [expandedTrackId, setExpandedTrackId] = useState(null);
+  const laneHs = useMemo(
+    () => laneHeightsFor(tracks, isMobileViewport, expandedTrackId),
+    [tracks, isMobileViewport, expandedTrackId],
+  );
+  const laneHsRef = useRef(laneHs);
+  laneHsRef.current = laneHs;
   const selectedCropSegmentId = useTimelineStore((s) => s.selectedCropSegmentId);
   const playhead = useTimelineStore((s) => s.playhead);
   const duration = useTimelineStore((s) => s.duration);
@@ -719,7 +760,9 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
 
     // ── Track lanes (ALL tracks always visible in timeline) ──
     tracks.forEach((track, idx) => {
-      const y = RULER_HEIGHT + idx * (TRACK_HEIGHT + TRACK_GAP);
+      const laneHsD = laneHsRef.current;
+      const y = laneTop(laneHsD, idx);
+      const laneH = laneHsD[idx] ?? TRACK_HEIGHT;
       const isHidden = track.visible === false;
 
       // Card-style track lane with subtle alternating tint — Premiere
@@ -729,36 +772,36 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
       ctx.fillStyle = isDark
         ? (laneAlt ? 'rgba(255,255,255,0.035)' : 'rgba(255,255,255,0.02)')
         : (laneAlt ? 'rgba(0,0,0,0.03)' : 'rgba(0,0,0,0.015)');
-      ctx.fillRect(contentLeft, y, contentWidth, TRACK_HEIGHT);
+      ctx.fillRect(contentLeft, y, contentWidth, laneH);
 
       // Track label background — solid darker strip so headers read as
       // "side rail" instead of part of the timeline grid.
       ctx.fillStyle = isDark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.04)';
-      ctx.fillRect(0, y, LABEL_WIDTH - 1, TRACK_HEIGHT);
+      ctx.fillRect(0, y, LABEL_WIDTH - 1, laneH);
 
       // Soft inner border — same accent on both axes so the lane reads
       // as a single rounded "card" even though we don't actually round
       // the rect (would force a save/restore per track).
       ctx.strokeStyle = isDark ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.07)';
       ctx.lineWidth = 1;
-      ctx.strokeRect(contentLeft + 0.5, y + 0.5, contentWidth - 1, TRACK_HEIGHT - 1);
+      ctx.strokeRect(contentLeft + 0.5, y + 0.5, contentWidth - 1, laneH - 1);
 
       // Muted overlay
       if (track.muted) {
         ctx.fillStyle = isDark ? 'rgba(255,59,48,0.07)' : 'rgba(255,59,48,0.05)';
-        ctx.fillRect(contentLeft, y, contentWidth, TRACK_HEIGHT);
+        ctx.fillRect(contentLeft, y, contentWidth, laneH);
       }
 
       // Hidden track overlay — dimmed with diagonal stripes pattern
       if (isHidden) {
         ctx.fillStyle = isDark ? 'rgba(0,0,0,0.35)' : 'rgba(128,128,128,0.15)';
-        ctx.fillRect(contentLeft, y, contentWidth, TRACK_HEIGHT);
-        ctx.fillRect(0, y, LABEL_WIDTH - 1, TRACK_HEIGHT);
+        ctx.fillRect(contentLeft, y, contentWidth, laneH);
+        ctx.fillRect(0, y, LABEL_WIDTH - 1, laneH);
       }
 
       // Track separator line — drawn in the gap between this track and the next
       if (idx < tracks.length - 1) {
-        const sepY = y + TRACK_HEIGHT + Math.floor(TRACK_GAP / 2);
+        const sepY = y + laneH + Math.floor(TRACK_GAP / 2);
         ctx.strokeStyle = isDark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.08)';
         ctx.lineWidth = 1;
         ctx.beginPath();
@@ -790,7 +833,9 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
     items.forEach((item) => {
       const trackIdx = tracks.findIndex((t) => t.id === item.trackId);
       if (trackIdx < 0) return;
-      const y = RULER_HEIGHT + trackIdx * (TRACK_HEIGHT + TRACK_GAP);
+      const laneHsD = laneHsRef.current;
+      const y = laneTop(laneHsD, trackIdx);
+      const laneH = laneHsD[trackIdx] ?? TRACK_HEIGHT;
       const x1 = contentLeft + item.start * pps - sx;
       const x2 = contentLeft + item.end * pps - sx;
       const w = x2 - x1;
@@ -798,7 +843,7 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
       // Clip rendering to track bounds — prevents visual bleed across the gap
       ctx.save();
       ctx.beginPath();
-      ctx.rect(0, y, canvasW, TRACK_HEIGHT);
+      ctx.rect(0, y, canvasW, laneH);
       ctx.clip();
 
       if (x2 < contentLeft || x1 > canvasW) { ctx.restore(); return; }
@@ -824,7 +869,7 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
       // Subtle vertical gradient — top is lighter, bottom darker. Reads
       // as depth without competing with the track-color identity.
       const bodyY = y + 3;
-      const bodyH = TRACK_HEIGHT - 6;
+      const bodyH = laneH - 6;
       const grad = ctx.createLinearGradient(0, bodyY, 0, bodyY + bodyH);
       const alphaTop = (isSelected || isMultiSelected) ? 'F0' : (isHovered ? 'C0' : '99');
       const alphaBot = (isSelected || isMultiSelected) ? 'C0' : (isHovered ? '95' : '6A');
@@ -859,7 +904,7 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
       // Throttled by computeThumbStops which targets ~thumbW pixels per
       // thumb so the count scales with zoom.
       const thumbCarrier = item.type === 'video' || item.type === 'image';
-      const innerH = TRACK_HEIGHT - 8;
+      const innerH = laneH - 8;
       const minClipPxForThumbs = 80;
       const mediaSrc = item.mediaSrc || item.src || null;
       if (thumbCarrier && clipW >= minClipPxForThumbs && innerH > 24 && mediaSrc) {
@@ -944,7 +989,7 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
       if (item.groupId && clipW > 8) {
         const hue = hashGroupId(item.groupId) % 360;
         ctx.fillStyle = `hsl(${hue}, 70%, 50%)`;
-        ctx.fillRect(clipX + 2, y + TRACK_HEIGHT - 6, clipW - 4, 4);
+        ctx.fillRect(clipX + 2, y + laneH - 6, clipW - 4, 4);
       }
 
       // Transition indicator
@@ -955,7 +1000,7 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
         ctx.beginPath();
         ctx.moveTo(x1, y + 2);
         ctx.lineTo(x1 + transW, y + 2);
-        ctx.lineTo(x1, y + TRACK_HEIGHT - 2);
+        ctx.lineTo(x1, y + laneH - 2);
         ctx.closePath();
         ctx.fill();
       }
@@ -973,7 +1018,7 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
         // Subtle text shadow so labels stay readable on any track color.
         ctx.shadowColor = 'rgba(0,0,0,0.45)';
         ctx.shadowBlur = 2;
-        ctx.fillText(label, Math.max(x1 + 10, contentLeft + 6), y + TRACK_HEIGHT / 2 + 4, w - 18);
+        ctx.fillText(label, Math.max(x1 + 10, contentLeft + 6), y + laneH / 2 + 4, w - 18);
         ctx.shadowColor = 'transparent';
         ctx.shadowBlur = 0;
       }
@@ -1042,12 +1087,14 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
       if (cropTrackIdx >= 0) {
         const cropTrack = tracks[cropTrackIdx];
         if (cropTrack.visible !== false) {
-          const cy = RULER_HEIGHT + cropTrackIdx * (TRACK_HEIGHT + TRACK_GAP);
+          const laneHsC = laneHsRef.current;
+          const cy = laneTop(laneHsC, cropTrackIdx);
+          const cropLaneH = laneHsC[cropTrackIdx] ?? TRACK_HEIGHT;
 
           // Clip crop segment rendering to crop track bounds
           ctx.save();
           ctx.beginPath();
-          ctx.rect(0, cy, canvasW, TRACK_HEIGHT);
+          ctx.rect(0, cy, canvasW, cropLaneH);
           ctx.clip();
 
           // Precompute next-segment start times so min-width clamping doesn't
@@ -1081,7 +1128,7 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
             const isHoverCrop = hoverRef.current.cropId === seg.id;
 
             const sBodyY = cy + 4;
-            const sBodyH = TRACK_HEIGHT - 8;
+            const sBodyH = cropLaneH - 8;
             const sRr = 4;
 
             // Vertical gradient — same depth treatment as the main
@@ -1166,7 +1213,7 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
               ctx.shadowColor = 'rgba(0,0,0,0.45)';
               ctx.shadowBlur = 2;
               const lbl = seg.label || `${Math.round(seg.cropX)}%`;
-              ctx.fillText(lbl, Math.max(cx1 + 8, contentLeft + 6), cy + TRACK_HEIGHT / 2 + 4, cw - 16);
+              ctx.fillText(lbl, Math.max(cx1 + 8, contentLeft + 6), cy + cropLaneH / 2 + 4, cw - 16);
               ctx.shadowColor = 'transparent';
               ctx.shadowBlur = 0;
             }
@@ -1486,8 +1533,8 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
     const canvas = canvasRef.current;
     if (!canvas) return null;
     const rect = canvas.getBoundingClientRect();
-    const y = clientY - rect.top - RULER_HEIGHT;
-    const idx = Math.floor(y / (TRACK_HEIGHT + TRACK_GAP));
+    const y = clientY - rect.top;
+    const idx = laneIndexFromY(laneHsRef.current, y);
     // Read latest tracks from store to avoid stale closures
     const currentTracks = useTimelineStore.getState().tracks;
     if (idx < 0 || idx >= currentTracks.length) return null;
@@ -1508,7 +1555,7 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
 
     // Inline track-from-Y to use currentTracks from getState()
     const mouseY = clientY - rect.top;
-    const trackIdx = Math.floor((mouseY - RULER_HEIGHT) / (TRACK_HEIGHT + TRACK_GAP));
+    const trackIdx = laneIndexFromY(laneHsRef.current, mouseY);
     if (trackIdx < 0 || trackIdx >= currentTracks.length) return null;
     const track = currentTracks[trackIdx];
     if (!track) return null;
@@ -1563,7 +1610,7 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
     const currentPps = ppsRef.current;
 
     // Verify Y is on the crop track
-    const trackIdx = Math.floor((mouseY - RULER_HEIGHT) / (TRACK_HEIGHT + TRACK_GAP));
+    const trackIdx = laneIndexFromY(laneHsRef.current, mouseY);
     if (trackIdx !== cropTrackIdx) return null;
 
     const x = px - LABEL_WIDTH + currentScrollX;
@@ -1594,7 +1641,7 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
       const px = e.clientX - rect.left;
       const mouseY = e.clientY - rect.top;
       if (px < LABEL_WIDTH && mouseY > RULER_HEIGHT) {
-        const trackIdx = Math.floor((mouseY - RULER_HEIGHT) / (TRACK_HEIGHT + TRACK_GAP));
+        const trackIdx = laneIndexFromY(laneHsRef.current, mouseY);
         const track = useTimelineStore.getState().tracks[trackIdx];
         if (track) {
           setContextMenu({ kind: 'track', x: e.clientX, y: e.clientY, trackId: track.id });
@@ -2378,6 +2425,101 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
     return entries;
   }, [contextMenu, selectedItemIds, splitItem, removeItem, updateItem, groupItems, ungroupItems]);
 
+  // ── Touch gestures (3.1): pinch = zoom, two-finger pan = scroll,
+  //    long-press = context menu action sheet ──
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return undefined;
+    const touches = new Map();
+    let gesture = null;
+    let longPressTimer = 0;
+    let pressOrigin = null;
+
+    const clearLongPress = () => { if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = 0; } };
+
+    const onDown = (e) => {
+      if (e.pointerType !== 'touch') return;
+      touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      if (touches.size === 1) {
+        const { clientX, clientY } = e;
+        pressOrigin = { x: clientX, y: clientY };
+        longPressTimer = setTimeout(() => {
+          const hit = hitTestItem(clientX, clientY);
+          if (hit?.item) {
+            // Abort any drag the regular pointerdown started
+            setIsDragging(false);
+            setDragInfo(null);
+            setSelectedItemId(hit.item.id);
+            setContextMenu({
+              kind: 'item', sheet: true,
+              x: clientX, y: clientY,
+              time: getTimeFromX(clientX),
+              item: hit.item,
+            });
+          }
+        }, 550);
+      } else {
+        clearLongPress();
+      }
+      if (touches.size === 2) {
+        // Two fingers → cancel single-finger drag, start pinch/pan
+        setIsDragging(false);
+        setDragInfo(null);
+        const pts = [...touches.values()];
+        const st = useTimelineStore.getState();
+        gesture = {
+          startDist: Math.max(8, Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y)),
+          startZoom: st.zoom,
+          startScrollX: st.scrollX,
+          startMidX: (pts[0].x + pts[1].x) / 2,
+        };
+      }
+    };
+
+    const onMove = (e) => {
+      if (e.pointerType !== 'touch' || !touches.has(e.pointerId)) return;
+      touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      if (pressOrigin && Math.hypot(e.clientX - pressOrigin.x, e.clientY - pressOrigin.y) > 10) {
+        clearLongPress();
+      }
+      if (touches.size === 2 && gesture) {
+        e.preventDefault();
+        const pts = [...touches.values()];
+        const dist = Math.max(8, Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y));
+        const midX = (pts[0].x + pts[1].x) / 2;
+        const newZoom = Math.max(0.01, Math.min(10, gesture.startZoom * (dist / gesture.startDist)));
+        // Anchor the zoom on the gesture midpoint; horizontal midpoint
+        // travel doubles as a two-finger pan.
+        const rect = canvas.getBoundingClientRect();
+        const cursorPx = Math.max(0, gesture.startMidX - rect.left - LABEL_WIDTH);
+        const anchorTime = (gesture.startScrollX + cursorPx) / (basePPS * gesture.startZoom);
+        const panDx = midX - gesture.startMidX;
+        setZoom(newZoom);
+        setScrollX(Math.max(0, anchorTime * basePPS * newZoom - cursorPx - panDx));
+      }
+    };
+
+    const onUp = (e) => {
+      if (e.pointerType !== 'touch') return;
+      touches.delete(e.pointerId);
+      clearLongPress();
+      pressOrigin = null;
+      if (touches.size < 2) gesture = null;
+    };
+
+    canvas.addEventListener('pointerdown', onDown);
+    canvas.addEventListener('pointermove', onMove, { passive: false });
+    canvas.addEventListener('pointerup', onUp);
+    canvas.addEventListener('pointercancel', onUp);
+    return () => {
+      clearLongPress();
+      canvas.removeEventListener('pointerdown', onDown);
+      canvas.removeEventListener('pointermove', onMove);
+      canvas.removeEventListener('pointerup', onUp);
+      canvas.removeEventListener('pointercancel', onUp);
+    };
+  }, [basePPS, hitTestItem, getTimeFromX, setZoom, setScrollX, setSelectedItemId]);
+
   // ── Zoom to fit — toolbar Fit button, ⇧Z (action registry event) ──
   const zoomToFit = useCallback(() => {
     const canvas = canvasRef.current;
@@ -2399,7 +2541,7 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
   }, [zoomToFit]);
 
   // ── Compute canvas height ──────────────────────────────────────────────────
-  const canvasHeight = RULER_HEIGHT + tracks.length * (TRACK_HEIGHT + TRACK_GAP) + 12;
+  const canvasHeight = laneTop(laneHs, tracks.length) + 12;
 
   return (
     <div ref={containerRef} className="ve-multi-timeline" style={{ position: 'relative', height: '100%' }}>
@@ -2552,8 +2694,12 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
                   e.stopPropagation();
                   setContextMenu({ kind: 'track', x: e.clientX, y: e.clientY, trackId: track.id });
                 }}
+                onClick={isMobileViewport ? () => {
+                  // Tap a lane badge on mobile → expand that one lane
+                  setExpandedTrackId((cur) => (cur === track.id ? null : track.id));
+                } : undefined}
                 style={{
-                  height: TRACK_HEIGHT,
+                  height: laneHs[trackIdx] ?? TRACK_HEIGHT,
                   marginBottom: TRACK_GAP,
                   display: 'flex',
                   flexDirection: 'column',
@@ -2758,14 +2904,14 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
             aria-label="Track rail — click a swatch to scroll its track into view"
           >
             {tracks.map((track, trackIdx) => {
-              const trackY = RULER_HEIGHT + trackIdx * (TRACK_HEIGHT + TRACK_GAP);
+              const trackY = laneTop(laneHs, trackIdx);
               const swatchColor = TRACK_COLORS[track.type] || TRACK_COLORS.video;
               return (
                 <button
                   key={track.id}
                   className="ve-multi-timeline__rail-dot"
                   style={{
-                    height: TRACK_HEIGHT - 6,
+                    height: (laneHs[trackIdx] ?? TRACK_HEIGHT) - 6,
                     background: swatchColor,
                     marginTop: trackIdx === 0 ? RULER_HEIGHT + 3 : TRACK_GAP - 1,
                   }}
@@ -2817,6 +2963,7 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
           x={contextMenu.x}
           y={contextMenu.y}
           items={contextMenuItems}
+          sheet={!!contextMenu.sheet}
           onClose={() => setContextMenu(null)}
         />
       )}
