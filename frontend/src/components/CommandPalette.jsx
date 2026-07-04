@@ -57,16 +57,29 @@ export default function CommandPalette({ open, onClose, ctx }) {
           value={query}
           onChange={(e) => { setQuery(e.target.value); setCursor(0); }}
           onKeyDown={onKeyDown}
+          role="combobox"
+          aria-expanded={results.length > 0}
+          aria-controls="ve-palette-listbox"
+          aria-activedescendant={results[cursor] ? `ve-palette-opt-${results[cursor].id}` : undefined}
+          aria-autocomplete="list"
         />
-        <div className="ve-palette__list" role="listbox">
+        {/* Result count for screen readers — the visual list is aria-hidden
+            from announcement duplication by virtue of the options below */}
+        <div className="ve-visually-hidden" aria-live="polite">
+          {results.length === 0 ? 'No matching commands'
+            : `${results.length} command${results.length === 1 ? '' : 's'} available`}
+        </div>
+        <div className="ve-palette__list" role="listbox" id="ve-palette-listbox">
           {results.length === 0 && (
             <div className="ve-palette__empty">No matching commands</div>
           )}
           {results.map((a, i) => (
             <button
               key={a.id}
+              id={`ve-palette-opt-${a.id}`}
               role="option"
               aria-selected={i === cursor}
+              tabIndex={-1}
               className={`ve-palette__item${i === cursor ? ' ve-palette__item--active' : ''}`}
               onPointerEnter={() => setCursor(i)}
               onClick={() => run(a)}

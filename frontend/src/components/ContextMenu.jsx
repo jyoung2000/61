@@ -65,6 +65,13 @@ export default function ContextMenu({ x = 0, y = 0, items = [], onClose, sheet =
 
   const onKeyDown = (e) => {
     if (e.key === 'Escape') { e.stopPropagation(); onClose?.(); return; }
+    if (e.key === 'Home' || e.key === 'End') {
+      e.preventDefault();
+      if (actionable.length === 0) return;
+      const target = e.key === 'Home' ? actionable[0] : actionable[actionable.length - 1];
+      setFocusIdx(target.i);
+      return;
+    }
     if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
       e.preventDefault();
       if (actionable.length === 0) return;
