@@ -5,7 +5,7 @@
  * PropertiesPanel renders inside unchanged, so phone and desktop share
  * one inspector implementation. Respects env(safe-area-inset-bottom).
  */
-import React, { useCallback, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 
 const DETENTS = { peek: 0.16, half: 0.45, full: 0.85 }; // × viewport height
 
@@ -14,7 +14,21 @@ export default function BottomSheet({ children, title = 'Inspector', onClose }) 
   const [dragY, setDragY] = useState(null); // live height while dragging (px)
   const gestureRef = useRef(null);
 
-  const vh = typeof window !== 'undefined' ? window.innerHeight : 800;
+  // Detents measure against the VISIBLE viewport: on iOS Safari
+  // window.innerHeight includes space under the collapsed URL bar and
+  // above the keyboard, so a "half" sheet could bury its handle. The
+  // visualViewport API tracks the live visible height; resubscribe on
+  // its resize so the detents follow keyboard/toolbar changes.
+  const readVh = () => (typeof window !== 'undefined'
+    ? (window.visualViewport?.height || window.innerHeight)
+    : 800);
+  const [vh, setVh] = useState(readVh);
+  useEffect(() => {
+    const vv = typeof window !== 'undefined' ? window.visualViewport : null;
+    const update = () => setVh(readVh());
+    (vv || window).addEventListener('resize', update);
+    return () => (vv || window).removeEventListener('resize', update);
+  }, []);
   const heightPx = dragY ?? Math.round(DETENTS[detent] * vh);
 
   const snap = useCallback((px) => {

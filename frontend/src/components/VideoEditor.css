@@ -134,8 +134,13 @@
   position: fixed;
   inset: 0;
   z-index: 99999;
+  /* iOS Safari viewport ladder: vh/vw base for old engines, svh keeps
+     the frame clear of the collapsed URL bar, dvh tracks the LIVE
+     browser chrome so the lightbox always fills exactly the visible
+     screen with the toolbar expanded or collapsed. */
   width: 100vw;
   height: 100vh;
+  height: 100svh;
   max-width: none;
   max-height: none;
   margin: 0;
@@ -148,6 +153,14 @@
   aspect-ratio: auto;
   /* Animate in. */
   animation: ve-lightbox-fade-in 160ms ease-out;
+}
+
+
+@supports (height: 100dvh) {
+  .ve-viewport--fullscreen {
+    width: 100dvw;
+    height: 100dvh;
+  }
 }
 
 @keyframes ve-lightbox-fade-in {
@@ -180,6 +193,9 @@
   height: min(100vh, calc(100vw / var(--ve-target-ratio, 1.7777)));
   width: min(100vw, calc(100svh * var(--ve-target-ratio, 1.7777)));
   height: min(100svh, calc(100vw / var(--ve-target-ratio, 1.7777)));
+  /* Live-chrome tier: dvh/dvw track the URL bar expanding/collapsing. */
+  width: min(100dvw, calc(100dvh * var(--ve-target-ratio, 1.7777)));
+  height: min(100dvh, calc(100dvw / var(--ve-target-ratio, 1.7777)));
   display: block;
   background: #000;
   box-shadow: 0 30px 80px rgba(0, 0, 0, 0.55);
@@ -3967,6 +3983,8 @@ input.ve-timecode--input {
   -webkit-overflow-scrolling: touch;
   padding: 0 12px calc(12px + var(--safe-bottom, 0px));
   touch-action: pan-y;
+  /* Scrolling inside the sheet must never rubber-band the page behind it */
+  overscroll-behavior: contain;
 }
 
 /* Mobile editor ergonomics: ≥44px touch targets on editor chrome */
