@@ -20,6 +20,7 @@ import ExportDialog from './ExportDialog';
 import CommandPalette from './CommandPalette';
 import ShortcutCheatSheet from './ShortcutCheatSheet';
 import PanelDivider, { usePanelSize } from './PanelDivider';
+import SafeZoneOverlay from './SafeZoneOverlay';
 import InteractiveOverlay from './InteractiveOverlay';
 import MarqueeSelection from './MarqueeSelection';
 import { hexToRgbString } from '../utils/colorUtils';
@@ -2497,6 +2498,8 @@ export default function VideoEditor({
   }, []);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [cheatSheetOpen, setCheatSheetOpen] = useState(false);
+  // Platform safe-zone preview overlay (driven by the export dialog)
+  const [safeZonePlatform, setSafeZonePlatform] = useState(null);
 
   // Shared action context — the same shape the keyboard registry uses,
   // handed to the command palette so both run identical action code.
@@ -3309,6 +3312,15 @@ export default function VideoEditor({
             (which default to the topmost track) appear on top of shapes,
             images, and text overlays — matching the track stacking order. */}
         {subtitleOverlay}
+
+        {/* Platform safe-zone preview — toggled from the export dialog */}
+        {safeZonePlatform && (
+          <SafeZoneOverlay
+            profile={safeZonePlatform}
+            videoWidth={sourceWidth}
+            videoHeight={sourceHeight}
+          />
+        )}
 
         {/* Interactive overlay: click-to-select, drag, resize, rotate on preview.
             Disabled in lightbox/fullscreen — that view is preview-focused, not
@@ -4476,6 +4488,7 @@ export default function VideoEditor({
           sourceHeight={sourceHeight}
           subjectX={subjectX}
           onServerExport={handleServerExport}
+          onSafeZonePreview={setSafeZonePlatform}
         />
       )}
 

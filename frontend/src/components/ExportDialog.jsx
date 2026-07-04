@@ -4,6 +4,7 @@ import useTimelineStore from '../stores/timelineStore';
 import { runSubtitleQA } from '../utils/subtitleQA';
 import { buildOverlayPayload, buildVideoEffectsPayload, buildPlaybackPayload, mapSubtitleSettings } from '../utils/buildExportPayload';
 import { EXPORT_QUALITIES, EXPORT_QUALITY_PRESETS, getExportDims } from '../utils/defaultSettings';
+import { PLATFORM_PRESETS } from '../utils/safeZones';
 
 // Derived from the shared quality tables in defaultSettings.js — the
 // dialog can't drift from the panel or the backend dims again.
@@ -41,6 +42,9 @@ export default function ExportDialog({
   sourceWidth = 1920,
   sourceHeight = 1080,
   subjectX = 50,
+  // Platform safe-zone preview: called with a profile name (or null) so
+  // the parent viewport can shade the regions platform UI will cover.
+  onSafeZonePreview,
 }) {
   // Initialize from the parent's clip settings so the dialog and the
   // Settings panel stay in agreement. Default to ``1080p`` only when
@@ -60,6 +64,39 @@ export default function ExportDialog({
   const [error, setError] = useState(null);
   const [qaReport, setQaReport] = useState(null);
   const exportEngineRef = useRef(null);
+
+  // Platform preset chips (TikTok / Reels / Shorts / YouTube): one click
+  // sets aspect + quality for THIS export and offers the safe-zone
+  // preview. The aspect override is export-local — it never mutates the
+  // editor settings.
+  const [platformId, setPlatformId] = useState(null);
+  const [aspectOverride, setAspectOverride] = useState(null);
+  const [showSafeZones, setShowSafeZones] = useState(false);
+  const effectiveAspect = aspectOverride ?? aspectRatio;
+  const activePlatform = PLATFORM_PRESETS.find((p) => p.id === platformId) || null;
+
+  const selectPlatform = (preset) => {
+    if (platformId === preset.id) {
+      setPlatformId(null);
+      setAspectOverride(null);
+      setShowSafeZones(false);
+      onSafeZonePreview?.(null);
+      return;
+    }
+    setPlatformId(preset.id);
+    setAspectOverride(preset.aspect);
+    setQuality(preset.quality);
+    if (showSafeZones) onSafeZonePreview?.(preset.profile);
+  };
+
+  const toggleSafeZones = () => {
+    const next = !showSafeZones;
+    setShowSafeZones(next);
+    onSafeZonePreview?.(next && activePlatform ? activePlatform.profile : null);
+  };
+
+  // Clear the viewport overlay when the dialog unmounts
+  useEffect(() => () => onSafeZonePreview?.(null), []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const canClientExport = ExportEngine.isWebCodecsAvailable();
 
@@ -138,14 +175,28 @@ export default function ExportDialog({
   };
 
   const subtitleQA = useMemo(() => {
-    const { w: exportW, h: exportH } = getExportDims(quality, aspectRatio);
+    const { w: exportW, h: exportH } = getExportDims(quality, effectiveAspect);
     const syncInfo = transcript ? { transcript, clipStart: startTime, clipEnd: endTime } : undefined;
     const trackingInfo = scenes?.length ? {
       scenes, clipStart: startTime, clipEnd: endTime,
       srcW: sourceWidth, srcH: sourceHeight, subjectX,
     } : null;
-    return runSubtitleQA(timelineItems, settings, { w: exportW, h: exportH }, syncInfo, exportFPS, trackingInfo, aspectRatio);
-  }, [timelineItems, settings, quality, aspectRatio, transcript, startTime, endTime, exportFPS, scenes, sourceWidth, sourceHeight, subjectX]);
+    return runSubtitleQA(timelineItems, settings, { w: exportW, h: exportH }, syncInfo, exportFPS, trackingInfo, effectiveAspect);
+  }, [timelineItems, settings, quality, effectiveAspect, transcript, startTime, endTime, exportFPS, scenes, sourceWidth, sourceHeight, subjectX]);
+
+  // Pre-export checklist: overlay payload warnings (media not uploaded,
+  // blob URLs, …) surfaced as checklist rows instead of a toast at
+  // export time.
+  const overlayWarnings = useMemo(() => {
+    try {
+      return buildOverlayPayload({
+        timelineItems,
+        mediaLibrary: timelineMediaLibrary,
+        clipStart: startTime,
+        tracks: useTimelineStore.getState().tracks,
+      }).warnings;
+    } catch { return []; }
+  }, [timelineItems, timelineMediaLibrary, startTime]);
 
   const handleExport = useCallback(async () => {
     setError(null);
@@ -169,8 +220,9 @@ export default function ExportDialog({
 
       // Map camelCase clipSettings → snake_case backend fields (not a blind spread)
       if (settings) {
-        if (settings.aspectRatio) {
-          exportPayload.aspect_ratio = settings.aspectRatio;
+        if (aspectOverride || settings.aspectRatio) {
+          // Platform chip override wins for this export only
+          exportPayload.aspect_ratio = aspectOverride || settings.aspectRatio;
         }
         const globalSubsOn = settings.subtitlesEnabled || false;
         // Check if any segment has per-segment subtitle overrides
@@ -326,7 +378,7 @@ export default function ExportDialog({
 
     const preset = QUALITY_PRESETS.find(p => p.id === quality) || QUALITY_PRESETS[1];
     // Shared quality × aspect table — identical pixel dims to server export.
-    const { w: exportW, h: exportH } = getExportDims(quality, aspectRatio);
+    const { w: exportW, h: exportH } = getExportDims(quality, effectiveAspect);
 
     const engine = new ExportEngine(renderEngine, {
       fps: exportFPS,
@@ -375,6 +427,7 @@ export default function ExportDialog({
     startTime, endTime, aspectRatio, onServerExport, onClose, subtitleQA,
     jobId, clipId, clipTitle, timelineMediaLibrary, transcript, exportFPS,
     scenes, sourceWidth, sourceHeight, subjectX, needsServerForPitch,
+    aspectOverride, effectiveAspect,
   ]);
 
   const handleCancel = useCallback(() => {
@@ -435,6 +488,38 @@ export default function ExportDialog({
             </button>
           ))}
         </div>
+
+        {/* Platform presets: aspect + quality + safe-zone preview */}
+        <div className="ve-export-dialog__platforms">
+          {PLATFORM_PRESETS.map((p) => (
+            <button
+              key={p.id}
+              className={`ve-export-dialog__platform-chip${platformId === p.id ? ' ve-export-dialog__platform-chip--active' : ''}`}
+              onClick={() => selectPlatform(p)}
+              aria-pressed={platformId === p.id}
+            >
+              {p.label}
+            </button>
+          ))}
+          {activePlatform && (
+            <button
+              className={`ve-export-dialog__safezone-toggle${showSafeZones ? ' ve-export-dialog__safezone-toggle--active' : ''}`}
+              onClick={toggleSafeZones}
+              aria-pressed={showSafeZones}
+            >
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
+                <circle cx="12" cy="12" r="3" />
+              </svg>
+              Show safe zones
+            </button>
+          )}
+        </div>
+        {activePlatform && aspectOverride && aspectOverride !== aspectRatio && (
+          <p className="ve-export-dialog__notice" style={{ fontSize: 10 }}>
+            Exporting as {aspectOverride} for {activePlatform.label} (editor aspect unchanged).
+          </p>
+        )}
       </div>
 
       {/* Cost / quota preview ─ informational only ─────────────── */}
@@ -514,6 +599,19 @@ export default function ExportDialog({
           <div className={`ve-export-dialog__qa-confidence ve-export-dialog__qa-confidence--${subtitleQA.confidence}`}>
             Preview-to-export match confidence: {subtitleQA.confidence}
             {subtitleQA.confidence === 'high' && ' — exported video will look exactly like preview'}
+          </div>
+        )}
+        {/* Overlay payload pre-flight — media/upload issues that would
+            otherwise only appear as a toast at export time */}
+        {overlayWarnings.length > 0 && (
+          <div className="ve-export-dialog__qa-check">
+            <div className="ve-export-dialog__qa-check-head">
+              <span className="ve-export-dialog__qa-check-icon ve-export-dialog__qa-check-icon--warn">⚠</span>
+              <span className="ve-export-dialog__qa-check-name">Overlays</span>
+            </div>
+            {overlayWarnings.map((w, i) => (
+              <div key={`ow-${i}`} className="ve-export-dialog__qa-issue ve-export-dialog__qa-issue--warn">• {w}</div>
+            ))}
           </div>
         )}
         {/* Per-check breakdown */}

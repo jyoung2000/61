@@ -3819,3 +3819,80 @@ input.ve-timecode--input {
 .ve-panel-divider:focus-visible .ve-panel-divider__grip {
   background: var(--ve-accent);
 }
+
+/* ═══ Safe-zone overlay (2.8) ═══ */
+.ve-safezone {
+  position: absolute;
+  inset: 0;
+  z-index: 6;
+  pointer-events: none;
+}
+
+.ve-safezone__frame {
+  border: 1.5px dashed var(--ve-accent);
+  border-radius: 4px;
+}
+
+.ve-safezone__label {
+  position: absolute;
+  top: 4px;
+  left: 6px;
+  padding: 1px 6px;
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: capitalize;
+  letter-spacing: 0.03em;
+  color: #fff;
+  background: var(--ve-accent);
+  border-radius: 3px;
+}
+
+/* ═══ Export dialog platform chips (2.8) ═══ */
+.ve-export-dialog__platforms {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 10px;
+  flex-wrap: wrap;
+}
+
+.ve-export-dialog__platform-chip {
+  padding: 4px 10px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--ve-text);
+  background: var(--ve-track-bg);
+  border: 1px solid var(--ve-track-border);
+  border-radius: 999px;
+  cursor: pointer;
+  transition: all var(--dur-fast) var(--ease-out-quart);
+}
+
+.ve-export-dialog__platform-chip:hover {
+  border-color: var(--ve-accent);
+}
+
+.ve-export-dialog__platform-chip--active {
+  background: var(--ve-accent);
+  border-color: var(--ve-accent);
+  color: #fff;
+}
+
+.ve-export-dialog__safezone-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+  padding: 4px 8px;
+  font-size: 10px;
+  color: var(--ve-text-muted);
+  background: none;
+  border: 1px solid var(--ve-track-border);
+  border-radius: 999px;
+  cursor: pointer;
+}
+
+.ve-export-dialog__safezone-toggle--active {
+  color: var(--ve-accent);
+  border-color: var(--ve-accent);
+}
