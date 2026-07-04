@@ -159,6 +159,114 @@ def qwen3_translation_options(model_name: str) -> dict:
     }
 
 
+# Approximate effective bits-per-weight for common GGUF quantizations, used
+# only to SIZE a model against VRAM (not for any accuracy claim). Good enough
+# to tell a q4 (~4.8 bpw) from a q3 (~3.4 bpw) of the same model.
+_QUANT_BPW = {
+    "q2_k": 2.6, "q3_k_s": 3.1, "q3_k_m": 3.4, "q3_k_l": 3.7,
+    "q4_0": 4.5, "q4_1": 4.9, "q4_k_s": 4.6, "q4_k_m": 4.8,
+    "q5_0": 5.5, "q5_1": 5.9, "q5_k_s": 5.5, "q5_k_m": 5.7,
+    "q6_k": 6.6, "q8_0": 8.5, "f16": 16.0, "fp16": 16.0, "bf16": 16.0,
+}
+
+
+def _parse_quant(name: str):
+    """Return ``(quant_key, bits_per_weight)`` parsed from a GGUF tag, or
+    ``(None, None)``. Matches the longest quant token so ``q4_k_m`` wins over
+    ``q4``. Tolerates ``-``/``_`` separators and case (``q4_K_M``)."""
+    n = (name or "").lower().replace("-", "_")
+    best = None
+    for k in _QUANT_BPW:
+        if k in n and (best is None or len(k) > len(best)):
+            best = k
+    return (best, _QUANT_BPW[best]) if best else (None, None)
+
+
+def _model_base_key(name: str) -> str:
+    """Identity of a model IGNORING its quant tag, so different quantizations
+    of the same weights compare equal.
+
+    ``qwen3:4b-instruct-2507-q4_K_M`` and ``…-q3_K_M`` both key to
+    ``qwen3:4b_instruct_2507``."""
+    n = _norm_ollama_name(name).replace("-", "_")
+    qk, _ = _parse_quant(n)
+    if qk:
+        idx = n.rfind(qk)
+        if idx > 0:
+            return n[:idx].rstrip("_")
+    return n
+
+
+def estimate_model_weights_gb(name: str) -> Optional[float]:
+    """Rough GiB of GPU memory the WEIGHTS of ``name`` occupy.
+
+    ``params_b * bits_per_weight / 8``. Returns ``None`` when the tag carries no
+    parseable size. Quant defaults to q4 (~4.8 bpw) when the tag omits it."""
+    params = _parse_params_b(name)
+    if params is None:
+        return None
+    _, bpw = _parse_quant(name)
+    if not bpw:
+        bpw = 4.8  # assume a q4 build when the tag omits the quant
+    return params * bpw / 8.0
+
+
+def select_gpu_fitting_quant(
+    configured: str,
+    installed: list,
+    *,
+    total_vram_gb: float,
+    baseline_reserve_gb: float,
+    kv_headroom_gb: float,
+):
+    """Pick a GPU-fitting quantization of ``configured`` when it won't fit.
+
+    Returns ``(chosen_model, reason)`` — ``reason`` is ``None`` (keep the
+    configured model) when it already fits, VRAM can't be measured, or no
+    smaller-quant build of the SAME weights is installed that fits.
+
+    Fit test: ``weights_gb + kv_headroom_gb <= (total_vram_gb -
+    baseline_reserve_gb)``. The reserve accounts for the CUDA context +
+    baseline allocation that never frees; the headroom for the KV cache +
+    compute graph. Among fitting same-base builds we keep the LARGEST quant
+    (highest fidelity that still runs fully on the GPU)."""
+    if not configured or total_vram_gb <= 0:
+        return (configured, None)
+    budget = total_vram_gb - max(0.0, baseline_reserve_gb)
+    if budget <= 0:
+        return (configured, None)
+
+    def _fits(model_name: str) -> bool:
+        w = estimate_model_weights_gb(model_name)
+        return w is not None and (w + max(0.0, kv_headroom_gb)) <= budget
+
+    if _fits(configured):
+        return (configured, None)  # already runs fully on the GPU
+
+    base = _model_base_key(configured)
+    _, cfg_bpw = _parse_quant(configured)
+    candidates = []
+    for m in installed or []:
+        if not m or _model_base_key(m) != base:
+            continue
+        _, bpw = _parse_quant(m)
+        if bpw is None:
+            continue
+        if cfg_bpw is not None and bpw >= cfg_bpw:
+            continue  # not a smaller quant than what's configured
+        if _fits(m):
+            candidates.append((bpw, m))
+    if not candidates:
+        return (configured, None)  # nothing smaller that fits — keep configured
+    candidates.sort(reverse=True)  # largest fitting quant = best fidelity
+    chosen = candidates[0][1]
+    reason = (
+        f"{configured} (~{estimate_model_weights_gb(configured):.1f}GB) won't fit "
+        f"fully on a {total_vram_gb:.1f}GB GPU → using {chosen} "
+        f"(~{estimate_model_weights_gb(chosen):.1f}GB, runs on GPU)")
+    return (chosen, reason)
+
+
 def gpu_offload_ladder(model_name: str) -> list[int]:
     """Descending ``num_gpu`` (layer-count) values to try for ``model_name``.
 

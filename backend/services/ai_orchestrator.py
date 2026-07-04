@@ -676,6 +676,24 @@ class AIOrchestrator:
             return VideoSummary(**fb), "fallback"
 
         video_end = max(s.end for s in transcript)
+
+        # ── Cap the chunk COUNT on long videos ──
+        # Each map chunk is one (sequential, on Ollama) LLM call; a 128-min
+        # video at 5-min chunks is ~21 calls ≈ 19 min. Enlarge the chunk span
+        # so the count stays under SUMMARY_MAX_CHUNKS — this only ever makes
+        # chunks BIGGER (never more granular than the tier), trading some
+        # summary granularity for far fewer LLM round trips. 0 disables the cap.
+        _max_chunks = int(getattr(settings, "SUMMARY_MAX_CHUNKS", 12) or 0)
+        if _max_chunks > 0 and chunk_seconds > 0 and video_end > 0:
+            import math as _math
+            _would = _math.ceil(video_end / chunk_seconds)
+            if _would > _max_chunks:
+                chunk_seconds = _math.ceil(video_end / _max_chunks)
+                logger.info(
+                    "[%s] Summary: %d chunks would exceed cap %d — enlarging chunk "
+                    "span to %.0fs (~%d chunks)",
+                    job_id, _would, _max_chunks, chunk_seconds,
+                    _math.ceil(video_end / chunk_seconds))
         chunk_overlap = 30.0  # 30 second overlap between chunks
         chunks: list[tuple[float, float, list[TranscriptSegment], list[SceneDescription]]] = []
         t = 0.0
@@ -703,9 +721,18 @@ class AIOrchestrator:
         async def _summarize_chunk(idx, start, end, segs, scns):
             async with sem:
                 time_label = f"{int(start//60)}:{int(start%60):02d}-{int(end//60)}:{int(end%60):02d}"
+                # Even-stride sample when a (possibly enlarged) chunk holds more
+                # than max_segs cues, so the summary spans the WHOLE chunk instead
+                # of only its opening minutes (head-truncation would drop the back
+                # half of a big chunk entirely).
+                if len(segs) > max_segs:
+                    _step = len(segs) / max_segs
+                    _picked = [segs[min(int(k * _step), len(segs) - 1)] for k in range(max_segs)]
+                else:
+                    _picked = segs
                 text = "\n".join(
                     f"[{s.start:.0f}s] {s.speaker}: {s.text}"
-                    for s in segs[:max_segs]
+                    for s in _picked
                 )
                 scene_text = "\n".join(
                     f"[{s.timestamp:.0f}s] {s.description[:60 if is_ollama else 100]}"
@@ -1162,9 +1189,19 @@ class AIOrchestrator:
                 # through qwen3 while editorial/SEO keep the fast editorial model.
                 # Temporarily swap the provider's text model; restored in the
                 # finally below.
-                model_name = model_override
+                _eff_override = model_override
+                # GPU-first: if the requested Ollama model (e.g. qwen3:4b-q4)
+                # won't fit this card and would spill to the CPU, substitute a
+                # smaller-quant build of the SAME model that runs fully on the
+                # GPU. Memoized on the provider; no-op on ample VRAM / cloud.
+                if pname == "ollama" and hasattr(provider, "resolve_gpu_fitting_model"):
+                    try:
+                        _eff_override = await provider.resolve_gpu_fitting_model(model_override)
+                    except Exception:
+                        _eff_override = model_override
+                model_name = _eff_override
                 original_model = provider._editorial_model
-                provider._editorial_model = model_override
+                provider._editorial_model = _eff_override
             try:
                 # Evict a leftover model (e.g. the vision model) before the text
                 # call, but KEEP the text model resident so consecutive text

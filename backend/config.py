@@ -131,6 +131,24 @@ class Settings(BaseSettings):
     # the ladder (×0.75, ×0.5) if 32 still OOMs.
     OLLAMA_MIDSIZE_GPU_LAYERS_START: int = 32
 
+    # ── GPU-first model selection: prefer a fitting quant over CPU offload ──
+    # On a card too small for the configured translation/polish model (e.g.
+    # qwen3:4b-q4 on a 4 GB GTX 1650, which OOMs and spills ~half its layers to
+    # the CPU), auto-substitute a SMALLER-QUANT build of the SAME model
+    # (qwen3:4b-…-q3_K_M) that runs FULLY on the GPU — only when that build is
+    # already installed on the Ollama host. The CPU is a genuine last resort;
+    # running fully on the GPU at a slightly lower quant is far faster than
+    # running a higher quant half on the CPU. Off = keep the configured tag and
+    # let the partial-offload ladder spill to CPU (legacy behavior).
+    OLLAMA_TRANSLATION_FIT_GPU_QUANT: bool = True
+    # VRAM the CUDA context + baseline allocation hold and never free — subtract
+    # from total VRAM to get the model's usable budget. ~1.2 GB matches a 4 GB
+    # GTX 1650 (≈2.5 GB free after Whisper releases).
+    OLLAMA_GPU_BASELINE_RESERVE_GB: float = 1.2
+    # Headroom reserved on top of the weights for the KV cache + compute graph
+    # at the 2048-token GPU context these models run.
+    OLLAMA_GPU_KV_HEADROOM_GB: float = 0.55
+
     # VideoLLaMA2 — optional local audio-visual model for Primary AI.
     # Requires ~10GB VRAM (RTX 4070+); on smaller GPUs the engine falls
     # back to the Ollama vision model, then cloud, then signal-only scoring.
@@ -344,6 +362,13 @@ class Settings(BaseSettings):
     VOCAL_SEPARATION_CONCURRENT: bool = True
     FRAME_SAMPLE_RATE: int = 10        # seconds between frames (lower=more detail, slower)
     MAX_CLIP_CANDIDATES: int = 12
+
+    # Upper bound on map-reduce summary chunks. Each chunk is one (sequential,
+    # on Ollama) LLM call, so on long videos the per-chunk count is the summary
+    # stage's runtime. Capping it enlarges each chunk's span (evenly sampled)
+    # rather than adding calls — trading granularity for speed. 0 = uncapped
+    # (legacy: chunk size fixed by the duration tier, ~21 chunks on a 2 h video).
+    SUMMARY_MAX_CHUNKS: int = 12
 
     # ── job.json persistence (write-amplification control) ──
     # Progress-only updates (progress %, progress_message, unchanged status)
@@ -936,6 +961,13 @@ class Settings(BaseSettings):
     # hopelessly-garbled transcript can't run for hours.
     TRANSLATION_LLM_CLEANUP_MAX_CUES: int = 500
     TRANSLATION_LLM_CLEANUP_BUDGET_S: float = 1200.0
+    # Front-load that cleanup with a BATCHED pre-pass: translate the unique
+    # leftover cues a few per LLM call (JSON map), so the per-cue loop mostly
+    # reuses cached results instead of paying one round trip per cue (the
+    # ~13-min recovery tail on a garbled transcript). Whatever a batch can't
+    # translate still falls through to the per-cue + cloud-escalation path.
+    TRANSLATION_LLM_CLEANUP_BATCH: bool = True
+    TRANSLATION_LLM_CLEANUP_BATCH_CUES: int = 30
     WHISPER_TRANSLATE_TO_EN: bool = True
     # Whisper-native translate is a second full ASR pass; it's only worth it when
     # it can run on the GPU. Below this much FREE VRAM it would fall back to CPU

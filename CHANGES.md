@@ -1,3 +1,59 @@
+# ClipAI — GPU-first LLM stages: fit translation to VRAM, trim summary chunks, batch the recovery loop
+
+Follow-up to the quality-neutral speed pass, targeting the stages that actually
+dominate a long-video run on a small GPU — all Ollama/LLM-bound and untouched
+by the earlier I/O work. Diagnosed from a 128-min run on a 4 GB GTX 1650 where
+the perception stage was fine (~25 min, slightly faster than before) but
+translation (~29 min), summary (~19 min) and the untranslated-cue recovery
+(~13 min of that) dominated. Root cause of the translation cost: the configured
+translation model `qwen3:4b-…-q4_K_M` is ~2.5 GB and, after Whisper releases,
+only ~2.5 GB is free — it OOM'd by ~160 MB and dropped half its layers onto the
+CPU (the slow path).
+
+Principle applied: **GPU-first — when a GPU is present, no model should run on
+the CPU unless there is genuinely no GPU-fitting option.** All changes are
+fail-soft and config-gated.
+
+- **GPU-fitting quant selection** (`local_models.py`, `providers/ollama_provider.py`,
+  `ai_orchestrator.py`). When the configured translation/polish model won't fit
+  the card (would engage the CPU-spilling partial-offload ladder), auto-substitute
+  a **smaller-quant build of the SAME model** that runs fully on the GPU —
+  *only if that build is already installed* on the Ollama host (e.g.
+  `qwen3:4b-instruct-2507-q3_K_M`, ~1.7 GB). Picks the largest quant that fits
+  (best fidelity still on GPU). Memoized per model so translation's hundreds of
+  per-batch calls never re-probe VRAM; applied centrally where the orchestrator
+  swaps in a model override, so translation *and* polish are covered. If no
+  fitting quant is installed, it logs an actionable `ollama pull …-q3_K_M` hint
+  and leaves the model as-is (legacy behavior). New settings:
+  `OLLAMA_TRANSLATION_FIT_GPU_QUANT` (True), `OLLAMA_GPU_BASELINE_RESERVE_GB`
+  (1.2), `OLLAMA_GPU_KV_HEADROOM_GB` (0.55). Fit test:
+  `weights_gb + kv_headroom ≤ total_vram − baseline_reserve` — the 1.2 GB
+  reserve matches the ~2.5 GB free after Whisper on a 4 GB card.
+- **Summary chunk-count cap** (`ai_orchestrator._map_reduce_summary`). Each map
+  chunk is one sequential Ollama call; a 128-min video at the tier's 5-min
+  chunks was ~21 calls ≈ 19 min. `SUMMARY_MAX_CHUNKS` (default 12) enlarges the
+  chunk span so the count stays bounded — roughly halving summary time on long
+  videos. Chunks only ever get BIGGER (never more granular than the tier), and
+  the per-chunk transcript is now sampled by even stride instead of head-
+  truncation so an enlarged chunk still spans its whole range. 0 = uncapped
+  (legacy).
+- **Batched untranslated-cue recovery** (`pipeline._llm_cleanup_untranslated`).
+  The post-translation cleanup re-translated leftover source-language cues one
+  LLM round trip each (the ~13-min tail). A batched pre-pass now translates the
+  unique leftovers a few per call (JSON map, parsed defensively) and pre-fills
+  the per-cue cache; anything a batch can't handle still falls through to the
+  existing per-cue + cloud-escalation path, so robustness is unchanged. New
+  settings: `TRANSLATION_LLM_CLEANUP_BATCH` (True), `TRANSLATION_LLM_CLEANUP_BATCH_CUES`
+  (30).
+
+Note: these are behavior changes (translation may run a slightly lower quant of
+the same model on a small card; the summary is coarser on long videos), made
+deliberately to honor the GPU-first / speed intent — not quality-neutral like
+the earlier pass. The perception/Whisper/clip stages are unchanged. Real GPU
+behavior must be validated on the target box (the CI environment here has no
+CUDA/Ollama); the pure selection/parsing/arithmetic logic is unit-tested in
+`tests/test_gpu_llm_speedups.py`.
+
 # ClipAI — Speed & efficiency pass (quality-neutral): I/O amplification, redundant decode/hash passes, event-loop stalls
 
 Every change is quality-neutral by construction: same frames at the same

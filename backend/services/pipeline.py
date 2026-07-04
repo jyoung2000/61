@@ -785,6 +785,103 @@ async def translate_subtitles(segments, source_lang, target_lang, *, video_path=
     return out, "nmt"
 
 
+def _validate_translation(raw, source_lang):
+    """Strip + verify a candidate translation; '' when unusable (empty, a
+    preamble echo, or still in the source language)."""
+    from backend.services.translator import _is_untranslated
+    v = (raw or "").strip().strip('"').strip()
+    try:
+        from backend.services.translator import strip_llm_preamble
+        v = strip_llm_preamble(v)
+    except Exception:
+        pass
+    if not v or _is_untranslated(v, source_lang):
+        return ""
+    return v
+
+
+def _parse_batch_translation_response(raw: str, n: int) -> list:
+    """Parse a batched-translation reply into an ``n``-length list (``None`` for
+    any line the model didn't return). Accepts a JSON object keyed by 1-based
+    index (``{"1": "...", "2": "..."}``) or a JSON array, tolerating code
+    fences / preamble. Returns ``[None]*n`` on any parse failure so the caller
+    falls back to the per-cue path."""
+    out = [None] * n
+    if not raw or n <= 0:
+        return out
+    text = raw.strip()
+    # Strip a ```json fence if present.
+    if text.startswith("```"):
+        text = text.split("```", 2)[1] if text.count("```") >= 2 else text.strip("`")
+        if text.lower().startswith("json"):
+            text = text[4:]
+    # Find the outermost JSON object/array.
+    import json as _json
+    for opener, closer in (("{", "}"), ("[", "]")):
+        a, b = text.find(opener), text.rfind(closer)
+        if a != -1 and b > a:
+            try:
+                data = _json.loads(text[a:b + 1])
+            except Exception:
+                continue
+            if isinstance(data, dict):
+                for k in range(1, n + 1):
+                    v = data.get(str(k), data.get(k))
+                    if isinstance(v, str) and v.strip():
+                        out[k - 1] = v.strip()
+                return out
+            if isinstance(data, list):
+                for i in range(min(n, len(data))):
+                    v = data[i]
+                    if isinstance(v, str) and v.strip():
+                        out[i] = v.strip()
+                return out
+    return out
+
+
+async def _batch_prefill_translations(orchestrator, unique_texts, source_lang,
+                                      tgt_name, terms_block, job_id, deadline):
+    """Translate ``unique_texts`` in a few batched LLM calls and return
+    ``{src_text: translation}`` for the ones that came back clean.
+
+    This front-loads the untranslated-cue recovery: instead of one LLM round
+    trip per cue (the ~13-min tail on a garbled transcript), a handful of cues
+    go out per call. Whatever a batch fails to translate is simply absent from
+    the result — the per-cue loop then handles those with its cloud-escalation
+    fallback. Fully fail-soft."""
+    out: dict[str, str] = {}
+    if not unique_texts:
+        return out
+    batch_size = max(1, int(getattr(settings, "TRANSLATION_LLM_CLEANUP_BATCH_CUES", 30)))
+    for _b in range(0, len(unique_texts), batch_size):
+        if deadline is not None and _time.monotonic() > deadline:
+            logger.info("[%s] Batched cleanup budget reached (%d done)", job_id, len(out))
+            break
+        batch = unique_texts[_b:_b + batch_size]
+        numbered = "\n".join(f"{k + 1}. {t}" for k, t in enumerate(batch))
+        prompt = (
+            (terms_block or "")
+            + f"Translate each numbered subtitle line into natural, fluent {tgt_name}. "
+            f"Return ONLY a JSON object mapping each line number (as a string) to its "
+            f"{tgt_name} translation, e.g. {{\"1\": \"...\", \"2\": \"...\"}}. "
+            f"Translate ALL {len(batch)} lines; do not merge, drop, add, or renumber "
+            f"lines, and do not repeat the original.\n\n{numbered}")
+        raw = None
+        try:
+            raw = await orchestrator.text_completion(
+                prompt, max_tokens=max(256, 40 * len(batch)),
+                timeout=90, job_id=job_id or "", skip_circuit_breaker=True,
+                json_mode=True)
+        except Exception:
+            raw = None
+        parsed = _parse_batch_translation_response(raw or "", len(batch))
+        for src, cand in zip(batch, parsed):
+            v = _validate_translation(cand, source_lang)
+            if v:
+                out[src] = v
+    return out
+
+
 async def _llm_cleanup_untranslated(segments, source_lang, target_lang,
                                     orchestrator, glossary, job_id):
     """Re-translate cues the offline NMT left in the source language, ONE CUE AT
@@ -863,12 +960,36 @@ async def _llm_cleanup_untranslated(segments, source_lang, target_lang,
             pass
 
         _t0 = _time.monotonic()
+        _deadline = (_t0 + _budget) if _budget > 0 else None
         _fixed = 0
         # The same hallucinated/looped run-on repeats across many cues — translate
         # each UNIQUE source text once and reuse it, so the cleanup is fast and
         # consistent. "" caches an attempted-but-failed text so its duplicates
         # are skipped instead of re-tried.
         _cache: dict[str, str] = {}
+        # Batched pre-pass: translate the unique leftovers a few per call so the
+        # per-cue loop below fast-paths them from _cache instead of paying one
+        # LLM round trip each (the multi-minute recovery tail). Anything the
+        # batch can't translate stays absent → the per-cue path (with cloud
+        # escalation) still handles it. Gated + fail-soft.
+        if getattr(settings, "TRANSLATION_LLM_CLEANUP_BATCH", True):
+            try:
+                _uniq, _seen = [], set()
+                for _i in leftover_idx:
+                    _st = _txt(segments[_i]).strip()
+                    if _st and _st not in _seen:
+                        _seen.add(_st)
+                        _uniq.append(_st)
+                if len(_uniq) > 1:
+                    _pre = await _batch_prefill_translations(
+                        orchestrator, _uniq, source_lang, _tgt_name,
+                        _terms_block, job_id, _deadline)
+                    _cache.update(_pre)
+                    logger.info(
+                        "[%s] Batched cleanup pre-translated %d/%d unique cue(s)",
+                        job_id, len(_pre), len(_uniq))
+            except Exception as _batch_err:
+                logger.info("[%s] Batched cleanup pre-pass skipped: %s", job_id, _batch_err)
         for i in leftover_idx:
             cur = segments[i]
             src_text = _txt(cur).strip()
@@ -887,26 +1008,13 @@ async def _llm_cleanup_untranslated(segments, source_lang, target_lang,
                     f"notes, do not repeat the original.\n\n{src_text}")
                 # ``except Exception`` only — a real cancel (CancelledError, a
                 # BaseException) still propagates and stops the run.
-
-                def _validate(raw):
-                    """Strip + verify a candidate translation; '' when unusable."""
-                    v = (raw or "").strip().strip('"').strip()
-                    try:
-                        from backend.services.translator import strip_llm_preamble
-                        v = strip_llm_preamble(v)
-                    except Exception:
-                        pass
-                    if not v or _is_untranslated(v, source_lang):
-                        return ""
-                    return v
-
                 resp = None
                 try:
                     resp = await orchestrator.text_completion(
                         prompt, timeout=60, job_id=job_id or "", skip_circuit_breaker=True)
                 except Exception:
                     resp = None
-                t = _validate(resp)
+                t = _validate_translation(resp, source_lang)
                 if not t:
                     # Local chain dead OR it echoed the source back (the 21:32
                     # run: 6/17 flagged cues shipped because qwen2.5:3b echoed
@@ -916,7 +1024,8 @@ async def _llm_cleanup_untranslated(segments, source_lang, target_lang,
                     try:
                         from backend.services.transcript_polisher import (
                             _cloud_polish_completion)
-                        t = _validate(await _cloud_polish_completion(prompt, 60))
+                        t = _validate_translation(
+                            await _cloud_polish_completion(prompt, 60), source_lang)
                     except Exception:
                         t = ""
                 if not t:

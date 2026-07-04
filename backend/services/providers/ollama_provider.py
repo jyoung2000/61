@@ -257,6 +257,10 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
         # successfully, so later calls start at the known-good rung of the
         # partial-offload ladder instead of re-OOMing at num_gpu=99 every time.
         self._gpu_layers_good: dict[str, int] = {}
+        # Memoized GPU-fitting-quant substitutions (configured tag -> tag that
+        # actually runs fully on this card). Populated on first use and reused
+        # so translation's hundreds of per-batch calls never re-probe VRAM.
+        self._gpu_fit_cache: dict[str, str] = {}
         self._vram_checked: bool = False
         self._available_vram_mb: int = 0
         # Cached GPU availability detection
@@ -719,6 +723,66 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
 
     def _remember_gpu_layers(self, model_name: str, n_gpu: int) -> None:
         self._gpu_layers_good[model_name] = int(n_gpu)
+
+    async def resolve_gpu_fitting_model(self, model_name: str) -> str:
+        """Return ``model_name`` — or a smaller-quant build of the SAME weights
+        that runs FULLY on this GPU when ``model_name`` (e.g. a 4B-q4 that OOMs
+        a 4 GB card) would otherwise spill layers onto the CPU.
+
+        Honors the "GPU-first, CPU is a last resort" policy: on a card too small
+        for the configured translation/polish model, prefer a lower-quant build
+        of the same model that fits entirely in VRAM over running the bigger
+        quant half on the CPU. Memoized per configured tag; fully fail-soft
+        (any error, feature disabled, or no fitting build → the original tag)."""
+        if not model_name:
+            return model_name
+        if not getattr(settings, "OLLAMA_TRANSLATION_FIT_GPU_QUANT", True):
+            return model_name
+        if model_name in self._gpu_fit_cache:
+            return self._gpu_fit_cache[model_name]
+        chosen = model_name
+        try:
+            from backend.services.local_models import (
+                select_gpu_fitting_quant, list_ollama_models, _total_vram_gb,
+                _ollama_names_match,
+            )
+            total_vram = _total_vram_gb()
+            if total_vram > 0:
+                installed = await list_ollama_models()
+                picked, reason = select_gpu_fitting_quant(
+                    model_name, installed,
+                    total_vram_gb=total_vram,
+                    baseline_reserve_gb=float(getattr(
+                        settings, "OLLAMA_GPU_BASELINE_RESERVE_GB", 1.2)),
+                    kv_headroom_gb=float(getattr(
+                        settings, "OLLAMA_GPU_KV_HEADROOM_GB", 0.55)),
+                )
+                if reason and picked != model_name:
+                    chosen = picked
+                    logger.info("GPU-fit translation model: %s", reason)
+                else:
+                    # No swap. If the configured model doesn't actually fit this
+                    # card (and we just couldn't find an installed smaller quant),
+                    # tell the user how to make it GPU-resident — a q3 build of the
+                    # same model would run fully on the GPU instead of spilling to
+                    # the CPU. One line, actionable.
+                    from backend.services.local_models import estimate_model_weights_gb
+                    _w = estimate_model_weights_gb(model_name)
+                    _budget = total_vram - float(getattr(
+                        settings, "OLLAMA_GPU_BASELINE_RESERVE_GB", 1.2))
+                    _head = float(getattr(settings, "OLLAMA_GPU_KV_HEADROOM_GB", 0.55))
+                    if _w is not None and (_w + _head) > _budget:
+                        _base = model_name.rsplit("-", 1)[0] if "-q" in model_name.lower() else model_name
+                        logger.warning(
+                            "Translation model %s (~%.1fGB) won't fit fully on a "
+                            "%.1fGB GPU and will spill layers to the CPU (slow). "
+                            "Install a smaller quant to keep it GPU-resident, e.g. "
+                            "`ollama pull %s-q3_K_M`.",
+                            model_name, _w, total_vram, _base)
+        except Exception as exc:  # never let model selection break a run
+            logger.info("GPU-fit model selection skipped for %s (%s)", model_name, exc)
+        self._gpu_fit_cache[model_name] = chosen
+        return chosen
 
     def _is_oom_error(self, error_text: str) -> bool:
         """Check if an error response indicates CUDA out-of-memory."""
