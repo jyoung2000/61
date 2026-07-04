@@ -2830,10 +2830,15 @@ def _build_subject_keyframes(
     # Extract and sort all scene data (including scenes outside clip range)
     all_data = []
     for s in scenes:
-        ts = float(s.timestamp if hasattr(s, "timestamp") else s.get("timestamp", 0))
+        def _field(name, default=None, _s=s):
+            if isinstance(_s, dict):
+                return _s.get(name, default)
+            return getattr(_s, name, default)
+
+        ts = float(_field("timestamp", 0))
         # Prefer active_speaker_x (when AI detected who is talking) over generic subject_x
-        asx = s.active_speaker_x if hasattr(s, "active_speaker_x") else s.get("active_speaker_x")
-        sx = s.subject_x if hasattr(s, "subject_x") else s.get("subject_x", 50)
+        asx = _field("active_speaker_x")
+        sx = _field("subject_x", 50)
         raw_sx = int(asx if asx is not None else sx)
         safe_sx = _safe_subject_x(raw_sx, src_ratio=src_ratio, target_ratio=target_ratio)
         all_data.append((ts, safe_sx))

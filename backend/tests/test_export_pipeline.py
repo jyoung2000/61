@@ -2797,8 +2797,8 @@ def test_filter_chain_static_fallback():
     """Single keyframe → static crop (backward compatible)."""
     print("\n--- filter_chain: static fallback (single keyframe) ---")
     kf = [(0.0, 30)]
-    vf_kf, _ = _build_filter_chain("9:16", 1920, 1080, None, subject_keyframes=kf)
-    vf_static, _ = _build_filter_chain("9:16", 1920, 1080, None, subject_x=30)
+    vf_kf, _, _ = _build_filter_chain("9:16", 1920, 1080, None, subject_keyframes=kf)
+    vf_static, _, _ = _build_filter_chain("9:16", 1920, 1080, None, subject_x=30)
     check("Both produce crop filter", "crop=" in vf_kf and "crop=" in vf_static)
     check("Single keyframe matches static", vf_kf == vf_static,
           f"keyframe: '{vf_kf}' vs static: '{vf_static}'")
@@ -2807,8 +2807,8 @@ def test_filter_chain_static_fallback():
 def test_filter_chain_no_keyframes():
     """No keyframes → uses subject_x fallback."""
     print("\n--- filter_chain: no keyframes → subject_x fallback ---")
-    vf_none, _ = _build_filter_chain("9:16", 1920, 1080, None, subject_x=70)
-    vf_empty, _ = _build_filter_chain("9:16", 1920, 1080, None, subject_x=70, subject_keyframes=None)
+    vf_none, _, _ = _build_filter_chain("9:16", 1920, 1080, None, subject_x=70)
+    vf_empty, _, _ = _build_filter_chain("9:16", 1920, 1080, None, subject_x=70, subject_keyframes=None)
     check("Both identical", vf_none == vf_empty, f"none: '{vf_none}' vs empty: '{vf_empty}'")
     check("Contains static crop", "crop=" in vf_none and "if(lt" not in vf_none,
           f"got '{vf_none}'")
@@ -3196,9 +3196,9 @@ def test_filter_chain_quality_affects_scale():
     """Different quality levels produce different scale dimensions in filter chain."""
     print("\n--- Quality presets: filter chain scale differs by quality ---")
     for ar in ["9:16", "1:1", "4:5"]:
-        vf_720, _ = _build_filter_chain(ar, 1920, 1080, None, export_quality="720p")
-        vf_1080, _ = _build_filter_chain(ar, 1920, 1080, None, export_quality="1080p")
-        vf_4k, _ = _build_filter_chain(ar, 1920, 1080, None, export_quality="4k")
+        vf_720, _, _ = _build_filter_chain(ar, 1920, 1080, None, export_quality="720p")
+        vf_1080, _, _ = _build_filter_chain(ar, 1920, 1080, None, export_quality="1080p")
+        vf_4k, _, _ = _build_filter_chain(ar, 1920, 1080, None, export_quality="4k")
 
         check(f"{ar}: 720p has filter", vf_720 is not None)
         check(f"{ar}: 1080p has filter", vf_1080 is not None)
@@ -3243,29 +3243,29 @@ def test_quality_scaling_without_aspect_ratio():
     print("\n--- Quality: scaling without aspect ratio ---")
 
     # 1080p source → 720p export should produce scale filter
-    vf_720, _ = _build_filter_chain(None, 1920, 1080, None, export_quality="720p")
+    vf_720, _, _ = _build_filter_chain(None, 1920, 1080, None, export_quality="720p")
     check("720p from 1080p source has filter", vf_720 is not None, f"got: {vf_720}")
     check("720p filter includes scale", "scale=" in (vf_720 or ""), f"got: {vf_720}")
     check("720p filter targets height 720", ":720" in (vf_720 or ""), f"got: {vf_720}")
 
     # 1080p source → 1080p export should NOT produce a filter (same resolution)
-    vf_1080, _ = _build_filter_chain(None, 1920, 1080, None, export_quality="1080p")
+    vf_1080, _, _ = _build_filter_chain(None, 1920, 1080, None, export_quality="1080p")
     check("1080p from 1080p source is None (stream copy)", vf_1080 is None,
           f"got: {vf_1080}")
 
     # 1080p source → 4K export should produce scale filter
-    vf_4k, _ = _build_filter_chain(None, 1920, 1080, None, export_quality="4k")
+    vf_4k, _, _ = _build_filter_chain(None, 1920, 1080, None, export_quality="4k")
     check("4K from 1080p source has filter", vf_4k is not None, f"got: {vf_4k}")
     check("4K filter includes scale", "scale=" in (vf_4k or ""), f"got: {vf_4k}")
     check("4K filter targets height 2160", ":2160" in (vf_4k or ""), f"got: {vf_4k}")
 
     # 720p source → 720p export should NOT produce a filter (same resolution)
-    vf_720_same, _ = _build_filter_chain(None, 1280, 720, None, export_quality="720p")
+    vf_720_same, _, _ = _build_filter_chain(None, 1280, 720, None, export_quality="720p")
     check("720p from 720p source is None (stream copy)", vf_720_same is None,
           f"got: {vf_720_same}")
 
     # 4K source → 720p export should produce scale filter
-    vf_720_from_4k, _ = _build_filter_chain(None, 3840, 2160, None, export_quality="720p")
+    vf_720_from_4k, _, _ = _build_filter_chain(None, 3840, 2160, None, export_quality="720p")
     check("720p from 4K source has filter", vf_720_from_4k is not None,
           f"got: {vf_720_from_4k}")
     check("720p from 4K targets height 720", ":720" in (vf_720_from_4k or ""),
