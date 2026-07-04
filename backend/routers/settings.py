@@ -61,6 +61,8 @@ _PERSISTABLE_KEYS = [
     "OLLAMA_HOSTS",
     "WHISPER_MODEL", "WHISPER_MODEL_USER_SET", "WHISPER_BEAM_SIZE",
     "WHISPER_VAD_FILTER", "FRAME_SAMPLE_RATE", "WHISPER_AUTO_UPGRADE",
+    # Remote Whisper (OpenAI-compatible server, e.g. the GPU Companion).
+    "WHISPER_REMOTE_URL", "WHISPER_REMOTE_API_KEY", "WHISPER_REMOTE_MODEL",
     # Reframer perception sampling (face-detection speed).
     "REFRAMER_MAX_SAMPLES", "REFRAMER_SAMPLE_FPS", "REFRAMER_MIN_SAMPLE_FPS",
     "WHISPER_NO_SPEECH_THRESHOLD",
@@ -127,6 +129,7 @@ _PERSISTABLE_KEYS = [
 _API_KEY_FIELDS = {
     "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "GROQ_API_KEY",
     "HF_AUTH_TOKEN", "REPLICATE_API_KEY", "OPENAI_API_KEY",
+    "WHISPER_REMOTE_API_KEY",
     # Translation cloud NMT secrets.
     "GOOGLE_TRANSLATE_API_KEY", "DEEPL_API_KEY",
     # Cloud client secrets — same "never overwrite with blank" rule.
@@ -2851,6 +2854,104 @@ async def test_ollama_host(req: TestOllamaHostRequest):
         "latency_ms": status.latency_ms,
         "version": version,
         "error": status.error,
+    }
+
+
+# ── Remote Whisper (OpenAI-compatible transcription server) ──────
+
+
+class SaveWhisperRemoteRequest(BaseModel):
+    url: Optional[str] = None
+    # None = keep the stored key; "" = clear it.
+    api_key: Optional[str] = None
+    model: Optional[str] = None
+
+
+@router.get("/settings/whisper-remote")
+async def get_whisper_remote():
+    """Remote Whisper config (key never echoed — only whether one is set)."""
+    return {
+        "url": (settings.WHISPER_REMOTE_URL or "").strip(),
+        "has_api_key": bool((settings.WHISPER_REMOTE_API_KEY or "").strip()),
+        "model": (settings.WHISPER_REMOTE_MODEL or "").strip(),
+    }
+
+
+@router.put("/settings/whisper-remote")
+async def put_whisper_remote(req: SaveWhisperRemoteRequest):
+    """Save the remote Whisper server URL / key / model override."""
+    if req.url is not None:
+        settings.WHISPER_REMOTE_URL = req.url.strip()
+    if req.api_key is not None:
+        settings.WHISPER_REMOTE_API_KEY = req.api_key.strip()
+    if req.model is not None:
+        settings.WHISPER_REMOTE_MODEL = req.model.strip()
+    _persist_user_settings()
+    # Drop the cached health verdict so the next job re-probes the new URL.
+    try:
+        from backend.services import reframer_audio as _ra
+        _ra._REMOTE_HEALTH_CACHE.update({"checked_at": 0.0, "url": ""})
+    except Exception:
+        pass
+    return await get_whisper_remote()
+
+
+@router.post("/settings/whisper-remote/test")
+async def test_whisper_remote(req: SaveWhisperRemoteRequest | None = None):
+    """Server-side health probe of the remote Whisper server.
+
+    Tests the request body's url/key when provided (the Settings form's
+    Test button, pre-save), else the saved settings. Reports the model
+    the server will be asked to run.
+    """
+    url = (req.url if req and req.url is not None
+           else settings.WHISPER_REMOTE_URL or "").strip()
+    if not url:
+        return {"online": False, "error": "No remote Whisper URL configured."}
+    key = (req.api_key if req and req.api_key is not None
+           else settings.WHISPER_REMOTE_API_KEY or "").strip()
+    base = url.rstrip("/")
+    if "://" not in base:
+        base = f"http://{base}"
+    if base.endswith("/v1"):
+        base = base[:-3]
+    headers = {"Authorization": f"Bearer {key}"} if key else {}
+    online = False
+    detail = ""
+    error = ""
+    try:
+        async with httpx.AsyncClient(timeout=4.0, headers=headers) as client:
+            for path in ("/v1/health", "/health", "/"):
+                try:
+                    resp = await client.get(f"{base}{path}")
+                except httpx.HTTPError as he:
+                    error = f"{type(he).__name__}: {str(he)[:120]}"
+                    continue
+                online = True
+                error = ""
+                if path == "/v1/health" and resp.status_code == 200:
+                    try:
+                        info = resp.json() or {}
+                        gpu = info.get("gpu_name") or ""
+                        free = info.get("vram_free_mb")
+                        if gpu:
+                            detail = gpu
+                            if free is not None:
+                                detail += f" — {int(free)} MB VRAM free"
+                    except Exception:
+                        pass
+                break
+    except Exception as e:
+        error = str(e)[:200]
+    from backend.services.reframer_audio import remote_whisper_pick_model
+    model = ((req.model if req and req.model is not None
+              else settings.WHISPER_REMOTE_MODEL) or "").strip()
+    return {
+        "online": online,
+        "error": error if not online else "",
+        "detail": detail,
+        "model": model or remote_whisper_pick_model(None),
+        "model_source": "configured" if model else "auto",
     }
 
 

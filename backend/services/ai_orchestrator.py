@@ -281,7 +281,18 @@ class AIOrchestrator:
             else:
                 model = getattr(provider, '_editorial_model', None)
             if model:
-                return f"{model} via ollama"
+                label = f"{model} via ollama"
+                # Multi-host registry: name WHICH machine served the stage
+                # (e.g. "… via ollama @ Desktop 4070") so failovers are
+                # visible in the job's provider/timing display.
+                try:
+                    if (getattr(settings, "OLLAMA_HOSTS", "") or "").strip():
+                        host_label = getattr(provider, "active_host_label", "")
+                        if host_label:
+                            label += f" @ {host_label}"
+                except Exception:
+                    pass
+                return label
         return pname
 
     # Rough cost per 1K tokens by provider (input+output blended average)

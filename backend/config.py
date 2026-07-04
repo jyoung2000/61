@@ -351,6 +351,23 @@ class Settings(BaseSettings):
     # on ≥6 GB cards; this flag extends the ladder so mid-tier GPUs
     # get ``small → medium`` on ≥2.5 GB as well.
     WHISPER_AUTO_UPGRADE: bool = True
+    # ── Remote Whisper (OpenAI-compatible /v1/audio/transcriptions) ──
+    # Point ClipAI at any OpenAI-compatible transcription server — the GPU
+    # Companion on a desktop 4070, speaches, whisper-asr-webservice, or
+    # whisper.cpp's server with ``--inference-path /v1/audio/transcriptions``.
+    # Only the already-extracted 16 kHz mono WAV is uploaded (never the
+    # source video). When the remote server is healthy the transcription
+    # stage runs there (stage location "remote"), the local VRAM
+    # serialization dance is skipped, and any mid-stage remote failure
+    # falls back to the local CUDA→CPU ladder — a job never fails solely
+    # because the remote server dropped. Blank = fully local (unchanged).
+    WHISPER_REMOTE_URL: str = ""
+    WHISPER_REMOTE_API_KEY: str = ""
+    # Model to request from the remote server. Blank = auto ladder:
+    # large-v3-turbo for English/auto jobs, large-v3 for pinned
+    # non-English (multilingual accuracy), unless the user explicitly
+    # pinned a model in Settings (WHISPER_MODEL_USER_SET).
+    WHISPER_REMOTE_MODEL: str = ""
     # ── Vocal separation (Demucs) before ASR ──
     # Isolate the vocal stem before Whisper so dialogue buried under loud
     # music / SFX (which the VAD otherwise hears as no-speech and drops) is

@@ -81,6 +81,22 @@ def build_precondition_filters(
 
 _pipeline_timings: dict[str, dict[str, float]] = {}
 _pipeline_warnings: dict[str, list[str]] = {}
+# Which device/host served each stage — "remote" / "local_gpu" / "cpu" for
+# transcription, an Ollama host name for AI stages. Flushed onto
+# ``JobResult.stage_locations`` alongside the timings.
+_pipeline_stage_locations: dict[str, dict[str, str]] = {}
+
+
+def _record_stage_location(job_id: str, stage: str, location: str) -> None:
+    """Tag ``stage`` with the device/host that served it (fail-soft)."""
+    if not job_id or not stage or not location:
+        return
+    _pipeline_stage_locations.setdefault(job_id, {})[stage] = location
+
+
+def _drain_stage_locations(job_id: str) -> dict[str, str]:
+    """Pop the accumulated stage→location map for ``job_id``."""
+    return _pipeline_stage_locations.pop(job_id, {}) or {}
 
 
 # ── Synthetic / fallback scene-description detection ────────────
@@ -276,9 +292,18 @@ async def _stage_timer(job_id: str, stage: str):
     If a stage runs twice (rare — recovery retries) the cumulative
     time is kept. The UI cares about "where time went", not which
     retry attempt it was.
+
+    Also stamps the stage name into the request context so outbound
+    remote calls (Ollama hosts, remote Whisper, the GPU Companion) carry
+    ``X-ClipAI-Stage`` for their live activity feeds.
     """
     t0 = _time.monotonic()
     logger.info("[%s] Stage '%s' started", job_id, stage)
+    try:
+        from backend.services.request_context import set_stage
+        set_stage(stage)
+    except Exception:
+        pass
     try:
         yield
     finally:

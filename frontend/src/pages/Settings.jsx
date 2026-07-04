@@ -7,6 +7,7 @@ import CloudStorageSection from '../components/cloud/CloudStorageSection';
 import UserManagementPanel from '../components/UserManagementPanel';
 import ClipGenerationSettings from '../components/ClipGenerationSettings';
 import OllamaHostsCard from '../components/OllamaHostsCard';
+import RemoteWhisperCard from '../components/RemoteWhisperCard';
 import SelfHostedSettings from '../components/SelfHostedSettings';
 import SubtitleQualitySettings from '../components/SubtitleQualitySettings';
 import { useAuth } from '../auth/AuthContext';
@@ -2015,6 +2016,9 @@ export default function Settings() {
                   </button>
                 )}
               </div>
+
+              {/* ── Remote Whisper (LAN GPU transcription server) ── */}
+              <RemoteWhisperCard isMobile={isMobile} />
 
               {/* ── Custom Vocabulary (Whisper biasing) ── */}
               <div style={{

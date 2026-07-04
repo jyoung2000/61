@@ -171,24 +171,35 @@ def _build_compute_summary(engine, perception) -> dict:
         whisper_dev = getattr(engine, "_perceiver_audio_device", None)
         if whisper_dev:
             # device_used strings look like "cuda_float16" / "cpu_int8" /
-            # "cpu_int8_base" / etc. Split on the first underscore.
-            on_gpu = whisper_dev.startswith("cuda")
-            compute_type = whisper_dev.split("_", 1)[1] if "_" in whisper_dev else ""
-            # Report the EFFECTIVE model that actually loaded (post any VRAM
-            # downgrade) so the active config can't disagree with what ran.
+            # "cpu_int8_base" — or "remote" when an OpenAI-compatible LAN
+            # server (e.g. the GPU Companion) served the transcription.
             _eff_model = getattr(engine, "_perceiver_audio_model", None)
             _req_model = getattr(engine, "_perceiver_audio_model_requested", None)
-            _detail = f"CTranslate2 {compute_type}".strip() if compute_type else "CTranslate2"
-            if _eff_model:
-                _detail = f"{_eff_model} ({_detail})"
-                if _req_model and _req_model != _eff_model:
-                    _detail += f" — downgraded from requested '{_req_model}'"
-            summary["whisper"] = {
-                "device": "cuda:0" if on_gpu else "cpu",
-                "model": _eff_model or "",
-                "requested_model": _req_model or "",
-                "detail": _detail,
-            }
+            if whisper_dev == "remote":
+                _remote_url = (getattr(settings, "WHISPER_REMOTE_URL", "") or "").strip()
+                summary["whisper"] = {
+                    "device": "remote",
+                    "model": _eff_model or "",
+                    "requested_model": _req_model or "",
+                    "detail": (f"{_eff_model} via remote Whisper ({_remote_url})"
+                               if _eff_model else f"remote Whisper ({_remote_url})"),
+                }
+            else:
+                on_gpu = whisper_dev.startswith("cuda")
+                compute_type = whisper_dev.split("_", 1)[1] if "_" in whisper_dev else ""
+                # Report the EFFECTIVE model that actually loaded (post any VRAM
+                # downgrade) so the active config can't disagree with what ran.
+                _detail = f"CTranslate2 {compute_type}".strip() if compute_type else "CTranslate2"
+                if _eff_model:
+                    _detail = f"{_eff_model} ({_detail})"
+                    if _req_model and _req_model != _eff_model:
+                        _detail += f" — downgraded from requested '{_req_model}'"
+                summary["whisper"] = {
+                    "device": "cuda:0" if on_gpu else "cpu",
+                    "model": _eff_model or "",
+                    "requested_model": _req_model or "",
+                    "detail": _detail,
+                }
     except Exception:
         pass
 
@@ -225,9 +236,24 @@ async def _release_whisper_vram(job_id: str):
     On a 4GB GTX 1650, faster-whisper occupies ~800MB. The reframer caches
     its faster-whisper engine on ``AudioIntelligence._cached_engine``; dropping
     that reference plus a CUDA cache flush hands the GPU to Ollama's VLM.
+
+    Skipped when transcription ran on a REMOTE Whisper server and no local
+    engine was ever loaded — there is nothing on the local GPU to release,
+    and the skip saves the model reload the serialization dance costs.
     """
     try:
         import gc
+
+        try:
+            from backend.services.reframer_audio import AudioIntelligence
+            if (AudioIntelligence._cached_engine is None
+                    and AudioIntelligence._last_loaded_device == "remote"):
+                logger.info(
+                    "[%s] Whisper VRAM release skipped — transcription ran on "
+                    "the remote server; the local GPU was never loaded", job_id)
+                return
+        except Exception:
+            pass
 
         # Step 1: Drop the reframer's cached faster-whisper engine.
         try:
@@ -354,6 +380,10 @@ def _whisper_native_translate_segments(video_path: str, source_lang: str,
     # lower free-VRAM floor — the whole point of reuse on small cards.
     _was_cached = getattr(AudioIntelligence, "_cached_engine", None) is not None
     ai = AudioIntelligence(model_name=model_name)
+    # NOTE: no force_local here — whisper_translate() itself swaps a
+    # remote-selected engine for the local ladder (the native translate
+    # task needs a real local model; remote servers only guarantee
+    # /v1/audio/transcriptions).
     if not ai.try_load():
         logger.warning("Whisper native translate: engine failed to load (model=%s)", model_name)
         return []
@@ -3372,6 +3402,15 @@ async def run_analysis(job_id: str):
         from backend.app.auth.settings_overlay import overlay_user_settings
         _job_for_owner = await database.load_job(job_id)
         _owner_id = getattr(_job_for_owner, "owner_user_id", "") if _job_for_owner else ""
+        # Stamp the job identity into the request context: every outbound
+        # remote call (Ollama hosts, remote Whisper, the GPU Companion)
+        # attaches it as X-ClipAI-Job-Id / -Job-Title / -Stage headers so
+        # the Companion can show "what is ClipAI running on my GPU" live.
+        try:
+            from backend.services.request_context import set_job
+            set_job(job_id, getattr(_job_for_owner, "filename", "") or "")
+        except Exception:
+            pass
         try:
             async with overlay_user_settings(_owner_id) as _overlay:
                 if _overlay:
@@ -3416,6 +3455,11 @@ async def run_analysis(job_id: str):
             _heartbeats.pop(job_id, None)
             _cancel_events.pop(job_id, None)
             _finalizing_jobs.discard(job_id)
+            try:
+                from backend.services.request_context import clear as _ctx_clear
+                _ctx_clear()
+            except Exception:
+                pass
             # Cancel a straggling background source-hash task (normal runs
             # awaited + consumed it long before this).
             _hash_straggler = _bg_hash_tasks.pop(job_id, None)
@@ -3426,13 +3470,14 @@ async def run_analysis(job_id: str):
             # where it died. Best-effort: any DB error is logged but
             # never re-raised from the cleanup path.
             try:
+                from backend.services.pipeline_helpers import _drain_stage_locations
                 _t, _w = _drain_pipeline_telemetry(job_id)
-                if _t or _w:
-                    await database.update_job_status(
-                        job_id,
-                        timings=_t,
-                        pipeline_warnings=_w,
-                    )
+                _locs = _drain_stage_locations(job_id)
+                if _t or _w or _locs:
+                    _kw = dict(timings=_t, pipeline_warnings=_w)
+                    if _locs:
+                        _kw["stage_locations"] = _locs
+                    await database.update_job_status(job_id, **_kw)
             except Exception as _te:
                 logger.info("[%s] telemetry drain failed: %s", job_id, _te)
 
@@ -4561,6 +4606,18 @@ async def _run_analysis_inner(job_id: str):
             reframer_plan = await asyncio.to_thread(engine.analyze, _engine_progress)
         perception = engine.perception
         _log_gpu_memory(job_id, "post-reframer")
+        # Tag the transcription stage with WHERE it ran (remote server /
+        # local GPU / CPU) for the job's stage-timing display.
+        try:
+            from backend.services.pipeline_helpers import _record_stage_location
+            _wdev = str(getattr(engine, "_perceiver_audio_device", "") or "")
+            if _wdev:
+                _loc = ("remote" if _wdev == "remote"
+                        else "local_gpu" if _wdev.startswith("cuda")
+                        else "cpu")
+                _record_stage_location(job_id, "transcription", _loc)
+        except Exception:
+            pass
         if _vs_executor is not None:
             _vs_executor.shutdown(wait=False)
 

@@ -231,6 +231,10 @@ class JobResult(BaseModel):
     # the UI show "where time went" without a separate metrics store.
     # Shape: ``{"frame+audio extraction": 12.3, "transcription": 84.1, ...}``
     timings: dict = {}
+    # Which device/host served each stage (remote GPU sharing): "remote" /
+    # "local_gpu" / "cpu" for transcription, an Ollama host name for AI
+    # stages. Shape: ``{"transcription": "remote", "summary": "Desktop 4070"}``.
+    stage_locations: dict = {}
     # Soft warnings the pipeline emitted but recovered from. Surfaced
     # to the UI alongside the result so users can see "saliency was
     # downsampled on this codec" style messages without grepping logs.

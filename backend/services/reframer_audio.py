@@ -269,6 +269,188 @@ def _drop_repetition_loops(segments: list) -> list:
     return out
 
 
+# ── Remote Whisper (OpenAI-compatible server, e.g. the GPU Companion) ──────
+
+_REMOTE_HEALTH_CACHE = {"checked_at": 0.0, "healthy": False, "url": ""}
+_REMOTE_HEALTH_TTL_S = 30.0
+
+
+def remote_whisper_configured() -> bool:
+    return bool((getattr(settings, "WHISPER_REMOTE_URL", "") or "").strip())
+
+
+def _remote_whisper_base() -> str:
+    url = (getattr(settings, "WHISPER_REMOTE_URL", "") or "").strip().rstrip("/")
+    if url and "://" not in url:
+        url = f"http://{url}"
+    # Accept either the bare server root or a URL that already ends in /v1.
+    if url.endswith("/v1"):
+        url = url[:-3]
+    return url
+
+
+def remote_whisper_healthy(force: bool = False) -> bool:
+    """Cheap health probe of the remote transcription server (cached ~30 s).
+
+    Servers differ: the GPU Companion serves ``/v1/health``, speaches serves
+    ``/health``, whisper.cpp answers on ``/``. Any HTTP response (even 404)
+    proves the server is up — connection errors are the only failure.
+    """
+    if not remote_whisper_configured():
+        return False
+    base = _remote_whisper_base()
+    now = _time.monotonic()
+    if (not force and _REMOTE_HEALTH_CACHE["url"] == base
+            and now - _REMOTE_HEALTH_CACHE["checked_at"] < _REMOTE_HEALTH_TTL_S):
+        return _REMOTE_HEALTH_CACHE["healthy"]
+    healthy = False
+    try:
+        import httpx
+        headers = {}
+        key = (getattr(settings, "WHISPER_REMOTE_API_KEY", "") or "").strip()
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+        with httpx.Client(timeout=3.0, headers=headers) as client:
+            for path in ("/v1/health", "/health", "/"):
+                try:
+                    client.get(f"{base}{path}")
+                    healthy = True
+                    break
+                except httpx.HTTPError:
+                    continue
+    except Exception:
+        healthy = False
+    _REMOTE_HEALTH_CACHE.update(
+        {"checked_at": now, "healthy": healthy, "url": base})
+    return healthy
+
+
+def remote_whisper_pick_model(language: Optional[str]) -> str:
+    """Model to request from the remote server.
+
+    ``WHISPER_REMOTE_MODEL`` wins when set; a user-pinned local model
+    (WHISPER_MODEL_USER_SET) is honored next; otherwise the auto ladder
+    requests large-v3-turbo for English/auto jobs and large-v3 for pinned
+    non-English (better multilingual accuracy on a 12 GB card).
+    """
+    configured = (getattr(settings, "WHISPER_REMOTE_MODEL", "") or "").strip()
+    if configured:
+        return configured
+    if bool(getattr(settings, "WHISPER_MODEL_USER_SET", False)):
+        pinned = (getattr(settings, "WHISPER_MODEL", "") or "").strip()
+        if pinned:
+            return pinned
+    lang = (language or "auto").strip().lower()
+    if lang in ("", "auto", "en", "english"):
+        return "large-v3-turbo"
+    return "large-v3"
+
+
+class RemoteWhisperEngine:
+    """OpenAI-compatible remote transcription client.
+
+    POSTs the already-extracted WAV (never the source video) to
+    ``{WHISPER_REMOTE_URL}/v1/audio/transcriptions`` with
+    ``response_format=verbose_json`` + word/segment timestamp
+    granularities and maps the response into the exact segment schema the
+    local faster-whisper path produces, so everything downstream (TACT
+    filters → forced alignment → polish → SRT/ASS) is byte-compatible.
+
+    Works with the GPU Companion, speaches, whisper-asr-webservice, and
+    whisper.cpp server (``--inference-path /v1/audio/transcriptions``).
+    """
+
+    TIMEOUT_S = 600  # generous — a 2 h WAV upload + decode on the LAN
+
+    def __init__(self, model: str = ""):
+        self.base = _remote_whisper_base()
+        self.model = model
+        self.api_key = (getattr(settings, "WHISPER_REMOTE_API_KEY", "") or "").strip()
+
+    def _headers(self) -> dict:
+        headers = {}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        try:
+            from backend.services.request_context import clipai_headers
+            headers.update(clipai_headers())
+        except Exception:
+            pass
+        return headers
+
+    def transcribe_wav(self, audio_path: str,
+                       language: Optional[str] = None) -> Optional[dict]:
+        """Returns ``{'segments', 'language', 'provider', 'model'}`` in the
+        local schema (same contract as ``cloud_transcription.transcribe_cloud``)
+        or ``None`` on any failure — the caller falls back to local."""
+        import httpx
+        from backend.services.cloud_transcription import (
+            _map_verbose_json, _vocab_prompt)
+
+        model = self.model or remote_whisper_pick_model(language)
+        data = {
+            "model": model,
+            "response_format": "verbose_json",
+            "timestamp_granularities[]": ["word", "segment"],
+        }
+        if language and language not in ("auto", ""):
+            data["language"] = language
+        prompt = _vocab_prompt(language or "en")
+        if prompt:
+            data["prompt"] = prompt
+
+        try:
+            with open(audio_path, "rb") as fh:
+                files = {"file": (os.path.basename(audio_path), fh, "audio/wav")}
+                resp = httpx.post(
+                    f"{self.base}/v1/audio/transcriptions",
+                    headers=self._headers(),
+                    data=data, files=files, timeout=self.TIMEOUT_S)
+            if resp.status_code == 503:
+                # Busy Companion: one bounded Retry-After wait, then give up
+                # to the local ladder (the pipeline must keep moving).
+                try:
+                    wait = min(30.0, max(0.5, float(
+                        resp.headers.get("Retry-After", "5"))))
+                except (TypeError, ValueError):
+                    wait = 5.0
+                logger.info("Remote Whisper busy (503) — retrying once in %.1fs", wait)
+                _time.sleep(wait)
+                with open(audio_path, "rb") as fh:
+                    files = {"file": (os.path.basename(audio_path), fh, "audio/wav")}
+                    resp = httpx.post(
+                        f"{self.base}/v1/audio/transcriptions",
+                        headers=self._headers(),
+                        data=data, files=files, timeout=self.TIMEOUT_S)
+            if resp.status_code != 200:
+                logger.warning(
+                    "Remote Whisper (%s, model=%s) HTTP %s: %s — falling back to local",
+                    self.base, model, resp.status_code, resp.text[:200])
+                return None
+            payload = resp.json()
+        except Exception as e:
+            logger.warning(
+                "Remote Whisper (%s, model=%s) failed: %s — falling back to local",
+                self.base, model, e)
+            return None
+
+        segments = _map_verbose_json(payload)
+        if not segments:
+            logger.warning("Remote Whisper returned no segments — falling back to local")
+            return None
+        for entry in segments:
+            entry["source"] = "remote"
+        logger.info("Remote Whisper (%s): %d segments, language=%s, model=%s",
+                    self.base, len(segments),
+                    payload.get("language", language or "auto"), model)
+        return {
+            "segments": segments,
+            "language": payload.get("language", language or "unknown"),
+            "provider": "remote",
+            "model": model,
+        }
+
+
 class AudioIntelligence:
     """
     Whisper-based audio analysis for reframing intelligence.
@@ -388,10 +570,35 @@ class AudioIntelligence:
         # Surfaced as ``self._batch_size`` so ``transcribe()`` uses it.
         self._batch_size = 16
 
-    def try_load(self) -> bool:
-        """Load faster-whisper with GPU → CPU fallback.
-        Uses cached model if same model was already loaded."""
+    def try_load(self, force_local: bool = False) -> bool:
+        """Load a transcription engine: remote → local CUDA ladder → CPU.
+
+        Selection order: a configured + healthy remote OpenAI-compatible
+        server wins (``WHISPER_REMOTE_URL`` — nothing loads on the local
+        GPU at all); otherwise the local faster-whisper CUDA→CPU ladder
+        runs unchanged. ``force_local=True`` skips the remote path — used
+        by callers that need the real local engine (whisper_translate's
+        native audio→English task, redecode) and by the mid-stage remote
+        failure fallback.
+
+        Uses the cached local model if the same model was already loaded.
+        """
         log = get_logger()
+
+        if not force_local and remote_whisper_configured():
+            if remote_whisper_healthy():
+                self.engine = RemoteWhisperEngine()
+                self.available = True
+                self.device_used = 'remote'
+                AudioIntelligence._record_loaded(
+                    remote_whisper_pick_model(None), 'remote')
+                log.log_stage('AUDIO',
+                    f'Remote Whisper selected: {_remote_whisper_base()} '
+                    '(local GPU stays free)')
+                return True
+            log.log_stage('AUDIO',
+                f'Remote Whisper configured ({_remote_whisper_base()}) but '
+                'health probe failed — using the local ladder')
 
         try:
             from faster_whisper import WhisperModel
@@ -756,6 +963,55 @@ class AudioIntelligence:
 
             audio_size = os.path.getsize(audio_path)
             log.log_stage('AUDIO', f'Audio extracted: {audio_size/1048576:.1f} MB')
+
+            # ── Remote Whisper (LAN server, e.g. the GPU Companion) ──
+            # The audio (never the video) goes to the OpenAI-compatible
+            # server picked in try_load(); output flows through the SAME
+            # post chain as cloud STT (hallucination filter → clamp →
+            # forced alignment) so downstream is schema-identical. Any
+            # mid-stage failure reloads the LOCAL ladder and continues —
+            # a job never fails solely because the remote server dropped.
+            if self.device_used == 'remote':
+                _remote_engine = (self.engine
+                                  if isinstance(self.engine, RemoteWhisperEngine)
+                                  else RemoteWhisperEngine())
+                _remote_model = _remote_engine.model or remote_whisper_pick_model(whisper_lang)
+                log.log_stage('AUDIO',
+                    f'Remote Whisper: {_remote_engine.base} '
+                    f'model={_remote_model} language={whisper_lang or "auto"}')
+                _remote_engine.model = _remote_model
+                _remote = _remote_engine.transcribe_wav(audio_path, whisper_lang)
+                if _remote:
+                    _result = self._finalize_cloud_transcription(
+                        _remote, audio_path, duration_ms, log, on_progress)
+                    if _result is not None:
+                        _result['transcription_provider'] = 'remote'
+                        _result['transcription_location'] = 'remote'
+                        # Report the REMOTE model as the effective model so
+                        # the compute summary shows what actually ran.
+                        self.model_name = _remote_model
+                        AudioIntelligence._record_loaded(_remote_model, 'remote')
+                        if _own_audio:
+                            try:
+                                os.remove(audio_path)
+                            except Exception:
+                                pass
+                        return _result
+                log.log_stage('AUDIO',
+                    'Remote Whisper failed mid-stage — falling back to the '
+                    'local CUDA→CPU ladder (job continues)')
+                self.available = False
+                self.engine = None
+                self.device_used = 'unknown'
+                if not self.try_load(force_local=True):
+                    log.log_stage('AUDIO',
+                        'Local Whisper fallback also unavailable — no transcript')
+                    if _own_audio:
+                        try:
+                            os.remove(audio_path)
+                        except Exception:
+                            pass
+                    return {'speech_active': {}, 'segments': [], 'language': ''}
 
             # ── Cloud transcription provider (audit Phase 4.1) ──
             # TRANSCRIPTION_PROVIDER=groq|openai runs the primary pass in
@@ -1861,6 +2117,22 @@ class AudioIntelligence:
         own audio-aligned timing), or ``[]`` when the engine is unavailable.
         """
         log = get_logger()
+
+        # The native translate task needs a REAL local faster-whisper engine
+        # (batched decode with task="translate" — no OpenAI-compatible
+        # equivalent is guaranteed remotely). If the remote engine was
+        # selected, swap in the local ladder just for this pass.
+        if self.device_used == 'remote' or isinstance(self.engine, RemoteWhisperEngine):
+            log.log_stage('TRANSLATE',
+                'Remote Whisper active — loading the LOCAL engine for the '
+                'native translate task')
+            self.engine = None
+            self.available = False
+            self.device_used = 'unknown'
+            if not self.try_load(force_local=True):
+                log.log_stage('TRANSLATE',
+                    'Local Whisper unavailable — cannot use native translate')
+                return []
 
         if not self.engine:
             log.log_stage('TRANSLATE',
