@@ -17,6 +17,8 @@ import ToolBar from './ToolBar';
 import EffectsPanel from './EffectsPanel';
 import TransitionPicker from './TransitionPicker';
 import ExportDialog from './ExportDialog';
+import CommandPalette from './CommandPalette';
+import ShortcutCheatSheet from './ShortcutCheatSheet';
 import InteractiveOverlay from './InteractiveOverlay';
 import MarqueeSelection from './MarqueeSelection';
 import { hexToRgbString } from '../utils/colorUtils';
@@ -2483,13 +2485,31 @@ export default function VideoEditor({
       });
     }
   }, []);
-  useKeyboardShortcuts({
-    enabled: showMultiTrack,
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [cheatSheetOpen, setCheatSheetOpen] = useState(false);
+
+  // Shared action context — the same shape the keyboard registry uses,
+  // handed to the command palette so both run identical action code.
+  const actionCtx = {
     onTogglePlay: togglePlay,
     onSeek: seekTo,
     onSkipTime: skipTime,
     onToggleMute: toggleMute,
     onShuttleSpeed: handleShuttleSpeed,
+    onOpenPalette: () => setPaletteOpen(true),
+    onOpenHelp: () => setCheatSheetOpen(true),
+    clipRange: { start: clipStart, end: clipEnd },
+  };
+
+  useKeyboardShortcuts({
+    enabled: showMultiTrack && !paletteOpen && !cheatSheetOpen,
+    onTogglePlay: togglePlay,
+    onSeek: seekTo,
+    onSkipTime: skipTime,
+    onToggleMute: toggleMute,
+    onShuttleSpeed: handleShuttleSpeed,
+    onOpenPalette: () => setPaletteOpen(true),
+    onOpenHelp: () => setCheatSheetOpen(true),
     // ``seekTo`` expects wall-clock time. Without this, End jumped to
     // ``timelineStore.duration`` (timeline-relative) which clamped to
     // ``clipStart`` for any clip with a non-zero start.
@@ -4433,8 +4453,14 @@ export default function VideoEditor({
           <span><kbd>Esc</kbd> Deselect</span>
           <span><kbd>Tab</kbd> Cycle Segments</span>
           {showMultiTrack && <span><kbd>Ctrl+Z</kbd>/<kbd>Ctrl+Shift+Z</kbd> Undo/Redo</span>}
+          {showMultiTrack && <span><kbd>⌘K</kbd> Commands</span>}
+          {showMultiTrack && <span><kbd>?</kbd> All shortcuts</span>}
         </div>
       )}
+
+      {/* ── Command palette (⌘K) + shortcut cheat sheet (?) ── */}
+      <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} ctx={actionCtx} />
+      <ShortcutCheatSheet open={cheatSheetOpen} onClose={() => setCheatSheetOpen(false)} />
     </div>
   );
 }

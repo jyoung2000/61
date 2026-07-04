@@ -1,5 +1,6 @@
 import React from 'react';
 import useTimelineStore from '../stores/timelineStore';
+import Tooltip from './Tooltip';
 
 const TOOLS = [
   { id: 'select', label: 'Select', shortcut: 'V', icon: (
@@ -115,40 +116,42 @@ export default function ToolBar({ compact = false }) {
   return (
     <div className={`ve-toolbar${compact ? ' ve-toolbar--compact' : ''}`}>
       {TOOLS.map((tool) => (
-        <button
-          key={tool.id}
-          className={`ve-toolbar__btn${activeTool === tool.id ? ' ve-toolbar__btn--active' : ''}`}
-          onClick={() => handleToolClick(tool.id)}
-          title={`${tool.label} (${tool.shortcut})`}
-        >
-          {tool.icon}
-          {!compact && <span className="ve-toolbar__label">{tool.label}</span>}
-        </button>
+        <Tooltip key={tool.id} label={tool.label} kbd={tool.shortcut}>
+          <button
+            className={`ve-toolbar__btn${activeTool === tool.id ? ' ve-toolbar__btn--active' : ''}`}
+            onClick={() => handleToolClick(tool.id)}
+          >
+            {tool.icon}
+            {!compact && <span className="ve-toolbar__label">{tool.label}</span>}
+          </button>
+        </Tooltip>
       ))}
 
       <div className="ve-toolbar__divider" />
 
       {/* Undo/Redo */}
-      <button
-        className="ve-toolbar__btn"
-        onClick={() => useTimelineStore.temporal.getState().undo()}
-        title="Undo (Ctrl+Z)"
-      >
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-          <polyline points="1 4 1 10 7 10" />
-          <path d="M3.51 15a9 9 0 102.13-9.36L1 10" />
-        </svg>
-      </button>
-      <button
-        className="ve-toolbar__btn"
-        onClick={() => useTimelineStore.temporal.getState().redo()}
-        title="Redo (Ctrl+Shift+Z)"
-      >
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-          <polyline points="23 4 23 10 17 10" />
-          <path d="M20.49 15a9 9 0 11-2.13-9.36L23 10" />
-        </svg>
-      </button>
+      <Tooltip actionId="undo">
+        <button
+          className="ve-toolbar__btn"
+          onClick={() => useTimelineStore.temporal.getState().undo()}
+        >
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <polyline points="1 4 1 10 7 10" />
+            <path d="M3.51 15a9 9 0 102.13-9.36L1 10" />
+          </svg>
+        </button>
+      </Tooltip>
+      <Tooltip actionId="redo">
+        <button
+          className="ve-toolbar__btn"
+          onClick={() => useTimelineStore.temporal.getState().redo()}
+        >
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <polyline points="23 4 23 10 17 10" />
+            <path d="M20.49 15a9 9 0 11-2.13-9.36L23 10" />
+          </svg>
+        </button>
+      </Tooltip>
     </div>
   );
 }

@@ -2317,6 +2317,26 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
     return entries;
   }, [contextMenu, selectedItemIds, splitItem, removeItem, updateItem, groupItems, ungroupItems]);
 
+  // ── Zoom to fit — toolbar Fit button, ⇧Z (action registry event) ──
+  const zoomToFit = useCallback(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const { items: curItems, duration: curDuration } = useTimelineStore.getState();
+    const maxEnd = curItems.length > 0
+      ? Math.max(...curItems.map(it => it.end || 0))
+      : curDuration || 30;
+    const fitDuration = maxEnd * 1.05 || 30;
+    const availableWidth = canvas.getBoundingClientRect().width - LABEL_WIDTH;
+    const fitZoom = Math.max(0.01, availableWidth / (fitDuration * basePPS));
+    setZoom(fitZoom);
+    setScrollX(0);
+  }, [basePPS, setZoom, setScrollX]);
+
+  useEffect(() => {
+    window.addEventListener('ve:zoom-fit', zoomToFit);
+    return () => window.removeEventListener('ve:zoom-fit', zoomToFit);
+  }, [zoomToFit]);
+
   // ── Compute canvas height ──────────────────────────────────────────────────
   const canvasHeight = RULER_HEIGHT + tracks.length * (TRACK_HEIGHT + TRACK_GAP) + 12;
 
@@ -2351,21 +2371,8 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
         </button>
         <button
           className="ve-btn"
-          onClick={() => {
-            // Fit entire content extent in view
-            const canvas = canvasRef.current;
-            if (canvas) {
-              const maxEnd = items.length > 0
-                ? Math.max(...items.map(it => it.end || 0))
-                : duration || 30;
-              const fitDuration = maxEnd * 1.05 || 30;
-              const availableWidth = canvas.getBoundingClientRect().width - LABEL_WIDTH;
-              const fitZoom = Math.max(0.01, availableWidth / (fitDuration * basePPS));
-              setZoom(fitZoom);
-              setScrollX(0);
-            }
-          }}
-          title="Fit entire video in view"
+          onClick={zoomToFit}
+          title="Fit entire video in view (⇧Z)"
           style={{ fontSize: 10, padding: '2px 8px', minWidth: 'auto', minHeight: 24, fontWeight: 600 }}
         >
           Fit
