@@ -2,6 +2,9 @@ __pycache__/
 node_modules/
 frontend/dist/
 data/
+# Local settings file auto-created by backend/config.py when running outside
+# Docker (tests, local CLI). Can carry user API keys — never commit it.
+.env
 # Local persisted user settings dir (written by the settings router /
 # pipeline when running outside the Docker data mount, e.g. tests).
 .clipai/
