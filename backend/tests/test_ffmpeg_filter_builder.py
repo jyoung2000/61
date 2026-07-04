@@ -186,6 +186,79 @@ class TestTransitions:
         assert "concat=n=2" in graph
 
 
+class TestTransitionTypeMapping:
+    """Parity fix 1.3: every NLE transition type maps to a real xfade
+    transition instead of collapsing to fade."""
+
+    ALL_SUPPORTED = frozenset(
+        {"fade", "wipeleft", "wiperight", "slideleft", "slideright", "zoomin"}
+    )
+
+    @pytest.fixture(autouse=True)
+    def _full_capability(self, monkeypatch):
+        # Tests must not depend on the sandbox's ffmpeg build — pretend
+        # every mapped transition is available unless a test overrides.
+        from backend.services import ffmpeg_filter_builder as fb
+        monkeypatch.setattr(
+            fb, "_supported_xfade_transitions", lambda: self.ALL_SUPPORTED)
+
+    def _graph_for(self, transition_type):
+        plan = _make_plan([
+            RenderOp(
+                kind=RenderOpKind.CROP,
+                start_sec=0.0, end_sec=5.0,
+                primary_rect=Rect(0.2, 0.0, 0.5, 1.0),
+            ),
+            RenderOp(
+                kind=RenderOpKind.CROP,
+                start_sec=5.0, end_sec=10.0,
+                primary_rect=Rect(0.5, 0.0, 0.5, 1.0),
+                ease_in_ms=500,
+                transition_type=transition_type,
+            ),
+        ])
+        return _build_filter_graph(plan)
+
+    @pytest.mark.parametrize("nle_type,xfade_name", [
+        ("fade", "fade"),
+        # canvas dissolve is an alpha crossfade — xfade 'fade' matches the
+        # preview; xfade 'dissolve' is a noisy pixel dissolve
+        ("dissolve", "fade"),
+        ("wipe-left", "wipeleft"),
+        ("wipe-right", "wiperight"),
+        ("slide-left", "slideleft"),
+        ("slide-right", "slideright"),
+        ("zoom", "zoomin"),
+    ])
+    def test_each_type_maps_to_xfade(self, nle_type, xfade_name):
+        graph = self._graph_for(nle_type)
+        assert f"xfade=transition={xfade_name}:" in graph
+
+    def test_none_type_defaults_to_fade(self):
+        graph = self._graph_for(None)
+        assert "xfade=transition=fade:" in graph
+
+    def test_unknown_type_falls_back_to_fade(self):
+        graph = self._graph_for("star-wipe")
+        assert "xfade=transition=fade:" in graph
+
+    def test_unsupported_build_falls_back_to_fade(self, monkeypatch):
+        from backend.services import ffmpeg_filter_builder as fb
+        monkeypatch.setattr(
+            fb, "_supported_xfade_transitions", lambda: frozenset({"fade"}))
+        graph = self._graph_for("wipe-left")
+        assert "xfade=transition=fade:" in graph
+
+    def test_mapping_covers_every_canvas_transition(self):
+        # Keep in sync with the canvas TRANSITIONS list (TransitionPicker)
+        from backend.services.ffmpeg_filter_builder import XFADE_BY_TRANSITION
+        canvas_types = {
+            "fade", "dissolve", "wipe-left", "wipe-right",
+            "slide-left", "slide-right", "zoom",
+        }
+        assert canvas_types == set(XFADE_BY_TRANSITION)
+
+
 class TestMultiOpConcat:
     def test_three_ops_produce_concat_n3(self):
         plan = _make_plan([

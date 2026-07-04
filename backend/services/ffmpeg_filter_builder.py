@@ -13,8 +13,11 @@ Design principles:
 
 import logging
 import os
+import re
+import subprocess
 import tempfile
 import uuid
+from functools import lru_cache
 from typing import List, Tuple
 
 from backend.services.render_plan import (
@@ -455,9 +458,80 @@ def _filter_grid_2x2(op, label, src_w, src_h, tgt_w, tgt_h, start, end) -> str:
     return ";\n".join(lines)
 
 
+# NLE timeline transition type → xfade transition name. The canvas
+# renderer (preview + client export) draws the same styles; easing
+# differs (canvas cubic-bezier vs xfade linear — parity matrix caveat).
+# 'dissolve' maps to xfade 'fade' on purpose: the canvas dissolve is a
+# plain alpha crossfade, while xfade's 'dissolve' is a noisy pixel
+# dissolve that looks nothing like the preview.
+XFADE_BY_TRANSITION = {
+    "fade": "fade",
+    "dissolve": "fade",
+    "wipe-left": "wipeleft",
+    "wipe-right": "wiperight",
+    "slide-left": "slideleft",
+    "slide-right": "slideright",
+    "zoom": "zoomin",
+}
+
+
+@lru_cache(maxsize=1)
+def _supported_xfade_transitions() -> frozenset:
+    """Probe ``ffmpeg -h filter=xfade`` for the supported transition names.
+
+    All the names in XFADE_BY_TRANSITION exist since FFmpeg 4.3 (xfade's
+    first release), but exotic/stripped builds do exist — probing once at
+    first use lets us fall back per-name instead of failing the export.
+    Returns a minimal {'fade'} on any probe failure so transitions always
+    render as at least a crossfade.
+    """
+    try:
+        out = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-h", "filter=xfade"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout or ""
+        names = {
+            name for name in set(XFADE_BY_TRANSITION.values())
+            if re.search(rf"^\s+{re.escape(name)}\b", out, flags=re.MULTILINE)
+        }
+        if names:
+            return frozenset(names | {"fade"})
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("xfade capability probe failed (%s) — using fade only", exc)
+    return frozenset({"fade"})
+
+
+def xfade_transition_for(transition_type) -> str:
+    """Map an NLE transition type to a supported xfade transition name.
+
+    Unknown types and types this FFmpeg build can't render fall back to
+    'fade' with a job-log warning (the preview showed the real style, so
+    the divergence must be visible in the logs).
+    """
+    if not transition_type:
+        return "fade"
+    mapped = XFADE_BY_TRANSITION.get(transition_type)
+    if mapped is None:
+        logger.warning(
+            "Unknown transition type '%s' — falling back to xfade fade",
+            transition_type,
+        )
+        return "fade"
+    if mapped not in _supported_xfade_transitions():
+        logger.warning(
+            "This FFmpeg build lacks xfade transition '%s' (for '%s') — "
+            "falling back to fade",
+            mapped, transition_type,
+        )
+        return "fade"
+    return mapped
+
+
 def _apply_transitions(ops, op_labels, lines) -> List[str]:
     """Apply xfade transitions between ops where ease_in_ms > 0.
 
+    The transition style comes from op.transition_type (None → fade),
+    mapped through XFADE_BY_TRANSITION with a capability guard.
     Returns the final list of stream labels to concat.
     """
     if len(ops) <= 1:
@@ -473,13 +547,16 @@ def _apply_transitions(ops, op_labels, lines) -> List[str]:
             offset = ops[i].start_sec - dur / 2.0
             offset = max(0, offset)
 
+            transition = xfade_transition_for(
+                getattr(ops[i], "transition_type", None))
+
             prev_label = final_labels[-1]
             curr_label = op_labels[i]
             xfade_label = f"[vx{i}]"
 
             lines.append(
                 f"{prev_label}{curr_label}"
-                f"xfade=transition=fade:duration={dur:.3f}:offset={offset:.3f}"
+                f"xfade=transition={transition}:duration={dur:.3f}:offset={offset:.3f}"
                 f"{xfade_label}"
             )
             final_labels[-1] = xfade_label

@@ -51,7 +51,7 @@ export const FEATURE_PARITY = [
     preview: 'ok', clientExport: 'ok', serverExport: 'ok' },
   { key: 'transition', label: 'Clip transition (type + duration)', panel: 'PropertiesPanel',
     preview: 'ok', clientExport: 'ok', serverExport: 'partial',
-    notes: 'Canvas supports dissolve/fade/wipe-left/wipe-right/slide-left/slide-right/zoom; the FFmpeg path inserts xfade=transition=fade only — other transition types render as fade on server export. Easing also differs (canvas cubic-bezier vs xfade linear).' },
+    notes: 'Every canvas transition type now maps to a matching xfade transition on the FFmpeg path (wipe-left→wipeleft, slide-left→slideleft, zoom→zoomin, …; dissolve intentionally maps to xfade fade because the canvas dissolve is an alpha crossfade, not xfade\'s pixel-noise dissolve). A capability probe falls back to fade with a job-log warning on FFmpeg builds lacking a transition. Remaining caveat: easing differs (canvas cubic-bezier vs xfade linear), so mid-transition frames diverge slightly.' },
 
   // ── Effects (EffectsPanel) ───────────────────────────────────────
   { key: 'effects.brightness', label: 'Brightness', panel: 'EffectsPanel',

@@ -99,6 +99,13 @@ class RenderOp:
     # 0 = hard cut (use when crossing a shot boundary).
     # 400-600 for within-shot eases.
     ease_in_ms: int = 0
+    # Transition style INTO this op when ease_in_ms > 0. One of the NLE
+    # timeline transition types ("fade" | "dissolve" | "wipe-left" |
+    # "wipe-right" | "slide-left" | "slide-right" | "zoom") or None for
+    # the legacy default (fade). The FFmpeg builder maps these to xfade
+    # transitions (ffmpeg_filter_builder.XFADE_BY_TRANSITION); the canvas
+    # renderer draws the same styles with cubic-bezier easing.
+    transition_type: Optional[str] = None
     # For debugging / logs only, not rendering
     strategy_label: str = ""
     content_type: str = "unknown"
