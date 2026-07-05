@@ -244,6 +244,36 @@ async fn list_models() -> Vec<serde_json::Value> {
     ollama::list_models_detailed().await
 }
 
+/// Re-probe whether a whisper sidecar is present (bundled or downloaded) and
+/// update the cached flag — the "Refresh" button after a Download/install.
+#[tauri::command]
+fn refresh_sidecar(app: tauri::AppHandle, state: tauri::State<'_, SharedState>) -> bool {
+    let rd = app.path().resource_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let dd = app.path().app_data_dir().unwrap_or_else(|_| rd.clone());
+    let ok = sidecar::available(&rd, &dd);
+    state.sidecar_available.store(ok, Ordering::Relaxed);
+    ok
+}
+
+/// Download the latest whisper.cpp server into app data (Windows), then
+/// re-probe availability. Progress arrives via `whisper-progress` events.
+#[tauri::command]
+async fn download_whisper(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, SharedState>,
+) -> Result<String, String> {
+    let dd = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("no app data dir: {e}"))?;
+    let rd = app.path().resource_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let msg = sidecar::download_whispercpp(&app, &dd).await?;
+    state
+        .sidecar_available
+        .store(sidecar::available(&rd, &dd), Ordering::Relaxed);
+    Ok(msg)
+}
+
 #[tauri::command]
 async fn delete_model(model: String) -> Result<(), String> {
     ollama::delete_model(&model).await
@@ -422,7 +452,7 @@ pub fn run() {
 
             let state: SharedState = Arc::new(AppState::load(config_dir));
             state.sidecar_available.store(
-                sidecar::available(&resource_dir),
+                sidecar::available(&resource_dir, &data_dir),
                 Ordering::Relaxed,
             );
             app.manage(state.clone());
@@ -533,6 +563,8 @@ pub fn run() {
             pull_model,
             list_models,
             delete_model,
+            refresh_sidecar,
+            download_whisper,
             pair_clipai,
         ]);
 

@@ -968,29 +968,13 @@ export default function Settings() {
         setPulling(false);
         return;
       }
-      showToast(data.message || 'Pulling models…', data.status === 'already_running' ? 'info' : 'success');
-      // Poll until the background pull finishes, reloading the list each tick.
-      let active = true;
-      let guard = 0;
-      while (active && guard < 600) {  // ~30 min ceiling at 3s/tick
-        guard += 1;
-        await new Promise((r) => setTimeout(r, 3000));
-        let st;
-        try {
-          const sres = await fetch('/api/providers/ollama/pull-status');
-          st = sres.ok ? await sres.json() : null;
-        } catch { st = null; }
-        if (!st) break;
-        setPullStatus(st.current ? `Pulling ${st.current}…`
-          : `${st.finished || 0}/${st.total || 0} done`);
-        await loadAvailableModels();
-        active = !!st.active;
-      }
+      showToast(data.message || 'Re-syncing models…', data.status === 'already_running' ? 'info' : 'success');
       setPullStatus('');
-      showToast('Model pull finished', 'success');
-      await loadAvailableModels();
+      // Drive the per-target (container + Companion) progress panel.
+      setCompanionSync({ active: true, models: data.models || [], hosts: [] });
+      await pollSyncStatus();
     } catch {
-      showToast('Failed to pull models', 'error');
+      showToast('Failed to re-sync models', 'error');
     } finally {
       setPulling(false);
     }
@@ -2313,7 +2297,7 @@ export default function Settings() {
                   <button
                     onClick={handlePullModels}
                     disabled={pulling}
-                    title="Download the configured local models (primary, editorial, translation) onto the Ollama host"
+                    title="Re-download the configured local models (primary, editorial, translation) onto every host — the container's Ollama and a paired Companion"
                     style={{
                       padding: '8px 14px', background: 'var(--bg-elevated)',
                       color: 'var(--accent-cyan)', border: '1px solid var(--accent-cyan)',
@@ -2321,7 +2305,7 @@ export default function Settings() {
                       opacity: pulling ? 0.6 : 1,
                     }}
                   >
-                    {pulling ? 'Pulling…' : '⤓ Pull local models'}
+                    {pulling ? 'Syncing…' : '⟳ Re-sync models'}
                   </button>
                 </div>
               </div>

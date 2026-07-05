@@ -44,12 +44,61 @@ fn sidecar_binary(resource_dir: &PathBuf) -> PathBuf {
     }
 }
 
-/// Whether this build shipped a whisper sidecar at all. From-source /
-/// cross-compiled installers may not bundle one — Ollama sharing still
-/// works; health + pairing report whisper honestly so ClipAI keeps its
-/// transcription local instead of probing a dead endpoint.
-pub fn available(resource_dir: &PathBuf) -> bool {
-    sidecar_binary(resource_dir).exists()
+/// Where a runtime-DOWNLOADED whisper.cpp server lives (app data). This is how
+/// a from-source build (which can't bundle the sidecar) gains local Whisper:
+/// the GUI's "Download Whisper" fetches the whisper.cpp release here.
+pub fn downloaded_whisper_dir(data_dir: &PathBuf) -> PathBuf {
+    data_dir.join("whisper-bin")
+}
+
+fn downloaded_whisper_server(data_dir: &PathBuf) -> Option<PathBuf> {
+    let dir = downloaded_whisper_dir(data_dir);
+    let names = ["whisper-server.exe", "whisper-server", "server.exe", "server"];
+    for name in names {
+        let p = dir.join(name);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    // whisper-bin-x64.zip may nest the binaries one folder deep — its DLLs sit
+    // beside the .exe there, so running it in place still resolves them.
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for entry in rd.flatten() {
+            if entry.path().is_dir() {
+                for name in names {
+                    let p = entry.path().join(name);
+                    if p.is_file() {
+                        return Some(p);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Resolve the whisper server to run: prefer a downloaded whisper.cpp build
+/// (works for from-source installs), else the bundled sidecar. Returns
+/// (binary_path, is_whispercpp) — whisper.cpp and faster-whisper take
+/// different launch args.
+fn resolve_sidecar(resource_dir: &PathBuf, data_dir: &PathBuf) -> Option<(PathBuf, bool)> {
+    if let Some(p) = downloaded_whisper_server(data_dir) {
+        return Some((p, true)); // downloaded == whisper.cpp on every platform
+    }
+    let bundled = sidecar_binary(resource_dir);
+    if bundled.is_file() {
+        // Bundled: macOS ships whisper.cpp, Windows ships faster-whisper.
+        return Some((bundled, cfg!(target_os = "macos")));
+    }
+    None
+}
+
+/// Whether a whisper sidecar is usable — bundled OR downloaded. From-source /
+/// cross-compiled installers don't bundle one; the user can add it via the
+/// GUI's "Download Whisper". Ollama sharing works regardless; health + pairing
+/// report whisper honestly so ClipAI keeps transcription local until it's here.
+pub fn available(resource_dir: &PathBuf, data_dir: &PathBuf) -> bool {
+    resolve_sidecar(resource_dir, data_dir).is_some()
 }
 
 /// Model directory in app data — models download on demand, never bundled.
@@ -145,19 +194,19 @@ pub async fn ensure_running(
         *guard = None;
     }
 
-    let binary = sidecar_binary(&resource_dir);
-    if !binary.exists() {
-        return Err(format!(
-            "whisper sidecar binary not found at {} — reinstall the Companion",
-            binary.display()
-        ));
-    }
+    let (binary, is_whispercpp) = resolve_sidecar(&resource_dir, &data_dir).ok_or_else(|| {
+        "no whisper sidecar available — use \"Download Whisper\" in the Companion, \
+         or install a build that bundles it".to_string()
+    })?;
     let models = models_dir(&data_dir);
     let _ = std::fs::create_dir_all(&models);
 
-    log::info!("starting whisper sidecar: model={model} compute={compute} (budget {budget:.1} GB)");
+    log::info!(
+        "starting whisper sidecar: {} model={model} compute={compute} (budget {budget:.1} GB)",
+        if is_whispercpp { "whisper.cpp" } else { "faster-whisper" }
+    );
     let mut cmd = quiet_command(&binary);
-    if cfg!(target_os = "macos") {
+    if is_whispercpp {
         // whisper.cpp server CLI — weights must exist before launch.
         let model_file = ensure_whispercpp_model(&models, model).await?;
         cmd.args([
@@ -199,6 +248,117 @@ pub async fn ensure_running(
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
     Err("whisper sidecar started but never became healthy (model download may have failed)".into())
+}
+
+/// Download the latest whisper.cpp prebuilt server into app data so a
+/// from-source Companion (which can't bundle the sidecar) gains local Whisper.
+/// Windows only — macOS builds bundle whisper.cpp. Emits `whisper-progress`.
+#[cfg(target_os = "windows")]
+pub async fn download_whispercpp(
+    app: &tauri::AppHandle,
+    data_dir: &PathBuf,
+) -> Result<String, String> {
+    use futures_util::StreamExt;
+    use tauri::Emitter;
+    use tokio::io::AsyncWriteExt;
+
+    let emit = |stage: &str, percent: f64, message: &str| {
+        let _ = app.emit(
+            "whisper-progress",
+            serde_json::json!({"stage": stage, "percent": percent, "message": message}),
+        );
+    };
+    emit("resolving", -1.0, "Finding the latest whisper.cpp release…");
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(1800))
+        .user_agent("clipai-companion")
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let rel: serde_json::Value = client
+        .get("https://api.github.com/repos/ggml-org/whisper.cpp/releases/latest")
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|e| format!("release lookup failed: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("release parse failed: {e}"))?;
+    let tag = rel.get("tag_name").and_then(|t| t.as_str()).unwrap_or("").to_string();
+    let assets = rel.get("assets").and_then(|a| a.as_array()).cloned().unwrap_or_default();
+    // Plain CPU x64 build first (most compatible); BLAS as a fallback.
+    let mut url = String::new();
+    'outer: for want in ["whisper-bin-x64.zip", "whisper-blas-bin-x64.zip"] {
+        for a in &assets {
+            if a.get("name").and_then(|n| n.as_str()) == Some(want) {
+                url = a.get("browser_download_url").and_then(|u| u.as_str()).unwrap_or("").to_string();
+                break 'outer;
+            }
+        }
+    }
+    if url.is_empty() {
+        return Err("no whisper-bin-x64.zip in the latest whisper.cpp release".into());
+    }
+
+    let dl_dir = downloaded_whisper_dir(data_dir);
+    let _ = std::fs::create_dir_all(&dl_dir);
+    let zip_path = dl_dir.join("_download.zip");
+
+    emit("downloading", 0.0, &format!("Downloading whisper.cpp {tag}…"));
+    let resp = client.get(&url).send().await.map_err(|e| format!("download failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("download failed: HTTP {}", resp.status()));
+    }
+    let total = resp.content_length().unwrap_or(0);
+    let mut file = tokio::fs::File::create(&zip_path).await.map_err(|e| e.to_string())?;
+    let mut downloaded: u64 = 0;
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("download interrupted: {e}"))?;
+        file.write_all(&chunk).await.map_err(|e| e.to_string())?;
+        downloaded += chunk.len() as u64;
+        if total > 0 {
+            emit("downloading", downloaded as f64 / total as f64 * 100.0, "Downloading…");
+        }
+    }
+    file.flush().await.map_err(|e| e.to_string())?;
+    drop(file);
+
+    emit("extracting", -1.0, "Extracting…");
+    let status = quiet_command("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!(
+                "Expand-Archive -Force -LiteralPath '{}' -DestinationPath '{}'",
+                zip_path.display(),
+                dl_dir.display()
+            ),
+        ])
+        .status()
+        .await
+        .map_err(|e| format!("extraction failed to start: {e}"))?;
+    let _ = std::fs::remove_file(&zip_path);
+    if !status.success() {
+        return Err("extraction failed (Expand-Archive)".into());
+    }
+
+    match downloaded_whisper_server(data_dir) {
+        Some(_) => {
+            emit("done", 100.0, "Whisper installed");
+            Ok(format!("whisper.cpp {tag} installed"))
+        }
+        None => Err("whisper-server.exe not found after extraction".into()),
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub async fn download_whispercpp(
+    _app: &tauri::AppHandle,
+    _data_dir: &PathBuf,
+) -> Result<String, String> {
+    Err("Runtime Whisper download is Windows-only — macOS builds bundle whisper.cpp.".into())
 }
 
 pub async fn shutdown(state: &AppState) {

@@ -6,6 +6,7 @@ import {
   CompanionStatus, getStatus, setConfig, regenerateToken,
   installOllama, startOllama, pullModel, pairClipai,
   listModels, deleteModel, InstalledModel,
+  downloadWhisper, refreshSidecar,
 } from './api';
 
 const fmtMb = (mb: number) => (mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${mb} MB`);
@@ -351,8 +352,25 @@ function Dashboard({ status, refresh }: { status: CompanionStatus; refresh: () =
   const [models, setModels] = useState<InstalledModel[]>([]);
   const [confirmDel, setConfirmDel] = useState('');
   const [deleting, setDeleting] = useState('');
+  const [whisperDl, setWhisperDl] = useState<{ active: boolean; percent: number; message: string } | null>(null);
+  const [syncing, setSyncing] = useState(false);
+  const [syncMsg, setSyncMsg] = useState('');
 
   useEffect(() => { autostartEnabled().then(setAutostart).catch(() => setAutostart(null)); }, []);
+
+  // Live progress for the Whisper download + model re-sync.
+  useEffect(() => {
+    const uW = listen<{ stage: string; percent: number; message: string }>('whisper-progress', (e) => {
+      const { stage, percent, message } = e.payload;
+      setWhisperDl({ active: stage !== 'done' && stage !== 'error', percent, message });
+      if (stage === 'done' || stage === 'error') setTimeout(() => setWhisperDl(null), 4000);
+    });
+    const uP = listen<{ model: string; status: string; percent: number }>('pull-progress', (e) => {
+      const { model, status: st, percent } = e.payload;
+      setSyncMsg(`${model}: ${st}${percent >= 0 ? ` ${Math.round(percent)}%` : ''}`);
+    });
+    return () => { uW.then((f) => f()); uP.then((f) => f()); };
+  }, []);
 
   const loadModels = useCallback(() => {
     listModels().then(setModels).catch(() => {});
@@ -367,6 +385,38 @@ function Dashboard({ status, refresh }: { status: CompanionStatus; refresh: () =
       loadModels();
       refresh();
     } catch { /* left installed */ } finally { setDeleting(''); }
+  };
+
+  const doDownloadWhisper = async () => {
+    setWhisperDl({ active: true, percent: -1, message: 'Starting…' });
+    try {
+      await downloadWhisper();
+      await refreshSidecar();
+      refresh();
+    } catch (e) {
+      setWhisperDl({ active: false, percent: 0, message: `Failed: ${e}` });
+      setTimeout(() => setWhisperDl(null), 6000);
+    }
+  };
+
+  const doRefreshWhisper = async () => {
+    try { await refreshSidecar(); } catch {}
+    refresh();
+  };
+
+  // Re-sync: pull any recommended local models not yet installed (idempotent).
+  const doReSync = async () => {
+    setSyncing(true);
+    setSyncMsg('');
+    try {
+      const recs = status.recommended_models || [];
+      for (const { model } of recs) {
+        const have = status.ollama.models.some((m) => m.startsWith(model.split(':')[0]));
+        if (!have) { try { await pullModel(model); } catch {} }
+      }
+      loadModels();
+      refresh();
+    } finally { setSyncing(false); setSyncMsg(''); }
   };
 
   const gpu = status.gpu;
@@ -480,8 +530,32 @@ function Dashboard({ status, refresh }: { status: CompanionStatus; refresh: () =
             }} />
             Whisper sidecar {status.sidecar_running ? 'running'
               : status.sidecar_available ? 'idle (starts on demand)'
-              : 'not included in this build (optional) — transcription runs on the ClipAI server instead; GPU sharing for Ollama is unaffected'}
+              : 'not installed (optional) — transcription runs on the ClipAI server instead; GPU sharing for Ollama is unaffected'}
           </div>
+          {!status.sidecar_available && (
+            <div style={{ margin: '0 0 8px 17px' }}>
+              <div className="row" style={{ marginBottom: whisperDl ? 6 : 0 }}>
+                <button className="secondary" onClick={doDownloadWhisper}
+                  disabled={!!whisperDl?.active}
+                  title="Download whisper.cpp so this GPU can also do transcription">
+                  {whisperDl?.active ? 'Downloading…' : 'Download Whisper'}
+                </button>
+                <button className="secondary" onClick={doRefreshWhisper} disabled={!!whisperDl?.active}
+                  title="Re-check whether Whisper is installed">
+                  ↻ Refresh
+                </button>
+              </div>
+              {whisperDl && (
+                <div>
+                  <div className="small muted" style={{ marginBottom: 3 }}>{whisperDl.message}</div>
+                  <div className={`meter${whisperDl.percent < 0 ? ' indeterminate' : ''}`}>
+                    <div style={whisperDl.percent < 0 ? undefined
+                      : { width: `${Math.max(2, Math.min(100, whisperDl.percent))}%` }} />
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
           <div className="small muted" style={{ margin: '8px 0 4px' }}>
             Share this address with ClipAI:
           </div>
@@ -529,10 +603,21 @@ function Dashboard({ status, refresh }: { status: CompanionStatus; refresh: () =
       <div className="panel">
         <div className="row spread" style={{ marginBottom: 8 }}>
           <h2 style={{ margin: 0 }}>Local AI models</h2>
-          <span className="muted small">
-            {models.length} installed{models.length ? ` · ${fmtBytes(models.reduce((s, m) => s + (m.size || 0), 0))}` : ''}
-          </span>
+          <div className="row">
+            <span className="muted small">
+              {models.length} installed{models.length ? ` · ${fmtBytes(models.reduce((s, m) => s + (m.size || 0), 0))}` : ''}
+            </span>
+            <button className="secondary" onClick={() => { loadModels(); refresh(); }}
+              title="Reload the installed-model list">↻ Refresh</button>
+            <button className="secondary" onClick={doReSync} disabled={syncing || !status.ollama.running}
+              title="Download any recommended models not yet installed">
+              {syncing ? 'Syncing…' : 'Re-sync models'}
+            </button>
+          </div>
         </div>
+        {syncing && syncMsg && (
+          <div className="small muted" style={{ marginBottom: 6 }}>{syncMsg}</div>
+        )}
         {models.length === 0 ? (
           <p className="muted small">
             No models installed yet. Pick models in ClipAI and hit Save (or use the setup
