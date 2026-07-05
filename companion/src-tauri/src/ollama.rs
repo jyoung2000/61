@@ -303,21 +303,21 @@ pub fn recommended_models(budget_gb: f32) -> Vec<(&'static str, &'static str)> {
             ("llava:13b", "Vision (Primary AI)"),
             ("qwen2.5vl:7b", "Video/vision understanding"),
             ("qwen2.5:14b", "Editorial (SEO / summaries)"),
-            ("qwen3:4b", "Subtitle translation"),
+            ("qwen3:4b-instruct-2507-q4_K_M", "Subtitle translation"),
         ]
     } else if budget_gb >= 6.0 {
         vec![
             ("llava:7b", "Vision (Primary AI)"),
             ("qwen2.5vl:7b", "Video/vision understanding"),
             ("qwen2.5:7b-instruct", "Editorial (SEO / summaries)"),
-            ("qwen3:4b", "Subtitle translation"),
+            ("qwen3:4b-instruct-2507-q4_K_M", "Subtitle translation"),
         ]
     } else {
         vec![
             ("moondream:1.8b", "Vision (Primary AI)"),
             ("qwen2.5vl:3b", "Video/vision understanding"),
             ("qwen2.5:3b-instruct", "Editorial (SEO / summaries)"),
-            ("qwen3:4b", "Subtitle translation"),
+            ("qwen3:4b-instruct-2507-q4_K_M", "Subtitle translation"),
         ]
     }
 }
