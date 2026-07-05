@@ -47,6 +47,12 @@ RUN set +e; \
 #   docker build --build-arg COMPANION_BUILD_FROM_SOURCE=1
 # Every step is fail-soft (set +e / exit 0) so a toolchain hiccup can
 # never abort the ClipAI image build.
+# The GTK / libayatana-appindicator3-dev packages look out of place for a
+# Windows target, but tauri-cli's bundle-settings step probes the *host*
+# for the Linux tray (appindicator) library — a side effect of the
+# `tray-icon` feature — and aborts ("Can't detect any appindicator
+# library") when it's missing, even though the .exe itself is already
+# built. Installing them lets the NSIS bundling step run to completion.
 FROM rust:1-bookworm AS companion-builder
 ARG COMPANION_BUILD_FROM_SOURCE=0
 WORKDIR /build
@@ -59,7 +65,8 @@ RUN set +e; \
     fi; \
     apt-get update && apt-get install -y --no-install-recommends \
       nsis gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 \
-      nodejs npm python3 ca-certificates curl; \
+      nodejs npm python3 ca-certificates curl \
+      pkg-config libgtk-3-dev libayatana-appindicator3-dev; \
     rustup target add x86_64-pc-windows-gnu; \
     cd companion \
       && npm install --no-audit --no-fund \
