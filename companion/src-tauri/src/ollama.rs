@@ -101,6 +101,55 @@ pub async fn list_models() -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Installed models with size + family, for the dashboard's model manager.
+pub async fn list_models_detailed() -> Vec<serde_json::Value> {
+    let Ok(resp) = reqwest::Client::new()
+        .get(format!("http://{OLLAMA_LOCAL}/api/tags"))
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+    else {
+        return vec![];
+    };
+    let Ok(json) = resp.json::<serde_json::Value>().await else {
+        return vec![];
+    };
+    json["models"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .map(|m| {
+                    serde_json::json!({
+                        "name": m["name"].as_str().unwrap_or(""),
+                        "size": m["size"].as_u64().unwrap_or(0),
+                        "family": m["details"]["family"].as_str().unwrap_or(""),
+                        "parameter_size": m["details"]["parameter_size"].as_str().unwrap_or(""),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Delete an installed model from the local Ollama (frees disk).
+pub async fn delete_model(model: &str) -> Result<(), String> {
+    let resp = reqwest::Client::new()
+        .request(
+            reqwest::Method::DELETE,
+            format!("http://{OLLAMA_LOCAL}/api/delete"),
+        )
+        .json(&serde_json::json!({ "name": model }))
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|e| format!("delete request failed: {e}"))?;
+    if resp.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!("Ollama returned HTTP {} deleting {model}", resp.status()))
+    }
+}
+
 pub async fn status(state: &AppState) -> OllamaStatus {
     let version = detect_version().await;
     let running = daemon_running().await;

@@ -60,5 +60,8 @@ export const regenerateToken = () => invoke<string>('regenerate_token');
 export const installOllama = () => invoke<string>('install_ollama');
 export const startOllama = () => invoke<boolean>('start_ollama');
 export const pullModel = (model: string) => invoke('pull_model', { model });
+export interface InstalledModel { name: string; size: number; family: string; parameter_size: string; }
+export const listModels = () => invoke<InstalledModel[]>('list_models');
+export const deleteModel = (model: string) => invoke('delete_model', { model });
 export const pairClipai = (clipaiUrl: string, apiKey: string) =>
   invoke('pair_clipai', { clipaiUrl, apiKey });

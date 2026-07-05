@@ -5,9 +5,15 @@ import { enable as enableAutostart, disable as disableAutostart, isEnabled as au
 import {
   CompanionStatus, getStatus, setConfig, regenerateToken,
   installOllama, startOllama, pullModel, pairClipai,
+  listModels, deleteModel, InstalledModel,
 } from './api';
 
 const fmtMb = (mb: number) => (mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${mb} MB`);
+const fmtBytes = (b: number) => {
+  if (!b) return '—';
+  const gb = b / (1024 ** 3);
+  return gb >= 1 ? `${gb.toFixed(1)} GB` : `${Math.round(b / (1024 * 1024))} MB`;
+};
 const elapsed = (startMs: number, endMs?: number | null) => {
   const s = Math.max(0, Math.floor(((endMs ?? Date.now()) - startMs) / 1000));
   return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
@@ -342,8 +348,26 @@ function Dashboard({ status, refresh }: { status: CompanionStatus; refresh: () =
   const [clipaiUrl, setClipaiUrl] = useState(status.config.paired_clipai_url);
   const [apiKey, setApiKey] = useState('');
   const [pairMsg, setPairMsg] = useState('');
+  const [models, setModels] = useState<InstalledModel[]>([]);
+  const [confirmDel, setConfirmDel] = useState('');
+  const [deleting, setDeleting] = useState('');
 
   useEffect(() => { autostartEnabled().then(setAutostart).catch(() => setAutostart(null)); }, []);
+
+  const loadModels = useCallback(() => {
+    listModels().then(setModels).catch(() => {});
+  }, []);
+  // Refresh the installed-model list whenever Ollama's state/model-count changes.
+  useEffect(() => { loadModels(); }, [loadModels, status.ollama.running, status.ollama.models.length]);
+  const removeModel = async (name: string) => {
+    setDeleting(name);
+    try {
+      await deleteModel(name);
+      setConfirmDel('');
+      loadModels();
+      refresh();
+    } catch { /* left installed */ } finally { setDeleting(''); }
+  };
 
   const gpu = status.gpu;
   const totalGb = gpu.vram_total_mb / 1024;
@@ -450,10 +474,13 @@ function Dashboard({ status, refresh }: { status: CompanionStatus; refresh: () =
               : 'not running'}
           </div>
           <div className="row small" style={{ marginBottom: 6 }}>
-            <span className={`dot ${status.sidecar_running ? 'ok' : status.sidecar_available ? 'warn' : 'bad'}`} />
+            <span className="dot" style={{
+              background: status.sidecar_running ? 'var(--success)'
+                : status.sidecar_available ? 'var(--warn)' : 'var(--muted)',
+            }} />
             Whisper sidecar {status.sidecar_running ? 'running'
               : status.sidecar_available ? 'idle (starts on demand)'
-              : 'not bundled in this build — transcription stays on the ClipAI server; Ollama sharing unaffected'}
+              : 'not included in this build (optional) — transcription runs on the ClipAI server instead; GPU sharing for Ollama is unaffected'}
           </div>
           <div className="small muted" style={{ margin: '8px 0 4px' }}>
             Share this address with ClipAI:
@@ -497,6 +524,53 @@ function Dashboard({ status, refresh }: { status: CompanionStatus; refresh: () =
             </label>
           )}
         </div>
+      </div>
+
+      <div className="panel">
+        <div className="row spread" style={{ marginBottom: 8 }}>
+          <h2 style={{ margin: 0 }}>Local AI models</h2>
+          <span className="muted small">
+            {models.length} installed{models.length ? ` · ${fmtBytes(models.reduce((s, m) => s + (m.size || 0), 0))}` : ''}
+          </span>
+        </div>
+        {models.length === 0 ? (
+          <p className="muted small">
+            No models installed yet. Pick models in ClipAI and hit Save (or use the setup
+            wizard) — they download here and appear in this list.
+          </p>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            {models.map((m) => (
+              <div className="row spread" key={m.name}
+                style={{ background: 'var(--elevated)', borderRadius: 6, padding: '6px 10px' }}>
+                <div style={{ minWidth: 0 }}>
+                  <span className="mono">{m.name}</span>
+                  <span className="muted small" style={{ marginLeft: 8 }}>
+                    {fmtBytes(m.size)}{m.parameter_size ? ` · ${m.parameter_size}` : ''}
+                  </span>
+                </div>
+                {confirmDel === m.name ? (
+                  <div className="row">
+                    <button className="secondary" disabled={deleting === m.name}
+                      onClick={() => removeModel(m.name)}
+                      style={{ color: 'var(--danger)', borderColor: 'var(--danger)' }}>
+                      {deleting === m.name ? 'Deleting…' : 'Confirm delete'}
+                    </button>
+                    <button className="secondary" onClick={() => setConfirmDel('')}>Cancel</button>
+                  </div>
+                ) : (
+                  <button className="secondary" onClick={() => setConfirmDel(m.name)}
+                    title="Delete this model from disk on this machine">
+                    Delete
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+        <p className="muted small" style={{ marginTop: 8 }}>
+          Deleting frees disk space; the model must be re-downloaded to use it again.
+        </p>
       </div>
 
       <div className="panel">

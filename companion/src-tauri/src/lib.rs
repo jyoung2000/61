@@ -240,6 +240,16 @@ async fn start_ollama(state: tauri::State<'_, SharedState>) -> Result<bool, Stri
 }
 
 #[tauri::command]
+async fn list_models() -> Vec<serde_json::Value> {
+    ollama::list_models_detailed().await
+}
+
+#[tauri::command]
+async fn delete_model(model: String) -> Result<(), String> {
+    ollama::delete_model(&model).await
+}
+
+#[tauri::command]
 async fn pull_model(app: tauri::AppHandle, model: String) -> Result<(), String> {
     // Stream the pull so the request survives multi-GB downloads AND so we can
     // relay real byte-level progress to the UI's progress bar. Ollama's
@@ -521,6 +531,8 @@ pub fn run() {
             install_ollama,
             start_ollama,
             pull_model,
+            list_models,
+            delete_model,
             pair_clipai,
         ]);
 
