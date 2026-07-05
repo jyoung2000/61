@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 ## Stage 1: Build frontend with Node
 FROM node:20-slim AS frontend-build
 WORKDIR /app/frontend
@@ -61,21 +62,34 @@ FROM rust:1-bookworm AS companion-builder
 ARG COMPANION_BUILD_FROM_SOURCE=0
 WORKDIR /build
 COPY companion/ ./companion/
-ENV XWIN_ACCEPT_LICENSE=1
-RUN set +e; \
+ENV XWIN_ACCEPT_LICENSE=1 XWIN_CACHE_DIR=/xwin-cache
+# BuildKit cache mounts persist across builds (see Dockerfile.gpu for detail):
+# repeat builds reuse apt debs, the cargo registry, the compiled target dir,
+# the ~1GB MSVC SDK, cargo-xwin, and the npm cache — minutes instead of tens.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/build/companion/src-tauri/target \
+    --mount=type=cache,target=/xwin-cache \
+    --mount=type=cache,target=/opt/xwin-tools \
+    --mount=type=cache,target=/root/.npm \
+    set +e; \
     mkdir -p /out; \
     if [ "$COMPANION_BUILD_FROM_SOURCE" != "1" ]; then \
       echo "COMPANION_BUILD_FROM_SOURCE!=1 — skipping from-source installer build (GitHub release is the source)"; \
       exit 0; \
     fi; \
+    rm -f /etc/apt/apt.conf.d/docker-clean; \
+    export PATH="/opt/xwin-tools/bin:$PATH"; \
     apt-get update && apt-get install -y --no-install-recommends \
       nsis clang llvm lld \
       nodejs npm python3 ca-certificates curl \
       pkg-config libgtk-3-dev libayatana-appindicator3-dev; \
     rustup target add x86_64-pc-windows-msvc; \
-    cargo install cargo-xwin --locked; \
+    command -v cargo-xwin >/dev/null 2>&1 || CARGO_INSTALL_ROOT=/opt/xwin-tools cargo install cargo-xwin --locked; \
     cd companion \
-      && npm install --no-audit --no-fund \
+      && npm install --no-audit --no-fund --prefer-offline \
       && npx tauri build --runner cargo-xwin --target x86_64-pc-windows-msvc --bundles nsis; \
     STATUS=$?; \
     EXE=$(ls src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe 2>/dev/null | head -1); \
