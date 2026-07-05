@@ -9,6 +9,7 @@ import ClipGenerationSettings from '../components/ClipGenerationSettings';
 import OllamaHostsCard from '../components/OllamaHostsCard';
 import RemoteWhisperCard from '../components/RemoteWhisperCard';
 import CompanionDownloadCard from '../components/CompanionDownloadCard';
+import PolishFallbackCard from '../components/PolishFallbackCard';
 import SelfHostedSettings from '../components/SelfHostedSettings';
 import SubtitleQualitySettings from '../components/SubtitleQualitySettings';
 import { useAuth } from '../auth/AuthContext';
@@ -1639,6 +1640,9 @@ export default function Settings() {
 
             {/* Multi-host Ollama registry — drag-and-drop priority + failover */}
             <OllamaHostsCard isMobile={isMobile} />
+
+            {/* Cloud fallback for subtitle polish — none / auto / pinned model */}
+            <PolishFallbackCard isMobile={isMobile} />
 
             {/* Speaker Detection — HuggingFace token for pyannote neural diarization */}
             {(() => {

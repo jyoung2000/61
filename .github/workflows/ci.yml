@@ -94,7 +94,8 @@ jobs:
             backend/tests/test_ollama_hosts_endpoints.py \
             backend/tests/test_remote_whisper.py \
             backend/tests/test_companion_register.py \
-            backend/tests/test_companion_downloads.py
+            backend/tests/test_companion_downloads.py \
+            backend/tests/test_polish_fallback_settings.py
 
   companion:
     name: Companion — cargo check + proxy e2e

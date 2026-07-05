@@ -2946,6 +2946,80 @@ async def companion_register(req: CompanionRegisterRequest,
     }
 
 
+# ── Subtitle-polish cloud fallback (AI Providers card) ───────────
+#
+# When the LOCAL polish chain fails a batch (Ollama cold-load timeout /
+# circuit breaker), the polisher can retry that batch via OpenRouter —
+# which bills real money on an otherwise-local setup. This pair of
+# endpoints exposes that choice as a single dropdown: "none" (strictly
+# local, never spend), "auto" (best efficient-tier model), or a pinned
+# OpenRouter model id. Persisted via user_settings.json like every other
+# provider pick (SUBTITLE_POLISH_CLOUD_FALLBACK / _CLOUD_MODEL are
+# already in the allow-list).
+
+
+class SavePolishFallbackRequest(BaseModel):
+    # "none" → fallback disabled; "auto" → enabled with the efficient-tier
+    # default; anything else → enabled with that OpenRouter model id.
+    choice: str
+
+
+def _polish_fallback_choice() -> str:
+    if not bool(getattr(settings, "SUBTITLE_POLISH_CLOUD_FALLBACK", True)):
+        return "none"
+    model = (getattr(settings, "SUBTITLE_POLISH_CLOUD_MODEL", "") or "").strip()
+    return model if model else "auto"
+
+
+@router.get("/settings/polish-fallback")
+async def get_polish_fallback():
+    """Current cloud-polish-fallback choice + the dropdown's model options."""
+    from backend.services.transcript_polisher import _resolve_cloud_polish_model
+    options = []
+    try:
+        from backend.services.providers.openrouter_provider import (
+            SUBTITLE_POLISH_SHORTLIST)
+        options = [
+            {"id": e["id"], "tier": e.get("tier", ""),
+             "rationale": e.get("rationale", "")}
+            for e in SUBTITLE_POLISH_SHORTLIST
+        ]
+    except Exception:
+        pass
+    return {
+        "choice": _polish_fallback_choice(),
+        "enabled": bool(getattr(settings, "SUBTITLE_POLISH_CLOUD_FALLBACK", True)),
+        "model": (getattr(settings, "SUBTITLE_POLISH_CLOUD_MODEL", "") or ""),
+        # What "auto" resolves to right now, so the dropdown can say so.
+        "auto_resolves_to": _resolve_cloud_polish_model(),
+        "openrouter_key_set": _key_is_set(settings.OPENROUTER_API_KEY),
+        "options": options,
+    }
+
+
+@router.put("/settings/polish-fallback")
+async def put_polish_fallback(req: SavePolishFallbackRequest):
+    """Persist the cloud-polish-fallback choice (none / auto / model id)."""
+    choice = (req.choice or "").strip()
+    if choice.lower() in ("none", "off", "disabled"):
+        settings.SUBTITLE_POLISH_CLOUD_FALLBACK = False
+        # Keep the stored model so re-enabling later restores the pick.
+    elif choice.lower() == "auto" or choice == "":
+        settings.SUBTITLE_POLISH_CLOUD_FALLBACK = True
+        settings.SUBTITLE_POLISH_CLOUD_MODEL = ""
+    else:
+        if "/" not in choice:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{choice!r} is not an OpenRouter model id "
+                       "(expected provider/model), 'auto', or 'none'")
+        settings.SUBTITLE_POLISH_CLOUD_FALLBACK = True
+        settings.SUBTITLE_POLISH_CLOUD_MODEL = choice
+    _persist_user_settings()
+    logger.info("Subtitle polish cloud fallback set to %r", _polish_fallback_choice())
+    return await get_polish_fallback()
+
+
 # ── Remote Whisper (OpenAI-compatible transcription server) ──────
 
 
