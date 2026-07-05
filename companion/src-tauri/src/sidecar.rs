@@ -214,7 +214,10 @@ pub async fn shutdown(state: &AppState) {
 
 /// Background reaper: stop the sidecar after the configured idle period.
 pub fn spawn_idle_reaper(state: Arc<AppState>) {
-    tokio::spawn(async move {
+    // Use Tauri's runtime handle, not `tokio::spawn`: this is called from the
+    // synchronous `setup` hook (main thread, no Tokio runtime in context), so
+    // a bare `tokio::spawn` panics with "there is no reactor running".
+    tauri::async_runtime::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             let idle_min = state.config.lock().unwrap().sidecar_idle_min.max(1) as u64;
