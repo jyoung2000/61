@@ -6,6 +6,40 @@ RUN npm install
 COPY frontend/ ./
 RUN npm run build
 
+## Stage 1b: Fetch GPU Companion installers (best-effort, never fails)
+# Downloads the .exe/.dmg/manifest.json assets of the requested
+# companion-v* GitHub Release so the ClipAI container can serve them from
+# Settings (backend/routers/downloads.py). COMPANION_VERSION=latest picks
+# the newest companion-v* tag; a fresh fork or an offline build simply
+# logs and continues with an empty directory (the downloads router then
+# redirects to GitHub Releases instead).
+FROM python:3.11-slim AS companion-fetch
+ARG COMPANION_VERSION=latest
+ARG COMPANION_REPO=jyoung2000/61
+WORKDIR /companion
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+RUN set +e; \
+    if [ "$COMPANION_VERSION" = "latest" ]; then \
+      TAG=$(curl -fsSL "https://api.github.com/repos/${COMPANION_REPO}/releases?per_page=30" \
+            | python3 -c "import json,sys; rels=[r for r in json.load(sys.stdin) if str(r.get('tag_name','')).startswith('companion-v')]; print(rels[0]['tag_name'] if rels else '')" 2>/dev/null); \
+    else \
+      TAG="companion-v${COMPANION_VERSION#companion-v}"; \
+    fi; \
+    if [ -n "$TAG" ]; then \
+      echo "Fetching GPU Companion release $TAG"; \
+      curl -fsSL "https://api.github.com/repos/${COMPANION_REPO}/releases/tags/${TAG}" \
+        | python3 -c "import json,sys; [print(a['browser_download_url']) for a in json.load(sys.stdin).get('assets',[]) if a['name'].lower().endswith(('.exe','.msi','.dmg')) or a['name']=='manifest.json']" 2>/dev/null \
+        | while read -r url; do \
+            echo "  downloading $url"; \
+            curl -fSL --retry 3 -O "$url" || echo "  (skipped: $url)"; \
+          done; \
+    else \
+      echo "No companion-v* release found for ${COMPANION_REPO} — continuing with an empty installer directory"; \
+    fi; \
+    ls -la /companion || true; \
+    exit 0
+
 ## Stage 2: Runtime
 FROM python:3.11-slim
 
@@ -214,6 +248,10 @@ COPY docs/ ./docs/
 
 # Copy built frontend from stage 1
 COPY --from=frontend-build /app/frontend/dist ./static
+
+# GPU Companion installers baked in from stage 1b (may be empty on fresh
+# forks/offline builds — the downloads router then redirects to GitHub).
+COPY --from=companion-fetch /companion/ ./static/companion/
 
 EXPOSE 1353
 

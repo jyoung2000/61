@@ -8,6 +8,7 @@ import UserManagementPanel from '../components/UserManagementPanel';
 import ClipGenerationSettings from '../components/ClipGenerationSettings';
 import OllamaHostsCard from '../components/OllamaHostsCard';
 import RemoteWhisperCard from '../components/RemoteWhisperCard';
+import CompanionDownloadCard from '../components/CompanionDownloadCard';
 import SelfHostedSettings from '../components/SelfHostedSettings';
 import SubtitleQualitySettings from '../components/SubtitleQualitySettings';
 import { useAuth } from '../auth/AuthContext';
@@ -1559,6 +1560,9 @@ export default function Settings() {
                 </div>
               );
             })}
+
+            {/* GPU Companion — desktop-GPU sharing, installers served by this container */}
+            <CompanionDownloadCard isMobile={isMobile} />
 
             {/* Ollama (local) — toggle to enable/disable */}
             <div style={{

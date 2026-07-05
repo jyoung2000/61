@@ -10,6 +10,35 @@ RUN npm install
 COPY frontend/ ./
 RUN npm run build
 
+## Stage 1b: Fetch GPU Companion installers (best-effort, never fails)
+# Same stage as in the CPU Dockerfile — see backend/routers/downloads.py.
+FROM python:3.11-slim AS companion-fetch
+ARG COMPANION_VERSION=latest
+ARG COMPANION_REPO=jyoung2000/61
+WORKDIR /companion
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+RUN set +e; \
+    if [ "$COMPANION_VERSION" = "latest" ]; then \
+      TAG=$(curl -fsSL "https://api.github.com/repos/${COMPANION_REPO}/releases?per_page=30" \
+            | python3 -c "import json,sys; rels=[r for r in json.load(sys.stdin) if str(r.get('tag_name','')).startswith('companion-v')]; print(rels[0]['tag_name'] if rels else '')" 2>/dev/null); \
+    else \
+      TAG="companion-v${COMPANION_VERSION#companion-v}"; \
+    fi; \
+    if [ -n "$TAG" ]; then \
+      echo "Fetching GPU Companion release $TAG"; \
+      curl -fsSL "https://api.github.com/repos/${COMPANION_REPO}/releases/tags/${TAG}" \
+        | python3 -c "import json,sys; [print(a['browser_download_url']) for a in json.load(sys.stdin).get('assets',[]) if a['name'].lower().endswith(('.exe','.msi','.dmg')) or a['name']=='manifest.json']" 2>/dev/null \
+        | while read -r url; do \
+            echo "  downloading $url"; \
+            curl -fSL --retry 3 -O "$url" || echo "  (skipped: $url)"; \
+          done; \
+    else \
+      echo "No companion-v* release found for ${COMPANION_REPO} — continuing with an empty installer directory"; \
+    fi; \
+    ls -la /companion || true; \
+    exit 0
+
 ## Stage 2: GPU Runtime
 # NVIDIA driver 580+ supports CUDA 13.x. Use CUDA 12.3 runtime which is
 # well within the supported range. If CTranslate2 still reports CUDA errors,
@@ -323,6 +352,10 @@ COPY docs/ ./docs/
 
 # Copy pre-built frontend from stage 1
 COPY --from=frontend-build /app/frontend/dist ./static
+
+# GPU Companion installers baked in from stage 1b (may be empty on fresh
+# forks/offline builds — the downloads router then redirects to GitHub).
+COPY --from=companion-fetch /companion/ ./static/companion/
 
 EXPOSE 1353
 

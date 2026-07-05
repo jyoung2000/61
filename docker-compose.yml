@@ -28,6 +28,10 @@ services:
       # causing generated clips and exports to disappear from the current
       # user's view even though the underlying job files survive.
       - ./data/auth:/data/auth
+      # GPU Companion installer cache — "Check for Companion updates" in
+      # Settings downloads newer release installers here so they survive
+      # image rebuilds (served before the baked-in copies).
+      - ./data/companion-cache:/config/companion-cache
       - whisper_models:/root/.cache/huggingface
     environment:
       - PYTHONUNBUFFERED=1

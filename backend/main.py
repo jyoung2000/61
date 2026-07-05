@@ -1113,6 +1113,11 @@ app.include_router(thumbnails_router.router)
 app.include_router(share_router.router)
 app.include_router(api_v1_router)
 
+# GPU Companion installer downloads (baked into the image / cached on
+# /config/companion-cache / redirected to GitHub Releases).
+from backend.routers import downloads as downloads_router  # noqa: E402
+app.include_router(downloads_router.router)
+
 # Mount MCP server at /mcp (if mcp package is available)
 try:
     from mcp.server.fastmcp import FastMCP
