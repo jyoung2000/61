@@ -109,6 +109,10 @@ pub struct AppState {
     pub last_request_ms: AtomicU64,
     /// True while a transcription request is in flight.
     pub whisper_busy: AtomicBool,
+    /// Whether the whisper sidecar binary shipped with this build (set once
+    /// at startup). From-source/cross-compiled builds may lack it — Ollama
+    /// sharing still works; /v1/health + pairing report whisper honestly.
+    pub sidecar_available: AtomicBool,
 }
 
 pub fn now_ms() -> u64 {
@@ -136,6 +140,7 @@ impl AppState {
             whisper_slot: tokio::sync::Semaphore::new(1),
             last_request_ms: AtomicU64::new(now_ms()),
             whisper_busy: AtomicBool::new(false),
+            sidecar_available: AtomicBool::new(false),
         };
         state.save(); // persist the generated token on first run
         state

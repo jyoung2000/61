@@ -44,6 +44,14 @@ fn sidecar_binary(resource_dir: &PathBuf) -> PathBuf {
     }
 }
 
+/// Whether this build shipped a whisper sidecar at all. From-source /
+/// cross-compiled installers may not bundle one — Ollama sharing still
+/// works; health + pairing report whisper honestly so ClipAI keeps its
+/// transcription local instead of probing a dead endpoint.
+pub fn available(resource_dir: &PathBuf) -> bool {
+    sidecar_binary(resource_dir).exists()
+}
+
 /// Model directory in app data — models download on demand, never bundled.
 fn models_dir(data_dir: &PathBuf) -> PathBuf {
     data_dir.join("whisper-models")

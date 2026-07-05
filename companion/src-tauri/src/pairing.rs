@@ -54,7 +54,11 @@ pub async fn pair(
         gpu_name: gpu.gpu_name,
         vram_total_mb: gpu.vram_total_mb,
         version: env!("CARGO_PKG_VERSION").into(),
-        register_whisper: true,
+        // Only point ClipAI's remote Whisper here when this build actually
+        // shipped a sidecar — otherwise transcription stays on the server.
+        register_whisper: state
+            .sidecar_available
+            .load(std::sync::atomic::Ordering::Relaxed),
     };
     let resp = reqwest::Client::new()
         .post(format!("{clipai_url}/api/settings/companion-register"))

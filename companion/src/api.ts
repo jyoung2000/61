@@ -42,6 +42,7 @@ export interface CompanionStatus {
     managed: boolean;
     models: string[];
   };
+  sidecar_available: boolean;
   sidecar_running: boolean;
   busy: boolean;
   current_job: ActivityEntry | null;

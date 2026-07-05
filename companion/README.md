@@ -99,3 +99,22 @@ The Windows whisper sidecar is built separately (see
 (`.github/workflows/companion-release.yml`) automates all of it on tag
 `companion-v*`. No model weights or Ollama binaries are ever committed to
 this repository.
+
+### Cross-building the Windows installer from Linux
+
+The ClipAI Docker image does this automatically (its `companion-builder`
+stage) so the Settings download button works before any GitHub release
+exists. Manually:
+
+```bash
+sudo apt install nsis gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64
+rustup target add x86_64-pc-windows-gnu
+cd companion && npm install && npx tauri icon app-icon.png
+npx tauri build --target x86_64-pc-windows-gnu --bundles nsis
+# → src-tauri/target/x86_64-pc-windows-gnu/release/bundle/nsis/*-setup.exe
+```
+
+This fallback build cannot include the PyInstaller whisper sidecar
+(PyInstaller doesn't cross-compile). The Companion detects that,
+reports `backends.whisper=false`, and pairing leaves ClipAI's
+transcription local — GPU-shared Ollama works fully either way.

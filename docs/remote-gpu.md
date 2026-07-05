@@ -30,7 +30,15 @@ With neither configured, ClipAI behaves exactly as before.
 
 1. **Download** the Companion from *Settings → AI Providers → GPU
    Companion* (Windows `.exe` or macOS `.dmg`, served by your own ClipAI
-   container).
+   container). Where the installer comes from, in order:
+   * the runtime cache (`/config/companion-cache`, filled by "Check for
+     updates"),
+   * installers baked into the Docker image — a published `companion-v*`
+     GitHub Release when one exists, otherwise a **Windows installer
+     cross-built from source during the image build** (Ollama sharing
+     fully works; the Whisper sidecar ships with official releases, so
+     transcription stays on the server until then),
+   * a labeled redirect to GitHub Releases.
 2. **Install and open it.** The setup wizard detects or installs Ollama
    (winget/brew — from ollama.com, never bundled), offers model pulls
    sized to your GPU, and shows the access token.

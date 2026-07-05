@@ -367,8 +367,10 @@ function Dashboard({ status, refresh }: { status: CompanionStatus; refresh: () =
               : 'not running'}
           </div>
           <div className="row small" style={{ marginBottom: 6 }}>
-            <span className={`dot ${status.sidecar_running ? 'ok' : 'warn'}`} />
-            Whisper sidecar {status.sidecar_running ? 'running' : 'idle (starts on demand)'}
+            <span className={`dot ${status.sidecar_running ? 'ok' : status.sidecar_available ? 'warn' : 'bad'}`} />
+            Whisper sidecar {status.sidecar_running ? 'running'
+              : status.sidecar_available ? 'idle (starts on demand)'
+              : 'not bundled in this build — transcription stays on the ClipAI server; Ollama sharing unaffected'}
           </div>
           <div className="small muted" style={{ margin: '8px 0 4px' }}>
             Share this address with ClipAI:

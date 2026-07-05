@@ -9,7 +9,10 @@ rust-version = "1.77"
 
 [lib]
 name = "clipai_companion_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+# Desktop-only: rlib. (staticlib/cdylib are only needed for Tauri
+# mobile targets — and cdylib exports every symbol, which overflows the
+# Windows PE 65535-ordinal export limit under the MinGW cross-build.)
+crate-type = ["rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

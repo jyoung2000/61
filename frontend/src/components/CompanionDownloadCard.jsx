@@ -144,6 +144,14 @@ export default function CompanionDownloadCard({ isMobile = false }) {
           </button>
         </div>
       )}
+      {manifest?.built_from_source && (
+        <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 8, lineHeight: 1.4 }}>
+          This Windows installer was built from source inside this server's Docker image
+          (no GitHub release yet). It shares your desktop GPU's Ollama fully; the Whisper
+          sidecar ships with official <code>companion-v*</code> releases — transcription
+          stays on this server until then.
+        </div>
+      )}
       {downloaded && (
         <div style={{
           fontSize: 11, color: 'var(--text-secondary)', lineHeight: 1.6,

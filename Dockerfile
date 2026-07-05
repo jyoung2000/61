@@ -40,6 +40,45 @@ RUN set +e; \
     ls -la /companion || true; \
     exit 0
 
+## Stage 1c: Build the Windows Companion installer from source (fallback)
+# Same stage as in Dockerfile.gpu — cross-compiles the Tauri app for
+# x86_64-pc-windows-gnu (MinGW) + NSIS so the Settings download button
+# works before any companion-v* GitHub release exists. Fail-soft; skip
+# with --build-arg COMPANION_BUILD_FROM_SOURCE=0. This fallback build
+# has no whisper sidecar (PyInstaller can't cross-build) — the Companion
+# reports that honestly and Ollama GPU sharing works fully.
+FROM rust:1-bookworm AS companion-builder
+ARG COMPANION_BUILD_FROM_SOURCE=1
+WORKDIR /build
+RUN set -e; \
+    if [ "$COMPANION_BUILD_FROM_SOURCE" = "1" ]; then \
+      apt-get update && apt-get install -y --no-install-recommends \
+        nsis gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 \
+        nodejs npm python3 ca-certificates curl \
+        && rm -rf /var/lib/apt/lists/*; \
+      rustup target add x86_64-pc-windows-gnu; \
+    fi
+COPY companion/ ./companion/
+RUN set +e; \
+    mkdir -p /out; \
+    if [ "$COMPANION_BUILD_FROM_SOURCE" = "1" ]; then \
+      cd companion \
+      && npm install --no-audit --no-fund \
+      && npx tauri build --target x86_64-pc-windows-gnu --bundles nsis; \
+      STATUS=$?; \
+      EXE=$(ls src-tauri/target/x86_64-pc-windows-gnu/release/bundle/nsis/*-setup.exe 2>/dev/null | head -1); \
+      if [ "$STATUS" = "0" ] && [ -n "$EXE" ]; then \
+        cp "$EXE" /out/ \
+        && python3 scripts/make_local_manifest.py /out \
+        && echo "Companion installer built from source: $(basename "$EXE")"; \
+      else \
+        echo "Companion from-source build FAILED (status=$STATUS) — image build continues; the Settings card falls back to GitHub releases"; \
+      fi; \
+    else \
+      echo "COMPANION_BUILD_FROM_SOURCE=0 — skipping from-source installer build"; \
+    fi; \
+    exit 0
+
 ## Stage 2: Runtime
 FROM python:3.11-slim
 
@@ -249,8 +288,11 @@ COPY docs/ ./docs/
 # Copy built frontend from stage 1
 COPY --from=frontend-build /app/frontend/dist ./static
 
-# GPU Companion installers baked in from stage 1b (may be empty on fresh
-# forks/offline builds — the downloads router then redirects to GitHub).
+# GPU Companion installers: the from-source Windows build (stage 1c)
+# first, then the GitHub release assets (stage 1b) OVER it — same-named
+# files (manifest.json) from a published release win, so the from-source
+# fallback only surfaces when no companion-v* release exists yet.
+COPY --from=companion-builder /out/ ./static/companion/
 COPY --from=companion-fetch /companion/ ./static/companion/
 
 EXPOSE 1353

@@ -57,6 +57,19 @@ def test_manifest_reports_baked_source(dirs, no_github):
     assert out["version"] == "0.1.0"
     assert out["platforms"]["windows"]["source"] == "baked"
     assert out["platforms"]["mac"]["source"] == "baked"
+    assert out["built_from_source"] is False
+
+
+def test_manifest_flags_from_source_build(dirs, no_github):
+    """The companion-builder Dockerfile stage marks its manifest so the UI
+    can explain the missing whisper sidecar vs official releases."""
+    baked, _cache = dirs
+    manifest = _write_release(baked, "0.1.0", {"windows": "Companion_0.1.0.exe"})
+    manifest["built_from_source"] = True
+    (baked / "manifest.json").write_text(json.dumps(manifest))
+    out = asyncio.run(D.companion_manifest())
+    assert out["built_from_source"] is True
+    assert out["platforms"]["windows"]["source"] == "baked"
 
 
 def test_cache_wins_over_baked(dirs, no_github):

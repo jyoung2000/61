@@ -253,6 +253,7 @@ async fn health(State(ctx): State<ProxyCtx>, headers: HeaderMap) -> Response {
         })
     });
     let ollama_up = crate::ollama::daemon_running().await;
+    let whisper_shipped = ctx.state.sidecar_available.load(Ordering::Relaxed);
     let body = serde_json::json!({
         "service": "clipai-gpu-companion",
         "version": env!("CARGO_PKG_VERSION"),
@@ -263,7 +264,7 @@ async fn health(State(ctx): State<ProxyCtx>, headers: HeaderMap) -> Response {
         "vram_budget_gb": ctx.state.effective_budget_gb(),
         "backends": {
             "ollama": ollama_up,
-            "whisper": true,
+            "whisper": whisper_shipped,
             "whisper_model": whisper_model,
         },
         "busy": busy,

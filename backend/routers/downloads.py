@@ -160,9 +160,15 @@ def _merged_view(github: Optional[dict]) -> dict:
                 platforms[key] = entry
     if not version:
         version = ((cache_manifest or baked_manifest or github or {}).get("version", ""))
+    # A from-source image-build installer (companion-builder Dockerfile
+    # stage) marks its manifest — the UI explains the whisper-sidecar
+    # difference vs official releases.
+    built_from_source = bool(
+        (cache_manifest or baked_manifest or {}).get("built_from_source", False))
     return {
         "version": version,
         "platforms": platforms,
+        "built_from_source": built_from_source,
         "github_repo": GITHUB_REPO,
         "refresh": dict(_refresh_state),
     }

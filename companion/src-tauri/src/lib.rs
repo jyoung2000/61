@@ -51,6 +51,7 @@ async fn get_status(state: tauri::State<'_, SharedState>) -> Result<serde_json::
         "effective_budget_gb": budget,
         "whisper_tier": { "model": whisper_model, "compute": whisper_compute },
         "ollama": ollama_status,
+        "sidecar_available": state.sidecar_available.load(Ordering::Relaxed),
         "sidecar_running": sidecar_running,
         "busy": state.whisper_busy.load(Ordering::Relaxed),
         "current_job": state.current_job(),
@@ -249,6 +250,10 @@ pub fn run() {
                 .unwrap_or_else(|_| std::path::PathBuf::from("."));
 
             let state: SharedState = Arc::new(AppState::load(config_dir));
+            state.sidecar_available.store(
+                sidecar::available(&resource_dir),
+                Ordering::Relaxed,
+            );
             app.manage(state.clone());
 
             // GPU telemetry poll (5 s) + tray tooltip/busy indicator.
