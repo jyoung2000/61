@@ -86,6 +86,8 @@ export default function Settings() {
 
   // Per-task model selection
   const [availableModels, setAvailableModels] = useState({ transcript: [], primary: [], editorial: [], translation: [] });
+  // Detected GPU + its VRAM, used to label the local-model recommendations.
+  const [localGpu, setLocalGpu] = useState(null);
   const [currentModels, setCurrentModels] = useState({ transcript_model: '', primary_model: '', editorial_model: '', editorial_model_fallback: '', translation_model: '' });
   const [pendingModels, setPendingModels] = useState({ transcript_model: '', primary_model: '', editorial_model: '', editorial_model_fallback: '', translation_model: '' });
   // Configured vs actually-loaded Whisper model (so the Settings page shows
@@ -488,20 +490,47 @@ export default function Settings() {
       // in parallel. Fallback is stored on the clipper config as a spec
       // so the per-clip judge keeps working; the UI shows it as a plain
       // model pick under the Editorial AI primary.
-      const [mres, jres] = await Promise.all([
+      const [mres, jres, rres] = await Promise.all([
         fetch('/api/providers/models/available'),
         fetch('/api/clipper/judge-config'),
+        fetch('/api/providers/models/local-recommended'),
       ]);
       const data = mres.ok ? await mres.json() : null;
       const judgeRaw = jres.ok ? await jres.json() : null;
       const judge = (judgeRaw && typeof judgeRaw === 'object')
         ? judgeRaw : { primary: '', fallback: '' };
-      if (data) {
+
+      // GPU-aware local recommendations, merged into each role's dropdown so
+      // the user sees several local models that fit their GPU (⭐ = best fit,
+      // ✓ = already installed, ⤓ = will download on Save).
+      const recData = rres && rres.ok ? await rres.json() : null;
+      if (recData) setLocalGpu({ gpu: recData.gpu, vram_gb: recData.vram_gb });
+      const roles = (recData && recData.roles) || {};
+      const mergeLocalRecs = (base, recs) => {
+        base = base || [];
+        if (!recs || !recs.length) return base;
+        const existing = new Set(base.map((m) => m.id));
+        const opts = recs
+          .map((r) => ({
+            id: r.id,
+            name: `${r.recommended ? '⭐ ' : ''}${r.tag} · ${r.size_gb}GB${r.installed ? ' ✓' : ' ⤓'}${r.fits ? '' : ' ⚠VRAM'}`,
+            provider: 'local', is_free: true,
+            recommended: r.recommended, fits: r.fits, installed: r.installed,
+            size_gb: r.size_gb, quality: r.why,
+          }))
+          .filter((o) => !existing.has(o.id))
+          .sort((a, b) => (Number(b.recommended) - Number(a.recommended))
+            || (Number(b.fits) - Number(a.fits)) || (b.size_gb - a.size_gb));
+        return [...opts, ...base];
+      };
+
+      if (data || recData) {
         setAvailableModels({
-          transcript: data.transcript || [],
-          primary: data.primary || data.vision || [],
-          editorial: data.editorial || data.text || [],
-          translation: data.translation || data.editorial || data.text || [],
+          transcript: (data && data.transcript) || [],
+          primary: mergeLocalRecs((data && (data.primary || data.vision)) || [], roles.primary),
+          editorial: mergeLocalRecs((data && (data.editorial || data.text)) || [], roles.editorial),
+          translation: mergeLocalRecs(
+            (data && (data.translation || data.editorial || data.text)) || [], roles.translation),
         });
       }
       // Build the saved-model state from BOTH sources. The editorial
@@ -796,7 +825,7 @@ export default function Settings() {
           pendingModels.translation_model,
         ].some((m) => (m || '').startsWith('ollama/'));
         if (syncedOllama) {
-          setCompanionSync({ active: true, models: [], done: [], failed: [], progress: {}, target: {} });
+          setCompanionSync({ active: true, models: [], hosts: [] });
           pollSyncStatus();
         }
       }
@@ -914,10 +943,10 @@ export default function Settings() {
     }
     await loadAvailableModels().catch(() => {});
     if (last) {
-      const tgt = last.target || {};
-      const where = tgt.gpu_name || tgt.name || 'the GPU host';
-      const failed = (last.failed || []).length;
-      if (failed) showToast(`${failed} model(s) failed to sync to ${where}`, 'error');
+      const hosts = last.hosts || [];
+      const failed = hosts.reduce((n, h) => n + (h.failed || []).length, 0);
+      const where = hosts.map((h) => h.gpu_name || h.name).filter(Boolean).join(' + ') || 'the GPU host';
+      if (failed) showToast(`${failed} model download(s) failed on ${where}`, 'error');
       else showToast(`Models downloaded to ${where} — ready to use`, 'success');
     }
     setTimeout(() => setCompanionSync(null), 8000);
@@ -2180,6 +2209,25 @@ export default function Settings() {
                 </div>
               </div>
 
+              {/* GPU-aware local-model hint: the dropdowns below list local
+                  models sized to the detected GPU. */}
+              {localGpu && (localGpu.gpu || localGpu.vram_gb > 0) && (
+                <div style={{
+                  margin: '4px 0 14px', padding: '8px 12px', fontSize: 11, lineHeight: 1.5,
+                  background: 'var(--bg-elevated)', border: '1px solid var(--border)',
+                  borderRadius: 'var(--radius-sm)', color: 'var(--text-secondary)',
+                }}>
+                  🖥 Local models recommended for{' '}
+                  <strong style={{ color: 'var(--text-primary)' }}>
+                    {localGpu.gpu || 'your GPU'}
+                  </strong>
+                  {localGpu.vram_gb > 0 ? ` (${localGpu.vram_gb} GB)` : ''}.{' '}
+                  <span style={{ color: 'var(--text-muted)' }}>
+                    ⭐ best fit · ✓ installed · ⤓ downloads on Save · ⚠VRAM = larger than this GPU
+                  </span>
+                </div>
+              )}
+
               <ModelDropdown
                 task="primary"
                 models={availableModels.primary}
@@ -2278,61 +2326,72 @@ export default function Settings() {
                 </div>
               </div>
 
-              {/* ── Live sync-to-Companion progress ── */}
+              {/* ── Live download progress, one section per target GPU
+                     (the container's Ollama + a paired Companion) ── */}
               {companionSync && (() => {
-                const tgt = companionSync.target || {};
-                const where = tgt.gpu_name
-                  ? `${tgt.gpu_name}${tgt.name ? ` · ${tgt.name}` : ''}`
-                  : (tgt.name || 'the Ollama host');
                 const models = companionSync.models || [];
-                const prog = companionSync.progress || {};
-                const done = companionSync.done || [];
-                const failed = companionSync.failed || [];
+                let hosts = companionSync.hosts || [];
+                if (!hosts.length) {
+                  // Fallback for the initial optimistic state before the first
+                  // poll returns the per-host breakdown.
+                  hosts = [{ name: 'Ollama host', progress: {}, done: [], failed: [], current: null }];
+                }
                 return (
                   <div style={{
                     marginTop: 4, marginBottom: 8, padding: '10px 12px',
                     background: 'var(--bg-elevated)', border: '1px solid var(--border)',
-                    borderRadius: 'var(--radius-sm)',
+                    borderRadius: 'var(--radius-sm)', display: 'flex', flexDirection: 'column', gap: 10,
                   }}>
-                    <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 6 }}>
+                    <div style={{ fontSize: 12, fontWeight: 600 }}>
                       {companionSync.active
-                        ? `Downloading models to ${where}…`
-                        : `Sync to ${where} complete`}
-                      {tgt.is_companion && (
-                        <span style={{ fontSize: 10, color: 'var(--accent-cyan)', marginLeft: 6 }}>
-                          GPU Companion
-                        </span>
-                      )}
+                        ? 'Downloading AI models…'
+                        : 'Model download complete'}
                     </div>
-                    {(models.length ? models : done).map((m) => {
-                      const pct = failed.includes(m) ? 0
-                        : done.includes(m) ? 100
-                        : Math.max(0, Math.min(100, prog[m] ?? 0));
-                      const err = failed.includes(m);
+                    {hosts.map((h, hi) => {
+                      const where = h.gpu_name ? `${h.gpu_name}${h.name ? ` · ${h.name}` : ''}` : (h.name || 'host');
+                      const prog = h.progress || {};
+                      const done = h.done || [];
+                      const failed = h.failed || [];
+                      const list = models.length ? models : [...done, ...failed];
                       return (
-                        <div key={m} style={{ marginBottom: 6 }}>
-                          <div style={{
-                            display: 'flex', justifyContent: 'space-between',
-                            fontSize: 10, fontFamily: 'var(--font-mono)', marginBottom: 2,
-                          }}>
-                            <span style={{ color: 'var(--text-secondary)' }}>{m}</span>
-                            <span style={{
-                              color: err ? 'var(--danger)'
-                                : pct >= 100 ? 'var(--success)' : 'var(--text-muted)',
-                            }}>
-                              {err ? 'failed' : pct >= 100 ? 'ready ✓' : `${Math.round(pct)}%`}
+                        <div key={hi}>
+                          <div style={{ fontSize: 11, marginBottom: 4, color: 'var(--text-secondary)' }}>
+                            {h.is_companion ? '🖥 ' : '📦 '}
+                            <strong style={{ color: 'var(--text-primary)' }}>{where}</strong>
+                            <span style={{ fontSize: 9, color: 'var(--text-muted)', marginLeft: 6 }}>
+                              {h.is_companion ? 'GPU Companion' : h.is_local ? 'this container' : 'remote host'}
                             </span>
                           </div>
-                          <div style={{
-                            height: 5, borderRadius: 3, overflow: 'hidden',
-                            background: 'var(--bg-base)',
-                          }}>
-                            <div style={{
-                              height: '100%', width: `${pct}%`, borderRadius: 3,
-                              background: err ? 'var(--danger)' : 'var(--accent-cyan)',
-                              transition: 'width 0.4s ease',
-                            }} />
-                          </div>
+                          {list.map((m) => {
+                            const err = failed.includes(m);
+                            const pct = err ? 0 : done.includes(m) ? 100
+                              : Math.max(0, Math.min(100, prog[m] ?? 0));
+                            return (
+                              <div key={m} style={{ marginBottom: 6 }}>
+                                <div style={{
+                                  display: 'flex', justifyContent: 'space-between',
+                                  fontSize: 10, fontFamily: 'var(--font-mono)', marginBottom: 2,
+                                }}>
+                                  <span style={{ color: 'var(--text-secondary)' }}>{m}</span>
+                                  <span style={{
+                                    color: err ? 'var(--danger)'
+                                      : pct >= 100 ? 'var(--success)' : 'var(--text-muted)',
+                                  }}>
+                                    {err ? 'failed' : pct >= 100 ? 'ready ✓' : `${Math.round(pct)}%`}
+                                  </span>
+                                </div>
+                                <div style={{
+                                  height: 5, borderRadius: 3, overflow: 'hidden', background: 'var(--bg-base)',
+                                }}>
+                                  <div style={{
+                                    height: '100%', width: `${pct}%`, borderRadius: 3,
+                                    background: err ? 'var(--danger)' : 'var(--accent-cyan)',
+                                    transition: 'width 0.4s ease',
+                                  }} />
+                                </div>
+                              </div>
+                            );
+                          })}
                         </div>
                       );
                     })}

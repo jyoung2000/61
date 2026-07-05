@@ -1291,95 +1291,118 @@ def _pre_download_whisper_model(model_name: str):
 
 # Progress state for the manual "Pull models" button (one pull run at a time).
 # Polled by GET /providers/ollama/pull-status so the UI can show progress and
-# reload the dropdown when the pull finishes.
+# reload the dropdown when the pull finishes. ``hosts`` carries per-target
+# (container + Companion) progress so downloads to each GPU show separately.
 _ollama_pull_state: dict = {
-    "active": False, "models": [], "done": [], "failed": [], "current": None,
+    "active": False, "models": [], "hosts": [],
+    # Legacy aggregate fields kept for older consumers.
+    "done": [], "failed": [], "current": None, "progress": {},
 }
 
 
 def _pull_ollama_models_background(models: list[str] | None = None):
-    """Pull Ollama models in a background thread.
-
-    If no models are specified, pulls the configured vision, text, and
-    translation models.  This is called when Ollama is toggled on or when
-    models are saved, so the models are ready by the time the user tries
-    to use them.
+    """Pull Ollama models onto EVERY enabled host in parallel — the local
+    container Ollama AND a paired GPU Companion — in a background thread, with
+    per-host progress. Called when Ollama is toggled on or models are saved so
+    the models are ready wherever a job might run.
     """
+    from backend.services import ollama_registry
+
     if models is None:
         models = []
         for m in (settings.OLLAMA_PRIMARY_MODEL, settings.OLLAMA_EDITORIAL_MODEL,
                   settings.OLLAMA_TRANSLATION_MODEL):
             if m and m not in models:
                 models.append(m)
-
     if not models:
         return
 
-    # Reset the progress state for this run so the UI can track it.
-    _ollama_pull_state.update(
-        {"active": True, "models": list(models), "done": [], "failed": [],
-         "current": None, "progress": {}, "target": {}})
+    hosts = ollama_registry.enabled_hosts()
+    if not hosts:
+        legacy = (getattr(settings, "OLLAMA_HOST", "") or "").strip()
+        if legacy:
+            hosts = [ollama_registry.OllamaHost(id="default", name="Local Ollama", url=legacy)]
+    # De-dup by normalized URL so a host listed twice isn't pulled twice.
+    seen, uniq = set(), []
+    for h in hosts:
+        if h.url and h.url not in seen:
+            seen.add(h.url)
+            uniq.append(h)
+    hosts = uniq
+    if not hosts:
+        return
 
-    def _do_pull():
+    host_states = []
+    for h in hosts:
+        host_states.append({
+            "name": h.name,
+            "gpu_name": h.gpu_name,
+            "is_companion": bool(h.is_companion),
+            "is_local": ollama_registry.is_local_gpu_host(h.url),
+            "url": h.url,
+            "current": None,
+            "progress": {},
+            "done": [],
+            "failed": [],
+        })
+    _ollama_pull_state.update({
+        "active": True, "models": list(models), "hosts": host_states,
+        "done": [], "failed": [], "current": None, "progress": {},
+    })
+
+    def _pull_one_host(host, hs):
         import httpx as _httpx
         import json as _json
-        from backend.services import ollama_registry
-        host = ollama_registry.primary_url() or settings.OLLAMA_HOST
-        _headers = ollama_registry.headers_for_url(host)
-        # Label the sync target so the UI can say "downloading to <GPU>".
-        try:
-            _hobj = ollama_registry.find_host_for_url(host)
-        except Exception:
-            _hobj = None
-        _ollama_pull_state["target"] = {
-            "name": getattr(_hobj, "name", "") or host,
-            "gpu_name": getattr(_hobj, "gpu_name", "") or "",
-            "is_companion": bool(getattr(_hobj, "is_companion", False)),
-        }
-        try:
-            for model in models:
-                _ollama_pull_state["current"] = model
-                _ollama_pull_state["progress"][model] = 0.0
-                try:
-                    logger.info("Background pull: requesting %s (→ %s)...",
-                                model, _ollama_pull_state["target"]["name"])
-                    # Stream so a multi-GB download onto a Companion reports a
-                    # real percentage instead of a long opaque wait.
-                    with _httpx.stream(
-                        "POST", f"{host}/api/pull",
-                        json={"name": model, "stream": True},
-                        headers=_headers,
-                        timeout=_httpx.Timeout(connect=10, read=1800, write=10, pool=10),
-                    ) as resp:
-                        if resp.status_code != 200:
-                            logger.warning("Background pull: %s returned %d", model, resp.status_code)
-                            _ollama_pull_state["failed"].append(model)
+        headers = ollama_registry.auth_headers(host)
+        label = hs["gpu_name"] or hs["name"]
+        for model in models:
+            hs["current"] = model
+            hs["progress"][model] = 0.0
+            try:
+                logger.info("Pull %s → %s ...", model, label)
+                with _httpx.stream(
+                    "POST", ollama_registry.join_url(host.url, "/api/pull"),
+                    json={"name": model, "stream": True},
+                    headers=headers,
+                    timeout=_httpx.Timeout(connect=10, read=1800, write=10, pool=10),
+                ) as resp:
+                    if resp.status_code != 200:
+                        logger.warning("Pull %s → %s: HTTP %d", model, label, resp.status_code)
+                        hs["failed"].append(model)
+                        continue
+                    for line in resp.iter_lines():
+                        if not line:
                             continue
-                        for line in resp.iter_lines():
-                            if not line:
-                                continue
-                            try:
-                                obj = _json.loads(line)
-                            except Exception:
-                                continue
-                            if obj.get("error"):
-                                raise RuntimeError(obj["error"])
-                            total = obj.get("total") or 0
-                            completed = obj.get("completed") or 0
-                            if total:
-                                _ollama_pull_state["progress"][model] = round(
-                                    completed / total * 100, 1)
-                    _ollama_pull_state["progress"][model] = 100.0
-                    _ollama_pull_state["done"].append(model)
-                    logger.info("Background pull: %s ready", model)
-                except Exception as exc:
-                    logger.warning("Background pull: %s failed (%s)", model, exc)
-                    _ollama_pull_state["failed"].append(model)
-        finally:
-            _ollama_pull_state["current"] = None
-            _ollama_pull_state["active"] = False
+                        try:
+                            obj = _json.loads(line)
+                        except Exception:
+                            continue
+                        if obj.get("error"):
+                            raise RuntimeError(obj["error"])
+                        total = obj.get("total") or 0
+                        completed = obj.get("completed") or 0
+                        if total:
+                            hs["progress"][model] = round(completed / total * 100, 1)
+                hs["progress"][model] = 100.0
+                hs["done"].append(model)
+                logger.info("Pull %s → %s: ready", model, label)
+            except Exception as exc:
+                logger.warning("Pull %s → %s failed (%s)", model, label, exc)
+                hs["failed"].append(model)
+        hs["current"] = None
 
-    threading.Thread(target=_do_pull, daemon=True, name="ollama-bg-pull").start()
+    def _run():
+        threads = []
+        for host, hs in zip(hosts, host_states):
+            t = threading.Thread(target=_pull_one_host, args=(host, hs),
+                                 daemon=True, name=f"pull-{hs['name']}")
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join()
+        _ollama_pull_state["active"] = False
+
+    threading.Thread(target=_run, daemon=True, name="ollama-bg-pull").start()
 
 
 @router.post("/providers/ollama/toggle")
@@ -1463,12 +1486,19 @@ async def pull_ollama_models(req: PullOllamaRequest | None = None):
 @router.get("/providers/ollama/pull-status")
 async def ollama_pull_status():
     """Report progress of the most recent /providers/ollama/pull run so the UI
-    can show a spinner and reload the model list when it finishes."""
+    can show per-target progress bars and reload the model list when it
+    finishes."""
     st = dict(_ollama_pull_state)
-    total = len(st.get("models") or [])
-    finished = len(st.get("done") or []) + len(st.get("failed") or [])
-    st["total"] = total
-    st["finished"] = finished
+    hosts = st.get("hosts") or []
+    n_models = len(st.get("models") or [])
+    if hosts:
+        st["total"] = n_models * len(hosts)
+        st["finished"] = sum(len(h.get("done") or []) + len(h.get("failed") or [])
+                             for h in hosts)
+        st["current"] = next((h.get("current") for h in hosts if h.get("current")), None)
+    else:
+        st["total"] = n_models
+        st["finished"] = len(st.get("done") or []) + len(st.get("failed") or [])
     return st
 
 
@@ -1674,6 +1704,106 @@ async def recommended_models():
         "models": result,
         "free_vision_count": total_free_vision,
         "free_text_count": total_free_text,
+    }
+
+
+# Curated local (Ollama) models per role, with an approximate VRAM footprint
+# (GB) for a q4-ish quant + KV cache. Used to recommend models that fit the
+# detected GPU. (tag, approx_vram_gb, why)
+_LOCAL_MODEL_CATALOG: dict[str, list[tuple]] = {
+    "primary": [  # vision / video-frame understanding
+        ("moondream:1.8b", 2.0, "Tiny vision model — runs on 2-4 GB GPUs"),
+        ("qwen2.5vl:3b", 4.0, "Qwen2.5-VL 3B — image/video-frame understanding"),
+        ("llava:7b", 6.0, "LLaVA 7B — balanced vision quality"),
+        ("qwen2.5vl:7b", 7.0, "Qwen2.5-VL 7B — best local video/vision"),
+        ("llava:13b", 10.0, "LLaVA 13B — highest-quality local vision"),
+    ],
+    "editorial": [  # SEO, summaries, scoring, polish
+        ("qwen2.5:3b-instruct", 3.0, "Fast editorial/SEO on small GPUs"),
+        ("llama3.1:8b", 6.5, "Llama 3.1 8B — strong general text"),
+        ("qwen2.5:7b-instruct", 6.0, "Balanced editorial quality"),
+        ("qwen2.5:14b", 10.0, "Best local editorial quality"),
+    ],
+    "translation": [  # subtitle translation
+        ("qwen2.5:3b-instruct", 3.0, "Fast subtitle translation"),
+        ("qwen3:4b-instruct-2507-q4_K_M", 4.0, "Qwen3 4B — great multilingual"),
+        ("qwen2.5:7b-instruct", 6.0, "Higher-quality translation"),
+        ("gemma2:9b", 7.0, "Gemma 2 9B — strong multilingual"),
+    ],
+}
+# The subtitle-polish role reuses the editorial catalog.
+_LOCAL_MODEL_CATALOG["polish"] = _LOCAL_MODEL_CATALOG["editorial"]
+
+
+async def _effective_local_vram_gb() -> tuple[float, str]:
+    """Best local GPU to size recommendations for: a paired Companion's GPU
+    when present (it becomes the primary host), else the container's own GPU.
+    Returns (vram_gb, label). 0.0 when no GPU is detectable."""
+    from backend.services import ollama_registry
+    for h in ollama_registry.get_hosts():
+        if h.is_companion and h.vram_total_mb:
+            return round(h.vram_total_mb / 1024.0, 1), (h.gpu_name or h.name or "Companion GPU")
+    try:
+        from backend.services.clip_exporter import detect_gpu_capabilities
+        info = await asyncio.to_thread(detect_gpu_capabilities, force_redetect=False)
+        mb = int(info.get("vram_mb") or 0)
+        if mb:
+            return round(mb / 1024.0, 1), (info.get("gpu_name") or info.get("name") or "local GPU")
+    except Exception as e:
+        logger.debug("local GPU detection failed: %s", e)
+    return 0.0, ""
+
+
+@router.get("/providers/models/local-recommended")
+async def local_recommended_models():
+    """Recommended LOCAL (Ollama) models per role, sized to the detected GPU.
+
+    Each entry is ready to select in a dropdown (``ollama/<tag>`` id) and
+    marks whether it fits the GPU's VRAM and whether it's already installed.
+    Selecting one and hitting Save downloads it to the container + Companion.
+    """
+    vram_gb, gpu_label = await _effective_local_vram_gb()
+
+    installed: set[str] = set()
+    try:
+        from backend.services import ollama_registry
+        for h in await ollama_registry.registry_status():
+            for m in (h.get("models") or []):
+                installed.add(str(m))
+    except Exception:
+        pass
+
+    from backend.services import ollama_registry as _oreg
+    headroom = 0.5  # allow a model to be recommended slightly above budget
+
+    def _role(role: str) -> list[dict]:
+        cat = _LOCAL_MODEL_CATALOG.get(role, [])
+        fitting = [c for c in cat if (vram_gb <= 0 or c[1] <= vram_gb + headroom)]
+        # The largest model that still fits is the headline recommendation.
+        best_tag = max(fitting, key=lambda c: c[1])[0] if fitting else None
+        out = []
+        for tag, gb, why in cat:
+            fits = (vram_gb <= 0) or (gb <= vram_gb + headroom)
+            out.append({
+                "id": f"ollama/{tag}",
+                "tag": tag,
+                "name": tag,
+                "size_gb": gb,
+                "why": why,
+                "provider": "local",
+                "is_free": True,
+                "fits": fits,
+                "recommended": tag == best_tag,
+                "installed": _oreg.model_present(list(installed), tag),
+            })
+        # Fitting first, then by size descending (bigger = better within budget).
+        out.sort(key=lambda m: (not m["fits"], -m["size_gb"]))
+        return out
+
+    return {
+        "gpu": gpu_label,
+        "vram_gb": vram_gb,
+        "roles": {r: _role(r) for r in ("primary", "editorial", "translation", "polish")},
     }
 
 
