@@ -47,6 +47,9 @@
     ],
     "resources": ["sidecar"],
     "windows": {
+      "webviewInstallMode": {
+        "type": "offlineInstaller"
+      },
       "nsis": {
         "installMode": "perMachine",
         "languages": ["English"],
