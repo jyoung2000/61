@@ -2,9 +2,10 @@ import { useEffect, useState } from 'react';
 import { showToast } from './Toast';
 
 // GPU Companion — download card at the top of the Ollama section.
-// Installers are served by THIS ClipAI container (baked into the image or
-// cached under /config/companion-cache), with a labeled GitHub redirect
-// when neither copy exists yet.
+// BOTH platform buttons are ALWAYS shown. When an installer exists it
+// downloads from this container (or 302-redirects to the GitHub asset);
+// when it doesn't, the button links to the GitHub releases page so there
+// is always a visible path — never a dead "check GitHub" state.
 
 const fmtSize = (bytes) => {
   if (!bytes) return '';
@@ -18,13 +19,14 @@ const detectOS = () => {
   return 'windows';
 };
 
-const btnStyle = (primary) => ({
+const btnStyle = (variant) => ({
   padding: '7px 14px',
-  background: primary ? 'var(--accent-cyan)' : 'var(--bg-elevated)',
-  color: primary ? 'var(--bg-base)' : 'var(--text-secondary)',
-  border: primary ? 'none' : '1px solid var(--border)',
+  background: variant === 'primary' ? 'var(--accent-cyan)'
+    : variant === 'ghost' ? 'transparent' : 'var(--bg-elevated)',
+  color: variant === 'primary' ? 'var(--bg-base)' : 'var(--text-secondary)',
+  border: variant === 'primary' ? 'none' : '1px solid var(--border)',
   borderRadius: 'var(--radius-sm)', fontSize: 11, fontWeight: 600,
-  textDecoration: 'none', display: 'inline-block',
+  textDecoration: 'none', display: 'inline-block', cursor: 'pointer',
 });
 
 export default function CompanionDownloadCard({ isMobile = false }) {
@@ -55,10 +57,10 @@ export default function CompanionDownloadCard({ isMobile = false }) {
       const res = await fetch('/api/downloads/companion/refresh', { method: 'POST' });
       const data = await res.json();
       if (data.status === 'started') {
-        showToast(`Checking for Companion updates (v${data.target_version || '?'})…`, 'success');
+        showToast(`Fetching Companion installers (v${data.target_version || '?'})…`, 'success');
         setTimeout(load, 5000);
       } else {
-        showToast(data.message || 'Nothing to fetch', 'error');
+        showToast(data.message || 'No installers to fetch yet', 'error');
       }
     } catch {
       showToast('Update check failed', 'error');
@@ -68,25 +70,26 @@ export default function CompanionDownloadCard({ isMobile = false }) {
   };
 
   const platforms = manifest?.platforms || {};
-  const win = platforms.windows;
-  const mac = platforms.mac;
-  const anyLocal = [win, mac].some((p) => p && p.source !== 'github-only');
-  const anyAvailable = !!(win || mac);
+  const repo = manifest?.github_repo || '';
+  const releasesUrl = repo ? `https://github.com/${repo}/releases` : '';
+  const anyLocal = ['windows', 'mac'].some(
+    (k) => platforms[k] && platforms[k].source !== 'github-only');
+  const anyAvailable = !!(platforms.windows || platforms.mac);
 
-  const buttons = [
-    win && {
-      key: 'windows',
-      label: `Download for Windows (.exe)${win.size ? ` — ${fmtSize(win.size)}` : ''}`,
-      href: '/api/downloads/companion/windows',
-      primary: os === 'windows',
-    },
-    mac && {
-      key: 'mac',
-      label: `Download for macOS (.dmg)${mac.size ? ` — ${fmtSize(mac.size)}` : ''}`,
-      href: '/api/downloads/companion/mac',
-      primary: os === 'mac',
-    },
-  ].filter(Boolean).sort((a, b) => (b.primary ? 1 : 0) - (a.primary ? 1 : 0));
+  // One entry per platform, ALWAYS present.
+  const specs = [
+    { key: 'windows', os: 'windows', ext: '.exe', label: 'Windows' },
+    { key: 'mac', os: 'mac', ext: '.dmg', label: 'macOS' },
+  ].map((s) => {
+    const p = platforms[s.key];
+    return {
+      ...s,
+      available: !!p,
+      size: p?.size,
+      href: p ? `/api/downloads/companion/${s.key}` : releasesUrl,
+      external: !p,
+    };
+  }).sort((a, b) => (b.os === os ? 1 : 0) - (a.os === os ? 1 : 0));
 
   return (
     <div style={{
@@ -121,35 +124,49 @@ export default function CompanionDownloadCard({ isMobile = false }) {
           Setup guide →
         </a>
       </p>
-      {anyAvailable ? (
-        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 8 }}>
-          {buttons.map((b) => (
-            <a key={b.key} href={b.href} style={btnStyle(b.primary)}
-              onClick={() => setDownloaded(true)}>
-              {b.label}
-            </a>
-          ))}
-          <button onClick={checkUpdates} disabled={refreshing}
-            style={{ ...btnStyle(false), opacity: refreshing ? 0.5 : 1, cursor: 'pointer' }}>
-            {refreshing ? 'Checking…' : 'Check for updates'}
-          </button>
-        </div>
-      ) : (
-        <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 8 }}>
-          No Companion installers are available yet — they're built by the
-          <code style={{ margin: '0 4px' }}>companion-v*</code> release workflow.
-          <button onClick={checkUpdates} disabled={refreshing}
-            style={{ ...btnStyle(false), marginLeft: 8, cursor: 'pointer', opacity: refreshing ? 0.5 : 1 }}>
-            {refreshing ? 'Checking…' : 'Check GitHub'}
-          </button>
+
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 8 }}>
+        {specs.map((s) => (
+          <a
+            key={s.key}
+            href={s.href || '#'}
+            {...(s.external ? { target: '_blank', rel: 'noopener noreferrer' } : {})}
+            onClick={(e) => {
+              if (!s.href) { e.preventDefault(); return; }
+              if (s.available) setDownloaded(true);
+            }}
+            title={s.available
+              ? `Download the ${s.label} installer`
+              : `Not built yet — opens the GitHub releases page`}
+            style={{
+              ...btnStyle(s.available && s.os === os ? 'primary' : (s.available ? 'secondary' : 'ghost')),
+              opacity: s.available ? 1 : 0.75,
+            }}
+          >
+            {s.available
+              ? `Download for ${s.label} (${s.ext})${s.size ? ` — ${fmtSize(s.size)}` : ''}`
+              : `${s.label} (${s.ext}) — on GitHub ↗`}
+          </a>
+        ))}
+        <button onClick={checkUpdates} disabled={refreshing}
+          style={{ ...btnStyle('secondary'), opacity: refreshing ? 0.5 : 1 }}
+          title="Pull the latest installers from GitHub into this container so downloads are served locally">
+          {refreshing ? 'Fetching…' : anyLocal ? 'Check for updates' : 'Fetch from GitHub'}
+        </button>
+      </div>
+
+      {!anyAvailable && (
+        <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 8, lineHeight: 1.4 }}>
+          No installer is published yet. The buttons above open the GitHub releases page;
+          once a <code>companion-v*</code> release exists, click <strong>Fetch from
+          GitHub</strong> and the installers will be served directly by this server.
         </div>
       )}
       {manifest?.built_from_source && (
         <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 8, lineHeight: 1.4 }}>
-          This Windows installer was built from source inside this server's Docker image
-          (no GitHub release yet). It shares your desktop GPU's Ollama fully; the Whisper
-          sidecar ships with official <code>companion-v*</code> releases — transcription
-          stays on this server until then.
+          This Windows installer was built from source inside this server's Docker image.
+          It shares your desktop GPU's Ollama fully; the Whisper sidecar ships with official
+          <code>companion-v*</code> releases — transcription stays on this server until then.
         </div>
       )}
       {downloaded && (

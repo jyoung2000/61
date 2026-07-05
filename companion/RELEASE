@@ -1,0 +1,12 @@
+companion-v0.1.0
+
+# ClipAI GPU Companion — release trigger.
+#
+# The first non-empty line above is the release tag. Pushing a change to
+# this file on any branch fires .github/workflows/companion-release.yml,
+# which builds the Windows .exe/.msi + macOS .dmg, publishes them to a
+# GitHub Release, and attaches a sha256 manifest.json. This is the path
+# for environments that can push commits but not tags.
+#
+# To cut a new release: bump the tag on line 1 (e.g. companion-v0.1.1)
+# and commit. A tag that already has all three installers is skipped.

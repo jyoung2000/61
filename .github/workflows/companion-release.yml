@@ -1,24 +1,34 @@
 # Build + release the ClipAI GPU Companion installers.
 #
-# Trigger: push a tag like `companion-v0.1.0`. Artifacts:
-#   * Windows x64: NSIS .exe wizard installer + .msi
-#   * macOS universal (aarch64 + x86_64): .dmg with drag-to-Applications
+# Three ways to cut a release (all resolve to a companion-vX.Y.Z tag):
+#   1. Push a tag `companion-v*`.
+#   2. `workflow_dispatch` with a `tag` input.
+#   3. Push a change to `companion/RELEASE` on any branch — its first line
+#      is the tag. This is the path for environments that can push commits
+#      but not tags and lack dispatch permission (e.g. remote agent
+#      sessions). Creating the GitHub Release below creates the tag at the
+#      run's commit.
+#
+# Artifacts on the release:
+#   * Windows x64: NSIS `.exe` wizard installer + `.msi`
+#   * macOS universal (aarch64 + x86_64): `.dmg`
 #   * manifest.json (version, per-file name/size/sha256) — consumed by the
 #     ClipAI container's Settings download card (backend/routers/downloads.py)
 #
-# NOTE ON SIGNING: builds are UNSIGNED by default. macOS users must
-# right-click → Open on first launch (or `xattr -dr com.apple.quarantine
-# "/Applications/ClipAI GPU Companion.app"`). To sign, uncomment the
-# signing env blocks below and add the certificates as repo secrets.
+# Builds are UNSIGNED. macOS users: right-click → Open on first launch, or
+# `xattr -dr com.apple.quarantine "/Applications/ClipAI GPU Companion.app"`.
+# Signing hooks are left commented in the build job.
 name: companion-release
 
 on:
   push:
     tags:
       - "companion-v*"
-  # Manual runs: creating the GitHub Release below also creates the tag at
-  # this run's commit, so environments that can't push tags directly (e.g.
-  # remote sessions restricted to one branch) can still cut a release.
+    branches:
+      - "**"
+    paths:
+      - "companion/RELEASE"
+      - ".github/workflows/companion-release.yml"
   workflow_dispatch:
     inputs:
       tag:
@@ -29,11 +39,55 @@ on:
 permissions:
   contents: write
 
-env:
-  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
+concurrency:
+  group: companion-release
+  cancel-in-progress: false
 
 jobs:
+  # ── Resolve the tag once and decide whether to build ────────────────
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.r.outputs.tag }}
+      should_build: ${{ steps.r.outputs.should_build }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve tag + skip-if-already-released
+        id: r
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            TAG="${{ github.ref_name }}"
+          else
+            TAG="$(head -1 companion/RELEASE 2>/dev/null | tr -d '[:space:]' || true)"
+          fi
+          echo "Resolved tag: '${TAG:-<none>}'"
+          case "$TAG" in
+            companion-v*) : ;;
+            *) echo "tag=" >> "$GITHUB_OUTPUT"
+               echo "should_build=false" >> "$GITHUB_OUTPUT"
+               echo "No companion-v* tag — nothing to build."; exit 0 ;;
+          esac
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          # Skip if a release with the full asset set already exists, so an
+          # unrelated push to companion/RELEASE can't clobber a live release.
+          COUNT=$(gh release view "$TAG" --repo "${{ github.repository }}" \
+                    --json assets --jq '[.assets[] | select(.name|test("\\.(exe|msi|dmg)$"))] | length' \
+                    2>/dev/null || echo 0)
+          if [ "${COUNT:-0}" -ge 3 ]; then
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            echo "Release $TAG already has $COUNT installers — skipping rebuild."
+          else
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
+    needs: resolve
+    if: needs.resolve.outputs.should_build == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -43,9 +97,7 @@ jobs:
             # never ask Windows for a .dmg (or macOS for NSIS).
             args: "--bundles nsis,msi"
           - platform: macos-latest
-            # Universal app binary: Apple Silicon + Intel in one .dmg. (The
-            # whisper.cpp sidecar is built for the runner's arch — arm64 —
-            # which matches the Apple Silicon target audience.)
+            # Universal app binary: Apple Silicon + Intel in one .dmg.
             args: "--target universal-apple-darwin --bundles dmg"
     runs-on: ${{ matrix.platform }}
     steps:
@@ -64,6 +116,8 @@ jobs:
           workspaces: companion/src-tauri
 
       # ── Windows: build the faster-whisper sidecar (PyInstaller) ──────
+      # Fail-soft: if the sidecar can't build, the installer still ships
+      # (Ollama sharing works; the Companion reports whisper unavailable).
       - uses: actions/setup-python@v5
         if: matrix.platform == 'windows-latest'
         with:
@@ -73,6 +127,7 @@ jobs:
         if: matrix.platform == 'windows-latest'
         shell: pwsh
         working-directory: companion/sidecars/whisper-server
+        continue-on-error: true
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
@@ -80,14 +135,13 @@ jobs:
           New-Item -ItemType Directory -Force ..\..\src-tauri\sidecar | Out-Null
           Copy-Item -Recurse -Force dist\whisper-server\* ..\..\src-tauri\sidecar\
 
-      # ── macOS: fetch whisper.cpp server (Metal) ──────────────────────
+      # ── macOS: build whisper.cpp server (Metal) ──────────────────────
       - name: Build whisper.cpp server (macOS)
         if: matrix.platform == 'macos-latest'
+        continue-on-error: true
         working-directory: companion
         run: |
           git clone --depth 1 --branch v1.7.4 https://github.com/ggerganov/whisper.cpp
-          # Static libs + embedded Metal shader → one self-contained binary,
-          # no dylib/.metal files to ship alongside it.
           cmake -S whisper.cpp -B whisper.cpp/build \
             -DGGML_METAL=ON \
             -DGGML_METAL_EMBED_LIBRARY=ON \
@@ -96,11 +150,21 @@ jobs:
             -DWHISPER_BUILD_TESTS=OFF
           cmake --build whisper.cpp/build --config Release -j 3
           mkdir -p src-tauri/sidecar
-          # Binary name changed across whisper.cpp releases — accept either.
           cp whisper.cpp/build/bin/whisper-server src-tauri/sidecar/whisper-server \
             || cp whisper.cpp/build/bin/server src-tauri/sidecar/whisper-server
           chmod +x src-tauri/sidecar/whisper-server
           ./src-tauri/sidecar/whisper-server --help | head -5 || true
+
+      # The bundler needs at least one file under src-tauri/sidecar (the
+      # tauri.conf.json resource glob). The committed README guarantees it,
+      # but a fresh checkout of a sidecar-less build could be empty — ensure
+      # the dir exists so the resource copy never fails the bundle.
+      - name: Ensure sidecar resource dir exists
+        shell: bash
+        run: |
+          mkdir -p companion/src-tauri/sidecar
+          [ -e companion/src-tauri/sidecar/README.md ] || \
+            echo "sidecar staging" > companion/src-tauri/sidecar/README.md
 
       - name: Install frontend dependencies
         working-directory: companion
@@ -110,25 +174,18 @@ jobs:
         working-directory: companion
         run: npx tauri icon app-icon.png
 
-      - name: Build Tauri app
+      - name: Build Tauri app + publish to the release
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # ── Code signing (disabled by default) ──
-          # Windows:
-          # WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
-          # WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
-          # macOS:
-          # APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          # APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          # APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          # APPLE_ID: ${{ secrets.APPLE_ID }}
-          # APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          # APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # Windows: WINDOWS_CERTIFICATE / WINDOWS_CERTIFICATE_PASSWORD
+          # macOS: APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD /
+          #        APPLE_SIGNING_IDENTITY / APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID
         with:
           projectPath: companion
-          tagName: ${{ env.RELEASE_TAG }}
-          releaseName: "ClipAI GPU Companion ${{ env.RELEASE_TAG }}"
+          tagName: ${{ needs.resolve.outputs.tag }}
+          releaseName: "ClipAI GPU Companion ${{ needs.resolve.outputs.tag }}"
           releaseBody: |
             ClipAI GPU Companion — share a desktop GPU (Ollama + Whisper) with your ClipAI server.
 
@@ -138,20 +195,22 @@ jobs:
             `xattr -dr com.apple.quarantine "/Applications/ClipAI GPU Companion.app"`.
 
             After installing: open the Companion, follow the setup wizard, and paste
-            your ClipAI URL + API key to pair.
+            your ClipAI URL + API key to pair. It also downloads directly from
+            ClipAI → Settings → GPU Companion once this release exists.
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
 
   manifest:
     name: Publish manifest.json
-    needs: build
+    needs: [resolve, build]
+    if: needs.resolve.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Build + upload manifest of release assets
         uses: actions/github-script@v7
         env:
-          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
         with:
           script: |
             const crypto = require('crypto');
@@ -189,7 +248,6 @@ jobs:
               platforms,
             };
             const body = JSON.stringify(manifest, null, 2);
-            // Replace any stale manifest from a re-run.
             const stale = release.data.assets.find(a => a.name === 'manifest.json');
             if (stale) {
               await github.rest.repos.deleteReleaseAsset({

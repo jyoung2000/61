@@ -40,42 +40,38 @@ RUN set +e; \
     ls -la /companion || true; \
     exit 0
 
-## Stage 1c: Build the Windows Companion installer from source (fallback)
-# Same stage as in Dockerfile.gpu — cross-compiles the Tauri app for
-# x86_64-pc-windows-gnu (MinGW) + NSIS so the Settings download button
-# works before any companion-v* GitHub release exists. Fail-soft; skip
-# with --build-arg COMPANION_BUILD_FROM_SOURCE=0. This fallback build
-# has no whisper sidecar (PyInstaller can't cross-build) — the Companion
-# reports that honestly and Ollama GPU sharing works fully.
+## Stage 1c: Build the Windows Companion installer from source (OPT-IN)
+# Same stage as in Dockerfile.gpu. DEFAULT OFF: the published
+# companion-v* GitHub Release provides the complete installers, which the
+# Settings card serves. Enable only for airgapped / no-release setups:
+#   docker build --build-arg COMPANION_BUILD_FROM_SOURCE=1
+# Every step is fail-soft (set +e / exit 0) so a toolchain hiccup can
+# never abort the ClipAI image build.
 FROM rust:1-bookworm AS companion-builder
-ARG COMPANION_BUILD_FROM_SOURCE=1
+ARG COMPANION_BUILD_FROM_SOURCE=0
 WORKDIR /build
-RUN set -e; \
-    if [ "$COMPANION_BUILD_FROM_SOURCE" = "1" ]; then \
-      apt-get update && apt-get install -y --no-install-recommends \
-        nsis gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 \
-        nodejs npm python3 ca-certificates curl \
-        && rm -rf /var/lib/apt/lists/*; \
-      rustup target add x86_64-pc-windows-gnu; \
-    fi
 COPY companion/ ./companion/
 RUN set +e; \
     mkdir -p /out; \
-    if [ "$COMPANION_BUILD_FROM_SOURCE" = "1" ]; then \
-      cd companion \
+    if [ "$COMPANION_BUILD_FROM_SOURCE" != "1" ]; then \
+      echo "COMPANION_BUILD_FROM_SOURCE!=1 — skipping from-source installer build (GitHub release is the source)"; \
+      exit 0; \
+    fi; \
+    apt-get update && apt-get install -y --no-install-recommends \
+      nsis gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 \
+      nodejs npm python3 ca-certificates curl; \
+    rustup target add x86_64-pc-windows-gnu; \
+    cd companion \
       && npm install --no-audit --no-fund \
       && npx tauri build --target x86_64-pc-windows-gnu --bundles nsis; \
-      STATUS=$?; \
-      EXE=$(ls src-tauri/target/x86_64-pc-windows-gnu/release/bundle/nsis/*-setup.exe 2>/dev/null | head -1); \
-      if [ "$STATUS" = "0" ] && [ -n "$EXE" ]; then \
-        cp "$EXE" /out/ \
+    STATUS=$?; \
+    EXE=$(ls src-tauri/target/x86_64-pc-windows-gnu/release/bundle/nsis/*-setup.exe 2>/dev/null | head -1); \
+    if [ "$STATUS" = "0" ] && [ -n "$EXE" ]; then \
+      cp "$EXE" /out/ \
         && python3 scripts/make_local_manifest.py /out \
         && echo "Companion installer built from source: $(basename "$EXE")"; \
-      else \
-        echo "Companion from-source build FAILED (status=$STATUS) — image build continues; the Settings card falls back to GitHub releases"; \
-      fi; \
     else \
-      echo "COMPANION_BUILD_FROM_SOURCE=0 — skipping from-source installer build"; \
+      echo "Companion from-source build FAILED (status=$STATUS) — image build continues; the Settings card falls back to the GitHub release"; \
     fi; \
     exit 0
 
