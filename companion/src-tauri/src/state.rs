@@ -103,6 +103,9 @@ pub struct AppState {
     pub sidecar: tokio::sync::Mutex<Option<crate::sidecar::SidecarHandle>>,
     /// Managed Ollama child (None when an external Ollama is used).
     pub ollama_child: tokio::sync::Mutex<Option<tokio::process::Child>>,
+    /// Guard so concurrent ensure_running() calls don't spawn `ollama serve`
+    /// more than once (the supervisor loop + the UI's start button can race).
+    pub ollama_starting: AtomicBool,
     /// Serializes GPU-heavy whisper work: one transcription at a time.
     pub whisper_slot: tokio::sync::Semaphore,
     /// Last time any proxied request finished (ms epoch) — idle shutdown.
@@ -137,6 +140,7 @@ impl AppState {
             gpu: Mutex::new(GpuSnapshot::default()),
             sidecar: tokio::sync::Mutex::new(None),
             ollama_child: tokio::sync::Mutex::new(None),
+            ollama_starting: AtomicBool::new(false),
             whisper_slot: tokio::sync::Semaphore::new(1),
             last_request_ms: AtomicU64::new(now_ms()),
             whisper_busy: AtomicBool::new(false),

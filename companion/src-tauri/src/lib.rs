@@ -457,13 +457,21 @@ pub fn run() {
                 });
             }
 
-            // Start the managed Ollama (no-op if one is already running)
-            // and the LAN proxy.
+            // Self-healing Ollama supervisor: keep probing/starting so Ollama
+            // is detected automatically once it's installed or started — e.g.
+            // right after the in-app install, WITHOUT needing an app restart
+            // (the freshly-installed binary is found by known-path resolution
+            // even though this process's PATH is stale).
             {
                 let state = state.clone();
                 tauri::async_runtime::spawn(async move {
-                    if let Err(e) = ollama::ensure_running(&state).await {
-                        log::warn!("ollama not started yet: {e}");
+                    loop {
+                        if !ollama::daemon_running().await {
+                            if let Err(e) = ollama::ensure_running(&state).await {
+                                log::warn!("ollama not up yet: {e}");
+                            }
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(8)).await;
                     }
                 });
             }

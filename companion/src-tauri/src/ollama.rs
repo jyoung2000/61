@@ -19,11 +19,40 @@ pub struct OllamaStatus {
     pub models: Vec<String>,
 }
 
-fn ollama_binary() -> &'static str {
-    if cfg!(target_os = "windows") {
-        "ollama.exe"
-    } else {
-        "ollama"
+/// Resolve the Ollama executable. Prefer a KNOWN INSTALL PATH over the bare
+/// name so we still find it right after a fresh install — the installer adds
+/// Ollama to PATH, but our already-running process has a stale PATH and would
+/// otherwise fail with "program not found" until the app is restarted.
+fn ollama_binary() -> String {
+    #[cfg(target_os = "windows")]
+    {
+        let mut candidates: Vec<String> = Vec::new();
+        // Ollama's Windows installer is per-user → %LOCALAPPDATA%\Programs\Ollama.
+        for var in ["LOCALAPPDATA", "ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"] {
+            if let Ok(base) = std::env::var(var) {
+                candidates.push(format!("{base}\\Programs\\Ollama\\ollama.exe"));
+                candidates.push(format!("{base}\\Ollama\\ollama.exe"));
+            }
+        }
+        for c in candidates {
+            if std::path::Path::new(&c).exists() {
+                return c;
+            }
+        }
+        "ollama.exe".to_string()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        for c in [
+            "/usr/local/bin/ollama",
+            "/opt/homebrew/bin/ollama",
+            "/Applications/Ollama.app/Contents/Resources/ollama",
+        ] {
+            if std::path::Path::new(c).exists() {
+                return c.to_string();
+            }
+        }
+        "ollama".to_string()
     }
 }
 
@@ -183,6 +212,31 @@ pub async fn ensure_running(state: &Arc<AppState>) -> Result<bool, String> {
     if daemon_running().await {
         return Ok(false);
     }
+    // Only one start attempt at a time — the supervisor loop and the UI's
+    // start button both call this and would otherwise spawn duplicate daemons.
+    if state
+        .ollama_starting
+        .swap(true, std::sync::atomic::Ordering::SeqCst)
+    {
+        for _ in 0..40 {
+            if daemon_running().await {
+                return Ok(true);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        return Ok(false);
+    }
+    let result = ensure_running_inner(state).await;
+    state
+        .ollama_starting
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    result
+}
+
+async fn ensure_running_inner(state: &Arc<AppState>) -> Result<bool, String> {
+    if daemon_running().await {
+        return Ok(false);
+    }
     let keep_alive = state.config.lock().unwrap().ollama_keep_alive.clone();
     let overhead = gpu_overhead_bytes(state);
     log::info!(
@@ -248,19 +302,22 @@ pub fn recommended_models(budget_gb: f32) -> Vec<(&'static str, &'static str)> {
         vec![
             ("llava:13b", "Vision (Primary AI)"),
             ("qwen2.5vl:7b", "Video/vision understanding"),
-            ("qwen2.5:14b", "Editorial / translation"),
+            ("qwen2.5:14b", "Editorial (SEO / summaries)"),
+            ("qwen3:4b", "Subtitle translation"),
         ]
     } else if budget_gb >= 6.0 {
         vec![
             ("llava:7b", "Vision (Primary AI)"),
             ("qwen2.5vl:7b", "Video/vision understanding"),
-            ("qwen2.5:7b-instruct", "Editorial / translation"),
+            ("qwen2.5:7b-instruct", "Editorial (SEO / summaries)"),
+            ("qwen3:4b", "Subtitle translation"),
         ]
     } else {
         vec![
             ("moondream:1.8b", "Vision (Primary AI)"),
             ("qwen2.5vl:3b", "Video/vision understanding"),
-            ("qwen2.5:3b-instruct", "Editorial / translation"),
+            ("qwen2.5:3b-instruct", "Editorial (SEO / summaries)"),
+            ("qwen3:4b", "Subtitle translation"),
         ]
     }
 }
