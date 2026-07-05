@@ -152,6 +152,14 @@ class Settings(BaseSettings):
     # running a higher quant half on the CPU. Off = keep the configured tag and
     # let the partial-offload ladder spill to CPU (legacy behavior).
     OLLAMA_TRANSLATION_FIT_GPU_QUANT: bool = True
+    # Extra seconds granted ON TOP of a caller's text timeout when the target
+    # Ollama model is NOT currently resident (checked via /api/ps). On a 4 GB
+    # GTX 1650 a cold load is unload-other-model + read ~2 GB of weights from
+    # the (often spinning) appdata disk + CUDA alloc — routinely 60-150 s,
+    # which blew the polisher's 90 s ceiling and silently pushed batches to
+    # the cloud fallback. Warm calls keep the caller's tight timeout so a
+    # genuinely stuck model still fails over quickly. 0 disables.
+    OLLAMA_COLD_LOAD_TIMEOUT_EXTRA_S: float = 240.0
     # VRAM the CUDA context + baseline allocation hold and never free — subtract
     # from total VRAM to get the model's usable budget. ~1.2 GB matches a 4 GB
     # GTX 1650 (≈2.5 GB free after Whisper releases).

@@ -505,6 +505,24 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
         except Exception as e:
             logger.debug("Could not query Ollama status: %s", e)
 
+    async def is_model_loaded(self, model_name: str) -> bool:
+        """Whether ``model_name`` is currently RESIDENT in Ollama (GPU or
+        CPU). Used for cold-load-aware timeouts: a call against a resident
+        model that produces nothing for 90s is stuck, but the same silence
+        during a multi-GB weights load from disk is normal on a small card
+        — the two must not share one ceiling. Fail-open (True) on probe
+        errors so a broken /api/ps can never inflate every timeout."""
+        try:
+            resp = await self._client.get(f"{self._host}/api/ps", timeout=5.0)
+            if resp.status_code != 200:
+                return True
+            for m in resp.json().get("models", []) or []:
+                if _ollama_names_match(m.get("name", ""), model_name):
+                    return True
+            return False
+        except Exception:
+            return True
+
     async def is_model_on_gpu(self, model_name: str) -> bool:
         """Check if a specific model is currently loaded on GPU."""
         try:

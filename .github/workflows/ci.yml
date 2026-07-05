@@ -95,7 +95,8 @@ jobs:
             backend/tests/test_remote_whisper.py \
             backend/tests/test_companion_register.py \
             backend/tests/test_companion_downloads.py \
-            backend/tests/test_polish_fallback_settings.py
+            backend/tests/test_polish_fallback_settings.py \
+            backend/tests/test_cold_load_timeout.py
 
   companion:
     name: Companion — cargo check + proxy e2e

@@ -102,7 +102,12 @@ services:
       # each GPU stage (gpu_preflight), so a short keep_alive only added
       # cold-load churn BETWEEN polish/translation batches — the cold load
       # is what blew the polish timeout and killed the polish stage.
-      - OLLAMA_KEEP_ALIVE=5m
+      # 30m (was 5m): summary/SEO/polish stages regularly have >5m gaps
+      # between calls to the SAME model on long videos, so 5m still paid a
+      # multi-GB reload mid-stage. VRAM pressure is unaffected — the
+      # pipeline evicts explicitly (keep_alive=0) whenever another engine
+      # needs the card; this only stops ACCIDENTAL expiry.
+      - OLLAMA_KEEP_ALIVE=30m
       - OLLAMA_MAX_LOADED_MODELS=1
       - OLLAMA_NUM_PARALLEL=1
       # Force Ollama to use all available GPU layers

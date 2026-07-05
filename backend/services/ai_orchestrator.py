@@ -1237,6 +1237,7 @@ class AIOrchestrator:
                 model_name = _eff_override
                 original_model = provider._editorial_model
                 provider._editorial_model = _eff_override
+            _call_timeout = timeout
             try:
                 # Evict a leftover model (e.g. the vision model) before the text
                 # call, but KEEP the text model resident so consecutive text
@@ -1245,11 +1246,32 @@ class AIOrchestrator:
                 # slowed analysis and showed in the pipeline visualization.
                 if pname == "ollama" and hasattr(provider, 'clear_vram') and self._consecutive_ollama_failures == 0 and not self._current_model_override:
                     await provider.clear_vram(except_model=model_name)
+                # Cold-load-aware timeout: the caller's ceiling (e.g. the
+                # polisher's 90s) exists to catch a STUCK model — but on a
+                # small card the same silence during a multi-GB weights load
+                # is normal, and treating the two alike is what pushed local
+                # polish batches to the paid cloud fallback. When the target
+                # model is not resident, grant the configured cold-load
+                # allowance on top; warm calls keep the tight ceiling.
+                _cold_extra = float(getattr(
+                    settings, "OLLAMA_COLD_LOAD_TIMEOUT_EXTRA_S", 240.0) or 0.0)
+                if (pname == "ollama" and _cold_extra > 0
+                        and hasattr(provider, "is_model_loaded")):
+                    try:
+                        if not await provider.is_model_loaded(model_name):
+                            _call_timeout = timeout + _cold_extra
+                            logger.info(
+                                "text_completion: %s is not resident — cold "
+                                "load expected; extending timeout %.0fs → %.0fs",
+                                model_name, timeout, _call_timeout,
+                            )
+                    except Exception:
+                        pass
                 logger.info("text_completion attempting via %s model=%s (%d chars prompt)", pname, model_name, len(prompt))
                 t0 = time.monotonic()
                 result = await asyncio.wait_for(
-                    provider.text_complete(prompt, max_tokens=max_tokens, timeout=int(timeout)),
-                    timeout=timeout,
+                    provider.text_complete(prompt, max_tokens=max_tokens, timeout=int(_call_timeout)),
+                    timeout=_call_timeout,
                 )
                 elapsed = time.monotonic() - t0
                 logger.info("text_completion via %s model=%s completed in %.1fs", pname, model_name, elapsed)
@@ -1262,10 +1284,10 @@ class AIOrchestrator:
             except asyncio.TimeoutError:
                 if not skip_circuit_breaker:
                     self._circuit_breaker.record_failure(pname)
-                logger.warning("text_completion via %s model=%s timed out after %.0fs — trying next provider", pname, model_name, timeout)
+                logger.warning("text_completion via %s model=%s timed out after %.0fs — trying next provider", pname, model_name, _call_timeout)
                 if pname == "ollama":
                     await self._maybe_downgrade_ollama_model(provider)
-                await self._notify_fallback(job_id, pname, f"Text completion timed out after {timeout:.0f}s (model={model_name})")
+                await self._notify_fallback(job_id, pname, f"Text completion timed out after {_call_timeout:.0f}s (model={model_name})")
                 continue
             except Exception as e:
                 if not skip_circuit_breaker:
