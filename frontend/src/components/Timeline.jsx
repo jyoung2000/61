@@ -17,14 +17,31 @@ const TRACK_HEIGHT = 56;
 // Mobile: lanes collapse to a slim bar; tapping a track header expands
 // ONE lane at a time back to full height (see laneHeightsFor).
 const COMPACT_TRACK_HEIGHT = 28;
+// Desktop fit-to-window floor: lanes shrink (never below this) so EVERY
+// track fits stacked in the visible canvas without vertical scrolling.
+// 28px matches the mobile compact lane, which the whole draw/hit-test
+// path already supports.
+const MIN_FIT_TRACK_HEIGHT = 28;
 const TRACK_GAP = 6;
 
-/** Per-track lane heights. Desktop: uniform. Mobile: compact except the
- * expanded lane. Pure so hit-tests and draw share the exact math. */
-function laneHeightsFor(tracks, isMobile, expandedTrackId) {
-  return tracks.map((t) => (
-    !isMobile || t.id === expandedTrackId ? TRACK_HEIGHT : COMPACT_TRACK_HEIGHT
-  ));
+/** Per-track lane heights. Desktop: uniform, shrunk uniformly when the
+ * stack would overflow ``fitHeight`` (fit-to-window — no scrolling until
+ * lanes hit the 28px floor). Mobile: compact except the expanded lane.
+ * Pure so hit-tests and draw share the exact math. */
+function laneHeightsFor(tracks, isMobile, expandedTrackId, fitHeight = 0) {
+  if (isMobile) {
+    return tracks.map((t) => (
+      t.id === expandedTrackId ? TRACK_HEIGHT : COMPACT_TRACK_HEIGHT
+    ));
+  }
+  let per = TRACK_HEIGHT;
+  if (fitHeight > 0 && tracks.length > 0) {
+    // Mirror canvasHeight's math: ruler + N lanes + N gaps + 12px pad.
+    const usable = fitHeight - RULER_HEIGHT - 12;
+    per = Math.floor(usable / tracks.length) - TRACK_GAP;
+    per = Math.max(MIN_FIT_TRACK_HEIGHT, Math.min(TRACK_HEIGHT, per));
+  }
+  return tracks.map(() => per);
 }
 
 function laneTop(laneHs, idx) {
@@ -560,9 +577,24 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
   // at a time. laneHsRef feeds draw + hit tests (which read via refs).
   const { isMobile: isMobileViewport } = useResponsive();
   const [expandedTrackId, setExpandedTrackId] = useState(null);
+  // Fit-to-window: the px budget the track stack may occupy (matches the
+  // canvas-wrap's 72vh − 96px cap). Lanes shrink uniformly to fit it so
+  // every track is visible without scrolling; tracked on resize.
+  const [fitHeight, setFitHeight] = useState(() => (
+    typeof window !== 'undefined'
+      ? Math.max(200, Math.floor(window.innerHeight * 0.72 - 96))
+      : 0
+  ));
+  useEffect(() => {
+    const update = () => {
+      setFitHeight(Math.max(200, Math.floor(window.innerHeight * 0.72 - 96)));
+    };
+    window.addEventListener('resize', update);
+    return () => window.removeEventListener('resize', update);
+  }, []);
   const laneHs = useMemo(
-    () => laneHeightsFor(tracks, isMobileViewport, expandedTrackId),
-    [tracks, isMobileViewport, expandedTrackId],
+    () => laneHeightsFor(tracks, isMobileViewport, expandedTrackId, fitHeight),
+    [tracks, isMobileViewport, expandedTrackId, fitHeight],
   );
   const laneHsRef = useRef(laneHs);
   laneHsRef.current = laneHs;
@@ -2637,12 +2669,13 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
         </div>
       </div>
 
-      {/* Canvas area with track header overlay.  When the stack of
-          tracks grows past the visible window (8+ tracks), the wrapping
-          container scrolls vertically. A thin styled scrollbar plus a
-          right-edge "track rail" with a color swatch per track gives
-          the user a Premiere-style overview + quick jump-to-track
-          affordance. */}
+      {/* Canvas area with track header overlay. Lanes shrink uniformly
+          (fit-to-window, 28px floor — see laneHeightsFor) so every track
+          fits stacked in view WITHOUT vertical scrolling. The overflow
+          scroll below is only a backstop for extreme cases (dozens of
+          tracks on a short window) where even floor-height lanes can't
+          fit; the right-edge track rail then gives a Premiere-style
+          overview + jump-to-track affordance. */}
       <div
         className="ve-multi-timeline__canvas-wrap"
         style={{

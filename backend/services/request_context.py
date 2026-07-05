@@ -34,6 +34,11 @@ def clear() -> None:
     _job_stage.set("")
 
 
+def current_job_id() -> str:
+    """The job this task is working for, or "" outside a pipeline run."""
+    return _job_id.get()
+
+
 def _header_safe(value: str, limit: int = 180) -> str:
     """HTTP headers must be latin-1; strip anything that isn't and cap length."""
     cleaned = "".join(ch for ch in (value or "") if 32 <= ord(ch) < 256)

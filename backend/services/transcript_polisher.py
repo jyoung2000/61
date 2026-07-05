@@ -789,10 +789,43 @@ async def _cloud_polish_completion(full_prompt: str, timeout: float) -> Optional
         finally:
             prov._editorial_model = prev_model
         logger.info("polish cloud fallback succeeded via OpenRouter %s", model)
+        _note_cloud_fallback_used(model)
         return result
     except Exception as e:
         logger.warning("polish cloud fallback via %s failed: %s", model, e)
         return None
+
+
+# Jobs already warned about cloud polish spend (one warning per job — the
+# fallback fires per batch and can run dozens of times).
+_cloud_fallback_warned_jobs: set[str] = set()
+
+
+def _note_cloud_fallback_used(model: str) -> None:
+    """Surface the polish cloud fallback in the job's pipeline warnings.
+
+    The fallback is a deliberate safety net, but it spends real money on a
+    setup the user believes is fully local (observed: 31 silent Haiku calls
+    ≈ $0.009 on an 'all-Ollama' job after the local model cold-load blew
+    the 90s text timeout). Warn once per job, with the off switch named.
+    """
+    try:
+        from backend.services.request_context import current_job_id
+        job_id = current_job_id()
+        if not job_id or job_id in _cloud_fallback_warned_jobs:
+            return
+        _cloud_fallback_warned_jobs.add(job_id)
+        from backend.services.pipeline_helpers import _record_pipeline_warning
+        _record_pipeline_warning(
+            job_id,
+            (f"Local polish model timed out — polish batches fell back to "
+             f"OpenRouter ({model}), which bills a small cloud cost. For a "
+             "strictly-local run, disable 'cloud polish fallback' in "
+             "Settings → Subtitles, or fix the local timeout (see the "
+             "estimated cost on this job for the actual spend)."),
+        )
+    except Exception:
+        pass
 
 
 async def _polish_batch(
