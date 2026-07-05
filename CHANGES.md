@@ -1,3 +1,53 @@
+# ClipAI — Remote desktop GPU sharing: multi-Ollama failover, remote Whisper, GPU Companion
+
+Turns the 4 GB GTX 1650 bottleneck inside out: the AI stages (Whisper, VLM,
+editorial/translation LLMs) can now run on a bigger GPU elsewhere on the LAN
+(e.g. a Windows desktop's RTX 4070), while FFmpeg NVENC/NVDEC stays on the
+Unraid card where it belongs. Remote hosts only ever receive prompts, frames,
+and extracted audio — never source video. With nothing configured, behavior
+is identical to before (the full pre-existing test suite passes unchanged).
+
+- **Multi-host Ollama registry** (`services/ollama_registry.py`, new setting
+  `OLLAMA_HOSTS`): a JSON array of hosts where ARRAY ORDER IS PRIORITY —
+  index 0 primary, the rest ordered fallbacks. Per-host bearer tokens, URL
+  base-path support (`…:11500/ollama`), ~10 s probe cache, ~30 s unhealthy
+  cooldown, 503 Retry-After handling, and a model-substitution ladder when a
+  host lacks the configured model. Provider/orchestrator/translator call
+  sites fail over mid-job; after a full pass the existing AI_FALLBACK_CHAIN
+  takes over. `OLLAMA_HOST` stays synced to the primary for back-compat.
+  Settings UI: drag-and-drop "Ollama Hosts" card (@dnd-kit) with add/test/
+  edit/toggle/delete; all probing server-side.
+- **Remote Whisper** (`WHISPER_REMOTE_URL/_API_KEY/_MODEL`): transcription
+  POSTs the already-extracted WAV to any OpenAI-compatible
+  `/v1/audio/transcriptions` server (verbose_json + word timestamps) and
+  maps the response through the same post chain as cloud STT — downstream
+  schema byte-identical. Selection: healthy remote → local CUDA ladder →
+  CPU; mid-stage failure falls back locally. The 4 GB VRAM serialization
+  dance (`_release_whisper_vram`) is skipped when the local GPU never
+  loaded. New `JobResult.stage_locations` + Compute-card badges show where
+  each stage ran; Ollama host names ride `provider_used`.
+- **GPU Companion** (`companion/`, Tauri 2, Windows + macOS): tray/dashboard
+  app that manages Ollama (winget/brew install, localhost-only, keep-alive +
+  `OLLAMA_GPU_OVERHEAD` from a soft VRAM-budget slider), lazy-starts a
+  Whisper sidecar (faster-whisper on Windows/NVIDIA, whisper.cpp Metal on
+  macOS, idle auto-shutdown), and exposes one authenticated LAN port
+  (11500) with a live "what is ClipAI running on my GPU" activity feed.
+  Pairing endpoint `POST /api/settings/companion-register` (API-key
+  protected) registers the Companion as primary + remote Whisper in one
+  step. CI workflow builds NSIS `.exe`/`.msi` + universal `.dmg` on
+  `companion-v*` tags with a sha256 manifest.
+- **In-container distribution** (`routers/downloads.py`, Dockerfile
+  `companion-fetch` stage, Settings "GPU Companion" card): installers are
+  baked into the image (build-arg `COMPANION_VERSION`, never fails on fresh
+  forks), refreshable at runtime into `/config/companion-cache`
+  (sha256-verified), served with a hosted-vs-GitHub indicator, and fall
+  back to a GitHub Releases redirect.
+- Docs: `docs/remote-gpu.md` (one-click + manual paths, VRAM-tier model
+  table, troubleshooting); `.env.example` updated; 55 new tests including
+  real-socket failover/whisper contract fixtures.
+
+---
+
 # ClipAI — GPU-first LLM stages: fit translation to VRAM, trim summary chunks, batch the recovery loop
 
 Follow-up to the quality-neutral speed pass, targeting the stages that actually

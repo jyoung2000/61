@@ -1595,6 +1595,32 @@ async def serve_cloud_storage_doc(doc_name: str):
     return Response(content=html, media_type="text/html")
 
 
+@app.get("/docs/remote-gpu.md")
+async def serve_remote_gpu_doc():
+    """Render the remote GPU sharing guide (linked from the Settings page's
+    GPU Companion card). Same hardening as the cloud-storage docs: one
+    fixed file, no user-controlled paths."""
+    doc_path = os.path.join(
+        os.path.dirname(os.path.dirname(__file__)), "docs", "remote-gpu.md")
+    if not os.path.isfile(doc_path):
+        return Response(
+            content=("Doc missing: remote-gpu.md. Rebuild the image with the "
+                     "docs/ directory included."),
+            status_code=404,
+            media_type="text/plain",
+        )
+    try:
+        with open(doc_path, "r", encoding="utf-8") as f:
+            md_text = f.read()
+    except OSError as exc:
+        return Response(content=f"Failed to read remote-gpu.md: {exc}",
+                        status_code=500, media_type="text/plain")
+    return Response(
+        content=_render_markdown_to_html(md_text, "Remote GPU Sharing"),
+        media_type="text/html",
+    )
+
+
 # Serve frontend static files
 static_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static")
 _assets_dir = os.path.join(static_dir, "assets")

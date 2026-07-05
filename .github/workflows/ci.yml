@@ -84,3 +84,14 @@ jobs:
             backend/tests/test_repetition_and_timeline.py \
             backend/tests/test_translation_fail_loud.py \
             backend/tests/test_engine_checkpoint.py
+      - name: Remote GPU sharing tests
+        # Separate invocation: these exercise module-level engine caches and
+        # (in minimal envs) stub cv2, so they get their own process instead
+        # of sharing global state with the fake-injecting tests above.
+        run: |
+          pytest -v \
+            backend/tests/test_ollama_registry.py \
+            backend/tests/test_ollama_hosts_endpoints.py \
+            backend/tests/test_remote_whisper.py \
+            backend/tests/test_companion_register.py \
+            backend/tests/test_companion_downloads.py

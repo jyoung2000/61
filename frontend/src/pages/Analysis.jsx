@@ -3541,8 +3541,8 @@ export default function Analysis() {
           {job.reframe_report && (
             <ReframeGrade report={job.reframe_report} isMobile={isMobile} />
           )}
-          {job.compute_summary && (
-            <ComputeCard summary={job.compute_summary} />
+          {(job.compute_summary || job.stage_locations) && (
+            <ComputeCard summary={job.compute_summary} stageLocations={job.stage_locations} />
           )}
         </div>
       )}

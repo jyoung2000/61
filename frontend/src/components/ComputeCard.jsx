@@ -28,8 +28,13 @@ function isGpu(device) {
   return typeof device === 'string' && device.toLowerCase().startsWith('cuda');
 }
 
+function isRemote(device) {
+  return typeof device === 'string' && device.toLowerCase() === 'remote';
+}
+
 function StageRow({ stage, info }) {
   const gpu = isGpu(info?.device);
+  const remote = isRemote(info?.device);
   const label = STAGE_LABELS[stage] || stage;
   return (
     <div
@@ -53,23 +58,71 @@ function StageRow({ stage, info }) {
       <span style={{
         padding: '2px 10px', borderRadius: 12,
         fontSize: 10, fontWeight: 700, fontFamily: 'var(--font-mono)',
-        background: gpu ? 'rgba(34,197,94,0.15)' : 'rgba(245,158,11,0.15)',
-        color: gpu ? 'var(--success, #22c55e)' : 'var(--accent-amber, #f59e0b)',
-        border: `1px solid ${gpu ? 'rgba(34,197,94,0.35)' : 'rgba(245,158,11,0.35)'}`,
+        background: remote ? 'rgba(34,211,238,0.15)'
+          : gpu ? 'rgba(34,197,94,0.15)' : 'rgba(245,158,11,0.15)',
+        color: remote ? 'var(--accent-cyan, #22d3ee)'
+          : gpu ? 'var(--success, #22c55e)' : 'var(--accent-amber, #f59e0b)',
+        border: `1px solid ${remote ? 'rgba(34,211,238,0.35)'
+          : gpu ? 'rgba(34,197,94,0.35)' : 'rgba(245,158,11,0.35)'}`,
         whiteSpace: 'nowrap',
       }}>
-        {gpu ? `GPU (${info.device})` : 'CPU'}
+        {remote ? 'REMOTE GPU' : gpu ? `GPU (${info.device})` : 'CPU'}
       </span>
     </div>
   );
 }
 
-export default function ComputeCard({ summary }) {
-  if (!summary || typeof summary !== 'object') return null;
-  const stages = STAGE_ORDER.filter((k) => summary[k]);
-  if (stages.length === 0) return null;
+// Remote-GPU-sharing rows: which device/host served each pipeline stage.
+// Values are "remote" / "local_gpu" / "cpu" (transcription) or an Ollama
+// host name (AI stages) — see JobResult.stage_locations.
+function LocationRow({ stage, location }) {
+  const lower = String(location).toLowerCase();
+  const kind = lower === 'remote' ? 'remote'
+    : lower === 'local_gpu' ? 'gpu'
+    : lower === 'cpu' ? 'cpu' : 'host';
+  const badgeText = kind === 'remote' ? 'REMOTE'
+    : kind === 'gpu' ? 'LOCAL GPU'
+    : kind === 'cpu' ? 'CPU' : location;
+  const color = kind === 'remote' || kind === 'host'
+    ? 'var(--accent-cyan, #22d3ee)'
+    : kind === 'gpu' ? 'var(--success, #22c55e)' : 'var(--accent-amber, #f59e0b)';
+  const bg = kind === 'remote' || kind === 'host'
+    ? 'rgba(34,211,238,0.15)'
+    : kind === 'gpu' ? 'rgba(34,197,94,0.15)' : 'rgba(245,158,11,0.15)';
+  return (
+    <div style={{
+      display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+      gap: 12, padding: '6px 0',
+    }}>
+      <span style={{ fontSize: 12, color: 'var(--text-primary)', textTransform: 'capitalize' }}>
+        {String(stage).replace(/[_+]/g, ' ')}
+      </span>
+      <span
+        title={kind === 'host' ? `Served by Ollama host "${location}"` : ''}
+        style={{
+          padding: '2px 10px', borderRadius: 12,
+          fontSize: 10, fontWeight: 700, fontFamily: 'var(--font-mono)',
+          background: bg, color, border: `1px solid ${bg.replace('0.15', '0.35')}`,
+          whiteSpace: 'nowrap', maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis',
+        }}
+      >
+        {badgeText}
+      </span>
+    </div>
+  );
+}
 
-  const anyCpu = stages.some((k) => !isGpu(summary[k]?.device));
+export default function ComputeCard({ summary, stageLocations }) {
+  const hasSummary = summary && typeof summary === 'object';
+  const stages = hasSummary ? STAGE_ORDER.filter((k) => summary[k]) : [];
+  // Stage→location rows (remote GPU sharing) that aren't already covered
+  // by a compute-summary row above (whisper covers "transcription").
+  const locations = Object.entries(stageLocations || {}).filter(
+    ([stage]) => !(stage === 'transcription' && stages.includes('whisper')),
+  );
+  if (stages.length === 0 && locations.length === 0) return null;
+
+  const anyCpu = stages.some((k) => !isGpu(summary[k]?.device) && !isRemote(summary[k]?.device));
 
   return (
     <div style={{
@@ -94,6 +147,9 @@ export default function ComputeCard({ summary }) {
       </div>
       {stages.map((stage) => (
         <StageRow key={stage} stage={stage} info={summary[stage]} />
+      ))}
+      {locations.map(([stage, location]) => (
+        <LocationRow key={`loc-${stage}`} stage={stage} location={location} />
       ))}
     </div>
   );
