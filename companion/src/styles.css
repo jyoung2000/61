@@ -75,6 +75,9 @@ input[type="range"] { accent-color: var(--accent); width: 100%; }
 
 .meter { height: 8px; background: var(--elevated); border-radius: 4px; overflow: hidden; }
 .meter > div { height: 100%; background: var(--accent); transition: width 0.4s; }
+/* Indeterminate progress (install phases with no byte total). */
+.meter.indeterminate > div { width: 35%; border-radius: 4px; transition: none; animation: indet 1.1s ease-in-out infinite; }
+@keyframes indet { 0% { transform: translateX(-120%); } 100% { transform: translateX(340%); } }
 
 .feed { display: flex; flex-direction: column; gap: 6px; max-height: 220px; overflow-y: auto; }
 .feed-item {

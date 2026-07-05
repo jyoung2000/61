@@ -5,11 +5,10 @@
 //! Ollama itself is never bundled or reimplemented: it installs from the
 //! official channels (https://ollama.com/download).
 
-use crate::state::{AppState, OLLAMA_LOCAL};
+use crate::state::{quiet_command, AppState, OLLAMA_LOCAL};
 use serde::Serialize;
 use std::process::Stdio;
 use std::sync::Arc;
-use tokio::process::Command;
 
 #[derive(Serialize, Clone, Default)]
 pub struct OllamaStatus {
@@ -29,7 +28,7 @@ fn ollama_binary() -> &'static str {
 }
 
 pub async fn detect_version() -> Option<String> {
-    let out = Command::new(ollama_binary())
+    let out = quiet_command(ollama_binary())
         .arg("--version")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -86,14 +85,17 @@ pub async fn status(state: &AppState) -> OllamaStatus {
     }
 }
 
-/// One-click install. Windows: winget (official Ollama package).
-/// macOS: Homebrew when present. Returns a human-readable transcript;
-/// the GUI falls back to an "open ollama.com/download" button when this
-/// reports failure.
-pub async fn install() -> Result<String, String> {
+/// One-click install with live progress. Windows: winget (official Ollama
+/// package). macOS: Homebrew when present. `on_line` is called with each
+/// output line so the GUI can show a live status/progress bar. Returns the
+/// transcript; the GUI falls back to an "open ollama.com/download" button
+/// when this reports failure.
+#[allow(unused_variables, unused_mut)]
+pub async fn install_streaming<F: FnMut(&str)>(mut on_line: F) -> Result<String, String> {
     #[cfg(target_os = "windows")]
     {
-        let out = Command::new("winget")
+        on_line("Locating Ollama package (winget)…");
+        let mut child = quiet_command("winget")
             .args([
                 "install",
                 "--id",
@@ -102,45 +104,65 @@ pub async fn install() -> Result<String, String> {
                 "--accept-package-agreements",
                 "--silent",
             ])
-            .output()
-            .await
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .map_err(|e| format!("winget not available: {e}"))?;
-        let text = format!(
-            "{}\n{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        if out.status.success() {
-            return Ok(text);
+        let transcript = stream_lines(&mut child, &mut on_line).await;
+        let status = child.wait().await.map_err(|e| format!("winget wait failed: {e}"))?;
+        if status.success() {
+            return Ok(transcript);
         }
-        return Err(format!("winget install failed:\n{text}"));
+        return Err(format!("winget install failed:\n{transcript}"));
     }
     #[cfg(target_os = "macos")]
     {
-        // brew when available; otherwise the caller opens the download page.
-        let brew = Command::new("brew").arg("--version").output().await;
+        let brew = quiet_command("brew").arg("--version").output().await;
         if brew.map(|o| o.status.success()).unwrap_or(false) {
-            let out = Command::new("brew")
+            on_line("Installing Ollama via Homebrew…");
+            let mut child = quiet_command("brew")
                 .args(["install", "ollama"])
-                .output()
-                .await
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
                 .map_err(|e| format!("brew failed to start: {e}"))?;
-            let text = format!(
-                "{}\n{}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
-            );
-            if out.status.success() {
-                return Ok(text);
+            let transcript = stream_lines(&mut child, &mut on_line).await;
+            let status = child.wait().await.map_err(|e| format!("brew wait failed: {e}"))?;
+            if status.success() {
+                return Ok(transcript);
             }
-            return Err(format!("brew install failed:\n{text}"));
+            return Err(format!("brew install failed:\n{transcript}"));
         }
-        return Err("Homebrew not found — use the download page instead.".into());
+        return Err("Homebrew not found — install from https://ollama.com/download".into());
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
+        let _ = on_line;
         Err("Automated install is only wired for Windows/macOS — see https://ollama.com/download".into())
     }
+}
+
+/// Drain a child's stdout line-by-line, forwarding each to `on_line` and
+/// accumulating a transcript.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+async fn stream_lines<F: FnMut(&str)>(
+    child: &mut tokio::process::Child,
+    on_line: &mut F,
+) -> String {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let mut transcript = String::new();
+    if let Some(stdout) = child.stdout.take() {
+        let mut lines = BufReader::new(stdout).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let t = line.trim();
+            if !t.is_empty() {
+                on_line(t);
+                transcript.push_str(t);
+                transcript.push('\n');
+            }
+        }
+    }
+    transcript
 }
 
 /// GPU-overhead reservation: everything ABOVE the user's budget is held
@@ -167,7 +189,7 @@ pub async fn ensure_running(state: &Arc<AppState>) -> Result<bool, String> {
         "starting managed ollama (keep_alive={keep_alive}, gpu_overhead={} MB)",
         overhead / 1024 / 1024
     );
-    let mut cmd = Command::new(ollama_binary());
+    let mut cmd = quiet_command(ollama_binary());
     cmd.arg("serve")
         .env("OLLAMA_HOST", OLLAMA_LOCAL) // localhost ONLY — proxy is the LAN surface
         .env("OLLAMA_MAX_LOADED_MODELS", "1")
@@ -178,14 +200,11 @@ pub async fn ensure_running(state: &Arc<AppState>) -> Result<bool, String> {
     if overhead > 0 {
         cmd.env("OLLAMA_GPU_OVERHEAD", overhead.to_string());
     }
-    #[cfg(target_os = "windows")]
-    {
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
     let child = cmd
         .spawn()
         .map_err(|e| format!("could not start ollama serve: {e}"))?;
+    // Die with the Companion — no orphaned daemon after quit/kill.
+    crate::state::bind_child_to_lifetime(&child);
     *state.ollama_child.lock().await = Some(child);
 
     // Wait for the daemon to come up (up to ~15 s).

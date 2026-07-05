@@ -2,8 +2,7 @@
 //! Silicon): unified memory via sysctl — free VRAM is not a meaningful
 //! number there, so we degrade gracefully and report totals only.
 
-use crate::state::GpuSnapshot;
-use std::process::Command;
+use crate::state::{quiet_std_command, GpuSnapshot};
 
 #[cfg(target_os = "windows")]
 fn nvidia_smi_candidates() -> Vec<String> {
@@ -22,7 +21,7 @@ fn nvidia_smi_candidates() -> Vec<String> {
 
 fn query_nvidia() -> Option<GpuSnapshot> {
     for bin in nvidia_smi_candidates() {
-        let out = Command::new(&bin)
+        let out = quiet_std_command(&bin)
             .args([
                 "--query-gpu=name,memory.total,memory.free",
                 "--format=csv,noheader,nounits",
@@ -55,19 +54,19 @@ fn query_macos() -> Option<GpuSnapshot> {
     // Apple Silicon: GPU shares unified memory. Report the machine total;
     // "free" is approximated from vm_stat's free+inactive pages and is
     // best-effort (blank when unavailable).
-    let total_bytes: u64 = Command::new("sysctl")
+    let total_bytes: u64 = quiet_std_command("sysctl")
         .args(["-n", "hw.memsize"])
         .output()
         .ok()
         .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())?;
-    let chip = Command::new("sysctl")
+    let chip = quiet_std_command("sysctl")
         .args(["-n", "machdep.cpu.brand_string"])
         .output()
         .ok()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_else(|| "Apple GPU".into());
     let mut free_mb = 0u64;
-    if let Ok(out) = Command::new("vm_stat").output() {
+    if let Ok(out) = quiet_std_command("vm_stat").output() {
         let text = String::from_utf8_lossy(&out.stdout);
         let mut page_size = 16384u64;
         if let Some(first) = text.lines().next() {

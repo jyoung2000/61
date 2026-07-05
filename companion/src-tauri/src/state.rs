@@ -232,6 +232,107 @@ impl AppState {
     }
 }
 
+// ── Process helpers ─────────────────────────────────────────────────
+// The GUI runs with no console (windows_subsystem = "windows"); by default
+// every child process (nvidia-smi, ollama, winget, whisper) would flash its
+// own console window. CREATE_NO_WINDOW suppresses that.
+
+#[cfg(target_os = "windows")]
+pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// A tokio `Command` that never flashes a console window on Windows.
+pub fn quiet_command(program: impl AsRef<std::ffi::OsStr>) -> tokio::process::Command {
+    #[allow(unused_mut)]
+    let mut cmd = tokio::process::Command::new(program);
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd
+}
+
+/// A blocking `std` `Command` that never flashes a console window on Windows
+/// (used for the every-5s nvidia-smi telemetry poll).
+pub fn quiet_std_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    #[allow(unused_mut)]
+    let mut cmd = std::process::Command::new(program);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
+/// Tie a freshly spawned child process to the Companion's lifetime so it is
+/// killed when the Companion exits for ANY reason (quit, crash, or kill).
+/// Windows: assign it to a KILL_ON_JOB_CLOSE job object. Other platforms:
+/// no-op here — graceful shutdown (tray Quit / RunEvent::Exit) stops them.
+pub fn bind_child_to_lifetime(_child: &tokio::process::Child) {
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(handle) = _child.raw_handle() {
+            killjob::assign(handle as isize);
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+mod killjob {
+    //! A process-wide Job Object with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.
+    //! Children assigned to it are terminated automatically when the last
+    //! handle to the job closes — which happens when our process dies, for
+    //! any reason. This guarantees no orphaned `ollama serve` after the
+    //! Companion is killed from Task Manager.
+    use std::sync::OnceLock;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
+        JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    // Stored as isize (HANDLE isn't Send/Sync) — created once, intentionally
+    // never closed: its lifetime IS the process lifetime.
+    static JOB: OnceLock<isize> = OnceLock::new();
+
+    fn job_handle() -> isize {
+        *JOB.get_or_init(|| unsafe {
+            match CreateJobObjectW(None, PCWSTR::null()) {
+                Ok(job) => {
+                    let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+                    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                    let _ = SetInformationJobObject(
+                        job,
+                        JobObjectExtendedLimitInformation,
+                        &info as *const _ as *const core::ffi::c_void,
+                        std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                    );
+                    job.0 as isize
+                }
+                Err(e) => {
+                    log::warn!("could not create kill-on-close job object: {e}");
+                    0
+                }
+            }
+        })
+    }
+
+    pub fn assign(raw_handle: isize) {
+        let job = job_handle();
+        if job == 0 || raw_handle == 0 {
+            return;
+        }
+        unsafe {
+            if let Err(e) = AssignProcessToJobObject(
+                HANDLE(job as *mut core::ffi::c_void),
+                HANDLE(raw_handle as *mut core::ffi::c_void),
+            ) {
+                log::warn!("could not assign child to kill-on-close job: {e}");
+            }
+        }
+    }
+}
+
 /// Whisper model tier for a VRAM budget — mirrored in the dashboard UI.
 /// macOS uses the corresponding whisper.cpp quants (resolved in sidecar.rs).
 pub fn whisper_tier_for_budget(budget_gb: f32) -> (&'static str, &'static str) {

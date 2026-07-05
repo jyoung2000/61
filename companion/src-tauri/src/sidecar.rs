@@ -10,12 +10,12 @@
 //! the first transcription request and exits after a configurable idle
 //! period so an overnight-idle desktop holds no models and near-zero CPU.
 
-use crate::state::{whisper_tier_for_budget, AppState, WHISPER_SIDECAR_PORT};
+use crate::state::{quiet_command, whisper_tier_for_budget, AppState, WHISPER_SIDECAR_PORT};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use tokio::process::{Child, Command};
+use tokio::process::Child;
 
 pub struct SidecarHandle {
     pub child: Child,
@@ -156,7 +156,7 @@ pub async fn ensure_running(
     let _ = std::fs::create_dir_all(&models);
 
     log::info!("starting whisper sidecar: model={model} compute={compute} (budget {budget:.1} GB)");
-    let mut cmd = Command::new(&binary);
+    let mut cmd = quiet_command(&binary);
     if cfg!(target_os = "macos") {
         // whisper.cpp server CLI — weights must exist before launch.
         let model_file = ensure_whispercpp_model(&models, model).await?;
@@ -179,14 +179,11 @@ pub async fn ensure_running(
             .env("HF_HOME", models.to_string_lossy().as_ref());
     }
     cmd.stdout(Stdio::null()).stderr(Stdio::null());
-    #[cfg(target_os = "windows")]
-    {
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
     let child = cmd
         .spawn()
         .map_err(|e| format!("could not start whisper sidecar: {e}"))?;
+    // Die with the Companion — no orphaned sidecar after quit/kill.
+    crate::state::bind_child_to_lifetime(&child);
     *guard = Some(SidecarHandle {
         child,
         model: model.to_string(),

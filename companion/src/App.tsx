@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { listen } from '@tauri-apps/api/event';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { enable as enableAutostart, disable as disableAutostart, isEnabled as autostartEnabled } from '@tauri-apps/plugin-autostart';
 import {
@@ -52,6 +53,22 @@ function TokenBox({ token, onRegenerate }: { token: string; onRegenerate?: () =>
   );
 }
 
+// Determinate or indeterminate progress bar (reuses the .meter styles).
+function ProgressBar({ percent, label, indeterminate }: {
+  percent?: number; label?: string; indeterminate?: boolean;
+}) {
+  const indet = indeterminate || percent == null || percent < 0;
+  const pct = indet ? 100 : Math.max(3, Math.min(100, percent));
+  return (
+    <div style={{ margin: '6px 0' }}>
+      {label && <div className="small muted" style={{ marginBottom: 3 }}>{label}</div>}
+      <div className={`meter${indet ? ' indeterminate' : ''}`}>
+        <div style={indet ? undefined : { width: `${pct}%` }} />
+      </div>
+    </div>
+  );
+}
+
 // ── First-run wizard ─────────────────────────────────────────────────
 
 function Wizard({ status, refresh, onDone }: {
@@ -60,7 +77,9 @@ function Wizard({ status, refresh, onDone }: {
   const [step, setStep] = useState(0);
   const [installing, setInstalling] = useState(false);
   const [installError, setInstallError] = useState('');
+  const [installMsg, setInstallMsg] = useState('');
   const [pulling, setPulling] = useState<Record<string, 'pulling' | 'done' | 'error'>>({});
+  const [pullProg, setPullProg] = useState<Record<string, { percent: number; status: string }>>({});
   const [clipaiUrl, setClipaiUrl] = useState('');
   const [apiKey, setApiKey] = useState('');
   const [pairBusy, setPairBusy] = useState(false);
@@ -69,6 +88,18 @@ function Wizard({ status, refresh, onDone }: {
 
   const steps = ['Welcome', 'Ollama', 'Models', 'Access token', 'Connect', 'Done'];
   const ollamaReady = status.ollama.running;
+
+  // Live progress from the backend (install transcript + model-pull bytes).
+  useEffect(() => {
+    const unInstall = listen<{ stage: string; message: string }>(
+      'install-progress', (e) => setInstallMsg(e.payload.message || ''));
+    const unPull = listen<{ model: string; status: string; percent: number }>(
+      'pull-progress', (e) => {
+        const { model, status: st, percent } = e.payload;
+        setPullProg((p) => ({ ...p, [model]: { percent, status: st } }));
+      });
+    return () => { unInstall.then((f) => f()); unPull.then((f) => f()); };
+  }, []);
 
   const doInstall = async () => {
     setInstalling(true);
@@ -89,6 +120,7 @@ function Wizard({ status, refresh, onDone }: {
     try {
       await pullModel(model);
       setPulling((p) => ({ ...p, [model]: 'done' }));
+      refresh();
     } catch {
       setPulling((p) => ({ ...p, [model]: 'error' }));
     }
@@ -107,6 +139,28 @@ function Wizard({ status, refresh, onDone }: {
       setPairBusy(false);
     }
   };
+
+  // Hands-off setup: auto-install Ollama when its step opens, and auto-pull
+  // the recommended models once Ollama is up — no clicks required. Manual
+  // buttons remain as a fallback.
+  const autoInstallTried = useRef(false);
+  useEffect(() => {
+    if (step === 1 && !ollamaReady && !installing && !autoInstallTried.current) {
+      autoInstallTried.current = true;
+      doInstall();
+    }
+  }, [step, ollamaReady, installing]);
+
+  const autoPullTried = useRef(false);
+  useEffect(() => {
+    if (step === 2 && ollamaReady && !autoPullTried.current) {
+      autoPullTried.current = true;
+      status.recommended_models.forEach(({ model }) => {
+        const have = status.ollama.models.some((m) => m.startsWith(model.split(':')[0]));
+        if (!have && pulling[model] !== 'pulling') doPull(model);
+      });
+    }
+  }, [step, ollamaReady]);
 
   return (
     <div className="wizard">
@@ -138,12 +192,15 @@ function Wizard({ status, refresh, onDone }: {
           ) : (
             <>
               <p className="muted">
-                Ollama runs the vision/text models locally. It isn't installed (or isn't
-                running) yet — install it with one click, or grab it from ollama.com.
+                Ollama runs the vision/text models locally. Installing it automatically —
+                this can take a couple of minutes. No action needed.
               </p>
+              {installing && (
+                <ProgressBar indeterminate label={installMsg || 'Installing Ollama…'} />
+              )}
               <div className="row">
                 <button onClick={doInstall} disabled={installing}>
-                  {installing ? 'Installing…' : 'Install Ollama'}
+                  {installing ? 'Installing…' : installError ? 'Retry install' : 'Install Ollama'}
                 </button>
                 <button className="secondary" onClick={() => openUrl('https://ollama.com/download')}>
                   Open ollama.com/download
@@ -152,7 +209,12 @@ function Wizard({ status, refresh, onDone }: {
                   Re-detect
                 </button>
               </div>
-              {installError && <p className="small" style={{ color: 'var(--danger)' }}>{installError}</p>}
+              {installError && (
+                <p className="small" style={{ color: 'var(--danger)' }}>
+                  Automatic install failed: {installError} — click “Open ollama.com/download”,
+                  install it, then “Re-detect”.
+                </p>
+              )}
             </>
           )}
           <div className="row" style={{ marginTop: 10 }}>
@@ -166,29 +228,50 @@ function Wizard({ status, refresh, onDone }: {
         <div className="panel">
           <h2>Recommended models</h2>
           <p className="muted">
-            Sized for your {fmtMb(status.gpu.vram_total_mb)} of GPU memory. Downloads run
-            in Ollama; you can add more later.
+            Sized for your {fmtMb(status.gpu.vram_total_mb)} of GPU memory. Downloading
+            these automatically — they're multi-GB, so this can take a while.
           </p>
           {status.recommended_models.map(({ model, why }) => {
             const installed = status.ollama.models.some((m) => m.startsWith(model.split(':')[0]));
             const st = pulling[model];
+            const prog = pullProg[model];
             return (
-              <div className="row spread" key={model} style={{ marginBottom: 6 }}>
-                <div>
-                  <span className="mono">{model}</span>
-                  <span className="muted" style={{ marginLeft: 8 }}>{why}</span>
+              <div key={model} style={{ marginBottom: 8 }}>
+                <div className="row spread">
+                  <div>
+                    <span className="mono">{model}</span>
+                    <span className="muted" style={{ marginLeft: 8 }}>{why}</span>
+                  </div>
+                  {installed || st === 'done' ? (
+                    <span className="badge live">Installed</span>
+                  ) : (
+                    <button className="secondary" disabled={st === 'pulling' || !ollamaReady}
+                      onClick={() => doPull(model)}>
+                      {st === 'pulling' ? 'Downloading…' : st === 'error' ? 'Retry' : 'Pull'}
+                    </button>
+                  )}
                 </div>
-                {installed || st === 'done' ? (
-                  <span className="badge live">Installed</span>
-                ) : (
-                  <button className="secondary" disabled={st === 'pulling' || !ollamaReady}
-                    onClick={() => doPull(model)}>
-                    {st === 'pulling' ? 'Pulling…' : st === 'error' ? 'Retry' : 'Pull'}
-                  </button>
+                {st === 'pulling' && (
+                  <ProgressBar
+                    percent={prog?.percent}
+                    label={prog
+                      ? `${prog.status}${prog.percent >= 0 ? ` — ${Math.round(prog.percent)}%` : ''}`
+                      : 'starting…'}
+                  />
+                )}
+                {st === 'error' && (
+                  <p className="small" style={{ color: 'var(--danger)' }}>
+                    Download failed — click Retry.
+                  </p>
                 )}
               </div>
             );
           })}
+          {!ollamaReady && (
+            <p className="small" style={{ color: 'var(--warn)' }}>
+              Ollama isn't running yet — go back a step so models can download.
+            </p>
+          )}
           <button style={{ marginTop: 8 }} onClick={() => setStep(3)}>Continue</button>
         </div>
       )}

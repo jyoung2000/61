@@ -61,11 +61,11 @@ fn init_diagnostics() -> std::path::PathBuf {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    // Truncate on each launch so a pasted log is just the latest run.
+    // Append (don't truncate): a blocked second instance must not wipe the
+    // running instance's log. Each launch writes a "starting" separator.
     let file = std::fs::OpenOptions::new()
         .create(true)
-        .write(true)
-        .truncate(true)
+        .append(true)
         .open(&path)
         .ok();
     let mut builder =
@@ -208,8 +208,30 @@ fn regenerate_token(state: tauri::State<'_, SharedState>) -> String {
 }
 
 #[tauri::command]
-async fn install_ollama() -> Result<String, String> {
-    ollama::install().await
+async fn install_ollama(app: tauri::AppHandle) -> Result<String, String> {
+    let progress = app.clone();
+    let result = ollama::install_streaming(move |line| {
+        let _ = progress.emit(
+            "install-progress",
+            serde_json::json!({"stage": "installing", "message": line}),
+        );
+    })
+    .await;
+    match &result {
+        Ok(_) => {
+            let _ = app.emit(
+                "install-progress",
+                serde_json::json!({"stage": "done", "message": "Ollama installed"}),
+            );
+        }
+        Err(e) => {
+            let _ = app.emit(
+                "install-progress",
+                serde_json::json!({"stage": "error", "message": e}),
+            );
+        }
+    }
+    result
 }
 
 #[tauri::command]
@@ -218,11 +240,13 @@ async fn start_ollama(state: tauri::State<'_, SharedState>) -> Result<bool, Stri
 }
 
 #[tauri::command]
-async fn pull_model(model: String) -> Result<(), String> {
-    // Stream the pull so the request survives multi-GB downloads.
+async fn pull_model(app: tauri::AppHandle, model: String) -> Result<(), String> {
+    // Stream the pull so the request survives multi-GB downloads AND so we can
+    // relay real byte-level progress to the UI's progress bar. Ollama's
+    // /api/pull emits NDJSON lines: {status, digest?, total?, completed?}.
     let resp = reqwest::Client::new()
         .post(format!("http://{}/api/pull", state::OLLAMA_LOCAL))
-        .json(&serde_json::json!({"name": model}))
+        .json(&serde_json::json!({"name": model, "stream": true}))
         .timeout(std::time::Duration::from_secs(3600))
         .send()
         .await
@@ -232,9 +256,43 @@ async fn pull_model(model: String) -> Result<(), String> {
     }
     use futures_util::StreamExt;
     let mut stream = resp.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
     while let Some(chunk) = stream.next().await {
-        chunk.map_err(|e| format!("pull interrupted: {e}"))?;
+        let chunk = chunk.map_err(|e| format!("pull interrupted: {e}"))?;
+        buf.extend_from_slice(&chunk);
+        while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = buf.drain(..=nl).collect();
+            let line = &line[..line.len().saturating_sub(1)];
+            if line.is_empty() {
+                continue;
+            }
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) {
+                if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
+                    return Err(format!("pull error: {err}"));
+                }
+                let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("");
+                let total = v.get("total").and_then(|t| t.as_u64()).unwrap_or(0);
+                let completed = v.get("completed").and_then(|c| c.as_u64()).unwrap_or(0);
+                // -1 = indeterminate (manifest/verify phases have no byte total).
+                let percent = if total > 0 {
+                    completed as f64 / total as f64 * 100.0
+                } else {
+                    -1.0
+                };
+                let _ = app.emit(
+                    "pull-progress",
+                    serde_json::json!({
+                        "model": &model, "status": status,
+                        "percent": percent, "completed": completed, "total": total,
+                    }),
+                );
+            }
+        }
     }
+    let _ = app.emit(
+        "pull-progress",
+        serde_json::json!({"model": &model, "status": "success", "percent": 100.0}),
+    );
     Ok(())
 }
 
@@ -317,6 +375,16 @@ pub fn run() {
     log::info!("log file: {}", log_path.display());
 
     let builder = tauri::Builder::default()
+        // Single instance MUST be the first plugin: a second launch focuses
+        // the running window and exits instead of starting a duplicate.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            log::info!("second instance launched — focusing the existing window");
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.show();
+                let _ = w.unminimize();
+                let _ = w.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
@@ -448,13 +516,30 @@ pub fn run() {
             pair_clipai,
         ]);
 
-    // Log (don't silently .expect()) any failure to start the Tauri runtime
-    // — e.g. a missing WebView2 runtime — so the crash log explains the exit.
-    if let Err(e) = builder.run(tauri::generate_context!()) {
-        let msg = format!("tauri runtime failed to start / run: {e:?}");
-        log::error!("{msg}");
-        append_crash(&msg);
-        std::process::exit(1);
+    // Build first (so a build failure — e.g. missing WebView2 — is logged, not
+    // a silent .expect()), then run with an exit handler that stops the managed
+    // Ollama + whisper children on the way out. On Windows the kill-on-close job
+    // object also guarantees this even on a hard kill; this covers clean quits
+    // and other platforms.
+    match builder.build(tauri::generate_context!()) {
+        Ok(app) => app.run(|handle, event| {
+            if let tauri::RunEvent::Exit = event {
+                if let Some(state) = handle.try_state::<SharedState>() {
+                    let state = state.inner().clone();
+                    tauri::async_runtime::block_on(async move {
+                        sidecar::shutdown(&state).await;
+                        ollama::shutdown(&state).await;
+                    });
+                    log::info!("shutdown: stopped managed ollama + whisper sidecar");
+                }
+            }
+        }),
+        Err(e) => {
+            let msg = format!("tauri runtime failed to build/start: {e:?}");
+            log::error!("{msg}");
+            append_crash(&msg);
+            std::process::exit(1);
+        }
     }
     log::info!("app exited");
 }
