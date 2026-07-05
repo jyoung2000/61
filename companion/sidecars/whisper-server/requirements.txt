@@ -1,0 +1,13 @@
+# Windows/NVIDIA whisper sidecar — Python 3.11, CUDA 12.x + cuDNN 9.
+#
+# ctranslate2 >= 4.5 ships CUDA 12 / cuDNN 9 wheels; faster-whisper 1.1
+# is the matching release. Pin both so a resolver bump can't silently
+# pair a cuDNN-8 ctranslate2 with a cuDNN-9 driver stack (the classic
+# "cudnn_ops64_9.dll not found" failure).
+faster-whisper==1.1.0
+ctranslate2==4.5.0
+fastapi==0.111.0
+uvicorn==0.30.0
+python-multipart>=0.0.18
+# PyInstaller is a build-time dependency (see whisper-server.spec).
+pyinstaller==6.11.1

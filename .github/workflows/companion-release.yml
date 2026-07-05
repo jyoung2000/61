@@ -1,0 +1,182 @@
+# Build + release the ClipAI GPU Companion installers.
+#
+# Trigger: push a tag like `companion-v0.1.0`. Artifacts:
+#   * Windows x64: NSIS .exe wizard installer + .msi
+#   * macOS universal (aarch64 + x86_64): .dmg with drag-to-Applications
+#   * manifest.json (version, per-file name/size/sha256) — consumed by the
+#     ClipAI container's Settings download card (backend/routers/downloads.py)
+#
+# NOTE ON SIGNING: builds are UNSIGNED by default. macOS users must
+# right-click → Open on first launch (or `xattr -dr com.apple.quarantine
+# "/Applications/ClipAI GPU Companion.app"`). To sign, uncomment the
+# signing env blocks below and add the certificates as repo secrets.
+name: companion-release
+
+on:
+  push:
+    tags:
+      - "companion-v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            args: ""
+          - platform: macos-latest
+            # Universal binary: Apple Silicon + Intel in one .dmg.
+            args: "--target universal-apple-darwin"
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: companion/src-tauri
+
+      # ── Windows: build the faster-whisper sidecar (PyInstaller) ──────
+      - uses: actions/setup-python@v5
+        if: matrix.platform == 'windows-latest'
+        with:
+          python-version: "3.11"
+
+      - name: Build whisper sidecar (Windows)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        working-directory: companion/sidecars/whisper-server
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pyinstaller whisper-server.spec
+          New-Item -ItemType Directory -Force ..\..\src-tauri\sidecar | Out-Null
+          Copy-Item -Recurse -Force dist\whisper-server\* ..\..\src-tauri\sidecar\
+
+      # ── macOS: fetch whisper.cpp server (Metal) ──────────────────────
+      - name: Build whisper.cpp server (macOS)
+        if: matrix.platform == 'macos-latest'
+        working-directory: companion
+        run: |
+          git clone --depth 1 --branch v1.7.4 https://github.com/ggerganov/whisper.cpp
+          cmake -S whisper.cpp -B whisper.cpp/build -DGGML_METAL=ON -DWHISPER_BUILD_EXAMPLES=ON
+          cmake --build whisper.cpp/build --config Release -j 3 --target whisper-server
+          mkdir -p src-tauri/sidecar
+          cp whisper.cpp/build/bin/whisper-server src-tauri/sidecar/
+          # Metal shader lib must sit next to the binary.
+          cp whisper.cpp/build/src/libwhisper*.dylib src-tauri/sidecar/ 2>/dev/null || true
+          cp whisper.cpp/ggml/src/ggml-metal/ggml-metal.metal src-tauri/sidecar/ 2>/dev/null || true
+
+      - name: Install frontend dependencies
+        working-directory: companion
+        run: npm install --no-audit --no-fund
+
+      - name: Generate icons
+        working-directory: companion
+        run: npx tauri icon app-icon.png
+
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # ── Code signing (disabled by default) ──
+          # Windows:
+          # WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          # WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          # macOS:
+          # APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          # APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          # APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          # APPLE_ID: ${{ secrets.APPLE_ID }}
+          # APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          # APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          projectPath: companion
+          tagName: ${{ github.ref_name }}
+          releaseName: "ClipAI GPU Companion ${{ github.ref_name }}"
+          releaseBody: |
+            ClipAI GPU Companion — share a desktop GPU (Ollama + Whisper) with your ClipAI server.
+
+            **Windows**: run the `.exe` installer (NSIS wizard) or the `.msi`.
+            **macOS**: open the `.dmg` and drag to Applications. Unsigned build —
+            right-click the app → Open on first launch, or run
+            `xattr -dr com.apple.quarantine "/Applications/ClipAI GPU Companion.app"`.
+
+            After installing: open the Companion, follow the setup wizard, and paste
+            your ClipAI URL + API key to pair.
+          releaseDraft: false
+          prerelease: false
+          args: ${{ matrix.args }}
+
+  manifest:
+    name: Publish manifest.json
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build + upload manifest of release assets
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const crypto = require('crypto');
+            const tag = context.ref.replace('refs/tags/', '');
+            const release = await github.rest.repos.getReleaseByTag({
+              owner: context.repo.owner, repo: context.repo.repo, tag,
+            });
+            const platforms = {};
+            for (const asset of release.data.assets) {
+              const n = asset.name.toLowerCase();
+              let platform = null;
+              if (n.endsWith('.exe')) platform = 'windows';
+              else if (n.endsWith('.msi')) platform = 'windows_msi';
+              else if (n.endsWith('.dmg')) platform = 'mac';
+              if (!platform) continue;
+              const dl = await github.request(
+                'GET /repos/{owner}/{repo}/releases/assets/{asset_id}', {
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  asset_id: asset.id,
+                  headers: { accept: 'application/octet-stream' },
+                });
+              const sha256 = crypto.createHash('sha256')
+                .update(Buffer.from(dl.data)).digest('hex');
+              platforms[platform] = {
+                filename: asset.name,
+                size: asset.size,
+                sha256,
+                url: asset.browser_download_url,
+              };
+            }
+            const manifest = {
+              version: tag.replace(/^companion-v/, ''),
+              tag,
+              published_at: release.data.published_at,
+              platforms,
+            };
+            const body = JSON.stringify(manifest, null, 2);
+            // Replace any stale manifest from a re-run.
+            const stale = release.data.assets.find(a => a.name === 'manifest.json');
+            if (stale) {
+              await github.rest.repos.deleteReleaseAsset({
+                owner: context.repo.owner, repo: context.repo.repo,
+                asset_id: stale.id,
+              });
+            }
+            await github.rest.repos.uploadReleaseAsset({
+              owner: context.repo.owner, repo: context.repo.repo,
+              release_id: release.data.id,
+              name: 'manifest.json',
+              data: body,
+              headers: { 'content-type': 'application/json' },
+            });
+            core.info(`manifest.json uploaded:\n${body}`);

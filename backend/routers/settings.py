@@ -2857,6 +2857,95 @@ async def test_ollama_host(req: TestOllamaHostRequest):
     }
 
 
+# ── GPU Companion pairing ────────────────────────────────────────
+
+
+class CompanionRegisterRequest(BaseModel):
+    """Sent by the GPU Companion's "Connect to ClipAI" screen."""
+    name: str = "GPU Companion"
+    # Full proxy base URL as reachable FROM the ClipAI server, e.g.
+    # http://192.168.1.50:11500 — the Companion detects its own LAN IP.
+    url: str
+    token: str = ""
+    gpu_name: str = ""
+    vram_total_mb: int = 0
+    version: str = ""
+    # Register the Companion's whisper endpoint too (default on).
+    register_whisper: bool = True
+
+
+from fastapi import Depends as _Depends  # noqa: E402
+from backend.auth import verify_api_key as _verify_api_key  # noqa: E402
+
+
+@router.post("/settings/companion-register")
+async def companion_register(req: CompanionRegisterRequest,
+                             _key: str = _Depends(_verify_api_key)):
+    """Pair a GPU Companion: add its Ollama proxy to the registry AS PRIMARY
+    and point remote Whisper at it. Authenticated with the ClipAI API key
+    (the same key /api/v1/* uses) — the user pastes it into the Companion.
+
+    Idempotent: re-pairing the same URL updates the existing entry (and
+    re-promotes it to primary) instead of duplicating it.
+    """
+    from backend.services import ollama_registry
+    base = (req.url or "").strip().rstrip("/")
+    if not base:
+        raise HTTPException(status_code=400, detail="url is required")
+    if "://" not in base:
+        base = f"http://{base}"
+    ollama_url = f"{base}/ollama"
+
+    hosts = ollama_registry.get_hosts()
+    existing = next((h for h in hosts if h.url == ollama_url), None)
+    if existing is not None:
+        hosts.remove(existing)
+        existing.name = (req.name or existing.name).strip() or existing.name
+        if req.token:
+            existing.token = req.token
+        existing.enabled = True
+        entry = existing
+    else:
+        import uuid as _uuid
+        entry = ollama_registry.OllamaHost(
+            id=_uuid.uuid4().hex[:8],
+            name=(req.name or "GPU Companion").strip(),
+            url=ollama_url,
+            token=req.token or "",
+            enabled=True,
+        )
+    hosts.insert(0, entry)  # Companion becomes the PRIMARY
+    ollama_registry.save_hosts(hosts)
+
+    whisper_registered = False
+    if req.register_whisper:
+        settings.WHISPER_REMOTE_URL = base
+        if req.token:
+            settings.WHISPER_REMOTE_API_KEY = req.token
+        whisper_registered = True
+        try:
+            from backend.services import reframer_audio as _ra
+            _ra._REMOTE_HEALTH_CACHE.update({"checked_at": 0.0, "url": ""})
+        except Exception:
+            pass
+
+    _persist_user_settings()
+    _invalidate_status_cache()
+    logger.info(
+        "GPU Companion paired: '%s' (%s, gpu=%s, %d MB) — registered as "
+        "primary Ollama host%s",
+        entry.name, base, req.gpu_name or "?", req.vram_total_mb,
+        " + remote Whisper" if whisper_registered else "",
+    )
+    return {
+        "status": "paired",
+        "ollama_host": {"id": entry.id, "name": entry.name, "url": entry.url,
+                        "role": "primary"},
+        "whisper_remote_url": settings.WHISPER_REMOTE_URL if whisper_registered else "",
+        "hosts": await ollama_registry.registry_status(force=True),
+    }
+
+
 # ── Remote Whisper (OpenAI-compatible transcription server) ──────
 
 

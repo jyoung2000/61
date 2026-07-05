@@ -30,3 +30,16 @@ backend/services/VideoLLaMA2/
 # runs outside Docker (tests, local CLI). In Docker the logger
 # propagates to /data/logs/app.log instead so these don't accumulate.
 backend/services/logs/
+
+# ── GPU Companion (companion/) build artifacts ──
+# No binaries in git: installers live in GitHub Releases + Docker layers.
+companion/src-tauri/target/
+companion/src-tauri/gen/
+companion/src-tauri/sidecar/*
+!companion/src-tauri/sidecar/README.md
+companion/dist/
+companion/whisper.cpp/
+companion/sidecars/whisper-server/build/
+companion/sidecars/whisper-server/dist/
+# Installers baked into the ClipAI image at Docker build time.
+static/companion/
