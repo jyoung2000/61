@@ -28,10 +28,14 @@ jobs:
       matrix:
         include:
           - platform: windows-latest
-            args: ""
+            # Explicit bundles so the shared tauri.conf.json target list can
+            # never ask Windows for a .dmg (or macOS for NSIS).
+            args: "--bundles nsis,msi"
           - platform: macos-latest
-            # Universal binary: Apple Silicon + Intel in one .dmg.
-            args: "--target universal-apple-darwin"
+            # Universal app binary: Apple Silicon + Intel in one .dmg. (The
+            # whisper.cpp sidecar is built for the runner's arch — arm64 —
+            # which matches the Apple Silicon target audience.)
+            args: "--target universal-apple-darwin --bundles dmg"
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
@@ -71,13 +75,21 @@ jobs:
         working-directory: companion
         run: |
           git clone --depth 1 --branch v1.7.4 https://github.com/ggerganov/whisper.cpp
-          cmake -S whisper.cpp -B whisper.cpp/build -DGGML_METAL=ON -DWHISPER_BUILD_EXAMPLES=ON
-          cmake --build whisper.cpp/build --config Release -j 3 --target whisper-server
+          # Static libs + embedded Metal shader → one self-contained binary,
+          # no dylib/.metal files to ship alongside it.
+          cmake -S whisper.cpp -B whisper.cpp/build \
+            -DGGML_METAL=ON \
+            -DGGML_METAL_EMBED_LIBRARY=ON \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DWHISPER_BUILD_EXAMPLES=ON \
+            -DWHISPER_BUILD_TESTS=OFF
+          cmake --build whisper.cpp/build --config Release -j 3
           mkdir -p src-tauri/sidecar
-          cp whisper.cpp/build/bin/whisper-server src-tauri/sidecar/
-          # Metal shader lib must sit next to the binary.
-          cp whisper.cpp/build/src/libwhisper*.dylib src-tauri/sidecar/ 2>/dev/null || true
-          cp whisper.cpp/ggml/src/ggml-metal/ggml-metal.metal src-tauri/sidecar/ 2>/dev/null || true
+          # Binary name changed across whisper.cpp releases — accept either.
+          cp whisper.cpp/build/bin/whisper-server src-tauri/sidecar/whisper-server \
+            || cp whisper.cpp/build/bin/server src-tauri/sidecar/whisper-server
+          chmod +x src-tauri/sidecar/whisper-server
+          ./src-tauri/sidecar/whisper-server --help | head -5 || true
 
       - name: Install frontend dependencies
         working-directory: companion

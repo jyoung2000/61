@@ -41,6 +41,14 @@ export default function CompanionDownloadCard({ isMobile = false }) {
   };
   useEffect(load, []);
 
+  // While a cache refresh is downloading installers, keep polling so the
+  // buttons flip from "From GitHub" to "Hosted by this server" on finish.
+  useEffect(() => {
+    if (!manifest?.refresh?.active) return undefined;
+    const t = setInterval(load, 3000);
+    return () => clearInterval(t);
+  }, [manifest?.refresh?.active]);
+
   const checkUpdates = async () => {
     setRefreshing(true);
     try {

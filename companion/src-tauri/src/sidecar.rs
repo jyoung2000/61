@@ -58,6 +58,55 @@ fn whispercpp_model_file(model: &str) -> String {
     }
 }
 
+/// whisper.cpp has no on-demand model download (unlike faster-whisper) —
+/// fetch the GGML weights from the official Hugging Face mirror on first
+/// use. Streams to a `.part` file and renames atomically so a killed
+/// download never leaves a truncated model in place.
+async fn ensure_whispercpp_model(
+    models_dir: &std::path::Path,
+    model: &str,
+) -> Result<PathBuf, String> {
+    let file = whispercpp_model_file(model);
+    let dest = models_dir.join(&file);
+    if dest.exists() {
+        return Ok(dest);
+    }
+    let url = format!("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/{file}");
+    log::info!("downloading whisper.cpp model {file} (first use) from {url}");
+    let part = models_dir.join(format!("{file}.part"));
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3600))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("model download failed to start: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("model download failed: HTTP {}", resp.status()));
+    }
+    let mut out = tokio::fs::File::create(&part)
+        .await
+        .map_err(|e| format!("could not create {}: {e}", part.display()))?;
+    let mut stream = resp.bytes_stream();
+    use futures_util::StreamExt;
+    use tokio::io::AsyncWriteExt;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("model download interrupted: {e}"))?;
+        out.write_all(&chunk)
+            .await
+            .map_err(|e| format!("model write failed: {e}"))?;
+    }
+    out.flush().await.map_err(|e| e.to_string())?;
+    drop(out);
+    tokio::fs::rename(&part, &dest)
+        .await
+        .map_err(|e| format!("could not finalize model file: {e}"))?;
+    log::info!("whisper.cpp model ready: {}", dest.display());
+    Ok(dest)
+}
+
 pub async fn healthy() -> bool {
     reqwest::Client::new()
         .get(format!("{}/health", sidecar_url()))
@@ -101,8 +150,8 @@ pub async fn ensure_running(
     log::info!("starting whisper sidecar: model={model} compute={compute} (budget {budget:.1} GB)");
     let mut cmd = Command::new(&binary);
     if cfg!(target_os = "macos") {
-        // whisper.cpp server CLI.
-        let model_file = models.join(whispercpp_model_file(model));
+        // whisper.cpp server CLI — weights must exist before launch.
+        let model_file = ensure_whispercpp_model(&models, model).await?;
         cmd.args([
             "--host",
             "127.0.0.1",

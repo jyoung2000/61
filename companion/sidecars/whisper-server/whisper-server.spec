@@ -11,8 +11,18 @@
 
 from PyInstaller.utils.hooks import collect_dynamic_libs, collect_data_files
 
-binaries = collect_dynamic_libs("ctranslate2")
-datas = collect_data_files("faster_whisper")
+# ctranslate2 ships the CUDA/cuDNN DLLs; av (PyAV) decodes the uploaded
+# audio; onnxruntime runs faster-whisper's Silero VAD. Missing any of
+# these makes the frozen exe die at import time on a clean machine.
+binaries = (
+    collect_dynamic_libs("ctranslate2")
+    + collect_dynamic_libs("av")
+    + collect_dynamic_libs("onnxruntime")
+)
+datas = (
+    collect_data_files("faster_whisper")
+    + collect_data_files("onnxruntime")
+)
 
 a = Analysis(
     ["server.py"],
@@ -22,6 +32,10 @@ a = Analysis(
     hiddenimports=[
         "faster_whisper",
         "ctranslate2",
+        "av",
+        "onnxruntime",
+        "tokenizers",
+        "huggingface_hub",
         "uvicorn.logging",
         "uvicorn.loops.auto",
         "uvicorn.protocols.http.auto",
