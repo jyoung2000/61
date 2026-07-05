@@ -16,10 +16,21 @@ on:
   push:
     tags:
       - "companion-v*"
+  # Manual runs: creating the GitHub Release below also creates the tag at
+  # this run's commit, so environments that can't push tags directly (e.g.
+  # remote sessions restricted to one branch) can still cut a release.
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (companion-vX.Y.Z)"
+        required: true
+        default: "companion-v0.1.0"
 
 permissions:
   contents: write
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
 
 jobs:
   build:
@@ -116,8 +127,8 @@ jobs:
           # APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           projectPath: companion
-          tagName: ${{ github.ref_name }}
-          releaseName: "ClipAI GPU Companion ${{ github.ref_name }}"
+          tagName: ${{ env.RELEASE_TAG }}
+          releaseName: "ClipAI GPU Companion ${{ env.RELEASE_TAG }}"
           releaseBody: |
             ClipAI GPU Companion — share a desktop GPU (Ollama + Whisper) with your ClipAI server.
 
@@ -139,10 +150,12 @@ jobs:
     steps:
       - name: Build + upload manifest of release assets
         uses: actions/github-script@v7
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
         with:
           script: |
             const crypto = require('crypto');
-            const tag = context.ref.replace('refs/tags/', '');
+            const tag = process.env.RELEASE_TAG;
             const release = await github.rest.repos.getReleaseByTag({
               owner: context.repo.owner, repo: context.repo.repo, tag,
             });
