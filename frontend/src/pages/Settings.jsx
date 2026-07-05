@@ -96,6 +96,8 @@ export default function Settings() {
     whisper_downgraded: false,
   });
   const [modelsSaving, setModelsSaving] = useState(false);
+  // Live sync-to-Companion progress after a Save (per-model download %).
+  const [companionSync, setCompanionSync] = useState(null);
   const [modelsLoading, setModelsLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [pulling, setPulling] = useState(false);
@@ -786,6 +788,17 @@ export default function Settings() {
         // Now reload available models — the server now knows Ollama is primary
         await loadAvailableModels();
         showToast('Models saved successfully', 'success');
+        // If any saved pick is a local Ollama model, the backend just started
+        // downloading it to the active host (the Companion when paired) — show
+        // the live sync progress. Fire-and-forget so the button re-enables.
+        const syncedOllama = [
+          pendingModels.primary_model, pendingModels.editorial_model,
+          pendingModels.translation_model,
+        ].some((m) => (m || '').startsWith('ollama/'));
+        if (syncedOllama) {
+          setCompanionSync({ active: true, models: [], done: [], failed: [], progress: {}, target: {} });
+          pollSyncStatus();
+        }
       }
     } catch {
       showToast('Failed to save models', 'error');
@@ -880,6 +893,36 @@ export default function Settings() {
   // Pull the configured local (Ollama) models — primary, editorial, and the
   // translation default (e.g. qwen3:4b-instruct-2507-q4_K_M) — in the
   // background, polling progress and reloading the pickers as they arrive.
+  // After a Save that includes Ollama models, the backend kicks off a
+  // background pull to the active host (the Companion when paired). Poll the
+  // pull-status so the user sees per-model download progress and a "ready"
+  // toast naming the GPU it landed on.
+  const pollSyncStatus = async () => {
+    let active = true, guard = 0, last = null;
+    while (active && guard < 900) {  // ~30 min ceiling at 2s/tick
+      guard += 1;
+      let st;
+      try {
+        const r = await fetch('/api/providers/ollama/pull-status');
+        st = r.ok ? await r.json() : null;
+      } catch { st = null; }
+      if (!st) break;
+      last = st;
+      setCompanionSync(st);
+      active = !!st.active;
+      if (active) await new Promise((r) => setTimeout(r, 2000));
+    }
+    await loadAvailableModels().catch(() => {});
+    if (last) {
+      const tgt = last.target || {};
+      const where = tgt.gpu_name || tgt.name || 'the GPU host';
+      const failed = (last.failed || []).length;
+      if (failed) showToast(`${failed} model(s) failed to sync to ${where}`, 'error');
+      else showToast(`Models downloaded to ${where} — ready to use`, 'success');
+    }
+    setTimeout(() => setCompanionSync(null), 8000);
+  };
+
   const handlePullModels = async () => {
     setPulling(true);
     setPullStatus('Starting…');
@@ -2234,6 +2277,68 @@ export default function Settings() {
                   </button>
                 </div>
               </div>
+
+              {/* ── Live sync-to-Companion progress ── */}
+              {companionSync && (() => {
+                const tgt = companionSync.target || {};
+                const where = tgt.gpu_name
+                  ? `${tgt.gpu_name}${tgt.name ? ` · ${tgt.name}` : ''}`
+                  : (tgt.name || 'the Ollama host');
+                const models = companionSync.models || [];
+                const prog = companionSync.progress || {};
+                const done = companionSync.done || [];
+                const failed = companionSync.failed || [];
+                return (
+                  <div style={{
+                    marginTop: 4, marginBottom: 8, padding: '10px 12px',
+                    background: 'var(--bg-elevated)', border: '1px solid var(--border)',
+                    borderRadius: 'var(--radius-sm)',
+                  }}>
+                    <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 6 }}>
+                      {companionSync.active
+                        ? `Downloading models to ${where}…`
+                        : `Sync to ${where} complete`}
+                      {tgt.is_companion && (
+                        <span style={{ fontSize: 10, color: 'var(--accent-cyan)', marginLeft: 6 }}>
+                          GPU Companion
+                        </span>
+                      )}
+                    </div>
+                    {(models.length ? models : done).map((m) => {
+                      const pct = failed.includes(m) ? 0
+                        : done.includes(m) ? 100
+                        : Math.max(0, Math.min(100, prog[m] ?? 0));
+                      const err = failed.includes(m);
+                      return (
+                        <div key={m} style={{ marginBottom: 6 }}>
+                          <div style={{
+                            display: 'flex', justifyContent: 'space-between',
+                            fontSize: 10, fontFamily: 'var(--font-mono)', marginBottom: 2,
+                          }}>
+                            <span style={{ color: 'var(--text-secondary)' }}>{m}</span>
+                            <span style={{
+                              color: err ? 'var(--danger)'
+                                : pct >= 100 ? 'var(--success)' : 'var(--text-muted)',
+                            }}>
+                              {err ? 'failed' : pct >= 100 ? 'ready ✓' : `${Math.round(pct)}%`}
+                            </span>
+                          </div>
+                          <div style={{
+                            height: 5, borderRadius: 3, overflow: 'hidden',
+                            background: 'var(--bg-base)',
+                          }}>
+                            <div style={{
+                              height: '100%', width: `${pct}%`, borderRadius: 3,
+                              background: err ? 'var(--danger)' : 'var(--accent-cyan)',
+                              transition: 'width 0.4s ease',
+                            }} />
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                );
+              })()}
 
             </>
           )}

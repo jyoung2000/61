@@ -57,7 +57,7 @@ export default function ProviderStatus({ collapsed, onActiveChange }) {
           {/* Active model indicator */}
           {active.provider && active.provider !== 'none' && (
             <div
-              title={`T: ${active.transcript_model || 'whisper-small'} | P: ${active.replicate_available ? shortModel(active.replicate_model || 'videollama3-7b') : active.videollama2_available ? 'VideoLLaMA2' : shortModel(active.primary_model || active.vision_model)} | E: ${shortModel(active.editorial_model || active.text_model)}`}
+              title={`T: ${active.transcript_model || 'whisper-small'} | P: ${active.replicate_available ? shortModel(active.replicate_model || 'videollama3-7b') : active.videollama2_available ? 'VideoLLaMA2' : shortModel(active.primary_model || active.vision_model)} | E: ${shortModel(active.editorial_model || active.text_model)}${active.companion ? ` | GPU: ${active.companion.gpu_name || active.companion.name || 'Companion'} (${active.companion.online ? `${active.companion.models_ready}/${active.companion.models_total} ${active.companion.ready ? 'ready' : 'synced'}` : 'offline'})` : active.ollama_host_name ? ` | GPU: ${active.ollama_host_name}` : ''}`}
               style={{
                 width: 20,
                 height: 20,
@@ -148,6 +148,39 @@ export default function ProviderStatus({ collapsed, onActiveChange }) {
                     <span style={{ color: 'var(--text-secondary)' }}>
                       {shortModel(active.editorial_model || active.text_model || active.primary_model)}
                     </span>
+                  </div>
+                )}
+                {/* GPU / host indicator — which GPU serves these models, and
+                    (when a Companion is paired) whether all selected models
+                    are downloaded to it and ready. */}
+                {active.provider === 'ollama' && (active.companion || active.ollama_host_name) && (
+                  <div style={{
+                    fontSize: 9, fontFamily: 'var(--font-mono)', lineHeight: 1.5,
+                    marginTop: 2, paddingTop: 4, borderTop: '1px solid var(--border)',
+                    display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap',
+                  }}>
+                    <span style={{ color: 'var(--text-muted)' }}>gpu:</span>
+                    <span style={{ color: 'var(--text-secondary)' }}>
+                      {active.companion?.gpu_name
+                        ? `${active.companion.gpu_name}${active.companion.name ? ` · ${active.companion.name}` : ''}`
+                        : (active.ollama_host_name || 'local')}
+                    </span>
+                    {active.companion && (
+                      <span style={{
+                        marginLeft: 'auto', fontWeight: 600,
+                        color: active.companion.ready ? 'var(--success)'
+                          : active.companion.online ? 'var(--accent-amber)' : 'var(--danger)',
+                      }}
+                        title={active.companion.missing?.length
+                          ? `Not yet on the Companion: ${active.companion.missing.join(', ')}`
+                          : 'All selected models are downloaded to the Companion'}>
+                        {!active.companion.online
+                          ? '● companion offline'
+                          : active.companion.ready
+                            ? `● ${active.companion.models_ready}/${active.companion.models_total} ready`
+                            : `● ${active.companion.models_ready}/${active.companion.models_total} synced`}
+                      </span>
+                    )}
                   </div>
                 )}
               </div>
