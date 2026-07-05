@@ -17,6 +17,13 @@ Serve order per platform: runtime cache dir (Unraid-persistent, refreshed
 without a rebuild) → baked-in image dir (Dockerfile fetch stage) → 302 to
 GitHub Releases. Downloads pulled by the refresh endpoint are verified
 against the release manifest's sha256 before being served to anyone.
+
+File presence is authoritative: whichever installer FILES are in a
+directory drive the buttons, whether or not a manifest.json describes
+them. This lets a Windows .exe (cross-built by the from-source Docker
+stage) and a macOS .dmg (built natively on a Mac) be dropped into the
+same cache dir independently — neither build has to know about the
+other's manifest, and neither can clobber the other's download.
 """
 from __future__ import annotations
 
@@ -24,6 +31,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import threading
 import time
 from typing import Optional
@@ -53,6 +61,10 @@ _CONTENT_TYPES = {
     ".msi": "application/x-msi",
     ".dmg": "application/x-apple-diskimage",
 }
+# Installer file extension → platform key. File presence alone decides what
+# is offered, so a hand-dropped .dmg (or .exe) is served with no manifest.
+_EXT_PLATFORM = {".exe": "windows", ".msi": "windows_msi", ".dmg": "mac"}
+_VERSION_RE = re.compile(r"[_-](\d+\.\d+\.\d+(?:\.\d+)?)")
 
 _refresh_state = {"active": False, "message": "", "updated": False}
 _github_manifest_cache: dict = {"at": 0.0, "data": None}
@@ -67,17 +79,39 @@ def _read_manifest(directory: str) -> Optional[dict]:
         return None
 
 
-def _local_asset(directory: str, manifest: Optional[dict], platform: str) -> Optional[str]:
-    """Absolute path of a platform's installer inside ``directory`` when both
-    the manifest entry and the file exist."""
-    if not manifest:
-        return None
-    entry = (manifest.get("platforms") or {}).get(platform) or {}
-    filename = entry.get("filename")
-    if not filename:
-        return None
-    path = os.path.join(directory, os.path.basename(filename))
-    return path if os.path.isfile(path) else None
+def _scan_installers(directory: str) -> dict:
+    """Map platform → {filename, size, path} from the installer FILES present in
+    ``directory``. This — not a manifest.json — is the source of truth for what
+    can be served, so independently produced installers coexist in one folder."""
+    found: dict = {}
+    try:
+        names = sorted(os.listdir(directory))
+    except Exception:
+        return found
+    for name in names:
+        ext = os.path.splitext(name)[1].lower()
+        platform = _EXT_PLATFORM.get(ext)
+        if not platform or platform in found:
+            continue
+        path = os.path.join(directory, name)
+        if os.path.isfile(path):
+            found[platform] = {
+                "filename": name,
+                "size": os.path.getsize(path),
+                "path": path,
+            }
+    return found
+
+
+def _local_asset(directory: str, platform: str) -> Optional[str]:
+    """Absolute path of a platform's installer file present in ``directory``."""
+    entry = _scan_installers(directory).get(platform)
+    return entry["path"] if entry else None
+
+
+def _version_from_filename(name: str) -> str:
+    m = _VERSION_RE.search(name)
+    return m.group(1) if m else ""
 
 
 async def _github_latest_manifest(force: bool = False) -> Optional[dict]:
@@ -134,24 +168,35 @@ async def _github_latest_manifest(force: bool = False) -> Optional[dict]:
 
 
 def _merged_view(github: Optional[dict]) -> dict:
-    """One manifest for the UI: newest local source per platform + source tag."""
+    """One manifest for the UI: newest local source per platform + source tag.
+
+    Driven by the installer files present (``_scan_installers``); any
+    manifest.json is consulted only for extra metadata (version, sha256,
+    built_from_source), never to decide what exists."""
     cache_manifest = _read_manifest(CACHE_DIR)
     baked_manifest = _read_manifest(BAKED_DIR)
+    cache_files = _scan_installers(CACHE_DIR)
+    baked_files = _scan_installers(BAKED_DIR)
     platforms = {}
     version = ""
     for key in ("windows", "mac", "windows_msi"):
-        for source, directory, manifest in (
-            ("cached", CACHE_DIR, cache_manifest),
-            ("baked", BAKED_DIR, baked_manifest),
+        for source, files, manifest in (
+            ("cached", cache_files, cache_manifest),
+            ("baked", baked_files, baked_manifest),
         ):
-            path = _local_asset(directory, manifest, key)
-            if path:
-                entry = dict((manifest.get("platforms") or {}).get(key) or {})
-                entry["source"] = source
-                entry["size"] = os.path.getsize(path)
-                platforms[key] = entry
-                version = version or manifest.get("version", "")
-                break
+            f = files.get(key)
+            if not f:
+                continue
+            entry = {"filename": f["filename"], "size": f["size"], "source": source}
+            m_entry = (manifest.get("platforms") or {}).get(key) if manifest else None
+            if m_entry and os.path.basename(m_entry.get("filename", "")) == f["filename"]:
+                if m_entry.get("sha256"):
+                    entry["sha256"] = m_entry["sha256"]
+            platforms[key] = entry
+            if not version:
+                version = (manifest.get("version", "") if manifest else "") \
+                    or _version_from_filename(f["filename"])
+            break
         else:
             gh_entry = ((github or {}).get("platforms") or {}).get(key)
             if gh_entry:
@@ -190,8 +235,7 @@ async def companion_download(platform: str):
         raise HTTPException(status_code=404, detail=f"unknown platform {platform!r}")
 
     for directory in (CACHE_DIR, BAKED_DIR):
-        manifest = _read_manifest(directory)
-        path = _local_asset(directory, manifest, key)
+        path = _local_asset(directory, key)
         if path:
             filename = os.path.basename(path)
             ext = os.path.splitext(filename)[1].lower()

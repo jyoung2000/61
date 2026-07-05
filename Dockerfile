@@ -41,9 +41,13 @@ RUN set +e; \
     exit 0
 
 ## Stage 1c: Build the Windows Companion installer from source (OPT-IN)
-# Same stage as in Dockerfile.gpu. DEFAULT OFF: the published
-# companion-v* GitHub Release provides the complete installers, which the
-# Settings card serves. Enable only for airgapped / no-release setups:
+# Same stage as in Dockerfile.gpu. Cross-compiles for x86_64-pc-windows-
+# MSVC via cargo-xwin — MSVC is the only Windows toolchain Tauri/WebView2
+# supports (a MinGW/GNU build opens to a blank white webview and exits).
+# cargo-xwin downloads the MSVC CRT + Windows SDK at build time (needs
+# outbound internet). DEFAULT OFF: the published companion-v* GitHub
+# Release provides the complete installers, which the Settings card serves.
+# Enable only for setups that build locally:
 #   docker build --build-arg COMPANION_BUILD_FROM_SOURCE=1
 # Every step is fail-soft (set +e / exit 0) so a toolchain hiccup can
 # never abort the ClipAI image build.
@@ -57,6 +61,7 @@ FROM rust:1-bookworm AS companion-builder
 ARG COMPANION_BUILD_FROM_SOURCE=0
 WORKDIR /build
 COPY companion/ ./companion/
+ENV XWIN_ACCEPT_LICENSE=1
 RUN set +e; \
     mkdir -p /out; \
     if [ "$COMPANION_BUILD_FROM_SOURCE" != "1" ]; then \
@@ -64,15 +69,16 @@ RUN set +e; \
       exit 0; \
     fi; \
     apt-get update && apt-get install -y --no-install-recommends \
-      nsis gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 \
+      nsis clang llvm lld \
       nodejs npm python3 ca-certificates curl \
       pkg-config libgtk-3-dev libayatana-appindicator3-dev; \
-    rustup target add x86_64-pc-windows-gnu; \
+    rustup target add x86_64-pc-windows-msvc; \
+    cargo install cargo-xwin --locked; \
     cd companion \
       && npm install --no-audit --no-fund \
-      && npx tauri build --target x86_64-pc-windows-gnu --bundles nsis; \
+      && npx tauri build --runner cargo-xwin --target x86_64-pc-windows-msvc --bundles nsis; \
     STATUS=$?; \
-    EXE=$(ls src-tauri/target/x86_64-pc-windows-gnu/release/bundle/nsis/*-setup.exe 2>/dev/null | head -1); \
+    EXE=$(ls src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe 2>/dev/null | head -1); \
     if [ "$STATUS" = "0" ] && [ -n "$EXE" ]; then \
       cp "$EXE" /out/ \
         && python3 scripts/make_local_manifest.py /out \

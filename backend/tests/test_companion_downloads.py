@@ -115,6 +115,40 @@ def test_download_404_when_nothing_exists(dirs, no_github):
         asyncio.run(D.companion_download("amiga"))
 
 
+def test_installer_file_served_without_manifest(dirs, no_github):
+    """File presence is authoritative: a .dmg dropped into the cache dir with
+    NO manifest.json is still served (version inferred from the filename)."""
+    _baked, cache = dirs
+    (cache / "ClipAI GPU Companion_0.1.0_universal.dmg").write_bytes(b"dmg bytes")
+    out = asyncio.run(D.companion_manifest())
+    assert out["platforms"]["mac"]["source"] == "cached"
+    assert out["version"] == "0.1.0"
+
+    resp = asyncio.run(D.companion_download("mac"))
+    assert resp.path.endswith("_universal.dmg")
+    assert resp.media_type == "application/x-apple-diskimage"
+
+
+def test_windows_manifest_and_hand_dropped_dmg_coexist(dirs, no_github):
+    """A Windows .exe (from the Docker build, with a windows-only manifest) and
+    a macOS .dmg (built on a Mac, no matching manifest entry) live in the same
+    cache dir — BOTH buttons must work; neither clobbers the other."""
+    _baked, cache = dirs
+    m = _write_release(cache, "0.1.0", {"windows": "Companion_0.1.0.exe"})
+    m["built_from_source"] = True
+    (cache / "manifest.json").write_text(json.dumps(m))  # windows only
+    (cache / "Companion_0.1.0.dmg").write_bytes(b"mac installer")  # no manifest entry
+
+    out = asyncio.run(D.companion_manifest())
+    assert out["platforms"]["windows"]["source"] == "cached"
+    assert out["platforms"]["mac"]["source"] == "cached"
+
+    win = asyncio.run(D.companion_download("windows"))
+    assert win.path.endswith("Companion_0.1.0.exe")
+    mac = asyncio.run(D.companion_download("mac"))
+    assert mac.path.endswith("Companion_0.1.0.dmg")
+
+
 def test_manifest_falls_back_to_github_only(dirs, monkeypatch):
     async def gh(force=False):
         return {"version": "0.3.0", "platforms": {"mac": {

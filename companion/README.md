@@ -100,21 +100,46 @@ The Windows whisper sidecar is built separately (see
 `companion-v*`. No model weights or Ollama binaries are ever committed to
 this repository.
 
-### Cross-building the Windows installer from Linux
+### Cross-building the Windows installer from Linux (MSVC, via cargo-xwin)
 
 The ClipAI Docker image does this automatically (its `companion-builder`
-stage) so the Settings download button works before any GitHub release
-exists. Manually:
+stage, `--build-arg COMPANION_BUILD_FROM_SOURCE=1`) so the Settings
+download button works before any GitHub release exists. Manually:
 
 ```bash
-sudo apt install nsis gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64
-rustup target add x86_64-pc-windows-gnu
+sudo apt install nsis clang llvm lld pkg-config libgtk-3-dev libayatana-appindicator3-dev
+rustup target add x86_64-pc-windows-msvc
+cargo install cargo-xwin --locked
 cd companion && npm install && npx tauri icon app-icon.png
-npx tauri build --target x86_64-pc-windows-gnu --bundles nsis
-# → src-tauri/target/x86_64-pc-windows-gnu/release/bundle/nsis/*-setup.exe
+XWIN_ACCEPT_LICENSE=1 npx tauri build --runner cargo-xwin \
+  --target x86_64-pc-windows-msvc --bundles nsis
+# → src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe
 ```
+
+**Use MSVC, not MinGW.** Tauri/WebView2 only supports the MSVC toolchain
+on Windows; a `x86_64-pc-windows-gnu` (MinGW) build compiles but opens to
+a blank white webview and exits. `cargo-xwin` provides the MSVC target on
+Linux (it fetches the MSVC CRT + Windows SDK from Microsoft at build
+time — `XWIN_ACCEPT_LICENSE=1` accepts the EULA). The `libgtk-3-dev` /
+`libayatana-appindicator3-dev` packages satisfy a host-side probe
+tauri-cli runs for the tray library, regardless of the Windows target.
 
 This fallback build cannot include the PyInstaller whisper sidecar
 (PyInstaller doesn't cross-compile). The Companion detects that,
 reports `backends.whisper=false`, and pairing leaves ClipAI's
 transcription local — GPU-shared Ollama works fully either way.
+
+### Building the macOS installer (natively, on a Mac)
+
+macOS apps can't be built from Linux at all. On a Mac, run:
+
+```bash
+cd companion && ./scripts/build-macos.sh
+# → src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+```
+
+It builds a universal (Apple Silicon + Intel) `.dmg`, optionally with the
+whisper.cpp Metal sidecar (`NO_WHISPER=1` to skip). To make it downloadable
+from ClipAI, copy the `.dmg` into the server's `data/companion-cache/`
+folder — the Settings card serves whatever installer files are present, so
+the macOS button lights up with no manifest step.
