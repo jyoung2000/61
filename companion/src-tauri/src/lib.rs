@@ -4,12 +4,14 @@
 //! the whisper sidecar, poll GPU telemetry, expose commands to the
 //! React dashboard, and live in the tray (closing the window hides it).
 
-mod gpu;
-mod ollama;
-mod pairing;
-mod proxy;
-mod sidecar;
-mod state;
+// Public so the tests/proxy_e2e.rs integration test can exercise the
+// proxy + state contract without the Tauri shell.
+pub mod gpu;
+pub mod ollama;
+pub mod pairing;
+pub mod proxy;
+pub mod sidecar;
+pub mod state;
 
 use serde::Deserialize;
 use state::AppState;
