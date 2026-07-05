@@ -66,7 +66,8 @@ MAX_RETRY_AFTER_S = 15.0
 # model, fall back to the best model it DOES have instead of failing the
 # job. Ordered best-first; the requested model always wins when present.
 MODEL_LADDER = {
-    "vision": ["llava:13b", "llava:7b", "qwen2.5-vl:7b", "moondream:1.8b"],
+    "vision": ["qwen2.5vl:7b", "llava:13b", "llava:7b", "qwen2.5vl:3b",
+               "qwen2.5-vl:7b", "moondream:1.8b"],
     "text": ["qwen2.5:14b", "qwen2.5:7b-instruct", "qwen2.5:3b-instruct"],
 }
 
@@ -78,10 +79,30 @@ class OllamaHost:
     url: str  # normalized: no trailing slash; may include a base path (/ollama)
     token: str = ""
     enabled: bool = True
+    # Advertised by a paired GPU Companion (empty for plain Ollama hosts).
+    gpu_name: str = ""
+    vram_total_mb: int = 0
+    is_companion: bool = False
 
     def to_dict(self) -> dict:
         return {"id": self.id, "name": self.name, "url": self.url,
-                "token": self.token, "enabled": self.enabled}
+                "token": self.token, "enabled": self.enabled,
+                "gpu_name": self.gpu_name, "vram_total_mb": self.vram_total_mb,
+                "is_companion": self.is_companion}
+
+
+def model_present(installed: list, requested: str) -> bool:
+    """True if ``requested`` matches an installed Ollama tag, tolerating an
+    implicit ``:latest`` and an ``ollama/`` prefix on either side."""
+    if not requested:
+        return False
+    req = str(requested).split("/")[-1]
+    wanted = {req, req if ":" in req else f"{req}:latest"}
+    for m in installed or []:
+        mm = str(m).split("/")[-1]
+        if mm in wanted or (":" not in req and mm.split(":")[0] == req):
+            return True
+    return False
 
 
 @dataclass
@@ -157,6 +178,9 @@ def _parse_hosts_json(raw: str) -> list[OllamaHost]:
             url=url,
             token=str(entry.get("token") or ""),
             enabled=bool(entry.get("enabled", True)),
+            gpu_name=str(entry.get("gpu_name") or ""),
+            vram_total_mb=int(entry.get("vram_total_mb") or 0),
+            is_companion=bool(entry.get("is_companion", False)),
         ))
     return hosts
 
@@ -447,5 +471,8 @@ async def registry_status(force: bool = False) -> list[dict]:
             "latency_ms": st.latency_ms,
             "error": st.error,
             "in_cooldown": in_cooldown(host),
+            "gpu_name": host.gpu_name,
+            "vram_total_mb": host.vram_total_mb,
+            "is_companion": host.is_companion,
         })
     return out

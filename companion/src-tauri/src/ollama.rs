@@ -241,20 +241,25 @@ pub async fn shutdown(state: &AppState) {
 }
 
 /// Recommended model pulls by VRAM budget, offered by the setup wizard.
+/// `qwen2.5vl` is the Ollama-native image/video-frame understanding model
+/// (VideoLLaMA is not an Ollama/GGUF model and can't run here).
 pub fn recommended_models(budget_gb: f32) -> Vec<(&'static str, &'static str)> {
     if budget_gb >= 10.0 {
         vec![
             ("llava:13b", "Vision (Primary AI)"),
+            ("qwen2.5vl:7b", "Video/vision understanding"),
             ("qwen2.5:14b", "Editorial / translation"),
         ]
     } else if budget_gb >= 6.0 {
         vec![
             ("llava:7b", "Vision (Primary AI)"),
+            ("qwen2.5vl:7b", "Video/vision understanding"),
             ("qwen2.5:7b-instruct", "Editorial / translation"),
         ]
     } else {
         vec![
             ("moondream:1.8b", "Vision (Primary AI)"),
+            ("qwen2.5vl:3b", "Video/vision understanding"),
             ("qwen2.5:3b-instruct", "Editorial / translation"),
         ]
     }

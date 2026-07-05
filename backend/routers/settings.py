@@ -643,6 +643,40 @@ async def provider_status():
     except Exception as e:
         statuses["ollama"] = {"status": "offline", "error": str(e)}
 
+    # Companion GPU summary for the "active models" indicator: is a paired
+    # Companion serving jobs, and are the selected local models downloaded onto
+    # it and ready to use?
+    companion_info = None
+    try:
+        from backend.services import ollama_registry as _oreg
+        _hs = statuses.get("ollama", {}).get("hosts") or []
+        _comp = next((h for h in _hs if h.get("is_companion")), None)
+        if _comp is None:
+            _comp = next((h for h in _hs
+                          if not _oreg.is_local_gpu_host(h.get("url", ""))
+                          and str(h.get("url", "")).rstrip("/").endswith("/ollama")), None)
+        if _comp is not None:
+            want = []
+            for _m in (settings.OLLAMA_PRIMARY_MODEL, settings.OLLAMA_EDITORIAL_MODEL,
+                       settings.OLLAMA_TRANSLATION_MODEL):
+                if _m and _m not in want:
+                    want.append(_m)
+            have = _comp.get("models") or []
+            ready = [m for m in want if _oreg.model_present(have, m)]
+            companion_info = {
+                "name": _comp.get("name", ""),
+                "gpu_name": _comp.get("gpu_name", ""),
+                "url": _comp.get("url", ""),
+                "online": bool(_comp.get("online")),
+                "is_primary": _comp.get("priority") == 0,
+                "models_total": len(want),
+                "models_ready": len(ready),
+                "missing": [m for m in want if m not in ready],
+                "ready": bool(want) and len(ready) == len(want) and bool(_comp.get("online")),
+            }
+    except Exception as _e:
+        logger.debug("companion status calc failed: %s", _e)
+
     # OpenRouter — always read model IDs from settings (the provider does
     # the same), falling back to preset defaults if settings are empty.
     if _key_is_set(settings.OPENROUTER_API_KEY):
@@ -786,6 +820,10 @@ async def provider_status():
         "preset": settings.OPENROUTER_PRESET if active_provider == "openrouter" else "",
         "fallback_chain": chain,
         "ollama_enabled": "ollama" in chain,
+        # Which GPU/host is actually serving Ollama, and the paired-Companion
+        # download/readiness summary for the "active models" GPU indicator.
+        "ollama_host_name": statuses.get("ollama", {}).get("active_host_name", ""),
+        "companion": companion_info,
     }
 
     _status_cache = statuses
@@ -1280,30 +1318,60 @@ def _pull_ollama_models_background(models: list[str] | None = None):
     # Reset the progress state for this run so the UI can track it.
     _ollama_pull_state.update(
         {"active": True, "models": list(models), "done": [], "failed": [],
-         "current": None})
+         "current": None, "progress": {}, "target": {}})
 
     def _do_pull():
         import httpx as _httpx
+        import json as _json
         from backend.services import ollama_registry
         host = ollama_registry.primary_url() or settings.OLLAMA_HOST
         _headers = ollama_registry.headers_for_url(host)
+        # Label the sync target so the UI can say "downloading to <GPU>".
+        try:
+            _hobj = ollama_registry.find_host_for_url(host)
+        except Exception:
+            _hobj = None
+        _ollama_pull_state["target"] = {
+            "name": getattr(_hobj, "name", "") or host,
+            "gpu_name": getattr(_hobj, "gpu_name", "") or "",
+            "is_companion": bool(getattr(_hobj, "is_companion", False)),
+        }
         try:
             for model in models:
                 _ollama_pull_state["current"] = model
+                _ollama_pull_state["progress"][model] = 0.0
                 try:
-                    logger.info("Background pull: requesting %s from Ollama...", model)
-                    resp = _httpx.post(
-                        f"{host}/api/pull",
-                        json={"name": model},
+                    logger.info("Background pull: requesting %s (→ %s)...",
+                                model, _ollama_pull_state["target"]["name"])
+                    # Stream so a multi-GB download onto a Companion reports a
+                    # real percentage instead of a long opaque wait.
+                    with _httpx.stream(
+                        "POST", f"{host}/api/pull",
+                        json={"name": model, "stream": True},
                         headers=_headers,
                         timeout=_httpx.Timeout(connect=10, read=1800, write=10, pool=10),
-                    )
-                    if resp.status_code == 200:
-                        logger.info("Background pull: %s ready", model)
-                        _ollama_pull_state["done"].append(model)
-                    else:
-                        logger.warning("Background pull: %s returned %d", model, resp.status_code)
-                        _ollama_pull_state["failed"].append(model)
+                    ) as resp:
+                        if resp.status_code != 200:
+                            logger.warning("Background pull: %s returned %d", model, resp.status_code)
+                            _ollama_pull_state["failed"].append(model)
+                            continue
+                        for line in resp.iter_lines():
+                            if not line:
+                                continue
+                            try:
+                                obj = _json.loads(line)
+                            except Exception:
+                                continue
+                            if obj.get("error"):
+                                raise RuntimeError(obj["error"])
+                            total = obj.get("total") or 0
+                            completed = obj.get("completed") or 0
+                            if total:
+                                _ollama_pull_state["progress"][model] = round(
+                                    completed / total * 100, 1)
+                    _ollama_pull_state["progress"][model] = 100.0
+                    _ollama_pull_state["done"].append(model)
+                    logger.info("Background pull: %s ready", model)
                 except Exception as exc:
                     logger.warning("Background pull: %s failed (%s)", model, exc)
                     _ollama_pull_state["failed"].append(model)
@@ -2554,15 +2622,18 @@ async def save_models(req: SaveModelsRequest):
     _invalidate_status_cache()
     _persist_user_settings()
 
-    # Pull any newly selected Ollama models in the background
-    if has_ollama_models:
-        pull_models = []
-        if req.vision_model and req.vision_model.startswith("ollama/"):
-            pull_models.append(req.vision_model[len("ollama/"):])
-        if req.text_model and req.text_model.startswith("ollama/"):
-            pull_models.append(req.text_model[len("ollama/"):])
-        if pull_models:
-            _pull_ollama_models_background(pull_models)
+    # Pull every selected Ollama model (vision + editorial + translation) to
+    # the active host in the background. When a GPU Companion is paired it IS
+    # the primary host, so this downloads the models onto the desktop GPU and
+    # /providers/ollama/pull-status reports per-model progress + readiness.
+    pull_models = []
+    for _sel in (req.vision_model, req.text_model, req.translation_model):
+        if _sel and _sel.startswith("ollama/"):
+            _m = _sel[len("ollama/"):].strip()
+            if _m and _m not in pull_models:
+                pull_models.append(_m)
+    if pull_models:
+        _pull_ollama_models_background(pull_models)
 
     # Return the currently active models.
     # If the user just saved Ollama models, reflect those regardless of chain order.
@@ -2914,6 +2985,14 @@ async def companion_register(req: CompanionRegisterRequest,
             token=req.token or "",
             enabled=True,
         )
+    # Persist the advertised GPU so the "active models" indicator can name it,
+    # and mark this host as a Companion (drives sync/readiness UI + keeps its
+    # models from being evicted to free the local card).
+    entry.is_companion = True
+    if req.gpu_name:
+        entry.gpu_name = req.gpu_name.strip()
+    if req.vram_total_mb:
+        entry.vram_total_mb = int(req.vram_total_mb)
     hosts.insert(0, entry)  # Companion becomes the PRIMARY
     ollama_registry.save_hosts(hosts)
 
