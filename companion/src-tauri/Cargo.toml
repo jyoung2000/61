@@ -42,8 +42,14 @@ default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
 
 [profile.release]
-panic = "abort"
+# NOTE: `panic = "abort"` is intentionally NOT set. With abort, a panic in
+# any spawned task (GPU poll, proxy, ollama) instantly kills the whole
+# console-less GUI — which looks like "opens then closes". Unwinding keeps
+# the window alive; the panic hook in lib.rs logs the failure to a file.
 codegen-units = 1
 lto = true
 opt-level = "s"
-strip = true
+# Keep line tables (not full debug) so the crash log's backtraces carry
+# file:line — worth the modest size increase for a diagnosable installer.
+strip = false
+debug = "line-tables-only"

@@ -7,6 +7,9 @@
   </head>
   <body>
     <div id="root"></div>
+    <!-- Runs before the app bundle so it can catch a bundle that fails to
+         load/execute and show it on-screen (see public/boot-check.js). -->
+    <script src="/boot-check.js"></script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

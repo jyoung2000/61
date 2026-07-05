@@ -23,6 +23,80 @@ use tauri::{Emitter, Manager, WindowEvent};
 
 type SharedState = Arc<AppState>;
 
+// ── Crash diagnostics ───────────────────────────────────────────────
+// The GUI has no console (windows_subsystem = "windows"), so logs and
+// panics would otherwise vanish. Everything is mirrored to a file the
+// user can paste back when the app misbehaves.
+
+/// `%LOCALAPPDATA%\app.clipai.companion\companion.log` on Windows,
+/// `~/Library/Application Support/…` on macOS, `~/.local/share/…` on Linux.
+pub fn log_file_path() -> std::path::PathBuf {
+    dirs::data_local_dir()
+        .or_else(dirs::config_dir)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("app.clipai.companion")
+        .join("companion.log")
+}
+
+/// Append a clearly-delimited crash record straight to the log file — used
+/// by the panic hook and the top-level error handler so it survives even if
+/// the normal logger never initialised.
+fn append_crash(msg: &str) {
+    use std::io::Write;
+    let path = log_file_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let stamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+        let _ = writeln!(f, "\n===== CRASH {stamp} =====\n{msg}\n========================");
+    }
+}
+
+/// Route `log::*` to the log file (fresh per launch) and install a panic
+/// hook that records any thread's panic before it unwinds. Returns the log
+/// path so it can be surfaced to the user.
+fn init_diagnostics() -> std::path::PathBuf {
+    let path = log_file_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    // Truncate on each launch so a pasted log is just the latest run.
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&path)
+        .ok();
+    let mut builder =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
+    builder.format_timestamp_secs();
+    if let Some(file) = file {
+        builder.target(env_logger::Target::Pipe(Box::new(file)));
+    }
+    let _ = builder.try_init();
+
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let loc = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "<unknown location>".into());
+        let payload = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<non-string panic payload>".into());
+        let bt = std::backtrace::Backtrace::force_capture();
+        let msg = format!("panic at {loc}: {payload}\nbacktrace:\n{bt}");
+        log::error!("{msg}");
+        append_crash(&msg);
+        default(info);
+    }));
+    path
+}
+
 // ── Commands (invoked from the React UI) ────────────────────────────
 
 #[tauri::command]
@@ -190,11 +264,16 @@ fn build_tray(app: &tauri::App, state: SharedState) -> tauri::Result<()> {
 
     let pause_for_menu = pause_item.clone();
     let state_for_menu = state.clone();
-    TrayIconBuilder::with_id("main-tray")
-        .icon(app.default_window_icon().unwrap().clone())
+    let mut tray = TrayIconBuilder::with_id("main-tray")
         .tooltip("ClipAI GPU Companion — idle")
         .menu(&menu)
-        .show_menu_on_left_click(true)
+        .show_menu_on_left_click(true);
+    // Don't unwrap the icon — a missing default icon must not abort startup.
+    match app.default_window_icon() {
+        Some(icon) => tray = tray.icon(icon.clone()),
+        None => log::warn!("tray: no default window icon available"),
+    }
+    tray
         .on_menu_event(move |app, event| match event.id.as_ref() {
             "open" => {
                 if let Some(window) = app.get_webview_window("main") {
@@ -230,24 +309,38 @@ fn build_tray(app: &tauri::App, state: SharedState) -> tauri::Result<()> {
 // ── App entry ───────────────────────────────────────────────────────
 
 pub fn run() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    let log_path = init_diagnostics();
+    log::info!(
+        "=== ClipAI GPU Companion v{} starting ===",
+        env!("CARGO_PKG_VERSION")
+    );
+    log::info!("log file: {}", log_path.display());
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
         ))
         .setup(|app| {
+            log::info!("setup: begin");
             let config_dir = app
                 .path()
                 .app_config_dir()
-                .expect("no app config dir available");
+                .unwrap_or_else(|e| {
+                    log::warn!("no app config dir ({e}); falling back to temp dir");
+                    std::env::temp_dir().join("app.clipai.companion")
+                });
             let data_dir = app.path().app_data_dir().unwrap_or_else(|_| config_dir.clone());
             let resource_dir = app
                 .path()
                 .resource_dir()
                 .unwrap_or_else(|_| std::path::PathBuf::from("."));
+            log::info!(
+                "setup: config_dir={} resource_dir={}",
+                config_dir.display(),
+                resource_dir.display()
+            );
 
             let state: SharedState = Arc::new(AppState::load(config_dir));
             state.sidecar_available.store(
@@ -255,6 +348,10 @@ pub fn run() {
                 Ordering::Relaxed,
             );
             app.manage(state.clone());
+            log::info!(
+                "setup: state loaded (sidecar_available={})",
+                state.sidecar_available.load(Ordering::Relaxed)
+            );
 
             // GPU telemetry poll (5 s) + tray tooltip/busy indicator.
             {
@@ -303,20 +400,34 @@ pub fn run() {
                 });
             }
             {
-                let ctx = proxy::ProxyCtx {
-                    state: state.clone(),
-                    client: reqwest::Client::builder()
-                        .timeout(std::time::Duration::from_secs(3600))
-                        .connect_timeout(std::time::Duration::from_secs(10))
-                        .build()
-                        .expect("reqwest client"),
-                    resource_dir,
-                    data_dir,
+                let client = match reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(3600))
+                    .connect_timeout(std::time::Duration::from_secs(10))
+                    .build()
+                {
+                    Ok(c) => Some(c),
+                    Err(e) => {
+                        log::error!("failed to build HTTP client, proxy disabled: {e}");
+                        None
+                    }
                 };
-                tauri::async_runtime::spawn(proxy::serve(ctx));
+                if let Some(client) = client {
+                    let ctx = proxy::ProxyCtx {
+                        state: state.clone(),
+                        client,
+                        resource_dir,
+                        data_dir,
+                    };
+                    tauri::async_runtime::spawn(proxy::serve(ctx));
+                }
             }
             sidecar::spawn_idle_reaper(state.clone());
-            build_tray(app, state)?;
+            // Tray failure must not abort startup — the dashboard window is
+            // the primary surface; log and continue without the tray.
+            if let Err(e) = build_tray(app, state) {
+                log::error!("tray build failed (continuing without tray): {e}");
+            }
+            log::info!("setup: complete");
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -335,7 +446,15 @@ pub fn run() {
             start_ollama,
             pull_model,
             pair_clipai,
-        ])
-        .run(tauri::generate_context!())
-        .expect("error while running the ClipAI GPU Companion");
+        ]);
+
+    // Log (don't silently .expect()) any failure to start the Tauri runtime
+    // — e.g. a missing WebView2 runtime — so the crash log explains the exit.
+    if let Err(e) = builder.run(tauri::generate_context!()) {
+        let msg = format!("tauri runtime failed to start / run: {e:?}");
+        log::error!("{msg}");
+        append_crash(&msg);
+        std::process::exit(1);
+    }
+    log::info!("app exited");
 }
