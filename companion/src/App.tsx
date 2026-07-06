@@ -365,6 +365,7 @@ function Dashboard({ status, refresh }: { status: CompanionStatus; refresh: () =
   const [syncMsg, setSyncMsg] = useState('');
   const [modelQuery, setModelQuery] = useState('');
   const [pullingTag, setPullingTag] = useState('');
+  const [addrCopied, setAddrCopied] = useState(false);
 
   useEffect(() => { autostartEnabled().then(setAutostart).catch(() => setAutostart(null)); }, []);
 
@@ -426,8 +427,10 @@ function Dashboard({ status, refresh }: { status: CompanionStatus; refresh: () =
       refresh();
       setModelQuery('');
       setSyncMsg(`${t} downloaded ✓`);
-    } catch {
-      setSyncMsg(`Could not download ${t} — check the tag exists on ollama.com`);
+    } catch (e) {
+      // Surface the REAL error (e.g. "requires a newer version of Ollama",
+      // a 404, or a network failure) instead of a misleading canned message.
+      setSyncMsg(`Could not download ${t}: ${e}`);
     } finally {
       setPullingTag('');
       setTimeout(() => setSyncMsg(''), 6000);
@@ -448,19 +451,20 @@ function Dashboard({ status, refresh }: { status: CompanionStatus; refresh: () =
       return;
     }
     const failed = [];
+    let lastErr = '';
     try {
       for (const model of missing) {
         setSyncMsg(`Downloading ${model}…`);
-        try { await pullModel(model); } catch { failed.push(model); }
+        try { await pullModel(model); } catch (e) { failed.push(model); lastErr = String(e); }
       }
       loadModels();
       refresh();
     } finally {
       setSyncing(false);
       setSyncMsg(failed.length
-        ? `Could not download: ${failed.join(', ')} — check the tag exists on ollama.com`
+        ? `Could not download ${failed.join(', ')}: ${lastErr}`
         : 'Recommended models downloaded ✓');
-      setTimeout(() => setSyncMsg(''), 8000);
+      setTimeout(() => setSyncMsg(''), 10000);
     }
   };
 
@@ -604,10 +608,26 @@ function Dashboard({ status, refresh }: { status: CompanionStatus; refresh: () =
             </div>
           )}
           <div className="small muted" style={{ margin: '8px 0 4px' }}>
-            Share this address with ClipAI:
+            Ollama endpoint for ClipAI (easiest: use “Pair now” below — it fills this in
+            automatically):
           </div>
-          <div className="mono small" style={{ marginBottom: 8 }}>
-            http://{status.lan_ip || '<this-machine>'}:{status.config.port}
+          <div className="row" style={{ gap: 6, marginBottom: 4 }}>
+            <span className="mono small" style={{ flex: 1, wordBreak: 'break-all' }}>
+              http://{status.lan_ip || '<this-machine>'}:{status.config.port}/ollama
+            </span>
+            <button className="secondary" style={{ fontSize: 11, padding: '4px 10px' }}
+              onClick={() => {
+                navigator.clipboard.writeText(`http://${status.lan_ip || ''}:${status.config.port}/ollama`);
+                setAddrCopied(true); setTimeout(() => setAddrCopied(false), 1500);
+              }}
+              title="Copy the Ollama host URL to paste into ClipAI → Settings → Ollama Hosts">
+              {addrCopied ? 'Copied ✓' : 'Copy'}
+            </button>
+          </div>
+          <div className="small muted" style={{ marginBottom: 8 }}>
+            Adding manually? Paste that URL (keep the <span className="mono">/ollama</span>)
+            and the token below into ClipAI → Settings → Ollama Hosts, and allow inbound
+            TCP&nbsp;{status.config.port} in the Windows firewall.
           </div>
           <TokenBox token={status.config.token}
             onRegenerate={() => { regenerateToken().then(refresh); }} />

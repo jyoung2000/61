@@ -3072,36 +3072,85 @@ async def put_ollama_hosts(req: SaveOllamaHostsRequest):
     }
 
 
+@router.get("/settings/ollama-hosts/{host_id}/token")
+async def reveal_ollama_host_token(host_id: str):
+    """Return a host's stored bearer token so the user can view/copy it and
+    verify it matches the Companion's token."""
+    from backend.services import ollama_registry
+    host = next((h for h in ollama_registry.get_hosts() if h.id == host_id), None)
+    if host is None:
+        raise HTTPException(status_code=404, detail="host not found")
+    return {"id": host.id, "token": host.token or ""}
+
+
 @router.post("/settings/ollama-hosts/test")
 async def test_ollama_host(req: TestOllamaHostRequest):
     """Server-side probe of one host URL (+ optional token) for the Add/Edit
-    dialog's Test button. Returns online/offline, models, and version."""
+    dialog's Test button. Returns online/offline, models, version, and a plain
+    diagnosis of WHY it failed (wrong path / bad token / unreachable), plus a
+    suggested URL when the entry looks like a GPU Companion missing /ollama."""
     from backend.services import ollama_registry
+    from urllib.parse import urlparse
     url = (req.url or "").strip()
     if not url:
         raise HTTPException(status_code=400, detail="url is required")
-    candidate = ollama_registry.OllamaHost(
-        id="__test__", name="test", url=url, token=req.token or "")
-    status = await ollama_registry.probe(candidate, force=True)
-    # Never cache the throwaway probe under the sentinel id.
-    ollama_registry._probe_cache.pop("__test__", None)
+
+    async def _probe(u: str):
+        cand = ollama_registry.OllamaHost(id="__test__", name="test", url=u, token=req.token or "")
+        st = await ollama_registry.probe(cand, force=True)
+        ollama_registry._probe_cache.pop("__test__", None)
+        return cand, st
+
+    candidate, status = await _probe(url)
+
+    if not status.online:
+        # A GPU Companion serves Ollama under /ollama. If the user pasted the
+        # bare proxy address (no path), retry there and suggest it.
+        norm = ollama_registry._normalize_url(url)
+        path = urlparse(norm).path.rstrip("/")
+        note = ""
+        if not path:
+            alt = norm + "/ollama"
+            _, alt_status = await _probe(alt)
+            if alt_status.online:
+                return {
+                    "online": True, "models": alt_status.models,
+                    "latency_ms": alt_status.latency_ms, "version": "",
+                    "error": "", "suggested_url": alt,
+                    "note": f"This is a GPU Companion — reachable at {alt}. "
+                            f"Use that URL (with /ollama).",
+                }
+        err = status.error or ""
+        low = err.lower()
+        if "auth rejected" in low or "401" in err or "403" in err:
+            note = "Reached the host, but the bearer token was rejected — copy the exact token shown in the Companion."
+        elif "http 404" in low:
+            note = "Reached the host, but there's no Ollama API at this path. For a GPU Companion, add /ollama to the URL."
+        elif any(k in low for k in ("timeout", "connect", "refused", "unreachable", "name or service")):
+            note = ("Could not connect. Check the machine is on and the IP/port are right, "
+                    "and that the Windows firewall allows inbound TCP on this port (Private network).")
+        return {
+            "online": False, "models": [], "latency_ms": status.latency_ms,
+            "version": "", "error": err, "note": note,
+        }
+
     version = ""
-    if status.online:
-        try:
-            async with httpx.AsyncClient(timeout=3.0) as client:
-                vresp = await client.get(
-                    ollama_registry.join_url(url, "/api/version"),
-                    headers=ollama_registry.auth_headers(candidate))
-                if vresp.status_code == 200:
-                    version = (vresp.json() or {}).get("version", "")
-        except Exception:
-            pass
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            vresp = await client.get(
+                ollama_registry.join_url(url, "/api/version"),
+                headers=ollama_registry.auth_headers(candidate))
+            if vresp.status_code == 200:
+                version = (vresp.json() or {}).get("version", "")
+    except Exception:
+        pass
     return {
         "online": status.online,
         "models": status.models,
         "latency_ms": status.latency_ms,
         "version": version,
         "error": status.error,
+        "note": "",
     }
 
 

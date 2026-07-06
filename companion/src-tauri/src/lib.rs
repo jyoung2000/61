@@ -292,7 +292,10 @@ async fn pull_model(app: tauri::AppHandle, model: String) -> Result<(), String> 
         .await
         .map_err(|e| format!("pull failed to start: {e}"))?;
     if !resp.status().is_success() {
-        return Err(format!("pull failed: HTTP {}", resp.status()));
+        let code = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        let detail: String = body.trim().chars().take(200).collect();
+        return Err(format!("Ollama HTTP {code}{}", if detail.is_empty() { String::new() } else { format!(": {detail}") }));
     }
     use futures_util::StreamExt;
     let mut stream = resp.bytes_stream();

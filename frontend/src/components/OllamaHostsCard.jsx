@@ -49,6 +49,16 @@ function StatusDot({ host }) {
 function SortableHostRow({ host, index, isMobile, onToggle, onEdit, onDelete }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
     useSortable({ id: host.id });
+  const [revealedToken, setRevealedToken] = useState(null);
+  const [tokenCopied, setTokenCopied] = useState(false);
+  const revealToken = async () => {
+    if (revealedToken !== null) { setRevealedToken(null); return; }
+    try {
+      const r = await fetch(`/api/settings/ollama-hosts/${host.id}/token`);
+      const d = r.ok ? await r.json() : null;
+      setRevealedToken(d ? (d.token || '') : '');
+    } catch { setRevealedToken(''); }
+  };
   const modelsTip = host.online
     ? (host.models?.length ? `Models: ${host.models.join(', ')}` : 'Online — no models installed yet')
     : (host.error || 'Offline');
@@ -97,7 +107,16 @@ function SortableHostRow({ host, index, isMobile, onToggle, onEdit, onDelete }) 
               padding: '1px 6px', borderRadius: 8,
             }}>Fallback #{index}</span>
           )}
-          {host.has_token && <span title="Bearer token configured" style={{ fontSize: 10 }}>🔒</span>}
+          {host.has_token && (
+            <button onClick={revealToken}
+              title="Show/hide this host's bearer token to verify it matches the Companion"
+              style={{
+                background: 'transparent', border: 'none', cursor: 'pointer', fontSize: 10,
+                color: 'var(--text-muted)', padding: 0,
+              }}>
+              🔒 {revealedToken === null ? 'show token' : 'hide'}
+            </button>
+          )}
         </div>
         <div style={{
           fontSize: 10, color: 'var(--text-muted)', fontFamily: 'var(--font-mono)',
@@ -106,6 +125,29 @@ function SortableHostRow({ host, index, isMobile, onToggle, onEdit, onDelete }) 
           {host.url}
           {host.online && host.models?.length > 0 && ` — ${host.models.length} model${host.models.length === 1 ? '' : 's'}`}
         </div>
+        {revealedToken !== null && (
+          <div style={{
+            display: 'flex', alignItems: 'center', gap: 6, marginTop: 3,
+            fontSize: 10, fontFamily: 'var(--font-mono)',
+          }}>
+            <span style={{
+              color: 'var(--text-secondary)', wordBreak: 'break-all',
+              background: 'var(--bg-elevated)', padding: '2px 6px', borderRadius: 4,
+              userSelect: 'text', flex: 1,
+            }}>
+              {revealedToken || '(no token set)'}
+            </span>
+            {revealedToken && (
+              <button onClick={() => {
+                navigator.clipboard.writeText(revealedToken);
+                setTokenCopied(true); setTimeout(() => setTokenCopied(false), 1500);
+              }} style={{
+                background: 'transparent', border: '1px solid var(--border)', borderRadius: 4,
+                color: 'var(--text-secondary)', fontSize: 9, padding: '2px 6px', cursor: 'pointer',
+              }}>{tokenCopied ? 'Copied ✓' : 'Copy'}</button>
+            )}
+          </div>
+        )}
       </div>
       <label style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 10, color: 'var(--text-secondary)', cursor: 'pointer' }}>
         <input
@@ -398,9 +440,28 @@ export default function OllamaHostsCard({ isMobile = false }) {
                   {testResult.models?.length
                     ? `. Models: ${testResult.models.slice(0, 8).join(', ')}${testResult.models.length > 8 ? '…' : ''}`
                     : '. No models installed yet.'}
+                  {testResult.note && (
+                    <div style={{ marginTop: 4, color: 'var(--text-secondary)' }}>{testResult.note}</div>
+                  )}
+                  {testResult.suggested_url && (
+                    <button
+                      onClick={() => { setForm((f) => ({ ...f, url: testResult.suggested_url })); setTestResult(null); }}
+                      style={{
+                        marginTop: 6, background: 'var(--success)', color: 'var(--bg-base)',
+                        border: 'none', borderRadius: 'var(--radius-sm)', fontSize: 10,
+                        fontWeight: 600, padding: '4px 10px', cursor: 'pointer',
+                      }}>
+                      Use {testResult.suggested_url}
+                    </button>
+                  )}
                 </>
               ) : (
-                <>Unreachable{testResult.error ? ` — ${testResult.error}` : ''}</>
+                <>
+                  Unreachable{testResult.error ? ` — ${testResult.error}` : ''}
+                  {testResult.note && (
+                    <div style={{ marginTop: 4, color: 'var(--text-secondary)' }}>{testResult.note}</div>
+                  )}
+                </>
               )}
             </div>
           )}
