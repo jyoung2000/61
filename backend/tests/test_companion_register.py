@@ -98,9 +98,47 @@ def test_pairing_is_idempotent(client):
 
 
 def test_pairing_can_skip_whisper(client):
+    # register_whisper=False AND the /v1/health probe can't reach the (fake)
+    # host, so remote Whisper stays off.
     resp = _pair(client, register_whisper=False)
     assert resp.status_code == 200
     assert settings.WHISPER_REMOTE_URL == ""
+
+
+def test_pairing_enables_whisper_when_capable(client, monkeypatch):
+    # Even with register_whisper=False, an observed Whisper backend enables it.
+    async def _cap(base, token, timeout=4.0):
+        return True
+    monkeypatch.setattr(S, "_companion_whisper_capable", _cap)
+    resp = _pair(client, register_whisper=False)
+    assert resp.status_code == 200
+    assert settings.WHISPER_REMOTE_URL == "http://192.168.1.50:11500"
+    assert settings.WHISPER_REMOTE_API_KEY == "tok-abc"
+
+
+def test_companion_verify_404_without_companion(client):
+    resp = client.post("/api/settings/companion-verify",
+                       headers={"Authorization": "Bearer clipai-key-123"})
+    assert resp.status_code == 404
+
+
+def test_companion_verify_reports_per_model(client, monkeypatch):
+    async def _cap(base, token, timeout=4.0):
+        return None
+    monkeypatch.setattr(S, "_companion_whisper_capable", _cap)
+    monkeypatch.setattr(settings, "OLLAMA_PRIMARY_MODEL", "llava:7b", raising=False)
+    monkeypatch.setattr(settings, "OLLAMA_EDITORIAL_MODEL", "", raising=False)
+    monkeypatch.setattr(settings, "OLLAMA_TRANSLATION_MODEL", "", raising=False)
+    assert _pair(client).status_code == 200
+    resp = client.post("/api/settings/companion-verify",
+                       headers={"Authorization": "Bearer clipai-key-123"})
+    assert resp.status_code == 200
+    data = resp.json()
+    # The fake host isn't actually listening, so the sentinel generation fails
+    # and verification is honest about it (rather than trusting /api/tags).
+    assert data["verified"] is False
+    assert data["host"]["gpu_name"] == "NVIDIA GeForce RTX 4070"
+    assert [m["model"] for m in data["models"]] == ["llava:7b"]
 
 
 def test_pairing_requires_url(client):

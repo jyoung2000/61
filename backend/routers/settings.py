@@ -3338,6 +3338,68 @@ async def companion_register(req: CompanionRegisterRequest,
     }
 
 
+@router.post("/settings/companion-verify")
+async def companion_verify(_key: str = _Depends(_verify_api_key)):
+    """Round-trip proof that work actually EXECUTES on the paired Companion —
+    not just that its token authenticates. Runs a 1-token sentinel generation
+    for each selected local model against the Companion's Ollama proxy and
+    checks its Whisper capability, so "paired" means "a job ran on that GPU".
+    """
+    from backend.services import ollama_registry as _oreg
+    import httpx as _httpx
+    hosts = _oreg.get_hosts()
+    comp = next((h for h in hosts if h.is_companion), None)
+    if comp is None:
+        comp = next((h for h in hosts
+                     if not _oreg.is_local_gpu_host(h.url)
+                     and h.url.rstrip("/").endswith("/ollama")), None)
+    if comp is None:
+        raise HTTPException(status_code=404, detail="No paired GPU Companion found")
+
+    want: list[str] = []
+    for _m in (settings.OLLAMA_PRIMARY_MODEL, settings.OLLAMA_EDITORIAL_MODEL,
+               settings.OLLAMA_TRANSLATION_MODEL):
+        if _m and _m not in want:
+            want.append(_m)
+
+    gen_url = _oreg.join_url(comp.url, "/api/generate")
+    headers = _oreg.auth_headers(comp)
+    results = []
+    # Short connect so an unreachable Companion fails fast; long read so a cold
+    # model still has time to load and answer the 1-token sentinel.
+    _timeout = _httpx.Timeout(90.0, connect=5.0)
+    async with _httpx.AsyncClient(timeout=_timeout) as client:
+        for _m in want:
+            item = {"model": _m, "ok": False, "detail": ""}
+            try:
+                r = await client.post(gen_url, headers=headers, json={
+                    "model": _m, "prompt": "ping", "stream": False,
+                    "options": {"num_predict": 1},
+                })
+                if r.status_code == 200:
+                    item["ok"] = True
+                    item["detail"] = "generated on the Companion GPU"
+                elif r.status_code in (401, 403):
+                    item["detail"] = "auth rejected — check the host access token"
+                elif r.status_code == 404:
+                    item["detail"] = "model not installed on the Companion"
+                else:
+                    item["detail"] = f"HTTP {r.status_code}"
+            except Exception as e:
+                item["detail"] = f"{type(e).__name__}: {str(e)[:120]}"
+            results.append(item)
+
+    comp_base = comp.url[:-len("/ollama")] if comp.url.endswith("/ollama") else comp.url
+    whisper_cfg = bool((getattr(settings, "WHISPER_REMOTE_URL", "") or "").strip())
+    whisper_capable = await _companion_whisper_capable(comp_base, comp.token or "")
+    return {
+        "verified": bool(want) and all(x["ok"] for x in results),
+        "host": {"name": comp.name, "url": comp.url, "gpu_name": comp.gpu_name},
+        "models": results,
+        "whisper": {"configured": whisper_cfg, "capable": whisper_capable},
+    }
+
+
 # ── Subtitle-polish cloud fallback (AI Providers card) ───────────
 #
 # When the LOCAL polish chain fails a batch (Ollama cold-load timeout /

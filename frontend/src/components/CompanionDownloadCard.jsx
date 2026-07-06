@@ -33,6 +33,8 @@ export default function CompanionDownloadCard({ isMobile = false }) {
   const [manifest, setManifest] = useState(null);
   const [refreshing, setRefreshing] = useState(false);
   const [downloaded, setDownloaded] = useState(false);
+  const [verifying, setVerifying] = useState(false);
+  const [verifyResult, setVerifyResult] = useState(null);
   const os = detectOS();
 
   const load = () => {
@@ -66,6 +68,30 @@ export default function CompanionDownloadCard({ isMobile = false }) {
       showToast('Update check failed', 'error');
     } finally {
       setRefreshing(false);
+    }
+  };
+
+  // Round-trip proof that work actually runs on the paired Companion GPU —
+  // not just that its token authenticates.
+  const verifyOffload = async () => {
+    setVerifying(true);
+    setVerifyResult(null);
+    try {
+      const res = await fetch('/api/settings/companion-verify', { method: 'POST' });
+      if (res.status === 404) {
+        showToast('No paired GPU Companion found — pair one first', 'error');
+        return;
+      }
+      const data = await res.json();
+      setVerifyResult(data);
+      showToast(
+        data.verified ? 'Companion verified — jobs run on its GPU ✓'
+          : 'Companion did not fully verify — see details below',
+        data.verified ? 'success' : 'error');
+    } catch {
+      showToast('Verify failed', 'error');
+    } finally {
+      setVerifying(false);
     }
   };
 
@@ -153,7 +179,42 @@ export default function CompanionDownloadCard({ isMobile = false }) {
           title="Pull the latest installers from GitHub into this container so downloads are served locally">
           {refreshing ? 'Fetching…' : anyLocal ? 'Check for updates' : 'Fetch from GitHub'}
         </button>
+        <button onClick={verifyOffload} disabled={verifying}
+          style={{ ...btnStyle('secondary'), opacity: verifying ? 0.5 : 1 }}
+          title="Run a tiny test job on the paired Companion to confirm work actually executes on its GPU">
+          {verifying ? 'Verifying…' : 'Verify GPU offload'}
+        </button>
       </div>
+
+      {verifyResult && (
+        <div style={{
+          fontSize: 11, marginBottom: 8, paddingLeft: 8, lineHeight: 1.6,
+          borderLeft: `2px solid ${verifyResult.verified ? 'var(--success)' : 'var(--accent-amber)'}`,
+        }}>
+          <div style={{ fontWeight: 600, color: verifyResult.verified ? 'var(--success)' : 'var(--accent-amber)' }}>
+            {verifyResult.verified
+              ? `Verified — inference runs on ${verifyResult.host?.gpu_name || verifyResult.host?.name || 'the Companion'}`
+              : 'Not fully verified — work may be falling back to this server'}
+          </div>
+          {(verifyResult.models || []).map((m) => (
+            <div key={m.model} style={{
+              fontFamily: 'var(--font-mono)', fontSize: 10,
+              color: m.ok ? 'var(--success)' : 'var(--accent-amber)',
+            }}>
+              {m.ok ? '✓' : '✗'} {m.model} — {m.detail}
+            </div>
+          ))}
+          <div style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-muted)' }}>
+            whisper: {verifyResult.whisper?.configured
+              ? (verifyResult.whisper?.capable
+                ? 'remote — transcription runs on the Companion'
+                : 'configured, but the Companion reports no Whisper backend')
+              : (verifyResult.whisper?.capable
+                ? 'available on the Companion — enabling on next status refresh'
+                : 'runs on this server (Companion has no Whisper sidecar)')}
+          </div>
+        </div>
+      )}
 
       {!anyAvailable && (
         <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 8, lineHeight: 1.4 }}>
