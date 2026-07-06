@@ -47,6 +47,7 @@ export interface CompanionStatus {
   busy: boolean;
   current_job: ActivityEntry | null;
   activity: ActivityEntry[];
+  incoming_pulls: { model: string; percent: number }[];
   lan_ip: string | null;
   recommended_models: { model: string; why: string }[];
 }

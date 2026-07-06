@@ -19,7 +19,7 @@ use axum::http::{HeaderMap, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::Router;
-use futures_util::TryStreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -113,13 +113,14 @@ async fn ollama_proxy(State(ctx): State<ProxyCtx>, req: Request<Body>) -> Respon
         .path_and_query()
         .map(|pq| pq.as_str())
         .unwrap_or("/");
-    let stripped = path_q.strip_prefix("/ollama").unwrap_or(path_q);
-    let stripped = if stripped.is_empty() { "/" } else { stripped };
+    let stripped = path_q.strip_prefix("/ollama").unwrap_or(path_q).to_string();
+    let stripped = if stripped.is_empty() { "/".to_string() } else { stripped };
     let target = format!("http://{OLLAMA_LOCAL}{stripped}");
+    let is_pull = stripped.starts_with("/api/pull");
 
     let activity = ctx.state.begin_activity(
         "ollama",
-        stripped,
+        &stripped,
         &header_str(req.headers(), "x-clipai-job-id"),
         &header_str(req.headers(), "x-clipai-job-title"),
         &header_str(req.headers(), "x-clipai-stage"),
@@ -127,15 +128,27 @@ async fn ollama_proxy(State(ctx): State<ProxyCtx>, req: Request<Body>) -> Respon
 
     let method = reqwest::Method::from_bytes(req.method().as_str().as_bytes())
         .unwrap_or(reqwest::Method::GET);
-    let mut upstream = ctx.client.request(method, &target);
+    // Forwardable headers (drop hop-by-hop + auth).
+    let mut fwd: Vec<(String, String)> = Vec::new();
     for (name, value) in req.headers() {
         let lower = name.as_str().to_ascii_lowercase();
         if ["host", "authorization", "connection", "content-length"].contains(&lower.as_str()) {
             continue;
         }
         if let Ok(v) = value.to_str() {
-            upstream = upstream.header(name.as_str(), v);
+            fwd.push((name.as_str().to_string(), v.to_string()));
         }
+    }
+
+    // A model pull ClipAI pushes through here: record its progress so the
+    // Companion GUI can SHOW the download, not just silently proxy it.
+    if is_pull {
+        return proxy_pull(ctx, req, target, method, fwd, activity).await;
+    }
+
+    let mut upstream = ctx.client.request(method, &target);
+    for (n, v) in fwd {
+        upstream = upstream.header(n, v);
     }
     let body_stream = req
         .into_body()
@@ -149,6 +162,104 @@ async fn ollama_proxy(State(ctx): State<ProxyCtx>, req: Request<Body>) -> Respon
             relay(resp)
         }
         Err(e) => {
+            ctx.state.end_activity(activity, 502);
+            bad_gateway(e)
+        }
+    }
+}
+
+/// Forward an /api/pull, teeing the NDJSON progress into AppState so the
+/// Companion GUI shows the download ClipAI initiated.
+async fn proxy_pull(
+    ctx: ProxyCtx,
+    req: Request<Body>,
+    target: String,
+    method: reqwest::Method,
+    fwd: Vec<(String, String)>,
+    activity: u64,
+) -> Response {
+    // The pull body is tiny ({"name":"…"}) — buffer it to read the model.
+    let body_bytes = match axum::body::to_bytes(req.into_body(), 64 * 1024).await {
+        Ok(b) => b,
+        Err(e) => {
+            ctx.state.end_activity(activity, 400);
+            return bad_gateway(e);
+        }
+    };
+    let model = serde_json::from_slice::<serde_json::Value>(&body_bytes)
+        .ok()
+        .and_then(|v| {
+            v.get("name")
+                .or_else(|| v.get("model"))
+                .and_then(|m| m.as_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_default();
+    if !model.is_empty() {
+        ctx.state.note_incoming_pull(&model, 0.0);
+    }
+
+    let mut upstream = ctx.client.request(method, &target);
+    for (n, v) in fwd {
+        upstream = upstream.header(n, v);
+    }
+    upstream = upstream.body(body_bytes.to_vec());
+
+    match upstream.send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            ctx.state.end_activity(activity, status.as_u16());
+            if !status.is_success() {
+                if !model.is_empty() {
+                    ctx.state.clear_incoming_pull(&model);
+                }
+                return relay(resp);
+            }
+            let out_status =
+                StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::OK);
+            let mut builder = Response::builder().status(out_status);
+            for (name, value) in resp.headers() {
+                let lower = name.as_str().to_ascii_lowercase();
+                if ["connection", "transfer-encoding", "keep-alive"].contains(&lower.as_str()) {
+                    continue;
+                }
+                builder = builder.header(name, value);
+            }
+            let state = ctx.state.clone();
+            let model_c = model.clone();
+            let mut buf: Vec<u8> = Vec::new();
+            let stream = resp.bytes_stream().map(move |chunk| {
+                if let (Ok(bytes), false) = (&chunk, model_c.is_empty()) {
+                    buf.extend_from_slice(bytes);
+                    while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+                        let line: Vec<u8> = buf.drain(..=nl).collect();
+                        let line = &line[..line.len().saturating_sub(1)];
+                        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) {
+                            let st = v.get("status").and_then(|s| s.as_str()).unwrap_or("");
+                            let total = v.get("total").and_then(|t| t.as_u64()).unwrap_or(0);
+                            let completed = v.get("completed").and_then(|c| c.as_u64()).unwrap_or(0);
+                            if total > 0 {
+                                state.note_incoming_pull(
+                                    &model_c,
+                                    completed as f64 / total as f64 * 100.0,
+                                );
+                            }
+                            if st == "success" || v.get("error").is_some() {
+                                state.clear_incoming_pull(&model_c);
+                            }
+                        }
+                    }
+                }
+                chunk.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+            });
+            builder
+                .body(Body::from_stream(stream))
+                .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+        }
+        Err(e) => {
+            if !model.is_empty() {
+                ctx.state.clear_incoming_pull(&model);
+            }
             ctx.state.end_activity(activity, 502);
             bad_gateway(e)
         }

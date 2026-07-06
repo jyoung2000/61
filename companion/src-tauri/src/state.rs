@@ -3,7 +3,7 @@
 //! managed Ollama / whisper-sidecar child processes.
 
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -106,6 +106,10 @@ pub struct AppState {
     /// Guard so concurrent ensure_running() calls don't spawn `ollama serve`
     /// more than once (the supervisor loop + the UI's start button can race).
     pub ollama_starting: AtomicBool,
+    /// Model pulls flowing THROUGH the proxy (initiated by ClipAI): model →
+    /// (percent, last_update_ms). Lets the Companion GUI show downloads that
+    /// ClipAI pushed, not just ones started from the Companion itself.
+    pub incoming_pulls: Mutex<HashMap<String, (f64, u64)>>,
     /// Serializes GPU-heavy whisper work: one transcription at a time.
     pub whisper_slot: tokio::sync::Semaphore,
     /// Last time any proxied request finished (ms epoch) — idle shutdown.
@@ -141,6 +145,7 @@ impl AppState {
             sidecar: tokio::sync::Mutex::new(None),
             ollama_child: tokio::sync::Mutex::new(None),
             ollama_starting: AtomicBool::new(false),
+            incoming_pulls: Mutex::new(HashMap::new()),
             whisper_slot: tokio::sync::Semaphore::new(1),
             last_request_ms: AtomicU64::new(now_ms()),
             whisper_busy: AtomicBool::new(false),
@@ -167,6 +172,27 @@ impl AppState {
 
     pub fn config_snapshot(&self) -> Config {
         self.config.lock().unwrap().clone()
+    }
+
+    /// Record progress of a model pull flowing through the proxy.
+    pub fn note_incoming_pull(&self, model: &str, percent: f64) {
+        self.incoming_pulls
+            .lock()
+            .unwrap()
+            .insert(model.to_string(), (percent, now_ms()));
+    }
+
+    pub fn clear_incoming_pull(&self, model: &str) {
+        self.incoming_pulls.lock().unwrap().remove(model);
+    }
+
+    /// Snapshot of in-flight incoming pulls, dropping entries not updated in
+    /// the last 2 minutes (a client that vanished mid-pull).
+    pub fn incoming_pulls_snapshot(&self) -> Vec<(String, f64)> {
+        let now = now_ms();
+        let mut map = self.incoming_pulls.lock().unwrap();
+        map.retain(|_, (_, ts)| now.saturating_sub(*ts) < 120_000);
+        map.iter().map(|(m, (p, _))| (m.clone(), *p)).collect()
     }
 
     pub fn begin_activity(

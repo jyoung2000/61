@@ -130,6 +130,9 @@ async fn get_status(state: tauri::State<'_, SharedState>) -> Result<serde_json::
         "busy": state.whisper_busy.load(Ordering::Relaxed),
         "current_job": state.current_job(),
         "activity": activity,
+        "incoming_pulls": state.incoming_pulls_snapshot().into_iter()
+            .map(|(m, p)| serde_json::json!({"model": m, "percent": p}))
+            .collect::<Vec<_>>(),
         "lan_ip": pairing::detect_lan_ip(),
         "recommended_models": ollama::recommended_models(budget)
             .into_iter()

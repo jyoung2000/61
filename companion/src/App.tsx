@@ -17,6 +17,19 @@ const OLLAMA_CATALOG = [
   'mistral:7b', 'phi3:mini', 'nomic-embed-text',
 ];
 
+// AdGuard Home "allow" rules for the hosts model downloads need. If a DNS
+// blocker filters these, pulls stall — often near the end when Ollama fetches
+// blobs from its Cloudflare R2 CDN (*.r2.cloudflarestorage.com).
+const ADGUARD_RULES = [
+  '@@||ollama.com^',
+  '@@||registry.ollama.ai^',
+  '@@||r2.cloudflarestorage.com^',
+  '@@||huggingface.co^',
+  '@@||hf.co^',
+  '@@||github.com^',
+  '@@||githubusercontent.com^',
+];
+
 const fmtMb = (mb: number) => (mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${mb} MB`);
 const fmtBytes = (b: number) => {
   if (!b) return '—';
@@ -366,6 +379,8 @@ function Dashboard({ status, refresh }: { status: CompanionStatus; refresh: () =
   const [modelQuery, setModelQuery] = useState('');
   const [pullingTag, setPullingTag] = useState('');
   const [addrCopied, setAddrCopied] = useState(false);
+  const [adguardOpen, setAdguardOpen] = useState(false);
+  const [adguardCopied, setAdguardCopied] = useState(false);
 
   useEffect(() => { autostartEnabled().then(setAutostart).catch(() => setAutostart(null)); }, []);
 
@@ -718,6 +733,26 @@ function Dashboard({ status, refresh }: { status: CompanionStatus; refresh: () =
         {syncMsg && (
           <div className="small muted" style={{ marginBottom: 6 }}>{syncMsg}</div>
         )}
+        {/* Downloads pushed from ClipAI through the proxy — shown here so the
+            Companion reflects models ClipAI is syncing to this GPU. */}
+        {(status.incoming_pulls || []).length > 0 && (
+          <div style={{ marginBottom: 10 }}>
+            <div className="small" style={{ marginBottom: 4, color: 'var(--accent)' }}>
+              Downloading from ClipAI…
+            </div>
+            {status.incoming_pulls.map((p) => (
+              <div key={p.model} style={{ marginBottom: 6 }}>
+                <div className="row spread small" style={{ fontFamily: 'var(--font-mono)' }}>
+                  <span style={{ color: 'var(--text-secondary)' }}>{p.model}</span>
+                  <span className="muted">{p.percent >= 0 ? `${Math.round(p.percent)}%` : '…'}</span>
+                </div>
+                <div className="meter">
+                  <div style={{ width: `${Math.max(2, Math.min(100, p.percent))}%` }} />
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
         {models.length === 0 ? (
           <p className="muted small">
             No models installed yet. Pick models in ClipAI and hit Save (or use the setup
@@ -758,6 +793,39 @@ function Dashboard({ status, refresh }: { status: CompanionStatus; refresh: () =
         <p className="muted small" style={{ marginTop: 8 }}>
           Deleting frees disk space; the model must be re-downloaded to use it again.
         </p>
+      </div>
+
+      <div className="panel">
+        <div className="row spread">
+          <h2 style={{ margin: 0 }}>Network / AdGuard allowlist</h2>
+          <a href="#" onClick={(e) => { e.preventDefault(); setAdguardOpen((o) => !o); }}>
+            {adguardOpen ? 'Hide' : 'Show'}
+          </a>
+        </div>
+        {adguardOpen && (
+          <>
+            <p className="muted small" style={{ marginTop: 6 }}>
+              If AdGuard Home (or any DNS blocker) filters these hosts, model downloads
+              stall — often near the end, when Ollama fetches blobs from its Cloudflare
+              CDN (<span className="mono">*.r2.cloudflarestorage.com</span>). Paste these
+              into AdGuard Home → Filters → <strong>Custom filtering rules</strong>.
+            </p>
+            <pre style={{
+              background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 6,
+              padding: '8px 10px', fontSize: 11, fontFamily: 'var(--font-mono)',
+              overflowX: 'auto', margin: '4px 0', userSelect: 'text', color: 'var(--text)',
+            }}>{ADGUARD_RULES.join('\n')}</pre>
+            <button className="secondary" onClick={() => {
+              navigator.clipboard.writeText(ADGUARD_RULES.join('\n'));
+              setAdguardCopied(true); setTimeout(() => setAdguardCopied(false), 1500);
+            }}>{adguardCopied ? 'Copied ✓' : 'Copy rules'}</button>
+            <p className="muted small" style={{ marginTop: 8 }}>
+              These are DNS-level allow rules for the internet hosts Ollama, Whisper models
+              (Hugging Face) and the installer (GitHub) come from. Traffic between ClipAI
+              and this Companion is on your LAN and isn't affected by AdGuard.
+            </p>
+          </>
+        )}
       </div>
 
       <div className="panel">
