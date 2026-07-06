@@ -83,5 +83,17 @@ export const downloadWhisper = () => invoke<string>('download_whisper');
 export const refreshSidecar = () => invoke<boolean>('refresh_sidecar');
 /** Write a full diagnostics report to Downloads and reveal it; returns the path. */
 export const exportLogs = () => invoke<string>('export_logs');
+export interface ClipaiTest {
+  contacted: boolean;
+  connected: boolean;
+  serving: boolean;
+  secs_ago: number;
+  paired_url: string;
+  probe: { attempted: boolean; ok?: boolean; status?: number; error?: string; url?: string };
+  port: number;
+  lan_ip: string | null;
+}
+/** Test whether a ClipAI container is properly connected to this companion. */
+export const testClipai = () => invoke<ClipaiTest>('test_clipai');
 export const pairClipai = (clipaiUrl: string, apiKey: string) =>
   invoke('pair_clipai', { clipaiUrl, apiKey });

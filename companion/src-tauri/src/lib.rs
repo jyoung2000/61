@@ -478,6 +478,59 @@ async fn export_logs(
     Ok(path.to_string_lossy().to_string())
 }
 
+/// Test whether a ClipAI container is properly connected to THIS companion.
+/// The real data flow is ClipAI → companion (ClipAI is the client hitting our
+/// proxy on :11500), so the authoritative signal is "did an authenticated
+/// ClipAI request arrive recently". When we also know ClipAI's URL (paired),
+/// probe it back to confirm the LAN link is healthy both directions.
+#[tauri::command]
+async fn test_clipai(state: tauri::State<'_, SharedState>) -> Result<serde_json::Value, String> {
+    let cfg = state.config_snapshot();
+    let now = state::now_ms();
+    let last = state.last_clipai_contact_ms();
+    let contacted = last > 0;
+    let secs_ago = if contacted { now.saturating_sub(last) / 1000 } else { 0 };
+
+    // Active back-probe (companion → ClipAI) when we know the URL. Uses an
+    // unauthenticated ClipAI endpoint (the companion doesn't store ClipAI's key).
+    let mut probe = serde_json::json!({ "attempted": false });
+    let url = cfg.paired_clipai_url.trim().trim_end_matches('/').to_string();
+    if !url.is_empty() {
+        let target = format!("{url}/api/providers/status");
+        match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+        {
+            Ok(client) => match client.get(&target).send().await {
+                Ok(r) => {
+                    probe = serde_json::json!({
+                        "attempted": true, "ok": r.status().is_success(),
+                        "status": r.status().as_u16(), "url": url,
+                    });
+                }
+                Err(e) => {
+                    probe = serde_json::json!({
+                        "attempted": true, "ok": false,
+                        "error": format!("{e}"), "url": url,
+                    });
+                }
+            },
+            Err(e) => probe = serde_json::json!({ "attempted": true, "ok": false, "error": format!("{e}") }),
+        }
+    }
+
+    Ok(serde_json::json!({
+        "contacted": contacted,
+        "connected": state.clipai_connected(),
+        "serving": state.serving_jobs(),
+        "secs_ago": secs_ago,
+        "paired_url": url,
+        "probe": probe,
+        "port": cfg.port,
+        "lan_ip": pairing::detect_lan_ip(),
+    }))
+}
+
 #[tauri::command]
 async fn delete_model(model: String) -> Result<(), String> {
     ollama::delete_model(&model).await
@@ -809,6 +862,7 @@ pub fn run() {
             refresh_sidecar,
             download_whisper,
             export_logs,
+            test_clipai,
             pair_clipai,
         ]);
 

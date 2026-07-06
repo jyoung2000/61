@@ -3473,11 +3473,15 @@ async def companion_register(req: CompanionRegisterRequest,
 
 
 @router.post("/settings/companion-verify")
-async def companion_verify(_key: str = _Depends(_verify_api_key)):
+async def companion_verify():
     """Round-trip proof that work actually EXECUTES on the paired Companion —
     not just that its token authenticates. Runs a 1-token sentinel generation
     for each selected local model against the Companion's Ollama proxy and
     checks its Whisper capability, so "paired" means "a job ran on that GPU".
+
+    Browser-called (from Settings), so it is unauthenticated like the sibling
+    /settings/ollama-hosts/test and /providers/status endpoints — requiring the
+    API key here 401'd the webapp's fetch and bounced it to the login screen.
     """
     from backend.services import ollama_registry as _oreg
     import httpx as _httpx

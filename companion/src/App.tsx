@@ -6,7 +6,7 @@ import {
   CompanionStatus, getStatus, setConfig, regenerateToken,
   installOllama, startOllama, pullModel, pairClipai,
   listModels, deleteModel, InstalledModel,
-  downloadWhisper, refreshSidecar, exportLogs,
+  downloadWhisper, refreshSidecar, exportLogs, testClipai, ClipaiTest,
 } from './api';
 
 // Common Ollama models offered as search suggestions on the Companion.
@@ -434,6 +434,20 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
     refresh();
   };
 
+  const [clipaiTest, setClipaiTest] = useState<ClipaiTest | null>(null);
+  const [testingClipai, setTestingClipai] = useState(false);
+  const doTestClipai = async () => {
+    setTestingClipai(true);
+    setClipaiTest(null);
+    try {
+      setClipaiTest(await testClipai());
+    } catch {
+      setClipaiTest(null);
+    } finally {
+      setTestingClipai(false);
+    }
+  };
+
   const [exporting, setExporting] = useState(false);
   const doExportLogs = async () => {
     setExporting(true);
@@ -705,6 +719,47 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
               : status.config.paired_clipai_url ? 'ClipAI paired — waiting for requests'
               : 'No ClipAI connected yet'}
           </div>
+          <div className="row" style={{ marginBottom: 6 }}>
+            <button className="secondary" onClick={doTestClipai} disabled={testingClipai}
+              title="Check whether a ClipAI container is properly connected to this companion">
+              {testingClipai ? 'Testing…' : 'Test ClipAI connection'}
+            </button>
+          </div>
+          {clipaiTest && (
+            <div className="small" style={{
+              margin: '0 0 8px', padding: '8px 10px', borderRadius: 6,
+              background: 'var(--elevated)',
+              borderLeft: `3px solid ${clipaiTest.connected ? 'var(--success)' : 'var(--warn)'}`,
+            }}>
+              {clipaiTest.connected ? (
+                <div style={{ color: 'var(--success)', fontWeight: 600 }}>
+                  ✓ ClipAI is connected{clipaiTest.serving ? ' and sending jobs' : ' (reachable, idle)'}
+                </div>
+              ) : clipaiTest.contacted ? (
+                <div style={{ color: 'var(--warn)', fontWeight: 600 }}>
+                  ⚠ A ClipAI last contacted this companion {clipaiTest.secs_ago}s ago, but not in the last minute
+                </div>
+              ) : (
+                <div style={{ color: 'var(--warn)', fontWeight: 600 }}>
+                  ✗ No ClipAI has contacted this companion yet
+                </div>
+              )}
+              {!clipaiTest.contacted && (
+                <div className="muted" style={{ marginTop: 4 }}>
+                  In ClipAI → Settings → Ollama Hosts, add <span className="mono">http://{clipaiTest.lan_ip || '<this-PC-IP>'}:{clipaiTest.port}/ollama</span> with
+                  the token above, and allow inbound TCP {clipaiTest.port} in the Windows firewall.
+                </div>
+              )}
+              {clipaiTest.probe?.attempted && (
+                <div className="muted" style={{ marginTop: 4 }}>
+                  Back-probe to {clipaiTest.probe.url}:{' '}
+                  {clipaiTest.probe.ok
+                    ? 'reachable ✓'
+                    : `unreachable — ${clipaiTest.probe.error || `HTTP ${clipaiTest.probe.status}`}`}
+                </div>
+              )}
+            </div>
+          )}
           <div className="row small" style={{ marginBottom: 6 }}>
             <span className={`dot ${status.ollama.running ? 'ok' : 'bad'}`} />
             Ollama {status.ollama.running
