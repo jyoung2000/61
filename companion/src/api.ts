@@ -25,6 +25,8 @@ export interface CompanionStatus {
     token: string;
     port: number;
     vram_budget_gb: number;
+    vram_auto: boolean;
+    vram_buffer_gb: number;
     ollama_keep_alive: string;
     sidecar_idle_min: number;
     paused: boolean;

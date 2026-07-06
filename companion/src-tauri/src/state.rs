@@ -37,6 +37,13 @@ pub struct Config {
     pub name: String,
     /// Whether the first-run wizard has completed.
     pub setup_complete: bool,
+    /// Auto-allocate VRAM: budget tracks free VRAM (measured while Ollama is
+    /// idle) so the card is shared dynamically with games/other apps — it uses
+    /// what's free minus `vram_buffer_gb`, and backs off when other apps need
+    /// more. When true, `vram_budget_gb` (the manual slider) is ignored.
+    pub vram_auto: bool,
+    /// GB always kept free for the desktop in auto mode.
+    pub vram_buffer_gb: f32,
 }
 
 impl Default for Config {
@@ -51,6 +58,8 @@ impl Default for Config {
             paired_clipai_url: String::new(),
             name: default_name(),
             setup_complete: false,
+            vram_auto: false,
+            vram_buffer_gb: 1.0,
         }
     }
 }
@@ -113,6 +122,14 @@ pub struct AppState {
     /// ms epoch of the last authenticated request from a ClipAI server (any
     /// proxy route). Drives the "ClipAI connected" indicator.
     pub last_clipai_contact: AtomicU64,
+    /// VRAM (MB) used by NON-companion apps, measured while Ollama holds no
+    /// resident model. Auto-VRAM sizes the budget as total − this − buffer.
+    pub gpu_baseline_used_mb: AtomicU64,
+    /// ms epoch of the last auto-VRAM Ollama restart (debounces re-applies).
+    pub last_auto_apply_ms: AtomicU64,
+    /// Baseline (MB) in effect at the last auto-VRAM apply, so we only restart
+    /// Ollama when free VRAM has drifted materially (game started/stopped).
+    pub last_auto_baseline_mb: AtomicU64,
     /// Serializes GPU-heavy whisper work: one transcription at a time.
     pub whisper_slot: tokio::sync::Semaphore,
     /// Last time any proxied request finished (ms epoch) — idle shutdown.
@@ -150,6 +167,9 @@ impl AppState {
             ollama_starting: AtomicBool::new(false),
             incoming_pulls: Mutex::new(HashMap::new()),
             last_clipai_contact: AtomicU64::new(0),
+            gpu_baseline_used_mb: AtomicU64::new(0),
+            last_auto_apply_ms: AtomicU64::new(0),
+            last_auto_baseline_mb: AtomicU64::new(u64::MAX),
             whisper_slot: tokio::sync::Semaphore::new(1),
             last_request_ms: AtomicU64::new(now_ms()),
             whisper_busy: AtomicBool::new(false),
@@ -259,12 +279,25 @@ impl AppState {
             .cloned()
     }
 
-    /// Effective VRAM budget in GB: the user's slider, or (total − 1 GB)
-    /// when set to auto/0, clamped to sane bounds.
+    /// Effective VRAM budget in GB. Auto mode: total − (non-companion usage) −
+    /// buffer, so the card is shared dynamically with games/other apps. Manual
+    /// mode: the user's slider, or (total − 1 GB) when the slider is 0/auto.
     pub fn effective_budget_gb(&self) -> f32 {
-        let configured = self.config.lock().unwrap().vram_budget_gb;
+        let (auto, buffer, configured) = {
+            let c = self.config.lock().unwrap();
+            (c.vram_auto, c.vram_buffer_gb, c.vram_budget_gb)
+        };
         let total_gb = self.gpu.lock().unwrap().vram_total_mb as f32 / 1024.0;
-        let budget = if configured > 0.1 {
+
+        let budget = if auto {
+            if total_gb > 0.5 {
+                let baseline_gb =
+                    self.gpu_baseline_used_mb.load(Ordering::Relaxed) as f32 / 1024.0;
+                (total_gb - baseline_gb - buffer.max(0.0)).max(1.0)
+            } else {
+                4.0
+            }
+        } else if configured > 0.1 {
             configured
         } else if total_gb > 0.5 {
             (total_gb - 1.0).max(1.0)

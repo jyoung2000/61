@@ -114,6 +114,8 @@ async fn get_status(state: tauri::State<'_, SharedState>) -> Result<serde_json::
             "token": config.token,
             "port": config.port,
             "vram_budget_gb": config.vram_budget_gb,
+            "vram_auto": config.vram_auto,
+            "vram_buffer_gb": config.vram_buffer_gb,
             "ollama_keep_alive": config.ollama_keep_alive,
             "sidecar_idle_min": config.sidecar_idle_min,
             "paused": config.paused,
@@ -151,6 +153,8 @@ struct ConfigPatch {
     paused: Option<bool>,
     name: Option<String>,
     setup_complete: Option<bool>,
+    vram_auto: Option<bool>,
+    vram_buffer_gb: Option<f32>,
 }
 
 #[tauri::command]
@@ -189,7 +193,27 @@ async fn set_config(
         if let Some(v) = patch.setup_complete {
             cfg.setup_complete = v;
         }
+        if let Some(v) = patch.vram_auto {
+            if v != cfg.vram_auto {
+                cfg.vram_auto = v;
+                ollama_restart_needed = true;
+                sidecar_restart_needed = true;
+            }
+        }
+        if let Some(v) = patch.vram_buffer_gb {
+            let v = v.clamp(0.0, 64.0);
+            if (v - cfg.vram_buffer_gb).abs() > 0.01 {
+                cfg.vram_buffer_gb = v;
+                if cfg.vram_auto {
+                    ollama_restart_needed = true;
+                    sidecar_restart_needed = true;
+                }
+            }
+        }
     }
+    // Force the auto-VRAM loop to re-apply immediately after a settings change.
+    state.last_auto_baseline_mb.store(u64::MAX, Ordering::Relaxed);
+    state.last_auto_apply_ms.store(0, Ordering::Relaxed);
     state.save();
     if ollama_restart_needed {
         // Apply the new VRAM reservation: the managed daemon restarts with
@@ -479,6 +503,42 @@ pub fn run() {
                             .await
                             .unwrap_or_default();
                         *state.gpu.lock().unwrap() = snap.clone();
+
+                        // ── Auto-VRAM: track what other apps use and re-share ──
+                        if snap.vram_total_mb > 0 {
+                            // Baseline (non-companion VRAM) is only meaningful
+                            // when Ollama holds no model — else "used" includes
+                            // our own model. Measured here so it reflects games.
+                            if ollama::loaded_model_count().await == 0 {
+                                let baseline =
+                                    snap.vram_total_mb.saturating_sub(snap.vram_free_mb);
+                                state.gpu_baseline_used_mb.store(baseline, Ordering::Relaxed);
+                            }
+                            let auto = state.config.lock().unwrap().vram_auto;
+                            if auto {
+                                let busy = state.whisper_busy.load(Ordering::Relaxed)
+                                    || state.current_job().is_some();
+                                let managed = state.ollama_child.lock().await.is_some();
+                                let now = state::now_ms();
+                                let since = now.saturating_sub(
+                                    state.last_auto_apply_ms.load(Ordering::Relaxed));
+                                let baseline =
+                                    state.gpu_baseline_used_mb.load(Ordering::Relaxed);
+                                let last = state.last_auto_baseline_mb.load(Ordering::Relaxed);
+                                // Re-apply only when idle and free VRAM has
+                                // drifted >1 GB since we last set the budget, at
+                                // most every 30 s (a restart briefly unloads).
+                                if managed && !busy && since > 30_000 && baseline.abs_diff(last) > 1024 {
+                                    log::info!(
+                                        "auto-vram: free VRAM changed (baseline {last}→{baseline} MB) — re-sharing"
+                                    );
+                                    if ollama::restart(&state).await.is_ok() {
+                                        state.last_auto_baseline_mb.store(baseline, Ordering::Relaxed);
+                                        state.last_auto_apply_ms.store(now, Ordering::Relaxed);
+                                    }
+                                }
+                            }
+                        }
                         if let Some(tray) = app_handle.tray_by_id("main-tray") {
                             let busy = state.whisper_busy.load(Ordering::Relaxed)
                                 || state.current_job().is_some();

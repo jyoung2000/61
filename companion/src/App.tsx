@@ -365,6 +365,7 @@ function Wizard({ status, refresh, onDone }: {
 
 function Dashboard({ status, refresh }: { status: CompanionStatus; refresh: () => void }) {
   const [budget, setBudget] = useState<number | null>(null);
+  const [bufferGb, setBufferGb] = useState<number | null>(null);
   const [autostart, setAutostart] = useState<boolean | null>(null);
   const [pairOpen, setPairOpen] = useState(false);
   const [clipaiUrl, setClipaiUrl] = useState(status.config.paired_clipai_url);
@@ -496,6 +497,12 @@ function Dashboard({ status, refresh }: { status: CompanionStatus; refresh: () =
     refresh();
   };
 
+  const commitBuffer = async (v: number) => {
+    setBufferGb(null);
+    await setConfig({ vram_buffer_gb: v });
+    refresh();
+  };
+
   const doPair = async () => {
     setPairMsg('');
     try {
@@ -561,22 +568,63 @@ function Dashboard({ status, refresh }: { status: CompanionStatus; refresh: () =
           ) : (
             <p className="muted">No GPU telemetry available.</p>
           )}
-          <div className="row spread">
-            <span className="small" title="A soft budget: the Companion sizes Whisper and reserves the rest of the card away from Ollama (OLLAMA_GPU_OVERHEAD). Individual allocations can still briefly exceed it.">
-              GPU memory ClipAI may use: <strong>{sliderValue.toFixed(1)} GB</strong> ⓘ
+          <label className="row small" style={{ gap: 8, margin: '4px 0 8px', cursor: 'pointer' }}>
+            <input
+              type="checkbox"
+              checked={status.config.vram_auto}
+              onChange={(e) => setConfig({ vram_auto: e.target.checked }).then(refresh)}
+              style={{ width: 'auto' }}
+            />
+            <span>
+              <strong>Auto-allocate VRAM</strong> — dynamically use free memory,
+              leaving a buffer so other apps (games, editors) can grow.
             </span>
-          </div>
-          <input
-            type="range" min={2} max={sliderMax} step={0.5} value={sliderValue}
-            onChange={(e) => setBudget(parseFloat(e.target.value))}
-            onMouseUp={() => budget !== null && commitBudget(budget)}
-            onTouchEnd={() => budget !== null && commitBudget(budget)}
-          />
-          <div className="small muted">
-            Whisper tier at this budget: <span className="mono">{status.whisper_tier.model}</span>
-            {' '}({status.whisper_tier.compute}) — changing the slider restarts Ollama with the
-            new reservation.
-          </div>
+          </label>
+
+          {status.config.vram_auto ? (
+            <>
+              <div className="row spread small" style={{ marginBottom: 4 }}>
+                <span title="The Companion measures how much VRAM other apps are using while no model is loaded, then gives Ollama the rest minus this buffer. When other apps need more (e.g. you start gaming), it re-shares and steps back — always keeping this much free on top of what they use.">
+                  Free-VRAM buffer to keep for other apps ⓘ
+                </span>
+                <span className="mono">{status.config.vram_buffer_gb.toFixed(1)} GB</span>
+              </div>
+              <input
+                type="range" min={0} max={Math.max(2, Math.floor(totalGb))} step={0.5}
+                value={bufferGb ?? status.config.vram_buffer_gb}
+                onChange={(e) => setBufferGb(parseFloat(e.target.value))}
+                onMouseUp={() => bufferGb !== null && commitBuffer(bufferGb)}
+                onTouchEnd={() => bufferGb !== null && commitBuffer(bufferGb)}
+              />
+              <div className="small muted">
+                Currently giving Ollama <strong>{status.effective_budget_gb.toFixed(1)} GB</strong>
+                {' '}(total {totalGb.toFixed(1)} GB − in-use by other apps −{' '}
+                {(bufferGb ?? status.config.vram_buffer_gb).toFixed(1)} GB buffer).
+                Whisper tier: <span className="mono">{status.whisper_tier.model}</span>
+                {' '}({status.whisper_tier.compute}). Re-shares automatically when the card is idle
+                and other apps' usage shifts by more than ~1 GB.
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="row spread">
+                <span className="small" title="A soft budget: the Companion sizes Whisper and reserves the rest of the card away from Ollama (OLLAMA_GPU_OVERHEAD). Individual allocations can still briefly exceed it.">
+                  GPU memory ClipAI may use: <strong>{sliderValue.toFixed(1)} GB</strong> ⓘ
+                </span>
+              </div>
+              <input
+                type="range" min={2} max={sliderMax} step={0.5} value={sliderValue}
+                onChange={(e) => setBudget(parseFloat(e.target.value))}
+                onMouseUp={() => budget !== null && commitBudget(budget)}
+                onTouchEnd={() => budget !== null && commitBudget(budget)}
+              />
+              <div className="small muted">
+                Whisper tier at this budget: <span className="mono">{status.whisper_tier.model}</span>
+                {' '}({status.whisper_tier.compute}) — changing the slider restarts Ollama with the
+                new reservation.
+              </div>
+            </>
+          )}
         </div>
 
         <div className="panel">

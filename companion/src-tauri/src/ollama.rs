@@ -79,6 +79,24 @@ pub async fn daemon_running() -> bool {
         .is_ok()
 }
 
+/// Number of models currently resident in VRAM (via /api/ps). 0 means Ollama
+/// holds no GPU memory, so free VRAM reflects only other apps — the moment to
+/// measure the auto-VRAM baseline. Fail-open to 0.
+pub async fn loaded_model_count() -> usize {
+    let Ok(resp) = reqwest::Client::new()
+        .get(format!("http://{OLLAMA_LOCAL}/api/ps"))
+        .timeout(std::time::Duration::from_secs(2))
+        .send()
+        .await
+    else {
+        return 0;
+    };
+    let Ok(json) = resp.json::<serde_json::Value>().await else {
+        return 0;
+    };
+    json["models"].as_array().map(|a| a.len()).unwrap_or(0)
+}
+
 pub async fn list_models() -> Vec<String> {
     let Ok(resp) = reqwest::Client::new()
         .get(format!("http://{OLLAMA_LOCAL}/api/tags"))
