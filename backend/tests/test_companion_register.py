@@ -116,6 +116,41 @@ def test_pairing_enables_whisper_when_capable(client, monkeypatch):
     assert settings.WHISPER_REMOTE_API_KEY == "tok-abc"
 
 
+def test_companion_status_unpaired(client):
+    resp = client.get("/api/providers/companion-status")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["paired"] is False
+    assert data["online"] is False
+
+
+def test_companion_status_reports_online(client):
+    assert _pair(client).status_code == 200
+    resp = client.get("/api/providers/companion-status")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["paired"] is True
+    assert data["online"] is True  # fake_probe reports online
+    assert data["gpu_name"] == "NVIDIA GeForce RTX 4070"
+    assert data["last_seen_ms"] > 0
+
+
+def test_companion_status_reports_offline(client, monkeypatch):
+    assert _pair(client).status_code == 200
+
+    async def _offline_probe(host, force=False, timeout=None):
+        return R.HostStatus(host_id=host.id, online=False,
+                            error="ConnectError: refused")
+
+    monkeypatch.setattr(R, "probe", _offline_probe)
+    resp = client.get("/api/providers/companion-status")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["paired"] is True
+    assert data["online"] is False
+    assert "refused" in (data["error"] or "")
+
+
 def test_companion_verify_404_without_companion(client):
     resp = client.post("/api/settings/companion-verify",
                        headers={"Authorization": "Bearer clipai-key-123"})

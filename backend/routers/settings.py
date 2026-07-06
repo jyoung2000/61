@@ -678,6 +678,11 @@ async def provider_status():
                     logger.debug("remote-whisper auto-config skipped: %s", _we)
             _whisper_url = (getattr(settings, "WHISPER_REMOTE_URL", "") or "").strip()
             _whisper_remote_on = _whisper_url.rstrip("/") == _comp_base.rstrip("/") and bool(_whisper_url)
+            _now_ms = int(time.time() * 1000)
+            if bool(_comp.get("online")):
+                _companion_seen.update({"url": _comp_url, "last_online_ms": _now_ms})
+            _last_seen = (_companion_seen["last_online_ms"]
+                          if _companion_seen.get("url") == _comp_url else 0)
             companion_info = {
                 "name": _comp.get("name", ""),
                 "gpu_name": _comp.get("gpu_name", ""),
@@ -689,6 +694,12 @@ async def provider_status():
                 "missing": [m for m in want if m not in ready],
                 "ready": bool(want) and len(ready) == len(want) and bool(_comp.get("online")),
                 "whisper_remote": _whisper_remote_on,
+                # Live-detection fields so the UI can tell "went offline / expired"
+                # from "never paired", and show how long ago it was last seen.
+                "latency_ms": _comp.get("latency_ms"),
+                "error": _comp.get("error"),
+                "in_cooldown": bool(_comp.get("in_cooldown")),
+                "last_seen_ms": _last_seen,
             }
     except Exception as _e:
         logger.debug("companion status calc failed: %s", _e)
@@ -845,6 +856,49 @@ async def provider_status():
     _status_cache = statuses
     _status_cache_ts = time.time()
     return statuses
+
+
+@router.get("/providers/companion-status")
+async def companion_status():
+    """Cheap, fast-pollable liveness of the paired GPU Companion so the UI can
+    detect within ~10s when it goes offline / expires — without the heavy
+    all-hosts/all-providers work of /providers/status. Probes ONLY the Companion
+    host (result cached ~10s in the registry)."""
+    from backend.services import ollama_registry as _oreg
+    hosts = _oreg.get_hosts()
+    comp = _find_companion_host(hosts)
+    if comp is None:
+        return {"paired": False, "online": False}
+    st = await _oreg.probe(comp)
+    now_ms = int(time.time() * 1000)
+    if st.online:
+        _companion_seen.update({"url": comp.url, "last_online_ms": now_ms})
+    last_seen = (_companion_seen["last_online_ms"]
+                 if _companion_seen.get("url") == comp.url else 0)
+    want: list[str] = []
+    for _m in (settings.OLLAMA_PRIMARY_MODEL, settings.OLLAMA_EDITORIAL_MODEL,
+               settings.OLLAMA_TRANSLATION_MODEL):
+        if _m and _m not in want:
+            want.append(_m)
+    ready = [m for m in want if _oreg.model_present(st.models, m)]
+    comp_base = comp.url[:-len("/ollama")] if comp.url.endswith("/ollama") else comp.url
+    whisper_url = (getattr(settings, "WHISPER_REMOTE_URL", "") or "").strip()
+    return {
+        "paired": True,
+        "online": bool(st.online),
+        "name": comp.name,
+        "gpu_name": comp.gpu_name,
+        "url": comp.url,
+        "latency_ms": st.latency_ms,
+        "error": st.error,
+        "in_cooldown": _oreg.in_cooldown(comp),
+        "last_seen_ms": last_seen,
+        "now_ms": now_ms,
+        "models_total": len(want),
+        "models_ready": len(ready),
+        "ready": bool(want) and len(ready) == len(want) and bool(st.online),
+        "whisper_remote": whisper_url.rstrip("/") == comp_base.rstrip("/") and bool(whisper_url),
+    }
 
 
 @router.post("/providers/test/{provider_name}")
@@ -3203,6 +3257,23 @@ from backend.auth import verify_api_key as _verify_api_key  # noqa: E402
 
 _companion_whisper_probe: dict = {"ts": 0.0, "base": "", "capable": None}
 _COMPANION_WHISPER_TTL = 60.0
+
+# Last time the paired Companion was seen online (ms epoch), so the UI can show
+# "offline — last seen 3m ago" and distinguish an expired/gone Companion from
+# one that was never paired.
+_companion_seen: dict = {"url": "", "last_online_ms": 0}
+
+
+def _find_companion_host(hosts):
+    """The paired GPU Companion host, if any: prefer the is_companion flag, else
+    a non-local host whose URL ends in /ollama (the Companion proxy shape)."""
+    from backend.services import ollama_registry as _oreg
+    comp = next((h for h in hosts if h.is_companion), None)
+    if comp is None:
+        comp = next((h for h in hosts
+                     if not _oreg.is_local_gpu_host(h.url)
+                     and h.url.rstrip("/").endswith("/ollama")), None)
+    return comp
 
 
 async def _companion_whisper_capable(base: str, token: str,

@@ -1,5 +1,6 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Link, useLocation, useNavigate } from 'react-router-dom';
+import { showToast } from './Toast';
 import ProviderStatus from './ProviderStatus';
 import ConnectionStatus from './ConnectionStatus';
 import UserMenu from './UserMenu';
@@ -86,6 +87,46 @@ export default function Layout({ children }) {
         ? `${activeModel.companion.gpu_name}${activeModel.companion?.name ? ` · ${activeModel.companion.name}` : ''}`
         : (activeModel.ollama_host_name || 'local'))
     : null;
+
+  // Live Companion liveness: a cheap 10s poll (vs the 30s full status poll) so
+  // ClipAI notices within ~10s when the Companion app is closed / the PC sleeps
+  // / it drops off the network, and warns the moment it happens.
+  const [companionLive, setCompanionLive] = useState(null);
+  const prevOnlineRef = useRef(null);
+  useEffect(() => {
+    let active = true;
+    const poll = async () => {
+      try {
+        const res = await fetch('/api/providers/companion-status');
+        if (!res.ok) return;
+        const data = await res.json();
+        if (!active) return;
+        setCompanionLive(data);
+        if (data.paired) {
+          const prev = prevOnlineRef.current;
+          if (prev === true && data.online === false) {
+            showToast('GPU Companion went offline — AI falls back to another provider', 'error');
+          } else if (prev === false && data.online === true) {
+            showToast('GPU Companion reconnected', 'success');
+          }
+          prevOnlineRef.current = data.online;
+        }
+      } catch { /* silent — the chip just holds its last state */ }
+    };
+    poll();
+    const id = setInterval(poll, 10000);
+    return () => { active = false; clearInterval(id); };
+  }, []);
+
+  const agoText = (ms) => {
+    if (!ms) return '';
+    const s = Math.max(0, Math.floor((Date.now() - ms) / 1000));
+    if (s < 60) return `${s}s ago`;
+    if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+    return `${Math.floor(s / 3600)}h ago`;
+  };
+
+  const companionOffline = !!(companionLive?.paired && companionLive.online === false);
 
   // Detect if this is a sub-page that should show a back button
   const isSubPage = location.pathname.startsWith('/analysis') || location.pathname.startsWith('/seo');
@@ -492,6 +533,29 @@ export default function Layout({ children }) {
                 </span>
               </Link>
             )}
+            {companionOffline && (
+              <Link
+                to="/settings"
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 6,
+                  padding: '4px 10px',
+                  background: 'var(--danger-dim, rgba(239,68,68,0.12))',
+                  border: '1px solid var(--danger)',
+                  borderRadius: 'var(--radius-sm)', textDecoration: 'none',
+                  fontSize: 10, fontFamily: 'var(--font-mono)', color: 'var(--danger)',
+                }}
+                title={`GPU Companion unreachable${companionLive?.error ? ` — ${companionLive.error}` : ''}`
+                  + `${companionLive?.last_seen_ms ? ` (last seen ${agoText(companionLive.last_seen_ms)})` : ''}.`
+                  + ' AI has fallen back to another provider — click to check.'}
+              >
+                <span style={{
+                  width: 6, height: 6, borderRadius: '50%', flexShrink: 0,
+                  background: 'var(--danger)',
+                  animation: 'pulse 1.5s ease-in-out infinite',
+                }} />
+                Companion offline
+              </Link>
+            )}
             {hostGpu && (
               <Link
                 to="/settings"
@@ -516,8 +580,10 @@ export default function Layout({ children }) {
                 {activeModel.companion && (
                   <span style={{
                     width: 6, height: 6, borderRadius: '50%', flexShrink: 0,
-                    background: activeModel.companion.ready ? 'var(--success)'
-                      : activeModel.companion.online ? 'var(--accent-amber)' : 'var(--danger)',
+                    background: (companionLive?.paired ? !companionLive.online : !activeModel.companion.online)
+                      ? 'var(--danger)'
+                      : activeModel.companion.ready ? 'var(--success)'
+                        : 'var(--accent-amber)',
                   }} />
                 )}
                 <span style={{ color: 'var(--accent-cyan)' }}>AI GPU:</span> {hostGpu}
