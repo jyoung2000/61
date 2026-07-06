@@ -408,15 +408,30 @@ function Dashboard({ status, refresh }: { status: CompanionStatus; refresh: () =
   const doReSync = async () => {
     setSyncing(true);
     setSyncMsg('');
+    const missing = (status.recommended_models || [])
+      .map((r) => r.model)
+      .filter((m) => !status.ollama.models.some((im) => im.startsWith(m.split(':')[0])));
+    if (missing.length === 0) {
+      setSyncing(false);
+      setSyncMsg('All recommended models already installed ✓');
+      setTimeout(() => setSyncMsg(''), 5000);
+      return;
+    }
+    const failed = [];
     try {
-      const recs = status.recommended_models || [];
-      for (const { model } of recs) {
-        const have = status.ollama.models.some((m) => m.startsWith(model.split(':')[0]));
-        if (!have) { try { await pullModel(model); } catch {} }
+      for (const model of missing) {
+        setSyncMsg(`Downloading ${model}…`);
+        try { await pullModel(model); } catch { failed.push(model); }
       }
       loadModels();
       refresh();
-    } finally { setSyncing(false); setSyncMsg(''); }
+    } finally {
+      setSyncing(false);
+      setSyncMsg(failed.length
+        ? `Could not download: ${failed.join(', ')} — check the tag exists on ollama.com`
+        : 'Recommended models downloaded ✓');
+      setTimeout(() => setSyncMsg(''), 8000);
+    }
   };
 
   const gpu = status.gpu;
@@ -524,12 +539,14 @@ function Dashboard({ status, refresh }: { status: CompanionStatus; refresh: () =
               : 'not running'}
           </div>
           <div className="row small" style={{ marginBottom: 6 }}>
+            {/* Green once installed/ready (idle is healthy — it starts on
+                demand); gray only when it isn't installed at all. */}
             <span className="dot" style={{
-              background: status.sidecar_running ? 'var(--success)'
-                : status.sidecar_available ? 'var(--warn)' : 'var(--muted)',
+              background: (status.sidecar_running || status.sidecar_available)
+                ? 'var(--success)' : 'var(--muted)',
             }} />
             Whisper sidecar {status.sidecar_running ? 'running'
-              : status.sidecar_available ? 'idle (starts on demand)'
+              : status.sidecar_available ? 'ready (starts on demand)'
               : 'not installed (optional) — transcription runs on the ClipAI server instead; GPU sharing for Ollama is unaffected'}
           </div>
           {!status.sidecar_available && (
@@ -615,7 +632,7 @@ function Dashboard({ status, refresh }: { status: CompanionStatus; refresh: () =
             </button>
           </div>
         </div>
-        {syncing && syncMsg && (
+        {syncMsg && (
           <div className="small muted" style={{ marginBottom: 6 }}>{syncMsg}</div>
         )}
         {models.length === 0 ? (
