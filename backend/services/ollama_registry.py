@@ -212,6 +212,23 @@ def enabled_hosts() -> list[OllamaHost]:
     return [h for h in get_hosts() if h.enabled and h.url]
 
 
+def routable_hosts() -> list[OllamaHost]:
+    """Hosts eligible to serve a request, in priority order.
+
+    Same as :func:`enabled_hosts`, except when ``GPU_STRICT_REMOTE`` is on AND a
+    remote host exists: the local-GPU daemon (the weak on-server card) is
+    dropped so work never silently falls back to it — if every remote is down
+    the Ollama provider fails and the AI fallback chain goes to the cloud
+    instead. With no remote host configured this is a no-op so single-GPU
+    deployments are unaffected."""
+    hosts = enabled_hosts()
+    if getattr(settings, "GPU_STRICT_REMOTE", False):
+        remote = [h for h in hosts if not is_local_gpu_host(h.url)]
+        if remote:
+            return remote
+    return hosts
+
+
 def save_hosts(hosts: list[OllamaHost], persist: bool = True) -> None:
     """Persist a new registry (order = priority) and sync the legacy
     ``settings.OLLAMA_HOST`` to the new primary so untouched call sites
@@ -331,7 +348,7 @@ def _host_has_model(status: HostStatus, model: str) -> bool:
 async def pick_host(required_model: Optional[str] = None) -> Optional[OllamaHost]:
     """First enabled + online host in priority order (that has the model,
     when one is required). Every skip is logged with its reason."""
-    for host in enabled_hosts():
+    for host in routable_hosts():
         if in_cooldown(host):
             logger.info("Ollama host '%s' skipped: in failure cooldown", host.name)
             continue
@@ -398,7 +415,7 @@ async def request_with_failover(
     After one full pass the last connection error (or a RuntimeError) is
     raised so the existing ``AI_FALLBACK_CHAIN`` takes over exactly as today.
     """
-    hosts = enabled_hosts()
+    hosts = routable_hosts()
     if not hosts:
         raise RuntimeError("No Ollama hosts configured")
 

@@ -27,6 +27,28 @@ def _hosts_json(*entries):
     return json.dumps(list(entries))
 
 
+def test_routable_hosts_strict_drops_local_when_remote_exists(monkeypatch):
+    monkeypatch.setattr(settings, "OLLAMA_HOSTS", _hosts_json(
+        {"id": "comp", "name": "4070", "url": "http://192.168.8.10:11500/ollama"},
+        {"id": "loc", "name": "local", "url": "http://ollama:11434"},
+    ), raising=False)
+    # Off: both hosts routable.
+    monkeypatch.setattr(settings, "GPU_STRICT_REMOTE", False, raising=False)
+    assert [h.id for h in R.routable_hosts()] == ["comp", "loc"]
+    # On: the local-GPU host is dropped.
+    monkeypatch.setattr(settings, "GPU_STRICT_REMOTE", True, raising=False)
+    assert [h.id for h in R.routable_hosts()] == ["comp"]
+
+
+def test_routable_hosts_strict_noop_without_remote(monkeypatch):
+    # Strict on but only a local host — must NOT strip it (would break the box).
+    monkeypatch.setattr(settings, "OLLAMA_HOSTS", _hosts_json(
+        {"id": "loc", "name": "local", "url": "http://ollama:11434"},
+    ), raising=False)
+    monkeypatch.setattr(settings, "GPU_STRICT_REMOTE", True, raising=False)
+    assert [h.id for h in R.routable_hosts()] == ["loc"]
+
+
 # ── Parsing, ordering, migration ─────────────────────────────────────
 
 

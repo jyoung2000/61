@@ -1770,6 +1770,53 @@ export default function Settings() {
             {/* Multi-host Ollama registry — drag-and-drop priority + failover */}
             <OllamaHostsCard isMobile={isMobile} />
 
+            {/* Strict remote GPU — only meaningful once a Companion/remote host exists */}
+            {statuses._active?.companion && (
+              <div style={{
+                background: 'var(--bg-panel)', border: '1px solid var(--border)',
+                borderRadius: 'var(--radius-md)', padding: '12px 16px', marginTop: 12,
+              }}>
+                <label style={{ display: 'flex', alignItems: 'flex-start', gap: 10, cursor: 'pointer' }}>
+                  <input
+                    type="checkbox"
+                    checked={!!statuses._active?.gpu_strict_remote}
+                    onChange={async (e) => {
+                      const enabled = e.target.checked;
+                      try {
+                        const res = await fetch('/api/providers/ollama/strict-remote', {
+                          method: 'POST',
+                          headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({ enabled }),
+                        });
+                        if (res.ok) {
+                          showToast(enabled
+                            ? 'Strict remote GPU on — the local GPU is no longer a fallback'
+                            : 'Strict remote GPU off — the local GPU can be used as fallback', 'success');
+                          setStatuses((prev) => ({
+                            ...prev, _active: { ...prev._active, gpu_strict_remote: enabled },
+                          }));
+                        } else {
+                          showToast('Failed to update setting', 'error');
+                        }
+                      } catch { showToast('Failed to update setting', 'error'); }
+                    }}
+                    style={{ marginTop: 2, accentColor: 'var(--accent)' }}
+                  />
+                  <span>
+                    <span style={{ fontSize: 13, fontWeight: 600 }}>
+                      Use only the remote GPU — never fall back to the local GPU
+                    </span>
+                    <span style={{ display: 'block', fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.5, marginTop: 3 }}>
+                      Keeps all AI (LLM, vision, transcription) on the Companion. If it's
+                      briefly unavailable, ClipAI fails over to your cloud providers instead
+                      of the weak on-server card. Video decode/encode still run on the server
+                      GPU — the source video lives here, so those can't move.
+                    </span>
+                  </span>
+                </label>
+              </div>
+            )}
+
             {/* Cloud fallback for subtitle polish — none / auto / pinned model */}
             <PolishFallbackCard isMobile={isMobile} />
 

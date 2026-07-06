@@ -63,6 +63,7 @@ _PERSISTABLE_KEYS = [
     "WHISPER_VAD_FILTER", "FRAME_SAMPLE_RATE", "WHISPER_AUTO_UPGRADE",
     # Remote Whisper (OpenAI-compatible server, e.g. the GPU Companion).
     "WHISPER_REMOTE_URL", "WHISPER_REMOTE_API_KEY", "WHISPER_REMOTE_MODEL",
+    "GPU_STRICT_REMOTE",
     # Reframer perception sampling (face-detection speed).
     "REFRAMER_MAX_SAMPLES", "REFRAMER_SAMPLE_FPS", "REFRAMER_MIN_SAMPLE_FPS",
     "WHISPER_NO_SPEECH_THRESHOLD",
@@ -851,6 +852,7 @@ async def provider_status():
         # download/readiness summary for the "active models" GPU indicator.
         "ollama_host_name": statuses.get("ollama", {}).get("active_host_name", ""),
         "companion": companion_info,
+        "gpu_strict_remote": bool(getattr(settings, "GPU_STRICT_REMOTE", False)),
     }
 
     _status_cache = statuses
@@ -1473,6 +1475,21 @@ def _pull_ollama_models_background(models: list[str] | None = None):
         _ollama_pull_state["active"] = False
 
     threading.Thread(target=_run, daemon=True, name="ollama-bg-pull").start()
+
+
+class ToggleStrictRemoteRequest(BaseModel):
+    enabled: bool
+
+
+@router.post("/providers/ollama/strict-remote")
+async def toggle_strict_remote(req: ToggleStrictRemoteRequest):
+    """Enable/disable 'use only the remote GPU'. When on, Ollama never falls
+    back to the local-GPU daemon and remote Whisper isn't bypassed by a flaky
+    health probe — the AI stays on the Companion (or fails over to the cloud)."""
+    settings.GPU_STRICT_REMOTE = bool(req.enabled)
+    _persist_user_settings()
+    _invalidate_status_cache()
+    return {"status": "saved", "gpu_strict_remote": settings.GPU_STRICT_REMOTE}
 
 
 @router.post("/providers/ollama/toggle")

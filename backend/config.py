@@ -376,6 +376,12 @@ class Settings(BaseSettings):
     # non-English (multilingual accuracy), unless the user explicitly
     # pinned a model in Settings (WHISPER_MODEL_USER_SET).
     WHISPER_REMOTE_MODEL: str = ""
+    # When True, AI runs ONLY on remote GPUs (a paired Companion): Ollama never
+    # falls back to the local-GPU daemon (the weak on-server card), and a flaky
+    # remote-Whisper health probe won't silently route transcription to it. If
+    # the remote is unavailable, Ollama fails over to the CLOUD chain instead of
+    # the local card. Safe no-op when no remote host exists (nothing to prefer).
+    GPU_STRICT_REMOTE: bool = False
     # ── Vocal separation (Demucs) before ASR ──
     # Isolate the vocal stem before Whisper so dialogue buried under loud
     # music / SFX (which the VAD otherwise hears as no-speech and drops) is

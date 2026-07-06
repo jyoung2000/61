@@ -608,7 +608,14 @@ class AudioIntelligence:
         log = get_logger()
 
         if not force_local and remote_whisper_configured():
-            if remote_whisper_healthy():
+            _strict = bool(getattr(settings, "GPU_STRICT_REMOTE", False))
+            _healthy = remote_whisper_healthy()
+            # In strict mode we select the remote server even when the quick
+            # health probe fails: that probe can false-negative (cold sidecar,
+            # slow /v1/health) and must not silently push transcription onto the
+            # local GPU. The real request still falls back at transcribe-time if
+            # the remote genuinely can't serve it.
+            if _healthy or _strict:
                 self.engine = RemoteWhisperEngine()
                 self.available = True
                 self.device_used = 'remote'
@@ -616,7 +623,9 @@ class AudioIntelligence:
                     remote_whisper_pick_model(None), 'remote')
                 log.log_stage('AUDIO',
                     f'Remote Whisper selected: {_remote_whisper_base()} '
-                    '(local GPU stays free)')
+                    '(local GPU stays free)'
+                    + ('' if _healthy else
+                       ' — strict mode: health probe failed but not falling back to the local GPU'))
                 return True
             log.log_stage('AUDIO',
                 f'Remote Whisper configured ({_remote_whisper_base()}) but '
