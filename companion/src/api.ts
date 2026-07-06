@@ -46,6 +46,8 @@ export interface CompanionStatus {
   sidecar_running: boolean;
   busy: boolean;
   current_job: ActivityEntry | null;
+  clipai_connected: boolean;
+  clipai_last_contact_ms: number;
   activity: ActivityEntry[];
   incoming_pulls: { model: string; percent: number }[];
   lan_ip: string | null;

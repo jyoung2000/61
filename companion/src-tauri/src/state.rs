@@ -110,6 +110,9 @@ pub struct AppState {
     /// (percent, last_update_ms). Lets the Companion GUI show downloads that
     /// ClipAI pushed, not just ones started from the Companion itself.
     pub incoming_pulls: Mutex<HashMap<String, (f64, u64)>>,
+    /// ms epoch of the last authenticated request from a ClipAI server (any
+    /// proxy route). Drives the "ClipAI connected" indicator.
+    pub last_clipai_contact: AtomicU64,
     /// Serializes GPU-heavy whisper work: one transcription at a time.
     pub whisper_slot: tokio::sync::Semaphore,
     /// Last time any proxied request finished (ms epoch) — idle shutdown.
@@ -146,6 +149,7 @@ impl AppState {
             ollama_child: tokio::sync::Mutex::new(None),
             ollama_starting: AtomicBool::new(false),
             incoming_pulls: Mutex::new(HashMap::new()),
+            last_clipai_contact: AtomicU64::new(0),
             whisper_slot: tokio::sync::Semaphore::new(1),
             last_request_ms: AtomicU64::new(now_ms()),
             whisper_busy: AtomicBool::new(false),
@@ -172,6 +176,16 @@ impl AppState {
 
     pub fn config_snapshot(&self) -> Config {
         self.config.lock().unwrap().clone()
+    }
+
+    /// True when a ClipAI server has made an authenticated request recently.
+    pub fn clipai_connected(&self) -> bool {
+        let last = self.last_clipai_contact.load(Ordering::Relaxed);
+        last > 0 && now_ms().saturating_sub(last) < 60_000
+    }
+
+    pub fn last_clipai_contact_ms(&self) -> u64 {
+        self.last_clipai_contact.load(Ordering::Relaxed)
     }
 
     /// Record progress of a model pull flowing through the proxy.
@@ -203,6 +217,9 @@ impl AppState {
         job_title: &str,
         stage: &str,
     ) -> u64 {
+        // Every proxy route calls this only after the bearer check passes, so
+        // it's a reliable "a ClipAI server is talking to us" signal.
+        self.last_clipai_contact.store(now_ms(), Ordering::Relaxed);
         let id = self.next_activity_id.fetch_add(1, Ordering::Relaxed);
         let entry = ActivityEntry {
             id,

@@ -582,6 +582,17 @@ function Dashboard({ status, refresh }: { status: CompanionStatus; refresh: () =
         <div className="panel">
           <h2>Connection</h2>
           <div className="row small" style={{ marginBottom: 6 }}>
+            {/* Live: green when a ClipAI server has hit this Companion in the
+                last minute; amber when paired but idle; gray when never seen. */}
+            <span className="dot" style={{
+              background: status.clipai_connected ? 'var(--success)'
+                : status.config.paired_clipai_url ? 'var(--warn)' : 'var(--muted)',
+            }} />
+            {status.clipai_connected ? 'ClipAI connected'
+              : status.config.paired_clipai_url ? 'ClipAI paired — waiting for requests'
+              : 'No ClipAI connected yet'}
+          </div>
+          <div className="row small" style={{ marginBottom: 6 }}>
             <span className={`dot ${status.ollama.running ? 'ok' : 'bad'}`} />
             Ollama {status.ollama.running
               ? `running (${status.ollama.models.length} models${status.ollama.managed ? ', managed' : ''})`
