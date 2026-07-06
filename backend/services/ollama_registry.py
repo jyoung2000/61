@@ -114,6 +114,9 @@ class HostStatus:
     error: str = ""
     version: str = ""
     checked_at: float = 0.0
+    # True when the host answered but is refusing work (HTTP 503) — for the
+    # Companion proxy this means sharing is paused / the GPU is momentarily busy.
+    paused: bool = False
 
 
 # ── Module state ─────────────────────────────────────────────────────
@@ -352,6 +355,11 @@ async def probe(host: OllamaHost, force: bool = False,
                                  if m.get("name")]
             elif resp.status_code in (401, 403):
                 status.error = f"auth rejected (HTTP {resp.status_code}) — check the host token"
+            elif resp.status_code == 503:
+                # Companion returns 503 while sharing is paused (or the GPU is
+                # briefly busy). Surface it as a distinct, actionable state.
+                status.paused = True
+                status.error = "paused (HTTP 503) — resume GPU sharing in the Companion app"
             else:
                 status.error = f"HTTP {resp.status_code}"
     except Exception as e:
@@ -512,6 +520,7 @@ async def registry_status(force: bool = False) -> list[dict]:
             "models": st.models,
             "latency_ms": st.latency_ms,
             "error": st.error,
+            "paused": bool(getattr(st, "paused", False)),
             "in_cooldown": in_cooldown(host),
             "gpu_name": host.gpu_name,
             "vram_total_mb": host.vram_total_mb,

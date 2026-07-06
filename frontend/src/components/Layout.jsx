@@ -93,6 +93,7 @@ export default function Layout({ children }) {
   // / it drops off the network, and warns the moment it happens.
   const [companionLive, setCompanionLive] = useState(null);
   const prevOnlineRef = useRef(null);
+  const prevPausedRef = useRef(null);
   useEffect(() => {
     let active = true;
     const poll = async () => {
@@ -110,6 +111,13 @@ export default function Layout({ children }) {
             showToast('GPU Companion reconnected', 'success');
           }
           prevOnlineRef.current = data.online;
+          // Paused is distinct from offline: the Companion is reachable but
+          // refusing work (503). Warn once when it flips on.
+          const prevP = prevPausedRef.current;
+          if (prevP === false && data.paused === true) {
+            showToast('GPU Companion is PAUSED — resume sharing in the Companion app', 'error');
+          }
+          prevPausedRef.current = !!data.paused;
         }
       } catch { /* silent — the chip just holds its last state */ }
     };
@@ -127,6 +135,7 @@ export default function Layout({ children }) {
   };
 
   const companionOffline = !!(companionLive?.paired && companionLive.online === false);
+  const companionPaused = !!(companionLive?.paired && companionLive.paused === true);
 
   // Detect if this is a sub-page that should show a back button
   const isSubPage = location.pathname.startsWith('/analysis') || location.pathname.startsWith('/seo');
@@ -554,6 +563,27 @@ export default function Layout({ children }) {
                   animation: 'pulse 1.5s ease-in-out infinite',
                 }} />
                 Companion offline
+              </Link>
+            )}
+            {companionPaused && !companionOffline && (
+              <Link
+                to="/settings"
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 6,
+                  padding: '4px 10px',
+                  background: 'var(--danger-dim, rgba(239,68,68,0.12))',
+                  border: '1px solid var(--danger)',
+                  borderRadius: 'var(--radius-sm)', textDecoration: 'none',
+                  fontSize: 10, fontFamily: 'var(--font-mono)', color: 'var(--danger)',
+                }}
+                title={'GPU Companion is PAUSED — it answers but refuses every job with 503.'
+                  + ' Open the Companion app and click Resume sharing. AI has fallen back to another provider.'}
+              >
+                <span style={{
+                  width: 6, height: 6, borderRadius: '50%', flexShrink: 0,
+                  background: 'var(--danger)',
+                }} />
+                Companion paused
               </Link>
             )}
             {hostGpu && (

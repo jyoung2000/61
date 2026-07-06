@@ -629,6 +629,23 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
         </div>
       </header>
 
+      {status.config.paused && (
+        <div className="panel" style={{ borderColor: 'var(--danger)', background: 'rgba(244,104,92,0.12)' }}>
+          <div className="row spread">
+            <strong style={{ color: 'var(--danger)', fontSize: 14 }}>
+              ⏸ Sharing is PAUSED — ClipAI is getting 503 errors and can't use this GPU
+            </strong>
+            <button onClick={() => setConfig({ paused: false }).then(refresh)}>
+              Resume sharing
+            </button>
+          </div>
+          <div className="muted small" style={{ marginTop: 4 }}>
+            While paused, every request from ClipAI (models, transcription, vision) is
+            refused with 503. Click Resume to let ClipAI use this GPU again.
+          </div>
+        </div>
+      )}
+
       {status.proxy_bound === false && (
         <div className="panel" style={{ borderColor: 'var(--danger)', background: 'rgba(244,104,92,0.10)' }}>
           <strong style={{ color: 'var(--danger)' }}>

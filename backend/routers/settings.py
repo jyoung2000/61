@@ -694,6 +694,7 @@ async def provider_status():
                 # from "never paired", and show how long ago it was last seen.
                 "latency_ms": _comp.get("latency_ms"),
                 "error": _comp.get("error"),
+                "paused": bool(_comp.get("paused")),
                 "in_cooldown": bool(_comp.get("in_cooldown")),
                 "last_seen_ms": _last_seen,
             }
@@ -893,6 +894,7 @@ async def companion_status():
         "url": comp.url,
         "latency_ms": st.latency_ms,
         "error": st.error,
+        "paused": bool(getattr(st, "paused", False)),
         "in_cooldown": _oreg.in_cooldown(comp),
         "last_seen_ms": last_seen,
         "now_ms": now_ms,

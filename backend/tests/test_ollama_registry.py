@@ -282,6 +282,32 @@ def test_failover_raises_after_full_pass(monkeypatch):
         asyncio.run(R.request_with_failover(send))
 
 
+def test_probe_503_reports_paused(monkeypatch):
+    """A Companion returns 503 while sharing is paused — probe() must flag it as
+    a distinct `paused` state (not a generic HTTP error) so the UI can tell the
+    user to resume sharing rather than reporting the host as broken."""
+    monkeypatch.setattr(settings, "OLLAMA_HOSTS", _hosts_json(
+        {"id": "comp", "name": "Companion", "url": "http://desktop:11500/ollama"},
+    ), raising=False)
+    R.reset_state()
+    host = R.get_hosts()[0]
+
+    def _handler(request):
+        return httpx.Response(503, headers={"Retry-After": "5"})
+
+    orig_client = httpx.AsyncClient
+
+    def _client(*a, **kw):
+        kw.pop("timeout", None)
+        return orig_client(transport=httpx.MockTransport(_handler))
+
+    monkeypatch.setattr(R.httpx, "AsyncClient", _client)
+    st = asyncio.run(R.probe(host, force=True))
+    assert st.online is False
+    assert st.paused is True
+    assert "503" in st.error and "resume" in st.error.lower()
+
+
 def test_failover_no_hosts_configured(monkeypatch):
     monkeypatch.setattr(settings, "OLLAMA_HOSTS", "", raising=False)
     monkeypatch.setattr(settings, "OLLAMA_HOST", "", raising=False)
