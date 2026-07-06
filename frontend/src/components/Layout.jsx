@@ -79,6 +79,14 @@ export default function Layout({ children }) {
   const clientGpu = useClientGpuPreferences();
   useAutoDetectGpu(); // Auto-detect and enable WebGPU on first visit
 
+  // GPU actually running the active *local* models — the paired Companion's
+  // card (or a named Ollama host). Cloud providers have no local GPU.
+  const hostGpu = activeModel && activeModel.provider === 'ollama'
+    ? (activeModel.companion?.gpu_name
+        ? `${activeModel.companion.gpu_name}${activeModel.companion?.name ? ` · ${activeModel.companion.name}` : ''}`
+        : (activeModel.ollama_host_name || 'local'))
+    : null;
+
   // Detect if this is a sub-page that should show a back button
   const isSubPage = location.pathname.startsWith('/analysis') || location.pathname.startsWith('/seo');
 
@@ -484,6 +492,37 @@ export default function Layout({ children }) {
                 </span>
               </Link>
             )}
+            {hostGpu && (
+              <Link
+                to="/settings"
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 6,
+                  padding: '4px 10px',
+                  background: 'var(--bg-elevated)',
+                  border: '1px solid var(--border)',
+                  borderRadius: 'var(--radius-sm)',
+                  textDecoration: 'none',
+                  fontSize: 10,
+                  fontFamily: 'var(--font-mono)',
+                  color: 'var(--text-secondary)',
+                  transition: 'border-color 0.2s',
+                }}
+                title={activeModel.companion
+                  ? 'GPU running your local models (paired Companion) — click to configure'
+                  : 'GPU host running your local models — click to configure'}
+              >
+                {activeModel.companion && (
+                  <span style={{
+                    width: 6, height: 6, borderRadius: '50%', flexShrink: 0,
+                    background: activeModel.companion.ready ? 'var(--success)'
+                      : activeModel.companion.online ? 'var(--accent-amber)' : 'var(--danger)',
+                  }} />
+                )}
+                <span style={{ color: 'var(--accent-cyan)' }}>GPU:</span> {hostGpu}
+              </Link>
+            )}
             {clientGpu.enabled && clientGpu.selectedGpuName && (
               <Link
                 to="/settings"
@@ -501,7 +540,7 @@ export default function Layout({ children }) {
                   color: 'var(--text-secondary)',
                   transition: 'border-color 0.2s',
                 }}
-                title="Client GPU — click to configure"
+                title="Client GPU (in-browser) — click to configure"
               >
                 <span style={{ color: 'var(--accent-cyan)' }}>GPU:</span> {clientGpu.selectedGpuName}
               </Link>
