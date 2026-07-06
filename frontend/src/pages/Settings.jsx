@@ -64,7 +64,6 @@ function ModelDropdown({ ctx, task, models, pendingValue, savedValue, label, des
     : task === 'editorial' ? 'editorial' : null;
 
   const selectedModel = (models || []).find((m) => m.id === pendingValue);
-  const displayName = pendingValue ? (selectedModel ? selectedModel.name : pendingValue) : '-- Select a model --';
 
   const searchOpts = useMemo(() => {
     if (!q) return [];
@@ -116,40 +115,50 @@ function ModelDropdown({ ctx, task, models, pendingValue, savedValue, label, des
       </div>
       <p style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 8, lineHeight: 1.5 }}>{desc}</p>
       <div style={{ position: 'relative' }}>
-        <button type="button"
-          onClick={() => { const willOpen = !open; setOpenDropdown(willOpen ? task : null); setDropdownQuery(''); if (willOpen) loadCatalog(); }}
-          style={{ ...dropdownStyle, textAlign: 'left', borderColor: isChanged ? 'var(--accent-amber)' : undefined }}>
-          {displayName}
-        </button>
+        {/* The field IS the search box: click and type to live-filter across
+            Ollama + every OpenRouter model. Shows the current selection when
+            not being edited. */}
+        <input
+          type="text"
+          value={open ? query : (selectedModel ? selectedModel.name : (pendingValue || ''))}
+          placeholder={open
+            ? (pendingValue
+                ? `Type to search Ollama + OpenRouter… (current: ${selectedModel ? selectedModel.name : pendingValue})`
+                : 'Type to search Ollama + OpenRouter…')
+            : '-- Select or search for a model --'}
+          onFocus={() => { setOpenDropdown(task); setDropdownQuery(''); loadCatalog(); }}
+          onChange={(e) => { setOpenDropdown(task); setDropdownQuery(e.target.value); loadCatalog(); }}
+          onKeyDown={(e) => {
+            if (e.key === 'Escape') { setOpenDropdown(null); e.currentTarget.blur(); }
+            if (e.key === 'Enter' && freeText) { pick(`ollama/${freeText}`); e.currentTarget.blur(); }
+          }}
+          style={{
+            ...dropdownStyle, cursor: 'text',
+            borderColor: open ? 'var(--accent-cyan)' : (isChanged ? 'var(--accent-amber)' : undefined),
+          }}
+        />
         {open && (
           <div style={{
             position: 'absolute', top: 'calc(100% + 4px)', left: 0, right: 0, zIndex: 60,
             background: 'var(--bg-panel)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)',
-            boxShadow: '0 8px 28px rgba(0,0,0,0.45)', maxHeight: 340, display: 'flex', flexDirection: 'column',
+            boxShadow: '0 8px 28px rgba(0,0,0,0.45)', maxHeight: 340, overflowY: 'auto',
           }}>
-            <input autoFocus value={query} onChange={(e) => setDropdownQuery(e.target.value)}
-              placeholder={roleKey ? 'Search local + cloud models…' : 'Search models…'}
-              style={{
-                margin: 8, padding: '8px 10px', background: 'var(--bg-base)', border: '1px solid var(--border)',
-                borderRadius: 'var(--radius-sm)', color: 'var(--text-primary)', fontSize: 12, fontFamily: 'var(--font-mono)',
-              }} />
-            <div style={{ overflowY: 'auto' }}>
-              {!q && <div onClick={() => pick('')} style={{ ...OPT_ROW, color: 'var(--text-muted)' }}>-- Select a model --</div>}
-              {shown.slice(0, 200).map((m) => (
-                <div key={m.id} onClick={() => pick(m.id)}
-                  style={{ ...OPT_ROW, color: m.id === pendingValue ? 'var(--accent-cyan)' : 'var(--text-secondary)' }}>
-                  {optionLabel(m)}
-                </div>
-              ))}
-              {freeText && (
-                <div onClick={() => pick(`ollama/${freeText}`)} style={{ ...OPT_ROW, color: 'var(--accent-cyan)' }}>
-                  ⤓ Pull local model “{freeText}” from Ollama
-                </div>
-              )}
-              {q && shown.length === 0 && !freeText && (
-                <div style={{ ...OPT_ROW, color: 'var(--text-muted)', cursor: 'default' }}>No matches</div>
-              )}
-            </div>
+            {!q && <div onClick={() => pick('')} style={{ ...OPT_ROW, color: 'var(--text-muted)' }}>-- Clear selection --</div>}
+            {shown.slice(0, 200).map((m) => (
+              <div key={m.id} onMouseDown={(e) => { e.preventDefault(); pick(m.id); }}
+                style={{ ...OPT_ROW, color: m.id === pendingValue ? 'var(--accent-cyan)' : 'var(--text-secondary)' }}>
+                {optionLabel(m)}
+              </div>
+            ))}
+            {freeText && (
+              <div onMouseDown={(e) => { e.preventDefault(); pick(`ollama/${freeText}`); }}
+                style={{ ...OPT_ROW, color: 'var(--accent-cyan)' }}>
+                ⤓ Pull local model “{freeText}” from Ollama
+              </div>
+            )}
+            {q && shown.length === 0 && !freeText && (
+              <div style={{ ...OPT_ROW, color: 'var(--text-muted)', cursor: 'default' }}>No matches</div>
+            )}
           </div>
         )}
       </div>
