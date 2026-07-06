@@ -23,6 +23,31 @@ use tauri::{Emitter, Manager, WindowEvent};
 
 type SharedState = Arc<AppState>;
 
+/// Bring the main window to the foreground — recreating it if it was somehow
+/// destroyed (a WebView crash, or a close path that bypassed prevent_close),
+/// so the GUI can never end up permanently invisible with the process alive.
+fn show_or_create_main(app: &tauri::AppHandle) {
+    use tauri::Manager;
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+        return;
+    }
+    match tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::default())
+        .title("ClipAI GPU Companion")
+        .inner_size(920.0, 720.0)
+        .build()
+    {
+        Ok(w) => {
+            let _ = w.show();
+            let _ = w.set_focus();
+            log::info!("recreated missing main window");
+        }
+        Err(e) => log::error!("could not recreate main window: {e}"),
+    }
+}
+
 // ── Crash diagnostics ───────────────────────────────────────────────
 // The GUI has no console (windows_subsystem = "windows"), so logs and
 // panics would otherwise vanish. Everything is mirrored to a file the
@@ -141,6 +166,8 @@ async fn get_status(state: tauri::State<'_, SharedState>) -> Result<serde_json::
         "busy": state.whisper_busy.load(Ordering::Relaxed),
         "current_job": state.current_job(),
         "job_progress": job_progress,
+        "proxy_bound": state.proxy_bound.load(Ordering::Relaxed),
+        "proxy_last_error": state.proxy_last_error.lock().unwrap().clone(),
         "clipai_connected": state.clipai_connected(),
         "clipai_serving": state.serving_jobs(),
         "clipai_last_contact_ms": state.last_clipai_contact_ms(),
@@ -653,10 +680,7 @@ fn build_tray(app: &tauri::App, state: SharedState) -> tauri::Result<()> {
     tray
         .on_menu_event(move |app, event| match event.id.as_ref() {
             "open" => {
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.show();
-                    let _ = window.set_focus();
-                }
+                show_or_create_main(app);
             }
             "pause" => {
                 let paused = {
@@ -698,11 +722,7 @@ pub fn run() {
         // the running window and exits instead of starting a duplicate.
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             log::info!("second instance launched — focusing the existing window");
-            if let Some(w) = app.get_webview_window("main") {
-                let _ = w.show();
-                let _ = w.unminimize();
-                let _ = w.set_focus();
-            }
+            show_or_create_main(app);
         }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_autostart::init(
@@ -858,6 +878,9 @@ pub fn run() {
             if let Err(e) = build_tray(app, state) {
                 log::error!("tray build failed (continuing without tray): {e}");
             }
+            // Guarantee the window is visible on launch regardless of config
+            // defaults — a hidden-but-alive window reads as "GUI unreachable".
+            show_or_create_main(&app.handle().clone());
             log::info!("setup: complete");
             Ok(())
         })
@@ -896,9 +919,20 @@ pub fn run() {
             if let tauri::RunEvent::Exit = event {
                 if let Some(state) = handle.try_state::<SharedState>() {
                     let state = state.inner().clone();
+                    // Bound the graceful shutdown so a hung child.wait() can't
+                    // hold the proxy port + single-instance lock into the next
+                    // launch (which showed up as the Companion being
+                    // unreachable after a quick restart). On Windows the
+                    // kill-on-job-close object reaps children regardless.
                     tauri::async_runtime::block_on(async move {
-                        sidecar::shutdown(&state).await;
-                        ollama::shutdown(&state).await;
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(3),
+                            async {
+                                sidecar::shutdown(&state).await;
+                                ollama::shutdown(&state).await;
+                            },
+                        )
+                        .await;
                     });
                     log::info!("shutdown: stopped managed ollama + whisper sidecar");
                 }

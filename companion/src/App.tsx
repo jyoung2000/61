@@ -629,6 +629,19 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
         </div>
       </header>
 
+      {status.proxy_bound === false && (
+        <div className="panel" style={{ borderColor: 'var(--danger)', background: 'rgba(244,104,92,0.10)' }}>
+          <strong style={{ color: 'var(--danger)' }}>
+            ⚠ Can't open port {status.config.port} — ClipAI can't reach this companion
+          </strong>
+          <div className="muted small" style={{ marginTop: 4 }}>
+            {status.proxy_last_error || 'The port is in use.'} Another program (or a
+            leftover Companion process) may be holding it. It will keep retrying — close the
+            other program, or restart this app. Only one Companion should run at a time.
+          </div>
+        </div>
+      )}
+
       {job && (
         <div className="panel" style={{ borderColor: 'var(--success)' }}>
           <div className="row spread">

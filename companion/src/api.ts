@@ -58,6 +58,8 @@ export interface CompanionStatus {
   busy: boolean;
   current_job: ActivityEntry | null;
   job_progress: number | null;
+  proxy_bound: boolean;
+  proxy_last_error: string;
   clipai_connected: boolean;
   clipai_serving: boolean;
   clipai_last_contact_ms: number;

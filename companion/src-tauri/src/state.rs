@@ -163,6 +163,12 @@ pub struct AppState {
     /// at startup). From-source/cross-compiled builds may lack it — Ollama
     /// sharing still works; /v1/health + pairing report whisper honestly.
     pub sidecar_available: AtomicBool,
+    /// True while the LAN proxy is bound and listening. False if the port bind
+    /// failed (another process on the port) — surfaced to the GUI so an
+    /// unreachable Companion is loud, not a silently dead proxy.
+    pub proxy_bound: AtomicBool,
+    /// Last proxy bind error (empty when bound) for the GUI banner.
+    pub proxy_last_error: Mutex<String>,
 }
 
 pub fn now_ms() -> u64 {
@@ -200,6 +206,8 @@ impl AppState {
             last_request_ms: AtomicU64::new(now_ms()),
             whisper_busy: AtomicBool::new(false),
             sidecar_available: AtomicBool::new(false),
+            proxy_bound: AtomicBool::new(false),
+            proxy_last_error: Mutex::new(String::new()),
         };
         state.save(); // persist the generated token on first run
         state

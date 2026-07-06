@@ -438,23 +438,65 @@ async fn health(State(ctx): State<ProxyCtx>, headers: HeaderMap) -> Response {
     (StatusCode::OK, axum::Json(body)).into_response()
 }
 
-pub async fn serve(ctx: ProxyCtx) {
-    let port = ctx.state.config.lock().unwrap().port;
-    let app = Router::new()
+fn build_router(ctx: ProxyCtx) -> Router {
+    Router::new()
         .route("/v1/health", get(health))
         .route("/v1/audio/transcriptions", post(whisper_proxy))
         .route("/ollama", any(ollama_proxy))
         .route("/ollama/", any(ollama_proxy))
         .route("/ollama/*path", any(ollama_proxy))
-        .with_state(ctx);
+        .with_state(ctx)
+}
+
+/// Bind with SO_REUSEADDR so a rebind can succeed while a prior instance's
+/// socket is still draining (mio doesn't set it on Windows, our primary
+/// target). Returns a tokio listener.
+fn bind_reuse(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_reuse_address(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    socket.set_nonblocking(true)?;
+    let std_listener: std::net::TcpListener = socket.into();
+    tokio::net::TcpListener::from_std(std_listener)
+}
+
+pub async fn serve(ctx: ProxyCtx) {
+    let port = ctx.state.config.lock().unwrap().port;
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    log::info!("companion proxy listening on {addr}");
-    match tokio::net::TcpListener::bind(addr).await {
-        Ok(listener) => {
-            if let Err(e) = axum::serve(listener, app).await {
-                log::error!("proxy server exited: {e}");
+    let mut attempt: u32 = 0;
+    // Supervise the listener forever: a transient port conflict on a rapid
+    // quit→relaunch must NOT kill the proxy for the whole session (that's the
+    // silent "Companion unreachable"). Retry fast while a prior socket drains,
+    // then slowly self-heal, always publishing bound/error state to the GUI.
+    loop {
+        match bind_reuse(addr) {
+            Ok(listener) => {
+                attempt = 0;
+                ctx.state.proxy_bound.store(true, Ordering::Relaxed);
+                *ctx.state.proxy_last_error.lock().unwrap() = String::new();
+                log::info!("companion proxy listening on {addr}");
+                if let Err(e) = axum::serve(listener, build_router(ctx.clone())).await {
+                    log::error!("proxy server exited: {e} — rebinding");
+                }
+                ctx.state.proxy_bound.store(false, Ordering::Relaxed);
+                // Loop to rebind.
+            }
+            Err(e) => {
+                ctx.state.proxy_bound.store(false, Ordering::Relaxed);
+                *ctx.state.proxy_last_error.lock().unwrap() =
+                    format!("cannot open port {port}: {e}");
+                if attempt < 3 {
+                    log::error!("could not bind {addr}: {e} (port in use? another program \
+                                 or a lingering Companion may hold it — retrying)");
+                }
+                attempt = attempt.saturating_add(1);
+                // ~500ms for the first 5s (ride out a draining prior socket),
+                // then back off to every 3s so it recovers the moment it frees.
+                let wait_ms = if attempt <= 10 { 500 } else { 3000 };
+                tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
             }
         }
-        Err(e) => log::error!("could not bind {addr}: {e} (port in use?)"),
     }
 }
