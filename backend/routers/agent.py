@@ -116,8 +116,13 @@ async def health():
 
     ollama_available = False
     try:
+        # Via the host registry so a paired Companion proxy (which 401s
+        # unauthenticated requests) gets the bearer token attached — this
+        # poller was 401ing against the Companion every few seconds.
+        from backend.services import ollama_registry as _oreg
+        _url = _oreg.join_url(_oreg.primary_url() or settings.OLLAMA_HOST, "/api/version")
         async with httpx.AsyncClient(timeout=3) as client:
-            resp = await client.get(f"{settings.OLLAMA_HOST}/api/version")
+            resp = await client.get(_url, headers=_oreg.headers_for_url(_url))
             ollama_available = resp.status_code == 200
     except Exception:
         pass

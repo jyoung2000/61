@@ -813,8 +813,12 @@ async def get_providers():
 
     ollama_status = "not_configured"
     try:
+        # Via the host registry so a paired Companion proxy (which 401s
+        # unauthenticated requests) gets the bearer token attached.
+        from backend.services import ollama_registry as _oreg
+        _url = _oreg.join_url(_oreg.primary_url() or settings.OLLAMA_HOST, "/api/version")
         async with hx.AsyncClient(timeout=3) as client:
-            resp = await client.get(f"{settings.OLLAMA_HOST}/api/version")
+            resp = await client.get(_url, headers=_oreg.headers_for_url(_url))
             ollama_status = "connected" if resp.status_code == 200 else "error"
     except Exception:
         pass

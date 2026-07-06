@@ -4010,15 +4010,41 @@ async def _run_analysis_inner(job_id: str):
         # warmup() loaded Ollama models (qwen2.5:3b = 2.3GB) onto the GPU.
         # On a 4GB GPU, this leaves only ~1.5GB for Whisper → silent OOM.
         # Unload now — models reload when pipeline reaches scene analysis.
+        #
+        # ONLY when Ollama shares the LOCAL card AND Whisper runs locally.
+        # With a paired Companion primary, the warmed models sit on the
+        # Companion's GPU — unloading them frees nothing here and forces a
+        # cold reload at scene analysis. With remote Whisper, the local card
+        # doesn't need freeing at all.
+        _ollama_local = True
+        _whisper_remote = False
         try:
-            await _update_progress(job_id, JobStatus.EXTRACTING_FRAMES, 4, "Freeing GPU for transcription...")
-            await asyncio.wait_for(_primary_provider.unload_models(), timeout=15)
-            logger.info("[%s] Ollama models unloaded after warmup — GPU freed for Whisper", job_id)
-            await asyncio.sleep(2)  # Let CUDA driver reclaim across containers
-        except asyncio.TimeoutError:
-            logger.warning("[%s] Ollama model unload timed out after 15s — proceeding anyway", job_id)
-        except Exception as e:
-            logger.warning("[%s] Failed to unload Ollama after warmup: %s", job_id, e)
+            from backend.services import ollama_registry as _oreg
+            _ollama_local = _oreg.is_local_gpu_host(_oreg.primary_url())
+        except Exception:
+            pass
+        try:
+            from backend.services import reframer_audio as _ra
+            _whisper_remote = _ra.remote_whisper_configured()
+        except Exception:
+            pass
+        if _ollama_local and not _whisper_remote:
+            try:
+                await _update_progress(job_id, JobStatus.EXTRACTING_FRAMES, 4, "Freeing GPU for transcription...")
+                await asyncio.wait_for(_primary_provider.unload_models(), timeout=15)
+                logger.info("[%s] Ollama models unloaded after warmup — GPU freed for Whisper", job_id)
+                await asyncio.sleep(2)  # Let CUDA driver reclaim across containers
+            except asyncio.TimeoutError:
+                logger.warning("[%s] Ollama model unload timed out after 15s — proceeding anyway", job_id)
+            except Exception as e:
+                logger.warning("[%s] Failed to unload Ollama after warmup: %s", job_id, e)
+        else:
+            logger.info(
+                "[%s] Skipping post-warmup unload — %s; warmed models stay resident",
+                job_id,
+                "Ollama runs on a remote GPU (Companion)" if not _ollama_local
+                else "Whisper transcription is remote",
+            )
 
     logger.info(
         "[%s] Duration tier: %s (%.1f min) — frame_rate=%ds, summary=%s, "

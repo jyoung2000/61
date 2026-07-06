@@ -4035,8 +4035,11 @@ async def get_gpu_preflight_status():
     host = (settings.OLLAMA_HOST or "").rstrip("/")
     if host:
         try:
-            async with _httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.get(f"{host}/api/ps")
+            from backend.services import ollama_registry as _oreg
+            _ps_url = _oreg.join_url(host, "/api/ps")
+            async with _httpx.AsyncClient(
+                    timeout=5.0, headers=_oreg.headers_for_url(_ps_url)) as client:
+                resp = await client.get(_ps_url)
                 if resp.status_code == 200:
                     for m in resp.json().get("models", []) or []:
                         size_vram = int(m.get("size_vram", 0) or 0)
@@ -4073,13 +4076,26 @@ async def free_gpu_now():
     )
 
     before = _nvidia_smi_free_mb()
+    # Evict only from a LOCAL-GPU Ollama host. When the primary is a remote
+    # Companion, its models live on the Companion's card — unloading them frees
+    # nothing on this server and just forces a cold reload on the next request.
     host = (settings.OLLAMA_HOST or "").rstrip("/")
+    try:
+        from backend.services import ollama_registry as _oreg
+        _local = [h.url for h in _oreg.enabled_hosts()
+                  if _oreg.is_local_gpu_host(h.url)]
+        host = _local[0] if _local else ""
+    except Exception:
+        pass
     ollama_stats: dict = {}
     if host:
         try:
             ollama_stats = await _evict_all_ollama_models(host, "manual")
         except Exception as e:
             ollama_stats = {"error": str(e)}
+    else:
+        ollama_stats = {"skipped": True,
+                        "reason": "Ollama host is a remote GPU — its VRAM is not this server's"}
     torch_freed = _release_local_torch_vram("manual")
     after = _nvidia_smi_free_mb()
     return {

@@ -676,6 +676,28 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
 
         self._vram_checked = True
 
+        # Method 0: Remote host (paired Companion / LAN Ollama) — size against
+        # THAT card's advertised VRAM, not this server's. Without this, a 12GB
+        # Companion gets judged by the local 4GB card: false "will run on CPU"
+        # warnings and num_gpu=0 forcing for models that fit fine remotely.
+        try:
+            from backend.services import ollama_registry as _oreg
+            if not _oreg.is_local_gpu_host(self._host):
+                _h = _oreg.find_host_for_url(self._host)
+                if _h is not None and _h.vram_total_mb > 0:
+                    self._available_vram_mb = int(_h.vram_total_mb)
+                    logger.info(
+                        "Remote Ollama host '%s' — using its advertised VRAM (%d MB) "
+                        "for model sizing", _h.name, _h.vram_total_mb)
+                    return self._available_vram_mb
+                # Remote but VRAM unknown: leave 0 (unknown) rather than
+                # letting the LOCAL card's probes below misrepresent it.
+                logger.info(
+                    "Remote Ollama host — skipping local VRAM probes (remote card size unknown)")
+                return self._available_vram_mb
+        except Exception:
+            pass
+
         # Method 1: Ask Ollama for GPU info via /api/ps
         try:
             resp = await self._client.get(f"{self._host}/api/ps", timeout=5.0)

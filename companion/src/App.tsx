@@ -6,7 +6,7 @@ import {
   CompanionStatus, getStatus, setConfig, regenerateToken,
   installOllama, startOllama, pullModel, pairClipai,
   listModels, deleteModel, InstalledModel,
-  downloadWhisper, refreshSidecar,
+  downloadWhisper, refreshSidecar, exportLogs,
 } from './api';
 
 // Common Ollama models offered as search suggestions on the Companion.
@@ -434,6 +434,22 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
     refresh();
   };
 
+  const [exporting, setExporting] = useState(false);
+  const doExportLogs = async () => {
+    setExporting(true);
+    setSyncMsg('Exporting logs…');
+    try {
+      const path = await exportLogs();
+      setSyncMsg(`Logs saved to ${path}`);
+      setTimeout(() => setSyncMsg(''), 12000);
+    } catch (e) {
+      setSyncMsg(`Export failed: ${e}`);
+      setTimeout(() => setSyncMsg(''), 8000);
+    } finally {
+      setExporting(false);
+    }
+  };
+
   // Search + download any Ollama model by tag (with live pull-progress).
   const doPullTag = async (tag: string) => {
     const t = (tag || '').trim();
@@ -757,10 +773,17 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
           <div className="small muted" style={{ marginTop: 8 }}>
             {status.config.paired_clipai_url
               ? <>Paired with <span className="mono">{status.config.paired_clipai_url}</span></>
-              : 'Not paired yet.'}
+              : status.clipai_connected
+                // Manual add in ClipAI (URL + token) never sets paired_clipai_url,
+                // yet an authenticated ClipAI IS talking to us — don't claim
+                // "not paired" while it's actively connected.
+                ? <>In use by a ClipAI server (added manually — endpoint + token above).</>
+                : 'Not paired yet.'}
             {' '}
             <a href="#" onClick={(e) => { e.preventDefault(); setPairOpen((o) => !o); }}>
-              {pairOpen ? 'Close' : status.config.paired_clipai_url ? 'Re-pair' : 'Pair now'}
+              {pairOpen ? 'Close'
+                : status.config.paired_clipai_url ? 'Re-pair'
+                : status.clipai_connected ? 'Pair anyway' : 'Pair now'}
             </a>
           </div>
           {pairOpen && (
@@ -937,7 +960,13 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
       </div>
 
       <div className="panel">
-        <h2>Pipeline activity</h2>
+        <div className="row spread">
+          <h2>Pipeline activity</h2>
+          <button className="secondary" onClick={doExportLogs} disabled={exporting}
+            title="Save a full text report — config, connection, GPU, Ollama, every job/error since the app opened, plus the app log — to your Downloads folder">
+            {exporting ? 'Exporting…' : '⤓ Export logs'}
+          </button>
+        </div>
         {status.job_logs.length === 0 ? (
           <p className="muted small">
             {status.clipai_connected

@@ -81,5 +81,7 @@ export const listModels = () => invoke<InstalledModel[]>('list_models');
 export const deleteModel = (model: string) => invoke('delete_model', { model });
 export const downloadWhisper = () => invoke<string>('download_whisper');
 export const refreshSidecar = () => invoke<boolean>('refresh_sidecar');
+/** Write a full diagnostics report to Downloads and reveal it; returns the path. */
+export const exportLogs = () => invoke<string>('export_logs');
 export const pairClipai = (clipaiUrl: string, apiKey: string) =>
   invoke('pair_clipai', { clipaiUrl, apiKey });

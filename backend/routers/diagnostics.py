@@ -334,8 +334,10 @@ async def _unload_and_wait(max_wait: int = 15) -> bool:
     for attempt in range(max_wait):
         await asyncio.sleep(1)
         try:
+            _ps_url = _ollama_url("/api/ps")
+            _gen_url = _ollama_url("/api/generate")
             async with httpx.AsyncClient(timeout=5) as client:
-                resp = await client.get(f"{settings.OLLAMA_HOST}/api/ps")
+                resp = await client.get(_ps_url, headers=_ollama_headers(_ps_url))
                 if resp.status_code == 200:
                     models = resp.json().get("models", [])
                     if not models:
@@ -352,7 +354,8 @@ async def _unload_and_wait(max_wait: int = 15) -> bool:
                         name = m.get("name", "")
                         if name:
                             await client.post(
-                                f"{settings.OLLAMA_HOST}/api/generate",
+                                _gen_url,
+                                headers=_ollama_headers(_gen_url),
                                 json={"model": name, "keep_alive": 0},
                             )
         except Exception:
@@ -392,9 +395,10 @@ async def _test_primary_model(model: str) -> dict:
     start = time.time()
     try:
         test_image_b64 = _generate_test_image()
-        async with httpx.AsyncClient(timeout=180) as client:
+        _chat_url = _ollama_url("/api/chat")
+        async with httpx.AsyncClient(timeout=180, headers=_ollama_headers(_chat_url)) as client:
             resp = await client.post(
-                f"{settings.OLLAMA_HOST}/api/chat",
+                _chat_url,
                 json={
                     "model": model,
                     "messages": [{
@@ -467,9 +471,10 @@ async def _test_editorial_model(model: str) -> dict:
     """Test text model: load, run a short completion, check GPU status."""
     start = time.time()
     try:
-        async with httpx.AsyncClient(timeout=120) as client:
+        _chat_url = _ollama_url("/api/chat")
+        async with httpx.AsyncClient(timeout=120, headers=_ollama_headers(_chat_url)) as client:
             resp = await client.post(
-                f"{settings.OLLAMA_HOST}/api/chat",
+                _chat_url,
                 json={
                     "model": model,
                     "messages": [{
@@ -620,7 +625,8 @@ async def _test_cloud_text(model: str, provider: str) -> dict:
 async def _check_model_gpu(client: httpx.AsyncClient, model: str) -> tuple[str, int]:
     """Check if a model is on GPU via /api/ps. Returns (gpu_status_str, vram_bytes)."""
     try:
-        ps_resp = await client.get(f"{settings.OLLAMA_HOST}/api/ps")
+        _ps_url = _ollama_url("/api/ps")
+        ps_resp = await client.get(_ps_url, headers=_ollama_headers(_ps_url))
         if ps_resp.status_code == 200:
             for m in ps_resp.json().get("models", []):
                 if model.split(":")[0] in m.get("name", ""):
@@ -919,8 +925,9 @@ async def test_pipeline(request: Request):
                 # ── Ollama local pipeline — check connectivity and GPU ──
                 gpu = None
                 try:
+                    _tags_url = _ollama_url("/api/tags")
                     async with httpx.AsyncClient(timeout=5) as client:
-                        resp = await client.get(f"{settings.OLLAMA_HOST}/api/tags")
+                        resp = await client.get(_tags_url, headers=_ollama_headers(_tags_url))
                         if resp.status_code != 200:
                             raise Exception(f"HTTP {resp.status_code}")
 
@@ -1218,9 +1225,13 @@ async def test_pipeline(request: Request):
 
                 gpu_rediscovered = False
                 try:
+                    _gen_url = _ollama_url("/api/generate")
+                    _ps_url = _ollama_url("/api/ps")
+                    _gen_hdr = _ollama_headers(_gen_url)
                     async with httpx.AsyncClient(timeout=120) as _rc:
                         _probe = await _rc.post(
-                            f"{settings.OLLAMA_HOST}/api/generate",
+                            _gen_url,
+                            headers=_gen_hdr,
                             json={
                                 "model": vision_model,
                                 "prompt": "test",
@@ -1230,14 +1241,14 @@ async def test_pipeline(request: Request):
                             timeout=120,
                         )
                         if _probe.status_code == 200:
-                            _ps = await _rc.get(f"{settings.OLLAMA_HOST}/api/ps", timeout=10)
+                            _ps = await _rc.get(_ps_url, headers=_ollama_headers(_ps_url), timeout=10)
                             if _ps.status_code == 200:
                                 for m in _ps.json().get("models", []):
                                     if m.get("size_vram", 0) > 0:
                                         gpu_rediscovered = True
                                         vram_mb = m.get("size_vram", 0) // 1024 // 1024
                                         break
-                            await _rc.post(f"{settings.OLLAMA_HOST}/api/generate",
+                            await _rc.post(_gen_url, headers=_gen_hdr,
                                 json={"model": vision_model, "keep_alive": 0}, timeout=10)
                 except Exception as e:
                     logger.warning("GPU rediscovery probe failed: %s", e)
@@ -1552,9 +1563,11 @@ async def test_subject_tracking():
             if is_moondream:
                 payload["format"] = "json"
 
+            _chat_url = _ollama_url("/api/chat")
             async with httpx.AsyncClient(timeout=120) as client:
                 resp = await client.post(
-                    f"{settings.OLLAMA_HOST}/api/chat",
+                    _chat_url,
+                    headers=_ollama_headers(_chat_url),
                     json=payload,
                     timeout=120,
                 )

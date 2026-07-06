@@ -12,8 +12,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const PROXY_PORT_DEFAULT: u16 = 11500;
 pub const OLLAMA_LOCAL: &str = "127.0.0.1:11434";
 pub const WHISPER_SIDECAR_PORT: u16 = 11510;
-/// Recent-request history kept for the dashboard.
-const ACTIVITY_CAP: usize = 50;
+/// Request history kept in memory. Big enough that "Export logs" can dump
+/// everything the app served since it opened; the dashboard and get_status
+/// only ever render/serialize a small slice of it.
+const ACTIVITY_CAP: usize = 1000;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -131,6 +133,8 @@ pub struct AppState {
     /// (percent, last_update_ms). Lets the Companion GUI show downloads that
     /// ClipAI pushed, not just ones started from the Companion itself.
     pub incoming_pulls: Mutex<HashMap<String, (f64, u64)>>,
+    /// ms epoch of when this app instance started — for uptime in exports.
+    pub app_started_ms: u64,
     /// ms epoch of the last authenticated request from a ClipAI server (any
     /// proxy route). Drives the "ClipAI connected" indicator.
     pub last_clipai_contact: AtomicU64,
@@ -182,6 +186,7 @@ impl AppState {
             ollama_child: tokio::sync::Mutex::new(None),
             ollama_starting: AtomicBool::new(false),
             incoming_pulls: Mutex::new(HashMap::new()),
+            app_started_ms: now_ms(),
             last_clipai_contact: AtomicU64::new(0),
             last_job_ms: AtomicU64::new(0),
             gpu_baseline_used_mb: AtomicU64::new(0),

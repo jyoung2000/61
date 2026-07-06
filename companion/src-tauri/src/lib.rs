@@ -305,6 +305,179 @@ async fn download_whisper(
     Ok(msg)
 }
 
+/// Format a ms-epoch as local time, or "-" for 0/unset.
+fn fmt_ms(ms: u64) -> String {
+    if ms == 0 {
+        return "-".into();
+    }
+    use chrono::TimeZone;
+    chrono::Local
+        .timestamp_millis_opt(ms as i64)
+        .single()
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_else(|| ms.to_string())
+}
+
+/// Human duration for a millisecond span.
+fn fmt_dur_ms(ms: u64) -> String {
+    let s = ms / 1000;
+    let (h, m, sec) = (s / 3600, (s % 3600) / 60, s % 60);
+    if h > 0 {
+        format!("{h}h{m}m{sec}s")
+    } else if m > 0 {
+        format!("{m}m{sec}s")
+    } else {
+        format!("{sec}s")
+    }
+}
+
+/// Compose a full human-readable diagnostics report: environment, config
+/// (token redacted), connection/pairing, GPU, Ollama, Whisper, every job/
+/// activity entry since launch, and the on-disk application log.
+async fn build_diagnostics_report(state: &AppState) -> String {
+    use std::fmt::Write as _;
+    let now = state::now_ms();
+    let cfg = state.config_snapshot();
+    let gpu = state.gpu.lock().unwrap().clone();
+    let budget = state.effective_budget_gb();
+    let ollama = ollama::status(state).await;
+    let sidecar_running = state.sidecar.lock().await.is_some();
+    let pulls = state.incoming_pulls_snapshot();
+    let jobs = state.job_logs();
+    let activity: Vec<state::ActivityEntry> =
+        state.activity.lock().unwrap().iter().cloned().collect();
+
+    let mut r = String::new();
+    let _ = writeln!(r, "================ ClipAI GPU Companion — Diagnostics Report ================");
+    let _ = writeln!(r, "Generated:     {}", fmt_ms(now));
+    let _ = writeln!(r, "App version:   {}", env!("CARGO_PKG_VERSION"));
+    let _ = writeln!(r, "Platform:      {} / {}", std::env::consts::OS, std::env::consts::ARCH);
+    let _ = writeln!(r, "Log file:      {}", log_file_path().display());
+    let _ = writeln!(r, "App started:   {}  (uptime {})",
+        fmt_ms(state.app_started_ms), fmt_dur_ms(now.saturating_sub(state.app_started_ms)));
+
+    let _ = writeln!(r, "\n---- Configuration ----");
+    let _ = writeln!(r, "Companion name:       {}", cfg.name);
+    let _ = writeln!(r, "Proxy port:           {}", cfg.port);
+    let _ = writeln!(r, "Access token:         present ({} chars) [redacted]", cfg.token.len());
+    let _ = writeln!(r, "Paused:               {}", cfg.paused);
+    let _ = writeln!(r, "Setup complete:       {}", cfg.setup_complete);
+    let _ = writeln!(r, "Auto-allocate VRAM:   {}", cfg.vram_auto);
+    let _ = writeln!(r, "VRAM budget (manual): {} GB", cfg.vram_budget_gb);
+    let _ = writeln!(r, "VRAM free buffer:     {} GB", cfg.vram_buffer_gb);
+    let _ = writeln!(r, "Effective VRAM given: {:.1} GB", budget);
+    let _ = writeln!(r, "Ollama keep-alive:    {}", cfg.ollama_keep_alive);
+    let _ = writeln!(r, "Sidecar idle (min):   {}", cfg.sidecar_idle_min);
+    let _ = writeln!(r, "Paired ClipAI URL:    {}",
+        if cfg.paired_clipai_url.is_empty() { "(none — added manually in ClipAI, or not paired)".into() }
+        else { cfg.paired_clipai_url.clone() });
+
+    let _ = writeln!(r, "\n---- Connection ----");
+    let _ = writeln!(r, "LAN IP:               {}", pairing::detect_lan_ip().unwrap_or_else(|| "(unknown)".into()));
+    let last = state.last_clipai_contact_ms();
+    let _ = writeln!(r, "ClipAI connected:     {} (last contact {}{})",
+        state.clipai_connected(), fmt_ms(last),
+        if last > 0 { format!(", {} ago", fmt_dur_ms(now.saturating_sub(last))) } else { String::new() });
+    let _ = writeln!(r, "Serving real jobs:    {}", state.serving_jobs());
+
+    let _ = writeln!(r, "\n---- GPU ----");
+    let _ = writeln!(r, "Name:                 {}", if gpu.gpu_name.is_empty() { "(none)".into() } else { gpu.gpu_name.clone() });
+    let _ = writeln!(r, "VRAM used/free/total: {} / {} / {} MB",
+        gpu.vram_total_mb.saturating_sub(gpu.vram_free_mb), gpu.vram_free_mb, gpu.vram_total_mb);
+    let _ = writeln!(r, "Unified memory:       {}", gpu.unified_memory);
+    let _ = writeln!(r, "Available:            {}", gpu.available);
+
+    let _ = writeln!(r, "\n---- Ollama ----");
+    let _ = writeln!(r, "Installed: {}   Version: {}   Running: {}   Managed: {}",
+        ollama.installed, if ollama.version.is_empty() { "-" } else { &ollama.version },
+        ollama.running, ollama.managed);
+    let _ = writeln!(r, "Models ({}):", ollama.models.len());
+    for m in &ollama.models {
+        let _ = writeln!(r, "  - {m}");
+    }
+
+    let _ = writeln!(r, "\n---- Whisper sidecar ----");
+    let _ = writeln!(r, "Bundled/available:    {}", state.sidecar_available.load(Ordering::Relaxed));
+    let _ = writeln!(r, "Running now:          {}", sidecar_running);
+
+    let _ = writeln!(r, "\n---- Incoming model pulls (from ClipAI) ----");
+    if pulls.is_empty() {
+        let _ = writeln!(r, "  (none)");
+    } else {
+        for (m, pct) in &pulls {
+            let _ = writeln!(r, "  {m}: {pct:.0}%");
+        }
+    }
+
+    let _ = writeln!(r, "\n---- Pipeline activity (grouped by ClipAI job) ----");
+    if jobs.is_empty() {
+        let _ = writeln!(r, "  (no jobs served this session)");
+    }
+    for j in &jobs {
+        let _ = writeln!(r, "\n[JOB {}] {}  ({})  started {}  last {}",
+            if j.job_id.is_empty() { "ad-hoc".into() } else { j.job_id.clone() },
+            if j.job_title.is_empty() { "(untitled)".into() } else { j.job_title.clone() },
+            if j.active { "ACTIVE" } else { "done" },
+            fmt_ms(j.started_at_ms), fmt_ms(j.last_activity_ms));
+        for e in &j.entries {
+            let dur = match e.finished_at_ms {
+                Some(f) => fmt_dur_ms(f.saturating_sub(e.started_at_ms)),
+                None => format!("{}…", fmt_dur_ms(now.saturating_sub(e.started_at_ms))),
+            };
+            let _ = writeln!(r, "  {}  {:<8} {:<28} {}  {}{}",
+                fmt_ms(e.started_at_ms), e.kind, e.path,
+                e.status.map(|s| s.to_string()).unwrap_or_else(|| "…".into()),
+                dur,
+                if e.stage.is_empty() { String::new() } else { format!("  stage={}", e.stage) });
+        }
+    }
+
+    let _ = writeln!(r, "\n---- Raw activity log (newest first, {} entries) ----", activity.len());
+    for e in &activity {
+        let _ = writeln!(r, "  {}  {:<8} {:<28} {}  job={} {}",
+            fmt_ms(e.started_at_ms), e.kind, e.path,
+            e.status.map(|s| s.to_string()).unwrap_or_else(|| "…".into()),
+            if e.job_id.is_empty() { "-" } else { &e.job_id },
+            if e.stage.is_empty() { String::new() } else { format!("stage={}", e.stage) });
+    }
+
+    let _ = writeln!(r, "\n======================= Application log (companion.log) =======================");
+    match std::fs::read_to_string(log_file_path()) {
+        Ok(contents) => {
+            r.push_str(&contents);
+        }
+        Err(e) => {
+            let _ = writeln!(r, "(could not read log file: {e})");
+        }
+    }
+    r
+}
+
+/// Write a full diagnostics report to the Downloads folder and reveal it.
+/// Returns the saved path. Powers the GUI "Export logs" button.
+#[tauri::command]
+async fn export_logs(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, SharedState>,
+) -> Result<String, String> {
+    let report = build_diagnostics_report(&state).await;
+    let dir = dirs::download_dir()
+        .or_else(dirs::desktop_dir)
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(std::env::temp_dir);
+    let _ = std::fs::create_dir_all(&dir);
+    let stamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+    let path = dir.join(format!("clipai-companion-logs_{stamp}.txt"));
+    std::fs::write(&path, report).map_err(|e| format!("could not write report: {e}"))?;
+    // Best-effort reveal in the OS file manager so the user can grab it.
+    {
+        use tauri_plugin_opener::OpenerExt;
+        let _ = app.opener().reveal_item_in_dir(&path);
+    }
+    log::info!("exported diagnostics report to {}", path.display());
+    Ok(path.to_string_lossy().to_string())
+}
+
 #[tauri::command]
 async fn delete_model(model: String) -> Result<(), String> {
     ollama::delete_model(&model).await
@@ -635,6 +808,7 @@ pub fn run() {
             delete_model,
             refresh_sidecar,
             download_whisper,
+            export_logs,
             pair_clipai,
         ]);
 
