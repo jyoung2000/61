@@ -95,7 +95,7 @@ function LocationRow({ stage, location }) {
       gap: 12, padding: '6px 0',
     }}>
       <span style={{ fontSize: 12, color: 'var(--text-primary)', textTransform: 'capitalize' }}>
-        {String(stage).replace(/[_+]/g, ' ')}
+        {stage === 'ai_inference' ? 'AI (vision + text)' : String(stage).replace(/[_+]/g, ' ')}
       </span>
       <span
         title={kind === 'host' ? `Served by Ollama host "${location}"` : ''}

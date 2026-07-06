@@ -115,12 +115,31 @@ def _remote_whisper_label() -> str:
     return f"{name} @ {base}" if name else base
 
 
+def _ollama_host_label() -> str:
+    """Name the GPU serving Ollama LLM/vision when a REMOTE host (Companion) is
+    primary, e.g. 'NVIDIA GeForce RTX 4070 @ http://…:11500', else '' (local or
+    cloud). Pure settings/registry read — no network."""
+    try:
+        from backend.services import ollama_registry as _oreg
+        chain = [p.strip() for p in (getattr(settings, "AI_FALLBACK_CHAIN", "") or "").split(",") if p.strip()]
+        if not chain or chain[0] != "ollama":
+            return ""
+        h = _oreg.primary_host()
+        if h is None or _oreg.is_local_gpu_host(h.url):
+            return ""
+        base = h.url[:-len("/ollama")] if h.url.endswith("/ollama") else h.url
+        return f"{h.gpu_name} @ {base}" if h.gpu_name else base
+    except Exception:
+        return ""
+
+
 def _gpu_status_message() -> str:
     """Human-readable GPU status line for the live Processing Log.
 
     The backend logs GPU availability at startup, but the per-job log only ever
     mentioned the GPU on a CPU FALLBACK — so a healthy GPU run looked CPU-silent.
-    Broadcast this positively at the stages the user actually watches.
+    Broadcast this positively at the stages the user actually watches, naming the
+    GPU for EACH kind of work so the log can't be read as "only the 1650 is used".
     """
     enabled = bool(getattr(settings, "GPU_ACCELERATION_ENABLED", False))
     name = ""
@@ -131,12 +150,19 @@ def _gpu_status_message() -> str:
     except Exception:
         name = ""
     if enabled and name:
-        remote = _remote_whisper_label()
-        if remote:
-            # Split setup: local card decodes/encodes, the paired Companion GPU
-            # transcribes. Naming both stops the log from contradicting the header.
-            return (f"GPU acceleration active: video decode and subject detection run on "
-                    f"{name}; Whisper transcription runs on the Companion GPU ({remote}).")
+        remote_whisper = _remote_whisper_label()
+        remote_ai = _ollama_host_label()
+        # Everything that must stay local (the source video lives on the server).
+        local_part = (f"Video decode, frame extraction, subject detection and encoding "
+                      f"run on the server GPU ({name})")
+        # Offloaded AI stages, named so the log matches the header chip.
+        remote_bits = []
+        if remote_ai:
+            remote_bits.append(f"AI vision + text run on the Companion GPU ({remote_ai})")
+        if remote_whisper:
+            remote_bits.append(f"Whisper transcription runs on the Companion GPU ({remote_whisper})")
+        if remote_bits:
+            return f"GPU acceleration active: {local_part}; " + "; ".join(remote_bits) + "."
         return (f"GPU acceleration active: {name} — video decode, subject detection, "
                 "and Whisper transcription run on the GPU.")
     if enabled:
@@ -4677,6 +4703,23 @@ async def _run_analysis_inner(job_id: str):
                         else "local_gpu" if _wdev.startswith("cuda")
                         else "cpu")
                 _record_stage_location(job_id, "transcription", _loc)
+        except Exception:
+            pass
+        # Tag AI inference (vision + text) with the GPU/host that serves it, so
+        # the Compute card shows the LLM/vision device too — the Companion when
+        # it's the primary Ollama host, else the local card. Cloud providers have
+        # no GPU to name here.
+        try:
+            from backend.services.pipeline_helpers import _record_stage_location
+            from backend.services import ollama_registry as _oreg
+            _chain = [p.strip() for p in (getattr(settings, "AI_FALLBACK_CHAIN", "") or "").split(",") if p.strip()]
+            if _chain and _chain[0] == "ollama":
+                _h = _oreg.primary_host()
+                if _h is not None:
+                    _record_stage_location(
+                        job_id, "ai_inference",
+                        "local_gpu" if _oreg.is_local_gpu_host(_h.url)
+                        else (_h.gpu_name or _h.name or "remote"))
         except Exception:
             pass
         if _vs_executor is not None:
