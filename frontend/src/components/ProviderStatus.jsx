@@ -159,11 +159,15 @@ export default function ProviderStatus({ collapsed, onActiveChange }) {
                     marginTop: 2, paddingTop: 4, borderTop: '1px solid var(--border)',
                     display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap',
                   }}>
-                    <span style={{ color: 'var(--text-muted)' }}>gpu:</span>
-                    <span style={{ color: 'var(--text-secondary)' }}>
+                    <span style={{ color: 'var(--text-muted)' }}>ai gpu:</span>
+                    <span style={{ color: 'var(--text-secondary)' }}
+                      title={active.companion?.whisper_remote
+                        ? 'Runs local AI models and transcription (remote Whisper)'
+                        : 'Runs local AI models (transcription runs on the ClipAI server GPU)'}>
                       {active.companion?.gpu_name
                         ? `${active.companion.gpu_name}${active.companion.name ? ` · ${active.companion.name}` : ''}`
                         : (active.ollama_host_name || 'local')}
+                      {active.companion?.whisper_remote ? ' + whisper' : ''}
                     </span>
                     {active.companion && (
                       <span style={{

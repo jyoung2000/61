@@ -663,6 +663,21 @@ async def provider_status():
                     want.append(_m)
             have = _comp.get("models") or []
             ready = [m for m in want if _oreg.model_present(have, m)]
+            # Self-heal remote Whisper: if the Companion can now serve
+            # transcription (e.g. the user just downloaded Whisper in its GUI),
+            # point WHISPER_REMOTE_URL at it so the next job's transcription
+            # runs on the paired GPU instead of the local card.
+            _comp_url = _comp.get("url", "")
+            _comp_base = _comp_url[:-len("/ollama")] if _comp_url.endswith("/ollama") else _comp_url
+            _comp_host = next((h for h in _oreg.get_hosts() if h.url == _comp_url), None)
+            _comp_tok = _comp_host.token if _comp_host is not None else ""
+            if bool(_comp.get("online")):
+                try:
+                    await _maybe_autoconfig_remote_whisper(_comp_base, _comp_tok)
+                except Exception as _we:
+                    logger.debug("remote-whisper auto-config skipped: %s", _we)
+            _whisper_url = (getattr(settings, "WHISPER_REMOTE_URL", "") or "").strip()
+            _whisper_remote_on = _whisper_url.rstrip("/") == _comp_base.rstrip("/") and bool(_whisper_url)
             companion_info = {
                 "name": _comp.get("name", ""),
                 "gpu_name": _comp.get("gpu_name", ""),
@@ -673,6 +688,7 @@ async def provider_status():
                 "models_ready": len(ready),
                 "missing": [m for m in want if m not in ready],
                 "ready": bool(want) and len(ready) == len(want) and bool(_comp.get("online")),
+                "whisper_remote": _whisper_remote_on,
             }
     except Exception as _e:
         logger.debug("companion status calc failed: %s", _e)
@@ -3175,6 +3191,70 @@ from fastapi import Depends as _Depends  # noqa: E402
 from backend.auth import verify_api_key as _verify_api_key  # noqa: E402
 
 
+# ── Remote-Whisper auto-configuration ────────────────────────────────────
+#
+# Remote Whisper is gated purely on WHISPER_REMOTE_URL. A from-source Companion
+# ships no Whisper sidecar at first pair, so pairing leaves that URL empty and
+# every transcription stays on the LOCAL GPU. Once the user downloads Whisper in
+# the Companion GUI, its /v1/health advertises backends.whisper=true — so we
+# trust observed capability and enable remote Whisper automatically, with no
+# manual re-pair (which would need the ClipAI API key the Companion doesn't
+# store). This is what routes transcription onto the paired GPU.
+
+_companion_whisper_probe: dict = {"ts": 0.0, "base": "", "capable": None}
+_COMPANION_WHISPER_TTL = 60.0
+
+
+async def _companion_whisper_capable(base: str, token: str,
+                                     timeout: float = 4.0):
+    """Probe a Companion's ``/v1/health`` for Whisper capability. Returns True
+    when it can serve transcription, False when it explicitly cannot, or None
+    when the probe is inconclusive (network error / not a Companion)."""
+    import httpx as _httpx
+    url = f"{base.rstrip('/')}/v1/health"
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    try:
+        async with _httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.get(url, headers=headers)
+        if resp.status_code == 200:
+            data = resp.json() or {}
+            if data.get("service") == "clipai-gpu-companion":
+                return bool((data.get("backends") or {}).get("whisper"))
+    except Exception:
+        return None
+    return None
+
+
+async def _maybe_autoconfig_remote_whisper(comp_base: str, token: str) -> bool:
+    """Point WHISPER_REMOTE_URL at the paired Companion when it can serve
+    transcription but no remote Whisper is configured yet. Cached ~60s and only
+    runs while WHISPER_REMOTE_URL is empty, so it never hammers /v1/health.
+    Returns True when it just enabled remote Whisper."""
+    if (getattr(settings, "WHISPER_REMOTE_URL", "") or "").strip():
+        return False  # already configured — nothing to auto-detect
+    import time as _t
+    now = _t.time()
+    cache = _companion_whisper_probe
+    if cache["base"] == comp_base and now - cache["ts"] < _COMPANION_WHISPER_TTL:
+        capable = cache["capable"]
+    else:
+        capable = await _companion_whisper_capable(comp_base, token)
+        cache.update({"ts": now, "base": comp_base, "capable": capable})
+    if not capable:
+        return False
+    settings.WHISPER_REMOTE_URL = comp_base
+    if token:
+        settings.WHISPER_REMOTE_API_KEY = token
+    try:
+        from backend.services import reframer_audio as _ra
+        _ra._REMOTE_HEALTH_CACHE.update({"checked_at": 0.0, "url": ""})
+    except Exception:
+        pass
+    _persist_user_settings()
+    logger.info("Remote Whisper auto-enabled from Companion capability: %s", comp_base)
+    return True
+
+
 @router.post("/settings/companion-register")
 async def companion_register(req: CompanionRegisterRequest,
                              _key: str = _Depends(_verify_api_key)):
@@ -3222,8 +3302,15 @@ async def companion_register(req: CompanionRegisterRequest,
     hosts.insert(0, entry)  # Companion becomes the PRIMARY
     ollama_registry.save_hosts(hosts)
 
+    # Enable remote Whisper if the Companion says it can serve it (register_whisper)
+    # OR if a live /v1/health probe shows a Whisper backend — so a Companion that
+    # gained Whisper after its first pair still offloads transcription.
     whisper_registered = False
-    if req.register_whisper:
+    want_whisper = bool(req.register_whisper)
+    if not want_whisper:
+        cap = await _companion_whisper_capable(base, req.token or "")
+        want_whisper = bool(cap)
+    if want_whisper:
         settings.WHISPER_REMOTE_URL = base
         if req.token:
             settings.WHISPER_REMOTE_API_KEY = req.token

@@ -311,13 +311,35 @@ def remote_whisper_healthy(force: bool = False) -> bool:
         if key:
             headers["Authorization"] = f"Bearer {key}"
         with httpx.Client(timeout=3.0, headers=headers) as client:
-            for path in ("/v1/health", "/health", "/"):
-                try:
-                    client.get(f"{base}{path}")
-                    healthy = True
-                    break
-                except httpx.HTTPError:
-                    continue
+            # Prefer /v1/health: a ClipAI Companion reports whether its Whisper
+            # backend is actually present, so we never route transcription to a
+            # Companion that has no sidecar (which would just time out and fall
+            # back to local). Its verdict is authoritative.
+            try:
+                r = client.get(f"{base}/v1/health")
+                if r.status_code == 200:
+                    try:
+                        data = r.json()
+                    except Exception:
+                        data = {}
+                    if isinstance(data, dict) and data.get("service") == "clipai-gpu-companion":
+                        healthy = bool((data.get("backends") or {}).get("whisper"))
+                        _REMOTE_HEALTH_CACHE.update(
+                            {"checked_at": now, "healthy": healthy, "url": base})
+                        return healthy
+                    healthy = True  # some other server exposes /v1/health
+            except httpx.HTTPError:
+                pass
+            # Third-party servers (speaches /health, whisper.cpp on /): any HTTP
+            # response proves the server is up — connection errors are failure.
+            if not healthy:
+                for path in ("/health", "/"):
+                    try:
+                        client.get(f"{base}{path}")
+                        healthy = True
+                        break
+                    except httpx.HTTPError:
+                        continue
     except Exception:
         healthy = False
     _REMOTE_HEALTH_CACHE.update(

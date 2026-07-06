@@ -91,6 +91,30 @@ def _canonical_clipper_config_path() -> str:
     return os.path.join(local_dir, "clipper_config.json")
 
 
+def _remote_whisper_label() -> str:
+    """Name the GPU that will serve remote Whisper (the paired Companion),
+    e.g. ``NVIDIA GeForce RTX 4070 @ http://192.168.8.14:11500``, or ``""`` when
+    remote Whisper isn't configured. Pure settings/registry read — no network."""
+    try:
+        from backend.services import reframer_audio as _ra
+        if not _ra.remote_whisper_configured():
+            return ""
+        base = _ra._remote_whisper_base()
+    except Exception:
+        return ""
+    name = ""
+    try:
+        from backend.services import ollama_registry as _oreg
+        for h in _oreg.get_hosts():
+            hb = h.url[:-len("/ollama")] if h.url.endswith("/ollama") else h.url
+            if hb.rstrip("/") == base.rstrip("/") and h.gpu_name:
+                name = h.gpu_name
+                break
+    except Exception:
+        pass
+    return f"{name} @ {base}" if name else base
+
+
 def _gpu_status_message() -> str:
     """Human-readable GPU status line for the live Processing Log.
 
@@ -107,6 +131,12 @@ def _gpu_status_message() -> str:
     except Exception:
         name = ""
     if enabled and name:
+        remote = _remote_whisper_label()
+        if remote:
+            # Split setup: local card decodes/encodes, the paired Companion GPU
+            # transcribes. Naming both stops the log from contradicting the header.
+            return (f"GPU acceleration active: video decode and subject detection run on "
+                    f"{name}; Whisper transcription runs on the Companion GPU ({remote}).")
         return (f"GPU acceleration active: {name} — video decode, subject detection, "
                 "and Whisper transcription run on the GPU.")
     if enabled:
@@ -4058,7 +4088,12 @@ async def _run_analysis_inner(job_id: str):
         from backend.services.clip_exporter import detect_gpu_capabilities, get_encoder_label
         _gpu = detect_gpu_capabilities()
         _gpu_parts = []
-        if _gpu.get("cuda_available"):
+        _remote_whisper = _remote_whisper_label()
+        if _remote_whisper:
+            # Transcription is offloaded to the paired Companion GPU — don't
+            # claim the local card runs Whisper.
+            _gpu_parts.append(f"Whisper: remote ({_remote_whisper})")
+        elif _gpu.get("cuda_available"):
             _gpu_parts.append(f"Whisper: CUDA ({_gpu.get('gpu_name', 'GPU')})")
         else:
             # Check if GPU is detected but CUDA isn't available

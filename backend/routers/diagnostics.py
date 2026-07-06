@@ -14,9 +14,28 @@ from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 
 from backend.config import settings
+from backend.services import ollama_registry
 
 router = APIRouter(prefix="/api/diagnostics", tags=["diagnostics"])
 logger = logging.getLogger(__name__)
+
+
+def _ollama_url(path: str = "") -> str:
+    """Active Ollama base (the paired Companion proxy or the local daemon)
+    resolved through the host registry, with the legacy ``OLLAMA_HOST`` as a
+    fallback. ``path`` must start with ``/`` when given."""
+    base = ollama_registry.primary_url() or (getattr(settings, "OLLAMA_HOST", "") or "")
+    return ollama_registry.join_url(base, path) if path else base
+
+
+def _ollama_headers(url: str) -> dict:
+    """Bearer + ``X-ClipAI-*`` headers for the active host so probes against a
+    Companion proxy (which 401s unauthenticated requests) succeed. Empty for a
+    tokenless local daemon, so single-host deployments are unaffected."""
+    try:
+        return ollama_registry.headers_for_url(url)
+    except Exception:
+        return {}
 
 # ── GPU info cache (doesn't change at runtime) ──────────────────────────
 _gpu_info_cache: dict | None = None
@@ -139,8 +158,9 @@ async def _get_gpu_info() -> dict:
 
     # Method 1: Check Ollama /api/ps — if a model is loaded on GPU, we know GPU exists
     try:
+        _url = _ollama_url("/api/ps")
         async with httpx.AsyncClient(timeout=5) as client:
-            resp = await client.get(f"{settings.OLLAMA_HOST}/api/ps")
+            resp = await client.get(_url, headers=_ollama_headers(_url))
             if resp.status_code == 200:
                 for m in resp.json().get("models", []):
                     if m.get("size_vram", 0) > 0:
@@ -212,9 +232,13 @@ async def _get_gpu_info() -> dict:
     # Method 5: Probe Ollama — load a model with GPU request, check if it gets GPU
     if not info["gpu_available"]:
         try:
+            _gen_url = _ollama_url("/api/generate")
+            _ps_url = _ollama_url("/api/ps")
+            _hdr = _ollama_headers(_gen_url)
             async with httpx.AsyncClient(timeout=60) as client:
                 resp = await client.post(
-                    f"{settings.OLLAMA_HOST}/api/generate",
+                    _gen_url,
+                    headers=_hdr,
                     json={
                         "model": settings.OLLAMA_PRIMARY_MODEL,
                         "prompt": "hi",
@@ -224,7 +248,7 @@ async def _get_gpu_info() -> dict:
                     timeout=60,
                 )
                 if resp.status_code == 200:
-                    ps_resp = await client.get(f"{settings.OLLAMA_HOST}/api/ps")
+                    ps_resp = await client.get(_ps_url, headers=_ollama_headers(_ps_url))
                     if ps_resp.status_code == 200:
                         for m in ps_resp.json().get("models", []):
                             if m.get("size_vram", 0) > 0:
@@ -234,7 +258,8 @@ async def _get_gpu_info() -> dict:
                                 break
                     # Clean up probe
                     await client.post(
-                        f"{settings.OLLAMA_HOST}/api/generate",
+                        _gen_url,
+                        headers=_hdr,
                         json={"model": settings.OLLAMA_PRIMARY_MODEL, "keep_alive": 0},
                     )
                     await asyncio.sleep(2)
@@ -252,8 +277,9 @@ async def _get_gpu_info() -> dict:
 async def _get_ollama_loaded_models() -> list[dict]:
     """Get currently loaded Ollama models with VRAM info."""
     try:
+        _url = _ollama_url("/api/ps")
         async with httpx.AsyncClient(timeout=5) as client:
-            resp = await client.get(f"{settings.OLLAMA_HOST}/api/ps")
+            resp = await client.get(_url, headers=_ollama_headers(_url))
             if resp.status_code == 200:
                 models = []
                 for m in resp.json().get("models", []):
@@ -273,14 +299,18 @@ async def _get_ollama_loaded_models() -> list[dict]:
 async def _unload_all_models() -> None:
     """Unload all loaded Ollama models to free VRAM."""
     try:
+        _ps_url = _ollama_url("/api/ps")
+        _gen_url = _ollama_url("/api/generate")
+        _gen_hdr = _ollama_headers(_gen_url)
         async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.get(f"{settings.OLLAMA_HOST}/api/ps")
+            resp = await client.get(_ps_url, headers=_ollama_headers(_ps_url))
             if resp.status_code == 200:
                 for m in resp.json().get("models", []):
                     name = m.get("name", "")
                     if name:
                         await client.post(
-                            f"{settings.OLLAMA_HOST}/api/generate",
+                            _gen_url,
+                            headers=_gen_hdr,
                             json={"model": name, "keep_alive": 0},
                         )
     except Exception:
@@ -683,18 +713,30 @@ async def get_gpu_status():
         if gpu["vram_total_bytes"] == 0:
             gpu["vram_total_bytes"] = int(3.6 * 1024 * 1024 * 1024)
 
+    # Availability via the host registry's authenticated /api/tags probe (cached
+    # ~10s). The old bare HEAD to settings.OLLAMA_HOST 401'd against a paired
+    # Companion proxy — which requires a bearer token — so it always read
+    # "offline" and drove the false "Ollama offline — reconnecting" banner.
     ollama_available = False
+    ollama_error = None
     try:
-        async with httpx.AsyncClient(timeout=3) as client:
-            resp = await client.head(f"{settings.OLLAMA_HOST}")
-            ollama_available = resp.status_code == 200
-    except Exception:
-        pass
+        host = ollama_registry.primary_host()
+        if host is not None:
+            st = await ollama_registry.probe(host)
+            ollama_available = bool(st.online)
+            ollama_error = st.error
+        else:
+            async with httpx.AsyncClient(timeout=3) as client:
+                resp = await client.get(_ollama_url())
+                ollama_available = resp.status_code == 200
+    except Exception as e:
+        ollama_error = f"{type(e).__name__}: {str(e)[:120]}"
 
     return {
         "gpu": gpu,
         "loaded_models": loaded_models,
         "ollama_available": ollama_available,
+        "ollama_error": ollama_error,
         "torch_gpu": torch_gpu,
         "whisper_gpu": whisper_gpu,
     }

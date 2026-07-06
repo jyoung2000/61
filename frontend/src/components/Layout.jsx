@@ -510,8 +510,8 @@ export default function Layout({ children }) {
                   transition: 'border-color 0.2s',
                 }}
                 title={activeModel.companion
-                  ? 'GPU running your local models (paired Companion) — click to configure'
-                  : 'GPU host running your local models — click to configure'}
+                  ? `GPU running your local AI models (paired Companion)${activeModel.companion.whisper_remote ? ' — also transcribing here' : ''} — click to configure`
+                  : 'GPU host running your local AI models — click to configure'}
               >
                 {activeModel.companion && (
                   <span style={{
@@ -520,7 +520,7 @@ export default function Layout({ children }) {
                       : activeModel.companion.online ? 'var(--accent-amber)' : 'var(--danger)',
                   }} />
                 )}
-                <span style={{ color: 'var(--accent-cyan)' }}>GPU:</span> {hostGpu}
+                <span style={{ color: 'var(--accent-cyan)' }}>AI GPU:</span> {hostGpu}
               </Link>
             )}
             {clientGpu.enabled && clientGpu.selectedGpuName && (

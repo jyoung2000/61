@@ -23,13 +23,20 @@ function Spinner() {
 }
 
 // ── VRAM Gauge ──────────────────────────────────────────────────────────
-function VramGauge({ gpu, loadedModels, ollamaAvailable, torchGpu, whisperGpu, onUnload, onReleaseGpu, onRestart }) {
-  // Ollama offline
+function VramGauge({ gpu, loadedModels, ollamaAvailable, ollamaError, torchGpu, whisperGpu, onUnload, onReleaseGpu, onRestart }) {
+  // Ollama offline. Distinguish an auth/token problem (actionable) from a
+  // genuine connectivity drop so the user isn't told to "wait" when the fix is
+  // to check the Companion's access token.
   if (ollamaAvailable === false) {
+    const isAuth = ollamaError && /auth|401|403/i.test(ollamaError);
     return (
       <div style={cardStyle}>
-        <div style={{ fontSize: 12, color: 'var(--text-muted)', textAlign: 'center', padding: '8px 0' }}>
-          Ollama offline — reconnecting...
+        <div style={{ fontSize: 12, color: isAuth ? 'var(--accent-amber)' : 'var(--text-muted)', textAlign: 'center', padding: '8px 0' }}>
+          {isAuth
+            ? 'Ollama host rejected the token — check the host access token in Settings → Ollama Hosts'
+            : ollamaError
+              ? `Ollama unreachable — ${ollamaError}`
+              : 'Ollama offline — reconnecting...'}
         </div>
       </div>
     );
@@ -109,8 +116,9 @@ function VramGauge({ gpu, loadedModels, ollamaAvailable, torchGpu, whisperGpu, o
     <div style={cardStyle}>
       {/* Header */}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
-        <span style={{ fontSize: 11, fontFamily: 'var(--font-mono)', color: 'var(--text-secondary)' }}>
-          GPU: {gpu.gpu_name || 'Unknown'}
+        <span style={{ fontSize: 11, fontFamily: 'var(--font-mono)', color: 'var(--text-secondary)' }}
+          title="The ClipAI server's own GPU — handles video decode, encode, YOLO, and local Whisper. AI models may run on a separate paired Companion GPU (see the header).">
+          Local GPU: {gpu.gpu_name || 'Unknown'}
         </span>
         <span style={{ fontSize: 10, fontFamily: 'var(--font-mono)', color: 'var(--text-muted)' }}>
           <span style={{
@@ -303,6 +311,7 @@ export default function PipelineDiagnostics({ showTestRunner = true } = {}) {
   const [torchGpu, setTorchGpu] = useState(null);
   const [whisperGpu, setWhisperGpu] = useState(null);
   const [ollamaAvailable, setOllamaAvailable] = useState(null);
+  const [ollamaError, setOllamaError] = useState(null);
   const [testRunning, setTestRunning] = useState(false);
   const [testPhases, setTestPhases] = useState([]);
   const [testOverall, setTestOverall] = useState(null);
@@ -317,7 +326,7 @@ export default function PipelineDiagnostics({ showTestRunner = true } = {}) {
       try {
         const resp = await fetch('/api/diagnostics/gpu-status');
         if (!resp.ok) {
-          if (active) setOllamaAvailable(false);
+          if (active) { setOllamaAvailable(false); setOllamaError(`gpu-status HTTP ${resp.status}`); }
           return;
         }
         const data = await resp.json();
@@ -327,8 +336,9 @@ export default function PipelineDiagnostics({ showTestRunner = true } = {}) {
         setTorchGpu(data.torch_gpu || null);
         setWhisperGpu(data.whisper_gpu || null);
         setOllamaAvailable(data.ollama_available);
+        setOllamaError(data.ollama_error || null);
       } catch {
-        if (active) setOllamaAvailable(false);
+        if (active) { setOllamaAvailable(false); setOllamaError('network error'); }
       }
     };
     poll();
@@ -415,6 +425,7 @@ export default function PipelineDiagnostics({ showTestRunner = true } = {}) {
         torchGpu={torchGpu}
         whisperGpu={whisperGpu}
         ollamaAvailable={ollamaAvailable}
+        ollamaError={ollamaError}
         onUnload={handleUnload}
         onReleaseGpu={handleReleaseGpu}
         onRestart={handleRestart}
