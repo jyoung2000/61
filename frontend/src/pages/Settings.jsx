@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import ModelBrowser from '../components/ModelBrowser';
 import PipelineDiagnostics from '../components/PipelineDiagnostics';
@@ -38,6 +38,140 @@ const dropdownStyle = {
 };
 
 const TAB_NAME_TO_INDEX = { 'ai-provider': 0, prompts: 1, fonts: 2, presets: 3, advanced: 4, 'usage-costs': 5, 'api-access': 6, 'about': 7, 'users': 8 };
+
+const OPT_ROW = {
+  padding: '7px 12px', fontSize: 12, fontFamily: 'var(--font-mono)', cursor: 'pointer',
+  whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+};
+
+// Searchable model picker. Defined at MODULE scope (not inside Settings) so it
+// keeps a stable identity — otherwise every status/sync poll would remount it
+// and drop focus while the user is typing in the search box. The search field
+// lives inside an absolutely-positioned panel that only exists while open, so
+// it never takes layout space when closed. Searches the curated list by
+// default; when the user types it searches the full local + cloud catalog.
+function ModelDropdown({ ctx, task, models, pendingValue, savedValue, label, desc }) {
+  const {
+    catalog, loadCatalog, openDropdown, setOpenDropdown, dropdownQuery, setDropdownQuery,
+    handleSelectModel, qualityStars,
+  } = ctx;
+  const isChanged = pendingValue !== savedValue;
+  const open = openDropdown === task;
+  const query = open ? dropdownQuery : '';
+  const q = query.trim().toLowerCase();
+  const roleKey = task === 'primary' ? 'primary'
+    : task === 'translation' ? 'translation'
+    : task === 'editorial' ? 'editorial' : null;
+
+  const selectedModel = (models || []).find((m) => m.id === pendingValue);
+  const displayName = pendingValue ? (selectedModel ? selectedModel.name : pendingValue) : '-- Select a model --';
+
+  const searchOpts = useMemo(() => {
+    if (!q) return [];
+    const seen = new Set(); const out = [];
+    const add = (o) => { if (o && o.id && !seen.has(o.id)) { seen.add(o.id); out.push(o); } };
+    (models || []).forEach(add);
+    if (catalog && roleKey) {
+      (catalog.local[roleKey] || []).forEach((r) => add({
+        id: r.id,
+        name: `${r.tag}${r.size_gb ? ` · ${r.size_gb}GB` : ''}${r.installed ? ' ✓' : ' ⤓'}${r.fits ? '' : ' ⚠VRAM'}`,
+        provider: 'local',
+      }));
+      if (task !== 'transcript') {
+        (catalog.cloud || []).forEach((c) => add({
+          id: c.id, name: `${c.name}${c.is_free ? ' [FREE]' : ''}${c.vision ? ' 👁' : ''}`, provider: 'openrouter',
+        }));
+      }
+    }
+    return out.filter((o) => (`${o.id} ${o.name || ''}`).toLowerCase().includes(q));
+  }, [q, models, catalog, roleKey, task]);
+
+  const shown = q ? searchOpts : (models || []);
+  const freeText = q && roleKey
+    && !shown.some((o) => o.id.toLowerCase() === q || o.id.toLowerCase() === `ollama/${q}`)
+    ? query.trim() : '';
+
+  const optionLabel = (m) => {
+    const price = m.is_free ? '[FREE]' : m.cost_per_hour > 0 ? `[$${m.cost_per_hour.toFixed(3)}/hr]` : '';
+    const provider = m.provider && m.provider !== 'local' ? ` (${m.provider})` : '';
+    const stars = m.quality_score ? qualityStars(m.quality_score) : '';
+    return [stars, price, (m.name || m.id) + provider].filter(Boolean).join(' ');
+  };
+  const pick = (id) => { handleSelectModel(task, id); setOpenDropdown(null); setDropdownQuery(''); };
+
+  return (
+    <div className="model-dropdown" style={{ marginBottom: 20 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+        <h4 style={{ fontSize: 13, margin: 0, color: 'var(--text-primary)' }}>
+          {label}
+          {isChanged && (
+            <span style={{ fontSize: 10, fontWeight: 400, color: 'var(--accent-amber)', marginLeft: 8 }}>unsaved</span>
+          )}
+        </h4>
+        {savedValue && (
+          <span style={{ fontSize: 10, fontFamily: 'var(--font-mono)', color: isChanged ? 'var(--text-muted)' : 'var(--accent-cyan)' }}>
+            {savedValue}
+          </span>
+        )}
+      </div>
+      <p style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 8, lineHeight: 1.5 }}>{desc}</p>
+      <div style={{ position: 'relative' }}>
+        <button type="button"
+          onClick={() => { const willOpen = !open; setOpenDropdown(willOpen ? task : null); setDropdownQuery(''); if (willOpen) loadCatalog(); }}
+          style={{ ...dropdownStyle, textAlign: 'left', borderColor: isChanged ? 'var(--accent-amber)' : undefined }}>
+          {displayName}
+        </button>
+        {open && (
+          <div style={{
+            position: 'absolute', top: 'calc(100% + 4px)', left: 0, right: 0, zIndex: 60,
+            background: 'var(--bg-panel)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)',
+            boxShadow: '0 8px 28px rgba(0,0,0,0.45)', maxHeight: 340, display: 'flex', flexDirection: 'column',
+          }}>
+            <input autoFocus value={query} onChange={(e) => setDropdownQuery(e.target.value)}
+              placeholder={roleKey ? 'Search local + cloud models…' : 'Search models…'}
+              style={{
+                margin: 8, padding: '8px 10px', background: 'var(--bg-base)', border: '1px solid var(--border)',
+                borderRadius: 'var(--radius-sm)', color: 'var(--text-primary)', fontSize: 12, fontFamily: 'var(--font-mono)',
+              }} />
+            <div style={{ overflowY: 'auto' }}>
+              {!q && <div onClick={() => pick('')} style={{ ...OPT_ROW, color: 'var(--text-muted)' }}>-- Select a model --</div>}
+              {shown.slice(0, 200).map((m) => (
+                <div key={m.id} onClick={() => pick(m.id)}
+                  style={{ ...OPT_ROW, color: m.id === pendingValue ? 'var(--accent-cyan)' : 'var(--text-secondary)' }}>
+                  {optionLabel(m)}
+                </div>
+              ))}
+              {freeText && (
+                <div onClick={() => pick(`ollama/${freeText}`)} style={{ ...OPT_ROW, color: 'var(--accent-cyan)' }}>
+                  ⤓ Pull local model “{freeText}” from Ollama
+                </div>
+              )}
+              {q && shown.length === 0 && !freeText && (
+                <div style={{ ...OPT_ROW, color: 'var(--text-muted)', cursor: 'default' }}>No matches</div>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+      {selectedModel && (selectedModel.speed || selectedModel.quality_score) && (
+        <div style={{
+          marginTop: 6, padding: '6px 10px', borderRadius: 'var(--radius-sm)',
+          background: 'var(--bg-elevated)', border: '1px solid var(--border)',
+          display: 'flex', gap: 12, alignItems: 'center', fontSize: 11, flexWrap: 'wrap',
+        }}>
+          {selectedModel.quality_score && (
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, color: 'var(--accent-cyan)' }}>
+              <span style={{ fontSize: 12, letterSpacing: 1 }}>{qualityStars(selectedModel.quality_score)}</span>
+              <span style={{ fontSize: 10, textTransform: 'uppercase', fontFamily: 'var(--font-mono)' }}>
+                {selectedModel.quality || `${selectedModel.quality_score}/5`}
+              </span>
+            </span>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
 
 // Static fallback list for the Whisper Model dropdown, used only when the
 // backend's /providers/models/available hasn't populated availableModels yet.
@@ -88,6 +222,29 @@ export default function Settings() {
   const [availableModels, setAvailableModels] = useState({ transcript: [], primary: [], editorial: [], translation: [] });
   // Detected GPU + its VRAM, used to label the local-model recommendations.
   const [localGpu, setLocalGpu] = useState(null);
+  // Searchable superset (full local catalog + all cloud models), lazy-loaded
+  // the first time a model dropdown is opened.
+  const [catalog, setCatalog] = useState(null);
+  const catalogLoading = useRef(false);
+  const loadCatalog = async () => {
+    if (catalog || catalogLoading.current) return;
+    catalogLoading.current = true;
+    try {
+      const r = await fetch('/api/providers/models/catalog');
+      if (r.ok) setCatalog(await r.json());
+    } catch { /* search falls back to the curated list */ }
+    finally { catalogLoading.current = false; }
+  };
+  // Which model dropdown is open (task id or null) + its search query. Lifted
+  // to the parent so a status/sync poll re-render doesn't reset an open search.
+  const [openDropdown, setOpenDropdown] = useState(null);
+  const [dropdownQuery, setDropdownQuery] = useState('');
+  useEffect(() => {
+    if (openDropdown === null) return undefined;
+    const onDown = (e) => { if (!e.target.closest('.model-dropdown')) setOpenDropdown(null); };
+    document.addEventListener('mousedown', onDown);
+    return () => document.removeEventListener('mousedown', onDown);
+  }, [openDropdown]);
   const [currentModels, setCurrentModels] = useState({ transcript_model: '', primary_model: '', editorial_model: '', editorial_model_fallback: '', translation_model: '' });
   const [pendingModels, setPendingModels] = useState({ transcript_model: '', primary_model: '', editorial_model: '', editorial_model_fallback: '', translation_model: '' });
   // Configured vs actually-loaded Whisper model (so the Settings page shows
@@ -1333,103 +1490,10 @@ export default function Settings() {
     return '\u2605'.repeat(filled) + '\u2606'.repeat(5 - filled);
   };
 
-  const ModelDropdown = ({ task, models, pendingValue, savedValue, label, desc }) => {
-    const isChanged = pendingValue !== savedValue;
-    const selectedModel = models.find((m) => m.id === pendingValue);
-    // A persisted pick (e.g. an OpenRouter ":free" judge fallback, or a
-    // model the live availability list filtered out) may not appear in
-    // ``models``. Without a matching <option> the native <select> renders
-    // blank — which looks exactly like the saved value failed to persist
-    // across a refresh / container restart, even though the server kept it.
-    // Surface it as a synthetic option so the dropdown reflects reality.
-    const valueMissing = pendingValue && !models.some((m) => m.id === pendingValue);
-    return (
-      <div style={{ marginBottom: 20 }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
-          <h4 style={{ fontSize: 13, margin: 0, color: 'var(--text-primary)' }}>
-            {label}
-            {isChanged && (
-              <span style={{ fontSize: 10, fontWeight: 400, color: 'var(--accent-amber)', marginLeft: 8 }}>
-                unsaved
-              </span>
-            )}
-          </h4>
-          {savedValue && (
-            <span style={{ fontSize: 10, fontFamily: 'var(--font-mono)', color: isChanged ? 'var(--text-muted)' : 'var(--accent-cyan)' }}>
-              {savedValue}
-            </span>
-          )}
-        </div>
-        <p style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 8, lineHeight: 1.5 }}>{desc}</p>
-        <div style={{ position: 'relative' }}>
-          <select
-            value={pendingValue || ''}
-            onChange={(e) => handleSelectModel(task, e.target.value)}
-            style={{
-              ...dropdownStyle,
-              borderColor: isChanged ? 'var(--accent-amber)' : undefined,
-            }}
-          >
-            <option value="">-- Select a model --</option>
-            {valueMissing && (
-              <option value={pendingValue}>{pendingValue} (saved)</option>
-            )}
-            {models.map((m) => {
-              const price = m.is_free ? '[FREE]' : m.cost_per_hour > 0 ? `[$${m.cost_per_hour.toFixed(3)}/hr]` : '';
-              const released = m.created ? `[${formatRelease(m.created)}]` : '';
-              const provider = m.provider !== 'local' ? ` (${m.provider})` : '';
-              const speed = speedBadge(m);
-              const stars = m.quality_score ? qualityStars(m.quality_score) : '';
-              const tracking = task === 'primary' && m.tracking_score
-                ? m.tracking_score >= 4 ? '[TRACK:\u2605\u2605]' : m.tracking_score >= 2 ? '[TRACK:\u2605]' : '[TRACK:\u26A0]'
-                : '';
-              return (
-                <option key={m.id} value={m.id}>
-                  {[stars, speed, tracking, price, released, m.name + provider].filter(Boolean).join(' ')}
-                </option>
-              );
-            })}
-          </select>
-        </div>
-        {/* Speed / quality info for selected model */}
-        {selectedModel && (selectedModel.speed || selectedModel.quality_score) && (
-          <div style={{
-            marginTop: 6, padding: '6px 10px', borderRadius: 'var(--radius-sm)',
-            background: 'var(--bg-elevated)', border: '1px solid var(--border)',
-            display: 'flex', gap: 12, alignItems: 'center', fontSize: 11, flexWrap: 'wrap',
-          }}>
-            {selectedModel.speed && (
-              <span style={{
-                padding: '2px 8px', borderRadius: 8, fontWeight: 700, fontSize: 10,
-                fontFamily: 'var(--font-mono)',
-                background: selectedModel.speed === 'fast' ? 'var(--success)' : selectedModel.speed === 'slow' ? 'var(--accent-amber)' : 'var(--accent-cyan)',
-                color: 'var(--bg-base)',
-              }}>
-                {selectedModel.speed === 'fast' ? 'SPEED' : selectedModel.speed === 'slow' ? 'QUALITY' : 'BALANCED'}
-              </span>
-            )}
-            {selectedModel.speed && (
-              <span style={{ color: 'var(--text-secondary)', fontFamily: 'var(--font-mono)' }}>
-                10 min video: {selectedModel.est_time_display || '~2min'}
-              </span>
-            )}
-            {selectedModel.quality_score && (
-              <span style={{
-                display: 'inline-flex', alignItems: 'center', gap: 4,
-                color: selectedModel.quality_score >= 4 ? 'var(--accent-amber)' : selectedModel.quality_score <= 2 ? 'var(--text-muted)' : 'var(--accent-cyan)',
-              }}>
-                <span style={{ fontSize: 12, letterSpacing: 1 }}>
-                  {qualityStars(selectedModel.quality_score)}
-                </span>
-                <span style={{ fontSize: 10, textTransform: 'uppercase', fontFamily: 'var(--font-mono)' }}>
-                  {selectedModel.quality || `${selectedModel.quality_score}/5`}
-                </span>
-              </span>
-            )}
-          </div>
-        )}
-      </div>
-    );
+  // Shared context handed to the module-level searchable ModelDropdown.
+  const modelDropdownCtx = {
+    catalog, loadCatalog, openDropdown, setOpenDropdown, dropdownQuery, setDropdownQuery,
+    handleSelectModel, qualityStars,
   };
 
   return (
@@ -1830,6 +1894,7 @@ export default function Settings() {
           ) : (
             <>
               <ModelDropdown
+                ctx={modelDropdownCtx}
                 task="transcript"
                 models={availableModels.transcript}
                 pendingValue={pendingModels.transcript_model}
@@ -2213,6 +2278,7 @@ export default function Settings() {
               )}
 
               <ModelDropdown
+                ctx={modelDropdownCtx}
                 task="primary"
                 models={availableModels.primary}
                 pendingValue={pendingModels.primary_model}
@@ -2221,6 +2287,7 @@ export default function Settings() {
                 desc="Used when Replicate and VideoLLaMA2 are not available. Analyzes video frames for clip discovery and scene understanding. Requires a vision-capable model."
               />
               <ModelDropdown
+                ctx={modelDropdownCtx}
                 task="editorial"
                 models={availableModels.editorial}
                 pendingValue={pendingModels.editorial_model}
@@ -2229,6 +2296,7 @@ export default function Settings() {
                 desc="Used to polish transcript text (punctuation, proper nouns), score clips, and generate per-clip SEO + summaries/tags. Keep this on a fast model that fits your GPU — it runs once per clip. Subtitle translation has its own model below."
               />
               <ModelDropdown
+                ctx={modelDropdownCtx}
                 task="translation"
                 models={availableModels.translation}
                 pendingValue={pendingModels.translation_model}
@@ -2237,6 +2305,7 @@ export default function Settings() {
                 desc="Used ONLY to translate subtitles into the target language — separate from the Editorial AI so you can run a stronger (slower) model just for translation. Leave on '-- Select a model --' to reuse the Editorial AI. On a 4 GB GPU a 4B model runs on CPU (slower); pick a 3B model to keep it on the GPU."
               />
               <ModelDropdown
+                ctx={modelDropdownCtx}
                 task="editorial_fallback"
                 models={availableModels.editorial}
                 pendingValue={pendingModels.editorial_model_fallback}

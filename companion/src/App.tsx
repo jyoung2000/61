@@ -9,6 +9,14 @@ import {
   downloadWhisper, refreshSidecar,
 } from './api';
 
+// Common Ollama models offered as search suggestions on the Companion.
+const OLLAMA_CATALOG = [
+  'qwen2.5vl:7b', 'qwen2.5vl:3b', 'llava:13b', 'llava:7b', 'moondream:1.8b',
+  'qwen2.5:14b', 'qwen2.5:7b-instruct', 'qwen2.5:3b-instruct',
+  'qwen3:4b-instruct-2507-q4_K_M', 'qwen3:8b', 'llama3.1:8b', 'gemma2:9b',
+  'mistral:7b', 'phi3:mini', 'nomic-embed-text',
+];
+
 const fmtMb = (mb: number) => (mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${mb} MB`);
 const fmtBytes = (b: number) => {
   if (!b) return '—';
@@ -355,6 +363,8 @@ function Dashboard({ status, refresh }: { status: CompanionStatus; refresh: () =
   const [whisperDl, setWhisperDl] = useState<{ active: boolean; percent: number; message: string } | null>(null);
   const [syncing, setSyncing] = useState(false);
   const [syncMsg, setSyncMsg] = useState('');
+  const [modelQuery, setModelQuery] = useState('');
+  const [pullingTag, setPullingTag] = useState('');
 
   useEffect(() => { autostartEnabled().then(setAutostart).catch(() => setAutostart(null)); }, []);
 
@@ -402,6 +412,26 @@ function Dashboard({ status, refresh }: { status: CompanionStatus; refresh: () =
   const doRefreshWhisper = async () => {
     try { await refreshSidecar(); } catch {}
     refresh();
+  };
+
+  // Search + download any Ollama model by tag (with live pull-progress).
+  const doPullTag = async (tag: string) => {
+    const t = (tag || '').trim();
+    if (!t) return;
+    setPullingTag(t);
+    setSyncMsg(`Downloading ${t}…`);
+    try {
+      await pullModel(t);
+      loadModels();
+      refresh();
+      setModelQuery('');
+      setSyncMsg(`${t} downloaded ✓`);
+    } catch {
+      setSyncMsg(`Could not download ${t} — check the tag exists on ollama.com`);
+    } finally {
+      setPullingTag('');
+      setTimeout(() => setSyncMsg(''), 6000);
+    }
   };
 
   // Re-sync: pull any recommended local models not yet installed (idempotent).
@@ -632,6 +662,39 @@ function Dashboard({ status, refresh }: { status: CompanionStatus; refresh: () =
             </button>
           </div>
         </div>
+        {/* Search + download any Ollama model by tag. */}
+        <div style={{ marginBottom: 10 }}>
+          <div className="row" style={{ gap: 6 }}>
+            <input type="text" style={{ flex: 1 }}
+              placeholder="Search or type a model tag (e.g. llama3.1:8b)…"
+              value={modelQuery} onChange={(e) => setModelQuery(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter') doPullTag(modelQuery); }} />
+            <button disabled={!modelQuery.trim() || !!pullingTag || !status.ollama.running}
+              onClick={() => doPullTag(modelQuery)}
+              title="Download this model from ollama.com onto this GPU">
+              {pullingTag ? 'Downloading…' : '⤓ Download'}
+            </button>
+          </div>
+          {modelQuery.trim() && (() => {
+            const q = modelQuery.trim().toLowerCase();
+            const sugg = OLLAMA_CATALOG.filter((t) =>
+              t.toLowerCase().includes(q)
+              && !status.ollama.models.some((im) => im.startsWith(t.split(':')[0])));
+            if (!sugg.length) return null;
+            return (
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 6 }}>
+                {sugg.slice(0, 8).map((t) => (
+                  <button key={t} className="secondary" style={{ fontSize: 11 }}
+                    disabled={!!pullingTag || !status.ollama.running}
+                    onClick={() => doPullTag(t)}>⤓ {t}</button>
+                ))}
+              </div>
+            );
+          })()}
+          {!status.ollama.running && (
+            <div className="small muted" style={{ marginTop: 4 }}>Start Ollama to download models.</div>
+          )}
+        </div>
         {syncMsg && (
           <div className="small muted" style={{ marginBottom: 6 }}>{syncMsg}</div>
         )}
@@ -642,7 +705,9 @@ function Dashboard({ status, refresh }: { status: CompanionStatus; refresh: () =
           </p>
         ) : (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-            {models.map((m) => (
+            {models
+              .filter((m) => !modelQuery.trim() || m.name.toLowerCase().includes(modelQuery.trim().toLowerCase()))
+              .map((m) => (
               <div className="row spread" key={m.name}
                 style={{ background: 'var(--elevated)', borderRadius: 6, padding: '6px 10px' }}>
                 <div style={{ minWidth: 0 }}>

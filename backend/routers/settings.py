@@ -1807,6 +1807,53 @@ async def local_recommended_models():
     }
 
 
+@router.get("/providers/models/catalog")
+async def models_catalog():
+    """Searchable superset for the model dropdowns: the full local (Ollama)
+    catalog per role + the full OpenRouter cloud model list. The UI shows the
+    curated list by default and searches this when the user types."""
+    vram_gb, gpu_label = await _effective_local_vram_gb()
+    installed: set[str] = set()
+    try:
+        from backend.services import ollama_registry
+        for h in await ollama_registry.registry_status():
+            for m in (h.get("models") or []):
+                installed.add(str(m))
+    except Exception:
+        pass
+    from backend.services import ollama_registry as _oreg
+
+    def _local(role: str) -> list[dict]:
+        out = []
+        for tag, gb, why in _LOCAL_MODEL_CATALOG.get(role, []):
+            out.append({
+                "id": f"ollama/{tag}", "tag": tag, "name": tag, "size_gb": gb,
+                "why": why, "provider": "local",
+                "fits": (vram_gb <= 0) or (gb <= vram_gb + 0.5),
+                "installed": _oreg.model_present(list(installed), tag),
+            })
+        return out
+
+    local = {r: _local(r) for r in ("primary", "editorial", "translation", "polish")}
+
+    cloud: list[dict] = []
+    if _key_is_set(settings.OPENROUTER_API_KEY):
+        all_models = await _fetch_openrouter_models() or []
+        for m in all_models:
+            mid = m.get("id", "")
+            if not mid:
+                continue
+            arch = m.get("architecture", {}) or {}
+            cloud.append({
+                "id": mid,
+                "name": m.get("name", mid),
+                "provider": "openrouter",
+                "vision": "image" in (arch.get("modality", "") or ""),
+                "is_free": ":free" in mid or _is_zero_cost(m),
+            })
+    return {"gpu": gpu_label, "vram_gb": vram_gb, "local": local, "cloud": cloud}
+
+
 POLISH_BENCH_PATH = os.path.join(_DATA_DIR, "polish_benchmark_scores.json")
 
 
