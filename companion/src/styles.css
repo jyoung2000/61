@@ -12,6 +12,19 @@
   font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
 }
 
+:root[data-theme="light"] {
+  --bg: #f4f6fa;
+  --panel: #ffffff;
+  --elevated: #eceff5;
+  --border: #d3dae5;
+  --text: #17202e;
+  --muted: #5b6675;
+  --accent: #0a84d8;
+  --success: #1a9e63;
+  --warn: #b0781a;
+  --danger: #d6453b;
+}
+
 * { box-sizing: border-box; }
 
 body {
@@ -108,3 +121,16 @@ input[type="range"] { accent-color: var(--accent); width: 100%; }
 
 a { color: var(--accent); }
 label.checkbox { display: flex; gap: 8px; align-items: center; font-size: 12px; color: var(--muted); cursor: pointer; }
+
+/* Header meta strip: GPU / models / current job / theme toggle. */
+.appbar { flex-wrap: wrap; gap: 10px; }
+.appbar-meta { justify-content: flex-end; gap: 8px; row-gap: 8px; }
+.chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  background: var(--elevated); border: 1px solid var(--border);
+  border-radius: 8px; padding: 4px 10px; font-size: 12px; color: var(--text);
+}
+.chip .muted { font-size: 11px; }
+.chip.truncate { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chip.live { border-color: var(--success); background: rgba(62, 207, 142, 0.14); }
+button.icon { padding: 6px 10px; font-size: 14px; line-height: 1; }

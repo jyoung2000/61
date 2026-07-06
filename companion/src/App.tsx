@@ -363,7 +363,10 @@ function Wizard({ status, refresh, onDone }: {
 
 // ── Dashboard ────────────────────────────────────────────────────────
 
-function Dashboard({ status, refresh }: { status: CompanionStatus; refresh: () => void }) {
+function Dashboard({ status, refresh, theme, toggleTheme }: {
+  status: CompanionStatus; refresh: () => void;
+  theme: 'dark' | 'light'; toggleTheme: () => void;
+}) {
   const [budget, setBudget] = useState<number | null>(null);
   const [bufferGb, setBufferGb] = useState<number | null>(null);
   const [autostart, setAutostart] = useState<boolean | null>(null);
@@ -519,9 +522,53 @@ function Dashboard({ status, refresh }: { status: CompanionStatus; refresh: () =
 
   return (
     <div className="app">
-      <div className="row spread">
+      <header className="row spread appbar">
         <h1>ClipAI GPU Companion</h1>
-        <div className="row">
+        <div className="row appbar-meta">
+          {/* GPU currently in use */}
+          <span className="chip truncate" title={
+            gpu.gpu_name
+              ? `GPU: ${gpu.gpu_name}${gpu.vram_total_mb > 0
+                  ? ` — ${fmtMb(usedMb)} of ${fmtMb(gpu.vram_total_mb)} in use` : ''}`
+              : 'No GPU detected'}>
+            <span className="dot" style={{
+              background: gpu.available ? 'var(--success)' : 'var(--muted)',
+            }} />
+            {gpu.gpu_name || 'No GPU'}
+            {gpu.vram_total_mb > 0 && (
+              <span className="muted">{fmtMb(usedMb)}/{fmtMb(gpu.vram_total_mb)}</span>
+            )}
+          </span>
+
+          {/* Installed AI models */}
+          <span className="chip" title={
+            status.ollama.models.length
+              ? `Installed models:\n${status.ollama.models.join('\n')}`
+              : 'No models installed yet'}>
+            🧠 {status.ollama.models.length} model{status.ollama.models.length === 1 ? '' : 's'}
+          </span>
+
+          {/* Current job the companion is being used for */}
+          <span className={`chip truncate ${job || status.busy ? 'live' : ''}`} title={
+            job
+              ? `${job.kind === 'whisper' ? 'Transcribing' : 'AI inference'}`
+                + `${job.job_title ? ` — ${job.job_title}` : ''}`
+                + `${job.stage ? ` (stage: ${job.stage})` : ''}`
+              : status.busy ? 'Working' : 'No active job'}>
+            <span className="dot" style={{
+              background: job || status.busy ? 'var(--success)' : 'var(--muted)',
+            }} />
+            {job
+              ? `${job.kind === 'whisper' ? 'Transcribing' : 'AI inference'}${job.job_title ? ` — ${job.job_title}` : ''}`
+              : status.busy ? 'Working…' : 'No active job'}
+          </span>
+
+          {/* Light / dark mode switcher */}
+          <button className="secondary icon" title="Toggle light / dark mode"
+            aria-label="Toggle light / dark mode" onClick={toggleTheme}>
+            {theme === 'dark' ? '☀️' : '🌙'}
+          </button>
+
           {status.config.paused
             ? <span className="badge">Paused</span>
             : status.busy || job
@@ -532,7 +579,7 @@ function Dashboard({ status, refresh }: { status: CompanionStatus; refresh: () =
             {status.config.paused ? 'Resume sharing' : 'Pause sharing'}
           </button>
         </div>
-      </div>
+      </header>
 
       {job && (
         <div className="panel" style={{ borderColor: 'var(--success)' }}>
@@ -917,9 +964,24 @@ function Dashboard({ status, refresh }: { status: CompanionStatus; refresh: () =
   );
 }
 
+function useTheme(): ['dark' | 'light', () => void] {
+  const [theme, setTheme] = useState<'dark' | 'light'>(() => {
+    const saved = localStorage.getItem('companion-theme');
+    if (saved === 'light' || saved === 'dark') return saved;
+    return window.matchMedia?.('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+  });
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    localStorage.setItem('companion-theme', theme);
+  }, [theme]);
+  const toggle = useCallback(() => setTheme((t) => (t === 'dark' ? 'light' : 'dark')), []);
+  return [theme, toggle];
+}
+
 export default function App() {
   const { status, refresh } = useStatus();
   const [forceDashboard, setForceDashboard] = useState(false);
+  const [theme, toggleTheme] = useTheme();
 
   if (!status) {
     return <div className="app"><p className="muted">Starting…</p></div>;
@@ -930,5 +992,5 @@ export default function App() {
         onDone={() => { setConfig({ setup_complete: true }).then(refresh); setForceDashboard(true); }} />
     );
   }
-  return <Dashboard status={status} refresh={refresh} />;
+  return <Dashboard status={status} refresh={refresh} theme={theme} toggleTheme={toggleTheme} />;
 }
