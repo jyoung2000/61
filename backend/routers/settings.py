@@ -3296,6 +3296,69 @@ async def _companion_whisper_capable(base: str, token: str,
     return None
 
 
+def _tiny_wav_bytes(seconds: float = 1.0, freq: float = 440.0, rate: int = 16000) -> bytes:
+    """A short 16kHz mono WAV (a tone) to exercise a remote Whisper server with
+    a real transcription request. Pure stdlib — no numpy/ffmpeg."""
+    import io as _io, wave as _wave, struct as _struct, math as _math
+    buf = _io.BytesIO()
+    with _wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        n = int(seconds * rate)
+        frames = bytearray()
+        for i in range(n):
+            frames += _struct.pack("<h", int(2500 * _math.sin(2 * _math.pi * freq * (i / rate))))
+        w.writeframes(bytes(frames))
+    return buf.getvalue()
+
+
+async def _verify_remote_whisper_transcribe(base: str, key: str, model: str) -> dict:
+    """REAL round-trip: POST a tiny WAV to {base}/v1/audio/transcriptions and
+    confirm the remote server actually transcribes it. A /v1/health 200 only
+    proves the proxy answers — the sidecar starts on demand, so this is the only
+    check that proves transcription will run on the remote GPU. Returns
+    {reachable, transcribed, detail, error}."""
+    import httpx as _httpx
+    out = {"reachable": False, "transcribed": False, "detail": "", "error": ""}
+    base = (base or "").rstrip("/")
+    if not base:
+        out["error"] = "no remote Whisper URL"
+        return out
+    if "://" not in base:
+        base = f"http://{base}"
+    if base.endswith("/v1"):
+        base = base[:-3]
+    headers = {"Authorization": f"Bearer {key}"} if key else {}
+    url = f"{base}/v1/audio/transcriptions"
+    files = {"file": ("verify.wav", _tiny_wav_bytes(), "audio/wav")}
+    data = {"response_format": "json"}
+    if model:
+        data["model"] = model
+    # Short connect (unreachable → fail fast); long read — a cold sidecar may
+    # take tens of seconds to load its model on the first request.
+    timeout = _httpx.Timeout(120.0, connect=5.0)
+    try:
+        async with _httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.post(url, headers=headers, files=files, data=data)
+        out["reachable"] = True
+        if r.status_code == 200:
+            out["transcribed"] = True
+            out["detail"] = "transcribed a test clip on the remote GPU"
+        elif r.status_code in (401, 403):
+            out["error"] = "auth rejected — check the host access token"
+        elif r.status_code == 404:
+            out["error"] = "server has no /v1/audio/transcriptions (no Whisper backend)"
+        elif r.status_code == 503:
+            out["error"] = "Whisper backend busy/unavailable (503)"
+        else:
+            body = (r.text or "")[:160]
+            out["error"] = f"HTTP {r.status_code}{': ' + body if body else ''}"
+    except Exception as e:
+        out["error"] = f"{type(e).__name__}: {str(e)[:140]}"
+    return out
+
+
 async def _maybe_autoconfig_remote_whisper(comp_base: str, token: str) -> bool:
     """Point WHISPER_REMOTE_URL at the paired Companion when it can serve
     transcription but no remote Whisper is configured yet. Cached ~60s and only
@@ -3462,12 +3525,25 @@ async def companion_verify(_key: str = _Depends(_verify_api_key)):
 
     comp_base = comp.url[:-len("/ollama")] if comp.url.endswith("/ollama") else comp.url
     whisper_cfg = bool((getattr(settings, "WHISPER_REMOTE_URL", "") or "").strip())
-    whisper_capable = await _companion_whisper_capable(comp_base, comp.token or "")
+    # Real transcription round-trip against the Companion — the only proof that
+    # transcription will actually run on its GPU (a /v1/health 200 doesn't cut
+    # it: the sidecar starts on demand and may still fail to transcribe).
+    try:
+        from backend.services.reframer_audio import remote_whisper_pick_model
+        _wmodel = remote_whisper_pick_model(None)
+    except Exception:
+        _wmodel = ""  # let the remote server auto-pick its tier
+    whisper = await _verify_remote_whisper_transcribe(comp_base, comp.token or "", _wmodel)
+    whisper["configured"] = whisper_cfg
+    ollama_ok = bool(want) and all(x["ok"] for x in results)
     return {
-        "verified": bool(want) and all(x["ok"] for x in results),
+        # "verified" means the LLM path works AND transcription actually ran on
+        # the Companion — a green light to route jobs there.
+        "verified": ollama_ok and whisper.get("transcribed", False),
+        "ollama_ok": ollama_ok,
         "host": {"name": comp.name, "url": comp.url, "gpu_name": comp.gpu_name},
         "models": results,
-        "whisper": {"configured": whisper_cfg, "capable": whisper_capable},
+        "whisper": whisper,
     }
 
 
@@ -3634,12 +3710,23 @@ async def test_whisper_remote(req: SaveWhisperRemoteRequest | None = None):
     from backend.services.reframer_audio import remote_whisper_pick_model
     model = ((req.model if req and req.model is not None
               else settings.WHISPER_REMOTE_MODEL) or "").strip()
+    # Real transcription round-trip so "Test" proves the server can actually
+    # transcribe — not just that it answers /v1/health. Only run it when the
+    # server is reachable (avoids a pointless 5s connect wait when it's down).
+    transcribe = {"reachable": False, "transcribed": False, "detail": "", "error": ""}
+    if online:
+        transcribe = await _verify_remote_whisper_transcribe(
+            base, key, model or remote_whisper_pick_model(None))
+
     return {
         "online": online,
-        "error": error if not online else "",
+        "error": error if not online else (transcribe.get("error", "") if not transcribe.get("transcribed") else ""),
         "detail": detail,
         "model": model or remote_whisper_pick_model(None),
         "model_source": "configured" if model else "auto",
+        # True only when a sample clip actually transcribed on the remote GPU.
+        "transcribes": bool(transcribe.get("transcribed")),
+        "transcribe_detail": transcribe.get("detail") or transcribe.get("error", ""),
     }
 
 

@@ -85,8 +85,8 @@ export default function CompanionDownloadCard({ isMobile = false }) {
       const data = await res.json();
       setVerifyResult(data);
       showToast(
-        data.verified ? 'Companion verified — jobs run on its GPU ✓'
-          : 'Companion did not fully verify — see details below',
+        data.verified ? 'GPU test passed — inference + transcription run on the Companion ✓'
+          : 'GPU test incomplete — some work falls back to this server (see details)',
         data.verified ? 'success' : 'error');
     } catch {
       showToast('Verify failed', 'error');
@@ -180,41 +180,47 @@ export default function CompanionDownloadCard({ isMobile = false }) {
           {refreshing ? 'Fetching…' : anyLocal ? 'Check for updates' : 'Fetch from GitHub'}
         </button>
         <button onClick={verifyOffload} disabled={verifying}
-          style={{ ...btnStyle('secondary'), opacity: verifying ? 0.5 : 1 }}
-          title="Run a tiny test job on the paired Companion to confirm work actually executes on its GPU">
-          {verifying ? 'Verifying…' : 'Verify GPU offload'}
+          style={{ ...btnStyle('primary'), opacity: verifying ? 0.5 : 1 }}
+          title="Run a real round-trip on the paired Companion — a 1-token generation on each model AND an actual test transcription — to confirm work truly runs on its GPU before you rely on it">
+          {verifying ? 'Testing…' : 'Test GPU connection'}
         </button>
       </div>
 
-      {verifyResult && (
-        <div style={{
-          fontSize: 11, marginBottom: 8, paddingLeft: 8, lineHeight: 1.6,
-          borderLeft: `2px solid ${verifyResult.verified ? 'var(--success)' : 'var(--accent-amber)'}`,
-        }}>
-          <div style={{ fontWeight: 600, color: verifyResult.verified ? 'var(--success)' : 'var(--accent-amber)' }}>
-            {verifyResult.verified
-              ? `Verified — inference runs on ${verifyResult.host?.gpu_name || verifyResult.host?.name || 'the Companion'}`
-              : 'Not fully verified — work may be falling back to this server'}
-          </div>
-          {(verifyResult.models || []).map((m) => (
-            <div key={m.model} style={{
-              fontFamily: 'var(--font-mono)', fontSize: 10,
-              color: m.ok ? 'var(--success)' : 'var(--accent-amber)',
-            }}>
-              {m.ok ? '✓' : '✗'} {m.model} — {m.detail}
+      {verifyResult && (() => {
+        const w = verifyResult.whisper || {};
+        const wOk = !!w.transcribed;
+        return (
+          <div style={{
+            fontSize: 11, marginBottom: 8, paddingLeft: 8, lineHeight: 1.6,
+            borderLeft: `2px solid ${verifyResult.verified ? 'var(--success)' : 'var(--accent-amber)'}`,
+          }}>
+            <div style={{ fontWeight: 600, color: verifyResult.verified ? 'var(--success)' : 'var(--accent-amber)' }}>
+              {verifyResult.verified
+                ? `Verified — inference AND transcription run on ${verifyResult.host?.gpu_name || verifyResult.host?.name || 'the Companion'}`
+                : 'Not fully verified — some work will fall back to this server'}
             </div>
-          ))}
-          <div style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-muted)' }}>
-            whisper: {verifyResult.whisper?.configured
-              ? (verifyResult.whisper?.capable
-                ? 'remote — transcription runs on the Companion'
-                : 'configured, but the Companion reports no Whisper backend')
-              : (verifyResult.whisper?.capable
-                ? 'available on the Companion — enabling on next status refresh'
-                : 'runs on this server (Companion has no Whisper sidecar)')}
+            <div style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: verifyResult.ollama_ok ? 'var(--success)' : 'var(--accent-amber)' }}>
+              {verifyResult.ollama_ok ? '✓' : '✗'} LLM / vision (Ollama)
+            </div>
+            {(verifyResult.models || []).map((m) => (
+              <div key={m.model} style={{
+                fontFamily: 'var(--font-mono)', fontSize: 10, paddingLeft: 12,
+                color: m.ok ? 'var(--success)' : 'var(--accent-amber)',
+              }}>
+                {m.ok ? '✓' : '✗'} {m.model} — {m.detail}
+              </div>
+            ))}
+            <div style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: wOk ? 'var(--success)' : 'var(--accent-amber)' }}>
+              {wOk ? '✓' : '✗'} Whisper transcription —{' '}
+              {wOk
+                ? 'a test clip transcribed on the Companion GPU'
+                : (w.configured
+                  ? `remote configured but the test transcription failed${w.error ? `: ${w.error}` : ''} — jobs transcribe on this server`
+                  : `not offloaded${w.error ? ` (${w.error})` : ''} — transcription runs on this server`)}
+            </div>
           </div>
-        </div>
-      )}
+        );
+      })()}
 
       {!anyAvailable && (
         <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 8, lineHeight: 1.4 }}>

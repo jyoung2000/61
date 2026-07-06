@@ -151,6 +151,24 @@ def test_companion_status_reports_offline(client, monkeypatch):
     assert "refused" in (data["error"] or "")
 
 
+def test_tiny_wav_is_valid():
+    import io as _io, wave as _wave
+    data = S._tiny_wav_bytes(seconds=0.2)
+    with _wave.open(_io.BytesIO(data), "rb") as w:
+        assert w.getnchannels() == 1
+        assert w.getframerate() == 16000
+        assert w.getnframes() > 0
+
+
+def test_verify_remote_whisper_unreachable():
+    import asyncio
+    out = asyncio.run(
+        S._verify_remote_whisper_transcribe("http://127.0.0.1:59999", "tok", "large-v3-turbo"))
+    assert out["reachable"] is False
+    assert out["transcribed"] is False
+    assert out["error"]
+
+
 def test_companion_verify_404_without_companion(client):
     resp = client.post("/api/settings/companion-verify",
                        headers={"Authorization": "Bearer clipai-key-123"})
