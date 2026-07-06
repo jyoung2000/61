@@ -142,6 +142,9 @@ pub struct AppState {
     /// not a /api/tags, /api/ps or /v1/health probe. Distinguishes "serving
     /// jobs" from merely "reachable" so the UI can say which is happening.
     pub last_job_ms: AtomicU64,
+    /// Latest overall job progress (0-100) from ClipAI's X-ClipAI-Progress
+    /// header, or u64::MAX when unknown — drives the live progress bar.
+    pub job_progress: AtomicU64,
     /// VRAM (MB) used by NON-companion apps, measured while Ollama holds no
     /// resident model. Auto-VRAM sizes the budget as total − this − buffer.
     pub gpu_baseline_used_mb: AtomicU64,
@@ -189,6 +192,7 @@ impl AppState {
             app_started_ms: now_ms(),
             last_clipai_contact: AtomicU64::new(0),
             last_job_ms: AtomicU64::new(0),
+            job_progress: AtomicU64::new(u64::MAX),
             gpu_baseline_used_mb: AtomicU64::new(0),
             last_auto_apply_ms: AtomicU64::new(0),
             last_auto_baseline_mb: AtomicU64::new(u64::MAX),

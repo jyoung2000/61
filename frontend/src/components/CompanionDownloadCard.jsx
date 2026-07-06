@@ -64,13 +64,17 @@ function TestModal({ verifying, result, error, onClose, onRetry }) {
 
         {verifying && (
           <div style={{ fontSize: 13, color: 'var(--text-secondary)', lineHeight: 1.6 }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-              <span style={{
-                width: 16, height: 16, border: '2px solid var(--border)',
-                borderTopColor: 'var(--accent-cyan)', borderRadius: '50%',
-                display: 'inline-block', animation: 'spin 0.8s linear infinite',
+            <div style={{ marginBottom: 8 }}>Running a real job on the Companion…</div>
+            {/* Indeterminate loading bar (not a spinner). */}
+            <style>{`@keyframes clipaiIndet { 0% { left: -40%; } 100% { left: 100%; } }`}</style>
+            <div style={{
+              position: 'relative', height: 6, borderRadius: 3,
+              background: 'var(--bg-elevated)', overflow: 'hidden',
+            }}>
+              <div style={{
+                position: 'absolute', top: 0, bottom: 0, width: '40%', borderRadius: 3,
+                background: 'var(--accent-cyan)', animation: 'clipaiIndet 1.1s ease-in-out infinite',
               }} />
-              Running a real job on the Companion…
             </div>
             <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 8 }}>
               This can take up to ~2 minutes if the GPU is cold — it loads each model and

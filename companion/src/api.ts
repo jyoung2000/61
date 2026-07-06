@@ -57,6 +57,7 @@ export interface CompanionStatus {
   sidecar_running: boolean;
   busy: boolean;
   current_job: ActivityEntry | null;
+  job_progress: number | null;
   clipai_connected: boolean;
   clipai_serving: boolean;
   clipai_last_contact_ms: number;
@@ -95,5 +96,7 @@ export interface ClipaiTest {
 }
 /** Test whether a ClipAI container is properly connected to this companion. */
 export const testClipai = () => invoke<ClipaiTest>('test_clipai');
+/** Unload all resident Ollama models to free GPU VRAM now. */
+export const freeVram = () => invoke<{ unloaded: number; models: string[] }>('free_vram');
 export const pairClipai = (clipaiUrl: string, apiKey: string) =>
   invoke('pair_clipai', { clipaiUrl, apiKey });

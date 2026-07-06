@@ -15,6 +15,7 @@ import contextvars
 _job_id: contextvars.ContextVar[str] = contextvars.ContextVar("clipai_job_id", default="")
 _job_title: contextvars.ContextVar[str] = contextvars.ContextVar("clipai_job_title", default="")
 _job_stage: contextvars.ContextVar[str] = contextvars.ContextVar("clipai_job_stage", default="")
+_job_progress: contextvars.ContextVar[int] = contextvars.ContextVar("clipai_job_progress", default=-1)
 
 
 def set_job(job_id: str = "", title: str = "") -> None:
@@ -28,10 +29,20 @@ def set_stage(stage: str) -> None:
     _job_stage.set(stage or "")
 
 
+def set_progress(pct: int) -> None:
+    """Stamp the job's overall progress (0-100) so the Companion can show a live
+    bar for the work it serves. Best-effort; -1 means unknown."""
+    try:
+        _job_progress.set(max(0, min(100, int(pct))))
+    except Exception:
+        pass
+
+
 def clear() -> None:
     _job_id.set("")
     _job_title.set("")
     _job_stage.set("")
+    _job_progress.set(-1)
 
 
 def current_job_id() -> str:
@@ -57,4 +68,7 @@ def clipai_headers() -> dict:
     title = _job_title.get()
     if title:
         headers["X-ClipAI-Job-Title"] = _header_safe(title)
+    pct = _job_progress.get()
+    if pct is not None and pct >= 0:
+        headers["X-ClipAI-Progress"] = str(int(pct))
     return headers

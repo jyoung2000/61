@@ -6,7 +6,7 @@ import {
   CompanionStatus, getStatus, setConfig, regenerateToken,
   installOllama, startOllama, pullModel, pairClipai,
   listModels, deleteModel, InstalledModel,
-  downloadWhisper, refreshSidecar, exportLogs, testClipai, ClipaiTest,
+  downloadWhisper, refreshSidecar, exportLogs, testClipai, ClipaiTest, freeVram,
 } from './api';
 
 // Common Ollama models offered as search suggestions on the Companion.
@@ -448,6 +448,24 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
     }
   };
 
+  const [freeing, setFreeing] = useState(false);
+  const doFreeVram = async () => {
+    setFreeing(true);
+    setSyncMsg('Freeing GPU memory…');
+    try {
+      const r = await freeVram();
+      setSyncMsg(r.unloaded > 0
+        ? `Freed ${r.unloaded} model${r.unloaded === 1 ? '' : 's'} from VRAM ✓`
+        : 'No models were resident — VRAM already free');
+      setTimeout(() => { setSyncMsg(''); refresh(); }, 1500);
+    } catch (e) {
+      setSyncMsg(`Could not free VRAM: ${e}`);
+      setTimeout(() => setSyncMsg(''), 6000);
+    } finally {
+      setFreeing(false);
+    }
+  };
+
   const [exporting, setExporting] = useState(false);
   const doExportLogs = async () => {
     setExporting(true);
@@ -624,7 +642,16 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
                 {job.job_id ? ` — job ${job.job_id.slice(0, 8)}` : ''}
               </div>
             </div>
-            <span className="badge live">Live</span>
+            <span className="badge live">
+              {status.job_progress != null ? `${status.job_progress}%` : 'Live'}
+            </span>
+          </div>
+          {/* Live progress bar for the pipeline ClipAI is running (from
+              X-ClipAI-Progress). Indeterminate until ClipAI reports a %. */}
+          <div className={`meter${status.job_progress == null ? ' indeterminate' : ''}`}
+            style={{ marginTop: 8 }}>
+            <div style={status.job_progress == null ? undefined
+              : { width: `${Math.max(2, Math.min(100, status.job_progress))}%` }} />
           </div>
         </div>
       )}
@@ -640,6 +667,17 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
               </div>
               <div className="meter" style={{ margin: '6px 0 12px' }}>
                 <div style={{ width: `${Math.min(100, (usedMb / gpu.vram_total_mb) * 100)}%` }} />
+              </div>
+              <div className="row" style={{ marginBottom: 10 }}>
+                <button className="secondary" onClick={doFreeVram} disabled={freeing}
+                  title="Unload all resident Ollama models to free VRAM right now (e.g. before gaming)">
+                  {freeing ? 'Freeing…' : 'Free GPU memory'}
+                </button>
+                <span className="muted small">
+                  {status.ollama.models.length > 0
+                    ? 'Unloads models held in VRAM (they reload on the next request)'
+                    : ''}
+                </span>
               </div>
             </>
           ) : (

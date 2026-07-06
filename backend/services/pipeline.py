@@ -1736,6 +1736,13 @@ async def _update_progress(
         progress_message=message,
         protect_terminal=protect_terminal,
     )
+    # Publish overall % onto the request context so outbound Ollama/Whisper calls
+    # carry X-ClipAI-Progress — the Companion shows a live bar for the work it serves.
+    try:
+        from backend.services.request_context import set_progress
+        set_progress(progress)
+    except Exception:
+        pass
     status_str = status.value if hasattr(status, 'value') else str(status)
     _stage = _resolve_pipeline_stage(status_str, progress)
     _stage_start = _stage.get("start_pct", 0)

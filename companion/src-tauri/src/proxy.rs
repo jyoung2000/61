@@ -41,6 +41,18 @@ fn header_str(headers: &HeaderMap, name: &str) -> String {
         .to_string()
 }
 
+/// Record ClipAI's overall job progress (X-ClipAI-Progress, 0-100) so the GUI
+/// can show a live bar for the work it's serving.
+fn note_progress(state: &AppState, headers: &HeaderMap) {
+    if let Some(p) = headers
+        .get("x-clipai-progress")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+    {
+        state.job_progress.store(p.min(100), Ordering::Relaxed);
+    }
+}
+
 fn authorized(ctx: &ProxyCtx, headers: &HeaderMap) -> bool {
     let expected = ctx.state.config.lock().unwrap().token.clone();
     if expected.is_empty() {
@@ -166,6 +178,7 @@ async fn ollama_proxy(State(ctx): State<ProxyCtx>, req: Request<Body>) -> Respon
         &header_str(req.headers(), "x-clipai-job-title"),
         &header_str(req.headers(), "x-clipai-stage"),
     );
+    note_progress(&ctx.state, req.headers());
 
     let method = reqwest::Method::from_bytes(req.method().as_str().as_bytes())
         .unwrap_or(reqwest::Method::GET);
@@ -331,6 +344,7 @@ async fn whisper_proxy(State(ctx): State<ProxyCtx>, req: Request<Body>) -> Respo
         &header_str(req.headers(), "x-clipai-job-title"),
         &header_str(req.headers(), "x-clipai-stage"),
     );
+    note_progress(&ctx.state, req.headers());
 
     let result = async {
         crate::sidecar::ensure_running(

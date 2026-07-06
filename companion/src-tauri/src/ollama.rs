@@ -97,6 +97,41 @@ pub async fn loaded_model_count() -> usize {
     json["models"].as_array().map(|a| a.len()).unwrap_or(0)
 }
 
+/// Unload every resident model (POST /api/generate keep_alive=0 per model) to
+/// free VRAM immediately — for the "Free GPU memory" button and idle auto-free.
+/// Returns (models_unloaded, names). Works whether Ollama is managed or external.
+pub async fn unload_all() -> (usize, Vec<String>) {
+    let client = reqwest::Client::new();
+    let Ok(resp) = client
+        .get(format!("http://{OLLAMA_LOCAL}/api/ps"))
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await
+    else {
+        return (0, vec![]);
+    };
+    let Ok(json) = resp.json::<serde_json::Value>().await else {
+        return (0, vec![]);
+    };
+    let names: Vec<String> = json["models"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|m| m.get("name").and_then(|n| n.as_str()).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    for name in &names {
+        let _ = client
+            .post(format!("http://{OLLAMA_LOCAL}/api/generate"))
+            .json(&serde_json::json!({ "model": name, "keep_alive": 0 }))
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await;
+    }
+    (names.len(), names)
+}
+
 pub async fn list_models() -> Vec<String> {
     let Ok(resp) = reqwest::Client::new()
         .get(format!("http://{OLLAMA_LOCAL}/api/tags"))

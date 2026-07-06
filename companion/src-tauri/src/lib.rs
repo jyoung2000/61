@@ -109,6 +109,15 @@ async fn get_status(state: tauri::State<'_, SharedState>) -> Result<serde_json::
     let sidecar_running = state.sidecar.lock().await.is_some();
     let activity: Vec<state::ActivityEntry> =
         state.activity.lock().unwrap().iter().cloned().collect();
+    // Live job progress (0-100) — only while a job is in flight, else null.
+    let job_progress: serde_json::Value = {
+        let p = state.job_progress.load(Ordering::Relaxed);
+        if p != u64::MAX && state.current_job().is_some() {
+            serde_json::json!(p)
+        } else {
+            serde_json::Value::Null
+        }
+    };
     Ok(serde_json::json!({
         "config": {
             "token": config.token,
@@ -131,6 +140,7 @@ async fn get_status(state: tauri::State<'_, SharedState>) -> Result<serde_json::
         "sidecar_running": sidecar_running,
         "busy": state.whisper_busy.load(Ordering::Relaxed),
         "current_job": state.current_job(),
+        "job_progress": job_progress,
         "clipai_connected": state.clipai_connected(),
         "clipai_serving": state.serving_jobs(),
         "clipai_last_contact_ms": state.last_clipai_contact_ms(),
@@ -531,6 +541,15 @@ async fn test_clipai(state: tauri::State<'_, SharedState>) -> Result<serde_json:
     }))
 }
 
+/// Unload all resident Ollama models to free GPU VRAM right now (e.g. before
+/// gaming). Returns how many were unloaded.
+#[tauri::command]
+async fn free_vram() -> Result<serde_json::Value, String> {
+    let (n, names) = ollama::unload_all().await;
+    log::info!("free_vram: unloaded {n} model(s): {}", names.join(", "));
+    Ok(serde_json::json!({ "unloaded": n, "models": names }))
+}
+
 #[tauri::command]
 async fn delete_model(model: String) -> Result<(), String> {
     ollama::delete_model(&model).await
@@ -863,6 +882,7 @@ pub fn run() {
             download_whisper,
             export_logs,
             test_clipai,
+            free_vram,
             pair_clipai,
         ]);
 
