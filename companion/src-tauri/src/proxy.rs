@@ -100,6 +100,47 @@ fn bad_gateway(err: impl std::fmt::Display) -> Response {
     (StatusCode::BAD_GATEWAY, format!("upstream error: {err}")).into_response()
 }
 
+/// Marks an activity finished exactly once when dropped — used to keep a
+/// streamed response "current" until its body actually completes (or the
+/// client aborts), instead of finishing it the moment the headers arrive.
+struct EndActivityGuard {
+    state: Arc<AppState>,
+    activity: u64,
+    code: u16,
+}
+
+impl Drop for EndActivityGuard {
+    fn drop(&mut self) {
+        self.state.end_activity(self.activity, self.code);
+    }
+}
+
+/// Like `relay`, but ends `activity` when the response BODY finishes streaming
+/// (via the guard's Drop), so a long streamed generation reads as an active job
+/// the whole time it's running.
+fn relay_tracked(upstream: reqwest::Response, state: Arc<AppState>, activity: u64) -> Response {
+    let code = upstream.status().as_u16();
+    let status = StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut builder = Response::builder().status(status);
+    for (name, value) in upstream.headers() {
+        let lower = name.as_str().to_ascii_lowercase();
+        if ["connection", "transfer-encoding", "keep-alive"].contains(&lower.as_str()) {
+            continue;
+        }
+        builder = builder.header(name, value);
+    }
+    let guard = EndActivityGuard { state, activity, code };
+    let stream = upstream.bytes_stream().map(move |chunk| {
+        // Hold the guard for the life of the stream; when the body completes or
+        // the client disconnects, the stream drops and end_activity fires once.
+        let _hold = &guard;
+        chunk.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+    });
+    builder
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+}
+
 /// /ollama/* → strip the prefix, forward to the local daemon.
 async fn ollama_proxy(State(ctx): State<ProxyCtx>, req: Request<Body>) -> Response {
     if !authorized(&ctx, req.headers()) {
@@ -157,10 +198,7 @@ async fn ollama_proxy(State(ctx): State<ProxyCtx>, req: Request<Body>) -> Respon
     upstream = upstream.body(reqwest::Body::wrap_stream(body_stream));
 
     match upstream.send().await {
-        Ok(resp) => {
-            ctx.state.end_activity(activity, resp.status().as_u16());
-            relay(resp)
-        }
+        Ok(resp) => relay_tracked(resp, ctx.state.clone(), activity),
         Err(e) => {
             ctx.state.end_activity(activity, 502);
             bad_gateway(e)

@@ -132,8 +132,10 @@ async fn get_status(state: tauri::State<'_, SharedState>) -> Result<serde_json::
         "busy": state.whisper_busy.load(Ordering::Relaxed),
         "current_job": state.current_job(),
         "clipai_connected": state.clipai_connected(),
+        "clipai_serving": state.serving_jobs(),
         "clipai_last_contact_ms": state.last_clipai_contact_ms(),
         "activity": activity,
+        "job_logs": state.job_logs(),
         "incoming_pulls": state.incoming_pulls_snapshot().into_iter()
             .map(|(m, p)| serde_json::json!({"model": m, "percent": p}))
             .collect::<Vec<_>>(),

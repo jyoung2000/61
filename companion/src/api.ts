@@ -20,6 +20,15 @@ export interface ActivityEntry {
   status: number | null;
 }
 
+export interface JobLog {
+  job_id: string;
+  job_title: string;
+  active: boolean;
+  started_at_ms: number;
+  last_activity_ms: number;
+  entries: ActivityEntry[];
+}
+
 export interface CompanionStatus {
   config: {
     token: string;
@@ -49,8 +58,10 @@ export interface CompanionStatus {
   busy: boolean;
   current_job: ActivityEntry | null;
   clipai_connected: boolean;
+  clipai_serving: boolean;
   clipai_last_contact_ms: number;
   activity: ActivityEntry[];
+  job_logs: JobLog[];
   incoming_pulls: { model: string; percent: number }[];
   lan_ip: string | null;
   recommended_models: { model: string; why: string }[];

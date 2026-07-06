@@ -93,6 +93,18 @@ pub struct ActivityEntry {
     pub status: Option<u16>,
 }
 
+/// One video-analysis pipeline's worth of proxy activity, grouped by the
+/// X-ClipAI-Job-Id header so the GUI can show a separate log per job.
+#[derive(Clone, Serialize)]
+pub struct JobLog {
+    pub job_id: String,
+    pub job_title: String,
+    pub active: bool,
+    pub started_at_ms: u64,
+    pub last_activity_ms: u64,
+    pub entries: Vec<ActivityEntry>,
+}
+
 #[derive(Clone, Serialize, Default)]
 pub struct GpuSnapshot {
     pub gpu_name: String,
@@ -122,6 +134,10 @@ pub struct AppState {
     /// ms epoch of the last authenticated request from a ClipAI server (any
     /// proxy route). Drives the "ClipAI connected" indicator.
     pub last_clipai_contact: AtomicU64,
+    /// ms epoch of the last REAL job request (inference/transcription) — i.e.
+    /// not a /api/tags, /api/ps or /v1/health probe. Distinguishes "serving
+    /// jobs" from merely "reachable" so the UI can say which is happening.
+    pub last_job_ms: AtomicU64,
     /// VRAM (MB) used by NON-companion apps, measured while Ollama holds no
     /// resident model. Auto-VRAM sizes the budget as total − this − buffer.
     pub gpu_baseline_used_mb: AtomicU64,
@@ -167,6 +183,7 @@ impl AppState {
             ollama_starting: AtomicBool::new(false),
             incoming_pulls: Mutex::new(HashMap::new()),
             last_clipai_contact: AtomicU64::new(0),
+            last_job_ms: AtomicU64::new(0),
             gpu_baseline_used_mb: AtomicU64::new(0),
             last_auto_apply_ms: AtomicU64::new(0),
             last_auto_baseline_mb: AtomicU64::new(u64::MAX),
@@ -240,6 +257,15 @@ impl AppState {
         // Every proxy route calls this only after the bearer check passes, so
         // it's a reliable "a ClipAI server is talking to us" signal.
         self.last_clipai_contact.store(now_ms(), Ordering::Relaxed);
+        // Real work vs. a liveness probe: /api/tags, /api/ps and /v1/health are
+        // polled constantly and shouldn't read as "serving jobs".
+        let is_probe = kind == "health"
+            || path.ends_with("/api/tags")
+            || path.ends_with("/api/ps")
+            || path.ends_with("/api/version");
+        if !is_probe {
+            self.last_job_ms.store(now_ms(), Ordering::Relaxed);
+        }
         let id = self.next_activity_id.fetch_add(1, Ordering::Relaxed);
         let entry = ActivityEntry {
             id,
@@ -277,6 +303,58 @@ impl AppState {
             .iter()
             .find(|e| e.finished_at_ms.is_none() && e.kind != "health")
             .cloned()
+    }
+
+    /// True when a real inference/transcription request (not a probe) has been
+    /// served in the last 60s — "serving jobs" vs merely "reachable".
+    pub fn serving_jobs(&self) -> bool {
+        let last = self.last_job_ms.load(Ordering::Relaxed);
+        last > 0 && now_ms().saturating_sub(last) < 60_000
+    }
+
+    /// Activity grouped by ClipAI job id, newest job first, so the GUI can show
+    /// one log stream per video-analysis pipeline. Health probes are excluded.
+    pub fn job_logs(&self) -> Vec<JobLog> {
+        let feed = self.activity.lock().unwrap();
+        let mut order: Vec<String> = Vec::new();
+        let mut groups: HashMap<String, Vec<ActivityEntry>> = HashMap::new();
+        // feed is newest-first (push_front), so first-seen key order = newest job first.
+        for e in feed.iter() {
+            if e.kind == "health" {
+                continue;
+            }
+            let key = e.job_id.clone();
+            if !groups.contains_key(&key) {
+                order.push(key.clone());
+            }
+            groups.entry(key).or_default().push(e.clone());
+        }
+        order
+            .into_iter()
+            .map(|key| {
+                let entries = groups.remove(&key).unwrap_or_default();
+                let job_title = entries
+                    .iter()
+                    .map(|e| e.job_title.clone())
+                    .find(|t| !t.is_empty())
+                    .unwrap_or_default();
+                let active = entries.iter().any(|e| e.finished_at_ms.is_none());
+                let started_at_ms = entries.iter().map(|e| e.started_at_ms).min().unwrap_or(0);
+                let last_activity_ms = entries
+                    .iter()
+                    .map(|e| e.finished_at_ms.unwrap_or(e.started_at_ms))
+                    .max()
+                    .unwrap_or(0);
+                JobLog {
+                    job_id: key,
+                    job_title,
+                    active,
+                    started_at_ms,
+                    last_activity_ms,
+                    entries,
+                }
+            })
+            .collect()
     }
 
     /// Effective VRAM budget in GB. Auto mode: total − (non-companion usage) −

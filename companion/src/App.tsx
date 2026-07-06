@@ -677,13 +677,15 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
         <div className="panel">
           <h2>Connection</h2>
           <div className="row small" style={{ marginBottom: 6 }}>
-            {/* Live: green when a ClipAI server has hit this Companion in the
-                last minute; amber when paired but idle; gray when never seen. */}
+            {/* Green + "serving jobs" when real inference/transcription ran in
+                the last minute; green + "connected" when ClipAI is only probing;
+                amber when paired but silent; gray when never seen. */}
             <span className="dot" style={{
               background: status.clipai_connected ? 'var(--success)'
                 : status.config.paired_clipai_url ? 'var(--warn)' : 'var(--muted)',
             }} />
-            {status.clipai_connected ? 'ClipAI connected'
+            {status.clipai_serving ? 'ClipAI connected — serving jobs'
+              : status.clipai_connected ? 'ClipAI connected — reachable, idle'
               : status.config.paired_clipai_url ? 'ClipAI paired — waiting for requests'
               : 'No ClipAI connected yet'}
           </div>
@@ -935,26 +937,42 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
       </div>
 
       <div className="panel">
-        <h2>Recent activity</h2>
-        {status.activity.length === 0 ? (
+        <h2>Pipeline activity</h2>
+        {status.job_logs.length === 0 ? (
           <p className="muted small">
-            Nothing yet — activity appears here when ClipAI sends work to this GPU.
+            {status.clipai_connected
+              ? 'Connected — no jobs yet. Each video analysis ClipAI runs on this GPU appears here as its own log.'
+              : 'Nothing yet — activity appears here when ClipAI sends work to this GPU.'}
           </p>
         ) : (
-          <div className="feed">
-            {status.activity.filter((a) => a.kind !== 'health').slice(0, 20).map((a) => (
-              <div className="feed-item" key={a.id}>
-                <span className={`dot ${a.finished_at_ms === null ? 'ok' : (a.status ?? 500) < 400 ? 'ok' : 'bad'}`} />
-                <span style={{ minWidth: 66 }} className="badge">{a.kind}</span>
-                <span style={{ flex: 1 }}>
-                  {a.job_title || a.path}
-                  {a.stage && <span className="muted"> — {a.stage}</span>}
-                </span>
-                <span className="muted mono">
-                  {a.finished_at_ms === null
-                    ? `${elapsed(a.started_at_ms)}…`
-                    : elapsed(a.started_at_ms, a.finished_at_ms)}
-                </span>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            {status.job_logs.slice(0, 6).map((jl) => (
+              <div key={jl.job_id || 'misc'}>
+                <div className="row spread" style={{ marginBottom: 4 }}>
+                  <strong style={{ fontSize: 13 }}>
+                    {jl.job_title
+                      || (jl.job_id ? `Job ${jl.job_id.slice(0, 8)}` : 'Ad-hoc requests')}
+                  </strong>
+                  {jl.active
+                    ? <span className="badge live">Running · {elapsed(jl.started_at_ms)}</span>
+                    : <span className="badge">done · {elapsed(jl.started_at_ms, jl.last_activity_ms)}</span>}
+                </div>
+                <div className="feed">
+                  {jl.entries.slice(0, 12).map((a) => (
+                    <div className="feed-item" key={a.id}>
+                      <span className={`dot ${a.finished_at_ms === null ? 'ok' : (a.status ?? 500) < 400 ? 'ok' : 'bad'}`} />
+                      <span style={{ minWidth: 66 }} className="badge">{a.kind}</span>
+                      <span style={{ flex: 1 }}>
+                        {a.stage || a.path}
+                      </span>
+                      <span className="muted mono">
+                        {a.finished_at_ms === null
+                          ? `${elapsed(a.started_at_ms)}…`
+                          : elapsed(a.started_at_ms, a.finished_at_ms)}
+                      </span>
+                    </div>
+                  ))}
+                </div>
               </div>
             ))}
           </div>
