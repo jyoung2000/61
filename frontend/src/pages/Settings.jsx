@@ -7,7 +7,6 @@ import CloudStorageSection from '../components/cloud/CloudStorageSection';
 import UserManagementPanel from '../components/UserManagementPanel';
 import ClipGenerationSettings from '../components/ClipGenerationSettings';
 import OllamaHostsCard from '../components/OllamaHostsCard';
-import RemoteWhisperCard from '../components/RemoteWhisperCard';
 import CompanionDownloadCard from '../components/CompanionDownloadCard';
 import PolishFallbackCard from '../components/PolishFallbackCard';
 import SelfHostedSettings from '../components/SelfHostedSettings';
@@ -2202,8 +2201,9 @@ export default function Settings() {
                 )}
               </div>
 
-              {/* ── Remote Whisper (LAN GPU transcription server) ── */}
-              <RemoteWhisperCard isMobile={isMobile} />
+              {/* Remote Whisper is no longer a separate field — a paired GPU
+                  Companion in the Ollama Hosts list handles transcription on the
+                  same GPU/token automatically. */}
 
               {/* ── Custom Vocabulary (Whisper biasing) ── */}
               <div style={{

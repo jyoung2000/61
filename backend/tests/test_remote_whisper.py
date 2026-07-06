@@ -357,42 +357,57 @@ def test_release_whisper_vram_runs_for_local(monkeypatch, caplog):
     assert AudioIntelligence._cached_engine is None  # actually released
 
 
-# ── Settings endpoints ───────────────────────────────────────────────
+# ── Resolution from the Ollama host registry (no separate field) ─────────
 
 
-def test_whisper_remote_settings_roundtrip(monkeypatch):
-    import backend.routers.settings as S
-    monkeypatch.setattr(S, "_persist_user_settings", lambda: True)
-    out = asyncio.run(S.put_whisper_remote(S.SaveWhisperRemoteRequest(
-        url="http://192.168.1.50:11500", api_key="k3y", model="")))
-    assert out["url"] == "http://192.168.1.50:11500"
-    assert out["has_api_key"] is True
-    assert "k3y" not in json.dumps(out)  # key never echoed
-    # None key keeps the stored secret; "" clears it.
-    out = asyncio.run(S.put_whisper_remote(S.SaveWhisperRemoteRequest(
-        url="http://192.168.1.50:11500")))
-    assert out["has_api_key"] is True
-    out = asyncio.run(S.put_whisper_remote(S.SaveWhisperRemoteRequest(api_key="")))
-    assert out["has_api_key"] is False
-
-
-def test_whisper_remote_test_endpoint(monkeypatch):
-    import backend.routers.settings as S
-    server = _FixtureServer()
-    server.start()
+def test_remote_whisper_resolves_from_companion_host(monkeypatch):
+    """A paired Companion in the Ollama registry IS the Whisper endpoint —
+    base URL (minus /ollama) + its token — with no WHISPER_REMOTE_URL set."""
+    from backend.services import ollama_registry as R
+    R.reset_state()
+    monkeypatch.setattr(settings, "WHISPER_REMOTE_URL", "", raising=False)
+    monkeypatch.setattr(settings, "WHISPER_REMOTE_API_KEY", "", raising=False)
+    monkeypatch.setattr(settings, "OLLAMA_HOSTS", json.dumps([
+        {"id": "c", "name": "4070", "url": "http://192.168.8.10:11500/ollama",
+         "token": "tok-xyz", "is_companion": True},
+        {"id": "l", "name": "local", "url": "http://ollama:11434"},
+    ]), raising=False)
     try:
-        out = asyncio.run(S.test_whisper_remote(S.SaveWhisperRemoteRequest(
-            url=server.url)))
-        assert out["online"] is True
-        assert out["model"] == "large-v3-turbo"
-        assert out["model_source"] == "auto"
+        assert RA.remote_whisper_configured() is True
+        assert RA._remote_whisper_base() == "http://192.168.8.10:11500"
+        assert RA._remote_whisper_token() == "tok-xyz"
     finally:
-        server.stop()
+        R.reset_state()
 
 
-def test_whisper_remote_test_endpoint_offline():
-    import backend.routers.settings as S
-    out = asyncio.run(S.test_whisper_remote(S.SaveWhisperRemoteRequest(
-        url="http://127.0.0.1:1")))
-    assert out["online"] is False
-    assert out["error"]
+def test_remote_whisper_not_configured_without_companion(monkeypatch):
+    """A local-only registry (no remote host) and no WHISPER_REMOTE_URL means
+    remote Whisper stays off — transcription runs locally."""
+    from backend.services import ollama_registry as R
+    R.reset_state()
+    monkeypatch.setattr(settings, "WHISPER_REMOTE_URL", "", raising=False)
+    monkeypatch.setattr(settings, "OLLAMA_HOSTS", json.dumps([
+        {"id": "l", "name": "local", "url": "http://ollama:11434"},
+    ]), raising=False)
+    try:
+        assert RA.remote_whisper_configured() is False
+        assert RA._remote_whisper_base() == ""
+    finally:
+        R.reset_state()
+
+
+def test_remote_whisper_falls_back_to_env_url(monkeypatch):
+    """With no Companion but an explicit third-party WHISPER_REMOTE_URL set,
+    that URL is still honored (env fallback path)."""
+    from backend.services import ollama_registry as R
+    R.reset_state()
+    monkeypatch.setattr(settings, "OLLAMA_HOSTS", "", raising=False)
+    monkeypatch.setattr(settings, "OLLAMA_HOST", "http://ollama:11434", raising=False)
+    monkeypatch.setattr(settings, "WHISPER_REMOTE_URL", "http://speaches.lan:8000", raising=False)
+    monkeypatch.setattr(settings, "WHISPER_REMOTE_API_KEY", "envkey", raising=False)
+    try:
+        assert RA.remote_whisper_configured() is True
+        assert RA._remote_whisper_base() == "http://speaches.lan:8000"
+        assert RA._remote_whisper_token() == "envkey"
+    finally:
+        R.reset_state()

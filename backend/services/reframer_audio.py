@@ -275,18 +275,49 @@ _REMOTE_HEALTH_CACHE = {"checked_at": 0.0, "healthy": False, "url": ""}
 _REMOTE_HEALTH_TTL_S = 30.0
 
 
+def _companion_whisper() -> tuple[str, str]:
+    """(base_url, token) of the paired GPU Companion from the Ollama host
+    registry — the SAME GPU that serves Ollama also does transcription, so
+    remote Whisper needs no separate URL/token. Empty base when none paired."""
+    try:
+        from backend.services import ollama_registry as _oreg
+        h = _oreg.companion_host()
+        if h is not None:
+            return _oreg.companion_base(h), (h.token or "").strip()
+    except Exception:
+        pass
+    return "", ""
+
+
 def remote_whisper_configured() -> bool:
+    """True when transcription can be offloaded remotely: a paired Companion in
+    the Ollama host registry, OR an explicit third-party WHISPER_REMOTE_URL."""
+    base, _ = _companion_whisper()
+    if base:
+        return True
     return bool((getattr(settings, "WHISPER_REMOTE_URL", "") or "").strip())
 
 
 def _remote_whisper_base() -> str:
-    url = (getattr(settings, "WHISPER_REMOTE_URL", "") or "").strip().rstrip("/")
+    # Prefer the paired Companion (its GPU already serves Ollama); fall back to
+    # a manually-set third-party WHISPER_REMOTE_URL.
+    base, _ = _companion_whisper()
+    url = (base or (getattr(settings, "WHISPER_REMOTE_URL", "") or "").strip()).rstrip("/")
     if url and "://" not in url:
         url = f"http://{url}"
     # Accept either the bare server root or a URL that already ends in /v1.
     if url.endswith("/v1"):
         url = url[:-3]
     return url
+
+
+def _remote_whisper_token() -> str:
+    """Bearer token for remote Whisper — the Companion host's token when paired,
+    else the third-party WHISPER_REMOTE_API_KEY."""
+    _, token = _companion_whisper()
+    if token:
+        return token
+    return (getattr(settings, "WHISPER_REMOTE_API_KEY", "") or "").strip()
 
 
 def remote_whisper_healthy(force: bool = False) -> bool:
@@ -307,7 +338,7 @@ def remote_whisper_healthy(force: bool = False) -> bool:
     try:
         import httpx
         headers = {}
-        key = (getattr(settings, "WHISPER_REMOTE_API_KEY", "") or "").strip()
+        key = _remote_whisper_token()
         if key:
             headers["Authorization"] = f"Bearer {key}"
         with httpx.Client(timeout=3.0, headers=headers) as client:
@@ -387,7 +418,7 @@ class RemoteWhisperEngine:
     def __init__(self, model: str = ""):
         self.base = _remote_whisper_base()
         self.model = model
-        self.api_key = (getattr(settings, "WHISPER_REMOTE_API_KEY", "") or "").strip()
+        self.api_key = _remote_whisper_token()
 
     def _headers(self) -> dict:
         headers = {}

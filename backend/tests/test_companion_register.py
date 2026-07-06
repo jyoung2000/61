@@ -80,9 +80,12 @@ def test_pairing_registers_primary_and_whisper(client):
     assert hosts[1].url == "http://ollama:11434"
     # Legacy field synced to the new primary.
     assert settings.OLLAMA_HOST == "http://192.168.1.50:11500/ollama"
-    # Remote Whisper auto-filled with the proxy base + token.
-    assert settings.WHISPER_REMOTE_URL == "http://192.168.1.50:11500"
-    assert settings.WHISPER_REMOTE_API_KEY == "tok-abc"
+    # Remote Whisper is resolved LIVE from the registry companion host — no
+    # separate WHISPER_REMOTE_URL is written.
+    import backend.services.reframer_audio as RA
+    assert RA.remote_whisper_configured() is True
+    assert RA._remote_whisper_base() == "http://192.168.1.50:11500"
+    assert RA._remote_whisper_token() == "tok-abc"
     # The Companion token is never echoed in the response.
     assert "tok-abc" not in json.dumps(data)
 
@@ -97,23 +100,17 @@ def test_pairing_is_idempotent(client):
     assert hosts[0].name == "Desktop 4070 (new)"
 
 
-def test_pairing_can_skip_whisper(client):
-    # register_whisper=False AND the /v1/health probe can't reach the (fake)
-    # host, so remote Whisper stays off.
+def test_pairing_resolves_whisper_from_registry_regardless_of_flag(client):
+    # Remote Whisper now derives from the registry companion host, so it's
+    # available whether or not register_whisper was sent — the same GPU that
+    # serves Ollama does transcription. No separate WHISPER_REMOTE_URL is set.
     resp = _pair(client, register_whisper=False)
     assert resp.status_code == 200
-    assert settings.WHISPER_REMOTE_URL == ""
-
-
-def test_pairing_enables_whisper_when_capable(client, monkeypatch):
-    # Even with register_whisper=False, an observed Whisper backend enables it.
-    async def _cap(base, token, timeout=4.0):
-        return True
-    monkeypatch.setattr(S, "_companion_whisper_capable", _cap)
-    resp = _pair(client, register_whisper=False)
-    assert resp.status_code == 200
-    assert settings.WHISPER_REMOTE_URL == "http://192.168.1.50:11500"
-    assert settings.WHISPER_REMOTE_API_KEY == "tok-abc"
+    assert settings.WHISPER_REMOTE_URL == ""  # never written anymore
+    import backend.services.reframer_audio as RA
+    assert RA.remote_whisper_configured() is True
+    assert RA._remote_whisper_base() == "http://192.168.1.50:11500"
+    assert RA._remote_whisper_token() == "tok-abc"
 
 
 def test_companion_status_unpaired(client):

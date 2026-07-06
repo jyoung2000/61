@@ -212,6 +212,31 @@ def enabled_hosts() -> list[OllamaHost]:
     return [h for h in get_hosts() if h.enabled and h.url]
 
 
+def companion_host() -> Optional[OllamaHost]:
+    """The paired GPU Companion host — the box that serves Ollama AND Whisper
+    on one GPU. First enabled ``is_companion`` host; else the first enabled
+    non-local host whose URL ends with ``/ollama`` (the Companion proxy shape,
+    which covers hosts added manually in the UI). ``None`` if there's no remote
+    Companion. This is THE single source of truth for "which GPU also does
+    transcription", so remote Whisper needs no separate configuration."""
+    hosts = enabled_hosts()
+    comp = next((h for h in hosts if h.is_companion), None)
+    if comp is not None:
+        return comp
+    return next((h for h in hosts
+                 if not is_local_gpu_host(h.url)
+                 and h.url.rstrip("/").endswith("/ollama")), None)
+
+
+def companion_base(host: OllamaHost) -> str:
+    """A Companion's base URL (for ``/v1/audio/transcriptions``, ``/v1/health``)
+    — its Ollama URL minus a trailing ``/ollama``."""
+    url = (getattr(host, "url", "") or "").rstrip("/")
+    if url.endswith("/ollama"):
+        url = url[: -len("/ollama")]
+    return url.rstrip("/")
+
+
 def routable_hosts() -> list[OllamaHost]:
     """Hosts eligible to serve a request, in priority order.
 

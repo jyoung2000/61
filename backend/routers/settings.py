@@ -664,21 +664,16 @@ async def provider_status():
                     want.append(_m)
             have = _comp.get("models") or []
             ready = [m for m in want if _oreg.model_present(have, m)]
-            # Self-heal remote Whisper: if the Companion can now serve
-            # transcription (e.g. the user just downloaded Whisper in its GUI),
-            # point WHISPER_REMOTE_URL at it so the next job's transcription
-            # runs on the paired GPU instead of the local card.
+            # Remote Whisper is resolved LIVE from this same Companion host (its
+            # GPU serves Ollama AND transcription) — no separate URL to sync.
             _comp_url = _comp.get("url", "")
             _comp_base = _comp_url[:-len("/ollama")] if _comp_url.endswith("/ollama") else _comp_url
-            _comp_host = next((h for h in _oreg.get_hosts() if h.url == _comp_url), None)
-            _comp_tok = _comp_host.token if _comp_host is not None else ""
-            if bool(_comp.get("online")):
-                try:
-                    await _maybe_autoconfig_remote_whisper(_comp_base, _comp_tok)
-                except Exception as _we:
-                    logger.debug("remote-whisper auto-config skipped: %s", _we)
-            _whisper_url = (getattr(settings, "WHISPER_REMOTE_URL", "") or "").strip()
-            _whisper_remote_on = _whisper_url.rstrip("/") == _comp_base.rstrip("/") and bool(_whisper_url)
+            try:
+                from backend.services import reframer_audio as _ra
+                _whisper_remote_on = (_ra.remote_whisper_configured()
+                                      and _ra._remote_whisper_base().rstrip("/") == _comp_base.rstrip("/"))
+            except Exception:
+                _whisper_remote_on = False
             _now_ms = int(time.time() * 1000)
             if bool(_comp.get("online")):
                 _companion_seen.update({"url": _comp_url, "last_online_ms": _now_ms})
@@ -884,7 +879,12 @@ async def companion_status():
             want.append(_m)
     ready = [m for m in want if _oreg.model_present(st.models, m)]
     comp_base = comp.url[:-len("/ollama")] if comp.url.endswith("/ollama") else comp.url
-    whisper_url = (getattr(settings, "WHISPER_REMOTE_URL", "") or "").strip()
+    try:
+        from backend.services import reframer_audio as _ra
+        _whisper_remote = (_ra.remote_whisper_configured()
+                           and _ra._remote_whisper_base().rstrip("/") == comp_base.rstrip("/"))
+    except Exception:
+        _whisper_remote = False
     return {
         "paired": True,
         "online": bool(st.online),
@@ -899,7 +899,7 @@ async def companion_status():
         "models_total": len(want),
         "models_ready": len(ready),
         "ready": bool(want) and len(ready) == len(want) and bool(st.online),
-        "whisper_remote": whisper_url.rstrip("/") == comp_base.rstrip("/") and bool(whisper_url),
+        "whisper_remote": _whisper_remote,
     }
 
 
@@ -3262,18 +3262,13 @@ from fastapi import Depends as _Depends  # noqa: E402
 from backend.auth import verify_api_key as _verify_api_key  # noqa: E402
 
 
-# ── Remote-Whisper auto-configuration ────────────────────────────────────
+# ── Remote-Whisper resolution ─────────────────────────────────────────────
 #
-# Remote Whisper is gated purely on WHISPER_REMOTE_URL. A from-source Companion
-# ships no Whisper sidecar at first pair, so pairing leaves that URL empty and
-# every transcription stays on the LOCAL GPU. Once the user downloads Whisper in
-# the Companion GUI, its /v1/health advertises backends.whisper=true — so we
-# trust observed capability and enable remote Whisper automatically, with no
-# manual re-pair (which would need the ClipAI API key the Companion doesn't
-# store). This is what routes transcription onto the paired GPU.
-
-_companion_whisper_probe: dict = {"ts": 0.0, "base": "", "capable": None}
-_COMPANION_WHISPER_TTL = 60.0
+# Remote Whisper is no longer a separate setting: the paired GPU Companion in
+# the Ollama host registry serves Ollama AND transcription on the same GPU with
+# the same token, so reframer_audio resolves the endpoint live from
+# ollama_registry.companion_host(). WHISPER_REMOTE_URL remains only as an
+# optional fallback for a truly separate third-party server.
 
 # Last time the paired Companion was seen online (ms epoch), so the UI can show
 # "offline — last seen 3m ago" and distinguish an expired/gone Companion from
@@ -3281,16 +3276,11 @@ _COMPANION_WHISPER_TTL = 60.0
 _companion_seen: dict = {"url": "", "last_online_ms": 0}
 
 
-def _find_companion_host(hosts):
-    """The paired GPU Companion host, if any: prefer the is_companion flag, else
-    a non-local host whose URL ends in /ollama (the Companion proxy shape)."""
+def _find_companion_host(hosts=None):
+    """The paired GPU Companion host (delegates to the registry's single source
+    of truth). ``hosts`` arg kept for backward-compat; ignored."""
     from backend.services import ollama_registry as _oreg
-    comp = next((h for h in hosts if h.is_companion), None)
-    if comp is None:
-        comp = next((h for h in hosts
-                     if not _oreg.is_local_gpu_host(h.url)
-                     and h.url.rstrip("/").endswith("/ollama")), None)
-    return comp
+    return _oreg.companion_host()
 
 
 async def _companion_whisper_capable(base: str, token: str,
@@ -3376,36 +3366,6 @@ async def _verify_remote_whisper_transcribe(base: str, key: str, model: str) -> 
     return out
 
 
-async def _maybe_autoconfig_remote_whisper(comp_base: str, token: str) -> bool:
-    """Point WHISPER_REMOTE_URL at the paired Companion when it can serve
-    transcription but no remote Whisper is configured yet. Cached ~60s and only
-    runs while WHISPER_REMOTE_URL is empty, so it never hammers /v1/health.
-    Returns True when it just enabled remote Whisper."""
-    if (getattr(settings, "WHISPER_REMOTE_URL", "") or "").strip():
-        return False  # already configured — nothing to auto-detect
-    import time as _t
-    now = _t.time()
-    cache = _companion_whisper_probe
-    if cache["base"] == comp_base and now - cache["ts"] < _COMPANION_WHISPER_TTL:
-        capable = cache["capable"]
-    else:
-        capable = await _companion_whisper_capable(comp_base, token)
-        cache.update({"ts": now, "base": comp_base, "capable": capable})
-    if not capable:
-        return False
-    settings.WHISPER_REMOTE_URL = comp_base
-    if token:
-        settings.WHISPER_REMOTE_API_KEY = token
-    try:
-        from backend.services import reframer_audio as _ra
-        _ra._REMOTE_HEALTH_CACHE.update({"checked_at": 0.0, "url": ""})
-    except Exception:
-        pass
-    _persist_user_settings()
-    logger.info("Remote Whisper auto-enabled from Companion capability: %s", comp_base)
-    return True
-
-
 @router.post("/settings/companion-register")
 async def companion_register(req: CompanionRegisterRequest,
                              _key: str = _Depends(_verify_api_key)):
@@ -3453,24 +3413,17 @@ async def companion_register(req: CompanionRegisterRequest,
     hosts.insert(0, entry)  # Companion becomes the PRIMARY
     ollama_registry.save_hosts(hosts)
 
-    # Enable remote Whisper if the Companion says it can serve it (register_whisper)
-    # OR if a live /v1/health probe shows a Whisper backend — so a Companion that
-    # gained Whisper after its first pair still offloads transcription.
-    whisper_registered = False
-    want_whisper = bool(req.register_whisper)
-    if not want_whisper:
-        cap = await _companion_whisper_capable(base, req.token or "")
-        want_whisper = bool(cap)
-    if want_whisper:
-        settings.WHISPER_REMOTE_URL = base
-        if req.token:
-            settings.WHISPER_REMOTE_API_KEY = req.token
-        whisper_registered = True
-        try:
-            from backend.services import reframer_audio as _ra
-            _ra._REMOTE_HEALTH_CACHE.update({"checked_at": 0.0, "url": ""})
-        except Exception:
-            pass
+    # Remote Whisper needs no separate setting: the host we just stored (with
+    # its token) IS the transcription endpoint — reframer_audio resolves it live
+    # from the registry. We only probe capability to shape the response message.
+    whisper_registered = bool(req.register_whisper)
+    if not whisper_registered:
+        whisper_registered = bool(await _companion_whisper_capable(base, req.token or ""))
+    try:
+        from backend.services import reframer_audio as _ra
+        _ra._REMOTE_HEALTH_CACHE.update({"checked_at": 0.0, "url": ""})
+    except Exception:
+        pass
 
     _persist_user_settings()
     _invalidate_status_cache()
@@ -3484,7 +3437,7 @@ async def companion_register(req: CompanionRegisterRequest,
         "status": "paired",
         "ollama_host": {"id": entry.id, "name": entry.name, "url": entry.url,
                         "role": "primary"},
-        "whisper_remote_url": settings.WHISPER_REMOTE_URL if whisper_registered else "",
+        "whisper_remote_url": base if whisper_registered else "",
         "hosts": await ollama_registry.registry_status(force=True),
     }
 
@@ -3545,7 +3498,11 @@ async def companion_verify():
             results.append(item)
 
     comp_base = comp.url[:-len("/ollama")] if comp.url.endswith("/ollama") else comp.url
-    whisper_cfg = bool((getattr(settings, "WHISPER_REMOTE_URL", "") or "").strip())
+    try:
+        from backend.services import reframer_audio as _ra
+        whisper_cfg = bool(_ra.remote_whisper_configured())
+    except Exception:
+        whisper_cfg = False
     # Real transcription round-trip against the Companion — the only proof that
     # transcription will actually run on its GPU (a /v1/health 200 doesn't cut
     # it: the sidecar starts on demand and may still fail to transcribe).
@@ -3640,115 +3597,6 @@ async def put_polish_fallback(req: SavePolishFallbackRequest):
     _persist_user_settings()
     logger.info("Subtitle polish cloud fallback set to %r", _polish_fallback_choice())
     return await get_polish_fallback()
-
-
-# ── Remote Whisper (OpenAI-compatible transcription server) ──────
-
-
-class SaveWhisperRemoteRequest(BaseModel):
-    url: Optional[str] = None
-    # None = keep the stored key; "" = clear it.
-    api_key: Optional[str] = None
-    model: Optional[str] = None
-
-
-@router.get("/settings/whisper-remote")
-async def get_whisper_remote():
-    """Remote Whisper config (key never echoed — only whether one is set)."""
-    return {
-        "url": (settings.WHISPER_REMOTE_URL or "").strip(),
-        "has_api_key": bool((settings.WHISPER_REMOTE_API_KEY or "").strip()),
-        "model": (settings.WHISPER_REMOTE_MODEL or "").strip(),
-    }
-
-
-@router.put("/settings/whisper-remote")
-async def put_whisper_remote(req: SaveWhisperRemoteRequest):
-    """Save the remote Whisper server URL / key / model override."""
-    if req.url is not None:
-        settings.WHISPER_REMOTE_URL = req.url.strip()
-    if req.api_key is not None:
-        settings.WHISPER_REMOTE_API_KEY = req.api_key.strip()
-    if req.model is not None:
-        settings.WHISPER_REMOTE_MODEL = req.model.strip()
-    _persist_user_settings()
-    # Drop the cached health verdict so the next job re-probes the new URL.
-    try:
-        from backend.services import reframer_audio as _ra
-        _ra._REMOTE_HEALTH_CACHE.update({"checked_at": 0.0, "url": ""})
-    except Exception:
-        pass
-    return await get_whisper_remote()
-
-
-@router.post("/settings/whisper-remote/test")
-async def test_whisper_remote(req: SaveWhisperRemoteRequest | None = None):
-    """Server-side health probe of the remote Whisper server.
-
-    Tests the request body's url/key when provided (the Settings form's
-    Test button, pre-save), else the saved settings. Reports the model
-    the server will be asked to run.
-    """
-    url = (req.url if req and req.url is not None
-           else settings.WHISPER_REMOTE_URL or "").strip()
-    if not url:
-        return {"online": False, "error": "No remote Whisper URL configured."}
-    key = (req.api_key if req and req.api_key is not None
-           else settings.WHISPER_REMOTE_API_KEY or "").strip()
-    base = url.rstrip("/")
-    if "://" not in base:
-        base = f"http://{base}"
-    if base.endswith("/v1"):
-        base = base[:-3]
-    headers = {"Authorization": f"Bearer {key}"} if key else {}
-    online = False
-    detail = ""
-    error = ""
-    try:
-        async with httpx.AsyncClient(timeout=4.0, headers=headers) as client:
-            for path in ("/v1/health", "/health", "/"):
-                try:
-                    resp = await client.get(f"{base}{path}")
-                except httpx.HTTPError as he:
-                    error = f"{type(he).__name__}: {str(he)[:120]}"
-                    continue
-                online = True
-                error = ""
-                if path == "/v1/health" and resp.status_code == 200:
-                    try:
-                        info = resp.json() or {}
-                        gpu = info.get("gpu_name") or ""
-                        free = info.get("vram_free_mb")
-                        if gpu:
-                            detail = gpu
-                            if free is not None:
-                                detail += f" — {int(free)} MB VRAM free"
-                    except Exception:
-                        pass
-                break
-    except Exception as e:
-        error = str(e)[:200]
-    from backend.services.reframer_audio import remote_whisper_pick_model
-    model = ((req.model if req and req.model is not None
-              else settings.WHISPER_REMOTE_MODEL) or "").strip()
-    # Real transcription round-trip so "Test" proves the server can actually
-    # transcribe — not just that it answers /v1/health. Only run it when the
-    # server is reachable (avoids a pointless 5s connect wait when it's down).
-    transcribe = {"reachable": False, "transcribed": False, "detail": "", "error": ""}
-    if online:
-        transcribe = await _verify_remote_whisper_transcribe(
-            base, key, model or remote_whisper_pick_model(None))
-
-    return {
-        "online": online,
-        "error": error if not online else (transcribe.get("error", "") if not transcribe.get("transcribed") else ""),
-        "detail": detail,
-        "model": model or remote_whisper_pick_model(None),
-        "model_source": "configured" if model else "auto",
-        # True only when a sample clip actually transcribed on the remote GPU.
-        "transcribes": bool(transcribe.get("transcribed")),
-        "transcribe_detail": transcribe.get("detail") or transcribe.get("error", ""),
-    }
 
 
 # ── Voiceprint registry (cross-job speaker naming) ───────────────

@@ -232,7 +232,11 @@ def _build_compute_summary(engine, perception) -> dict:
             _eff_model = getattr(engine, "_perceiver_audio_model", None)
             _req_model = getattr(engine, "_perceiver_audio_model_requested", None)
             if whisper_dev == "remote":
-                _remote_url = (getattr(settings, "WHISPER_REMOTE_URL", "") or "").strip()
+                try:
+                    from backend.services import reframer_audio as _ra
+                    _remote_url = _ra._remote_whisper_base()
+                except Exception:
+                    _remote_url = (getattr(settings, "WHISPER_REMOTE_URL", "") or "").strip()
                 summary["whisper"] = {
                     "device": "remote",
                     "model": _eff_model or "",
