@@ -998,6 +998,62 @@ export default function Logs() {
                   Export Activity
                 </button>
               )}
+              <button
+                onClick={async () => {
+                  try {
+                    const res = await fetch('/api/settings/providers/companion-logs');
+                    const data = await res.json();
+                    const comps = (data && data.companions) || [];
+                    if (!comps.length) {
+                      pushLog && pushLog('No connected Companion to export logs from.', 'warning');
+                      return;
+                    }
+                    let got = 0;
+                    comps.forEach((c) => {
+                      if (!c.ok || !c.text) {
+                        pushLog && pushLog(`Companion "${c.name}": ${c.error || 'no logs'}`, 'warning');
+                        return;
+                      }
+                      const safe = String(c.name || 'companion').replace(/[^a-z0-9._-]+/gi, '_');
+                      const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '');
+                      const blob = new Blob([c.text], { type: 'text/plain' });
+                      const url = URL.createObjectURL(blob);
+                      const a = document.createElement('a');
+                      a.href = url;
+                      a.download = `companion_${safe}_logs_${stamp}.txt`;
+                      document.body.appendChild(a);
+                      a.click();
+                      a.remove();
+                      URL.revokeObjectURL(url);
+                      got += 1;
+                    });
+                    if (got) pushLog && pushLog(`Downloaded logs from ${got} Companion${got === 1 ? '' : 's'}.`, 'success');
+                  } catch (e) {
+                    pushLog && pushLog(`Companion log export failed: ${e}`, 'error');
+                  }
+                }}
+                style={{
+                  padding: '4px 10px',
+                  background: 'var(--bg-elevated)',
+                  border: '1px solid var(--border)',
+                  borderRadius: 'var(--radius-sm)',
+                  fontSize: 11,
+                  fontWeight: 600,
+                  color: 'var(--text-secondary)',
+                  cursor: 'pointer',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 4,
+                }}
+                title="Download the diagnostics logs from each connected GPU Companion (remote)"
+              >
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <rect x="2" y="3" width="20" height="14" rx="2" />
+                  <line x1="8" y1="21" x2="16" y2="21" />
+                  <line x1="12" y1="17" x2="12" y2="21" />
+                </svg>
+                Companion Logs
+              </button>
               <a
                 href="/api/logs/export"
                 download

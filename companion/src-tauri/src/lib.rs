@@ -466,7 +466,7 @@ fn fmt_dur_ms(ms: u64) -> String {
 /// Compose a full human-readable diagnostics report: environment, config
 /// (token redacted), connection/pairing, GPU, Ollama, Whisper, every job/
 /// activity entry since launch, and the on-disk application log.
-async fn build_diagnostics_report(state: &AppState, whisper_build: &str) -> String {
+pub(crate) async fn build_diagnostics_report(state: &AppState, whisper_build: &str) -> String {
     use std::fmt::Write as _;
     let now = state::now_ms();
     let cfg = state.config_snapshot();

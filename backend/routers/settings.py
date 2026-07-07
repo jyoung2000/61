@@ -952,6 +952,37 @@ async def companion_status():
     }
 
 
+@router.get("/providers/companion-logs")
+async def companion_logs():
+    """Pull the full diagnostics/log report from every connected Companion so
+    the user can download them from the ClipAI export menu — no need to be at
+    the Companion PC. Returns one entry per remote host (a home setup usually
+    has one). Fail-soft per host so one offline Companion doesn't break the rest."""
+    from backend.services import ollama_registry as _oreg
+    hosts = [h for h in _oreg.get_hosts() if not _oreg.is_local_gpu_host(h.url)]
+    companions = []
+    for h in hosts:
+        base = _oreg.companion_base(h)
+        entry = {"name": h.name or base, "url": base, "ok": False, "text": "", "error": ""}
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                r = await client.get(_oreg.join_url(base, "/v1/logs"),
+                                     headers=_oreg.auth_headers(h))
+            if r.status_code == 200:
+                entry["ok"] = True
+                entry["text"] = r.text
+            elif r.status_code in (401, 403):
+                entry["error"] = "auth rejected — check the host token"
+            elif r.status_code == 404:
+                entry["error"] = "this Companion is too old to export logs remotely (update it)"
+            else:
+                entry["error"] = f"HTTP {r.status_code}"
+        except Exception as e:
+            entry["error"] = f"{type(e).__name__}: {str(e)[:120]}"
+        companions.append(entry)
+    return {"companions": companions}
+
+
 @router.post("/providers/test/{provider_name}")
 async def test_provider(provider_name: str):
     """Live-test a provider by making a real API call and returning detailed status."""

@@ -445,6 +445,23 @@ async fn progress_report(State(ctx): State<ProxyCtx>, headers: HeaderMap) -> Res
     (StatusCode::OK, "ok").into_response()
 }
 
+/// /v1/logs → the full diagnostics report as plain text, so the ClipAI web app
+/// can pull this Companion's logs remotely (export menu) without the user being
+/// at the Companion PC. Bearer-authed like every other proxy route.
+async fn logs_export(State(ctx): State<ProxyCtx>, headers: HeaderMap) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+    let build = crate::sidecar::build_kind(&ctx.resource_dir, &ctx.data_dir);
+    let report = crate::build_diagnostics_report(&ctx.state, build).await;
+    (
+        StatusCode::OK,
+        [("content-type", "text/plain; charset=utf-8")],
+        report,
+    )
+        .into_response()
+}
+
 /// /v1/health → status JSON for ClipAI's probes + the pairing handshake.
 async fn health(State(ctx): State<ProxyCtx>, headers: HeaderMap) -> Response {
     if !authorized(&ctx, &headers) {
@@ -536,6 +553,7 @@ async fn health(State(ctx): State<ProxyCtx>, headers: HeaderMap) -> Response {
 fn build_router(ctx: ProxyCtx) -> Router {
     Router::new()
         .route("/v1/health", get(health))
+        .route("/v1/logs", get(logs_export))
         .route("/v1/progress", post(progress_report))
         .route("/v1/audio/transcriptions", post(whisper_proxy))
         .route("/ollama", any(ollama_proxy))
