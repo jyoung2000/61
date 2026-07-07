@@ -4287,6 +4287,68 @@ async def _run_analysis_inner(job_id: str):
         except Exception as _ce:
             logger.info("[%s] Cache probe failed (%s); falling back to fresh extract", job_id, _ce)
 
+    # ── Optimization #4: overlap frame+audio extraction with the perceive
+    #    stage. The reframer reads the video DIRECTLY (it consumes neither the
+    #    extracted `frames` nor `audio_path` — those feed clip detection AFTER
+    #    perceive), so a fresh extraction can run CONCURRENTLY with the long
+    #    perceive pass instead of blocking before it. Frame-identical: the same
+    #    extraction, just awaited later (before its first consumer). Progress is
+    #    suppressed during the overlap so it doesn't fight the perceive bar.
+    #    Cached hits stay synchronous (they're instant), and a resumed run skips
+    #    extraction entirely. Disable with PIPELINE_OVERLAP_EXTRACTION=0.
+    _extract_task = None
+
+    async def _fresh_extract(suppress_progress: bool):
+        nonlocal _source_sha256_local
+        _fp = None if suppress_progress else _frame_progress
+        _ap = None if suppress_progress else _audio_progress
+        async with _stage_timer(job_id, "frame+audio extraction"):
+            try:
+                extraction_result, _ = await asyncio.wait_for(
+                    asyncio.gather(
+                        extract_frames(
+                            video_path, frames_dir,
+                            cancel_check=cancel_check, progress_callback=_fp,
+                            video_duration=metadata["duration"],
+                            video_codec=metadata.get("codec_name", ""),
+                        ),
+                        extract_audio(
+                            video_path, audio_path,
+                            cancel_check=cancel_check,
+                            precondition=bool(getattr(settings, "WHISPER_AUDIO_PRECONDITION", True)),
+                            video_duration=metadata["duration"],
+                            progress_callback=_ap,
+                        ),
+                    ),
+                    timeout=_EXTRACTION_TIMEOUT,
+                )
+                _frames, _scene_cuts = extraction_result
+            except asyncio.TimeoutError:
+                logger.error("[%s] Frame+audio extraction timed out after %ds", job_id, _EXTRACTION_TIMEOUT)
+                raise RuntimeError(
+                    f"Frame and audio extraction timed out after {_EXTRACTION_TIMEOUT // 60} minutes. "
+                    "The video file may be very large or the container is under heavy load."
+                )
+        # Persist a tiny sidecar manifest so future cache hits can reconstruct
+        # frame timestamps + scene cuts without ffprobe / ffmpeg re-runs.
+        try:
+            _write_extraction_manifest(frames_dir, _frames, _scene_cuts)
+        except Exception:
+            pass
+        # Persist the source SHA so re-analyze runs can skip re-extracting.
+        try:
+            _sha = await _await_source_hash(job_id, _hash_task, video_path)
+            if _sha:
+                await database.update_job_status(job_id, source_sha256=_sha)
+                _source_sha256_local = _sha
+        except Exception as _he:
+            logger.info("[%s] source hash failed (%s); cache disabled for next run", job_id, _he)
+        # Store scene cut timestamps for shot-boundary-aware tracking.
+        if _scene_cuts:
+            await database.update_job_status(job_id, scene_cut_timestamps=_scene_cuts)
+            logger.info("[%s] Stored %d scene cut timestamps for tracking", job_id, len(_scene_cuts))
+        return _frames, _scene_cuts
+
     if cached_extraction is not None:
         frames, scene_cut_timestamps = cached_extraction
         async with _stage_timer(job_id, "frame+audio extraction (cached)"):
@@ -4303,59 +4365,22 @@ async def _run_analysis_inner(job_id: str):
                 job_id,
                 "Re-used cached frames + audio (re-analyze without source change)",
             )
+        if scene_cut_timestamps:
+            await database.update_job_status(job_id, scene_cut_timestamps=scene_cut_timestamps)
     else:
-        # Run frame extraction and audio extraction concurrently — both are
-        # independent FFmpeg reads of the source video, writing to different outputs.
-        async with _stage_timer(job_id, "frame+audio extraction"):
-            try:
-                extraction_result, _ = await asyncio.wait_for(
-                    asyncio.gather(
-                        extract_frames(
-                            video_path, frames_dir,
-                            cancel_check=cancel_check, progress_callback=_frame_progress,
-                            video_duration=metadata["duration"],
-                            video_codec=metadata.get("codec_name", ""),
-                        ),
-                        extract_audio(
-                            video_path, audio_path,
-                            cancel_check=cancel_check,
-                            precondition=bool(getattr(settings, "WHISPER_AUDIO_PRECONDITION", True)),
-                            video_duration=metadata["duration"],
-                            progress_callback=_audio_progress,
-                        ),
-                    ),
-                    timeout=_EXTRACTION_TIMEOUT,
-                )
-                frames, scene_cut_timestamps = extraction_result
-            except asyncio.TimeoutError:
-                logger.error("[%s] Frame+audio extraction timed out after %ds", job_id, _EXTRACTION_TIMEOUT)
-                raise RuntimeError(
-                    f"Frame and audio extraction timed out after {_EXTRACTION_TIMEOUT // 60} minutes. "
-                    "The video file may be very large or the container is under heavy load."
-                )
-        # Persist a tiny sidecar manifest so future cache hits can
-        # reconstruct frame timestamps + scene cuts without ffprobe /
-        # ffmpeg re-runs.
-        try:
-            _write_extraction_manifest(frames_dir, frames, scene_cut_timestamps)
-        except Exception:
-            pass
-        # Persist the source SHA so re-analyze runs can skip re-extracting.
-        # The digest comes from the background task started at metadata time
-        # (it ran concurrently with the extraction above); best-effort.
-        try:
-            _sha = await _await_source_hash(job_id, _hash_task, video_path)
-            if _sha:
-                await database.update_job_status(job_id, source_sha256=_sha)
-                _source_sha256_local = _sha
-        except Exception as _he:
-            logger.info("[%s] source hash failed (%s); cache disabled for next run", job_id, _he)
-    total_frames = len(frames)
+        _overlap_extract = bool(getattr(settings, "PIPELINE_OVERLAP_EXTRACTION", True))
+        if _overlap_extract:
+            # Kick it off now; it runs while vocal-sep + perceive execute and is
+            # joined just before the first consumer (clip detection).
+            _extract_task = asyncio.create_task(_fresh_extract(suppress_progress=True))
+            frames, scene_cut_timestamps = [], []
+            logger.info(
+                "[%s] Frame+audio extraction started CONCURRENTLY with the perceive "
+                "stage (joined before clip detection)", job_id)
+        else:
+            frames, scene_cut_timestamps = await _fresh_extract(suppress_progress=False)
 
-    # Store scene cut timestamps for shot-boundary-aware tracking
-    if scene_cut_timestamps:
-        await database.update_job_status(job_id, scene_cut_timestamps=scene_cut_timestamps)
-        logger.info("[%s] Stored %d scene cut timestamps for tracking", job_id, len(scene_cut_timestamps))
+    total_frames = len(frames)
 
     # ═══════════════════════════════════════════════════════════════════
     #  ENGINE — ReframeEngine (Perceiver → Planner → Smoother) → Bridge
@@ -4727,6 +4752,16 @@ async def _run_analysis_inner(job_id: str):
             reframer_plan = await asyncio.to_thread(engine.analyze, _engine_progress)
         perception = engine.perception
         _log_gpu_memory(job_id, "post-reframer")
+        # Optimization #4: join the frame+audio extraction that ran concurrently
+        # with the perceive stage above, before clip detection consumes the
+        # frames. Any extraction error surfaces here exactly as it would have
+        # synchronously (the RuntimeError propagates and fails the job).
+        if _extract_task is not None:
+            frames, scene_cut_timestamps = await _extract_task
+            total_frames = len(frames)
+            _extract_task = None
+            logger.info("[%s] Extraction joined after perceive — %d frames ready",
+                        job_id, total_frames)
         # Tag the transcription stage with WHERE it ran (remote server /
         # local GPU / CPU) for the job's stage-timing display.
         try:
@@ -4819,6 +4854,15 @@ async def _run_analysis_inner(job_id: str):
             await _release_whisper_vram(job_id)
             _log_gpu_memory(job_id, "post-whisper-release")
             _vram_snapshot("post_whisper_release", job_id)
+
+    # Safety join for optimization #4: on a checkpoint-resumed run the engine
+    # block (which joins the overlapped extraction) is skipped, so join here —
+    # a convergence point both paths reach before clip detection. Idempotent:
+    # a no-op when the engine block already joined it.
+    if _extract_task is not None:
+        frames, scene_cut_timestamps = await _extract_task
+        total_frames = len(frames)
+        _extract_task = None
 
     _n_face_samples = sum(1 for v in (perception.face_timeline or {}).values() if v)
     logger.info(

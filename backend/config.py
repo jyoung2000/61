@@ -402,6 +402,11 @@ class Settings(BaseSettings):
     # Auto-degrades to the sequential order on GPUs under 6 GB total so a
     # 4 GB card never runs Demucs and YOLO at the same time.
     VOCAL_SEPARATION_CONCURRENT: bool = True
+    # Overlap frame+audio extraction with the perceive stage (the reframer reads
+    # the video directly, so it doesn't need the extracted frames/audio until
+    # clip detection). Quality-neutral — the same extraction, just concurrent —
+    # so the CPU-bound audio preconditioning runs under the GPU-bound face pass.
+    PIPELINE_OVERLAP_EXTRACTION: bool = True
     FRAME_SAMPLE_RATE: int = 10        # seconds between frames (lower=more detail, slower)
     MAX_CLIP_CANDIDATES: int = 12
 
