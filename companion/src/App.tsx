@@ -578,6 +578,37 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
 
   const job = status.current_job;
 
+  // ── Single "Performance" control ─────────────────────────────────────────
+  // One knob for how much of this GPU ClipAI may use. It drives BOTH the Ollama
+  // speed profile (pipeline parallelism) AND the Whisper transcription quality
+  // (beam search + model), because both draw on the same VRAM/compute budget.
+  // The two underlying config fields still exist (and the container reads
+  // whisper quality back for sync) — the UI just sets them together.
+  const PERF_LEVELS = [
+    { key: 'auto', speed: 'auto', whisper: 'auto',
+      hint: 'Recommended — automatically balances pipeline speed and transcription accuracy for your card + allocated VRAM.' },
+    { key: 'eco', speed: 'eco', whisper: 'fast',
+      hint: 'Light touch — one AI job at a time and fast greedy captions. Leaves the card free for games/other apps.' },
+    { key: 'balanced', speed: 'balanced', whisper: 'balanced',
+      hint: 'Moderate parallelism + beam-search captions. Good speed and accuracy.' },
+    { key: 'turbo', speed: 'turbo', whisper: 'max',
+      hint: 'Full send — maximum parallelism and best "Netflix-grade" captions (large-v3 + beam search). Fastest pipeline and highest accuracy your VRAM allows.' },
+  ] as const;
+  // Which level is active. We always set both fields together, so the speed
+  // profile identifies the level (they align 1:1). Falls back to 'auto' if a
+  // pre-existing config has an unusual pairing.
+  const perfLevel = PERF_LEVELS.find((l) => l.speed === status.config.speed_profile)?.key ?? 'auto';
+  const wqe = status.whisper_quality_effective;
+  const capDesc = wqe.beam_search ? `${wqe.model} beam ${wqe.beam_size}` : `${wqe.model} greedy`;
+  const perfSubtitle =
+    perfLevel === 'auto'
+      ? `Auto — ${status.speed.num_parallel}× parallel and ${capDesc} captions for your ${gpu.gpu_name || 'GPU'} at ${status.effective_budget_gb.toFixed(1)} GB.`
+      : perfLevel === 'eco'
+      ? 'Eco — minimal GPU use: slowest pipeline and fast/greedy captions, but leaves the card free for other apps.'
+      : perfLevel === 'balanced'
+      ? `Balanced — ${status.speed.num_parallel}× parallel with beam-search captions (${wqe.model}). Solid speed and accuracy.`
+      : `Turbo — pushing this GPU as hard as its VRAM allows: ${status.speed.num_parallel}× parallel and ${capDesc} captions for the fastest pipeline and best accuracy.`;
+
   return (
     <div className="app">
       <header className="row spread appbar">
@@ -737,82 +768,34 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
             <p className="muted">No GPU telemetry available.</p>
           )}
 
-          {/* Speed profile — how hard to push this GPU for ClipAI. Auto tunes to
-              the card + allocated VRAM; ClipAI reads the resolved concurrency. */}
+          {/* Performance — ONE control for how much of this GPU ClipAI may use.
+              It drives both the pipeline speed (Ollama parallelism) and the
+              transcription quality (Whisper beam search + model) together, since
+              both draw on the same VRAM. Auto tunes to the card + allocated VRAM. */}
           <div style={{ margin: '4px 0 10px' }}>
             <div className="row spread small" style={{ marginBottom: 4 }}>
-              <strong title="Controls how many AI jobs run at once on this GPU (Ollama parallelism + resident models). ClipAI reads this and parallelizes the video pipeline to match.">
-                Speed ⚡
+              <strong title="One control for how hard ClipAI pushes this GPU. Higher = more concurrent AI (faster pipeline) AND higher-accuracy transcription (beam search + bigger Whisper model). Both use this card's VRAM.">
+                Performance ⚡🎯
               </strong>
               <span className="muted small mono">
-                {status.speed.num_parallel}× parallel · {status.speed.max_loaded_models} models resident
+                {status.speed.num_parallel}× · {capDesc}
               </span>
             </div>
             <div className="row" style={{ gap: 4 }}>
-              {(['auto', 'eco', 'balanced', 'turbo'] as const).map((p) => (
+              {PERF_LEVELS.map((lvl) => (
                 <button
-                  key={p}
-                  className={status.config.speed_profile === p ? '' : 'secondary'}
+                  key={lvl.key}
+                  className={perfLevel === lvl.key ? '' : 'secondary'}
                   style={{ flex: 1, textTransform: 'capitalize', padding: '5px 4px' }}
-                  onClick={() => setConfig({ speed_profile: p }).then(refresh)}
-                  title={
-                    p === 'auto' ? 'Recommended — picks the fastest setting your card + allocated VRAM can sustain'
-                    : p === 'eco' ? 'One job at a time — leaves the card free for games/other apps'
-                    : p === 'balanced' ? 'Moderate parallelism'
-                    : 'Maximum parallelism your VRAM allows — fastest'
-                  }
+                  onClick={() => setConfig({ speed_profile: lvl.speed, whisper_quality: lvl.whisper }).then(refresh)}
+                  title={lvl.hint}
                 >
-                  {p}
+                  {lvl.key}
                 </button>
               ))}
             </div>
             <div className="small muted" style={{ marginTop: 4 }}>
-              {status.config.speed_profile === 'auto'
-                ? `Auto — using ${status.speed.num_parallel}× parallel for your ${status.gpu.gpu_name || 'GPU'} at ${status.effective_budget_gb.toFixed(1)} GB. Faster = more concurrent AI on this card.`
-                : status.config.speed_profile === 'eco'
-                ? 'Eco — minimal GPU use; slowest for ClipAI but leaves the card for other apps.'
-                : status.config.speed_profile === 'turbo'
-                ? 'Turbo — pushing this GPU as hard as its VRAM allows for the fastest pipeline.'
-                : 'Balanced — moderate speed-up with headroom left on the card.'}
-            </div>
-          </div>
-
-          {/* Transcription quality — beam search + model, scaled to VRAM. This
-              is where the extra card buys Netflix/YouTube-grade captions. */}
-          <div style={{ margin: '0 0 10px' }}>
-            <div className="row spread small" style={{ marginBottom: 4 }}>
-              <strong title="Higher accuracy uses beam search (vs greedy) and a bigger Whisper model — both need VRAM, which is what this card provides. Slower but far more accurate captions.">
-                Transcription quality 🎯
-              </strong>
-              <span className="muted small mono">
-                {status.whisper_quality_effective.model}
-                {status.whisper_quality_effective.beam_search
-                  ? ` · beam ${status.whisper_quality_effective.beam_size}`
-                  : ' · greedy'}
-              </span>
-            </div>
-            <div className="row" style={{ gap: 4 }}>
-              {(['auto', 'fast', 'balanced', 'max'] as const).map((q) => (
-                <button
-                  key={q}
-                  className={status.config.whisper_quality === q ? '' : 'secondary'}
-                  style={{ flex: 1, textTransform: 'capitalize', padding: '5px 4px' }}
-                  onClick={() => setConfig({ whisper_quality: q }).then(refresh)}
-                  title={
-                    q === 'auto' ? 'Recommended — beam search when your VRAM affords it'
-                    : q === 'fast' ? 'Turbo model, greedy decode — fastest, good'
-                    : q === 'balanced' ? 'Turbo model + beam search — great accuracy'
-                    : 'Full large-v3 + beam search — best/"Netflix-grade" (needs the VRAM, slower)'
-                  }
-                >
-                  {q}
-                </button>
-              ))}
-            </div>
-            <div className="small muted" style={{ marginTop: 4 }}>
-              {status.whisper_quality_effective.beam_search
-                ? `Using ${status.whisper_quality_effective.model} with beam search (${status.whisper_quality_effective.beam_size}) — higher accuracy for the extra VRAM. Changing this restarts the Whisper engine.`
-                : `Using ${status.whisper_quality_effective.model} greedy — fastest. Pick “balanced” or “max” for beam search (more accurate).`}
+              {perfSubtitle} Changing this may briefly restart the GPU engines.
             </div>
           </div>
 
