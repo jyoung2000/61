@@ -426,7 +426,7 @@ export default function Upload() {
     let cancelled = false;
     const check = async () => {
       try {
-        const res = await fetch('/api/settings/providers/companion-files/roots');
+        const res = await fetch('/api/providers/companion-files/roots');
         const data = await res.json();
         const ok = ((data && data.companions) || []).some(
           (c) => c.online && (c.roots || []).length > 0);

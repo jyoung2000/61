@@ -1001,7 +1001,7 @@ export default function Logs() {
               <button
                 onClick={async () => {
                   try {
-                    const res = await fetch('/api/settings/providers/companion-logs');
+                    const res = await fetch('/api/providers/companion-logs');
                     const data = await res.json();
                     const comps = (data && data.companions) || [];
                     if (!comps.length) {

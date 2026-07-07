@@ -47,7 +47,7 @@ export default function CompanionBrowser({ kind = 'video', onClose, onImported }
   useEffect(() => {
     (async () => {
       try {
-        const res = await fetch('/api/settings/providers/companion-files/roots');
+        const res = await fetch('/api/providers/companion-files/roots');
         const data = await res.json();
         const comps = (data && data.companions) || [];
         setCompanions(comps);
@@ -71,7 +71,7 @@ export default function CompanionBrowser({ kind = 'video', onClose, onImported }
     setListing(true);
     setListError('');
     try {
-      const res = await fetch(`/api/settings/providers/companion-files/list?host_id=${encodeURIComponent(hostId)}&path=${encodeURIComponent(path)}`);
+      const res = await fetch(`/api/providers/companion-files/list?host_id=${encodeURIComponent(hostId)}&path=${encodeURIComponent(path)}`);
       if (!res.ok) {
         const t = await res.text();
         setListError(`Could not open folder (${res.status}) ${t.slice(0, 120)}`);
@@ -94,7 +94,7 @@ export default function CompanionBrowser({ kind = 'video', onClose, onImported }
     setImporting(entry.path);
     setImportMsg('');
     try {
-      const res = await fetch('/api/settings/providers/companion-files/import', {
+      const res = await fetch('/api/providers/companion-files/import', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ host_id: hostId, path: entry.path, kind }),
