@@ -694,7 +694,28 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                         "Remote Ollama host '%s' — using its advertised VRAM (%d MB) "
                         "for model sizing", _h.name, _h.vram_total_mb)
                     return self._available_vram_mb
-                # Remote but VRAM unknown: leave 0 (unknown) rather than
+                # Registry entry carries no VRAM (the common case — probe only
+                # reads /api/tags). Ask the Companion itself: its /v1/health
+                # advertises the real card size, so remote models get sized
+                # against THAT GPU (e.g. a 12GB 4070) instead of this server's
+                # tiny local card — the difference between running vision on
+                # the 4070's GPU vs. forcing it onto the CPU.
+                try:
+                    _h_url = self._host.rstrip("/")
+                    _base = _h_url[:-len("/ollama")] if _h_url.endswith("/ollama") else _h_url
+                    resp = await self._client.get(f"{_base}/v1/health", timeout=5.0)
+                    if resp.status_code == 200:
+                        _total = int((resp.json() or {}).get("vram_total_mb") or 0)
+                        if _total > 0:
+                            self._available_vram_mb = _total
+                            logger.info(
+                                "Remote Ollama host '%s' — using advertised VRAM "
+                                "(%d MB) from /v1/health for model sizing",
+                                (_h.name if _h else self._host), _total)
+                            return self._available_vram_mb
+                except Exception:
+                    pass
+                # Remote but VRAM still unknown: leave 0 (unknown) rather than
                 # letting the LOCAL card's probes below misrepresent it.
                 logger.info(
                     "Remote Ollama host — skipping local VRAM probes (remote card size unknown)")
@@ -773,12 +794,21 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
         if self._force_cpu:
             return 0
 
-        # Models known to exceed 4GB VRAM — always force CPU
+        # Models too big for a 4GB card. These are only CPU-bound when VRAM is
+        # genuinely tight (the local GTX 1650). When the active host is a big
+        # card — e.g. a paired 12GB Companion 4070 — they fit fully in VRAM, so
+        # force all layers ONTO the GPU instead of crippling them on the CPU.
+        # (``_available_vram_mb`` is companion-aware via ``_detect_vram``.)
         model_lower = model_name.lower()
         large_models = ["llava:7b", "llava:13b", "llama3", "llama3.1:8b", "mistral:7b",
                         "gemma:7b", "deepseek:7b", "phi3:14b", "qwen2.5:7b"]
         for pattern in large_models:
             if pattern in model_lower:
+                if self._available_vram_mb >= 6000:
+                    logger.info(
+                        "Model %s fits the active GPU (%d MB VRAM) — forcing all "
+                        "layers on GPU (num_gpu=99)", model_name, self._available_vram_mb)
+                    return 99
                 logger.info("Model %s known to exceed 4GB VRAM — forcing num_gpu=0 (CPU)", model_name)
                 return 0
 
@@ -880,7 +910,18 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                 select_gpu_fitting_quant, list_ollama_models, _total_vram_gb,
                 _ollama_names_match,
             )
-            total_vram = _total_vram_gb()
+            from backend.services import ollama_registry as _oreg
+            # Size the translation model against the GPU that will ACTUALLY run
+            # it. When the active host is remote (paired Companion), use that
+            # card's VRAM — otherwise a 12GB 4070 gets judged by this server's
+            # 4GB local card, producing false "will spill to CPU" warnings and
+            # needless downgrades to a smaller quant (a quality regression).
+            if not _oreg.is_local_gpu_host(self._host):
+                await self._detect_vram()
+                total_vram = (self._available_vram_mb / 1024.0
+                              if self._available_vram_mb > 0 else _total_vram_gb())
+            else:
+                total_vram = _total_vram_gb()
             if total_vram > 0:
                 installed = await list_ollama_models()
                 picked, reason = select_gpu_fitting_quant(
