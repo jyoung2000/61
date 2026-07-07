@@ -240,6 +240,41 @@ def companion_base(host: OllamaHost) -> str:
     return url.rstrip("/")
 
 
+# Cache the Companion's advertised concurrency (from /v1/health) briefly so the
+# pipeline doesn't re-probe on every access. (base, num_parallel, checked_at).
+_companion_speed_cache: tuple[str, int, float] = ("", 0, 0.0)
+
+
+async def companion_num_parallel(host: Optional[OllamaHost] = None,
+                                 ttl: float = 15.0) -> int:
+    """The concurrency the paired Companion advertises it can run (its Speed
+    profile → ``num_parallel`` in ``/v1/health``). Lets ClipAI parallelize the
+    pipeline to exactly what the user chose on the Companion. Returns 0 when
+    there's no Companion or it can't be reached (caller falls back to a VRAM
+    heuristic). Cached ~15 s."""
+    global _companion_speed_cache
+    host = host or companion_host()
+    if host is None:
+        return 0
+    base = companion_base(host)
+    if not base:
+        return 0
+    cached_base, cached_val, checked = _companion_speed_cache
+    if cached_base == base and (time.time() - checked) < ttl:
+        return cached_val
+    val = 0
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            resp = await client.get(join_url(base, "/v1/health"),
+                                    headers=auth_headers(host))
+            if resp.status_code == 200:
+                val = int((resp.json() or {}).get("num_parallel", 0) or 0)
+    except Exception:
+        val = 0
+    _companion_speed_cache = (base, val, time.time())
+    return val
+
+
 def routable_hosts() -> list[OllamaHost]:
     """Hosts eligible to serve a request, in priority order.
 

@@ -157,6 +157,7 @@ async fn get_status(
     let rd = app.path().resource_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let dd = app.path().app_data_dir().unwrap_or_else(|_| rd.clone());
     let whisper_build = sidecar::build_kind(&rd, &dd);
+    let (speed_parallel, speed_loaded) = state.resolve_speed_settings();
     let activity: Vec<state::ActivityEntry> =
         state.activity.lock().unwrap().iter().cloned().collect();
     // Prefer the progress ClipAI EXPLICITLY reported (POST /v1/progress) — it
@@ -204,6 +205,12 @@ async fn get_status(
             "paired_clipai_url": config.paired_clipai_url,
             "name": config.name,
             "setup_complete": config.setup_complete,
+            "speed_profile": config.speed_profile,
+        },
+        "speed": {
+            "profile": config.speed_profile,
+            "num_parallel": speed_parallel,
+            "max_loaded_models": speed_loaded,
         },
         "gpu": gpu,
         "clipai_vram_mb": clipai_vram_mb,
@@ -244,6 +251,7 @@ struct ConfigPatch {
     setup_complete: Option<bool>,
     vram_auto: Option<bool>,
     vram_buffer_gb: Option<f32>,
+    speed_profile: Option<String>,
 }
 
 #[tauri::command]
@@ -297,6 +305,14 @@ async fn set_config(
                     ollama_restart_needed = true;
                     sidecar_restart_needed = true;
                 }
+            }
+        }
+        if let Some(v) = patch.speed_profile {
+            let v = v.trim().to_lowercase();
+            if matches!(v.as_str(), "auto" | "eco" | "balanced" | "turbo") && v != cfg.speed_profile {
+                cfg.speed_profile = v;
+                // Restart Ollama so the new NUM_PARALLEL / MAX_LOADED take effect.
+                ollama_restart_needed = true;
             }
         }
     }

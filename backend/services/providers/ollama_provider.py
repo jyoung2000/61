@@ -2638,25 +2638,38 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
             # improves and wall-clock drops with no quality loss. Falls back to
             # sequential for the local card / CPU-forced models.
             _remote_vram_gb = 0.0
+            _adv_parallel = 0
             try:
                 from backend.services import ollama_registry as _oreg
                 _ph = _oreg.primary_host()
                 if _ph is not None and not _oreg.is_local_gpu_host(_ph.url) \
                         and getattr(_ph, "vram_total_mb", 0):
                     _remote_vram_gb = float(_ph.vram_total_mb) / 1024.0
+                    # The concurrency the user chose via the Companion's Speed
+                    # profile (advertised in /v1/health). Wins over the VRAM guess.
+                    _adv_parallel = await _oreg.companion_num_parallel(_ph)
             except Exception:
-                _remote_vram_gb = 0.0
+                _remote_vram_gb, _adv_parallel = _remote_vram_gb, 0
             if tier:
                 from backend.config import apply_ollama_overrides
                 tier = apply_ollama_overrides(tier, is_ollama=True,
                                               remote_vram_gb=_remote_vram_gb)
-            # Concurrent only on a capable remote GPU; the local card / CPU stay
-            # sequential for VRAM safety.
-            _sequential = not (not self._force_cpu and _remote_vram_gb >= 5.0)
+                if _adv_parallel > 0:
+                    from dataclasses import replace as _replace
+                    tier = _replace(tier, vision_batch_concurrency=_adv_parallel)
+            # Concurrency comes from the Companion's Speed profile when advertised
+            # (eco=1 → sequential; turbo=N → N-way), else the VRAM heuristic. The
+            # local card / CPU-forced models always stay sequential for safety.
+            if self._force_cpu:
+                _sequential = True
+            elif _adv_parallel > 0:
+                _sequential = _adv_parallel <= 1
+            else:
+                _sequential = _remote_vram_gb < 5.0
             logger.info(
                 "Ollama: video %.0fs (>5min) — multi-pass clip detection "
-                "(sequential=%s, remote GPU %.1f GB)",
-                video_duration, _sequential, _remote_vram_gb)
+                "(sequential=%s, remote GPU %.1f GB, companion_parallel=%d)",
+                video_duration, _sequential, _remote_vram_gb, _adv_parallel)
             # CPU-forced models are extremely slow (1-3 tok/s on Sandy Bridge).
             # Even 12 windows × 90s timeout = 18 min of mostly-wasted time.
             # Widen windows so fewer are needed to cover the video.

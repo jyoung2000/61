@@ -736,6 +736,47 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
           ) : (
             <p className="muted">No GPU telemetry available.</p>
           )}
+
+          {/* Speed profile — how hard to push this GPU for ClipAI. Auto tunes to
+              the card + allocated VRAM; ClipAI reads the resolved concurrency. */}
+          <div style={{ margin: '4px 0 10px' }}>
+            <div className="row spread small" style={{ marginBottom: 4 }}>
+              <strong title="Controls how many AI jobs run at once on this GPU (Ollama parallelism + resident models). ClipAI reads this and parallelizes the video pipeline to match.">
+                Speed ⚡
+              </strong>
+              <span className="muted small mono">
+                {status.speed.num_parallel}× parallel · {status.speed.max_loaded_models} models resident
+              </span>
+            </div>
+            <div className="row" style={{ gap: 4 }}>
+              {(['auto', 'eco', 'balanced', 'turbo'] as const).map((p) => (
+                <button
+                  key={p}
+                  className={status.config.speed_profile === p ? '' : 'secondary'}
+                  style={{ flex: 1, textTransform: 'capitalize', padding: '5px 4px' }}
+                  onClick={() => setConfig({ speed_profile: p }).then(refresh)}
+                  title={
+                    p === 'auto' ? 'Recommended — picks the fastest setting your card + allocated VRAM can sustain'
+                    : p === 'eco' ? 'One job at a time — leaves the card free for games/other apps'
+                    : p === 'balanced' ? 'Moderate parallelism'
+                    : 'Maximum parallelism your VRAM allows — fastest'
+                  }
+                >
+                  {p}
+                </button>
+              ))}
+            </div>
+            <div className="small muted" style={{ marginTop: 4 }}>
+              {status.config.speed_profile === 'auto'
+                ? `Auto — using ${status.speed.num_parallel}× parallel for your ${status.gpu.gpu_name || 'GPU'} at ${status.effective_budget_gb.toFixed(1)} GB. Faster = more concurrent AI on this card.`
+                : status.config.speed_profile === 'eco'
+                ? 'Eco — minimal GPU use; slowest for ClipAI but leaves the card for other apps.'
+                : status.config.speed_profile === 'turbo'
+                ? 'Turbo — pushing this GPU as hard as its VRAM allows for the fastest pipeline.'
+                : 'Balanced — moderate speed-up with headroom left on the card.'}
+            </div>
+          </div>
+
           <label className="row small" style={{ gap: 8, margin: '4px 0 8px', cursor: 'pointer' }}>
             <input
               type="checkbox"

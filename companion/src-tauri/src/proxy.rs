@@ -445,6 +445,9 @@ async fn health(State(ctx): State<ProxyCtx>, headers: HeaderMap) -> Response {
     });
     let ollama_up = crate::ollama::daemon_running().await;
     let whisper_shipped = ctx.state.sidecar_available.load(Ordering::Relaxed);
+    // Advertise the concurrency this GPU is willing to run so ClipAI can
+    // parallelize the pipeline to match the user's Speed profile.
+    let (num_parallel, max_loaded) = ctx.state.resolve_speed_settings();
     let body = serde_json::json!({
         "service": "clipai-gpu-companion",
         "version": env!("CARGO_PKG_VERSION"),
@@ -453,6 +456,9 @@ async fn health(State(ctx): State<ProxyCtx>, headers: HeaderMap) -> Response {
         "vram_free_mb": gpu.vram_free_mb,
         "unified_memory": gpu.unified_memory,
         "vram_budget_gb": ctx.state.effective_budget_gb(),
+        "speed_profile": config.speed_profile,
+        "num_parallel": num_parallel,
+        "max_loaded_models": max_loaded,
         "backends": {
             "ollama": ollama_up,
             "whisper": whisper_shipped,

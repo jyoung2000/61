@@ -46,7 +46,10 @@ export interface CompanionStatus {
     paired_clipai_url: string;
     name: string;
     setup_complete: boolean;
+    speed_profile: 'auto' | 'eco' | 'balanced' | 'turbo';
   };
+  /** Effective speed: resolved concurrency for the chosen profile + VRAM. */
+  speed: { profile: string; num_parallel: number; max_loaded_models: number };
   gpu: GpuSnapshot;
   /** VRAM (MB) ClipAI is actively holding (Ollama models + Whisper while busy). */
   clipai_vram_mb: number;

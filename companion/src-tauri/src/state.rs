@@ -50,6 +50,42 @@ pub struct Config {
     /// attempted once on this machine. Prevents re-download loops when a build
     /// is already present — a manual retry stays available in the GUI.
     pub whisper_autoinstalled: bool,
+    /// How hard to push the GPU for ClipAI: "auto" (pick from VRAM + card),
+    /// "eco" (1 job at a time — leave the card for games), "balanced", or
+    /// "turbo" (max concurrency the VRAM allows). Drives Ollama parallelism and
+    /// is advertised to ClipAI so it parallelizes the pipeline to match.
+    pub speed_profile: String,
+}
+
+/// Resolve a speed profile + VRAM budget to (num_parallel, max_loaded_models).
+/// The ceiling always fits the budget (each parallel slot costs KV-cache VRAM);
+/// profiles pick how much of that ceiling to use. "auto"/"turbo" maximize speed
+/// (the user's goal); "eco" keeps the card free for other apps.
+pub fn resolve_speed(profile: &str, budget_gb: f32) -> (u32, u32) {
+    let ceil_parallel: u32 = if budget_gb >= 16.0 {
+        6
+    } else if budget_gb >= 10.0 {
+        4
+    } else if budget_gb >= 7.0 {
+        3
+    } else if budget_gb >= 4.0 {
+        2
+    } else {
+        1
+    };
+    let ceil_loaded: u32 = if budget_gb >= 10.0 {
+        3
+    } else if budget_gb >= 5.0 {
+        2
+    } else {
+        1
+    };
+    match profile {
+        "eco" => (1, 1),
+        "balanced" => (ceil_parallel.min(2).max(1), ceil_loaded.min(2).max(1)),
+        // "turbo" and "auto" both use the full safe ceiling for the VRAM.
+        _ => (ceil_parallel.max(1), ceil_loaded.max(1)),
+    }
 }
 
 impl Default for Config {
@@ -67,6 +103,7 @@ impl Default for Config {
             vram_auto: false,
             vram_buffer_gb: 1.0,
             whisper_autoinstalled: false,
+            speed_profile: "auto".into(),
         }
     }
 }
@@ -491,6 +528,14 @@ impl AppState {
         } else {
             budget.max(1.0)
         }
+    }
+
+    /// Effective (num_parallel, max_loaded) for the current speed profile + VRAM
+    /// budget — the single source of truth for Ollama concurrency and what we
+    /// advertise to ClipAI.
+    pub fn resolve_speed_settings(&self) -> (u32, u32) {
+        let profile = self.config.lock().unwrap().speed_profile.clone();
+        resolve_speed(&profile, self.effective_budget_gb())
     }
 }
 
