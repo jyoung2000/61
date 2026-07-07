@@ -1054,6 +1054,12 @@ class Settings(BaseSettings):
     # Per-pass ceiling (s) for the Whisper-EN timing reference; on timeout we
     # degrade to tier B rather than block the job.
     HYBRID_WHISPER_REF_TIMEOUT_S: float = 1800.0
+    # Estimated local Whisper *translate* throughput as a multiple of realtime
+    # (2.5 = 2.5x realtime on a weak card). Used to predict whether the timing
+    # reference pass can finish before HYBRID_WHISPER_REF_TIMEOUT_S; if the
+    # estimate exceeds the timeout the pass is skipped up front (it would time
+    # out and degrade to tier B anyway) instead of burning the whole budget.
+    HYBRID_LOCAL_TRANSLATE_SPEEDUP: float = 2.5
     TRANSLATION_CONTEXT_WINDOW: int = 5         # segments before/after for context
     TRANSLATION_GLOSSARY_ENABLED: bool = True   # per-video KNP glossary support
     # Auto-derive a per-video glossary of recurring proper nouns from the source

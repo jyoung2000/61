@@ -548,6 +548,29 @@ async def _get_whisper_en_timing_reference(
             job_id, free_gb, floor)
         return []
     timeout = float(getattr(settings, "HYBRID_WHISPER_REF_TIMEOUT_S", 1800.0))
+    # A full SECOND Whisper pass over the whole video only helps if it FINISHES.
+    # The native translate task runs on the LOCAL engine (the remote Companion
+    # endpoint only transcribes), so on a long video + a weak local card it
+    # blows through the timeout and degrades to tier B anyway — burning the whole
+    # timeout budget for nothing. Estimate the local runtime from the audio
+    # length and skip the doomed pass up front: same tier-B result, no wasted
+    # wait. Short videos (where it can finish and buy tier-A timing) still run.
+    audio_s = 0.0
+    for _s in (source_segments or []):
+        _e = _s.get("end") if isinstance(_s, dict) else getattr(_s, "end", None)
+        if _e is not None:
+            try:
+                audio_s = max(audio_s, float(_e))
+            except (TypeError, ValueError):
+                pass
+    speedup = float(getattr(settings, "HYBRID_LOCAL_TRANSLATE_SPEEDUP", 2.5))
+    if audio_s > 0 and speedup > 0 and (audio_s / speedup) > timeout:
+        logger.info(
+            "[%s] Hybrid timing: skipping Whisper-EN reference — est. local "
+            "runtime ~%.0fs for %.0fs of audio exceeds the %.0fs timeout "
+            "(would time out and degrade to tier B anyway) — degrading now, "
+            "saving the wait", job_id, audio_s / speedup, audio_s, timeout)
+        return []
     try:
         ref = await asyncio.wait_for(
             asyncio.to_thread(
