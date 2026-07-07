@@ -215,6 +215,8 @@ def test_remote_segments_match_local_schema(monkeypatch, wav_file):
         assert "x-clipai-job-id: job-7" in joined
         assert "x-clipai-stage: transcription" in joined
         assert "x-clipai-job-title: podcast ep 12" in joined
+        # Selected model is synced so the Companion loads the same GPU model.
+        assert "x-clipai-whisper-model: large-v3-turbo" in joined
     finally:
         server.stop()
 

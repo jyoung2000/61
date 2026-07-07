@@ -46,6 +46,10 @@ pub struct Config {
     pub vram_auto: bool,
     /// GB always kept free for the desktop in auto mode.
     pub vram_buffer_gb: f32,
+    /// One-shot latch: the GPU (CUDA) whisper build auto-install has been
+    /// attempted once on this machine. Prevents re-download loops when a build
+    /// is already present — a manual retry stays available in the GUI.
+    pub whisper_autoinstalled: bool,
 }
 
 impl Default for Config {
@@ -62,6 +66,7 @@ impl Default for Config {
             setup_complete: false,
             vram_auto: false,
             vram_buffer_gb: 1.0,
+            whisper_autoinstalled: false,
         }
     }
 }
@@ -517,5 +522,35 @@ pub fn whisper_tier_for_budget(budget_gb: f32) -> (&'static str, &'static str) {
         ("medium", "int8_float16")
     } else {
         ("small", "int8_float16")
+    }
+}
+
+/// Rank a whisper model family: 3=large/turbo, 2=medium, 1=small/base/tiny.
+fn whisper_rank(name: &str) -> u8 {
+    let n = name.to_lowercase();
+    if n.contains("large") || n.contains("turbo") {
+        3
+    } else if n.contains("medium") {
+        2
+    } else {
+        1
+    }
+}
+
+/// Whisper tier honoring the model ClipAI SELECTED (synced per request via the
+/// `X-ClipAI-Whisper-Model` header) while never exceeding what the VRAM budget
+/// can fit on this GPU. Keeps the Companion loading the same model family the
+/// ClipAI server picked — so transcription quality matches — but caps it so a
+/// big model can never OOM a small budget. Empty `requested` ⇒ budget default.
+pub fn whisper_tier_for_request(requested: &str, budget_gb: f32) -> (&'static str, &'static str) {
+    let (cap_model, cap_compute) = whisper_tier_for_budget(budget_gb);
+    if requested.trim().is_empty() {
+        return (cap_model, cap_compute);
+    }
+    let rank = whisper_rank(requested).min(whisper_rank(cap_model));
+    match rank {
+        3 => ("large-v3-turbo", "float16"),
+        2 => ("medium", "int8_float16"),
+        _ => ("small", "int8_float16"),
     }
 }

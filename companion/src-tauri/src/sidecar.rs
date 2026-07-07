@@ -10,7 +10,7 @@
 //! the first transcription request and exits after a configurable idle
 //! period so an overnight-idle desktop holds no models and near-zero CPU.
 
-use crate::state::{quiet_command, whisper_tier_for_budget, AppState, WHISPER_SIDECAR_PORT};
+use crate::state::{quiet_command, AppState, WHISPER_SIDECAR_PORT};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::Ordering;
@@ -101,6 +101,36 @@ pub fn available(resource_dir: &PathBuf, data_dir: &PathBuf) -> bool {
     resolve_sidecar(resource_dir, data_dir).is_some()
 }
 
+/// Which whisper build is installed, so the GUI can warn when transcription
+/// would run on the CPU (unusably slow for large models) and offer the GPU one.
+/// Returns "gpu", "cpu", "bundled", or "none".
+///   - "gpu"     — a downloaded whisper.cpp CUDA (cuBLAS) build: CUDA runtime
+///                 DLLs sit beside the server, so it offloads to the NVIDIA GPU.
+///   - "cpu"     — a downloaded whisper.cpp build with no CUDA DLLs.
+///   - "bundled" — the sidecar shipped with an official release (GPU-capable).
+///   - "none"    — no sidecar available.
+pub fn build_kind(resource_dir: &PathBuf, data_dir: &PathBuf) -> &'static str {
+    if let Some(server) = downloaded_whisper_server(data_dir) {
+        // CUDA builds ship cudart/cublas/ggml-cuda DLLs next to the server exe.
+        let dir = server.parent().map(|p| p.to_path_buf())
+            .unwrap_or_else(|| downloaded_whisper_dir(data_dir));
+        let has_cuda = std::fs::read_dir(&dir)
+            .map(|rd| {
+                rd.flatten().any(|e| {
+                    let n = e.file_name().to_string_lossy().to_lowercase();
+                    n.ends_with(".dll")
+                        && (n.contains("cudart") || n.contains("cublas") || n.contains("cuda"))
+                })
+            })
+            .unwrap_or(false);
+        return if has_cuda { "gpu" } else { "cpu" };
+    }
+    if sidecar_binary(resource_dir).is_file() {
+        return "bundled";
+    }
+    "none"
+}
+
 /// Model directory in app data — models download on demand, never bundled.
 fn models_dir(data_dir: &PathBuf) -> PathBuf {
     data_dir.join("whisper-models")
@@ -180,9 +210,12 @@ pub async fn ensure_running(
     state: &Arc<AppState>,
     resource_dir: PathBuf,
     data_dir: PathBuf,
+    requested_model: &str,
 ) -> Result<String, String> {
     let budget = state.effective_budget_gb();
-    let (model, compute) = whisper_tier_for_budget(budget);
+    // Honor the model ClipAI selected (synced per request) but cap by budget so
+    // it always fits on the GPU. Empty request ⇒ the budget-default tier.
+    let (model, compute) = crate::state::whisper_tier_for_request(requested_model, budget);
 
     let mut guard = state.sidecar.lock().await;
     if let Some(handle) = guard.as_mut() {
@@ -287,25 +320,69 @@ pub async fn download_whispercpp(
         .map_err(|e| format!("release parse failed: {e}"))?;
     let tag = rel.get("tag_name").and_then(|t| t.as_str()).unwrap_or("").to_string();
     let assets = rel.get("assets").and_then(|a| a.as_array()).cloned().unwrap_or_default();
-    // Plain CPU x64 build first (most compatible); BLAS as a fallback.
+    let asset_name = |a: &serde_json::Value| {
+        a.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string()
+    };
+    let asset_url = |a: &serde_json::Value| {
+        a.get("browser_download_url").and_then(|u| u.as_str()).unwrap_or("").to_string()
+    };
+
+    // Prefer a CUDA (cuBLAS) build when an NVIDIA GPU is present so transcription
+    // runs ON THE GPU. A CPU build makes large-v3-turbo unusably slow — minutes
+    // per clip, so even the tiny verify clip times out. whisper.cpp bundles the
+    // CUDA runtime DLLs inside the cublas zip, so it runs in place without a
+    // separate CUDA toolkit install. Falls back to the CPU build otherwise.
+    let is_nvidia = crate::gpu::snapshot().gpu_name.to_lowercase().contains("nvidia");
     let mut url = String::new();
-    'outer: for want in ["whisper-bin-x64.zip", "whisper-blas-bin-x64.zip"] {
+    let mut chosen = String::new();
+    let mut gpu_build = false;
+    if is_nvidia {
+        // Newest cuBLAS x64 asset (e.g. whisper-cublas-12.4.0-bin-x64.zip).
+        // Lexicographic max over the name is a good-enough "highest CUDA build".
+        let mut best: Option<&serde_json::Value> = None;
         for a in &assets {
-            if a.get("name").and_then(|n| n.as_str()) == Some(want) {
-                url = a.get("browser_download_url").and_then(|u| u.as_str()).unwrap_or("").to_string();
-                break 'outer;
+            let n = asset_name(a);
+            let nl = n.to_lowercase();
+            if nl.contains("cublas") && nl.contains("x64") && nl.ends_with(".zip") {
+                if best.map(|b| asset_name(b) < n).unwrap_or(true) {
+                    best = Some(a);
+                }
+            }
+        }
+        if let Some(a) = best {
+            url = asset_url(a);
+            chosen = asset_name(a);
+            gpu_build = true;
+        }
+    }
+    if url.is_empty() {
+        // CPU fallback — plain build first (most compatible), then BLAS.
+        'outer: for want in ["whisper-bin-x64.zip", "whisper-blas-bin-x64.zip"] {
+            for a in &assets {
+                if asset_name(a) == want {
+                    url = asset_url(a);
+                    chosen = want.to_string();
+                    break 'outer;
+                }
             }
         }
     }
     if url.is_empty() {
-        return Err("no whisper-bin-x64.zip in the latest whisper.cpp release".into());
+        return Err("no whisper x64 build in the latest whisper.cpp release".into());
     }
+    log::info!(
+        "selected whisper.cpp asset '{chosen}' ({}) from {tag}",
+        if gpu_build { "CUDA/GPU" } else { "CPU" }
+    );
 
     let dl_dir = downloaded_whisper_dir(data_dir);
     let _ = std::fs::create_dir_all(&dl_dir);
     let zip_path = dl_dir.join("_download.zip");
 
-    emit("downloading", 0.0, &format!("Downloading whisper.cpp {tag}…"));
+    emit("downloading", 0.0, &format!(
+        "Downloading whisper.cpp {tag} ({} build)…",
+        if gpu_build { "GPU / CUDA" } else { "CPU" }
+    ));
     let resp = client.get(&url).send().await.map_err(|e| format!("download failed: {e}"))?;
     if !resp.status().is_success() {
         return Err(format!("download failed: HTTP {}", resp.status()));
@@ -346,8 +423,9 @@ pub async fn download_whispercpp(
 
     match downloaded_whisper_server(data_dir) {
         Some(_) => {
-            emit("done", 100.0, "Whisper installed");
-            Ok(format!("whisper.cpp {tag} installed"))
+            let kind = if gpu_build { "GPU / CUDA" } else { "CPU" };
+            emit("done", 100.0, &format!("Whisper installed ({kind} build)"));
+            Ok(format!("whisper.cpp {tag} installed ({kind} build)"))
         }
         None => Err("whisper-server.exe not found after extraction".into()),
     }

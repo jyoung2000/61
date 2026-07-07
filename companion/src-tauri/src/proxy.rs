@@ -346,11 +346,15 @@ async fn whisper_proxy(State(ctx): State<ProxyCtx>, req: Request<Body>) -> Respo
     );
     note_progress(&ctx.state, req.headers());
 
+    // The whisper model ClipAI selected, synced per request so the Companion
+    // loads the same family on its GPU (capped by VRAM budget in ensure_running).
+    let requested_model = header_str(req.headers(), "x-clipai-whisper-model");
     let result = async {
         crate::sidecar::ensure_running(
             &ctx.state,
             ctx.resource_dir.clone(),
             ctx.data_dir.clone(),
+            &requested_model,
         )
         .await
         .map_err(|e| format!("sidecar unavailable: {e}"))?;

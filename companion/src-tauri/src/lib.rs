@@ -125,13 +125,21 @@ fn init_diagnostics() -> std::path::PathBuf {
 // ── Commands (invoked from the React UI) ────────────────────────────
 
 #[tauri::command]
-async fn get_status(state: tauri::State<'_, SharedState>) -> Result<serde_json::Value, String> {
+async fn get_status(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, SharedState>,
+) -> Result<serde_json::Value, String> {
     let config = state.config_snapshot();
     let gpu = state.gpu.lock().unwrap().clone();
     let ollama_status = ollama::status(&state).await;
     let budget = state.effective_budget_gb();
     let (whisper_model, whisper_compute) = state::whisper_tier_for_budget(budget);
     let sidecar_running = state.sidecar.lock().await.is_some();
+    // Which whisper build is installed (gpu/cpu/bundled/none) so the GUI can warn
+    // when transcription would fall back to the CPU and offer the GPU build.
+    let rd = app.path().resource_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let dd = app.path().app_data_dir().unwrap_or_else(|_| rd.clone());
+    let whisper_build = sidecar::build_kind(&rd, &dd);
     let activity: Vec<state::ActivityEntry> =
         state.activity.lock().unwrap().iter().cloned().collect();
     // Live job progress (0-100) — only while a job is in flight, else null.
@@ -163,6 +171,7 @@ async fn get_status(state: tauri::State<'_, SharedState>) -> Result<serde_json::
         "ollama": ollama_status,
         "sidecar_available": state.sidecar_available.load(Ordering::Relaxed),
         "sidecar_running": sidecar_running,
+        "whisper_build": whisper_build,
         "busy": state.whisper_busy.load(Ordering::Relaxed),
         "current_job": state.current_job(),
         "job_progress": job_progress,
@@ -335,6 +344,10 @@ async fn download_whisper(
         .app_data_dir()
         .map_err(|e| format!("no app data dir: {e}"))?;
     let rd = app.path().resource_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    // Stop any running sidecar first: on Windows a live whisper-server.exe holds
+    // a file lock, so re-downloading (e.g. swapping a CPU build for the GPU one)
+    // would fail to overwrite it. It restarts lazily on the next request.
+    sidecar::shutdown(&state).await;
     let msg = sidecar::download_whispercpp(&app, &dd).await?;
     state
         .sidecar_available
@@ -371,7 +384,7 @@ fn fmt_dur_ms(ms: u64) -> String {
 /// Compose a full human-readable diagnostics report: environment, config
 /// (token redacted), connection/pairing, GPU, Ollama, Whisper, every job/
 /// activity entry since launch, and the on-disk application log.
-async fn build_diagnostics_report(state: &AppState) -> String {
+async fn build_diagnostics_report(state: &AppState, whisper_build: &str) -> String {
     use std::fmt::Write as _;
     let now = state::now_ms();
     let cfg = state.config_snapshot();
@@ -436,6 +449,12 @@ async fn build_diagnostics_report(state: &AppState) -> String {
     let _ = writeln!(r, "\n---- Whisper sidecar ----");
     let _ = writeln!(r, "Bundled/available:    {}", state.sidecar_available.load(Ordering::Relaxed));
     let _ = writeln!(r, "Running now:          {}", sidecar_running);
+    let _ = writeln!(r, "Build:                {}  ({})", whisper_build, match whisper_build {
+        "gpu" => "CUDA — runs on the GPU",
+        "cpu" => "CPU only — SLOW; install the GPU build",
+        "bundled" => "official release sidecar",
+        _ => "not installed",
+    });
 
     let _ = writeln!(r, "\n---- Incoming model pulls (from ClipAI) ----");
     if pulls.is_empty() {
@@ -497,7 +516,9 @@ async fn export_logs(
     app: tauri::AppHandle,
     state: tauri::State<'_, SharedState>,
 ) -> Result<String, String> {
-    let report = build_diagnostics_report(&state).await;
+    let rd = app.path().resource_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let dd = app.path().app_data_dir().unwrap_or_else(|_| rd.clone());
+    let report = build_diagnostics_report(&state, sidecar::build_kind(&rd, &dd)).await;
     let dir = dirs::download_dir()
         .or_else(dirs::desktop_dir)
         .or_else(dirs::home_dir)
@@ -759,6 +780,57 @@ pub fn run() {
                 "setup: state loaded (sidecar_available={})",
                 state.sidecar_available.load(Ordering::Relaxed)
             );
+
+            // GPU Whisper by default: on a from-source install (which ships no
+            // bundled sidecar) with an NVIDIA GPU, install the CUDA whisper.cpp
+            // build in the background so transcription runs ON THE GPU out of the
+            // box — the user never has to click "Download Whisper", and a CPU
+            // build (unusably slow for large models) is upgraded once. Latched in
+            // config so it attempts at most once per machine (no re-download
+            // loop); a manual "Install GPU build" button remains in the GUI.
+            #[cfg(target_os = "windows")]
+            {
+                let state = state.clone();
+                let app_handle = app.handle().clone();
+                let rd = resource_dir.clone();
+                let dd = data_dir.clone();
+                tauri::async_runtime::spawn(async move {
+                    let already = state.config.lock().unwrap().whisper_autoinstalled;
+                    let kind = sidecar::build_kind(&rd, &dd);
+                    // Nothing to do if a GPU/bundled build is already in place, or
+                    // we've already tried once on this machine.
+                    if already || kind == "gpu" || kind == "bundled" {
+                        return;
+                    }
+                    let is_nvidia = tokio::task::spawn_blocking(gpu::snapshot)
+                        .await
+                        .map(|s| s.gpu_name.to_lowercase().contains("nvidia"))
+                        .unwrap_or(false);
+                    if !is_nvidia {
+                        return; // CPU-only host: leave transcription on the ClipAI server.
+                    }
+                    log::info!(
+                        "auto-installing GPU whisper build (current='{kind}', NVIDIA GPU present)"
+                    );
+                    // Release any file lock on an existing whisper-server.exe so
+                    // the overwrite (CPU→GPU swap) can't fail. No-op if unstarted.
+                    sidecar::shutdown(&state).await;
+                    match sidecar::download_whispercpp(&app_handle, &dd).await {
+                        Ok(msg) => log::info!("auto-install whisper: {msg}"),
+                        Err(e) => log::warn!(
+                            "auto-install whisper failed (retry via the GUI button): {e}"
+                        ),
+                    }
+                    state.sidecar_available.store(
+                        sidecar::available(&rd, &dd), Ordering::Relaxed);
+                    // Latch regardless of outcome so a transient failure can't loop.
+                    {
+                        let mut c = state.config.lock().unwrap();
+                        c.whisper_autoinstalled = true;
+                    }
+                    state.save();
+                });
+            }
 
             // GPU telemetry poll (5 s) + tray tooltip/busy indicator.
             {

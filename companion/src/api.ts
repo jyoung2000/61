@@ -55,6 +55,8 @@ export interface CompanionStatus {
   };
   sidecar_available: boolean;
   sidecar_running: boolean;
+  /** Which whisper build is installed: "gpu" (CUDA), "cpu", "bundled", "none". */
+  whisper_build: 'gpu' | 'cpu' | 'bundled' | 'none';
   busy: boolean;
   current_job: ActivityEntry | null;
   job_progress: number | null;

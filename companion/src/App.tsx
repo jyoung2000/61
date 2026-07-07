@@ -869,6 +869,41 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
               )}
             </div>
           )}
+          {status.sidecar_available && status.whisper_build === 'cpu' && (
+            <div className="panel" style={{
+              margin: '0 0 8px 17px', padding: 8,
+              borderColor: 'var(--accent-amber, #e0a52a)',
+              background: 'rgba(224,165,42,0.12)',
+            }}>
+              <div className="small" style={{ color: 'var(--accent-amber, #e0a52a)', fontWeight: 600 }}>
+                ⚠ Whisper is the CPU build — transcription runs on the CPU and is very slow
+              </div>
+              <div className="small muted" style={{ margin: '3px 0 6px' }}>
+                Your GPU can do transcription too. Install the CUDA build to run Whisper
+                on the {status.gpu.gpu_name || 'GPU'} — many times faster.
+              </div>
+              <div className="row" style={{ marginBottom: whisperDl ? 6 : 0 }}>
+                <button onClick={doDownloadWhisper} disabled={!!whisperDl?.active}
+                  title="Download the CUDA (GPU) whisper.cpp build and swap it in">
+                  {whisperDl?.active ? 'Installing…' : '⚡ Install GPU build'}
+                </button>
+              </div>
+              {whisperDl && (
+                <div>
+                  <div className="small muted" style={{ marginBottom: 3 }}>{whisperDl.message}</div>
+                  <div className={`meter${whisperDl.percent < 0 ? ' indeterminate' : ''}`}>
+                    <div style={whisperDl.percent < 0 ? undefined
+                      : { width: `${Math.max(2, Math.min(100, whisperDl.percent))}%` }} />
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+          {status.sidecar_available && status.whisper_build === 'gpu' && (
+            <div className="small muted" style={{ margin: '0 0 8px 17px' }}>
+              ⚡ Whisper GPU build installed — transcription runs on the {status.gpu.gpu_name || 'GPU'}.
+            </div>
+          )}
           <div className="small muted" style={{ margin: '8px 0 4px' }}>
             Ollama endpoint for ClipAI (easiest: use “Pair now” below — it fills this in
             automatically):

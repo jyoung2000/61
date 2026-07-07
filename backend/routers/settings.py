@@ -3344,6 +3344,8 @@ async def _verify_remote_whisper_transcribe(base: str, key: str, model: str) -> 
     data = {"response_format": "json"}
     if model:
         data["model"] = model
+        # Sync the selected model so the Companion warms the same GPU model here.
+        headers["X-ClipAI-Whisper-Model"] = model
     # Short connect (unreachable → fail fast); long read — a cold sidecar may
     # take tens of seconds to load its model on the first request.
     timeout = _httpx.Timeout(120.0, connect=5.0)

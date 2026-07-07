@@ -452,12 +452,19 @@ class RemoteWhisperEngine:
         if prompt:
             data["prompt"] = prompt
 
+        # Sync the SELECTED model to the Companion so it loads the same family on
+        # its GPU (the GPU Companion picks its whisper.cpp model from this header,
+        # capped by its VRAM budget). Cheap header — read before the WAV streams.
+        headers = self._headers()
+        if model:
+            headers["X-ClipAI-Whisper-Model"] = model
+
         try:
             with open(audio_path, "rb") as fh:
                 files = {"file": (os.path.basename(audio_path), fh, "audio/wav")}
                 resp = httpx.post(
                     f"{self.base}/v1/audio/transcriptions",
-                    headers=self._headers(),
+                    headers=headers,
                     data=data, files=files, timeout=self.TIMEOUT_S)
             if resp.status_code == 503:
                 # Busy Companion: one bounded Retry-After wait, then give up
@@ -473,7 +480,7 @@ class RemoteWhisperEngine:
                     files = {"file": (os.path.basename(audio_path), fh, "audio/wav")}
                     resp = httpx.post(
                         f"{self.base}/v1/audio/transcriptions",
-                        headers=self._headers(),
+                        headers=headers,
                         data=data, files=files, timeout=self.TIMEOUT_S)
             if resp.status_code != 200:
                 logger.warning(
