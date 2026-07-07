@@ -856,6 +856,44 @@ async def provider_status():
     return statuses
 
 
+async def _sync_companion_whisper(comp) -> dict:
+    """Mirror the paired Companion's transcription quality into THIS container's
+    whisper settings. The Companion is the source of truth for quality when it
+    runs transcription (the user picks it there); reading its /v1/health and
+    writing WHISPER_MODEL / WHISPER_BEAM_SIZE keeps the container's settings,
+    logs and any local fallback consistent with what the GPU is actually doing.
+    Persists only when a value changed. Returns the effective quality."""
+    from backend.services import ollama_registry as _oreg
+    out = {"model": "", "beam_size": 0, "quality": ""}
+    try:
+        base = _oreg.companion_base(comp)
+        async with httpx.AsyncClient(timeout=4) as client:
+            r = await client.get(_oreg.join_url(base, "/v1/health"),
+                                 headers=_oreg.auth_headers(comp))
+        if r.status_code != 200:
+            return out
+        h = r.json() or {}
+        model = (h.get("whisper_model_effective") or "").strip()
+        beam = int(h.get("whisper_beam_size", 0) or 0)
+        quality = (h.get("whisper_quality") or "").strip()
+        out = {"model": model, "beam_size": beam, "quality": quality}
+        changed = False
+        if model and model != getattr(settings, "WHISPER_MODEL", ""):
+            settings.WHISPER_MODEL = model
+            changed = True
+        if beam > 0 and beam != int(getattr(settings, "WHISPER_BEAM_SIZE", 0) or 0):
+            settings.WHISPER_BEAM_SIZE = beam
+            changed = True
+        if changed:
+            _persist_user_settings()
+            _invalidate_status_cache()
+            logger.info("Synced Whisper settings from Companion: model=%s beam=%s "
+                        "(quality=%s)", model, beam, quality)
+    except Exception as e:
+        logger.debug("companion whisper sync skipped: %s", e)
+    return out
+
+
 @router.get("/providers/companion-status")
 async def companion_status():
     """Cheap, fast-pollable liveness of the paired GPU Companion so the UI can
@@ -886,6 +924,12 @@ async def companion_status():
                            and _ra._remote_whisper_base().rstrip("/") == comp_base.rstrip("/"))
     except Exception:
         _whisper_remote = False
+    # When this Companion serves transcription, mirror its quality (model + beam)
+    # into the container's whisper settings so they stay in sync with what the
+    # user picked on the Companion.
+    _wq = {"model": "", "beam_size": 0, "quality": ""}
+    if st.online and _whisper_remote:
+        _wq = await _sync_companion_whisper(comp)
     return {
         "paired": True,
         "online": bool(st.online),
@@ -902,6 +946,9 @@ async def companion_status():
         "models_ready": len(ready),
         "ready": bool(want) and len(ready) == len(want) and bool(st.online),
         "whisper_remote": _whisper_remote,
+        "whisper_quality": _wq.get("quality", ""),
+        "whisper_model": _wq.get("model", ""),
+        "whisper_beam_size": _wq.get("beam_size", 0),
     }
 
 

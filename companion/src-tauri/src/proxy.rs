@@ -453,7 +453,17 @@ async fn health(State(ctx): State<ProxyCtx>, headers: HeaderMap) -> Response {
     let activity = ctx.state.begin_activity("health", "/v1/health", "", "", "");
     let gpu = ctx.state.gpu.lock().unwrap().clone();
     let config = ctx.state.config_snapshot();
-    let (whisper_model, _) = crate::state::whisper_tier_for_budget(ctx.state.effective_budget_gb());
+    let budget = ctx.state.effective_budget_gb();
+    let (whisper_model, _) = crate::state::whisper_tier_for_budget(budget);
+    // Effective transcription quality (beam search + model) so ClipAI can sync
+    // its own whisper settings + display to what this GPU is actually doing.
+    let (whisper_beam, whisper_full) =
+        crate::state::whisper_quality_params(&config.whisper_quality, budget);
+    let whisper_model_eff = if whisper_full && whisper_model == "large-v3-turbo" {
+        "large-v3"
+    } else {
+        whisper_model
+    };
     let busy = ctx.state.whisper_busy.load(Ordering::Relaxed);
     let current = ctx.state.current_job().map(|e| {
         serde_json::json!({
@@ -496,10 +506,15 @@ async fn health(State(ctx): State<ProxyCtx>, headers: HeaderMap) -> Response {
         "speed_profile": config.speed_profile,
         "num_parallel": num_parallel,
         "max_loaded_models": max_loaded,
+        // Transcription quality this GPU is configured for — ClipAI syncs its
+        // own whisper settings + display to match.
+        "whisper_quality": config.whisper_quality,
+        "whisper_model_effective": whisper_model_eff,
+        "whisper_beam_size": whisper_beam,
         "backends": {
             "ollama": ollama_up,
             "whisper": whisper_shipped,
-            "whisper_model": whisper_model,
+            "whisper_model": whisper_model_eff,
         },
         "busy": busy,
         "paused": config.paused,
