@@ -139,6 +139,8 @@ fn models_dir(data_dir: &PathBuf) -> PathBuf {
 /// macOS whisper.cpp quant for a tier (int8 tiers map to q5 GGUFs).
 fn whispercpp_model_file(model: &str) -> String {
     match model {
+        // Full large-v3 (highest accuracy — the "max" quality tier).
+        "large-v3" => "ggml-large-v3.bin".into(),
         "large-v3-turbo" => "ggml-large-v3-turbo.bin".into(),
         "medium" => "ggml-medium-q5_0.bin".into(),
         _ => "ggml-small-q5_1.bin".into(),
@@ -215,12 +217,24 @@ pub async fn ensure_running(
     let budget = state.effective_budget_gb();
     // Honor the model ClipAI selected (synced per request) but cap by budget so
     // it always fits on the GPU. Empty request ⇒ the budget-default tier.
-    let (model, compute) = crate::state::whisper_tier_for_request(requested_model, budget);
+    let (mut model, compute) = crate::state::whisper_tier_for_request(requested_model, budget);
+    // Transcription quality: beam search (accuracy) + optionally the full
+    // large-v3 model, scaled to the VRAM budget. This is where the extra VRAM
+    // buys Netflix/YouTube-grade captions.
+    let quality = state.config.lock().unwrap().whisper_quality.clone();
+    let (beam_size, prefer_full) = crate::state::whisper_quality_params(&quality, budget);
+    if prefer_full && model == "large-v3-turbo" {
+        model = "large-v3";
+    }
+    let is_gpu_build = build_kind(&resource_dir, &data_dir) == "gpu";
+    // A restart is needed when the model OR the decode settings change, so the
+    // service key folds both in.
+    let service_key = format!("{model}|bs{beam_size}");
 
     let mut guard = state.sidecar.lock().await;
     if let Some(handle) = guard.as_mut() {
         let alive = handle.child.try_wait().map(|s| s.is_none()).unwrap_or(false);
-        if alive && handle.model == model && healthy().await {
+        if alive && handle.model == service_key && healthy().await {
             return Ok(model.to_string());
         }
         let _ = handle.child.kill().await;
@@ -235,7 +249,8 @@ pub async fn ensure_running(
     let _ = std::fs::create_dir_all(&models);
 
     log::info!(
-        "starting whisper sidecar: {} model={model} compute={compute} (budget {budget:.1} GB)",
+        "starting whisper sidecar: {} model={model} compute={compute} \
+         quality={quality} beam_size={beam_size} flash_attn={is_gpu_build} (budget {budget:.1} GB)",
         if is_whispercpp { "whisper.cpp" } else { "faster-whisper" }
     );
     let mut cmd = quiet_command(&binary);
@@ -252,6 +267,16 @@ pub async fn ensure_running(
             "--model",
             model_file.to_string_lossy().as_ref(),
         ]);
+        // Beam search — the main accuracy lever over greedy decoding. Costs more
+        // compute/VRAM, which is exactly what the extra card affords.
+        if beam_size > 1 {
+            cmd.arg("--beam-size").arg(beam_size.to_string());
+        }
+        // Flash attention on the CUDA build: faster + lower memory, numerically
+        // exact (no quality trade-off) — lets the bigger model + beam fit.
+        if is_gpu_build {
+            cmd.arg("--flash-attn");
+        }
     } else {
         // faster-whisper PyInstaller server — configured via env.
         cmd.env("WHISPER_MODEL", model)
@@ -268,7 +293,9 @@ pub async fn ensure_running(
     crate::state::bind_child_to_lifetime(&child);
     *guard = Some(SidecarHandle {
         child,
-        model: model.to_string(),
+        // Store the model+decode key so a quality change (beam size / full
+        // model) is detected and triggers a restart on the next request.
+        model: service_key,
         started_ms: crate::state::now_ms(),
     });
     drop(guard);

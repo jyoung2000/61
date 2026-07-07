@@ -777,6 +777,45 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
             </div>
           </div>
 
+          {/* Transcription quality — beam search + model, scaled to VRAM. This
+              is where the extra card buys Netflix/YouTube-grade captions. */}
+          <div style={{ margin: '0 0 10px' }}>
+            <div className="row spread small" style={{ marginBottom: 4 }}>
+              <strong title="Higher accuracy uses beam search (vs greedy) and a bigger Whisper model — both need VRAM, which is what this card provides. Slower but far more accurate captions.">
+                Transcription quality 🎯
+              </strong>
+              <span className="muted small mono">
+                {status.whisper_quality_effective.model}
+                {status.whisper_quality_effective.beam_search
+                  ? ` · beam ${status.whisper_quality_effective.beam_size}`
+                  : ' · greedy'}
+              </span>
+            </div>
+            <div className="row" style={{ gap: 4 }}>
+              {(['auto', 'fast', 'balanced', 'max'] as const).map((q) => (
+                <button
+                  key={q}
+                  className={status.config.whisper_quality === q ? '' : 'secondary'}
+                  style={{ flex: 1, textTransform: 'capitalize', padding: '5px 4px' }}
+                  onClick={() => setConfig({ whisper_quality: q }).then(refresh)}
+                  title={
+                    q === 'auto' ? 'Recommended — beam search when your VRAM affords it'
+                    : q === 'fast' ? 'Turbo model, greedy decode — fastest, good'
+                    : q === 'balanced' ? 'Turbo model + beam search — great accuracy'
+                    : 'Full large-v3 + beam search — best/"Netflix-grade" (needs the VRAM, slower)'
+                  }
+                >
+                  {q}
+                </button>
+              ))}
+            </div>
+            <div className="small muted" style={{ marginTop: 4 }}>
+              {status.whisper_quality_effective.beam_search
+                ? `Using ${status.whisper_quality_effective.model} with beam search (${status.whisper_quality_effective.beam_size}) — higher accuracy for the extra VRAM. Changing this restarts the Whisper engine.`
+                : `Using ${status.whisper_quality_effective.model} greedy — fastest. Pick “balanced” or “max” for beam search (more accurate).`}
+            </div>
+          </div>
+
           <label className="row small" style={{ gap: 8, margin: '4px 0 8px', cursor: 'pointer' }}>
             <input
               type="checkbox"

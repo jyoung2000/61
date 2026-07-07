@@ -55,6 +55,35 @@ pub struct Config {
     /// "turbo" (max concurrency the VRAM allows). Drives Ollama parallelism and
     /// is advertised to ClipAI so it parallelizes the pipeline to match.
     pub speed_profile: String,
+    /// Transcription accuracy vs speed: "auto" (pick from VRAM), "fast" (turbo,
+    /// greedy), "balanced" (turbo + beam search), "max" (full large-v3 + beam
+    /// search — best/"Netflix-grade", needs the VRAM). More VRAM ⇒ beam search
+    /// and a bigger model, which is where the accuracy gains come from.
+    pub whisper_quality: String,
+}
+
+/// Resolve transcription quality + VRAM budget to whisper.cpp decode settings:
+/// (beam_size, prefer_full_large_v3). beam_size>1 enables beam search (the main
+/// accuracy lever over greedy); prefer_full swaps large-v3-turbo for the full
+/// large-v3 model (highest accuracy) when the VRAM affords it.
+pub fn whisper_quality_params(quality: &str, budget_gb: f32) -> (u32, bool) {
+    match quality {
+        "fast" => (1, false),
+        "balanced" => (5, false),
+        // Full large-v3 needs ~3 GB just for weights + beam KV — gate on VRAM.
+        "max" => (5, budget_gb >= 8.0),
+        // "auto": turn on beam search once the card can afford it (the 4070
+        // easily can); keep greedy only on tiny budgets.
+        _ => {
+            if budget_gb >= 6.0 {
+                (5, false)
+            } else if budget_gb >= 3.0 {
+                (2, false)
+            } else {
+                (1, false)
+            }
+        }
+    }
 }
 
 /// Resolve a speed profile + VRAM budget to (num_parallel, max_loaded_models).
@@ -104,6 +133,7 @@ impl Default for Config {
             vram_buffer_gb: 1.0,
             whisper_autoinstalled: false,
             speed_profile: "auto".into(),
+            whisper_quality: "auto".into(),
         }
     }
 }

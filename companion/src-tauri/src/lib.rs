@@ -134,6 +134,14 @@ async fn get_status(
     let ollama_status = ollama::status(&state).await;
     let budget = state.effective_budget_gb();
     let (whisper_model, whisper_compute) = state::whisper_tier_for_budget(budget);
+    // Effective transcription quality for the current profile + VRAM.
+    let (whisper_beam, whisper_full) =
+        state::whisper_quality_params(&config.whisper_quality, budget);
+    let whisper_model_eff = if whisper_full && whisper_model == "large-v3-turbo" {
+        "large-v3"
+    } else {
+        whisper_model
+    };
     let sidecar_running = state.sidecar.lock().await.is_some();
     // VRAM ClipAI is actively holding: resident Ollama models (/api/ps) plus a
     // rough whisper-model footprint while transcribing (whisper.cpp VRAM isn't
@@ -206,6 +214,7 @@ async fn get_status(
             "name": config.name,
             "setup_complete": config.setup_complete,
             "speed_profile": config.speed_profile,
+            "whisper_quality": config.whisper_quality,
         },
         "speed": {
             "profile": config.speed_profile,
@@ -216,6 +225,12 @@ async fn get_status(
         "clipai_vram_mb": clipai_vram_mb,
         "effective_budget_gb": budget,
         "whisper_tier": { "model": whisper_model, "compute": whisper_compute },
+        "whisper_quality_effective": {
+            "profile": config.whisper_quality,
+            "model": whisper_model_eff,
+            "beam_size": whisper_beam,
+            "beam_search": whisper_beam > 1,
+        },
         "ollama": ollama_status,
         "sidecar_available": state.sidecar_available.load(Ordering::Relaxed),
         "sidecar_running": sidecar_running,
@@ -252,6 +267,7 @@ struct ConfigPatch {
     vram_auto: Option<bool>,
     vram_buffer_gb: Option<f32>,
     speed_profile: Option<String>,
+    whisper_quality: Option<String>,
 }
 
 #[tauri::command]
@@ -313,6 +329,15 @@ async fn set_config(
                 cfg.speed_profile = v;
                 // Restart Ollama so the new NUM_PARALLEL / MAX_LOADED take effect.
                 ollama_restart_needed = true;
+            }
+        }
+        if let Some(v) = patch.whisper_quality {
+            let v = v.trim().to_lowercase();
+            if matches!(v.as_str(), "auto" | "fast" | "balanced" | "max") && v != cfg.whisper_quality {
+                cfg.whisper_quality = v;
+                // Drop the whisper sidecar so the next request restarts it with
+                // the new beam-search / model settings.
+                sidecar_restart_needed = true;
             }
         }
     }
