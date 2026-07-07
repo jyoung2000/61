@@ -215,6 +215,7 @@ async fn get_status(
             "setup_complete": config.setup_complete,
             "speed_profile": config.speed_profile,
             "whisper_quality": config.whisper_quality,
+            "shared_paths": config.shared_paths,
         },
         "speed": {
             "profile": config.speed_profile,
@@ -268,6 +269,7 @@ struct ConfigPatch {
     vram_buffer_gb: Option<f32>,
     speed_profile: Option<String>,
     whisper_quality: Option<String>,
+    shared_paths: Option<Vec<String>>,
 }
 
 #[tauri::command]
@@ -339,6 +341,17 @@ async fn set_config(
                 // the new beam-search / model settings.
                 sidecar_restart_needed = true;
             }
+        }
+        if let Some(v) = patch.shared_paths {
+            // Normalize: trim, drop empties, de-dupe (order preserved). These are
+            // the folders ClipAI may browse + pull files from; no restart needed.
+            let mut seen = std::collections::HashSet::new();
+            let cleaned: Vec<String> = v
+                .into_iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty() && seen.insert(s.clone()))
+                .collect();
+            cfg.shared_paths = cleaned;
         }
     }
     // Force the auto-VRAM loop to re-apply immediately after a settings change.

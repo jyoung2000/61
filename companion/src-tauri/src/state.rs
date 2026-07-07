@@ -60,6 +60,12 @@ pub struct Config {
     /// search — best/"Netflix-grade", needs the VRAM). More VRAM ⇒ beam search
     /// and a bigger model, which is where the accuracy gains come from.
     pub whisper_quality: String,
+    /// Folders the user has shared with ClipAI. ClipAI can browse these paths
+    /// and pull video/media/font files from them remotely (e.g. drop a clip on
+    /// a shared folder from your phone, then import it in ClipAI while away from
+    /// the PC). Every file API is strictly JAILED to these roots — a request for
+    /// any path that doesn't canonicalize to inside one of them is refused.
+    pub shared_paths: Vec<String>,
 }
 
 /// Resolve transcription quality + VRAM budget to whisper.cpp decode settings:
@@ -134,8 +140,30 @@ impl Default for Config {
             whisper_autoinstalled: false,
             speed_profile: "auto".into(),
             whisper_quality: "auto".into(),
+            shared_paths: Vec::new(),
         }
     }
+}
+
+/// Resolve a user-supplied path against the configured shared roots, enforcing
+/// the jail. Returns the canonicalized absolute path ONLY when it exists and
+/// canonicalizes to inside one of the (canonicalized) shared roots — otherwise
+/// `None`. Canonicalizing both sides defeats `..` traversal and symlink escapes:
+/// a symlink inside a shared folder that points outside it resolves to a real
+/// path that fails the prefix check.
+pub fn resolve_shared_path(shared_roots: &[String], requested: &str) -> Option<PathBuf> {
+    let req = std::fs::canonicalize(requested).ok()?;
+    for root in shared_roots {
+        if root.trim().is_empty() {
+            continue;
+        }
+        if let Ok(root_c) = std::fs::canonicalize(root) {
+            if req == root_c || req.starts_with(&root_c) {
+                return Some(req);
+            }
+        }
+    }
+    None
 }
 
 fn default_name() -> String {

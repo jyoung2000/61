@@ -14,12 +14,13 @@
 
 use crate::state::{AppState, OLLAMA_LOCAL};
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::{HeaderMap, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
-use axum::Router;
+use axum::{Json, Router};
 use futures_util::{StreamExt, TryStreamExt};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -445,6 +446,154 @@ async fn progress_report(State(ctx): State<ProxyCtx>, headers: HeaderMap) -> Res
     (StatusCode::OK, "ok").into_response()
 }
 
+// ── Shared-folder file access ───────────────────────────────────────────────
+// ClipAI can browse the folders the user shared and pull files from them (video
+// to analyze, media/fonts for the library). EVERY handler is bearer-authed AND
+// jailed to the configured shared roots via resolve_shared_path (canonicalized,
+// so `..` traversal and symlink escapes are refused). Read-only: no write/delete.
+
+/// /v1/files/roots → the shared folders the user configured (name + exists).
+async fn files_roots(State(ctx): State<ProxyCtx>, headers: HeaderMap) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+    let roots = ctx.state.config.lock().unwrap().shared_paths.clone();
+    let items: Vec<_> = roots
+        .iter()
+        .filter(|r| !r.trim().is_empty())
+        .map(|r| {
+            let p = std::path::Path::new(r);
+            serde_json::json!({
+                "path": r,
+                "name": p.file_name().and_then(|s| s.to_str()).unwrap_or(r.as_str()),
+                "exists": p.is_dir(),
+            })
+        })
+        .collect();
+    (StatusCode::OK, Json(serde_json::json!({ "roots": items }))).into_response()
+}
+
+/// /v1/files/list?path=… → directory entries inside a shared root (dirs first).
+async fn files_list(
+    State(ctx): State<ProxyCtx>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+    let roots = ctx.state.config.lock().unwrap().shared_paths.clone();
+    let requested = q.get("path").cloned().unwrap_or_default();
+    let dir = match crate::state::resolve_shared_path(&roots, &requested) {
+        Some(p) => p,
+        None => {
+            return (StatusCode::FORBIDDEN, "path is not inside a shared folder").into_response()
+        }
+    };
+    if !dir.is_dir() {
+        return (StatusCode::BAD_REQUEST, "not a directory").into_response();
+    }
+    let mut entries = vec![];
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            let md = e.metadata().ok();
+            let is_dir = md.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+            let size = md.as_ref().map(|m| m.len()).unwrap_or(0);
+            let mtime_ms = md
+                .as_ref()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let name = e.file_name().to_string_lossy().to_string();
+            let ext = p
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            entries.push(serde_json::json!({
+                "name": name,
+                "path": p.to_string_lossy(),
+                "is_dir": is_dir,
+                "size": size,
+                "ext": ext,
+                "mtime_ms": mtime_ms,
+            }));
+        }
+    }
+    entries.sort_by(|a, b| {
+        let ad = a["is_dir"].as_bool().unwrap_or(false);
+        let bd = b["is_dir"].as_bool().unwrap_or(false);
+        bd.cmp(&ad).then(
+            a["name"]
+                .as_str()
+                .unwrap_or("")
+                .to_lowercase()
+                .cmp(&b["name"].as_str().unwrap_or("").to_lowercase()),
+        )
+    });
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "path": dir.to_string_lossy(), "entries": entries })),
+    )
+        .into_response()
+}
+
+/// /v1/files/read?path=… → stream a shared file's bytes (64 KB chunks, no full
+/// in-memory load) so ClipAI can pull large videos.
+async fn files_read(
+    State(ctx): State<ProxyCtx>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+    let roots = ctx.state.config.lock().unwrap().shared_paths.clone();
+    let requested = q.get("path").cloned().unwrap_or_default();
+    let path = match crate::state::resolve_shared_path(&roots, &requested) {
+        Some(p) => p,
+        None => {
+            return (StatusCode::FORBIDDEN, "path is not inside a shared folder").into_response()
+        }
+    };
+    if !path.is_file() {
+        return (StatusCode::BAD_REQUEST, "not a file").into_response();
+    }
+    let file = match tokio::fs::File::open(&path).await {
+        Ok(f) => f,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("open failed: {e}")).into_response()
+        }
+    };
+    use tokio::io::AsyncReadExt;
+    let stream = futures_util::stream::try_unfold(file, |mut f| async move {
+        let mut buf = vec![0u8; 64 * 1024];
+        let n = f.read(&mut buf).await?;
+        if n == 0 {
+            Ok::<_, std::io::Error>(None)
+        } else {
+            buf.truncate(n);
+            Ok(Some((axum::body::Bytes::from(buf), f)))
+        }
+    });
+    let fname = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("file")
+        .to_string();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/octet-stream")
+        .header(
+            "content-disposition",
+            format!("attachment; filename=\"{fname}\""),
+        )
+        .body(Body::from_stream(stream))
+        .unwrap()
+}
+
 /// /v1/logs → the full diagnostics report as plain text, so the ClipAI web app
 /// can pull this Companion's logs remotely (export menu) without the user being
 /// at the Companion PC. Bearer-authed like every other proxy route.
@@ -554,6 +703,9 @@ fn build_router(ctx: ProxyCtx) -> Router {
     Router::new()
         .route("/v1/health", get(health))
         .route("/v1/logs", get(logs_export))
+        .route("/v1/files/roots", get(files_roots))
+        .route("/v1/files/list", get(files_list))
+        .route("/v1/files/read", get(files_read))
         .route("/v1/progress", post(progress_report))
         .route("/v1/audio/transcriptions", post(whisper_proxy))
         .route("/ollama", any(ollama_proxy))

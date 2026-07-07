@@ -374,6 +374,7 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
 }) {
   const [budget, setBudget] = useState<number | null>(null);
   const [bufferGb, setBufferGb] = useState<number | null>(null);
+  const [newSharedPath, setNewSharedPath] = useState('');
   const [autostart, setAutostart] = useState<boolean | null>(null);
   const [pairOpen, setPairOpen] = useState(false);
   const [clipaiUrl, setClipaiUrl] = useState(status.config.paired_clipai_url);
@@ -577,6 +578,18 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
   };
 
   const job = status.current_job;
+  const sharedPaths = status.config.shared_paths || [];
+  const addSharedPath = async () => {
+    const p = newSharedPath.trim();
+    if (!p) return;
+    await setConfig({ shared_paths: [...sharedPaths, p] });
+    setNewSharedPath('');
+    refresh();
+  };
+  const removeSharedPath = async (p: string) => {
+    await setConfig({ shared_paths: sharedPaths.filter((x) => x !== p) });
+    refresh();
+  };
 
   // ── Single "Performance" control ─────────────────────────────────────────
   // One knob for how much of this GPU ClipAI may use. It drives BOTH the Ollama
@@ -811,6 +824,49 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
               leaving a buffer so other apps (games, editors) can grow.
             </span>
           </label>
+
+          {/* Shared folders — ClipAI can browse these and pull video/media/font
+              files from them remotely (e.g. drop a clip here from your phone,
+              then import it in ClipAI while away from the PC). Read-only + jailed
+              to exactly these folders on the ClipAI side. */}
+          <div style={{ margin: '6px 0 10px' }}>
+            <div className="row spread small" style={{ marginBottom: 4 }}>
+              <strong title="ClipAI can browse and pull files (video, media, fonts) from these folders over your LAN. Access is read-only and strictly limited to the folders you list here.">
+                Shared folders 📂
+              </strong>
+              <span className="muted small">{sharedPaths.length} shared</span>
+            </div>
+            {sharedPaths.length > 0 ? (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginBottom: 6 }}>
+                {sharedPaths.map((p) => (
+                  <div key={p} className="row spread small"
+                    style={{ background: 'var(--bg-elevated)', padding: '4px 8px', borderRadius: 'var(--radius-sm)' }}>
+                    <span className="mono" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={p}>{p}</span>
+                    <button className="secondary" style={{ padding: '2px 8px' }}
+                      onClick={() => removeSharedPath(p)} title="Stop sharing this folder">✕</button>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="small muted" style={{ marginBottom: 6 }}>
+                No shared folders yet. Add one to let ClipAI import videos/media from it remotely.
+              </div>
+            )}
+            <div className="row" style={{ gap: 4 }}>
+              <input
+                type="text"
+                value={newSharedPath}
+                onChange={(e) => setNewSharedPath(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') addSharedPath(); }}
+                placeholder="e.g. C:\Users\you\Videos\ClipAI"
+                style={{ flex: 1 }}
+              />
+              <button onClick={addSharedPath} disabled={!newSharedPath.trim()}>Add</button>
+            </div>
+            <div className="small muted" style={{ marginTop: 4 }}>
+              Paste a full folder path. ClipAI sees only what's inside the folders you list — nothing else.
+            </div>
+          </div>
 
           {status.config.vram_auto ? (
             <>
