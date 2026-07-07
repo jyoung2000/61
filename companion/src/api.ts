@@ -48,6 +48,8 @@ export interface CompanionStatus {
     setup_complete: boolean;
   };
   gpu: GpuSnapshot;
+  /** VRAM (MB) ClipAI is actively holding (Ollama models + Whisper while busy). */
+  clipai_vram_mb: number;
   effective_budget_gb: number;
   whisper_tier: { model: string; compute: string };
   ollama: {

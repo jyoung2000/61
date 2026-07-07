@@ -97,6 +97,31 @@ pub async fn loaded_model_count() -> usize {
     json["models"].as_array().map(|a| a.len()).unwrap_or(0)
 }
 
+/// VRAM (bytes) held by resident Ollama models right now — the ClipAI portion
+/// of GPU memory, via /api/ps `size_vram`. Fail-open to 0 so the bar just shows
+/// no ClipAI segment if Ollama is briefly unreachable.
+pub async fn loaded_vram_bytes() -> u64 {
+    let Ok(resp) = reqwest::Client::new()
+        .get(format!("http://{OLLAMA_LOCAL}/api/ps"))
+        .timeout(std::time::Duration::from_secs(2))
+        .send()
+        .await
+    else {
+        return 0;
+    };
+    let Ok(json) = resp.json::<serde_json::Value>().await else {
+        return 0;
+    };
+    json["models"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|m| m.get("size_vram").and_then(|v| v.as_u64()))
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
 /// Unload every resident model (POST /api/generate keep_alive=0 per model) to
 /// free VRAM immediately — for the "Free GPU memory" button and idle auto-free.
 /// Returns (models_unloaded, names). Works whether Ollama is managed or external.

@@ -543,6 +543,11 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
   const gpu = status.gpu;
   const totalGb = gpu.vram_total_mb / 1024;
   const usedMb = Math.max(0, gpu.vram_total_mb - gpu.vram_free_mb);
+  // Split the used VRAM: what ClipAI holds (Ollama models + Whisper) vs what
+  // other apps (games/editors) are using, so each gets its own bar color.
+  const clipaiMb = Math.min(usedMb, Math.max(0, status.clipai_vram_mb || 0));
+  const otherMb = Math.max(0, usedMb - clipaiMb);
+  const pct = (mb: number) => (gpu.vram_total_mb > 0 ? Math.min(100, (mb / gpu.vram_total_mb) * 100) : 0);
   const sliderValue = budget ?? (status.config.vram_budget_gb > 0
     ? status.config.vram_budget_gb : status.effective_budget_gb);
   const sliderMax = Math.max(2, Math.floor(totalGb) - 1);
@@ -700,8 +705,21 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
                 <span>{gpu.unified_memory ? 'Unified memory' : 'VRAM'} used: {fmtMb(usedMb)}</span>
                 <span>free: {fmtMb(gpu.vram_free_mb)} / {fmtMb(gpu.vram_total_mb)}</span>
               </div>
-              <div className="meter" style={{ margin: '6px 0 12px' }}>
-                <div style={{ width: `${Math.min(100, (usedMb / gpu.vram_total_mb) * 100)}%` }} />
+              {/* Two-segment bar: ClipAI's own VRAM (green) + other apps (blue). */}
+              <div className="meter" style={{ margin: '6px 0 4px', display: 'flex', overflow: 'hidden' }}
+                title={`ClipAI: ${fmtMb(clipaiMb)} · other apps: ${fmtMb(otherMb)} · free: ${fmtMb(gpu.vram_free_mb)}`}>
+                <div style={{ width: `${pct(clipaiMb)}%`, height: '100%', background: 'var(--success, #22c55e)', transition: 'width 0.4s' }} />
+                <div style={{ width: `${pct(otherMb)}%`, height: '100%', background: '#3b82f6', transition: 'width 0.4s' }} />
+              </div>
+              <div className="row small muted" style={{ gap: 14, margin: '0 0 12px' }}>
+                <span style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+                  <span style={{ width: 9, height: 9, borderRadius: 2, background: 'var(--success, #22c55e)' }} />
+                  ClipAI {fmtMb(clipaiMb)}
+                </span>
+                <span style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+                  <span style={{ width: 9, height: 9, borderRadius: 2, background: '#3b82f6' }} />
+                  Other apps {fmtMb(otherMb)}
+                </span>
               </div>
               <div className="row" style={{ marginBottom: 10 }}>
                 <button className="secondary" onClick={doFreeVram} disabled={freeing}

@@ -135,6 +135,23 @@ async fn get_status(
     let budget = state.effective_budget_gb();
     let (whisper_model, whisper_compute) = state::whisper_tier_for_budget(budget);
     let sidecar_running = state.sidecar.lock().await.is_some();
+    // VRAM ClipAI is actively holding: resident Ollama models (/api/ps) plus a
+    // rough whisper-model footprint while transcribing (whisper.cpp VRAM isn't
+    // in /api/ps). Lets the GUI color ClipAI's use vs unrelated apps (games).
+    let clipai_vram_mb: u64 = {
+        let ollama_bytes = ollama::loaded_vram_bytes().await;
+        let whisper_mb: u64 = if state.whisper_busy.load(Ordering::Relaxed) {
+            // Tier footprint: turbo/large ~1.6 GB, medium ~0.9 GB, else ~0.4 GB.
+            match whisper_model {
+                "large-v3-turbo" => 1600,
+                "medium" => 900,
+                _ => 400,
+            }
+        } else {
+            0
+        };
+        ollama_bytes / (1024 * 1024) + whisper_mb
+    };
     // Which whisper build is installed (gpu/cpu/bundled/none) so the GUI can warn
     // when transcription would fall back to the CPU and offer the GPU build.
     let rd = app.path().resource_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
@@ -189,6 +206,7 @@ async fn get_status(
             "setup_complete": config.setup_complete,
         },
         "gpu": gpu,
+        "clipai_vram_mb": clipai_vram_mb,
         "effective_budget_gb": budget,
         "whisper_tier": { "model": whisper_model, "compute": whisper_compute },
         "ollama": ollama_status,
