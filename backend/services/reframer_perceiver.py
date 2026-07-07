@@ -164,6 +164,79 @@ class Perceiver:
                        f'{r.total_frames} frames, {r.duration_ms/1000:.1f}s')
         log.log_stage('PERCEIVE', f'Face detector: {self.face_detector.tier}')
 
+        # ── Optimization #1: overlap remote Whisper with face detection ──
+        # When transcription runs on a REMOTE GPU (the paired Companion), it no
+        # longer competes with YOLO for the local card's VRAM — the old reason
+        # these stages were serialized. Kick it off NOW, on a background thread,
+        # so the local GPU detects faces while the Companion GPU transcribes.
+        # Byte-identical result: the SAME transcribe() call, just started earlier
+        # and joined before we assemble the transcript. Local Whisper keeps the
+        # safe sequential ordering below (it shares the card with YOLO).
+        _txn: dict = {"result": None, "error": None}
+        _txn_thread = None
+        try:
+            from backend.services.reframer_audio import remote_whisper_configured
+            _txn_remote = bool(remote_whisper_configured())
+        except Exception:
+            _txn_remote = False
+        if _txn_remote:
+            import threading as _threading
+
+            def _run_remote_txn(dur_ms=r.duration_ms):
+                try:
+                    _stem = self.transcribe_audio_path
+                    if callable(_stem):
+                        try:
+                            _stem = _stem()
+                        except Exception:
+                            _stem = None
+                    # force_local=False keeps the remote selection; if the remote
+                    # turns out unusable, try_load falls back and we still get a
+                    # transcript (same as the sequential path).
+                    if self.audio_intel.try_load():
+                        _txn["result"] = self.audio_intel.transcribe(
+                            self.path, dur_ms,
+                            language=self.source_language,
+                            on_progress=None,  # don't fight the face-loop's bar
+                            audio_path_override=_stem)
+                except Exception as _e:  # noqa: BLE001 — reported, then retried
+                    _txn["error"] = _e
+
+            _txn_thread = _threading.Thread(
+                target=_run_remote_txn, name="clipai-remote-whisper", daemon=True)
+            _txn_thread.start()
+            log.log_stage(
+                'PERCEIVE',
+                'Remote Whisper transcription started CONCURRENTLY with face '
+                'detection (runs on the Companion GPU — no local VRAM contention)')
+
+        # ── Optimization #2: overlap speaker diarization with the visual pass ──
+        # Diarization is audio-only — it doesn't need faces or the transcript
+        # until we LINK tracks to speakers — so run pyannote on a background
+        # thread concurrently with the face loop. Its models are tiny and
+        # co-reside with YOLO on the local card. Gated on remote Whisper so the
+        # single-GPU path keeps its safe sequential ordering (local Whisper would
+        # otherwise contend with a still-running diarization). Worst case we just
+        # join and wait — never slower than the old order; the local-embedding
+        # fallback (needs the transcript) still runs sequentially below.
+        _diar: dict = {"timeline": None, "error": None}
+        _diar_thread = None
+        if _txn_remote:
+            import threading as _threading_d
+
+            def _run_diar(dur_ms=r.duration_ms):
+                try:
+                    if self.diarizer.try_load():
+                        _diar["timeline"] = self.diarizer.diarize(self.path, dur_ms)
+                except Exception as _e:  # noqa: BLE001 — degrade to the fallback
+                    _diar["error"] = _e
+
+            _diar_thread = _threading_d.Thread(
+                target=_run_diar, name="clipai-diarize", daemon=True)
+            _diar_thread.start()
+            log.log_stage('PERCEIVE',
+                          'Speaker diarization started concurrently with face detection')
+
         # Detection resolution: scale down for speed, but keep enough pixels
         # to resolve small faces on high-res sources. 720p/1080p → 640px wide,
         # 1440p+ → 960px wide, 4K+ → 1280px wide. The extra pixels matter
@@ -737,27 +810,51 @@ class Perceiver:
         self._release_perception_models()
 
         # ── Audio intelligence (Whisper transcription) ──
-        # transcribe_audio_path may be a zero-arg callable (the pipeline's
-        # concurrent vocal-separation handle, audit Phase 5.5): resolve it
-        # HERE — after the visual pass — so Demucs got the perception
-        # stage's wall time for free. A plain string path passes through.
-        _stem_path = self.transcribe_audio_path
-        if callable(_stem_path):
-            try:
-                _stem_path = _stem_path()
-            except Exception:
-                _stem_path = None
-        if self.audio_intel.try_load():
-            audio_result = self.audio_intel.transcribe(
-                self.path, r.duration_ms,
-                language=self.source_language,
-                on_progress=on_progress,
-                audio_path_override=_stem_path)
+        # If it was started concurrently (remote GPU, optimization #1), JOIN it
+        # now — the transcript ran while faces were detected. Otherwise run it
+        # here (local Whisper: shares the card with YOLO, so it stays after the
+        # visual pass). transcribe_audio_path may be a zero-arg callable (the
+        # pipeline's concurrent vocal-separation handle): resolve it HERE for the
+        # sequential path so Demucs got the perception stage's wall time free.
+        def _apply_audio_result(audio_result):
+            if not audio_result:
+                return
             r.speech_active = audio_result.get('speech_active', {})
             r.transcript_segments = audio_result.get('segments', [])
             r.detected_language = audio_result.get('language', '')
             r.coverage_ledger = audio_result.get('coverage_ledger')
             r.audio_events = audio_result.get('audio_events', {})
+
+        _txn_done = False
+        if _txn_thread is not None:
+            _txn_thread.join()
+            if _txn["error"] is None and _txn["result"]:
+                _apply_audio_result(_txn["result"])
+                _txn_done = True
+                log.log_stage('PERCEIVE',
+                              'Remote Whisper transcript ready (ran concurrently '
+                              'with face detection)')
+            else:
+                # Concurrent attempt failed/empty — fall through to a clean
+                # sequential retry so the transcript is never lost.
+                if _txn["error"] is not None:
+                    log.log_stage('PERCEIVE',
+                                  f'Concurrent transcription failed ({_txn["error"]}) '
+                                  '— retrying sequentially')
+
+        if not _txn_done:
+            _stem_path = self.transcribe_audio_path
+            if callable(_stem_path):
+                try:
+                    _stem_path = _stem_path()
+                except Exception:
+                    _stem_path = None
+            if self.audio_intel.try_load():
+                _apply_audio_result(self.audio_intel.transcribe(
+                    self.path, r.duration_ms,
+                    language=self.source_language,
+                    on_progress=on_progress,
+                    audio_path_override=_stem_path))
 
         # ── Speaker diarization (audio-based) ──
         # Phase hint: diarization can run for many minutes with no per-item
@@ -769,7 +866,17 @@ class Perceiver:
                 on_progress(1.0, 'diarization')
             except TypeError:
                 on_progress(1.0)   # legacy single-arg callback
-        if self.diarizer.try_load():
+        if _diar_thread is not None:
+            # Concurrent (optimization #2) — join the pass that ran alongside faces.
+            _diar_thread.join()
+            r.speaker_timeline = _diar.get("timeline")
+            if _diar.get("error") is not None:
+                log.log_stage('PERCEIVE',
+                              f'Concurrent diarization failed ({_diar["error"]}) '
+                              '— using the fallback')
+            if r.speaker_timeline:
+                self._link_tracks_to_speakers(r)
+        elif self.diarizer.try_load():
             r.speaker_timeline = self.diarizer.diarize(self.path, r.duration_ms)
 
             # Link tracks to speakers: for each tracked face, find which speaker

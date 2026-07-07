@@ -149,9 +149,44 @@ def repair_high_problem_windows(video_path: str, plan, perception) -> dict:
         keyframes = plan.keyframes if isinstance(plan.keyframes, list) else []
         inserted_times: List[int] = []
 
-        for start_s, end_s in windows:
-            dense = _detect_faces_in_window(
-                cap, detector, start_s, end_s, fps, det_w, det_h, det_scale)
+        # ── Optimization #5: detect flagged windows in PARALLEL ──
+        # Each window's dense re-detection is independent and deterministic, so
+        # run them across a small thread pool — each worker with its OWN capture
+        # + detector (cv2 objects aren't shared across threads). Results are keyed
+        # by timestamp and applied below in the ORIGINAL window order, so the
+        # face_timeline + corrective keyframes are byte-identical to the serial
+        # pass — just computed concurrently (YuNet releases the GIL). Falls back
+        # to the shared serial capture for a single window / workers=1.
+        def _detect_window(win):
+            start_s, end_s = win
+            wcap = cv2.VideoCapture(video_path)
+            if not wcap.isOpened():
+                return {}
+            try:
+                wdet = cv2.FaceDetectorYN.create(
+                    model_path, "", (det_w, det_h), score_threshold=0.6)
+                return _detect_faces_in_window(
+                    wcap, wdet, start_s, end_s, fps, det_w, det_h, det_scale)
+            except Exception:
+                return {}
+            finally:
+                wcap.release()
+
+        _workers = max(1, min(len(windows),
+                              int(getattr(settings, "REFRAMER_REPAIR_WORKERS", 4))))
+        if _workers > 1 and len(windows) > 1:
+            import concurrent.futures as _cf
+            with _cf.ThreadPoolExecutor(max_workers=_workers) as _ex:
+                dense_results = list(_ex.map(_detect_window, windows))
+            logger.info("Problem repair: re-detected %d window(s) with %d parallel workers",
+                        len(windows), _workers)
+        else:
+            dense_results = [
+                _detect_faces_in_window(cap, detector, s, e, fps, det_w, det_h, det_scale)
+                for (s, e) in windows
+            ]
+
+        for (start_s, end_s), dense in zip(windows, dense_results):
             if not dense:
                 continue
             # Feed the fresh detections to every downstream consumer

@@ -1063,6 +1063,46 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
             self._force_cpu,
         )
 
+        # ── Optimization #3: parallel warmup on a high-VRAM host ──
+        # The sequential "warm vision → UNLOAD vision → warm text" dance below is
+        # a small-GPU necessity (a 4 GB card can't hold both). A high-VRAM host
+        # (a paired Companion, with MAX_LOADED_MODELS>1) keeps BOTH resident, so
+        # warm them CONCURRENTLY and skip the unload — the first real vision AND
+        # text calls are then both warm, saving a cold reload at each stage
+        # switch. Quality is identical (a 1-token warmup, same models).
+        async def _warm_model(model: str, num_gpu: int):
+            options = {"num_predict": 1}
+            if num_gpu >= 0:
+                options["num_gpu"] = num_gpu
+            if self._force_cpu:
+                options["num_gpu"] = 0
+            try:
+                resp = await self._client.post(f"{self._host}/api/chat", json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": "test"}],
+                    "stream": False,
+                    "options": options,
+                }, timeout=120.0)
+                if resp.status_code == 500 and self._is_oom_error(resp.text[:500]):
+                    logger.warning("Model %s OOM during warmup — forcing CPU-only", model)
+                    self._note_oom_force_cpu(model)
+            except Exception as e:  # noqa: BLE001
+                if self._is_oom_error(str(e)):
+                    self._note_oom_force_cpu(model)
+                else:
+                    logger.warning("Ollama warmup failed for %s (non-fatal): %s", model, e)
+
+        if self._available_vram_mb >= 6000 and not self._force_cpu:
+            await asyncio.gather(
+                _warm_model(self._primary_model, vision_num_gpu),
+                _warm_model(self._editorial_model, text_num_gpu),
+            )
+            logger.info(
+                "Ollama warmup: vision + text warmed CONCURRENTLY and kept resident "
+                "(host has %d MB — no reload churn between stages)",
+                self._available_vram_mb)
+            return
+
         try:
             # Warm up vision model
             options = {"num_predict": 1}
