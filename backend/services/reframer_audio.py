@@ -431,14 +431,149 @@ class RemoteWhisperEngine:
             pass
         return headers
 
+    # Reliability knobs for the LAN upload to the Companion.
+    UPLOAD_RETRIES = 3          # transient-failure attempts per payload
+    CHUNK_SECONDS = 600         # fallback chunk size (10 min) when a whole upload fails
+    MIN_CHUNK_SECONDS = 120     # don't chunk finer than this
+
+    def _post_wav(self, wav_bytes: bytes, filename: str, data: dict,
+                  headers: dict) -> tuple:
+        """ONE upload attempt with an EXACT Content-Length — the body is bytes
+        in memory, so it can never race a file that's still being written (the
+        "Too much data for declared Content-Length" failure). Returns
+        (ok, payload, retryable, detail, retry_after_s)."""
+        import httpx
+        try:
+            files = {"file": (filename, wav_bytes, "audio/wav")}
+            resp = httpx.post(
+                f"{self.base}/v1/audio/transcriptions",
+                headers=headers, data=data, files=files, timeout=self.TIMEOUT_S)
+        except Exception as e:  # network / connection reset / timeout
+            return (False, None, True, f"{type(e).__name__}: {str(e)[:120]}", 0.0)
+        if resp.status_code == 200:
+            try:
+                return (True, resp.json(), False, "", 0.0)
+            except Exception as e:
+                return (False, None, True, f"bad JSON: {str(e)[:80]}", 0.0)
+        if resp.status_code == 503:  # busy / paused — honor Retry-After
+            try:
+                wait = min(30.0, max(0.5, float(resp.headers.get("Retry-After", "5"))))
+            except (TypeError, ValueError):
+                wait = 5.0
+            return (False, None, True, "busy/paused (503)", wait)
+        if resp.status_code in (401, 403, 404):  # auth / no endpoint — don't retry
+            return (False, None, False, f"HTTP {resp.status_code}", 0.0)
+        # 413 (too large), 5xx, etc. — retryable; chunking may get it through.
+        return (False, None, True, f"HTTP {resp.status_code}: {resp.text[:120]}", 0.0)
+
+    def _transcribe_payload(self, wav_bytes: bytes, filename: str, data: dict,
+                            headers: dict, language, model,
+                            offset_s: float = 0.0) -> Optional[dict]:
+        """Upload one WAV payload with retries + backoff; map to the local
+        schema and shift timestamps by ``offset_s`` (for chunked uploads)."""
+        from backend.services.cloud_transcription import _map_verbose_json
+        last = ""
+        for attempt in range(1, self.UPLOAD_RETRIES + 1):
+            ok, payload, retryable, detail, retry_after = self._post_wav(
+                wav_bytes, filename, data, headers)
+            if ok:
+                segs = _map_verbose_json(payload) or []
+                if offset_s:
+                    for s in segs:
+                        for k in ("start", "end"):
+                            if isinstance(s.get(k), (int, float)):
+                                s[k] = s[k] + offset_s
+                        for w in (s.get("words") or []):
+                            for k in ("start", "end"):
+                                if isinstance(w.get(k), (int, float)):
+                                    w[k] = w[k] + offset_s
+                return {"segments": segs,
+                        "language": payload.get("language", language or "unknown")}
+            last = detail
+            if not retryable:
+                break
+            if attempt < self.UPLOAD_RETRIES:
+                wait = retry_after if retry_after > 0 else min(8.0, 1.5 * attempt)
+                logger.info("Remote Whisper upload attempt %d/%d failed (%s) — "
+                            "retrying in %.1fs", attempt, self.UPLOAD_RETRIES, detail, wait)
+                _time.sleep(wait)
+        logger.warning("Remote Whisper upload failed after %d attempts: %s",
+                       self.UPLOAD_RETRIES, last)
+        return None
+
+    def _iter_wav_chunks(self, audio_path: str, chunk_seconds: int):
+        """Yield (offset_s, wav_bytes, label) time slices of a PCM WAV, each a
+        complete standalone WAV. Raises if the file isn't a readable PCM WAV."""
+        import wave, io
+        with wave.open(audio_path, "rb") as w:
+            nch, sw, fr = w.getnchannels(), w.getsampwidth(), w.getframerate()
+            nframes = w.getnframes()
+            step = max(1, int(chunk_seconds * fr))
+            pos = 0
+            while pos < nframes:
+                w.setpos(pos)
+                frames = w.readframes(min(step, nframes - pos))
+                if not frames:
+                    break
+                buf = io.BytesIO()
+                with wave.open(buf, "wb") as out:
+                    out.setnchannels(nch)
+                    out.setsampwidth(sw)
+                    out.setframerate(fr)
+                    out.writeframes(frames)
+                yield (pos / float(fr), buf.getvalue(),
+                       f"{pos // fr}s-{(pos + step) // fr}s")
+                pos += step
+
+    def _transcribe_chunked(self, audio_path: str, data: dict, headers: dict,
+                            language, model) -> Optional[dict]:
+        """Fallback when a whole-file upload keeps failing: split the WAV into
+        smaller time chunks the Companion can accept, transcribe each (retried),
+        and merge with correct timestamps. Reliability path for any speed
+        setting / flaky link. Quality impact is negligible — Whisper already
+        works in ~30 s internal windows, so a 10-min chunk boundary only touches
+        one edge window."""
+        try:
+            base = os.path.basename(audio_path)
+            merged: list = []
+            lang_seen = language or "unknown"
+            n = 0
+            for offset_s, wav_bytes, label in self._iter_wav_chunks(
+                    audio_path, self.CHUNK_SECONDS):
+                n += 1
+                logger.info("Remote Whisper chunk %d (%s, %.1f MB) → Companion",
+                            n, label, len(wav_bytes) / (1024 * 1024))
+                part = self._transcribe_payload(
+                    wav_bytes, f"chunk{n}_{base}", data, headers,
+                    language, model, offset_s=offset_s)
+                if part is None:
+                    logger.warning("Remote Whisper chunk %d failed after retries "
+                                   "— aborting chunked upload", n)
+                    return None
+                merged.extend(part["segments"])
+                if part.get("language") and part["language"] != "unknown":
+                    lang_seen = part["language"]
+            if not merged:
+                return None
+            logger.info("Remote Whisper chunked upload OK: %d chunks → %d segments",
+                        n, len(merged))
+            return {"segments": merged, "language": lang_seen}
+        except Exception as e:
+            logger.warning("Remote Whisper chunked upload could not run (%s) — "
+                           "falling back to local", e)
+            return None
+
     def transcribe_wav(self, audio_path: str,
                        language: Optional[str] = None) -> Optional[dict]:
         """Returns ``{'segments', 'language', 'provider', 'model'}`` in the
         local schema (same contract as ``cloud_transcription.transcribe_cloud``)
-        or ``None`` on any failure — the caller falls back to local."""
-        import httpx
-        from backend.services.cloud_transcription import (
-            _map_verbose_json, _vocab_prompt)
+        or ``None`` on any failure — the caller falls back to local.
+
+        Reliable transfer to the Companion: the body is sent with an EXACT
+        Content-Length (bytes snapshot, never a growing file handle), transient
+        failures are retried with backoff, and if the whole upload still can't
+        get through, it's re-sent as smaller time chunks that are merged back."""
+        from backend.services.cloud_transcription import _vocab_prompt
 
         model = self.model or remote_whisper_pick_model(language)
         data = {
@@ -453,59 +588,42 @@ class RemoteWhisperEngine:
             data["prompt"] = prompt
 
         # Sync the SELECTED model to the Companion so it loads the same family on
-        # its GPU (the GPU Companion picks its whisper.cpp model from this header,
-        # capped by its VRAM budget). Cheap header — read before the WAV streams.
+        # its GPU (the Companion picks its whisper.cpp model from this header).
         headers = self._headers()
         if model:
             headers["X-ClipAI-Whisper-Model"] = model
 
+        # Snapshot the file to bytes ONCE — an exact Content-Length that can't
+        # race a still-being-written WAV.
         try:
             with open(audio_path, "rb") as fh:
-                files = {"file": (os.path.basename(audio_path), fh, "audio/wav")}
-                resp = httpx.post(
-                    f"{self.base}/v1/audio/transcriptions",
-                    headers=headers,
-                    data=data, files=files, timeout=self.TIMEOUT_S)
-            if resp.status_code == 503:
-                # Busy Companion: one bounded Retry-After wait, then give up
-                # to the local ladder (the pipeline must keep moving).
-                try:
-                    wait = min(30.0, max(0.5, float(
-                        resp.headers.get("Retry-After", "5"))))
-                except (TypeError, ValueError):
-                    wait = 5.0
-                logger.info("Remote Whisper busy (503) — retrying once in %.1fs", wait)
-                _time.sleep(wait)
-                with open(audio_path, "rb") as fh:
-                    files = {"file": (os.path.basename(audio_path), fh, "audio/wav")}
-                    resp = httpx.post(
-                        f"{self.base}/v1/audio/transcriptions",
-                        headers=headers,
-                        data=data, files=files, timeout=self.TIMEOUT_S)
-            if resp.status_code != 200:
-                logger.warning(
-                    "Remote Whisper (%s, model=%s) HTTP %s: %s — falling back to local",
-                    self.base, model, resp.status_code, resp.text[:200])
-                return None
-            payload = resp.json()
+                wav_bytes = fh.read()
         except Exception as e:
-            logger.warning(
-                "Remote Whisper (%s, model=%s) failed: %s — falling back to local",
-                self.base, model, e)
+            logger.warning("Remote Whisper could not read %s (%s) — local fallback",
+                           audio_path, e)
             return None
 
-        segments = _map_verbose_json(payload)
+        result = self._transcribe_payload(
+            wav_bytes, os.path.basename(audio_path), data, headers, language, model)
+        if result is None:
+            # Whole-file upload failed after retries — try smaller chunks.
+            logger.info("Remote Whisper whole-file upload failed — retrying in "
+                        "%d s chunks", self.CHUNK_SECONDS)
+            result = self._transcribe_chunked(audio_path, data, headers, language, model)
+        if result is None:
+            return None
+
+        segments = result["segments"]
         if not segments:
             logger.warning("Remote Whisper returned no segments — falling back to local")
             return None
         for entry in segments:
             entry["source"] = "remote"
         logger.info("Remote Whisper (%s): %d segments, language=%s, model=%s",
-                    self.base, len(segments),
-                    payload.get("language", language or "auto"), model)
+                    self.base, len(segments), result.get("language", "auto"), model)
         return {
             "segments": segments,
-            "language": payload.get("language", language or "unknown"),
+            "language": result.get("language", language or "unknown"),
             "provider": "remote",
             "model": model,
         }
@@ -920,9 +1038,16 @@ class AudioIntelligence:
     def transcribe(self, video_path: str, duration_ms: int,
                     language: str = 'auto',
                     on_progress: Callable = None,
-                    audio_path_override: Optional[str] = None) -> dict:
+                    audio_path_override: Optional[str] = None,
+                    remote_only: bool = False) -> dict:
         """Transcribe the video's audio track.
-        Optimized for speed: beam_size=1 (greedy), larger batch_size."""
+        Optimized for speed: beam_size=1 (greedy), larger batch_size.
+
+        ``remote_only`` (used by the perceiver's CONCURRENT transcription that
+        overlaps face detection): never fall back to the LOCAL CUDA/CPU engine —
+        that would contend with YOLO on the same card. On any remote failure it
+        returns ``{'_remote_failed': True, ...}`` so the caller can run the
+        normal (local-capable) pass SEQUENTIALLY, after the local GPU is free."""
         if not self.available:
             # A configured cloud provider can still transcribe without a
             # local faster-whisper install.
@@ -1066,6 +1191,22 @@ class AudioIntelligence:
                             except Exception:
                                 pass
                         return _result
+                if remote_only:
+                    # Concurrent-with-faces path: do NOT load local Whisper here
+                    # (it would fight YOLO for the local card). Signal the caller
+                    # to run the normal, local-capable pass sequentially once the
+                    # local GPU is free.
+                    log.log_stage('AUDIO',
+                        'Remote Whisper failed — remote_only set; deferring the '
+                        'local fallback to a sequential pass (keeps the local GPU '
+                        'for face detection)')
+                    if _own_audio:
+                        try:
+                            os.remove(audio_path)
+                        except Exception:
+                            pass
+                    return {'speech_active': {}, 'segments': [], 'language': '',
+                            '_remote_failed': True}
                 log.log_stage('AUDIO',
                     'Remote Whisper failed mid-stage — falling back to the '
                     'local CUDA→CPU ladder (job continues)')

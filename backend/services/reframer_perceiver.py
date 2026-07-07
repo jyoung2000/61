@@ -190,15 +190,20 @@ class Perceiver:
                             _stem = _stem()
                         except Exception:
                             _stem = None
-                    # force_local=False keeps the remote selection; if the remote
-                    # turns out unusable, try_load falls back and we still get a
-                    # transcript (same as the sequential path).
-                    if self.audio_intel.try_load():
+                    # Only run CONCURRENTLY when it will actually go to the remote
+                    # GPU — and remote_only=True so a remote failure never loads
+                    # local Whisper here (that would fight YOLO for the card). On
+                    # failure the main thread runs the normal (local-capable) pass
+                    # sequentially, after the local GPU is freed.
+                    if self.audio_intel.try_load() and self.audio_intel.device_used == 'remote':
                         _txn["result"] = self.audio_intel.transcribe(
                             self.path, dur_ms,
                             language=self.source_language,
                             on_progress=None,  # don't fight the face-loop's bar
-                            audio_path_override=_stem)
+                            audio_path_override=_stem,
+                            remote_only=True)
+                    else:
+                        _txn["result"] = {'_remote_failed': True}
                 except Exception as _e:  # noqa: BLE001 — reported, then retried
                     _txn["error"] = _e
 
@@ -828,19 +833,27 @@ class Perceiver:
         _txn_done = False
         if _txn_thread is not None:
             _txn_thread.join()
-            if _txn["error"] is None and _txn["result"]:
-                _apply_audio_result(_txn["result"])
+            _res = _txn["result"]
+            _ok = (_txn["error"] is None and _res is not None
+                   and not _res.get("_remote_failed"))
+            if _ok:
+                _apply_audio_result(_res)
                 _txn_done = True
                 log.log_stage('PERCEIVE',
                               'Remote Whisper transcript ready (ran concurrently '
                               'with face detection)')
             else:
-                # Concurrent attempt failed/empty — fall through to a clean
-                # sequential retry so the transcript is never lost.
+                # Concurrent remote attempt failed/deferred — run the normal
+                # (local-capable) pass sequentially now that the local GPU is
+                # free, so the transcript is never lost and never contends.
                 if _txn["error"] is not None:
                     log.log_stage('PERCEIVE',
                                   f'Concurrent transcription failed ({_txn["error"]}) '
                                   '— retrying sequentially')
+                else:
+                    log.log_stage('PERCEIVE',
+                                  'Remote transcription deferred — running the '
+                                  'sequential pass now (local GPU is free)')
 
         if not _txn_done:
             _stem_path = self.transcribe_audio_path
