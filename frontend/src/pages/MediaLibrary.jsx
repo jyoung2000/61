@@ -1,6 +1,7 @@
 import React, { useState, useCallback, useRef, useEffect } from 'react';
 import useTimelineStore from '../stores/timelineStore';
 import useResponsive from '../hooks/useResponsive';
+import CompanionBrowser from '../components/CompanionBrowser';
 
 const ACCEPTED_IMAGE = '.png,.jpg,.jpeg,.gif,.webp,.svg';
 const ACCEPTED_AUDIO = '.mp3,.wav,.ogg,.aac,.flac,.m4a';
@@ -93,6 +94,27 @@ export default function MediaLibrary() {
   const [selectMode, setSelectMode] = useState(false);
   const [fonts, setFonts] = useState([]);
   const [isLoading, setIsLoading] = useState(true);
+  const [showCompanionBrowser, setShowCompanionBrowser] = useState(false);
+  const [companionOnline, setCompanionOnline] = useState(false);
+
+  // "Import from Companion" only shows when a Companion is connected + sharing.
+  useEffect(() => {
+    let cancelled = false;
+    const check = async () => {
+      try {
+        const res = await fetch('/api/settings/providers/companion-files/roots');
+        const data = await res.json();
+        const ok = ((data && data.companions) || []).some(
+          (c) => c.online && (c.roots || []).length > 0);
+        if (!cancelled) setCompanionOnline(ok);
+      } catch {
+        if (!cancelled) setCompanionOnline(false);
+      }
+    };
+    check();
+    const id = setInterval(check, 20000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, []);
 
   // Load media from backend global library on mount
   useEffect(() => {
@@ -466,6 +488,23 @@ export default function MediaLibrary() {
                   Select
                 </button>
               )}
+              {companionOnline && (
+                <button
+                  onClick={() => setShowCompanionBrowser(true)}
+                  style={{
+                    padding: '8px 14px',
+                    background: 'var(--bg-elevated)',
+                    color: 'var(--text-secondary)',
+                    border: '1px solid var(--border)',
+                    borderRadius: 'var(--radius-sm)',
+                    fontSize: 12,
+                    cursor: 'pointer',
+                  }}
+                  title="Import media or fonts from a folder shared in the GPU Companion app"
+                >
+                  📂 From Companion
+                </button>
+              )}
               <button
                 onClick={() => fileRef.current?.click()}
                 style={{
@@ -484,6 +523,20 @@ export default function MediaLibrary() {
             </>
           )}
         </div>
+        {showCompanionBrowser && (
+          <CompanionBrowser
+            kind={filter === 'font' ? 'font' : 'media'}
+            onClose={() => setShowCompanionBrowser(false)}
+            onImported={(res) => {
+              if (!res || !res.ok) return;
+              if (res.kind === 'media') {
+                addMedia({ id: res.id, type: res.type, filename: res.filename, url: res.url });
+              } else if (res.kind === 'font') {
+                fetch('/api/fonts').then((r) => (r.ok ? r.json() : null)).then((f) => { if (f) setFonts(f); }).catch(() => {});
+              }
+            }}
+          />
+        )}
         <input
           ref={fileRef}
           type="file"

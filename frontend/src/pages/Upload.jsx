@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import ProgressBar from '../components/ProgressBar';
 import useResponsive from '../hooks/useResponsive';
 import CloudSourceTabs from '../components/cloud/CloudSourceTabs';
+import CompanionBrowser from '../components/CompanionBrowser';
 
 const ACCEPTED = 'video/*,.mp4,.mov,.avi,.mkv,.webm,.m4v,.3gp';
 const ACCEPTED_DISPLAY = 'MP4 \u00B7 MOV \u00B7 AVI \u00B7 MKV \u00B7 WEBM \u00B7 M4V \u00B7 3GP';
@@ -413,8 +414,31 @@ export default function Upload() {
   const hiddenSinceRef = useRef(null);
   const bgFetchActiveRef = useRef(false);
   const [bgFetchActive, setBgFetchActive] = useState(false);
+  const [showCompanionBrowser, setShowCompanionBrowser] = useState(false);
+  const [companionOnline, setCompanionOnline] = useState(false);
   const navigate = useNavigate();
   const { isMobile } = useResponsive();
+
+  // Detect a connected Companion that has shared folders — the "Import from
+  // Companion" option only appears when one is available (per the requirement
+  // that the browse option shows only when the container app is connected).
+  useEffect(() => {
+    let cancelled = false;
+    const check = async () => {
+      try {
+        const res = await fetch('/api/settings/providers/companion-files/roots');
+        const data = await res.json();
+        const ok = ((data && data.companions) || []).some(
+          (c) => c.online && (c.roots || []).length > 0);
+        if (!cancelled) setCompanionOnline(ok);
+      } catch {
+        if (!cancelled) setCompanionOnline(false);
+      }
+    };
+    check();
+    const id = setInterval(check, 20000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, []);
 
   const addLog = useCallback((msg, level = 'info') => {
     const ts = new Date().toLocaleTimeString();
@@ -1052,6 +1076,42 @@ export default function Upload() {
             subtitle_language: subtitleLanguage,
           }}
           onJobStart={handleCloudJobStart}
+        />
+      )}
+
+      {/* Import from a paired GPU Companion's shared folder — only when one is
+          connected + sharing folders. Lets the user pull a video the Companion
+          PC can see (e.g. dropped there from a phone) without a local upload. */}
+      {companionOnline && !uploading && (
+        <div style={{ marginBottom: 12, textAlign: 'center' }}>
+          <button
+            type="button"
+            onClick={() => setShowCompanionBrowser(true)}
+            style={{
+              padding: '8px 14px',
+              background: 'var(--bg-elevated)',
+              border: '1px solid var(--border)',
+              borderRadius: 'var(--radius-sm)',
+              fontSize: 13,
+              color: 'var(--text-secondary)',
+              cursor: 'pointer',
+            }}
+            title="Browse the folders you shared in the GPU Companion app and import a video from there"
+          >
+            📂 Import from Companion shared folder
+          </button>
+        </div>
+      )}
+      {showCompanionBrowser && (
+        <CompanionBrowser
+          kind="video"
+          onClose={() => setShowCompanionBrowser(false)}
+          onImported={(res) => {
+            if (res && res.job_id) {
+              setShowCompanionBrowser(false);
+              setTimeout(() => navigate(`/analysis/${res.job_id}`), 400);
+            }
+          }}
         />
       )}
 

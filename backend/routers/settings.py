@@ -983,6 +983,184 @@ async def companion_logs():
     return {"companions": companions}
 
 
+class CompanionImportRequest(BaseModel):
+    host_id: str
+    path: str
+    kind: str = "video"          # "video" | "media" | "font"
+
+
+def _companion_by_id(host_id: str):
+    from backend.services import ollama_registry as _oreg
+    for h in _oreg.get_hosts():
+        if not _oreg.is_local_gpu_host(h.url) and h.id == host_id:
+            return h
+    return None
+
+
+@router.get("/providers/companion-files/roots")
+async def companion_file_roots():
+    """List each connected Companion's shared folders so the ClipAI web app can
+    offer a remote file browser (only shown when a Companion is connected)."""
+    from backend.services import ollama_registry as _oreg
+    out = []
+    for h in _oreg.get_hosts():
+        if _oreg.is_local_gpu_host(h.url):
+            continue
+        base = _oreg.companion_base(h)
+        entry = {"host_id": h.id, "name": h.name or base, "online": False, "roots": [], "error": ""}
+        try:
+            async with httpx.AsyncClient(timeout=8) as client:
+                r = await client.get(_oreg.join_url(base, "/v1/files/roots"),
+                                     headers=_oreg.auth_headers(h))
+            if r.status_code == 200:
+                entry["online"] = True
+                entry["roots"] = (r.json() or {}).get("roots", [])
+            elif r.status_code in (401, 403):
+                entry["error"] = "auth rejected — check the host token"
+            elif r.status_code == 404:
+                entry["error"] = "update this Companion to share folders"
+            else:
+                entry["error"] = f"HTTP {r.status_code}"
+        except Exception as e:
+            entry["error"] = f"{type(e).__name__}: {str(e)[:100]}"
+        out.append(entry)
+    return {"companions": out}
+
+
+@router.get("/providers/companion-files/list")
+async def companion_file_list(host_id: str, path: str):
+    """Proxy a directory listing from a Companion's shared folder (jailed on the
+    Companion side to the folders the user shared)."""
+    from backend.services import ollama_registry as _oreg
+    h = _companion_by_id(host_id)
+    if h is None:
+        raise HTTPException(status_code=404, detail="companion not found or not connected")
+    base = _oreg.companion_base(h)
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(_oreg.join_url(base, "/v1/files/list"),
+                                 params={"path": path}, headers=_oreg.auth_headers(h))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"companion unreachable: {e}")
+    if r.status_code != 200:
+        raise HTTPException(status_code=r.status_code, detail=r.text[:200])
+    return r.json()
+
+
+@router.post("/providers/companion-files/import")
+async def companion_file_import(req: CompanionImportRequest):
+    """Pull a file from a Companion's shared folder into ClipAI: a video becomes
+    a queued analysis job; media/fonts land in the media library / fonts dir.
+    Streams the bytes (never loads the whole video into memory)."""
+    from backend.services import ollama_registry as _oreg
+    h = _companion_by_id(req.host_id)
+    if h is None:
+        raise HTTPException(status_code=404, detail="companion not found or not connected")
+    base = _oreg.companion_base(h)
+    read_url = _oreg.join_url(base, "/v1/files/read")
+    headers = _oreg.auth_headers(h)
+    filename = os.path.basename((req.path or "").replace("\\", "/")) or "import.bin"
+    kind = (req.kind or "video").lower()
+
+    async def _stream_to(dest_path: str) -> int:
+        size = 0
+        async with httpx.AsyncClient(timeout=None) as client:
+            async with client.stream("GET", read_url, params={"path": req.path},
+                                     headers=headers) as resp:
+                if resp.status_code != 200:
+                    body = (await resp.aread())[:200].decode("utf-8", "ignore")
+                    raise HTTPException(status_code=resp.status_code,
+                                        detail=f"companion read failed: {body}")
+                with open(dest_path, "wb") as f:
+                    async for chunk in resp.aiter_bytes(65536):
+                        f.write(chunk)
+                        size += len(chunk)
+        return size
+
+    if kind == "video":
+        import shutil as _sh
+        from datetime import datetime, timezone
+        from backend import database as _db
+        from backend.models import JobResult, JobStatus
+        job_id = str(uuid.uuid4())
+        job_dir = f"/data/uploads/{job_id}"
+        os.makedirs(job_dir, exist_ok=True)
+        dest = os.path.join(job_dir, filename)
+        try:
+            size = await _stream_to(dest)
+        except HTTPException:
+            _sh.rmtree(job_dir, ignore_errors=True)
+            raise
+        except Exception as e:
+            _sh.rmtree(job_dir, ignore_errors=True)
+            raise HTTPException(status_code=502, detail=f"import failed: {e}")
+        if size == 0:
+            _sh.rmtree(job_dir, ignore_errors=True)
+            raise HTTPException(status_code=400, detail="imported file is empty")
+        now = datetime.now(timezone.utc).isoformat()
+        job = JobResult(
+            job_id=job_id, filename=filename, file_path=dest,
+            file_size_mb=round(size / (1024 * 1024), 2),
+            status=JobStatus.QUEUED, progress=0,
+            progress_message="Imported from Companion, waiting for analysis",
+            created_at=now, updated_at=now,
+        )
+        await _db.save_job(job)
+        return {"ok": True, "kind": "video", "job_id": job_id, "filename": filename, "size": size}
+
+    if kind == "media":
+        from backend.routers.media import (
+            UPLOAD_DIR, GLOBAL_LIBRARY_ID, detect_media_type, _load_meta, _save_meta,
+        )
+        mtype = detect_media_type(filename)
+        if not mtype:
+            raise HTTPException(status_code=400, detail=f"unsupported media type: {filename}")
+        media_dir = os.path.join(UPLOAD_DIR, GLOBAL_LIBRARY_ID, "media")
+        os.makedirs(media_dir, exist_ok=True)
+        media_id = str(uuid.uuid4())[:8]
+        ext = os.path.splitext(filename)[1].lower()
+        safe = f"{media_id}{ext}"
+        dest = os.path.join(media_dir, safe)
+        try:
+            size = await _stream_to(dest)
+        except Exception:
+            try:
+                os.remove(dest)
+            except OSError:
+                pass
+            raise
+        meta = _load_meta(media_dir)
+        meta[media_id] = {"original_filename": filename}
+        _save_meta(media_dir, meta)
+        return {"ok": True, "kind": "media", "id": media_id, "filename": filename,
+                "type": mtype, "size": size,
+                "url": f"/api/files/{GLOBAL_LIBRARY_ID}/media/{safe}"}
+
+    if kind == "font":
+        from backend.routers.fonts import FONTS_DIR
+        if not filename.lower().endswith((".ttf", ".otf", ".ttc", ".woff", ".woff2")):
+            raise HTTPException(status_code=400, detail="not a font file")
+        os.makedirs(FONTS_DIR, exist_ok=True)
+        safe = os.path.basename(filename)
+        dest = os.path.join(FONTS_DIR, safe)
+        try:
+            size = await _stream_to(dest)
+        except Exception:
+            try:
+                os.remove(dest)
+            except OSError:
+                pass
+            raise
+        try:
+            import subprocess as _sp
+            _sp.run(["fc-cache", "-f", FONTS_DIR], capture_output=True, timeout=10)
+        except Exception:
+            pass
+        return {"ok": True, "kind": "font", "filename": safe, "size": size}
+
+    raise HTTPException(status_code=400, detail=f"unknown import kind: {kind}")
+
+
 @router.post("/providers/test/{provider_name}")
 async def test_provider(provider_name: str):
     """Live-test a provider by making a real API call and returning detailed status."""
