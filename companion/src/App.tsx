@@ -834,8 +834,25 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
               <strong title="ClipAI can browse and pull files (video, media, fonts) from these folders over your LAN. Access is read-only and strictly limited to the folders you list here.">
                 Shared folders 📂
               </strong>
-              <span className="muted small">{sharedPaths.length} shared</span>
+              <span className="muted small">
+                {status.config.share_all ? 'all drives' : `${sharedPaths.length} shared`}
+              </span>
             </div>
+
+            {/* Share EVERYTHING — all drives — instead of listing folders. */}
+            <label className="row small" style={{ gap: 8, margin: '2px 0 8px', cursor: 'pointer', alignItems: 'flex-start' }}>
+              <input
+                type="checkbox"
+                checked={!!status.config.share_all}
+                onChange={(e) => setConfig({ share_all: e.target.checked }).then(refresh)}
+                style={{ width: 'auto', marginTop: 3 }}
+              />
+              <span>
+                <strong>Share entire computer</strong> — let ClipAI browse every
+                drive (read-only). Convenient, but exposes all your files to the
+                paired ClipAI over the LAN. Leave off to share only the folders below.
+              </span>
+            </label>
             {sharedPaths.length > 0 ? (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginBottom: 6 }}>
                 {sharedPaths.map((p) => (

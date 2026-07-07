@@ -66,6 +66,11 @@ pub struct Config {
     /// the PC). Every file API is strictly JAILED to these roots — a request for
     /// any path that doesn't canonicalize to inside one of them is refused.
     pub shared_paths: Vec<String>,
+    /// When true, share the ENTIRE computer (all drives) instead of just the
+    /// folders in ``shared_paths`` — the file browser starts at the drive roots
+    /// and can reach any path. Opt-in and off by default; a deliberate, powerful
+    /// choice for a trusted LAN.
+    pub share_all: bool,
 }
 
 /// Resolve transcription quality + VRAM budget to whisper.cpp decode settings:
@@ -141,18 +146,42 @@ impl Default for Config {
             speed_profile: "auto".into(),
             whisper_quality: "auto".into(),
             shared_paths: Vec::new(),
+            share_all: false,
         }
     }
 }
 
-/// Resolve a user-supplied path against the configured shared roots, enforcing
-/// the jail. Returns the canonicalized absolute path ONLY when it exists and
-/// canonicalizes to inside one of the (canonicalized) shared roots — otherwise
-/// `None`. Canonicalizing both sides defeats `..` traversal and symlink escapes:
-/// a symlink inside a shared folder that points outside it resolves to a real
-/// path that fails the prefix check.
-pub fn resolve_shared_path(shared_roots: &[String], requested: &str) -> Option<PathBuf> {
+/// The storage-drive roots to expose when ``share_all`` is on: every existing
+/// drive letter on Windows (C:\, D:\, …), or ``/`` on Unix. Lets the file
+/// browser start at the top of each drive.
+pub fn list_drive_roots() -> Vec<String> {
+    if cfg!(windows) {
+        let mut out = Vec::new();
+        for c in b'A'..=b'Z' {
+            let p = format!("{}:\\", c as char);
+            if std::path::Path::new(&p).is_dir() {
+                out.push(p);
+            }
+        }
+        out
+    } else {
+        vec!["/".to_string()]
+    }
+}
+
+/// Resolve a user-supplied path against the shared roots, enforcing the jail.
+/// Returns the canonicalized absolute path ONLY when it exists and (a)
+/// ``share_all`` is on — the whole computer is shared — or (b) it canonicalizes
+/// to inside one of the (canonicalized) shared roots. Otherwise `None`.
+/// Canonicalizing both sides defeats `..` traversal and symlink escapes: a
+/// symlink inside a shared folder that points outside it resolves to a real path
+/// that fails the prefix check.
+pub fn resolve_shared_path(shared_roots: &[String], share_all: bool, requested: &str) -> Option<PathBuf> {
     let req = std::fs::canonicalize(requested).ok()?;
+    if share_all {
+        // The user opted to share the entire computer — any real path is allowed.
+        return Some(req);
+    }
     for root in shared_roots {
         if root.trim().is_empty() {
             continue;

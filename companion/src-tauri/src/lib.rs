@@ -216,6 +216,7 @@ async fn get_status(
             "speed_profile": config.speed_profile,
             "whisper_quality": config.whisper_quality,
             "shared_paths": config.shared_paths,
+            "share_all": config.share_all,
         },
         "speed": {
             "profile": config.speed_profile,
@@ -270,6 +271,7 @@ struct ConfigPatch {
     speed_profile: Option<String>,
     whisper_quality: Option<String>,
     shared_paths: Option<Vec<String>>,
+    share_all: Option<bool>,
 }
 
 #[tauri::command]
@@ -352,6 +354,9 @@ async fn set_config(
                 .filter(|s| !s.is_empty() && seen.insert(s.clone()))
                 .collect();
             cfg.shared_paths = cleaned;
+        }
+        if let Some(v) = patch.share_all {
+            cfg.share_all = v;
         }
     }
     // Force the auto-VRAM loop to re-apply immediately after a settings change.

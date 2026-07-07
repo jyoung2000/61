@@ -50,6 +50,8 @@ export interface CompanionStatus {
     whisper_quality: 'auto' | 'fast' | 'balanced' | 'max';
     /** Folders shared with ClipAI (it can browse + pull files from these). */
     shared_paths: string[];
+    /** Share the ENTIRE computer (all drives) instead of just shared_paths. */
+    share_all: boolean;
   };
   /** Effective speed: resolved concurrency for the chosen profile + VRAM. */
   speed: { profile: string; num_parallel: number; max_loaded_models: number };

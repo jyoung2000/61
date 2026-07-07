@@ -457,8 +457,17 @@ async fn files_roots(State(ctx): State<ProxyCtx>, headers: HeaderMap) -> Respons
     if !authorized(&ctx, &headers) {
         return unauthorized();
     }
-    let roots = ctx.state.config.lock().unwrap().shared_paths.clone();
-    let items: Vec<_> = roots
+    let (roots, share_all) = {
+        let c = ctx.state.config.lock().unwrap();
+        (c.shared_paths.clone(), c.share_all)
+    };
+    // Share-all → the storage-drive roots; otherwise the configured folders.
+    let listed: Vec<String> = if share_all {
+        crate::state::list_drive_roots()
+    } else {
+        roots
+    };
+    let items: Vec<_> = listed
         .iter()
         .filter(|r| !r.trim().is_empty())
         .map(|r| {
@@ -470,7 +479,7 @@ async fn files_roots(State(ctx): State<ProxyCtx>, headers: HeaderMap) -> Respons
             })
         })
         .collect();
-    (StatusCode::OK, Json(serde_json::json!({ "roots": items }))).into_response()
+    (StatusCode::OK, Json(serde_json::json!({ "roots": items, "share_all": share_all }))).into_response()
 }
 
 /// /v1/files/list?path=… → directory entries inside a shared root (dirs first).
@@ -482,9 +491,12 @@ async fn files_list(
     if !authorized(&ctx, &headers) {
         return unauthorized();
     }
-    let roots = ctx.state.config.lock().unwrap().shared_paths.clone();
+    let (roots, share_all) = {
+        let c = ctx.state.config.lock().unwrap();
+        (c.shared_paths.clone(), c.share_all)
+    };
     let requested = q.get("path").cloned().unwrap_or_default();
-    let dir = match crate::state::resolve_shared_path(&roots, &requested) {
+    let dir = match crate::state::resolve_shared_path(&roots, share_all, &requested) {
         Some(p) => p,
         None => {
             return (StatusCode::FORBIDDEN, "path is not inside a shared folder").into_response()
@@ -550,9 +562,12 @@ async fn files_read(
     if !authorized(&ctx, &headers) {
         return unauthorized();
     }
-    let roots = ctx.state.config.lock().unwrap().shared_paths.clone();
+    let (roots, share_all) = {
+        let c = ctx.state.config.lock().unwrap();
+        (c.shared_paths.clone(), c.share_all)
+    };
     let requested = q.get("path").cloned().unwrap_or_default();
-    let path = match crate::state::resolve_shared_path(&roots, &requested) {
+    let path = match crate::state::resolve_shared_path(&roots, share_all, &requested) {
         Some(p) => p,
         None => {
             return (StatusCode::FORBIDDEN, "path is not inside a shared folder").into_response()
