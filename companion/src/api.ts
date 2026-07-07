@@ -69,6 +69,8 @@ export interface CompanionStatus {
     managed: boolean;
     models: string[];
   };
+  /** Models actively resident in VRAM right now (name + VRAM MB), via /api/ps. */
+  resident_models: { name: string; vram_mb: number; expires_at: string }[];
   sidecar_available: boolean;
   sidecar_running: boolean;
   /** Which whisper build is installed: "gpu" (CUDA), "cpu", "bundled", "none". */

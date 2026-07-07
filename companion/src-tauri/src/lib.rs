@@ -132,6 +132,13 @@ async fn get_status(
     let config = state.config_snapshot();
     let gpu = state.gpu.lock().unwrap().clone();
     let ollama_status = ollama::status(&state).await;
+    // Models actively resident in VRAM right now (skip the probe when Ollama
+    // isn't even running so we don't wait on a doomed request).
+    let resident_models = if ollama_status.running {
+        ollama::resident_models().await
+    } else {
+        Vec::new()
+    };
     let budget = state.effective_budget_gb();
     let (whisper_model, whisper_compute) = state::whisper_tier_for_budget(budget);
     // Effective transcription quality for the current profile + VRAM.
@@ -234,6 +241,7 @@ async fn get_status(
             "beam_search": whisper_beam > 1,
         },
         "ollama": ollama_status,
+        "resident_models": resident_models,
         "sidecar_available": state.sidecar_available.load(Ordering::Relaxed),
         "sidecar_running": sidecar_running,
         "whisper_build": whisper_build,
@@ -846,6 +854,7 @@ pub fn run() {
             show_or_create_main(app);
         }))
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,

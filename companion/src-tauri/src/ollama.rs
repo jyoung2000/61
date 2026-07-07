@@ -122,6 +122,39 @@ pub async fn loaded_vram_bytes() -> u64 {
         .unwrap_or(0)
 }
 
+/// The models CURRENTLY resident in VRAM (actively loaded/running), one entry
+/// per model from /api/ps: `{name, vram_mb, expires_at}`. Powers the "what AI
+/// is running right now" readout. Fail-open to an empty list on any error so a
+/// brief Ollama blip just shows "idle" rather than breaking the status call.
+pub async fn resident_models() -> Vec<serde_json::Value> {
+    let Ok(resp) = reqwest::Client::new()
+        .get(format!("http://{OLLAMA_LOCAL}/api/ps"))
+        .timeout(std::time::Duration::from_secs(2))
+        .send()
+        .await
+    else {
+        return Vec::new();
+    };
+    let Ok(json) = resp.json::<serde_json::Value>().await else {
+        return Vec::new();
+    };
+    json["models"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|m| {
+                    serde_json::json!({
+                        "name": m.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+                        "vram_mb": m.get("size_vram").and_then(|v| v.as_u64()).unwrap_or(0)
+                            / (1024 * 1024),
+                        "expires_at": m.get("expires_at").and_then(|v| v.as_str()).unwrap_or(""),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Unload every resident model (POST /api/generate keep_alive=0 per model) to
 /// free VRAM immediately — for the "Free GPU memory" button and idle auto-free.
 /// Returns (models_unloaded, names). Works whether Ollama is managed or external.

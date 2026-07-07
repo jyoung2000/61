@@ -9,7 +9,26 @@
   --success: #3ecf8e;
   --warn: #f5b83d;
   --danger: #f4685c;
+
+  /* Aliases so both naming schemes resolve (older inline styles used the
+     -secondary / -sm / bg-elevated names). Keeping them as aliases means no
+     dead var() ever falls back to an invisible background or wrong radius. */
+  --text-secondary: var(--muted);
+  --text-primary: var(--text);
+  --bg-elevated: var(--elevated);
+  --bg-panel: var(--panel);
+  --accent-amber: var(--warn);
+  --font-mono: ui-monospace, "Cascadia Code", Menlo, Consolas, monospace;
+
+  /* Radius family (Apple-clean): cards 13, controls 8, meter 4. */
+  --radius-lg: 13px;
+  --radius-md: 10px;
+  --radius-sm: 8px;
+
+  --shadow-card: none;
+
   font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
 }
 
 :root[data-theme="light"] {
@@ -23,6 +42,8 @@
   --success: #1a9e63;
   --warn: #b0781a;
   --danger: #d6453b;
+  /* A hair of depth in light mode so white cards separate from the bg. */
+  --shadow-card: 0 1px 2px rgba(17, 32, 46, 0.05), 0 1px 8px rgba(17, 32, 46, 0.04);
 }
 
 * { box-sizing: border-box; }
@@ -37,49 +58,88 @@ body {
 
 #root { height: 100vh; display: flex; flex-direction: column; }
 
-.app { display: flex; flex-direction: column; height: 100%; padding: 18px 22px; gap: 14px; overflow-y: auto; }
+/* Single scroll container. Horizontal overflow is clipped app-wide so a stray
+   long token/path can never make the whole window scroll sideways — individual
+   wide blocks opt back into their own horizontal scroll via .code-scroll. */
+.app {
+  --app-pad-x: clamp(14px, 3.2vw, 24px);
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: 0 var(--app-pad-x) 24px;
+  gap: 14px;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
 
-h1 { font-size: 18px; margin: 0; }
-h2 { font-size: 14px; margin: 0 0 8px; }
+/* Let every flex/grid child that holds text shrink instead of forcing overflow
+   — the single most important rule for "no text ever clipped". */
+.row > * { min-width: 0; }
+
+h1 { font-size: clamp(17px, 1.4vw + 12px, 20px); margin: 0; letter-spacing: -0.01em; }
+h2 { font-size: 14px; margin: 0 0 10px; letter-spacing: -0.01em; }
 p { line-height: 1.5; }
 
 .panel {
   background: var(--panel);
   border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 14px 16px;
+  border-radius: var(--radius-lg);
+  padding: 15px 16px;
+  box-shadow: var(--shadow-card);
+  min-width: 0;
 }
+
+/* Responsive card mosaic: as many ~340px columns as fit, one column when
+   narrow. No fixed widths → nothing to clip. */
+.card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 14px;
+  align-items: start;
+}
+.card-grid .span-all { grid-column: 1 / -1; }
 
 .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .spread { justify-content: space-between; }
 .muted { color: var(--muted); font-size: 12px; }
 .small { font-size: 11px; }
-.mono { font-family: ui-monospace, "Cascadia Code", Menlo, monospace; }
+.mono { font-family: var(--font-mono); }
 
 button {
   background: var(--accent);
   color: #06121c;
   border: none;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   padding: 8px 14px;
   font-weight: 600;
   font-size: 13px;
   cursor: pointer;
+  transition: filter 0.12s ease, transform 0.06s ease;
 }
+button:hover { filter: brightness(1.06); }
+button:active { transform: translateY(1px); }
 button.secondary { background: var(--elevated); color: var(--text); border: 1px solid var(--border); }
 button:disabled { opacity: 0.5; cursor: default; }
+button:disabled:hover { filter: none; }
+
+:where(button, input, a, [tabindex]):focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 55%, transparent);
+  outline-offset: 1px;
+}
 
 input[type="text"], input[type="password"] {
   background: var(--bg);
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   padding: 8px 10px;
   color: var(--text);
   font-size: 13px;
   width: 100%;
+  min-width: 0;
 }
 
 input[type="range"] { accent-color: var(--accent); width: 100%; }
+input[type="checkbox"] { accent-color: var(--accent); }
 
 .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
 .dot.ok { background: var(--success); }
@@ -88,23 +148,70 @@ input[type="range"] { accent-color: var(--accent); width: 100%; }
 
 .meter { height: 8px; background: var(--elevated); border-radius: 4px; overflow: hidden; }
 .meter > div { height: 100%; background: var(--accent); transition: width 0.4s; }
-/* Indeterminate progress (install phases with no byte total). */
 .meter.indeterminate > div { width: 35%; border-radius: 4px; transition: none; animation: indet 1.1s ease-in-out infinite; }
 @keyframes indet { 0% { transform: translateX(-120%); } 100% { transform: translateX(340%); } }
 
-.feed { display: flex; flex-direction: column; gap: 6px; max-height: 220px; overflow-y: auto; }
-.feed-item {
-  display: flex; gap: 8px; align-items: baseline;
-  background: var(--elevated); border-radius: 6px; padding: 6px 10px; font-size: 12px;
+/* Segmented control (Performance profiles). Neutral active fill — Apple-clean,
+   not accent-flooded. Wraps to a 2x2 grid on very narrow windows. */
+.segmented {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 4px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 3px;
 }
+.segmented button {
+  background: transparent;
+  color: var(--muted);
+  border: none;
+  padding: 6px 4px;
+  font-size: 12px;
+  text-transform: capitalize;
+  border-radius: 6px;
+  min-width: 0;
+}
+.segmented button:hover { filter: none; color: var(--text); }
+.segmented button.active {
+  background: var(--panel);
+  color: var(--text);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.18);
+}
+@media (max-width: 400px) { .segmented { grid-template-columns: 1fr 1fr; } }
+
+/* One row treatment reused for shared paths, resident models, installed models:
+   label ellipsizes (keep a title tooltip), the trailing control never shrinks. */
+.list-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  background: var(--elevated);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  min-width: 0;
+}
+.list-row .name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.list-row .action { flex-shrink: 0; }
+
+.feed { display: flex; flex-direction: column; gap: 6px; max-height: 220px; overflow-y: auto; overflow-x: hidden; }
+.feed-item {
+  display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap;
+  background: var(--elevated); border-radius: var(--radius-sm); padding: 6px 10px; font-size: 12px;
+  min-width: 0;
+}
+.feed-item .feed-text { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.feed-item .feed-tail { overflow-wrap: anywhere; }
 
 .badge {
   font-size: 10px; font-weight: 700; letter-spacing: 0.4px; text-transform: uppercase;
-  padding: 1px 7px; border-radius: 8px; background: var(--elevated); color: var(--muted);
+  padding: 1px 7px; border-radius: var(--radius-sm); background: var(--elevated); color: var(--muted);
+  flex-shrink: 0;
 }
 .badge.live { background: rgba(62, 207, 142, 0.15); color: var(--success); }
 
-.wizard { max-width: 560px; margin: 30px auto; display: flex; flex-direction: column; gap: 14px; }
+.wizard { max-width: 560px; margin: 24px auto; display: flex; flex-direction: column; gap: 14px; width: 100%; }
 .steps { display: flex; gap: 6px; }
 .steps span { flex: 1; height: 4px; border-radius: 2px; background: var(--elevated); }
 .steps span.done { background: var(--accent); }
@@ -112,9 +219,16 @@ input[type="range"] { accent-color: var(--accent); width: 100%; }
 .token-box {
   display: flex; align-items: center; gap: 8px;
   background: var(--bg); border: 1px solid var(--border);
-  border-radius: 6px; padding: 8px 10px;
+  border-radius: var(--radius-sm); padding: 8px 10px;
+  min-width: 0;
 }
-.token-box code { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; user-select: text; }
+.token-box code { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; user-select: text; }
+/* A revealed token wraps to its full length instead of being clipped. */
+.token-box code.revealed { white-space: normal; overflow: visible; text-overflow: clip; overflow-wrap: anywhere; }
+
+/* Wide, selectable content (AdGuard rules) gets its own horizontal scroll
+   rather than pushing the body sideways. */
+.code-scroll { overflow-x: auto; }
 
 .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
 @media (max-width: 720px) { .grid2 { grid-template-columns: 1fr; } }
@@ -122,15 +236,29 @@ input[type="range"] { accent-color: var(--accent); width: 100%; }
 a { color: var(--accent); }
 label.checkbox { display: flex; gap: 8px; align-items: center; font-size: 12px; color: var(--muted); cursor: pointer; }
 
-/* Header meta strip: GPU / models / current job / theme toggle. */
-.appbar { flex-wrap: wrap; gap: 10px; }
-.appbar-meta { justify-content: flex-end; gap: 8px; row-gap: 8px; }
+/* Sticky, translucent status header that bleeds to the window edges. */
+.appbar {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 0 calc(-1 * var(--app-pad-x));
+  padding: 12px var(--app-pad-x);
+  background: color-mix(in srgb, var(--bg) 82%, transparent);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border-bottom: 1px solid var(--border);
+}
+.appbar-meta { justify-content: flex-end; gap: 8px; row-gap: 8px; flex-wrap: wrap; min-width: 0; }
 .chip {
   display: inline-flex; align-items: center; gap: 6px;
   background: var(--elevated); border: 1px solid var(--border);
-  border-radius: 8px; padding: 4px 10px; font-size: 12px; color: var(--text);
+  border-radius: var(--radius-sm); padding: 4px 10px; font-size: 12px; color: var(--text);
+  min-width: 0;
 }
 .chip .muted { font-size: 11px; }
-.chip.truncate { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Chips ellipsize their label instead of hard-clipping at a fixed width. */
+.chip-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 200px; }
 .chip.live { border-color: var(--success); background: rgba(62, 207, 142, 0.14); }
 button.icon { padding: 6px 10px; font-size: 14px; line-height: 1; }

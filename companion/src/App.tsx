@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { openUrl } from '@tauri-apps/plugin-opener';
+import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import { enable as enableAutostart, disable as disableAutostart, isEnabled as autostartEnabled } from '@tauri-apps/plugin-autostart';
 import {
   CompanionStatus, getStatus, setConfig, regenerateToken,
@@ -579,17 +580,28 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
 
   const job = status.current_job;
   const sharedPaths = status.config.shared_paths || [];
-  const addSharedPath = async () => {
-    const p = newSharedPath.trim();
-    if (!p) return;
+  const addSharedPath = async (pathArg?: string) => {
+    const p = (pathArg ?? newSharedPath).trim();
+    if (!p || sharedPaths.includes(p)) { setNewSharedPath(''); return; }
     await setConfig({ shared_paths: [...sharedPaths, p] });
     setNewSharedPath('');
     refresh();
+  };
+  const browseSharedPath = async () => {
+    // Native OS folder picker (Tauri dialog plugin). null = user cancelled.
+    const sel = await openDialog({
+      directory: true, multiple: false,
+      title: 'Share a folder with ClipAI',
+      defaultPath: newSharedPath || undefined,
+    });
+    if (typeof sel === 'string') await addSharedPath(sel);
   };
   const removeSharedPath = async (p: string) => {
     await setConfig({ shared_paths: sharedPaths.filter((x) => x !== p) });
     refresh();
   };
+  // Models actively resident in VRAM right now (largest first).
+  const residentModels = [...(status.resident_models || [])].sort((a, b) => b.vram_mb - a.vram_mb);
 
   // ── Single "Performance" control ─────────────────────────────────────────
   // One knob for how much of this GPU ClipAI may use. It drives BOTH the Ollama
@@ -628,7 +640,7 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
         <h1>ClipAI GPU Companion</h1>
         <div className="row appbar-meta">
           {/* GPU currently in use */}
-          <span className="chip truncate" title={
+          <span className="chip" title={
             gpu.gpu_name
               ? `GPU: ${gpu.gpu_name}${gpu.vram_total_mb > 0
                   ? ` — ${fmtMb(usedMb)} of ${fmtMb(gpu.vram_total_mb)} in use` : ''}`
@@ -636,7 +648,7 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
             <span className="dot" style={{
               background: gpu.available ? 'var(--success)' : 'var(--muted)',
             }} />
-            {gpu.gpu_name || 'No GPU'}
+            <span className="chip-label">{gpu.gpu_name || 'No GPU'}</span>
             {gpu.vram_total_mb > 0 && (
               <span className="muted">{fmtMb(usedMb)}/{fmtMb(gpu.vram_total_mb)}</span>
             )}
@@ -650,8 +662,21 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
             🧠 {status.ollama.models.length} model{status.ollama.models.length === 1 ? '' : 's'}
           </span>
 
+          {/* Models ACTIVELY RESIDENT in VRAM right now (what's running). */}
+          <span className={`chip ${residentModels.length ? 'live' : ''}`} title={
+            residentModels.length
+              ? `Running now (VRAM-resident):\n${residentModels.map((m) => `${m.name} — ${fmtMb(m.vram_mb)}`).join('\n')}`
+              : 'No models resident in VRAM — idle'}>
+            <span className="dot" style={{
+              background: residentModels.length ? 'var(--success)' : 'var(--muted)',
+            }} />
+            <span className="chip-label">
+              {residentModels.length ? `${residentModels.length} running · ${fmtMb(clipaiMb)}` : 'VRAM idle'}
+            </span>
+          </span>
+
           {/* Current job the companion is being used for */}
-          <span className={`chip truncate ${job || status.busy ? 'live' : ''}`} title={
+          <span className={`chip ${job || status.busy ? 'live' : ''}`} title={
             job
               ? `${job.kind === 'whisper' ? 'Transcribing' : 'AI inference'}`
                 + `${job.job_title ? ` — ${job.job_title}` : ''}`
@@ -660,9 +685,9 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
             <span className="dot" style={{
               background: job || status.busy ? 'var(--success)' : 'var(--muted)',
             }} />
-            {job
+            <span className="chip-label">{job
               ? `${job.kind === 'whisper' ? 'Transcribing' : 'AI inference'}${job.job_title ? ` — ${job.job_title}` : ''}`
-              : status.busy ? 'Working…' : 'No active job'}
+              : status.busy ? 'Working…' : 'No active job'}</span>
           </span>
 
           {/* Light / dark mode switcher */}
@@ -765,13 +790,36 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
                   Other apps {fmtMb(otherMb)}
                 </span>
               </div>
+              {/* Resident-in-VRAM: the itemized expansion of the green ClipAI
+                  segment — exactly which AI models are loaded right now. */}
+              <div style={{ margin: '0 0 12px' }}>
+                <div className="row small" style={{ gap: 6, marginBottom: 5 }}>
+                  <span className="dot" style={{ background: residentModels.length ? 'var(--success)' : 'var(--muted)' }} />
+                  <strong>Running in VRAM</strong>
+                  <span className="muted">· {fmtMb(clipaiMb)}</span>
+                </div>
+                {residentModels.length > 0 ? (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                    {residentModels.map((m) => (
+                      <div key={m.name} className="list-row small">
+                        <span className="name mono" title={m.name}>{m.name}</span>
+                        <span className="muted mono action">{fmtMb(m.vram_mb)}</span>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="list-row small">
+                    <span className="name muted">No models loaded — VRAM idle. Models load on ClipAI's next request.</span>
+                  </div>
+                )}
+              </div>
               <div className="row" style={{ marginBottom: 10 }}>
-                <button className="secondary" onClick={doFreeVram} disabled={freeing}
+                <button className="secondary" onClick={doFreeVram} disabled={freeing || residentModels.length === 0}
                   title="Unload all resident Ollama models to free VRAM right now (e.g. before gaming)">
                   {freeing ? 'Freeing…' : 'Free GPU memory'}
                 </button>
                 <span className="muted small">
-                  {status.ollama.models.length > 0
+                  {residentModels.length > 0
                     ? 'Unloads models held in VRAM (they reload on the next request)'
                     : ''}
                 </span>
@@ -794,12 +842,11 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
                 {status.speed.num_parallel}× · {capDesc}
               </span>
             </div>
-            <div className="row" style={{ gap: 4 }}>
+            <div className="segmented">
               {PERF_LEVELS.map((lvl) => (
                 <button
                   key={lvl.key}
-                  className={perfLevel === lvl.key ? '' : 'secondary'}
-                  style={{ flex: 1, textTransform: 'capitalize', padding: '5px 4px' }}
+                  className={perfLevel === lvl.key ? 'active' : ''}
                   onClick={() => setConfig({ speed_profile: lvl.speed, whisper_quality: lvl.whisper }).then(refresh)}
                   title={lvl.hint}
                 >
@@ -853,36 +900,48 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
                 paired ClipAI over the LAN. Leave off to share only the folders below.
               </span>
             </label>
-            {sharedPaths.length > 0 ? (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginBottom: 6 }}>
-                {sharedPaths.map((p) => (
-                  <div key={p} className="row spread small"
-                    style={{ background: 'var(--bg-elevated)', padding: '4px 8px', borderRadius: 'var(--radius-sm)' }}>
-                    <span className="mono" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={p}>{p}</span>
-                    <button className="secondary" style={{ padding: '2px 8px' }}
-                      onClick={() => removeSharedPath(p)} title="Stop sharing this folder">✕</button>
-                  </div>
-                ))}
+            {status.config.share_all ? (
+              <div className="small muted" style={{ marginBottom: 2 }}>
+                Sharing every drive. ClipAI can browse your whole computer (read-only).
+                Turn this off to share only specific folders.
               </div>
             ) : (
-              <div className="small muted" style={{ marginBottom: 6 }}>
-                No shared folders yet. Add one to let ClipAI import videos/media from it remotely.
-              </div>
+              <>
+                {sharedPaths.length > 0 ? (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginBottom: 6 }}>
+                    {sharedPaths.map((p) => (
+                      <div key={p} className="list-row small">
+                        <span className="name mono" title={p}>{p}</span>
+                        <button className="secondary action" style={{ padding: '2px 8px' }}
+                          onClick={() => removeSharedPath(p)} title="Stop sharing this folder">✕</button>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="small muted" style={{ marginBottom: 6 }}>
+                    No shared folders yet. Add one to let ClipAI import videos/media from it remotely.
+                  </div>
+                )}
+                <div className="row" style={{ gap: 6 }}>
+                  <input
+                    type="text"
+                    value={newSharedPath}
+                    onChange={(e) => setNewSharedPath(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === 'Enter') addSharedPath(); }}
+                    placeholder="e.g. C:\Users\you\Videos\ClipAI"
+                    style={{ flex: '1 1 180px', minWidth: 0 }}
+                  />
+                  <button type="button" className="secondary" style={{ flexShrink: 0 }}
+                    onClick={browseSharedPath} title="Pick a folder with the file browser">Browse…</button>
+                  <button type="button" style={{ flexShrink: 0 }}
+                    onClick={() => addSharedPath()} disabled={!newSharedPath.trim()}>Add</button>
+                </div>
+                <div className="small muted" style={{ marginTop: 4 }}>
+                  Pick a folder with <strong>Browse…</strong> or paste a full path. ClipAI sees only
+                  what's inside the folders you list — nothing else.
+                </div>
+              </>
             )}
-            <div className="row" style={{ gap: 4 }}>
-              <input
-                type="text"
-                value={newSharedPath}
-                onChange={(e) => setNewSharedPath(e.target.value)}
-                onKeyDown={(e) => { if (e.key === 'Enter') addSharedPath(); }}
-                placeholder="e.g. C:\Users\you\Videos\ClipAI"
-                style={{ flex: 1 }}
-              />
-              <button onClick={addSharedPath} disabled={!newSharedPath.trim()}>Add</button>
-            </div>
-            <div className="small muted" style={{ marginTop: 4 }}>
-              Paste a full folder path. ClipAI sees only what's inside the folders you list — nothing else.
-            </div>
           </div>
 
           {status.config.vram_auto ? (
