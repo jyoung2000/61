@@ -3898,6 +3898,7 @@ export default function Analysis() {
 
                 <TranscriptViewer
                   transcript={activeTranscript}
+                  rawTranscript={job?.raw_transcript || []}
                   videoName={job?.filename || ''}
                   currentTime={videoCurrentTime}
                   speakerColors={clipSettings?.speakerColors}

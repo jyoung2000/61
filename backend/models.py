@@ -267,6 +267,10 @@ class JobResult(BaseModel):
     summary: Optional[VideoSummary] = None
     scenes: list[SceneDescription] = []
     transcript: list[TranscriptSegment] = []
+    # Raw, UNPOLISHED transcript — the direct Whisper output captured before the
+    # LLM polish / dedup / translation cleanup rewrites ``transcript``. Kept so
+    # the UI can offer both the polished and the raw transcript for download.
+    raw_transcript: list[TranscriptSegment] = []
     translated_transcript: list[TranscriptSegment] = []  # Translated subtitle segments
     # Visible outcome of a *planned* subtitle translation. Surfaced so a job
     # that planned a translation (subtitle_language != source) but couldn't

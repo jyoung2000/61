@@ -210,7 +210,7 @@ async def _save_job_unlocked(job: JobResult, *, _preserve_terminal_status: bool 
     # serializing a job bloated by a corrupted run (tens of thousands of cues) is
     # heavy enough to stall the loop on every progress write during a run.
     def _coerce_and_dump():
-        for _tk in ("transcript", "translated_transcript"):
+        for _tk in ("transcript", "raw_transcript", "translated_transcript"):
             _rows = getattr(job, _tk, None)
             if isinstance(_rows, list) and any(isinstance(r, dict) for r in _rows):
                 try:

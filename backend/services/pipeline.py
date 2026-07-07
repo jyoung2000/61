@@ -4955,6 +4955,19 @@ async def _run_analysis_inner(job_id: str):
         render_plan, scenes, transcript, subject_track = (
             await asyncio.to_thread(_run_bridge))
 
+        # Snapshot the RAW (unpolished) transcript now — before the LLM polish /
+        # dedup / translation cleanup below rewrites ``transcript`` — so the UI
+        # can offer both the polished and the raw Whisper output for download.
+        if transcript:
+            try:
+                _raw_dicts = [
+                    t.model_dump() if hasattr(t, "model_dump") else dict(t)
+                    for t in transcript
+                ]
+                await database.update_job_status(job_id, raw_transcript=_raw_dicts)
+            except Exception as _rt_err:
+                logger.debug("[%s] could not save raw transcript: %s", job_id, _rt_err)
+
     # Loud, visible signal when transcription came back empty. Without a
     # transcript the pipeline silently skips subtitle translation AND produces
     # an empty summary ("no transcript was available") — so surface it as a job
