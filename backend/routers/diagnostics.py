@@ -644,6 +644,80 @@ async def _check_model_gpu(client: httpx.AsyncClient, model: str) -> tuple[str, 
 # ── Endpoints ────────────────────────────────────────────────────────────
 
 
+async def _companion_gpu_block(local_loaded_models: list[dict]) -> dict | None:
+    """Live VRAM + resident models for the paired GPU Companion (the desktop
+    card actually running the AI), so the diagnostics gauge can show the GPU
+    doing the work — not just the weak server card. Returns ``None`` when no
+    Companion is paired. Bytes-normalized to match the local ``gpu`` block.
+
+    ``local_loaded_models`` is the models list already fetched from the ACTIVE
+    Ollama host (which IS the Companion when it's primary); reused as the
+    Companion's model list in that common case to avoid a second /api/ps call."""
+    host = ollama_registry.companion_host()
+    if host is None:
+        return None
+    MB = 1024 * 1024
+    try:
+        st = await ollama_registry.probe(host)
+        base = ollama_registry.companion_base(host)
+        headers = _ollama_headers(host.url)
+        # GPU VRAM totals from the Companion's own /v1/health (its nvidia-smi).
+        vram_total_mb = vram_free_mb = 0
+        whisper_model = ""
+        busy = False
+        try:
+            async with httpx.AsyncClient(timeout=4) as client:
+                resp = await client.get(f"{base}/v1/health", headers=headers)
+                if resp.status_code == 200:
+                    h = resp.json() or {}
+                    vram_total_mb = int(h.get("vram_total_mb", 0) or 0)
+                    vram_free_mb = int(h.get("vram_free_mb", 0) or 0)
+                    whisper_model = ((h.get("backends") or {}).get("whisper_model") or "")
+                    busy = bool(h.get("busy"))
+        except Exception:
+            pass
+        primary = ollama_registry.primary_host()
+        is_primary = bool(primary and primary.id == host.id)
+        # Models resident on the Companion GPU. When it's the primary host the
+        # already-fetched list IS its /api/ps; otherwise query it directly.
+        if is_primary:
+            models = local_loaded_models
+        else:
+            models = []
+            try:
+                url = ollama_registry.join_url(host.url, "/api/ps")
+                async with httpx.AsyncClient(timeout=5) as client:
+                    r = await client.get(url, headers=_ollama_headers(url))
+                    if r.status_code == 200:
+                        for m in r.json().get("models", []):
+                            models.append({
+                                "name": m.get("name", ""),
+                                "size_bytes": m.get("size", 0),
+                                "vram_bytes": m.get("size_vram", 0),
+                                "processor": m.get("processor", "unknown"),
+                                "expires_at": m.get("expires_at", ""),
+                            })
+            except Exception:
+                pass
+        used_mb = max(0, vram_total_mb - vram_free_mb)
+        return {
+            "online": bool(st.online),
+            "paused": bool(getattr(st, "paused", False)),
+            "is_primary": is_primary,
+            "gpu_name": host.gpu_name or "Companion GPU",
+            "name": host.name,
+            "vram_total_bytes": vram_total_mb * MB,
+            "vram_free_bytes": vram_free_mb * MB,
+            "vram_used_bytes": used_mb * MB,
+            "whisper_model": whisper_model,
+            "busy": busy,
+            "loaded_models": models,
+        }
+    except Exception as e:
+        logger.debug("companion gpu block failed: %s", e)
+        return None
+
+
 @router.get("/gpu-status")
 async def get_gpu_status():
     """Real-time GPU memory usage and loaded Ollama models. Polled every 2s.
@@ -738,6 +812,10 @@ async def get_gpu_status():
     except Exception as e:
         ollama_error = f"{type(e).__name__}: {str(e)[:120]}"
 
+    # Companion GPU (the paired desktop card doing the AI) — its real VRAM and
+    # resident models, so the gauge shows the GPU actually doing the work.
+    companion = await _companion_gpu_block(loaded_models)
+
     return {
         "gpu": gpu,
         "loaded_models": loaded_models,
@@ -745,6 +823,7 @@ async def get_gpu_status():
         "ollama_error": ollama_error,
         "torch_gpu": torch_gpu,
         "whisper_gpu": whisper_gpu,
+        "companion": companion,
     }
 
 

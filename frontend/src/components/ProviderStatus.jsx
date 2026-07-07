@@ -42,7 +42,7 @@ export default function ProviderStatus({ collapsed, onActiveChange }) {
     return () => clearInterval(interval);
   }, []);
 
-  const providers = ['ollama', 'openrouter', 'anthropic', 'gemini', 'groq'];
+  const providers = ['ollama', 'openrouter', 'anthropic', 'gemini'];
   const active = statuses._active || {};
 
   return (

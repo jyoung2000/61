@@ -142,10 +142,31 @@ async fn get_status(
     let whisper_build = sidecar::build_kind(&rd, &dd);
     let activity: Vec<state::ActivityEntry> =
         state.activity.lock().unwrap().iter().cloned().collect();
-    // Live job progress (0-100) — only while a job is in flight, else null.
-    let job_progress: serde_json::Value = {
+    // Prefer the progress ClipAI EXPLICITLY reported (POST /v1/progress) — it
+    // covers local-only pipeline stages where no AI request reaches us, so the
+    // bar tracks the container instead of freezing on the last in-flight call.
+    let reported = state.reported_job_fresh();
+    let in_flight = state.current_job();
+    // Headline: a fresh heartbeat wins; else the in-flight request; else null.
+    let current_job: serde_json::Value = if let Some(r) = &reported {
+        serde_json::json!({
+            "job_id": r.job_id,
+            "job_title": r.job_title,
+            "stage": r.stage,
+            "kind": in_flight.as_ref().map(|e| e.kind.clone()).unwrap_or_default(),
+            "started_at_ms": in_flight.as_ref().map(|e| e.started_at_ms).unwrap_or(0),
+        })
+    } else if let Some(e) = &in_flight {
+        serde_json::to_value(e).unwrap_or(serde_json::Value::Null)
+    } else {
+        serde_json::Value::Null
+    };
+    // Live job progress (0-100) — from the heartbeat, else an in-flight request.
+    let job_progress: serde_json::Value = if let Some(r) = &reported {
+        serde_json::json!(r.progress)
+    } else {
         let p = state.job_progress.load(Ordering::Relaxed);
-        if p != u64::MAX && state.current_job().is_some() {
+        if p != u64::MAX && in_flight.is_some() {
             serde_json::json!(p)
         } else {
             serde_json::Value::Null
@@ -173,7 +194,7 @@ async fn get_status(
         "sidecar_running": sidecar_running,
         "whisper_build": whisper_build,
         "busy": state.whisper_busy.load(Ordering::Relaxed),
-        "current_job": state.current_job(),
+        "current_job": current_job,
         "job_progress": job_progress,
         "proxy_bound": state.proxy_bound.load(Ordering::Relaxed),
         "proxy_last_error": state.proxy_last_error.lock().unwrap().clone(),

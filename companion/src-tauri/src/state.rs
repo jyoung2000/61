@@ -174,6 +174,22 @@ pub struct AppState {
     pub proxy_bound: AtomicBool,
     /// Last proxy bind error (empty when bound) for the GUI banner.
     pub proxy_last_error: Mutex<String>,
+    /// Progress ClipAI EXPLICITLY reported via POST /v1/progress. During local-
+    /// only pipeline stages (video decode/frame-extract on the SERVER GPU) no AI
+    /// request reaches us, so the in-flight-request view would freeze; this
+    /// heartbeat keeps the GUI bar tracking the container. None until reported.
+    pub reported_job: Mutex<Option<ReportedJob>>,
+}
+
+/// A job-progress heartbeat pushed by ClipAI (POST /v1/progress) so the GUI
+/// tracks the container even when we're not actively serving an AI request.
+#[derive(Clone, Serialize)]
+pub struct ReportedJob {
+    pub job_id: String,
+    pub job_title: String,
+    pub stage: String,
+    pub progress: u64,
+    pub updated_ms: u64,
 }
 
 pub fn now_ms() -> u64 {
@@ -213,6 +229,7 @@ impl AppState {
             sidecar_available: AtomicBool::new(false),
             proxy_bound: AtomicBool::new(false),
             proxy_last_error: Mutex::new(String::new()),
+            reported_job: Mutex::new(None),
         };
         state.save(); // persist the generated token on first run
         state
@@ -325,6 +342,33 @@ impl AppState {
             .iter()
             .find(|e| e.finished_at_ms.is_none() && e.kind != "health")
             .cloned()
+    }
+
+    /// Record a progress heartbeat from ClipAI (POST /v1/progress). Also counts
+    /// as ClipAI contact so the connection indicator stays live during long
+    /// local stages.
+    pub fn set_reported_progress(
+        &self,
+        job_id: &str,
+        job_title: &str,
+        stage: &str,
+        progress: u64,
+    ) {
+        self.last_clipai_contact.store(now_ms(), Ordering::Relaxed);
+        *self.reported_job.lock().unwrap() = Some(ReportedJob {
+            job_id: job_id.into(),
+            job_title: job_title.into(),
+            stage: stage.into(),
+            progress: progress.min(100),
+            updated_ms: now_ms(),
+        });
+    }
+
+    /// The reported job if a heartbeat arrived recently (< 45s) — else None so a
+    /// finished/abandoned job stops driving the bar.
+    pub fn reported_job_fresh(&self) -> Option<ReportedJob> {
+        let r = self.reported_job.lock().unwrap().clone();
+        r.filter(|j| now_ms().saturating_sub(j.updated_ms) < 45_000)
     }
 
     /// True when a real inference/transcription request (not a probe) has been

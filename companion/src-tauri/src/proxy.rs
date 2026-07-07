@@ -400,6 +400,30 @@ async fn whisper_proxy(State(ctx): State<ProxyCtx>, req: Request<Body>) -> Respo
     }
 }
 
+/// /v1/progress → a lightweight job-progress heartbeat from ClipAI (same
+/// X-ClipAI-* headers the AI routes carry). During local-only pipeline stages
+/// (video decode/frame extraction on the SERVER GPU) no AI request reaches us,
+/// so the GUI bar would freeze; this keeps it tracking the container live.
+async fn progress_report(State(ctx): State<ProxyCtx>, headers: HeaderMap) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+    let progress = headers
+        .get("x-clipai-progress")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    ctx.state.set_reported_progress(
+        &header_str(&headers, "x-clipai-job-id"),
+        &header_str(&headers, "x-clipai-job-title"),
+        &header_str(&headers, "x-clipai-stage"),
+        progress,
+    );
+    // Mirror onto the atomic too so consumers reading job_progress stay in sync.
+    ctx.state.job_progress.store(progress.min(100), Ordering::Relaxed);
+    (StatusCode::OK, "ok").into_response()
+}
+
 /// /v1/health → status JSON for ClipAI's probes + the pairing handshake.
 async fn health(State(ctx): State<ProxyCtx>, headers: HeaderMap) -> Response {
     if !authorized(&ctx, &headers) {
@@ -445,6 +469,7 @@ async fn health(State(ctx): State<ProxyCtx>, headers: HeaderMap) -> Response {
 fn build_router(ctx: ProxyCtx) -> Router {
     Router::new()
         .route("/v1/health", get(health))
+        .route("/v1/progress", post(progress_report))
         .route("/v1/audio/transcriptions", post(whisper_proxy))
         .route("/ollama", any(ollama_proxy))
         .route("/ollama/", any(ollama_proxy))

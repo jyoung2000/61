@@ -1745,6 +1745,11 @@ async def _update_progress(
     try:
         from backend.services.request_context import set_progress
         set_progress(progress)
+        # Heartbeat the Companion so its live bar tracks the container even during
+        # local-only stages (frame extraction/encode on the server GPU) when no
+        # AI request reaches it. Throttled + fire-and-forget; no-op if unpaired.
+        from backend.services import companion_progress
+        companion_progress.heartbeat(progress)
     except Exception:
         pass
     status_str = status.value if hasattr(status, 'value') else str(status)
@@ -3522,6 +3527,11 @@ async def run_analysis(job_id: str):
             _heartbeats.pop(job_id, None)
             _cancel_events.pop(job_id, None)
             _finalizing_jobs.discard(job_id)
+            try:
+                from backend.services import companion_progress
+                companion_progress.forget(job_id)
+            except Exception:
+                pass
             try:
                 from backend.services.request_context import clear as _ctx_clear
                 _ctx_clear()

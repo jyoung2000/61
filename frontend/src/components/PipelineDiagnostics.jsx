@@ -23,7 +23,7 @@ function Spinner() {
 }
 
 // ── VRAM Gauge ──────────────────────────────────────────────────────────
-function VramGauge({ gpu, loadedModels, ollamaAvailable, ollamaError, torchGpu, whisperGpu, onUnload, onReleaseGpu, onRestart }) {
+function VramGauge({ gpu, loadedModels, ollamaAvailable, ollamaError, torchGpu, whisperGpu, onUnload, onReleaseGpu, onRestart, label, headerTitle }) {
   // Ollama offline. Distinguish an auth/token problem (actionable) from a
   // genuine connectivity drop so the user isn't told to "wait" when the fix is
   // to check the Companion's access token.
@@ -117,8 +117,8 @@ function VramGauge({ gpu, loadedModels, ollamaAvailable, ollamaError, torchGpu, 
       {/* Header */}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
         <span style={{ fontSize: 11, fontFamily: 'var(--font-mono)', color: 'var(--text-secondary)' }}
-          title="The ClipAI server's own GPU — handles video decode, encode, YOLO, and local Whisper. AI models may run on a separate paired Companion GPU (see the header).">
-          Local GPU: {gpu.gpu_name || 'Unknown'}
+          title={headerTitle || "The ClipAI server's own GPU — handles video decode, encode, YOLO, and local Whisper. AI models may run on a separate paired Companion GPU (see the header)."}>
+          {label || 'Local GPU'}: {gpu.gpu_name || 'Unknown'}
         </span>
         <span style={{ fontSize: 10, fontFamily: 'var(--font-mono)', color: 'var(--text-muted)' }}>
           <span style={{
@@ -308,6 +308,7 @@ function PhaseRow({ phase }) {
 export default function PipelineDiagnostics({ showTestRunner = true } = {}) {
   const [gpuStatus, setGpuStatus] = useState(null);
   const [loadedModels, setLoadedModels] = useState([]);
+  const [companion, setCompanion] = useState(null);
   const [torchGpu, setTorchGpu] = useState(null);
   const [whisperGpu, setWhisperGpu] = useState(null);
   const [ollamaAvailable, setOllamaAvailable] = useState(null);
@@ -333,6 +334,7 @@ export default function PipelineDiagnostics({ showTestRunner = true } = {}) {
         if (!active) return;
         setGpuStatus(data.gpu);
         setLoadedModels(data.loaded_models || []);
+        setCompanion(data.companion || null);
         setTorchGpu(data.torch_gpu || null);
         setWhisperGpu(data.whisper_gpu || null);
         setOllamaAvailable(data.ollama_available);
@@ -418,10 +420,42 @@ export default function PipelineDiagnostics({ showTestRunner = true } = {}) {
         Pipeline Diagnostics
       </h3>
 
-      {/* Live VRAM Gauge — always rendered */}
+      {/* Companion GPU gauge — the paired desktop card doing the AI. Rendered
+          FIRST (it's the GPU actually running the models) when a Companion is
+          paired and reachable, showing ITS real VRAM + resident models. */}
+      {companion && companion.online && companion.vram_total_bytes > 0 && (
+        <div style={{ marginBottom: 10 }}>
+          <VramGauge
+            gpu={{
+              gpu_name: companion.gpu_name,
+              gpu_available: true,
+              cuda_available: true,
+              vram_total_bytes: companion.vram_total_bytes,
+              vram_used_bytes: companion.vram_used_bytes,
+              gpu_in_use: companion.busy || (companion.loaded_models || []).length > 0,
+            }}
+            loadedModels={companion.loaded_models || []}
+            torchGpu={null}
+            whisperGpu={null}
+            ollamaAvailable={true}
+            onUnload={handleUnload}
+            label={companion.is_primary ? 'AI GPU (Companion, primary)' : 'AI GPU (Companion)'}
+            headerTitle="Your paired GPU Companion — this desktop card runs the AI (Ollama vision + text) and Whisper transcription. Video decode/encode stay on the server GPU below."
+          />
+          {companion.whisper_model && (
+            <div style={{ fontSize: 10, fontFamily: 'var(--font-mono)', color: 'var(--text-muted)', marginTop: 4, marginLeft: 2 }}>
+              Whisper on this GPU: {companion.whisper_model}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Server GPU gauge. When the Companion is the primary AI host, its models
+          run there — so don't also list them here; this card is the server's
+          own card (video decode/encode, YOLO, local Whisper fallback). */}
       <VramGauge
         gpu={gpuStatus}
-        loadedModels={loadedModels}
+        loadedModels={companion && companion.is_primary && companion.online ? [] : loadedModels}
         torchGpu={torchGpu}
         whisperGpu={whisperGpu}
         ollamaAvailable={ollamaAvailable}
@@ -429,6 +463,7 @@ export default function PipelineDiagnostics({ showTestRunner = true } = {}) {
         onUnload={handleUnload}
         onReleaseGpu={handleReleaseGpu}
         onRestart={handleRestart}
+        label={companion && companion.online ? 'Server GPU (video decode/encode)' : 'Local GPU'}
       />
 
       {/* Restart message */}
