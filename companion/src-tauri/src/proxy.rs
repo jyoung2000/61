@@ -476,6 +476,12 @@ async fn health(State(ctx): State<ProxyCtx>, headers: HeaderMap) -> Response {
     });
     let ollama_up = crate::ollama::daemon_running().await;
     let whisper_shipped = ctx.state.sidecar_available.load(Ordering::Relaxed);
+    // Advertise the audio→English translate task ONLY for the CUDA build: it
+    // runs whisper.cpp with --translate + word timestamps on the GPU, so ClipAI
+    // can route the tier-A timing pass here instead of its slow local card. The
+    // CPU build would be slower than the ClipAI server, so we don't advertise it.
+    let whisper_translate_cap =
+        whisper_shipped && crate::sidecar::build_kind(&ctx.resource_dir, &ctx.data_dir) == "gpu";
     // Advertise the concurrency this GPU is willing to run so ClipAI can
     // parallelize the pipeline to match the user's Speed profile.
     let (num_parallel, max_loaded) = ctx.state.resolve_speed_settings();
@@ -511,6 +517,9 @@ async fn health(State(ctx): State<ProxyCtx>, headers: HeaderMap) -> Response {
         "whisper_quality": config.whisper_quality,
         "whisper_model_effective": whisper_model_eff,
         "whisper_beam_size": whisper_beam,
+        // Capability flag: this GPU can run the audio→English translate task
+        // (ClipAI routes the tier-A timing pass here when true).
+        "whisper_translate": whisper_translate_cap,
         "backends": {
             "ollama": ollama_up,
             "whisper": whisper_shipped,

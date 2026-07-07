@@ -320,6 +320,39 @@ def _remote_whisper_token() -> str:
     return (getattr(settings, "WHISPER_REMOTE_API_KEY", "") or "").strip()
 
 
+_translate_cap_cache: dict = {"base": "", "ok": False, "at": 0.0}
+
+
+def remote_whisper_supports_translate() -> bool:
+    """True when the remote whisper host advertises the audio→English translate
+    task on ``/v1/health`` (``whisper_translate: true``). Cached ~30 s. Defaults
+    to False (safe: callers keep the local translate path) so a host that can't
+    translate — or an old Companion that doesn't advertise it — never silently
+    produces a worse result."""
+    import time as _t
+    base = _remote_whisper_base()
+    if not base:
+        return False
+    now = _t.monotonic()
+    if (_translate_cap_cache["base"] == base
+            and now - _translate_cap_cache["at"] < 30.0):
+        return bool(_translate_cap_cache["ok"])
+    ok = False
+    try:
+        import httpx as _httpx
+        headers = {}
+        tok = _remote_whisper_token()
+        if tok:
+            headers["Authorization"] = f"Bearer {tok}"
+        r = _httpx.get(f"{base}/v1/health", headers=headers, timeout=4.0)
+        if r.status_code == 200:
+            ok = bool((r.json() or {}).get("whisper_translate", False))
+    except Exception:
+        ok = False
+    _translate_cap_cache.update({"base": base, "ok": ok, "at": now})
+    return ok
+
+
 def remote_whisper_healthy(force: bool = False) -> bool:
     """Cheap health probe of the remote transcription server (cached ~30 s).
 
@@ -564,10 +597,16 @@ class RemoteWhisperEngine:
             return None
 
     def transcribe_wav(self, audio_path: str,
-                       language: Optional[str] = None) -> Optional[dict]:
+                       language: Optional[str] = None,
+                       translate: bool = False) -> Optional[dict]:
         """Returns ``{'segments', 'language', 'provider', 'model'}`` in the
         local schema (same contract as ``cloud_transcription.transcribe_cloud``)
         or ``None`` on any failure — the caller falls back to local.
+
+        ``translate=True`` requests Whisper's native audio→English translate
+        task (whisper.cpp honors the ``translate`` form field) so the primary
+        whisper GPU — the paired Companion — can produce the English timing
+        reference instead of the slow local card.
 
         Reliable transfer to the Companion: the body is sent with an EXACT
         Content-Length (bytes snapshot, never a growing file handle), transient
@@ -581,6 +620,9 @@ class RemoteWhisperEngine:
             "response_format": "verbose_json",
             "timestamp_granularities[]": ["word", "segment"],
         }
+        if translate:
+            # whisper.cpp server reads this to run task=translate (→ English).
+            data["translate"] = "true"
         if language and language not in ("auto", ""):
             data["language"] = language
         prompt = _vocab_prompt(language or "en")
@@ -2311,6 +2353,64 @@ class AudioIntelligence:
         AudioIntelligence._record_loaded(self.model_name, self.device_used)
         log.log_stage('AUDIO', f'Whisper reloaded on CPU int8 ({self.model_name})')
 
+    def _remote_translate(self, video_path: str, source_lang: str, log) -> List[dict]:
+        """Run audio→English translate on the PRIMARY remote whisper GPU (the
+        paired Companion). Extracts the WAV locally and uploads it with
+        ``translate=true``. Returns local-schema segments WITH word timestamps,
+        or ``[]`` to fall back to the local engine — e.g. when the remote host
+        can't return word-level timing, which tier-A projection requires."""
+        import subprocess as _sp
+        import tempfile as _tf
+        audio_path = os.path.join(_tf.gettempdir(), 'clipai_remote_translate.wav')
+        try:
+            _sp.run(['ffmpeg', '-y', '-i', video_path,
+                     '-vn', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1',
+                     audio_path],
+                    capture_output=True, timeout=180)
+        except Exception as e:
+            log.log_error('TRANSLATE', f'Remote translate audio extract failed: {e}')
+            return []
+        try:
+            log.log_stage('TRANSLATE',
+                f'Whisper native translate on the Companion GPU: '
+                f'{source_lang or "auto"} → en (remote)')
+            engine = RemoteWhisperEngine(model="")
+            whisper_lang = source_lang if source_lang and source_lang != 'auto' else None
+            result = engine.transcribe_wav(audio_path, language=whisper_lang, translate=True)
+            if not result:
+                return []
+            segs = result.get('segments') or []
+            # Tier-A projection needs word timestamps. If the host returned none,
+            # fall back to the local engine (which always produces them).
+            has_words = any(
+                (s.get('words') if isinstance(s, dict) else None) for s in segs)
+            if not has_words:
+                log.log_stage('TRANSLATE',
+                    'Remote translate returned no word timestamps — local '
+                    'fallback for tier-A timing')
+                return []
+            out = []
+            for s in segs:
+                if not isinstance(s, dict):
+                    continue
+                out.append({
+                    'start_sec': round(float(s.get('start_sec', s.get('start', 0.0))), 3),
+                    'end_sec': round(float(s.get('end_sec', s.get('end', 0.0))), 3),
+                    'text': (s.get('text') or '').strip(),
+                    'words': s.get('words') or [],
+                })
+            log.log_stage('TRANSLATE',
+                f'Remote translate complete on the Companion: {len(out)} segments')
+            return out
+        except Exception as e:
+            log.log_error('TRANSLATE', f'Remote translate failed: {e}')
+            return []
+        finally:
+            try:
+                os.remove(audio_path)
+            except Exception:
+                pass
+
     def whisper_translate(self, video_path: str, source_lang: str = None,
                           on_progress=None, reuse_loaded: bool = False) -> List[dict]:
         """Direct audio→English translation via Whisper's native translate task.
@@ -2328,14 +2428,25 @@ class AudioIntelligence:
         """
         log = get_logger()
 
-        # The native translate task needs a REAL local faster-whisper engine
-        # (batched decode with task="translate" — no OpenAI-compatible
-        # equivalent is guaranteed remotely). If the remote engine was
-        # selected, swap in the local ladder just for this pass.
+        # PRIMARY-GPU routing: when the paired Companion serves whisper AND it
+        # advertises the translate task, run audio→English on THAT GPU (e.g. the
+        # 4070) — the whole point of pairing it, and what lets long videos reach
+        # tier-A timing without the slow local pass. Falls back to the local
+        # engine below when the remote path yields no word-timestamped segments.
         if self.device_used == 'remote' or isinstance(self.engine, RemoteWhisperEngine):
-            log.log_stage('TRANSLATE',
-                'Remote Whisper active — loading the LOCAL engine for the '
-                'native translate task')
+            if remote_whisper_configured() and remote_whisper_supports_translate():
+                remote_segs = self._remote_translate(video_path, source_lang, log)
+                if remote_segs:
+                    return remote_segs
+                log.log_stage('TRANSLATE',
+                    'Remote translate unusable — falling back to the local engine')
+            else:
+                # No remote translate capability — the native translate task
+                # needs a REAL local faster-whisper engine (batched decode with
+                # task="translate"). Swap in the local ladder just for this pass.
+                log.log_stage('TRANSLATE',
+                    'Remote Whisper active — loading the LOCAL engine for the '
+                    'native translate task')
             self.engine = None
             self.available = False
             self.device_used = 'unknown'
