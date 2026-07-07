@@ -23,7 +23,7 @@ function Spinner() {
 }
 
 // ── VRAM Gauge ──────────────────────────────────────────────────────────
-function VramGauge({ gpu, loadedModels, ollamaAvailable, ollamaError, torchGpu, whisperGpu, onUnload, onReleaseGpu, onRestart, label, headerTitle }) {
+function VramGauge({ gpu, loadedModels, ollamaAvailable, ollamaError, torchGpu, whisperGpu, onUnload, onReleaseGpu, onRestart, label, headerTitle, otherAppsBytes = 0, clipaiFallbackBytes = 0 }) {
   // Ollama offline. Distinguish an auth/token problem (actionable) from a
   // genuine connectivity drop so the user isn't told to "wait" when the fix is
   // to check the Companion's access token.
@@ -110,6 +110,42 @@ function VramGauge({ gpu, loadedModels, ollamaAvailable, ollamaError, torchGpu, 
       ? `Whisper ${whisperGpu.model}${whisperEstimated ? ' (est)' : ''}`
       : `Whisper (CTranslate2)${whisperEstimated ? ' (est)' : ''}`;
     segments.push({ name: label, pct: whisperPct, color: '#a855f7', vram: whisperBytes });
+  }
+
+  // ClipAI fallback (Companion): the card is holding ClipAI's model VRAM but the
+  // per-model /api/ps list came back empty — still show it as ClipAI's segment.
+  if (loadedModels.length === 0 && clipaiFallbackBytes > 50 * 1024 * 1024 && totalBytes > 0) {
+    segments.push({
+      name: 'ClipAI (AI models)',
+      pct: Math.min(100, (clipaiFallbackBytes / totalBytes) * 100),
+      color: MODEL_COLORS.text,
+      vram: clipaiFallbackBytes,
+    });
+  }
+
+  // Other apps (Companion): VRAM used by everything else on that desktop GPU
+  // (games, editors, the browser) so the user sees what's competing for the card.
+  if (otherAppsBytes > 50 * 1024 * 1024 && totalBytes > 0) {
+    segments.push({
+      name: 'Other apps',
+      pct: Math.min(100, (otherAppsBytes / totalBytes) * 100),
+      color: '#3b82f6',
+      vram: otherAppsBytes,
+    });
+  }
+
+  // Fallback fill: any measured VRAM not attributed to a named segment above
+  // still shows on the bar, so the fill always reflects the real "X GB / Y GB"
+  // reading instead of leaving it empty.
+  const _segBytes = segments.reduce((s, seg) => s + (seg.vram || 0), 0);
+  const _unattributed = usedBytes - _segBytes;
+  if (_unattributed > 100 * 1024 * 1024 && totalBytes > 0) {
+    segments.push({
+      name: 'In use',
+      pct: Math.min(100, (_unattributed / totalBytes) * 100),
+      color: '#64748b',
+      vram: _unattributed,
+    });
   }
 
   return (
@@ -438,6 +474,8 @@ export default function PipelineDiagnostics({ showTestRunner = true } = {}) {
             loadedModels={companion.loaded_models || []}
             torchGpu={null}
             whisperGpu={null}
+            otherAppsBytes={companion.other_apps_bytes || 0}
+            clipaiFallbackBytes={companion.clipai_vram_bytes || 0}
             ollamaAvailable={companion.online === false ? false : true}
             ollamaError={companion.online === false
               ? (companion.paused ? 'Companion paused — resume sharing in the app' : 'Companion offline')
@@ -446,11 +484,17 @@ export default function PipelineDiagnostics({ showTestRunner = true } = {}) {
             label={companion.is_primary ? 'AI GPU (Companion, primary)' : 'AI GPU (Companion)'}
             headerTitle="Your paired GPU Companion — this desktop card runs the AI (Ollama vision + text) and Whisper transcription. Video decode/encode stay on the server GPU below."
           />
-          {companion.whisper_model && companion.online !== false && (
-            <div style={{ fontSize: 10, fontFamily: 'var(--font-mono)', color: 'var(--text-muted)', marginTop: 4, marginLeft: 2 }}>
-              Whisper on this GPU: {companion.whisper_model}
-            </div>
-          )}
+          <div className="companion-legend" style={{ display: 'flex', gap: 14, flexWrap: 'wrap', marginTop: 4, marginLeft: 2, fontSize: 10, fontFamily: 'var(--font-mono)', color: 'var(--text-muted)' }}>
+            {(companion.clipai_vram_bytes || 0) > 0 && (
+              <span><span style={{ display: 'inline-block', width: 8, height: 8, borderRadius: 2, background: MODEL_COLORS.text, marginRight: 5 }} />ClipAI {formatBytes(companion.clipai_vram_bytes)}</span>
+            )}
+            {(companion.other_apps_bytes || 0) > 50 * 1024 * 1024 && (
+              <span><span style={{ display: 'inline-block', width: 8, height: 8, borderRadius: 2, background: '#3b82f6', marginRight: 5 }} />Other apps {formatBytes(companion.other_apps_bytes)}</span>
+            )}
+            {companion.whisper_model && companion.online !== false && (
+              <span>Whisper: {companion.whisper_model}</span>
+            )}
+          </div>
         </div>
       )}
 

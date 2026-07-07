@@ -663,7 +663,9 @@ async def _companion_gpu_block(local_loaded_models: list[dict]) -> dict | None:
         headers = _ollama_headers(host.url)
         # GPU VRAM totals from the Companion's own /v1/health (its nvidia-smi).
         vram_total_mb = vram_free_mb = 0
+        clipai_vram_mb = 0
         whisper_model = ""
+        health_gpu_name = ""
         busy = False
         try:
             async with httpx.AsyncClient(timeout=4) as client:
@@ -672,7 +674,9 @@ async def _companion_gpu_block(local_loaded_models: list[dict]) -> dict | None:
                     h = resp.json() or {}
                     vram_total_mb = int(h.get("vram_total_mb", 0) or 0)
                     vram_free_mb = int(h.get("vram_free_mb", 0) or 0)
+                    clipai_vram_mb = int(h.get("clipai_vram_mb", 0) or 0)
                     whisper_model = ((h.get("backends") or {}).get("whisper_model") or "")
+                    health_gpu_name = (h.get("gpu_name") or "").strip()
                     busy = bool(h.get("busy"))
         except Exception:
             pass
@@ -713,15 +717,24 @@ async def _companion_gpu_block(local_loaded_models: list[dict]) -> dict | None:
         # Keep used within the total when we have one.
         if vram_total_mb > 0:
             used_mb = min(used_mb, vram_total_mb)
+        # Split into ClipAI's own use vs OTHER apps on that desktop (games,
+        # editors, the browser) so the user can see what else is on the card.
+        # Prefer the Companion's reported figure; fall back to the resident
+        # models we can see. Other = total used − ClipAI's use.
+        clipai_mb = clipai_vram_mb if clipai_vram_mb > 0 else models_vram_mb
+        clipai_mb = min(clipai_mb, used_mb)
+        other_apps_mb = max(0, used_mb - clipai_mb)
         return {
             "online": bool(st.online),
             "paused": bool(getattr(st, "paused", False)),
             "is_primary": is_primary,
-            "gpu_name": host.gpu_name or "Companion GPU",
+            "gpu_name": health_gpu_name or host.gpu_name or "Companion GPU",
             "name": host.name,
             "vram_total_bytes": vram_total_mb * MB,
             "vram_free_bytes": vram_free_mb * MB,
             "vram_used_bytes": used_mb * MB,
+            "clipai_vram_bytes": clipai_mb * MB,
+            "other_apps_bytes": other_apps_mb * MB,
             "whisper_model": whisper_model,
             "busy": busy,
             "loaded_models": models,

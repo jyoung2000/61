@@ -448,11 +448,27 @@ async fn health(State(ctx): State<ProxyCtx>, headers: HeaderMap) -> Response {
     // Advertise the concurrency this GPU is willing to run so ClipAI can
     // parallelize the pipeline to match the user's Speed profile.
     let (num_parallel, max_loaded) = ctx.state.resolve_speed_settings();
+    // VRAM ClipAI is actively holding (Ollama models + Whisper while busy) so
+    // ClipAI's diagnostics can split this GPU's usage into ClipAI vs other apps.
+    let clipai_vram_mb: u64 = {
+        let ollama_bytes = crate::ollama::loaded_vram_bytes().await;
+        let whisper_mb: u64 = if busy {
+            match whisper_model {
+                "large-v3-turbo" => 1600,
+                "medium" => 900,
+                _ => 400,
+            }
+        } else {
+            0
+        };
+        ollama_bytes / (1024 * 1024) + whisper_mb
+    };
     let body = serde_json::json!({
         "service": "clipai-gpu-companion",
         "version": env!("CARGO_PKG_VERSION"),
         "gpu_name": gpu.gpu_name,
         "vram_total_mb": gpu.vram_total_mb,
+        "clipai_vram_mb": clipai_vram_mb,
         "vram_free_mb": gpu.vram_free_mb,
         "unified_memory": gpu.unified_memory,
         "vram_budget_gb": ctx.state.effective_budget_gb(),
