@@ -255,9 +255,13 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
             except Exception:
                 pass
 
+        # Connection-level auto-retry: httpx re-establishes a dropped/refused
+        # connection up to N times before raising — smooths over a Companion
+        # that's mid-restart or a brief LAN blip without failing the request.
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(600.0, connect=15.0),
             limits=httpx.Limits(max_connections=4, max_keepalive_connections=2),
+            transport=httpx.AsyncHTTPTransport(retries=3),
             event_hooks={"request": [_attach_registry_headers]},
         )
         # Track whether we need CPU-only mode due to VRAM constraints.

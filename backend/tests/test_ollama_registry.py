@@ -236,6 +236,7 @@ def _failover_hosts(monkeypatch):
 
 def test_failover_walks_to_next_host_on_connect_error(monkeypatch):
     hosts = _failover_hosts(monkeypatch)
+    monkeypatch.setattr(R, "CONNECT_RETRY_BACKOFF_S", 0.0)
     attempts = []
 
     async def send(host):
@@ -246,10 +247,12 @@ def test_failover_walks_to_next_host_on_connect_error(monkeypatch):
                               request=httpx.Request("GET", host.url))
 
     resp, host = asyncio.run(R.request_with_failover(send))
-    assert attempts == ["a", "b"]
+    # Transient connect errors get ONE same-host retry (a LAN blip / mid-restart
+    # shouldn't drop work onto a weaker fallback) before failing over to b.
+    assert attempts == ["a", "a", "b"]
     assert host.id == "b"
     assert resp.status_code == 200
-    # Host a is now cooling down.
+    # Host a is now cooling down (it failed both attempts).
     assert R.in_cooldown(hosts["a"])
     assert not R.in_cooldown(hosts["b"])
 

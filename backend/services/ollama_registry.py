@@ -61,6 +61,9 @@ UNHEALTHY_COOLDOWN_S = 30.0
 PROBE_TIMEOUT_S = 3.0
 # Cap on how long we honor a host's Retry-After before moving to the next one.
 MAX_RETRY_AFTER_S = 15.0
+# Backoff before retrying the SAME host once on a transient connect error, so a
+# brief LAN blip / Companion restart doesn't drop work onto a weaker fallback.
+CONNECT_RETRY_BACKOFF_S = 1.5
 
 # Model substitution ladders — when the chosen host lacks the configured
 # model, fall back to the best model it DOES have instead of failing the
@@ -508,6 +511,15 @@ async def request_with_failover(
                     httpx.WriteTimeout, httpx.PoolTimeout, httpx.RemoteProtocolError,
                     OSError) as e:
                 last_exc = e
+                # Transient network blip (LAN hiccup, Companion mid-restart):
+                # retry the SAME host once with a short backoff before failing
+                # over — a fallback would drop the work onto the weak local card.
+                if attempt == 0:
+                    logger.info("Ollama host '%s' transient error (%s) — retrying "
+                                "the same host in %.1fs", host.name, type(e).__name__,
+                                CONNECT_RETRY_BACKOFF_S)
+                    await asyncio.sleep(CONNECT_RETRY_BACKOFF_S)
+                    continue
                 mark_unhealthy(host, f"{type(e).__name__}: {str(e)[:100]}")
                 break  # next host
             if resp.status_code == 503 and attempt == 0:

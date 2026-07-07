@@ -112,6 +112,26 @@ fn bad_gateway(err: impl std::fmt::Display) -> Response {
     (StatusCode::BAD_GATEWAY, format!("upstream error: {err}")).into_response()
 }
 
+/// Map a reqwest error from the LOCAL Ollama/Whisper to a client response. A
+/// connect/timeout usually means the upstream is mid-start or reloading, so we
+/// answer 503 + Retry-After (RETRYABLE) instead of 502 — that keeps ClipAI
+/// retrying THIS GPU rather than failing the work over to its weak local card.
+/// Returns (status_code, response) so the activity log records the real code.
+fn upstream_error(err: reqwest::Error) -> (u16, Response) {
+    if err.is_connect() || err.is_timeout() {
+        return (
+            503,
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [("Retry-After", "3")],
+                format!("upstream starting/unavailable: {err}"),
+            )
+                .into_response(),
+        );
+    }
+    (502, bad_gateway(err))
+}
+
 /// Marks an activity finished exactly once when dropped — used to keep a
 /// streamed response "current" until its body actually completes (or the
 /// client aborts), instead of finishing it the moment the headers arrive.
@@ -213,8 +233,9 @@ async fn ollama_proxy(State(ctx): State<ProxyCtx>, req: Request<Body>) -> Respon
     match upstream.send().await {
         Ok(resp) => relay_tracked(resp, ctx.state.clone(), activity),
         Err(e) => {
-            ctx.state.end_activity(activity, 502);
-            bad_gateway(e)
+            let (code, resp) = upstream_error(e);
+            ctx.state.end_activity(activity, code);
+            resp
         }
     }
 }
