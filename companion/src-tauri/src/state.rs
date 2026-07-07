@@ -196,6 +196,9 @@ pub struct ReportedJob {
     pub stage: String,
     pub progress: u64,
     pub updated_ms: u64,
+    /// ms epoch of the FIRST heartbeat for this job_id — so the GUI's "elapsed"
+    /// counts from when the job started here, not from the Unix epoch.
+    pub started_ms: u64,
 }
 
 pub fn now_ms() -> u64 {
@@ -361,12 +364,21 @@ impl AppState {
         progress: u64,
     ) {
         self.last_clipai_contact.store(now_ms(), Ordering::Relaxed);
-        *self.reported_job.lock().unwrap() = Some(ReportedJob {
+        let now = now_ms();
+        let mut slot = self.reported_job.lock().unwrap();
+        // Preserve the original start time across heartbeats for the same job;
+        // a new job_id resets it. This keeps the GUI "elapsed" sane.
+        let started_ms = match slot.as_ref() {
+            Some(prev) if prev.job_id == job_id => prev.started_ms,
+            _ => now,
+        };
+        *slot = Some(ReportedJob {
             job_id: job_id.into(),
             job_title: job_title.into(),
             stage: stage.into(),
             progress: progress.min(100),
-            updated_ms: now_ms(),
+            updated_ms: now,
+            started_ms,
         });
     }
 

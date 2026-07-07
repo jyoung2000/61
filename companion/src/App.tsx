@@ -37,8 +37,13 @@ const fmtBytes = (b: number) => {
   return gb >= 1 ? `${gb.toFixed(1)} GB` : `${Math.round(b / (1024 * 1024))} MB`;
 };
 const elapsed = (startMs: number, endMs?: number | null) => {
+  // Guard against a missing/epoch start (would render millions of hours).
+  if (!startMs || startMs < 1_000_000_000_000) return '—';
   const s = Math.max(0, Math.floor(((endMs ?? Date.now()) - startMs) / 1000));
-  return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
+  const h = Math.floor(s / 3600);
+  const mm = String(Math.floor((s % 3600) / 60)).padStart(2, '0');
+  const ss = String(s % 60).padStart(2, '0');
+  return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
 };
 
 // Poll every 2 s while visible; stop entirely when the window is hidden

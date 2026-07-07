@@ -154,7 +154,9 @@ async fn get_status(
             "job_title": r.job_title,
             "stage": r.stage,
             "kind": in_flight.as_ref().map(|e| e.kind.clone()).unwrap_or_default(),
-            "started_at_ms": in_flight.as_ref().map(|e| e.started_at_ms).unwrap_or(0),
+            // The job's real start (first heartbeat) — never 0, so "elapsed"
+            // isn't measured from the Unix epoch during a local-only stage.
+            "started_at_ms": r.started_ms,
         })
     } else if let Some(e) = &in_flight {
         serde_json::to_value(e).unwrap_or(serde_json::Value::Null)
