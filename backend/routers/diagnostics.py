@@ -699,7 +699,20 @@ async def _companion_gpu_block(local_loaded_models: list[dict]) -> dict | None:
                             })
             except Exception:
                 pass
-        used_mb = max(0, vram_total_mb - vram_free_mb)
+        # Robust totals: prefer the live /v1/health figure, else the VRAM the
+        # Companion advertised at pairing (host.vram_total_mb) so the gauge still
+        # renders when the health probe is momentarily unavailable.
+        if vram_total_mb <= 0:
+            vram_total_mb = int(getattr(host, "vram_total_mb", 0) or 0)
+        models_vram_mb = int(sum((m.get("vram_bytes", 0) or 0) for m in models) / MB)
+        if vram_free_mb > 0:
+            used_mb = max(0, vram_total_mb - vram_free_mb)
+        else:
+            # No live free-VRAM reading — attribute at least the resident models.
+            used_mb = models_vram_mb
+        # Keep used within the total when we have one.
+        if vram_total_mb > 0:
+            used_mb = min(used_mb, vram_total_mb)
         return {
             "online": bool(st.online),
             "paused": bool(getattr(st, "paused", False)),
