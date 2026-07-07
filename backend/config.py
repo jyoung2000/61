@@ -1443,11 +1443,29 @@ OLLAMA_VRAM_PROFILES = {
 }
 
 
-def apply_ollama_overrides(tier: VideoDurationTier, is_ollama: bool) -> VideoDurationTier:
-    """Return a modified tier with Ollama-appropriate settings if Ollama is active."""
+def apply_ollama_overrides(tier: VideoDurationTier, is_ollama: bool,
+                           remote_vram_gb: float = 0.0) -> VideoDurationTier:
+    """Return a modified tier with Ollama-appropriate settings if Ollama is active.
+
+    ``remote_vram_gb`` is the VRAM of the ACTIVE Ollama GPU when it's a remote
+    Companion (0 for the on-server card). The single-window / one-vision-at-a-time
+    defaults exist only because the weak 4 GB on-server card can't do more; a
+    high-VRAM Companion (e.g. a 12 GB RTX 4070) runs vision windows CONCURRENTLY,
+    which cuts wall-clock with NO quality change — same windows, same model, same
+    outputs, just not artificially serialized."""
     if not is_ollama:
         return tier
     overrides = OLLAMA_TIER_OVERRIDES.get(tier.name, OLLAMA_TIER_OVERRIDES["medium"])
+    # Base tier only carries vision_batch_concurrency; sequential-vs-concurrent
+    # window processing is decided by the caller (see ollama_provider) from the
+    # same remote_vram_gb signal. A capable remote GPU lifts the concurrency.
+    vision_conc = overrides.vision_batch_concurrency
+    if remote_vram_gb >= 10.0:
+        vision_conc = 4
+    elif remote_vram_gb >= 7.0:
+        vision_conc = 3
+    elif remote_vram_gb >= 5.0:
+        vision_conc = 2
     return replace(
         tier,
         window_duration=overrides.window_duration,
@@ -1455,5 +1473,5 @@ def apply_ollama_overrides(tier: VideoDurationTier, is_ollama: bool) -> VideoDur
         per_call_timeout_base=overrides.per_call_timeout_base,
         summary_strategy=overrides.summary_strategy,
         summary_chunk_minutes=overrides.summary_chunk_minutes if overrides.summary_chunk_minutes else tier.summary_chunk_minutes,
-        vision_batch_concurrency=overrides.vision_batch_concurrency,
+        vision_batch_concurrency=vision_conc,
     )

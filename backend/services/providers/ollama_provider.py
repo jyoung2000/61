@@ -2632,10 +2632,31 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
         await self._ensure_model_active(self._editorial_model)
         # For videos > 5 min, use multi-pass detection via mixin (sequential for VRAM safety)
         if video_duration > 300:
-            logger.info("Ollama: video %.0fs (>5min) — using sequential multi-pass clip detection", video_duration)
+            # A high-VRAM remote Companion GPU runs windows CONCURRENTLY and
+            # without the sequential-mode window cap (which samples/skips windows
+            # on the weak on-server card) — same model + prompts, so coverage
+            # improves and wall-clock drops with no quality loss. Falls back to
+            # sequential for the local card / CPU-forced models.
+            _remote_vram_gb = 0.0
+            try:
+                from backend.services import ollama_registry as _oreg
+                _ph = _oreg.primary_host()
+                if _ph is not None and not _oreg.is_local_gpu_host(_ph.url) \
+                        and getattr(_ph, "vram_total_mb", 0):
+                    _remote_vram_gb = float(_ph.vram_total_mb) / 1024.0
+            except Exception:
+                _remote_vram_gb = 0.0
             if tier:
                 from backend.config import apply_ollama_overrides
-                tier = apply_ollama_overrides(tier, is_ollama=True)
+                tier = apply_ollama_overrides(tier, is_ollama=True,
+                                              remote_vram_gb=_remote_vram_gb)
+            # Concurrent only on a capable remote GPU; the local card / CPU stay
+            # sequential for VRAM safety.
+            _sequential = not (not self._force_cpu and _remote_vram_gb >= 5.0)
+            logger.info(
+                "Ollama: video %.0fs (>5min) — multi-pass clip detection "
+                "(sequential=%s, remote GPU %.1f GB)",
+                video_duration, _sequential, _remote_vram_gb)
             # CPU-forced models are extremely slow (1-3 tok/s on Sandy Bridge).
             # Even 12 windows × 90s timeout = 18 min of mostly-wasted time.
             # Widen windows so fewer are needed to cover the video.
@@ -2649,7 +2670,7 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                 )
             return await self._multi_pass_clip_detection(
                 transcript, scenes, video_duration,
-                tier=tier, sequential=True,
+                tier=tier, sequential=_sequential,
                 custom_prompt=custom_prompt, cancel_check=cancel_check,
                 clip_count=clip_count, min_duration=min_duration,
                 max_duration=max_duration, video_summary=video_summary,

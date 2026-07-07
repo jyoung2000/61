@@ -4032,11 +4032,24 @@ async def _run_analysis_inner(job_id: str):
     is_ollama_primary = _primary_provider and _primary_provider.provider_name == "ollama"
 
     if is_ollama_primary:
-        tier = apply_ollama_overrides(tier, is_ollama=True)
+        # A high-VRAM remote Companion GPU can run vision windows concurrently —
+        # pass its VRAM so the overrides don't throttle it to the on-server card's
+        # one-at-a-time pace. 0 when the primary Ollama host is the local card.
+        _remote_vram_gb = 0.0
+        try:
+            from backend.services import ollama_registry as _oreg
+            _ph = _oreg.primary_host()
+            if _ph is not None and not _oreg.is_local_gpu_host(_ph.url) \
+                    and getattr(_ph, "vram_total_mb", 0):
+                _remote_vram_gb = float(_ph.vram_total_mb) / 1024.0
+        except Exception:
+            _remote_vram_gb = 0.0
+        tier = apply_ollama_overrides(tier, is_ollama=True, remote_vram_gb=_remote_vram_gb)
         logger.info(
             "[%s] Ollama is primary provider — applying overrides: "
-            "window=%ds, timeout=%ds, summary=%s, sequential=True",
+            "window=%ds, timeout=%ds, summary=%s, vision_concurrency=%d (remote GPU %.1f GB)",
             job_id, tier.window_duration, tier.per_call_timeout_base, tier.summary_strategy,
+            tier.vision_batch_concurrency, _remote_vram_gb,
         )
         # Warm up models to detect capabilities and VRAM constraints,
         # then immediately unload so Whisper gets exclusive GPU access.

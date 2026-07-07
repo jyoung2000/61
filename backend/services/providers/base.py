@@ -1818,8 +1818,12 @@ class ChunkedClipDetectionMixin:
                     )
                     continue
         else:
-            # Concurrent with semaphore
-            sem = asyncio.Semaphore(2)
+            # Concurrent with semaphore — sized to the GPU's capacity (a 12 GB
+            # Companion runs several vision windows at once; the local card 2).
+            _conc = max(1, int(kwargs.get("vision_concurrency", 2) or 2))
+            _mixin_logger.info("Windowed detection: running %d windows, up to %d concurrent",
+                               len(windows), _conc)
+            sem = asyncio.Semaphore(_conc)
 
             async def _concurrent_window(idx: int, ws: float, we: float):
                 async with sem:
@@ -1923,6 +1927,7 @@ class ChunkedClipDetectionMixin:
             window_duration=window_dur, overlap_duration=overlap_dur,
             _partial_results=_partial_results,
             sequential=sequential,
+            vision_concurrency=(tier.vision_batch_concurrency if tier else 2),
             custom_prompt=custom_prompt, cancel_check=cancel_check,
             clip_count=num_clips,
             min_duration=min_duration, max_duration=max_duration,

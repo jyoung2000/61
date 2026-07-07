@@ -366,15 +366,32 @@ async fn ensure_running_inner(state: &Arc<AppState>) -> Result<bool, String> {
     }
     let keep_alive = state.config.lock().unwrap().ollama_keep_alive.clone();
     let overhead = gpu_overhead_bytes(state);
+    // Scale concurrency + resident models to the VRAM budget so a big card (a
+    // gaming GPU) isn't throttled to one-request-at-a-time with constant model
+    // reloads. Parallel slots let ClipAI's per-frame vision requests run
+    // concurrently; keeping >1 model resident avoids a llava↔qwen reload every
+    // time the pipeline switches between the vision and text stages. Quality is
+    // unchanged — same models, same outputs, just no artificial serialization.
+    let budget_gb = state.effective_budget_gb();
+    let (num_parallel, max_loaded) = if budget_gb >= 10.0 {
+        ("4", "3")
+    } else if budget_gb >= 7.0 {
+        ("3", "2")
+    } else if budget_gb >= 4.0 {
+        ("2", "2")
+    } else {
+        ("1", "1")
+    };
     log::info!(
-        "starting managed ollama (keep_alive={keep_alive}, gpu_overhead={} MB)",
+        "starting managed ollama (keep_alive={keep_alive}, gpu_overhead={} MB, \
+         num_parallel={num_parallel}, max_loaded={max_loaded}, budget={budget_gb:.1} GB)",
         overhead / 1024 / 1024
     );
     let mut cmd = quiet_command(ollama_binary());
     cmd.arg("serve")
         .env("OLLAMA_HOST", OLLAMA_LOCAL) // localhost ONLY — proxy is the LAN surface
-        .env("OLLAMA_MAX_LOADED_MODELS", "1")
-        .env("OLLAMA_NUM_PARALLEL", "1")
+        .env("OLLAMA_MAX_LOADED_MODELS", max_loaded)
+        .env("OLLAMA_NUM_PARALLEL", num_parallel)
         .env("OLLAMA_KEEP_ALIVE", keep_alive)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
