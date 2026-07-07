@@ -1141,9 +1141,23 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
                       || (jl.job_id ? `Job ${jl.job_id.slice(0, 8)}` : 'Ad-hoc requests')}
                   </strong>
                   {jl.active
-                    ? <span className="badge live">Running · {elapsed(jl.started_at_ms)}</span>
+                    ? <span className="badge live">
+                        Running{jl.reported_stage ? ` · ${jl.reported_stage}` : ''}
+                        {jl.reported_progress >= 0 ? ` ${jl.reported_progress}%` : ''}
+                        {' · '}{elapsed(jl.started_at_ms)}
+                      </span>
                     : <span className="badge">done · {elapsed(jl.started_at_ms, jl.last_activity_ms)}</span>}
                 </div>
+                {/* Active by heartbeat but no request in flight → ClipAI is on a
+                    stage that runs on the SERVER (video decode/encode, offline
+                    NMT translation) — this GPU isn't needed for it right now. */}
+                {jl.active && !jl.entries.some((e) => e.finished_at_ms === null) && (
+                  <div className="muted small" style={{ marginBottom: 4 }}>
+                    Job still running on ClipAI — this stage
+                    {jl.reported_stage ? ` (${jl.reported_stage})` : ''} runs on the server;
+                    this GPU resumes when the next AI/transcription step starts.
+                  </div>
+                )}
                 <div className="feed">
                   {jl.entries.slice(0, 12).map((a) => (
                     <div className="feed-item" key={a.id}>

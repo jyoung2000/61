@@ -27,6 +27,10 @@ export interface JobLog {
   started_at_ms: number;
   last_activity_ms: number;
   entries: ActivityEntry[];
+  /** Stage ClipAI last reported (heartbeat) — live even during local-only stages. */
+  reported_stage: string;
+  /** Overall job progress 0-100 from the heartbeat, or -1 when unknown. */
+  reported_progress: number;
 }
 
 export interface CompanionStatus {

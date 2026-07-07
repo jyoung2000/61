@@ -110,6 +110,12 @@ pub struct JobLog {
     pub started_at_ms: u64,
     pub last_activity_ms: u64,
     pub entries: Vec<ActivityEntry>,
+    /// Stage ClipAI last reported for this job (heartbeat) — shown so the GUI
+    /// can say WHICH stage is live even when it isn't hitting our proxy (a
+    /// local-only stage like frame extraction or offline NMT translation).
+    pub reported_stage: String,
+    /// Overall job progress (0-100) from the heartbeat, or -1 when unknown.
+    pub reported_progress: i64,
 }
 
 #[derive(Clone, Serialize, Default)]
@@ -381,6 +387,10 @@ impl AppState {
     /// Activity grouped by ClipAI job id, newest job first, so the GUI can show
     /// one log stream per video-analysis pipeline. Health probes are excluded.
     pub fn job_logs(&self) -> Vec<JobLog> {
+        // A fresh progress heartbeat means ClipAI is STILL working this job even
+        // if it isn't hitting us right now (local-only stage) — so it must not
+        // read as "done". Captured before locking activity (separate mutex).
+        let reported = self.reported_job_fresh();
         let feed = self.activity.lock().unwrap();
         let mut order: Vec<String> = Vec::new();
         let mut groups: HashMap<String, Vec<ActivityEntry>> = HashMap::new();
@@ -404,13 +414,27 @@ impl AppState {
                     .map(|e| e.job_title.clone())
                     .find(|t| !t.is_empty())
                     .unwrap_or_default();
-                let active = entries.iter().any(|e| e.finished_at_ms.is_none());
+                // Active if a request is in-flight OR ClipAI is still reporting
+                // progress for this job (covers local-only stages like frame
+                // extraction / offline translation where nothing hits our proxy).
+                let reported_active = reported.as_ref().map(|r| r.job_id == key).unwrap_or(false);
+                let active = reported_active
+                    || entries.iter().any(|e| e.finished_at_ms.is_none());
                 let started_at_ms = entries.iter().map(|e| e.started_at_ms).min().unwrap_or(0);
-                let last_activity_ms = entries
+                let mut last_activity_ms = entries
                     .iter()
                     .map(|e| e.finished_at_ms.unwrap_or(e.started_at_ms))
                     .max()
                     .unwrap_or(0);
+                if reported_active {
+                    if let Some(r) = &reported {
+                        last_activity_ms = last_activity_ms.max(r.updated_ms);
+                    }
+                }
+                let (reported_stage, reported_progress) = match (reported_active, reported.as_ref()) {
+                    (true, Some(r)) => (r.stage.clone(), r.progress as i64),
+                    _ => (String::new(), -1),
+                };
                 JobLog {
                     job_id: key,
                     job_title,
@@ -418,6 +442,8 @@ impl AppState {
                     started_at_ms,
                     last_activity_ms,
                     entries,
+                    reported_stage,
+                    reported_progress,
                 }
             })
             .collect()
