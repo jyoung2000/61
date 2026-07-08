@@ -4067,18 +4067,81 @@ input.ve-timecode--input {
             playhead #FF5C5C · marker #FFC53D · text #ECECEF
    ═══════════════════════════════════════════════════════════════════════════ */
 
-.ve-container,
-[data-theme="dark"] .ve-container,
-[data-theme="light"] .ve-container {
-  /* Internal editor tokens */
+/* Light (default) — indigo accent on light surfaces. */
+.ve-container {
+  --ve-accent: #6E7BFF;
+  --ve-accent-hover: #5B67F0;
+  --ve-accent-dim: rgba(110, 123, 255, 0.14);
+  --ve-accent-border: rgba(110, 123, 255, 0.5);
+  --ve-on-accent: #FFFFFF;
+  --ve-playhead: #FF3B30;
+  --ve-warning: #C77A00;
+  --ve-success: #1F9D57;
+  --ve-danger: #E5484D;
+
+  --ve-canvas-bg: #ECECEF;
+  --ve-stage-bg: #E7E7EC;
+  --ve-chrome-bg: #F4F4F7;
+  --ve-chrome-border: rgba(0, 0, 0, 0.09);
+  --ve-text: #1D1D1F;
+  --ve-text-muted: rgba(60, 60, 67, 0.62);
+  --ve-text-dim: rgba(60, 60, 67, 0.42);
+  --ve-btn-hover: rgba(0, 0, 0, 0.06);
+  --ve-btn-active: rgba(0, 0, 0, 0.10);
+  --ve-track-bg: rgba(0, 0, 0, 0.045);
+  --ve-track-border: rgba(0, 0, 0, 0.10);
+  --ve-kbd-bg: rgba(0, 0, 0, 0.05);
+  --ve-kbd-border: rgba(0, 0, 0, 0.10);
+  --ve-slider-track: rgba(0, 0, 0, 0.14);
+  --ve-dropdown-bg: #FFFFFF;
+  --ve-dropdown-shadow: 0 12px 40px rgba(0, 0, 0, 0.18);
+  --ve-trim-color: #6E7BFF;
+  --ve-trim-dimmed: rgba(0, 0, 0, 0.30);
+
+  /* App-level tokens the editor's inline styles read (indigo accent kept in
+     both themes; surfaces follow the theme). */
+  --accent-cyan: #6E7BFF;
+  --accent-cyan-dim: rgba(110, 123, 255, 0.14);
+  --accent-amber: #C77A00;
+  --accent-amber-dim: rgba(199, 122, 0, 0.14);
+  --bg-base: #FFFFFF;
+  --bg-panel: #F4F4F7;
+  --bg-elevated: #FFFFFF;
+  --border: rgba(0, 0, 0, 0.09);
+  --border-dim: rgba(0, 0, 0, 0.06);
+  --border-strong: rgba(0, 0, 0, 0.14);
+  --text-primary: #1D1D1F;
+  --text-secondary: rgba(60, 60, 67, 0.72);
+  --text-muted: rgba(60, 60, 67, 0.55);
+  --text: #1D1D1F;
+  --success: #1F9D57;
+  --danger: #E5484D;
+  --glow-color: rgba(110, 123, 255, 0.35);
+  --glow-color-strong: rgba(110, 123, 255, 0.55);
+
+  background: var(--ve-canvas-bg);
+  color: var(--ve-text);
+  border-radius: 12px;
+}
+
+/* Dark — the committed premium-dark comp identity. */
+[data-theme="dark"] .ve-container {
+  --ve-accent-hover: #7F8BFF;
+  --ve-accent-dim: rgba(110, 123, 255, 0.16);
+  --ve-accent-border: rgba(110, 123, 255, 0.55);
+  --ve-on-accent: #0F0F11;
+  --ve-playhead: #FF5C5C;
+  --ve-warning: #FFB340;
+  --ve-success: #34C77B;
+  --ve-danger: #FF8A8A;
+
+  --ve-canvas-bg: #0F0F11;
+  --ve-stage-bg: #000000;
   --ve-chrome-bg: #17171A;
   --ve-chrome-border: rgba(255, 255, 255, 0.08);
-  --ve-accent: #6E7BFF;
-  --ve-accent-hover: #7F8BFF;
-  --ve-trim-color: #6E7BFF;
-  --ve-trim-dimmed: rgba(0, 0, 0, 0.55);
   --ve-text: #ECECEF;
   --ve-text-muted: #9A9AA3;
+  --ve-text-dim: #5E5E66;
   --ve-btn-hover: #232327;
   --ve-btn-active: #2A2A30;
   --ve-track-bg: #1D1D21;
@@ -4088,13 +4151,8 @@ input.ve-timecode--input {
   --ve-slider-track: #2A2A30;
   --ve-dropdown-bg: #1B1B1F;
   --ve-dropdown-shadow: 0 12px 40px rgba(0, 0, 0, 0.6);
-  --ve-warning: #FFB340;
-  --ve-success: #34C77B;
-  --ve-danger: #FF8A8A;
+  --ve-trim-dimmed: rgba(0, 0, 0, 0.55);
 
-  /* App-level tokens the editor's inline styles read — remapped to the comp
-     indigo-dark palette so inline-styled controls match the chrome. */
-  --accent-cyan: #6E7BFF;
   --accent-cyan-dim: rgba(110, 123, 255, 0.16);
   --accent-amber: #FFB340;
   --accent-amber-dim: rgba(255, 179, 64, 0.14);
@@ -4110,66 +4168,61 @@ input.ve-timecode--input {
   --text: #ECECEF;
   --success: #34C77B;
   --danger: #FF5C5C;
-  --glow-color: rgba(110, 123, 255, 0.35);
-  --glow-color-strong: rgba(110, 123, 255, 0.55);
 
-  background: #0F0F11;
-  color: #ECECEF;
   color-scheme: dark;
-  border-radius: 12px;
 }
 
-/* Header → comp top bar (40px, #17171A, hairline underline) */
+/* Header → comp top bar (40px, theme chrome, hairline underline) */
 .ve-container .ve-header {
   min-height: 40px;
   padding: 0 12px;
-  background: #17171A;
+  background: var(--ve-chrome-bg);
   backdrop-filter: none;
   -webkit-backdrop-filter: none;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  border-bottom: 1px solid var(--ve-chrome-border);
   gap: 10px;
 }
-.ve-container .ve-header__title { font-size: 13px; }
+.ve-container .ve-header__title { font-size: 13px; color: var(--ve-text); }
 
 /* Top-bar action cluster (⌘K / undo / redo / Editor / Export) */
 .ve-topbar__spacer { flex: 1; }
 .ve-topbar__cmdk {
-  font-size: 11px; font-weight: 600; color: #9A9AA3;
-  background: #1D1D21; border: 1px solid rgba(255, 255, 255, 0.08);
+  font-size: 11px; font-weight: 600; color: var(--ve-text-muted);
+  background: var(--ve-track-bg); border: 1px solid var(--ve-chrome-border);
   border-radius: 7px; padding: 4px 9px; cursor: pointer; white-space: nowrap;
   transition: color 120ms, background 120ms;
 }
-.ve-topbar__cmdk:hover { color: #ECECEF; background: #232327; }
+.ve-container .ve-topbar__cmdk:hover { color: var(--ve-text); background: var(--ve-btn-hover); }
 .ve-topbar__icon {
   width: 28px; height: 28px; border: none; background: transparent;
-  color: #9A9AA3; border-radius: 8px; cursor: pointer; font-size: 15px;
+  color: var(--ve-text-muted); border-radius: 8px; cursor: pointer; font-size: 15px;
   display: flex; align-items: center; justify-content: center;
   transition: background 120ms, color 120ms;
 }
-.ve-topbar__icon:hover { background: #232327; color: #ECECEF; }
+.ve-container .ve-topbar__icon:hover { background: var(--ve-btn-hover); color: var(--ve-text); }
 .ve-topbar__icon:active { transform: scale(0.94); }
 .ve-topbar__toggle {
   font-size: 11px; font-weight: 600; padding: 5px 11px; border-radius: 8px;
-  cursor: pointer; white-space: nowrap; border: 1px solid rgba(255, 255, 255, 0.08);
-  background: #1D1D21; color: #9A9AA3; transition: all 160ms cubic-bezier(0.25,1,0.5,1);
+  cursor: pointer; white-space: nowrap; border: 1px solid var(--ve-chrome-border);
+  background: var(--ve-track-bg); color: var(--ve-text-muted); transition: all 160ms cubic-bezier(0.25,1,0.5,1);
 }
-.ve-topbar__toggle:hover { color: #ECECEF; }
+.ve-topbar__toggle:hover { color: var(--ve-text); }
 .ve-topbar__toggle--on {
-  background: rgba(110, 123, 255, 0.16); border-color: rgba(110, 123, 255, 0.55); color: #ECECEF;
+  background: var(--ve-accent-dim); border-color: var(--ve-accent-border); color: var(--ve-text);
 }
 .ve-topbar__toggle:active { transform: scale(0.96); }
 .ve-topbar__export {
-  background: #6E7BFF; color: #0F0F11; font-weight: 700; font-size: 12.5px;
+  background: var(--ve-accent); color: var(--ve-on-accent); font-weight: 700; font-size: 12.5px;
   border: none; border-radius: 8px; padding: 6px 13px; cursor: pointer;
   white-space: nowrap; transition: background 120ms, transform 120ms;
 }
-.ve-topbar__export:hover { background: #7F8BFF; }
+.ve-topbar__export:hover { background: var(--ve-accent-hover); }
 .ve-topbar__export:active { transform: scale(0.96); }
 
-/* Viewport stays pure black */
+/* Viewport = the true video letterbox — stays black for accurate colour. */
 .ve-container .ve-viewport { background: #000; }
 
-/* Timeline / controls / toolbars → comp surfaces */
+/* Timeline / controls / toolbars → theme chrome surfaces */
 .ve-container .ve-timeline,
 .ve-container .ve-controls,
 .ve-container .ve-multitrack-toggle,
@@ -4178,19 +4231,19 @@ input.ve-timecode--input {
 .ve-container .ve-multi-timeline__toolbar,
 .ve-container .ve-toolbar,
 .ve-container .ve-shortcuts {
-  background: #17171A;
+  background: var(--ve-chrome-bg);
   backdrop-filter: none;
   -webkit-backdrop-filter: none;
-  border-color: rgba(255, 255, 255, 0.08);
+  border-color: var(--ve-chrome-border);
 }
 .ve-container .ve-multi-timeline,
-.ve-container .ve-multi-timeline__canvas-wrap { background: #0F0F11; }
+.ve-container .ve-multi-timeline__canvas-wrap { background: var(--ve-canvas-bg); }
 .ve-container .ve-multitrack__sidebar,
-.ve-container .ve-multitrack__sidebar-header { background: #17171A; }
+.ve-container .ve-multitrack__sidebar-header { background: var(--ve-chrome-bg); }
 
 /* Playhead → comp coral-red with glow */
-.ve-container .ve-timeline__playhead { background: #FF5C5C; }
-.ve-container .ve-timeline__playhead::before { border-top-color: #FF5C5C; }
+.ve-container .ve-timeline__playhead { background: var(--ve-playhead); }
+.ve-container .ve-timeline__playhead::before { border-top-color: var(--ve-playhead); }
 .ve-container .ve-timeline__playhead::after {
   background: radial-gradient(ellipse, rgba(255, 92, 92, 0.2) 0%, transparent 70%);
 }
@@ -4199,75 +4252,75 @@ input.ve-timecode--input {
 .ve-container .ve-speed__btn,
 .ve-container .ve-btn--small,
 .ve-container .ve-multitrack-toggle__btn {
-  background: #1D1D21;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  color: #9A9AA3;
+  background: var(--ve-track-bg);
+  border: 1px solid var(--ve-chrome-border);
+  color: var(--ve-text-muted);
   border-radius: 8px;
   font-weight: 600;
   transition: all 160ms cubic-bezier(0.25, 1, 0.5, 1);
 }
 .ve-container .ve-speed__btn:hover,
 .ve-container .ve-btn--small:hover,
-.ve-container .ve-multitrack-toggle__btn:hover { color: #ECECEF; background: #232327; }
+.ve-container .ve-multitrack-toggle__btn:hover { color: var(--ve-text); background: var(--ve-btn-hover); }
 .ve-container .ve-multitrack-toggle__btn--active,
 .ve-container .ve-speed__btn--active {
-  background: rgba(110, 123, 255, 0.16);
-  border-color: rgba(110, 123, 255, 0.55);
-  color: #ECECEF;
+  background: var(--ve-accent-dim);
+  border-color: var(--ve-accent-border);
+  color: var(--ve-text);
 }
 .ve-container .ve-btn--export {
-  background: #6E7BFF !important; color: #0F0F11 !important; font-weight: 700;
+  background: var(--ve-accent) !important; color: var(--ve-on-accent) !important; font-weight: 700;
 }
-.ve-container .ve-btn--export:hover { background: #7F8BFF !important; }
+.ve-container .ve-btn--export:hover { background: var(--ve-accent-hover) !important; }
 
 /* Toolbar tool buttons → comp look */
 .ve-container .ve-toolbar__btn { border-radius: 7px; }
 .ve-container .ve-toolbar__btn--active {
-  background: rgba(110, 123, 255, 0.16);
-  border-color: rgba(110, 123, 255, 0.55);
-  color: #ECECEF;
+  background: var(--ve-accent-dim);
+  border-color: var(--ve-accent-border);
+  color: var(--ve-text);
 }
 
 /* Trim handles → indigo */
-.ve-container .ve-trim-handle { background: #6E7BFF; }
+.ve-container .ve-trim-handle { background: var(--ve-accent); }
 .ve-container .ve-trim-handle:hover,
-.ve-container .ve-trim-handle--active { box-shadow: 0 0 10px rgba(110, 123, 255, 0.55); }
+.ve-container .ve-trim-handle--active { box-shadow: 0 0 10px var(--ve-accent-border); }
 
 /* Snap / ripple accents (comp) */
-.ve-container .ve-btn--active-snap { background: rgba(110, 123, 255, 0.16); color: #6E7BFF; }
+.ve-container .ve-btn--active-snap { background: var(--ve-accent-dim); color: var(--ve-accent); }
 .ve-container .ve-btn--active-ripple {
-  background: rgba(255, 179, 64, 0.14); color: #FFB340; border-color: rgba(255, 179, 64, 0.45);
+  background: var(--accent-amber-dim); color: var(--ve-warning); border-color: rgba(255, 179, 64, 0.45);
 }
 
 /* Shortcuts hint bar → comp muted row */
-.ve-container .ve-shortcuts { color: #4A4A52; font-size: 9.5px; gap: 10px; }
+.ve-container .ve-shortcuts { color: var(--ve-text-dim); font-size: 9.5px; gap: 10px; }
 .ve-container .ve-shortcuts kbd {
-  background: rgba(255, 255, 255, 0.05); border-color: rgba(255, 255, 255, 0.08); color: #6E6E76;
+  background: var(--ve-kbd-bg); border-color: var(--ve-kbd-border); color: var(--ve-text-muted);
 }
 
 /* Ratio pill row (comp small pills) */
 .ve-ratio-row { gap: 6px; }
 .ve-ratio-pill {
   padding: 3px 9px; font-size: 10.5px; font-weight: 600; border-radius: 8px;
-  background: #1D1D21; color: #9A9AA3; border: 1px solid rgba(255, 255, 255, 0.08);
+  background: var(--ve-track-bg); color: var(--ve-text-muted); border: 1px solid var(--ve-chrome-border);
   cursor: pointer; white-space: nowrap; transition: all 160ms cubic-bezier(0.25, 1, 0.5, 1);
   display: inline-flex; align-items: center; gap: 3px;
 }
-.ve-ratio-pill:hover { color: #ECECEF; }
+.ve-ratio-pill:hover { color: var(--ve-text); }
 .ve-ratio-pill--on {
-  background: rgba(110, 123, 255, 0.16); border-color: rgba(110, 123, 255, 0.55); color: #ECECEF;
+  background: var(--ve-accent-dim); border-color: var(--ve-accent-border); color: var(--ve-text);
 }
 .ve-ratio-pill:active { transform: scale(0.96); }
 .ve-ratio-label {
-  font-size: 9.5px; font-weight: 700; letter-spacing: 0.08em; color: #5E5E66;
+  font-size: 9.5px; font-weight: 700; letter-spacing: 0.08em; color: var(--ve-text-dim);
   text-transform: uppercase;
 }
 
 /* Speed dropdown → comp elevated */
-.ve-container .ve-speed__dropdown { background: #1B1B1F; border-color: rgba(255, 255, 255, 0.1); }
+.ve-container .ve-speed__dropdown { background: var(--ve-dropdown-bg); border-color: var(--ve-chrome-border); }
 
-/* Loading/error states inside the dark editor */
-.ve-container .ve-error, .ve-container .ve-loading { background: #0F0F11; color: #9A9AA3; }
+/* Loading/error states follow the editor canvas */
+.ve-container .ve-error, .ve-container .ve-loading { background: var(--ve-canvas-bg); color: var(--ve-text-muted); }
 
 /* Reduced-motion respect already handled globally */
 
@@ -4283,16 +4336,17 @@ input.ve-timecode--input {
   align-items: center;
   justify-content: center;
   width: 100%;
-  background: #000;
+  /* The stage matte follows the theme so any letterbox around a portrait clip
+     blends with the editor instead of reading as a hard black bezel. */
+  background: var(--ve-stage-bg);
   padding: 0;
-  box-shadow: inset 0 -1px 0 rgba(255, 255, 255, 0.05);
 }
 
-/* The player frame gets a subtle studio bezel: a 1px inset ring + soft drop
-   shadow so the canvas edge is crisp against the black matte. */
+/* The player frame gets a subtle studio bezel: a 1px ring + soft drop shadow
+   so the canvas edge is crisp against the stage matte in either theme. */
 .ve-container .ve-viewport:not(.ve-viewport--fullscreen) {
   border-radius: 6px;
-  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255, 255, 255, 0.06);
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.28), 0 0 0 1px var(--ve-chrome-border);
 }
 
 /* Desktop: the studio monitor is the hero — a touch of matte around the frame

@@ -2856,7 +2856,7 @@ export default function Analysis() {
       {/* Video Player (sticky) — hidden on Transcript tab where we show side-by-side layout */}
       <div ref={stickyPlayerRef} style={{ position: 'sticky', top: 0, zIndex: 10, background: 'var(--bg-base)', display: (tab === 2 && !showExportPreview) ? 'none' : 'block' }}>
         {showExportPreview ? (
-          <div style={{ position: 'relative', width: isMobile ? '100%' : '85vw', maxWidth: '1600px', margin: '0 auto' }}>
+          <div style={{ position: 'relative', width: '100%', maxWidth: '2400px', margin: '0 auto' }}>
             <VideoEditorBoundary>
             <VideoEditor
               key={`clip-${clipPreview.id}`}
@@ -2967,7 +2967,7 @@ export default function Analysis() {
             {renderInlineSubPanel()}
           </div>
         ) : (
-          <div style={{ width: isMobile ? '100%' : '85vw', maxWidth: '1600px', margin: '0 auto' }}>
+          <div style={{ width: '100%', maxWidth: '2400px', margin: '0 auto' }}>
             <VideoEditorBoundary>
             <VideoEditor
               src={videoSrc}

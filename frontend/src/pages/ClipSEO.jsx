@@ -1226,7 +1226,8 @@ export default function ClipSEO() {
         alignItems: !isMobile && layoutMode === 'sidebyside' ? 'flex-start' : undefined,
       }}>
         <div style={{
-          width: isMobile ? '100%' : layoutMode === 'editor' ? '90vw' : undefined,
+          width: isMobile ? '100%' : layoutMode === 'editor' ? '100%' : undefined,
+          maxWidth: !isMobile && layoutMode === 'editor' ? '2400px' : undefined,
           flex: !isMobile && layoutMode === 'sidebyside' ? '1 1 50%' : undefined,
           minWidth: !isMobile && layoutMode === 'sidebyside' ? 0 : undefined,
           maxWidth: !isMobile && layoutMode === 'sidebyside' ? '60%' : undefined,
