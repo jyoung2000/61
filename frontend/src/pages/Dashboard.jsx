@@ -48,6 +48,10 @@ export default function Dashboard() {
   const [searchQuery, setSearchQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState('all');
   const [sortBy, setSortBy] = useState('newest');
+  // Power-user multi-select for bulk deleting projects.
+  const [selectMode, setSelectMode] = useState(false);
+  const [selected, setSelected] = useState(() => new Set());
+  const [bulkBusy, setBulkBusy] = useState(false);
   const navigate = useNavigate();
   const { isMobile } = useResponsive();
 
@@ -114,6 +118,32 @@ export default function Dashboard() {
         setJobs((prev) => prev.filter((j) => j.job_id !== jobId));
       }
     } catch {}
+  };
+
+  // ── Multi-select bulk delete ──────────────────────────────────────────────
+  const toggleSelect = (jobId) => {
+    setSelected((prev) => {
+      const n = new Set(prev);
+      if (n.has(jobId)) n.delete(jobId); else n.add(jobId);
+      return n;
+    });
+  };
+  const exitSelectMode = () => { setSelectMode(false); setSelected(new Set()); };
+  const bulkDelete = async () => {
+    const ids = Array.from(selected);
+    if (!ids.length) return;
+    if (!window.confirm(`Delete ${ids.length} project${ids.length === 1 ? '' : 's'}? This can't be undone.`)) return;
+    setBulkBusy(true);
+    // Delete concurrently but cap fan-out so we don't hammer the server.
+    const CONC = 5;
+    for (let i = 0; i < ids.length; i += CONC) {
+      const batch = ids.slice(i, i + CONC);
+      await Promise.all(batch.map((id) =>
+        fetch(`/api/jobs/${id}`, { method: 'DELETE' }).catch(() => {})));
+      setJobs((prev) => prev.filter((j) => !batch.includes(j.job_id)));
+    }
+    setBulkBusy(false);
+    exitSelectMode();
   };
 
   const [fetchError, setFetchError] = useState(false);
@@ -222,6 +252,59 @@ export default function Dashboard() {
       </div>
 
       {/* Search & Filter Bar */}
+      {jobs.length > 0 && (
+        <div style={{ marginBottom: 12, display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+          {!selectMode ? (
+            <button
+              onClick={() => setSelectMode(true)}
+              style={{
+                padding: '8px 14px', background: 'var(--bg-elevated)', color: 'var(--text-secondary)',
+                border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', fontSize: 13, cursor: 'pointer',
+              }}
+              title="Select multiple projects to delete at once"
+            >
+              Select
+            </button>
+          ) : (
+            <>
+              <span style={{ fontSize: 13, color: 'var(--text-secondary)', marginRight: 4 }}>
+                {selected.size} selected
+              </span>
+              <button
+                onClick={() => setSelected(new Set(filteredJobs.map((j) => j.job_id)))}
+                style={{ padding: '8px 12px', background: 'var(--bg-elevated)', color: 'var(--text-secondary)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', fontSize: 13, cursor: 'pointer' }}
+              >
+                Select all
+              </button>
+              <button
+                onClick={() => setSelected(new Set())}
+                style={{ padding: '8px 12px', background: 'var(--bg-elevated)', color: 'var(--text-secondary)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', fontSize: 13, cursor: 'pointer' }}
+              >
+                Clear
+              </button>
+              <button
+                onClick={bulkDelete}
+                disabled={selected.size === 0 || bulkBusy}
+                style={{
+                  padding: '8px 14px', background: selected.size > 0 ? 'var(--danger)' : 'var(--bg-elevated)',
+                  color: selected.size > 0 ? '#fff' : 'var(--text-muted)', border: 'none',
+                  borderRadius: 'var(--radius-sm)', fontSize: 13, fontWeight: 600,
+                  cursor: selected.size > 0 && !bulkBusy ? 'pointer' : 'default',
+                }}
+              >
+                {bulkBusy ? 'Deleting…' : `Delete${selected.size ? ` (${selected.size})` : ''}`}
+              </button>
+              <button
+                onClick={exitSelectMode}
+                style={{ padding: '8px 12px', background: 'var(--bg-elevated)', color: 'var(--text-secondary)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', fontSize: 13, cursor: 'pointer' }}
+              >
+                Cancel
+              </button>
+            </>
+          )}
+        </div>
+      )}
+
       {jobs.length > 0 && (
         <div style={{ marginBottom: 16, display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'stretch' }}>
           {/* Search input */}
@@ -361,20 +444,34 @@ export default function Dashboard() {
         >
           {filteredJobs.map((job, i) => {
             const statusInfo = STATUS_STYLES[job.status] || STATUS_STYLES.queued;
+            const isSel = selected.has(job.job_id);
             return (
               <div
                 key={job.job_id}
                 className="card-hover slide-in"
-                onClick={() => navigate(`/analysis/${job.job_id}`)}
+                onClick={() => (selectMode ? toggleSelect(job.job_id) : navigate(`/analysis/${job.job_id}`))}
                 style={{
                   background: 'var(--bg-panel)',
-                  border: '1px solid var(--border)',
+                  border: `1px solid ${isSel ? 'var(--accent-cyan)' : 'var(--border)'}`,
+                  boxShadow: isSel ? '0 0 0 2px var(--accent-cyan-dim)' : 'var(--shadow-sm)',
                   borderRadius: 'var(--radius-md)',
-                  boxShadow: 'var(--shadow-sm)',
                   cursor: 'pointer',
+                  position: 'relative',
                   animationDelay: `${i * 50}ms`,
                 }}
               >
+                {selectMode && (
+                  <div style={{
+                    position: 'absolute', top: 10, right: 10, zIndex: 2,
+                    width: 22, height: 22, borderRadius: '50%',
+                    border: `2px solid ${isSel ? 'var(--accent-cyan)' : 'var(--border)'}`,
+                    background: isSel ? 'var(--accent-cyan)' : 'var(--bg-panel)',
+                    color: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                    fontSize: 13, fontWeight: 700,
+                  }}>
+                    {isSel ? '✓' : ''}
+                  </div>
+                )}
                 {/* Progress bar for active jobs */}
                 {job.progress > 0 && job.progress < 100 && (
                   <div style={{ height: 2, background: 'var(--bg-elevated)' }}>

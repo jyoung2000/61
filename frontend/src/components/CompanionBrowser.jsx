@@ -92,6 +92,8 @@ export default function CompanionBrowser({ kind = 'video', onClose, onImported }
   const [importingPath, setImportingPath] = useState('');
   const [importPct, setImportPct] = useState(null);
   const [importMsg, setImportMsg] = useState('');
+  const [selectedPaths, setSelectedPaths] = useState(() => new Set());
+  const [batchMsg, setBatchMsg] = useState('');
 
   useEffect(() => {
     (async () => {
@@ -159,46 +161,74 @@ export default function CompanionBrowser({ kind = 'video', onClose, onImported }
 
   const importable = (e) => !e.is_dir && exts.includes((e.ext || '').toLowerCase());
 
-  const pollImport = (importId, entry) => {
-    setImportPct(0);
-    const tick = async () => {
+  // Import one file end-to-end. Resolves to {job_id} (video), the media/font
+  // result, or {error}. Drives importingPath/importPct for the active row.
+  const importOne = (entry) => new Promise((resolve) => {
+    setImportingPath(entry.path); setImportPct(null);
+    (async () => {
       try {
-        const r = await fetch(`/api/providers/companion-files/import-progress?import_id=${encodeURIComponent(importId)}`);
-        if (!r.ok) { setImportingPath(''); return; }
-        const p = await r.json();
-        const total = p.total || entry.size || 0;
-        setImportPct(total > 0 ? Math.min(100, Math.round((p.done / total) * 100)) : null);
-        if (p.status === 'complete') {
-          setImportingPath(''); setImportMsg(`Imported “${entry.name}” ✓`);
-          onImported && onImported({ kind: 'video', ok: true, job_id: p.job_id });
-          return;
+        const res = await fetch('/api/providers/companion-files/import', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ host_id: hostId, path: entry.path, kind, size: entry.size || 0 }),
+        });
+        const data = await res.json();
+        if (!res.ok) { resolve({ error: data.detail || res.status }); return; }
+        if (kind === 'video' && data.import_id) {
+          const poll = async () => {
+            try {
+              const r = await fetch(`/api/providers/companion-files/import-progress?import_id=${encodeURIComponent(data.import_id)}`);
+              if (!r.ok) { resolve({ job_id: data.job_id }); return; }  // popped = done
+              const p = await r.json();
+              const total = p.total || entry.size || 0;
+              setImportPct(total > 0 ? Math.min(100, Math.round((p.done / total) * 100)) : null);
+              if (p.status === 'complete') { resolve({ job_id: p.job_id }); return; }
+              if (p.status === 'error') { resolve({ error: p.error }); return; }
+              setTimeout(poll, 500);
+            } catch { setTimeout(poll, 900); }
+          };
+          poll();
+        } else {
+          resolve(data);
         }
-        if (p.status === 'error') { setImportingPath(''); setImportMsg(`Import failed: ${p.error}`); return; }
-        setTimeout(tick, 500);
-      } catch { setTimeout(tick, 900); }
-    };
-    tick();
-  };
+      } catch (e) { resolve({ error: String(e) }); }
+    })();
+  });
 
   const doImport = async (entry) => {
-    setImportingPath(entry.path); setImportMsg(''); setImportPct(null);
-    try {
-      const res = await fetch('/api/providers/companion-files/import', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ host_id: hostId, path: entry.path, kind, size: entry.size || 0 }),
-      });
-      const data = await res.json();
-      if (!res.ok) { setImportMsg(`Import failed: ${data.detail || res.status}`); setImportingPath(''); return; }
-      if (kind === 'video' && data.import_id) {
-        pollImport(data.import_id, entry);
-      } else {
-        setImportingPath(''); setImportMsg(`Imported “${entry.name}” ✓`);
-        onImported && onImported(data);
-      }
-    } catch (e) {
-      setImportMsg(`Import failed: ${e}`); setImportingPath('');
-    }
+    setImportMsg('');
+    const r = await importOne(entry);
+    setImportingPath('');
+    if (r && r.error) { setImportMsg(`Import failed: ${r.error}`); return; }
+    setImportMsg(`Imported “${entry.name}” ✓`);
+    onImported && onImported(kind === 'video' ? { kind: 'video', ok: true, job_id: r.job_id } : r);
   };
+
+  const toggleSel = (path) => setSelectedPaths((prev) => {
+    const n = new Set(prev);
+    if (n.has(path)) n.delete(path); else n.add(path);
+    return n;
+  });
+
+  const importSelected = async () => {
+    const picked = shown.filter((e) => selectedPaths.has(e.path) && importable(e));
+    if (!picked.length) return;
+    setImportMsg('');
+    let ok = 0; let firstJob = null; const mediaResults = [];
+    for (let i = 0; i < picked.length; i++) {
+      setBatchMsg(`Importing ${i + 1} of ${picked.length}…`);
+      const r = await importOne(picked[i]);        // sequential — steady on the LAN
+      if (r && !r.error) {
+        ok += 1;
+        if (kind === 'video') { if (!firstJob) firstJob = r.job_id; }
+        else mediaResults.push(r);
+      }
+    }
+    setImportingPath(''); setBatchMsg(''); setSelectedPaths(new Set());
+    setImportMsg(`Imported ${ok} of ${picked.length}`);
+    if (kind === 'video' && firstJob) onImported && onImported({ kind: 'video', ok: true, job_id: firstJob });
+    else mediaResults.forEach((r) => onImported && onImported(r));
+  };
+  const busy = !!importingPath || !!batchMsg;
 
   const onSearchKey = (e) => {
     if (e.key === 'Enter' && looksLikePath(query)) goTo(query.trim());
@@ -306,8 +336,18 @@ export default function CompanionBrowser({ kind = 'video', onClose, onImported }
                 return (
                   <div key={e.path} style={{
                     display: 'flex', gap: 12, alignItems: 'center', padding: '8px 10px',
-                    borderRadius: 10, background: 'var(--bg-elevated)',
+                    borderRadius: 10,
+                    background: selectedPaths.has(e.path) ? 'var(--accent-cyan-dim, rgba(55,182,255,0.14))' : 'var(--bg-elevated)',
                   }}>
+                    {importable(e) && (
+                      <input
+                        type="checkbox"
+                        checked={selectedPaths.has(e.path)}
+                        onChange={() => toggleSel(e.path)}
+                        title="Select for batch import"
+                        style={{ width: 18, height: 18, flexShrink: 0, cursor: 'pointer' }}
+                      />
+                    )}
                     <Thumb entry={e} hostId={hostId} />
                     <div style={{ flex: 1, minWidth: 0 }}>
                       {e.is_dir ? (
@@ -339,7 +379,7 @@ export default function CompanionBrowser({ kind = 'video', onClose, onImported }
                     {e.is_dir ? (
                       <span style={{ flexShrink: 0, opacity: 0.4, fontSize: 18 }}>›</span>
                     ) : importable(e) ? (
-                      <button onClick={() => doImport(e)} disabled={!!importingPath} style={{ flexShrink: 0, padding: '6px 14px' }}>
+                      <button onClick={() => doImport(e)} disabled={busy} style={{ flexShrink: 0, padding: '6px 14px' }}>
                         {isImporting ? '…' : 'Import'}
                       </button>
                     ) : (
@@ -352,7 +392,23 @@ export default function CompanionBrowser({ kind = 'video', onClose, onImported }
           )}
         </div>
 
-        {importMsg && (
+        {/* Batch import bar — appears when files are checked. */}
+        {(selectedPaths.size > 0 || batchMsg) && (
+          <div className="row spread" style={{ padding: '10px 16px', borderTop: `1px solid ${C}`, gap: 10 }}>
+            <span className="small" style={{ color: 'var(--text-secondary)' }}>
+              {batchMsg || `${selectedPaths.size} selected`}
+            </span>
+            <div className="row" style={{ gap: 8 }}>
+              {selectedPaths.size > 0 && !batchMsg && (
+                <button className="secondary" style={{ padding: '6px 12px' }} onClick={() => setSelectedPaths(new Set())}>Clear</button>
+              )}
+              <button onClick={importSelected} disabled={busy || selectedPaths.size === 0} style={{ padding: '6px 16px' }}>
+                {batchMsg ? 'Importing…' : `Import ${selectedPaths.size} selected`}
+              </button>
+            </div>
+          </div>
+        )}
+        {importMsg && !batchMsg && (
           <div className="small" style={{ padding: '10px 16px', borderTop: `1px solid ${C}`, color: 'var(--text-secondary)' }}>
             {importMsg}
           </div>
