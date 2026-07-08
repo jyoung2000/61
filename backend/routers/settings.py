@@ -1239,6 +1239,14 @@ async def companion_file_import(req: CompanionImportRequest):
                 )
                 await _db.save_job(job)
                 _import_progress[import_id].update({"status": "complete", "job_id": job_id})
+                # START the analysis pipeline — saving a QUEUED job does NOT
+                # enqueue it (uploads call run_analysis explicitly); without this
+                # the imported video sits at "waiting for analysis" forever.
+                try:
+                    from backend.services.pipeline import run_analysis
+                    asyncio.create_task(run_analysis(job_id))
+                except Exception as _an_err:
+                    logger.error("Imported job %s: failed to start analysis: %s", job_id, _an_err)
             except Exception as e:
                 _sh.rmtree(job_dir, ignore_errors=True)
                 _import_progress[import_id].update({"status": "error", "error": str(e)[:200]})
