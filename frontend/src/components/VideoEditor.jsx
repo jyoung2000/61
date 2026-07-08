@@ -292,6 +292,10 @@ export default function VideoEditor({
   onSubjectKeyframes,
   // Optional RenderPlan for backend slot identity (Phase D)
   renderPlan = null,
+  // Optional node rendered in the top bar next to Export (e.g. a Share button),
+  // so page-level actions live inline in the editor chrome instead of a
+  // separate header row above it.
+  headerExtras = null,
 }) {
   const { isMobile, isTablet } = useResponsive();
   const viewportClass = isMobile ? 'mobile' : isTablet ? 'tablet' : 'desktop';
@@ -303,7 +307,7 @@ export default function VideoEditor({
   });
   const [railCollapsed, setRailCollapsed] = useState(false);
   const [timelineH, setTimelineH, resetTimelineH] = usePanelSize({
-    key: 'timeline_h', viewportClass, defaultSize: 320, min: 160, max: 640,
+    key: 'timeline_h', viewportClass, defaultSize: isMobile ? 320 : 480, min: 160, max: 820,
   });
 
   // ── Multi-track editor state ──────────────────────
@@ -3232,6 +3236,11 @@ export default function VideoEditor({
               Editor
             </button>
           </Tooltip>
+          {headerExtras && (
+            <span className="ve-topbar__extras" onClick={(e) => e.stopPropagation()}>
+              {headerExtras}
+            </span>
+          )}
           <Tooltip label="Export">
             <button
               className="ve-topbar__export"
@@ -3263,6 +3272,12 @@ export default function VideoEditor({
           )}
         </div>
       )}
+
+      {/* Body: main editor column + (desktop) a full-height inspector rail to
+          its right, so Properties sits beside the preview AND the timeline —
+          no scrolling up/down between the video and its properties. */}
+      <div className="ve-editor-body">
+      <div className="ve-editor-main">
 
       {/* ── Viewport ── */}
       <div
@@ -4505,89 +4520,9 @@ export default function VideoEditor({
               </div>
             </div>
 
-            {/* Right Sidebar: Properties + Effects + Transitions stacked */}
-            {showProperties && !isMobile && (
-              <PanelDivider
-                orientation="vertical"
-                size={inspectorW}
-                onResize={setInspectorW}
-                onReset={resetInspectorW}
-                sign={-1}
-                ariaLabel="Resize inspector width"
-              />
-            )}
-            {/* Tablet: collapsed icon rail (3.2) — tap to re-expand */}
-            {showProperties && !isMobile && isTablet && railCollapsed && (
-              <div className="ve-multitrack__rail-collapsed">
-                <Tooltip label="Expand inspector">
-                  <button
-                    className="ve-btn"
-                    onClick={() => setRailCollapsed(false)}
-                  >
-                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                      <path d="M15 18l-6-6 6-6" />
-                    </svg>
-                  </button>
-                </Tooltip>
-                <span className="ve-multitrack__rail-icon" aria-hidden="true">⚙</span>
-              </div>
-            )}
-            {showProperties && !isMobile && !(isTablet && railCollapsed) && (
-              <div
-                className="ve-multitrack__sidebar ve-multitrack__sidebar--right"
-                style={{ width: inspectorW, maxWidth: inspectorW }}
-              >
-                <div className="ve-multitrack__sidebar-header">
-                  <span>Properties</span>
-                  {isTablet && (
-                    <button
-                      className="ve-btn"
-                      onClick={() => setRailCollapsed(true)}
-                      aria-label="Collapse inspector to icons"
-                      style={{ minWidth: 24, minHeight: 24, fontSize: 12 }}
-                    >
-                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                        <path d="M9 18l6-6-6-6" />
-                      </svg>
-                    </button>
-                  )}
-                  <button
-                    className="ve-header__close"
-                    onClick={() => setShowProperties(false)}
-                    aria-label="Close properties"
-                  >
-                    <Icon.Close />
-                  </button>
-                </div>
-                <EditorErrorBoundary name="Properties" compact>
-                  <PropertiesPanel compact={compact} settings={settings} onSettingsChange={onSettingsChange} />
-                </EditorErrorBoundary>
-
-                {/* Effects Section (collapsible, inside sidebar) */}
-                {showEffectsPanel && (
-                  <div className="ve-multitrack__sidebar-section">
-                    <div className="ve-multitrack__sidebar-header">
-                      <span>Effects</span>
-                      <button className="ve-header__close" onClick={() => setShowEffectsPanel(false)} aria-label="Close effects"><Icon.Close /></button>
-                    </div>
-                    <EditorErrorBoundary name="Effects" compact>
-                      <EffectsPanel />
-                    </EditorErrorBoundary>
-                  </div>
-                )}
-
-                {/* Transitions Section (collapsible, inside sidebar) */}
-                {showTransitions && (
-                  <div className="ve-multitrack__sidebar-section">
-                    <div className="ve-multitrack__sidebar-header">
-                      <span>Transitions</span>
-                      <button className="ve-header__close" onClick={() => setShowTransitions(false)} aria-label="Close transitions"><Icon.Close /></button>
-                    </div>
-                    <TransitionPicker />
-                  </div>
-                )}
-              </div>
-            )}
+            {/* Inspector moved OUT of the timeline row into a full-height rail
+                beside the whole editor (see below), so Properties sits next to
+                the preview, not only the timeline. */}
           </div>
         </div>
       )}
@@ -4643,6 +4578,71 @@ export default function VideoEditor({
           {showMultiTrack && <span><kbd>?</kbd> All shortcuts</span>}
         </div>
       )}
+      </div>{/* /ve-editor-main */}
+
+      {/* ── Inspector rail: Properties beside the preview + timeline (desktop/
+          tablet). A full-height right column so editing a cue/clip/segment
+          shows the preview updating right next to the controls — no scrolling
+          up and down between the video and its properties. */}
+      {showMultiTrack && showProperties && !isMobile && isTablet && railCollapsed && (
+        <div className="ve-editor-rail-collapsed">
+          <Tooltip label="Expand inspector">
+            <button className="ve-btn" onClick={() => setRailCollapsed(false)}>
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M15 18l-6-6 6-6" /></svg>
+            </button>
+          </Tooltip>
+          <span className="ve-multitrack__rail-icon" aria-hidden="true">⚙</span>
+        </div>
+      )}
+      {showMultiTrack && showProperties && !isMobile && !(isTablet && railCollapsed) && (
+        <>
+          <PanelDivider
+            orientation="vertical"
+            size={inspectorW}
+            onResize={setInspectorW}
+            onReset={resetInspectorW}
+            sign={-1}
+            ariaLabel="Resize inspector width"
+          />
+          <div className="ve-editor-rail" style={{ width: inspectorW, maxWidth: inspectorW }}>
+            <div className="ve-editor-rail__sticky">
+            <div className="ve-multitrack__sidebar-header ve-editor-rail__header">
+              <span>Properties</span>
+              {isTablet && (
+                <button className="ve-btn" onClick={() => setRailCollapsed(true)} aria-label="Collapse inspector to icons" style={{ minWidth: 24, minHeight: 24, fontSize: 12 }}>
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M9 18l6-6-6-6" /></svg>
+                </button>
+              )}
+              <button className="ve-header__close" onClick={() => setShowProperties(false)} aria-label="Close properties"><Icon.Close /></button>
+            </div>
+            <div className="ve-editor-rail__scroll">
+              <EditorErrorBoundary name="Properties" compact>
+                <PropertiesPanel compact={compact} settings={settings} onSettingsChange={onSettingsChange} />
+              </EditorErrorBoundary>
+              {showEffectsPanel && (
+                <div className="ve-multitrack__sidebar-section">
+                  <div className="ve-multitrack__sidebar-header">
+                    <span>Effects</span>
+                    <button className="ve-header__close" onClick={() => setShowEffectsPanel(false)} aria-label="Close effects"><Icon.Close /></button>
+                  </div>
+                  <EditorErrorBoundary name="Effects" compact><EffectsPanel /></EditorErrorBoundary>
+                </div>
+              )}
+              {showTransitions && (
+                <div className="ve-multitrack__sidebar-section">
+                  <div className="ve-multitrack__sidebar-header">
+                    <span>Transitions</span>
+                    <button className="ve-header__close" onClick={() => setShowTransitions(false)} aria-label="Close transitions"><Icon.Close /></button>
+                  </div>
+                  <TransitionPicker />
+                </div>
+              )}
+            </div>{/* /ve-editor-rail__scroll */}
+            </div>{/* /ve-editor-rail__sticky */}
+          </div>
+        </>
+      )}
+      </div>{/* /ve-editor-body */}
 
       {/* ── Command palette (⌘K) + shortcut cheat sheet (?) ── */}
       <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} ctx={actionCtx} />

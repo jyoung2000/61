@@ -2826,24 +2826,9 @@ export default function Analysis() {
         </div>
       )}
 
-      {/* Page header — surfaces a Share button so the owner can hand a
-          public link to anyone, without requiring the recipient to sign
-          in. Renders the clip-scoped variant when an export preview is
-          open so the link is automatically narrowed to that clip. */}
-      {jobId && (
-        <div style={{
-          display: 'flex', alignItems: 'center', justifyContent: 'flex-end',
-          gap: 8,
-          padding: '8px var(--page-pad, 16px)',
-          borderBottom: '1px solid var(--border, #26263a)',
-        }}>
-          <ShareButton
-            jobId={jobId}
-            clipId={showExportPreview && clipPreview ? clipPreview.id : undefined}
-            label={showExportPreview && clipPreview ? 'Share clip' : 'Share analysis'}
-          />
-        </div>
-      )}
+      {/* Share button now lives INSIDE the editor top bar (passed as
+          headerExtras to <VideoEditor>), inline with Export — no separate
+          page header row above the editor (removes the top bezel). */}
 
       {/* Pipeline diagnostics banner removed per user request —
           Whisper / heuristic / pipeline info lines were cluttering the
@@ -2860,6 +2845,14 @@ export default function Analysis() {
             <VideoEditorBoundary>
             <VideoEditor
               key={`clip-${clipPreview.id}`}
+              headerExtras={jobId ? (
+                <ShareButton
+                  jobId={jobId}
+                  clipId={clipPreview ? clipPreview.id : undefined}
+                  label="Share clip"
+                  style={{ padding: '5px 11px', background: 'transparent', color: 'var(--ve-text-muted)', border: '1px solid var(--ve-chrome-border)', borderRadius: 8, fontSize: 11, fontWeight: 600 }}
+                />
+              ) : null}
               src={videoSrc}
               clipStart={clipPreview.start_time}
               clipEnd={clipPreview.end_time}
@@ -2970,6 +2963,13 @@ export default function Analysis() {
           <div style={{ width: '100%', maxWidth: '2400px', margin: '0 auto' }}>
             <VideoEditorBoundary>
             <VideoEditor
+              headerExtras={jobId ? (
+                <ShareButton
+                  jobId={jobId}
+                  label="Share analysis"
+                  style={{ padding: '5px 11px', background: 'transparent', color: 'var(--ve-text-muted)', border: '1px solid var(--ve-chrome-border)', borderRadius: 8, fontSize: 11, fontWeight: 600 }}
+                />
+              ) : null}
               src={videoSrc}
               clipStart={fullVideoRange ? fullVideoRange.start : 0}
               clipEnd={fullVideoRange ? fullVideoRange.end : (job.duration || 0)}

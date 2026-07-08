@@ -952,7 +952,18 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
       const mediaSrc = item.mediaSrc || item.src || null;
       if (thumbCarrier && clipW >= minClipPxForThumbs && innerH > 24 && mediaSrc) {
         const thumbW = Math.round(innerH * (16 / 9));
-        const stops = computeThumbStops(item.start, item.end, pps, thumbW);
+        // Thumbnail density must follow the VISIBLE pixels, not the whole clip.
+        // computeThumbStops caps at 120 stops; spread across a 2-hour clip that
+        // is one thumb every ~64s (~3800px apart), so none land in the ~1200px
+        // viewport and the filmstrip looks blank. Generate stops only for the
+        // clip ∩ viewport window (+ a thumb-width margin for edge tiles), so
+        // density is identical whether the clip is 60s or 2h.
+        const marginT = thumbW / Math.max(pps, 0.0001);
+        const visT0 = Math.max(item.start, sx / pps - marginT);
+        const visT1 = Math.min(item.end, (sx + contentWidth) / pps + marginT);
+        const stops = visT1 > visT0
+          ? computeThumbStops(visT0, visT1, pps, thumbW)
+          : [];
         let scheduledRedraw = false;
         for (const t of stops) {
           const tx = contentLeft + t * pps - sx;

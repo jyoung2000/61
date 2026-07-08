@@ -4492,3 +4492,67 @@ input.ve-timecode--input {
   /* Track eye/mute/lock a bit larger + more spacing (kept within the lane) */
   .ve-multi-timeline__track-ctrl { min-width: 30px; min-height: 26px; }
 }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Editor body: main column + full-height inspector rail (desktop/tablet)
+   Properties sits beside the preview AND the timeline so editing a selected
+   cue/clip/segment shows the preview updating right next to the controls.
+   ═══════════════════════════════════════════════════════════════════════════ */
+.ve-container { display: flex; flex-direction: column; }
+.ve-container .ve-editor-body {
+  display: flex;
+  align-items: stretch;
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+}
+.ve-container .ve-editor-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+/* The rail column fills the full editor height (chrome background), and its
+   inner content is pinned (sticky) just under the header so Properties stays in
+   view — beside whatever part of the editor you're working on — without
+   scrolling up/down between the video and its properties. */
+.ve-container .ve-editor-rail {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--ve-chrome-bg);
+  border-left: 1px solid var(--ve-chrome-border);
+}
+.ve-container .ve-editor-rail__sticky {
+  position: sticky;
+  top: 40px;
+  max-height: calc(100dvh - 40px);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+.ve-container .ve-editor-rail__header { flex: none; }
+.ve-container .ve-editor-rail__scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.ve-container .ve-editor-rail-collapsed {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  width: 44px;
+  padding-top: 8px;
+  border-left: 1px solid var(--ve-chrome-border);
+  background: var(--ve-chrome-bg);
+}
+
+/* On phones the inspector is a bottom sheet, so the body is a single column. */
+@media (max-width: 767px) {
+  .ve-container .ve-editor-body { display: block; }
+}
