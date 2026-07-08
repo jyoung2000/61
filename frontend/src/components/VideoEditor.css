@@ -844,6 +844,7 @@ input.ve-timecode--input {
 .ve-speed__btn {
   display: flex;
   align-items: center;
+  justify-content: center;
   gap: 2px;
   padding: 4px 10px;
   border: 1px solid var(--ve-track-border);
@@ -2350,6 +2351,7 @@ input.ve-timecode--input {
 .ve-toolbar__btn {
   display: flex;
   align-items: center;
+  justify-content: center;
   gap: 4px;
   padding: 4px 8px;
   background: none;
@@ -4451,6 +4453,15 @@ input.ve-timecode--input {
   .ve-segment-inspector__volume-slider::-moz-range-thumb,
   .ve-multi-timeline__zoom-slider::-moz-range-thumb,
   .ve-volume__slider::-moz-range-thumb { width: 22px; height: 22px; }
+
+  /* Volume stays skinny even on touch — a 22px knob made the bar look chunky.
+     A slim 2px track + a small 13px knob reads as a thin volume line while
+     remaining draggable. (Overrides the shared touch-thumb rule above.) */
+  .ve-volume__slider { height: 2px; }
+  .ve-volume__slider::-webkit-slider-runnable-track,
+  .ve-volume__slider::-moz-range-track { height: 2px; }
+  .ve-volume__slider::-webkit-slider-thumb { width: 13px; height: 13px; margin-top: -5.5px; }
+  .ve-volume__slider::-moz-range-thumb { width: 13px; height: 13px; }
 
   /* Transport: speed + timecode become real tap targets */
   .ve-container .ve-speed__btn { min-height: 40px; }

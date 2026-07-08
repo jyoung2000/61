@@ -757,7 +757,11 @@ export default function SubtitleOverlay({
   const editingText = resolvedSubtitleText;
 
   return (
-    <div ref={containerRef} style={{ position: 'absolute', inset: 0, pointerEvents: 'none', zIndex: 7 }}>
+    /* z-index 12 keeps subtitles ABOVE the interactive overlay layer
+       (InteractiveOverlay root is z-index 10), so subtitles always composite
+       on top of shapes / images / text overlays — the subtitle track sits at
+       the top of the compositing order (see getCompositingOrder). */
+    <div ref={containerRef} style={{ position: 'absolute', inset: 0, pointerEvents: 'none', zIndex: 12 }}>
       {/* Constrain subtitles to the actual video content area (handles letterboxing) */}
       <div style={{
         position: 'absolute',

@@ -2407,6 +2407,7 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
       const soloed = audible(track) && !audioMuted
         && store.tracks.filter((t) => audible(t) && t.id !== track.id)
           .every((t) => (t.audioMuted !== undefined ? !!t.audioMuted : !!t.muted));
+      const tIdx = store.tracks.findIndex((t) => t.id === track.id);
       return [
         { heading: track.name || track.id },
         {
@@ -2415,6 +2416,11 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
             if (name != null && name.trim()) store.updateTrack(track.id, { name: name.trim() });
           },
         },
+        // Reorder from the menu so touch users (no HTML5 drag) can restack
+        // tracks; changing order also changes preview compositing (higher =
+        // on top) for same-type tracks. Subtitles stay on top by type priority.
+        { id: 'move-up', label: 'Move up', disabled: tIdx <= 0, onSelect: () => reorderTracks(tIdx, tIdx - 1) },
+        { id: 'move-down', label: 'Move down', disabled: tIdx < 0 || tIdx >= store.tracks.length - 1, onSelect: () => reorderTracks(tIdx, tIdx + 1) },
         { separator: true },
         { id: 'mute', label: 'Mute', checked: audioMuted, disabled: !audible(track), onSelect: () => store.toggleTrackMute(track.id) },
         {
@@ -2793,9 +2799,13 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
                   height: laneHs[trackIdx] ?? TRACK_HEIGHT,
                   marginBottom: TRACK_GAP,
                   display: 'flex',
-                  flexDirection: 'column',
+                  // Mobile: single row so the track NAME is visible inline next
+                  // to the eye/mute/lock controls (the stacked column clipped
+                  // the name in a 28px compact lane). Desktop keeps the column.
+                  flexDirection: isMobileViewport ? 'row' : 'column',
+                  alignItems: isMobileViewport ? 'center' : undefined,
                   justifyContent: 'center',
-                  gap: 2,
+                  gap: isMobileViewport ? 4 : 2,
                   padding: '2px 4px',
                   pointerEvents: 'auto',
                   opacity: isHidden ? 0.5 : (dragTrackIdx === trackIdx ? 0.4 : 1),
@@ -2816,13 +2826,18 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
                   alignItems: 'center',
                   gap: 3,
                   minWidth: 0,
+                  flex: isMobileViewport ? 1 : undefined,
                   opacity: isHidden ? 0.5 : 0.8,
                 }}>
-                  <svg width="8" height="10" viewBox="0 0 8 10" fill="currentColor" style={{ opacity: 0.35, flexShrink: 0 }}>
-                    <circle cx="2" cy="2" r="1" /><circle cx="6" cy="2" r="1" />
-                    <circle cx="2" cy="5" r="1" /><circle cx="6" cy="5" r="1" />
-                    <circle cx="2" cy="8" r="1" /><circle cx="6" cy="8" r="1" />
-                  </svg>
+                  {/* Drag-to-reorder handle — desktop only (touch uses the
+                      long-press menu's Move up/down). */}
+                  {!isMobileViewport && (
+                    <svg width="8" height="10" viewBox="0 0 8 10" fill="currentColor" style={{ opacity: 0.35, flexShrink: 0 }}>
+                      <circle cx="2" cy="2" r="1" /><circle cx="6" cy="2" r="1" />
+                      <circle cx="2" cy="5" r="1" /><circle cx="6" cy="5" r="1" />
+                      <circle cx="2" cy="8" r="1" /><circle cx="6" cy="8" r="1" />
+                    </svg>
+                  )}
                   {TRACK_ICONS[track.type] || ''}{' '}
                   {renamingTrackId === track.id ? (
                     <input
@@ -2871,7 +2886,7 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
                   )}
                 </span>
                 {/* Controls row */}
-                <div style={{ display: 'flex', gap: 1 }}>
+                <div style={{ display: 'flex', gap: 1, flexShrink: 0 }}>
                   {/* Visibility toggle (eye icon) — preview only */}
                   <button
                     onClick={(e) => {
