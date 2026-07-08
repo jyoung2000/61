@@ -561,8 +561,31 @@ async fn files_list(
         .into_response()
 }
 
-/// /v1/files/read?path=… → stream a shared file's bytes (64 KB chunks, no full
-/// in-memory load) so ClipAI can pull large videos.
+/// Parse a single-range `Range: bytes=START-END` header against a known total.
+/// Supports `start-end`, `start-` (to EOF) and `-suffix` (last N). Returns the
+/// inclusive (start, end) clamped to the file, or None when unsatisfiable.
+fn parse_range(h: &str, total: u64) -> Option<(u64, u64)> {
+    let s = h.trim().strip_prefix("bytes=")?;
+    let (a, b) = s.split_once('-')?;
+    let (a, b) = (a.trim(), b.trim());
+    if a.is_empty() {
+        let n: u64 = b.parse().ok()?;
+        if n == 0 || total == 0 {
+            return None;
+        }
+        return Some((total.saturating_sub(n), total - 1));
+    }
+    let start: u64 = a.parse().ok()?;
+    let end: u64 = if b.is_empty() { total.saturating_sub(1) } else { b.parse().ok()? };
+    if total == 0 || start > end || start >= total {
+        return None;
+    }
+    Some((start, end.min(total - 1)))
+}
+
+/// /v1/files/read?path=… → stream a shared file's bytes in 1 MB chunks. Supports
+/// HTTP Range (206) so ClipAI can pull big videos with PARALLEL segments (to
+/// match multi-connection upload speed) and so browsers can seek.
 async fn files_read(
     State(ctx): State<ProxyCtx>,
     headers: HeaderMap,
@@ -585,40 +608,62 @@ async fn files_read(
     if !path.is_file() {
         return (StatusCode::BAD_REQUEST, "not a file").into_response();
     }
-    let file = match tokio::fs::File::open(&path).await {
+    let total = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    let range = headers
+        .get("range")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|h| parse_range(h, total));
+
+    let mut file = match tokio::fs::File::open(&path).await {
         Ok(f) => f,
         Err(e) => {
             return (StatusCode::INTERNAL_SERVER_ERROR, format!("open failed: {e}")).into_response()
         }
     };
-    use tokio::io::AsyncReadExt;
-    let stream = futures_util::stream::try_unfold(file, |mut f| async move {
-        // 1 MB chunks (not 64 KB): ~16x fewer read/poll/HTTP round-trips, which
-        // is what lets a shared-file pull actually saturate a gigabit LAN
-        // instead of crawling at tens of Mbps.
-        let mut buf = vec![0u8; 1024 * 1024];
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let (status, start, len) = match range {
+        Some((s, e)) => (StatusCode::PARTIAL_CONTENT, s, e - s + 1),
+        None => (StatusCode::OK, 0u64, total),
+    };
+    if start > 0 {
+        if let Err(e) = file.seek(std::io::SeekFrom::Start(start)).await {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("seek failed: {e}")).into_response();
+        }
+    }
+    // Stream EXACTLY `len` bytes in 1 MB chunks (16x fewer round-trips than the
+    // old 64 KB reads → a single stream can saturate a gigabit LAN; parallel
+    // Range segments push it further, matching multi-connection upload speed).
+    let stream = futures_util::stream::try_unfold((file, len), |(mut f, remaining)| async move {
+        if remaining == 0 {
+            return Ok::<_, std::io::Error>(None);
+        }
+        let want = remaining.min(1024 * 1024) as usize;
+        let mut buf = vec![0u8; want];
         let n = f.read(&mut buf).await?;
         if n == 0 {
-            Ok::<_, std::io::Error>(None)
-        } else {
-            buf.truncate(n);
-            Ok(Some((axum::body::Bytes::from(buf), f)))
+            return Ok(None);
         }
+        buf.truncate(n);
+        Ok(Some((axum::body::Bytes::from(buf), (f, remaining - n as u64))))
     });
     let fname = path
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("file")
         .to_string();
-    Response::builder()
-        .status(StatusCode::OK)
+    let mut builder = Response::builder()
+        .status(status)
         .header("content-type", "application/octet-stream")
-        .header(
-            "content-disposition",
-            format!("attachment; filename=\"{fname}\""),
-        )
-        .body(Body::from_stream(stream))
-        .unwrap()
+        .header("accept-ranges", "bytes")
+        .header("content-length", len.to_string())
+        .header("content-disposition", format!("attachment; filename=\"{fname}\""));
+    if status == StatusCode::PARTIAL_CONTENT {
+        builder = builder.header(
+            "content-range",
+            format!("bytes {}-{}/{}", start, start + len - 1, total),
+        );
+    }
+    builder.body(Body::from_stream(stream)).unwrap()
 }
 
 /// /v1/logs → the full diagnostics report as plain text, so the ClipAI web app

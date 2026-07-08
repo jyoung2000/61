@@ -996,6 +996,71 @@ class CompanionImportRequest(BaseModel):
 _import_progress: dict = {}
 
 
+async def _companion_download(read_url, params, headers, dest, total, on_done):
+    """Download a shared file to ``dest``. Uses PARALLEL HTTP Range segments when
+    the Companion supports them — several connections at once, the same trick
+    that makes browser uploads fast — else a single 1 MB-chunked stream.
+    ``on_done(bytes_so_far)`` drives the progress bar. Returns bytes written."""
+    supports_range = False
+    if total and total > 8 * 1024 * 1024:
+        try:
+            async with httpx.AsyncClient(timeout=15) as c:
+                r = await c.get(read_url, params=params,
+                                headers={**headers, "Range": "bytes=0-0"})
+                supports_range = (r.status_code == 206)
+        except Exception:
+            supports_range = False
+
+    if supports_range:
+        SEG = 32 * 1024 * 1024          # 32 MB per segment
+        segments = []
+        off = 0
+        while off < total:
+            end = min(off + SEG, total) - 1
+            segments.append((off, end))
+            off = end + 1
+        with open(dest, "wb") as f:     # preallocate the full file
+            f.truncate(total)
+        fd = os.open(dest, os.O_WRONLY)
+        counter = {"n": 0}
+        sem = asyncio.Semaphore(6)      # up to 6 connections at once
+
+        async def _seg(start, end):
+            async with sem:
+                async with httpx.AsyncClient(timeout=None) as c:
+                    async with c.stream("GET", read_url, params=params,
+                                        headers={**headers, "Range": f"bytes={start}-{end}"}) as resp:
+                        if resp.status_code not in (206, 200):
+                            raise RuntimeError(f"range {start}-{end}: HTTP {resp.status_code}")
+                        pos = start
+                        async for chunk in resp.aiter_bytes(1024 * 1024):
+                            w = 0
+                            while w < len(chunk):
+                                w += os.pwrite(fd, chunk[w:], pos + w)
+                            pos += len(chunk)
+                            counter["n"] += len(chunk)
+                            on_done(counter["n"])
+        try:
+            await asyncio.gather(*[_seg(s, e) for s, e in segments])
+        finally:
+            os.close(fd)
+        return counter["n"]
+
+    # Single-stream fallback (range unsupported / size unknown / small file).
+    size = 0
+    async with httpx.AsyncClient(timeout=None) as c:
+        async with c.stream("GET", read_url, params=params, headers=headers) as resp:
+            if resp.status_code != 200:
+                body = (await resp.aread())[:200].decode("utf-8", "ignore")
+                raise RuntimeError(f"companion read {resp.status_code}: {body}")
+            with open(dest, "wb", buffering=4 * 1024 * 1024) as f:
+                async for chunk in resp.aiter_bytes(1024 * 1024):
+                    f.write(chunk)
+                    size += len(chunk)
+                    on_done(size)
+    return size
+
+
 def _companion_by_id(host_id: str):
     from backend.services import ollama_registry as _oreg
     for h in _oreg.get_hosts():
@@ -1152,22 +1217,16 @@ async def companion_file_import(req: CompanionImportRequest):
             from backend.models import JobResult, JobStatus
             job_dir = f"/data/uploads/{job_id}"
             os.makedirs(job_dir, exist_ok=True)
-            dest = os.path.join(job_dir, filename)
-            size = 0
+            # Save to the CANONICAL path the pipeline + preview player expect
+            # (/data/uploads/<job>/video.<ext>) — not the original filename, or
+            # the analysis-page player's /api/files/<job>/video.<ext> 404s
+            # ("Failed to load video"). The original name rides on job.filename.
+            _ext = (os.path.splitext(filename)[1].lstrip(".").lower() or "mp4")
+            dest = os.path.join(job_dir, f"video.{_ext}")
             try:
-                async with httpx.AsyncClient(timeout=None) as client:
-                    async with client.stream("GET", read_url, params={"path": req.path},
-                                             headers=headers) as resp:
-                        if resp.status_code != 200:
-                            body = (await resp.aread())[:200].decode("utf-8", "ignore")
-                            raise RuntimeError(f"companion read {resp.status_code}: {body}")
-                        # 1 MB chunks + a big write buffer so the pull can run at
-                        # LAN speed instead of being throttled by tiny reads.
-                        with open(dest, "wb", buffering=4 * 1024 * 1024) as f:
-                            async for chunk in resp.aiter_bytes(1024 * 1024):
-                                f.write(chunk)
-                                size += len(chunk)
-                                _import_progress[import_id]["done"] = size
+                size = await _companion_download(
+                    read_url, {"path": req.path}, headers, dest, int(req.size or 0),
+                    lambda n: _import_progress[import_id].__setitem__("done", n))
                 if size == 0:
                     raise RuntimeError("imported file is empty")
                 now = datetime.now(timezone.utc).isoformat()
