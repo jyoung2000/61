@@ -3464,8 +3464,16 @@ def _planner_fingerprint() -> str:
     return ";".join(f"{k}={os.environ.get(k, '')}" for k in _PLANNER_ENV_FLAGS)
 
 
-async def run_analysis(job_id: str):
-    """Execute the full analysis pipeline for a video job."""
+async def run_analysis(job_id: str, resume: bool = False):
+    """Execute the full analysis pipeline for a video job.
+
+    ``resume=False`` (the default for every user-initiated run — upload,
+    import, re-analyze) is a FRESH run: any saved checkpoint from a previous
+    run is discarded so detection, Whisper transcription, and translation all
+    run fresh. ``resume=True`` is used ONLY by the startup auto-resume of a job
+    that was interrupted mid-analysis, where reusing the saved detection +
+    transcription to continue where it left off is the whole point.
+    """
     # Clear any stale finalization gate from a previous run so this run's
     # progress writes (and the QUEUED reset below) aren't suppressed.
     _finalizing_jobs.discard(job_id)
@@ -3515,7 +3523,7 @@ async def run_analysis(job_id: str):
                         sum(1 for k, v in _overlay.items() if v),
                         (_owner_id or "")[:8],
                     )
-                await _run_analysis_inner(job_id)
+                await _run_analysis_inner(job_id, resume=resume)
         except CancelledError:
             logger.info(f"Job {job_id} cancelled by user")
             await database.update_job_status(
@@ -3634,10 +3642,19 @@ def _select_dominant_face(faces, last_x=None):
     return best
 
 
-async def _run_analysis_inner(job_id: str):
+async def _run_analysis_inner(job_id: str, resume: bool = False):
     job = await database.load_job(job_id)
     if not job:
         raise RuntimeError(f"Job {job_id} not found")
+
+    # Fresh (user-initiated) run: discard any checkpoint from a previous run so
+    # nothing is silently reused — fresh detection, fresh Whisper, fresh
+    # translation. Only the startup auto-resume (resume=True) keeps checkpoints.
+    if not resume:
+        try:
+            pipeline_checkpoint.clear_checkpoints(job_id)
+        except Exception as _clr_err:
+            logger.info("[%s] checkpoint clear skipped (%s)", job_id, _clr_err)
 
     video_path = job.file_path
     job_dir = f"/data/uploads/{job_id}"
@@ -4653,7 +4670,10 @@ async def _run_analysis_inner(job_id: str):
     engine = None
     reframer_plan = None
     perception = None
-    if not _force_reanalyze:
+    # Only reuse a saved checkpoint when this is an actual resume of an
+    # interrupted job. A fresh (user-initiated) run already cleared the
+    # checkpoints above, and must re-detect + re-transcribe + re-translate.
+    if resume and not _force_reanalyze:
         try:
             _ckpt = await pipeline_checkpoint.load_engine_checkpoint(
                 job_id, signature=_engine_ckpt_signature)

@@ -192,6 +192,28 @@ def checkpoint_dir(job_id: str) -> str:
     return f"/data/uploads/{job_id}/checkpoint"
 
 
+def clear_checkpoints(job_id: str) -> bool:
+    """Delete ALL saved checkpoints for a job — the engine checkpoint
+    (detection + Whisper transcription + reframe plan) AND every stage
+    checkpoint (translation, judge verdicts) that live under the same dir.
+
+    Called at the start of a FRESH (user-initiated) run so nothing from a
+    previous run is silently reused: fresh detection, fresh Whisper, fresh
+    translation. The auto-resume-after-crash path deliberately does NOT call
+    this. Returns True when a checkpoint dir was removed. Fail-soft."""
+    import shutil
+    d = checkpoint_dir(job_id)
+    try:
+        if os.path.isdir(d):
+            shutil.rmtree(d, ignore_errors=True)
+            logger.info("[%s] Cleared saved checkpoints (%s) — this run will "
+                        "re-detect + re-transcribe + re-translate", job_id, d)
+            return True
+    except Exception as exc:  # noqa: BLE001 — clearing must never break a run
+        logger.warning("[%s] Failed to clear checkpoints (%s): %s", job_id, d, exc)
+    return False
+
+
 def checkpoint_signature(
     *,
     source_sha: str,

@@ -161,8 +161,9 @@ def test_resume_drainer_runs_jobs_sequentially_after_delay(monkeypatch):
 
     calls = []
 
-    async def fake_run(jid):
-        calls.append(jid)
+    async def fake_run(jid, resume=False):
+        # Auto-resume must reuse the saved checkpoint → resume=True.
+        calls.append((jid, resume))
 
     monkeypatch.setattr(pl, "run_analysis", fake_run)
     monkeypatch.setenv("CLIPAI_RESUME_DELAY_S", "0")  # no grace delay in the test
@@ -178,7 +179,8 @@ def test_resume_drainer_runs_jobs_sequentially_after_delay(monkeypatch):
                 break
 
     asyncio.run(go())
-    assert calls == ["j1", "j2"]  # ran sequentially, in order
+    # ran sequentially, in order, each as a resume (checkpoint reuse)
+    assert calls == [("j1", True), ("j2", True)]
 
 
 if __name__ == "__main__":

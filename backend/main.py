@@ -963,7 +963,10 @@ async def _drain_resume_queue() -> None:
         jid = _resume_queue.pop(0)
         try:
             logger.info("Auto-resume: starting deferred run for %s", jid)
-            await run_analysis(jid)
+            # resume=True: this job was interrupted mid-analysis, so reuse its
+            # saved checkpoint (detection + transcription) to continue where it
+            # left off. User-initiated runs default to resume=False (fresh).
+            await run_analysis(jid, resume=True)
             logger.info("Auto-resume: finished run for %s", jid)
         except Exception as exc:  # noqa: BLE001 — one bad job must not block the rest
             logger.warning("Auto-resume run for %s failed: %s", jid, exc)
