@@ -518,8 +518,10 @@ function InteractiveElement({
               .filter((o) => o.id !== it.id && o.position
                 && o.type !== 'audio' && o.type !== 'subtitle' && o.type !== 'video')
               .map((o) => ({ x: o.position.x, y: o.position.y, w: o.size?.w || 0, h: o.size?.h || 0 }));
-            const thX = (7 / (ds.containerW || 1)) * 100;
-            const thY = (7 / (ds.containerH || 1)) * 100;
+            // ~12px pull on each axis, converted to the % space of each
+            // dimension, so vertical and horizontal snapping feel identical.
+            const thX = (12 / (ds.containerW || 1)) * 100;
+            const thY = (12 / (ds.containerH || 1)) * 100;
             const snapped = snapToGuides({ x: newX, y: newY, w: sz.w, h: sz.h, others, thX, thY });
             newX = snapped.x;
             newY = snapped.y;

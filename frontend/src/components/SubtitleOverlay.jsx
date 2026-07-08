@@ -498,8 +498,8 @@ export default function SubtitleOverlay({
             .filter((o) => !ds.dragIds.includes(o.id) && o.position
               && o.type !== 'audio' && o.type !== 'video')
             .map((o) => ({ x: o.position.x, y: o.position.y, w: o.size?.w || 0, h: o.size?.h || 0 }));
-          const thX = (7 / ds.containerW) * 100;
-          const thY = (7 / ds.containerH) * 100;
+          const thX = (12 / ds.containerW) * 100;
+          const thY = (12 / ds.containerH) * 100;
           const snapped = snapToGuides({ x: rawX, y: rawY, w: 0, h: 0, others, thX, thY });
           dxPct += snapped.x - rawX;
           dyPct += snapped.y - rawY;
