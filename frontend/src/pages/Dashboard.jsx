@@ -253,60 +253,7 @@ export default function Dashboard() {
 
       {/* Search & Filter Bar */}
       {jobs.length > 0 && (
-        <div style={{ marginBottom: 12, display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
-          {!selectMode ? (
-            <button
-              onClick={() => setSelectMode(true)}
-              style={{
-                padding: '8px 14px', background: 'var(--bg-elevated)', color: 'var(--text-secondary)',
-                border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', fontSize: 13, cursor: 'pointer',
-              }}
-              title="Select multiple projects to delete at once"
-            >
-              Select
-            </button>
-          ) : (
-            <>
-              <span style={{ fontSize: 13, color: 'var(--text-secondary)', marginRight: 4 }}>
-                {selected.size} selected
-              </span>
-              <button
-                onClick={() => setSelected(new Set(filteredJobs.map((j) => j.job_id)))}
-                style={{ padding: '8px 12px', background: 'var(--bg-elevated)', color: 'var(--text-secondary)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', fontSize: 13, cursor: 'pointer' }}
-              >
-                Select all
-              </button>
-              <button
-                onClick={() => setSelected(new Set())}
-                style={{ padding: '8px 12px', background: 'var(--bg-elevated)', color: 'var(--text-secondary)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', fontSize: 13, cursor: 'pointer' }}
-              >
-                Clear
-              </button>
-              <button
-                onClick={bulkDelete}
-                disabled={selected.size === 0 || bulkBusy}
-                style={{
-                  padding: '8px 14px', background: selected.size > 0 ? 'var(--danger)' : 'var(--bg-elevated)',
-                  color: selected.size > 0 ? '#fff' : 'var(--text-muted)', border: 'none',
-                  borderRadius: 'var(--radius-sm)', fontSize: 13, fontWeight: 600,
-                  cursor: selected.size > 0 && !bulkBusy ? 'pointer' : 'default',
-                }}
-              >
-                {bulkBusy ? 'Deleting…' : `Delete${selected.size ? ` (${selected.size})` : ''}`}
-              </button>
-              <button
-                onClick={exitSelectMode}
-                style={{ padding: '8px 12px', background: 'var(--bg-elevated)', color: 'var(--text-secondary)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', fontSize: 13, cursor: 'pointer' }}
-              >
-                Cancel
-              </button>
-            </>
-          )}
-        </div>
-      )}
-
-      {jobs.length > 0 && (
-        <div style={{ marginBottom: 16, display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'stretch' }}>
+        <div style={{ marginBottom: selectMode ? 12 : 16, display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'stretch' }}>
           {/* Search input */}
           <div style={{ position: 'relative', flex: '1 1 220px', minWidth: 0 }}>
             <div style={{
@@ -389,6 +336,55 @@ export default function Dashboard() {
             <option value="name">By Name</option>
             <option value="clips">Most Clips</option>
           </select>
+
+          {/* Multi-select toggle — inline with the search / filter bar. */}
+          <button
+            onClick={() => (selectMode ? exitSelectMode() : setSelectMode(true))}
+            style={{
+              padding: '10px 14px', fontSize: 13, cursor: 'pointer',
+              borderRadius: 'var(--radius-md)',
+              background: selectMode ? 'var(--accent-cyan-dim)' : 'var(--bg-panel)',
+              border: `1px solid ${selectMode ? 'var(--accent-cyan)' : 'var(--border)'}`,
+              color: selectMode ? 'var(--accent-cyan)' : 'var(--text-secondary)',
+              fontWeight: selectMode ? 600 : 400, whiteSpace: 'nowrap',
+            }}
+            title="Select multiple projects to delete at once"
+          >
+            {selectMode ? 'Done' : 'Multi-select'}
+          </button>
+        </div>
+      )}
+
+      {/* Bulk-action bar — appears once multi-select is on. */}
+      {jobs.length > 0 && selectMode && (
+        <div style={{ marginBottom: 16, display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+          <span style={{ fontSize: 13, color: 'var(--text-secondary)', marginRight: 4 }}>
+            {selected.size} selected
+          </span>
+          <button
+            onClick={() => setSelected(new Set(filteredJobs.map((j) => j.job_id)))}
+            style={{ padding: '8px 12px', background: 'var(--bg-elevated)', color: 'var(--text-secondary)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', fontSize: 13, cursor: 'pointer' }}
+          >
+            Select all
+          </button>
+          <button
+            onClick={() => setSelected(new Set())}
+            style={{ padding: '8px 12px', background: 'var(--bg-elevated)', color: 'var(--text-secondary)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', fontSize: 13, cursor: 'pointer' }}
+          >
+            Clear
+          </button>
+          <button
+            onClick={bulkDelete}
+            disabled={selected.size === 0 || bulkBusy}
+            style={{
+              padding: '8px 14px', background: selected.size > 0 ? 'var(--danger)' : 'var(--bg-elevated)',
+              color: selected.size > 0 ? '#fff' : 'var(--text-muted)', border: 'none',
+              borderRadius: 'var(--radius-sm)', fontSize: 13, fontWeight: 600,
+              cursor: selected.size > 0 && !bulkBusy ? 'pointer' : 'default',
+            }}
+          >
+            {bulkBusy ? 'Deleting…' : `Delete${selected.size ? ` (${selected.size})` : ''}`}
+          </button>
         </div>
       )}
 
