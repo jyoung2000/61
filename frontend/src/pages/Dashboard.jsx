@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import useResponsive from '../hooks/useResponsive';
-import { exportProject, exportProjectBlocking, importProject } from '../utils/projectBundle';
+import { exportProjectBlocking, exportProjectWithProgress, importProject } from '../utils/projectBundle';
 
 function formatDuration(seconds) {
   if (!seconds) return '-';
@@ -61,15 +61,25 @@ export default function Dashboard() {
   const [importing, setImporting] = useState(false);
   const [importPct, setImportPct] = useState(0);
   const [exportingId, setExportingId] = useState(null);
+  const [exportPct, setExportPct] = useState(0);   // -1 = size unknown (indeterminate)
+  // Bulk export progress: { done, total } while exporting a multi-selection.
+  const [bulkExport, setBulkExport] = useState(null);
   // Delete confirmation modal (single or bulk) with an "export first" option.
   const [deleteModal, setDeleteModal] = useState(null); // { ids: string[] } | null
   const [exportBeforeDelete, setExportBeforeDelete] = useState(true);
 
-  const handleExport = (e, jobId) => {
+  const handleExport = async (e, jobId) => {
     if (e) e.stopPropagation();
     setExportingId(jobId);
-    try { exportProject(jobId); }
-    finally { setTimeout(() => setExportingId(null), 2500); }
+    setExportPct(0);
+    try {
+      await exportProjectWithProgress(jobId, {}, setExportPct);
+    } catch (err) {
+      window.alert(`Export failed: ${err.message || err}`);
+    } finally {
+      setExportingId(null);
+      setExportPct(0);
+    }
   };
 
   const handleImportPick = () => importInputRef.current?.click();
@@ -91,11 +101,24 @@ export default function Dashboard() {
     }
   };
 
-  // Export several selected projects (staggered so the browser queues each
-  // download instead of dropping all but the last).
-  const exportSelected = () => {
+  // Export several selected projects SEQUENTIALLY with a progress bar — one at a
+  // time so we never buffer multiple multi-GB bundles at once, and the user sees
+  // "Exporting k/N (pct%)" rather than a silent burst of downloads.
+  const exportSelected = async () => {
     const ids = Array.from(selected);
-    ids.forEach((id, i) => setTimeout(() => exportProject(id), i * 800));
+    if (!ids.length || bulkExport) return;
+    setBulkExport({ done: 0, total: ids.length });
+    for (let i = 0; i < ids.length; i++) {
+      setExportingId(ids[i]);
+      setExportPct(0);
+      try {
+        await exportProjectWithProgress(ids[i], {}, setExportPct);
+      } catch { /* skip a failed one, keep going */ }
+      setBulkExport({ done: i + 1, total: ids.length });
+    }
+    setExportingId(null);
+    setExportPct(0);
+    setBulkExport(null);
   };
 
   // Track cancelled job IDs so the 5-second poll never brings them back
@@ -515,11 +538,26 @@ export default function Dashboard() {
           </button>
           <button
             onClick={exportSelected}
-            disabled={selected.size === 0 || bulkBusy}
-            style={{ padding: '8px 12px', background: 'var(--bg-elevated)', color: 'var(--text-secondary)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', fontSize: 13, cursor: selected.size > 0 && !bulkBusy ? 'pointer' : 'default' }}
+            disabled={selected.size === 0 || bulkBusy || !!bulkExport}
+            style={{ position: 'relative', overflow: 'hidden', padding: '8px 12px', background: 'var(--bg-elevated)', color: 'var(--text-secondary)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', fontSize: 13, cursor: selected.size > 0 && !bulkBusy && !bulkExport ? 'pointer' : 'default', minWidth: bulkExport ? 180 : undefined }}
             title="Download each selected project as a .clipai.zip"
           >
-            Export{selected.size ? ` (${selected.size})` : ''}
+            {bulkExport && (
+              <span
+                aria-hidden="true"
+                style={{
+                  position: 'absolute', left: 0, top: 0, bottom: 0,
+                  width: `${Math.round(((bulkExport.done + (exportPct > 0 ? exportPct / 100 : 0)) / Math.max(1, bulkExport.total)) * 100)}%`,
+                  background: 'var(--accent-cyan-dim, rgba(56,189,248,0.25))',
+                  transition: 'width 0.2s ease',
+                }}
+              />
+            )}
+            <span style={{ position: 'relative' }}>
+              {bulkExport
+                ? `Exporting ${Math.min(bulkExport.done + 1, bulkExport.total)}/${bulkExport.total}${exportPct >= 0 ? ` (${exportPct}%)` : '…'}`
+                : `Export${selected.size ? ` (${selected.size})` : ''}`}
+            </span>
           </button>
           <button
             onClick={bulkDelete}
@@ -684,15 +722,33 @@ export default function Dashboard() {
                         onClick={(e) => handleExport(e, job.job_id)}
                         disabled={exportingId === job.job_id}
                         style={{
+                          position: 'relative', overflow: 'hidden',
                           padding: '6px 14px', background: 'var(--bg-elevated)',
                           border: '1px solid var(--border)', color: 'var(--text-secondary)',
                           fontSize: 12, fontWeight: 600,
                           cursor: exportingId === job.job_id ? 'default' : 'pointer',
-                          borderRadius: 'var(--radius-sm)', opacity: exportingId === job.job_id ? 0.7 : 1,
+                          borderRadius: 'var(--radius-sm)', opacity: exportingId === job.job_id ? 0.85 : 1,
+                          minWidth: exportingId === job.job_id ? 128 : undefined,
                         }}
                         title="Download this project as a .clipai.zip you can re-import later"
                       >
-                        {exportingId === job.job_id ? 'Preparing…' : 'Export'}
+                        {exportingId === job.job_id && (
+                          <span
+                            aria-hidden="true"
+                            style={{
+                              position: 'absolute', left: 0, top: 0, bottom: 0,
+                              width: exportPct < 0 ? '100%' : `${exportPct}%`,
+                              background: 'var(--accent-cyan-dim, rgba(56,189,248,0.25))',
+                              transition: 'width 0.2s ease',
+                              opacity: exportPct < 0 ? 0.4 : 1,
+                            }}
+                          />
+                        )}
+                        <span style={{ position: 'relative' }}>
+                          {exportingId === job.job_id
+                            ? (exportPct < 0 ? 'Exporting…' : `Exporting… ${exportPct}%`)
+                            : 'Export'}
+                        </span>
                       </button>
                     )}
                     {CANCELLABLE.includes(job.status) && (

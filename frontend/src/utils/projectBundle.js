@@ -70,6 +70,70 @@ export async function exportProjectBlocking(jobId, opts = {}) {
 }
 
 /**
+ * Export a project WITH a download-progress callback, then save the
+ * `.clipai.zip` to disk. Uses an XHR so we get `onprogress` (the export
+ * endpoint streams a FileResponse with Content-Length, so progress is
+ * computable). The bundle is buffered as a Blob on the user's machine, so run
+ * these one at a time for large videos. Resolves once the file has been saved.
+ * @param {string} jobId
+ * @param {object} [opts] same flags as exportProject
+ * @param {(pct:number)=>void} [onProgress] 0–100 download progress (-1 = unknown size)
+ * @returns {Promise<void>}
+ */
+export function exportProjectWithProgress(jobId, opts = {}, onProgress) {
+  return new Promise((resolve, reject) => {
+    const params = new URLSearchParams({
+      include_cache: String(opts.includeCache ?? false),
+      include_outputs: String(opts.includeOutputs ?? false),
+      include_thumbnails: String(opts.includeThumbnails ?? true),
+    });
+    const url = `/api/jobs/${encodeURIComponent(jobId)}/export?${params.toString()}`;
+
+    const xhr = new XMLHttpRequest();
+    xhr.open('GET', url);
+    xhr.responseType = 'blob';
+
+    if (onProgress) {
+      xhr.onprogress = (e) => {
+        // lengthComputable is false when the server/proxy omits Content-Length
+        // (e.g. chunked) — report -1 so the UI can show an indeterminate bar.
+        if (e.lengthComputable && e.total > 0) {
+          onProgress(Math.round((e.loaded / e.total) * 100));
+        } else {
+          onProgress(-1);
+        }
+      };
+    }
+
+    xhr.onload = () => {
+      if (xhr.status < 200 || xhr.status >= 300) {
+        reject(new Error(`Export failed (HTTP ${xhr.status})`));
+        return;
+      }
+      try {
+        const dispo = xhr.getResponseHeader('content-disposition') || '';
+        const m = /filename="?([^"]+)"?/i.exec(dispo);
+        const name = (m && m[1]) || `${jobId}.clipai.zip`;
+        const objUrl = URL.createObjectURL(xhr.response);
+        const a = document.createElement('a');
+        a.href = objUrl;
+        a.download = name;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(objUrl);
+        if (onProgress) onProgress(100);
+        resolve();
+      } catch (err) {
+        reject(err);
+      }
+    };
+    xhr.onerror = () => reject(new Error('Network error during export'));
+    xhr.send();
+  });
+}
+
+/**
  * Upload a project bundle to create a new job.
  * @param {File} file  a `.clipai.zip` (or any .zip) chosen by the user
  * @param {(pct:number)=>void} [onProgress] 0–100 upload progress
