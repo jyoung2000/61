@@ -987,6 +987,13 @@ class CompanionImportRequest(BaseModel):
     host_id: str
     path: str
     kind: str = "video"          # "video" | "media" | "font"
+    size: int = 0                # known file size (from the listing) for % progress
+
+
+# In-memory progress for in-flight Companion video imports, keyed by a short
+# import_id. The browser polls /companion-files/import-progress to drive a real
+# progress bar (video files can be many hundreds of MB over the LAN).
+_import_progress: dict = {}
 
 
 def _companion_by_id(host_id: str):
@@ -1047,6 +1054,55 @@ async def companion_file_list(host_id: str, path: str):
     return r.json()
 
 
+@router.get("/providers/companion-files/thumb")
+async def companion_file_thumb(host_id: str, path: str, v: str = ""):
+    """Return a small JPEG thumbnail for a shared image/video, generated with
+    ffmpeg reading the file straight off the Companion (auth'd). Cached on disk.
+    Returns 204 (no content) on any failure so the browser falls back to an
+    icon — never blocks the file browser. Video thumbs can be slow for large
+    moov-at-end files (no range seek yet); a 20s cap guards that."""
+    import hashlib
+    import subprocess
+    import urllib.parse
+    from fastapi.responses import FileResponse, Response
+    from backend.services import ollama_registry as _oreg
+
+    h = _companion_by_id(host_id)
+    if h is None:
+        return Response(status_code=204)
+    ext = os.path.splitext(path)[1].lower().lstrip(".")
+    IMAGE = {"png", "jpg", "jpeg", "gif", "webp", "bmp", "tiff"}
+    VIDEO = {"mp4", "mov", "mkv", "webm", "avi", "m4v", "mpg", "mpeg", "wmv", "flv"}
+    if ext not in IMAGE and ext not in VIDEO:
+        return Response(status_code=204)
+
+    cache_dir = "/tmp/clipai_companion_thumbs"
+    os.makedirs(cache_dir, exist_ok=True)
+    key = hashlib.md5(f"{host_id}|{path}|{v}".encode()).hexdigest()
+    out = os.path.join(cache_dir, key + ".jpg")
+    if os.path.isfile(out) and os.path.getsize(out) > 0:
+        return FileResponse(out, media_type="image/jpeg",
+                            headers={"Cache-Control": "max-age=86400"})
+
+    base = _oreg.companion_base(h)
+    read_url = _oreg.join_url(base, "/v1/files/read") + "?" + urllib.parse.urlencode({"path": path})
+    cmd = ["ffmpeg", "-y", "-loglevel", "error"]
+    tok = getattr(h, "token", "") or ""
+    if tok:
+        cmd += ["-headers", f"Authorization: Bearer {tok}\r\n"]
+    if ext in VIDEO:
+        cmd += ["-ss", "1"]          # grab a frame ~1s in (input seek)
+    cmd += ["-i", read_url, "-frames:v", "1", "-vf", "scale=360:-2", out]
+    try:
+        subprocess.run(cmd, capture_output=True, timeout=20)
+    except Exception:
+        pass
+    if os.path.isfile(out) and os.path.getsize(out) > 0:
+        return FileResponse(out, media_type="image/jpeg",
+                            headers={"Cache-Control": "max-age=86400"})
+    return Response(status_code=204)
+
+
 @router.post("/providers/companion-files/import")
 async def companion_file_import(req: CompanionImportRequest):
     """Pull a file from a Companion's shared folder into ClipAI: a video becomes
@@ -1078,35 +1134,57 @@ async def companion_file_import(req: CompanionImportRequest):
         return size
 
     if kind == "video":
-        import shutil as _sh
-        from datetime import datetime, timezone
-        from backend import database as _db
-        from backend.models import JobResult, JobStatus
+        # Video files are big — download in the BACKGROUND and report progress so
+        # the browser can show a real bar (like a normal upload). The job is only
+        # created (and thus queued for analysis) once the file is fully on disk,
+        # so the pipeline never grabs a half-downloaded file.
+        import_id = uuid.uuid4().hex[:12]
         job_id = str(uuid.uuid4())
-        job_dir = f"/data/uploads/{job_id}"
-        os.makedirs(job_dir, exist_ok=True)
-        dest = os.path.join(job_dir, filename)
-        try:
-            size = await _stream_to(dest)
-        except HTTPException:
-            _sh.rmtree(job_dir, ignore_errors=True)
-            raise
-        except Exception as e:
-            _sh.rmtree(job_dir, ignore_errors=True)
-            raise HTTPException(status_code=502, detail=f"import failed: {e}")
-        if size == 0:
-            _sh.rmtree(job_dir, ignore_errors=True)
-            raise HTTPException(status_code=400, detail="imported file is empty")
-        now = datetime.now(timezone.utc).isoformat()
-        job = JobResult(
-            job_id=job_id, filename=filename, file_path=dest,
-            file_size_mb=round(size / (1024 * 1024), 2),
-            status=JobStatus.QUEUED, progress=0,
-            progress_message="Imported from Companion, waiting for analysis",
-            created_at=now, updated_at=now,
-        )
-        await _db.save_job(job)
-        return {"ok": True, "kind": "video", "job_id": job_id, "filename": filename, "size": size}
+        _import_progress[import_id] = {
+            "done": 0, "total": int(req.size or 0), "status": "downloading",
+            "job_id": None, "error": "", "filename": filename,
+        }
+
+        async def _bg_import():
+            import shutil as _sh
+            from datetime import datetime, timezone
+            from backend import database as _db
+            from backend.models import JobResult, JobStatus
+            job_dir = f"/data/uploads/{job_id}"
+            os.makedirs(job_dir, exist_ok=True)
+            dest = os.path.join(job_dir, filename)
+            size = 0
+            try:
+                async with httpx.AsyncClient(timeout=None) as client:
+                    async with client.stream("GET", read_url, params={"path": req.path},
+                                             headers=headers) as resp:
+                        if resp.status_code != 200:
+                            body = (await resp.aread())[:200].decode("utf-8", "ignore")
+                            raise RuntimeError(f"companion read {resp.status_code}: {body}")
+                        with open(dest, "wb") as f:
+                            async for chunk in resp.aiter_bytes(262144):
+                                f.write(chunk)
+                                size += len(chunk)
+                                _import_progress[import_id]["done"] = size
+                if size == 0:
+                    raise RuntimeError("imported file is empty")
+                now = datetime.now(timezone.utc).isoformat()
+                job = JobResult(
+                    job_id=job_id, filename=filename, file_path=dest,
+                    file_size_mb=round(size / (1024 * 1024), 2),
+                    status=JobStatus.QUEUED, progress=0,
+                    progress_message="Imported from Companion, waiting for analysis",
+                    created_at=now, updated_at=now,
+                )
+                await _db.save_job(job)
+                _import_progress[import_id].update({"status": "complete", "job_id": job_id})
+            except Exception as e:
+                _sh.rmtree(job_dir, ignore_errors=True)
+                _import_progress[import_id].update({"status": "error", "error": str(e)[:200]})
+
+        asyncio.create_task(_bg_import())
+        return {"ok": True, "kind": "video", "import_id": import_id,
+                "job_id": job_id, "filename": filename}
 
     if kind == "media":
         from backend.routers.media import (
@@ -1159,6 +1237,20 @@ async def companion_file_import(req: CompanionImportRequest):
         return {"ok": True, "kind": "font", "filename": safe, "size": size}
 
     raise HTTPException(status_code=400, detail=f"unknown import kind: {kind}")
+
+
+@router.get("/providers/companion-files/import-progress")
+async def companion_import_progress(import_id: str):
+    """Poll the progress of a background video import (bytes done + status).
+    The browser turns this into a progress bar and navigates when complete."""
+    st = _import_progress.get(import_id)
+    if st is None:
+        raise HTTPException(status_code=404, detail="unknown import")
+    # Once terminal, let it be garbage-collected after the client reads it.
+    if st.get("status") in ("complete", "error"):
+        st = dict(st)
+        _import_progress.pop(import_id, None)
+    return st
 
 
 @router.post("/providers/test/{provider_name}")

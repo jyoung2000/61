@@ -518,6 +518,14 @@ async fn files_list(
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
+            // Creation time — available on Windows/macOS; Err on most Linux FS
+            // (falls back to 0, and the UI just sorts those together).
+            let created_ms = md
+                .as_ref()
+                .and_then(|m| m.created().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
             let name = e.file_name().to_string_lossy().to_string();
             let ext = p
                 .extension()
@@ -531,6 +539,7 @@ async fn files_list(
                 "size": size,
                 "ext": ext,
                 "mtime_ms": mtime_ms,
+                "created_ms": created_ms,
             }));
         }
     }

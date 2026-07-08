@@ -369,6 +369,15 @@ function Wizard({ status, refresh, onDone }: {
 
 // ── Dashboard ────────────────────────────────────────────────────────
 
+// Stable, distinct color per model name so each AI model reads as the same
+// hue everywhere (VRAM bar segment + list swatch) — lets the user see at a
+// glance how much VRAM each model is using. Deterministic hash → hue.
+function modelColor(name: string): string {
+  let h = 0;
+  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) % 360;
+  return `hsl(${h}, 68%, 55%)`;
+}
+
 function Dashboard({ status, refresh, theme, toggleTheme }: {
   status: CompanionStatus; refresh: () => void;
   theme: 'dark' | 'light'; toggleTheme: () => void;
@@ -774,10 +783,23 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
                 <span>{gpu.unified_memory ? 'Unified memory' : 'VRAM'} used: {fmtMb(usedMb)}</span>
                 <span>free: {fmtMb(gpu.vram_free_mb)} / {fmtMb(gpu.vram_total_mb)}</span>
               </div>
-              {/* Two-segment bar: ClipAI's own VRAM (green) + other apps (blue). */}
+              {/* Per-model VRAM bar: one colored segment per resident AI model
+                  (so you can see how much each is using), then any remaining
+                  ClipAI VRAM (green, e.g. Whisper), then other apps (blue). */}
               <div className="meter" style={{ margin: '6px 0 4px', display: 'flex', overflow: 'hidden' }}
                 title={`ClipAI: ${fmtMb(clipaiMb)} · other apps: ${fmtMb(otherMb)} · free: ${fmtMb(gpu.vram_free_mb)}`}>
-                <div style={{ width: `${pct(clipaiMb)}%`, height: '100%', background: 'var(--success, #22c55e)', transition: 'width 0.4s' }} />
+                {residentModels.map((m) => (
+                  <div key={m.name} title={`${m.name} — ${fmtMb(m.vram_mb)}`}
+                    style={{ width: `${pct(m.vram_mb)}%`, height: '100%', background: modelColor(m.name), transition: 'width 0.4s' }} />
+                ))}
+                {(() => {
+                  const residentVram = residentModels.reduce((s, m) => s + m.vram_mb, 0);
+                  const extra = Math.max(0, clipaiMb - residentVram);
+                  return extra > 0
+                    ? <div title={`ClipAI (other) — ${fmtMb(extra)}`}
+                        style={{ width: `${pct(extra)}%`, height: '100%', background: 'var(--success)', transition: 'width 0.4s' }} />
+                    : null;
+                })()}
                 <div style={{ width: `${pct(otherMb)}%`, height: '100%', background: '#3b82f6', transition: 'width 0.4s' }} />
               </div>
               <div className="row small muted" style={{ gap: 14, margin: '0 0 12px' }}>
@@ -802,7 +824,10 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
                     {residentModels.map((m) => (
                       <div key={m.name} className="list-row small">
-                        <span className="name mono" title={m.name}>{m.name}</span>
+                        <span className="name mono" title={m.name} style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+                          <span style={{ width: 10, height: 10, borderRadius: 3, background: modelColor(m.name), flexShrink: 0 }} />
+                          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{m.name}</span>
+                        </span>
                         <span className="muted mono action">{fmtMb(m.vram_mb)}</span>
                       </div>
                     ))}
