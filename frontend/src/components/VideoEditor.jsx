@@ -3168,6 +3168,13 @@ export default function VideoEditor({
   // (maximal canvas, minimal top/bottom waste). Scales down for tablet/phone
   // so the timeline and controls stay reachable on smaller screens.
   const previewMaxVh = compact ? 55 : isMobile ? 50 : isTablet ? 62 : 80;
+  // Height the player may take. `dvh` (dynamic viewport height) — NOT `vh` —
+  // so the collapsing mobile browser chrome never clips the bottom of the
+  // preview, and the `100dvh - 120px` guard guarantees the player is never
+  // taller than the visible viewport (so it's never cut off and the header +
+  // ratio controls always stay on screen alongside it). Compact embeds keep
+  // their original fixed cap.
+  const previewH = compact ? '55vh' : `min(${previewMaxVh}dvh, 100dvh - 120px)`;
 
   return (
     <div
@@ -3262,8 +3269,8 @@ export default function VideoEditor({
         className={`ve-viewport${isFullscreen ? ' ve-viewport--fullscreen' : ''}`}
         style={isFullscreen ? {} : {
           aspectRatio: `${previewRatio}`,
-          maxHeight: `${previewMaxVh}vh`,
-          maxWidth: reframePreviewActive ? undefined : `calc(${previewMaxVh}vh * ${previewRatio})`,
+          maxHeight: previewH,
+          maxWidth: (reframePreviewActive || compact) ? undefined : `calc(${previewH} * ${previewRatio})`,
           width: '100%',
           margin: reframePreviewActive ? 0 : '0 auto',
         }}

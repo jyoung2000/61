@@ -4320,3 +4320,44 @@ input.ve-timecode--input {
     border-radius: 10px;
   }
 }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   No-clip safety net — nothing in the editor gets cut off on any device.
+   .ve-container is overflow:hidden (for the rounded corners), so any row that
+   is wider than the screen would be clipped rather than scrolled. Make the
+   chrome rows wrap or scroll, and shed non-essential top-bar buttons on very
+   narrow phones so the title/Export never get clipped.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Top bar: never let it overflow — the title ellipsizes, the cluster stays. */
+.ve-container .ve-header { flex-wrap: nowrap; min-width: 0; }
+.ve-container .ve-header__title { min-width: 0; }
+
+/* Ratio pill row wraps instead of clipping when many ratios + label crowd. */
+.ve-ratio-row { flex-wrap: wrap; row-gap: 6px; }
+
+/* Toolbars / control rows scroll horizontally on small screens rather than
+   being clipped by the container. */
+@media (max-width: 767px) {
+  .ve-container .ve-controls,
+  .ve-container .ve-multitrack-toggle,
+  .ve-container .ve-multitrack__toolbar {
+    flex-wrap: wrap;
+  }
+}
+
+/* Very narrow phones: drop the ⌘K / undo / redo affordances from the top bar
+   (all still reachable via the toolbar + keyboard) so Editor + Export + close
+   never get pushed off-screen and clipped. */
+@media (max-width: 460px) {
+  .ve-container .ve-header { gap: 6px; padding: 0 10px; }
+  .ve-topbar__cmdk,
+  .ve-topbar__icon { display: none; }
+  .ve-topbar__toggle { padding: 5px 9px; }
+  .ve-topbar__export { padding: 6px 11px; }
+}
+
+/* The single-track scrubber can be dense on phones — let its chip row wrap. */
+@media (max-width: 767px) {
+  .ve-container .ve-timeline { overflow-x: hidden; }
+}
