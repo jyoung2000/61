@@ -996,6 +996,25 @@ class CompanionImportRequest(BaseModel):
 _import_progress: dict = {}
 
 
+async def _post_import_hb(base: str, token: str, job_id: str, title: str, stage: str, pct: int):
+    """Fire-and-forget a progress heartbeat to the Companion so its GUI shows
+    the import too (it's the source of the pull, but has no view of ClipAI's
+    overall progress otherwise). Best-effort — never affects the import."""
+    hdrs = {
+        "X-ClipAI-Progress": str(max(0, min(100, int(pct)))),
+        "X-ClipAI-Job-Id": job_id,
+        "X-ClipAI-Job-Title": title,
+        "X-ClipAI-Stage": stage,
+    }
+    if token:
+        hdrs["Authorization"] = f"Bearer {token}"
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as c:
+            await c.post(f"{base}/v1/progress", headers=hdrs)
+    except Exception:
+        pass
+
+
 async def _companion_download(read_url, params, headers, dest, total, on_done):
     """Download a shared file to ``dest``. Uses PARALLEL HTTP Range segments when
     the Companion supports them — several connections at once, the same trick
@@ -1224,11 +1243,32 @@ async def companion_file_import(req: CompanionImportRequest):
             _ext = (os.path.splitext(filename)[1].lstrip(".").lower() or "mp4")
             dest = os.path.join(job_dir, f"video.{_ext}")
             try:
+                _total = int(req.size or 0)
+                _comp_token = getattr(h, "token", "") or ""
+                _hb = {"t": 0.0, "pct": -1}
+
+                def _on_done(n):
+                    _import_progress[import_id]["done"] = n
+                    # Throttled heartbeat → the Companion shows "Importing … X%".
+                    try:
+                        pct = int(n * 100 / _total) if _total else 0
+                        now = time.monotonic()
+                        if now - _hb["t"] >= 1.5 and pct != _hb["pct"]:
+                            _hb["t"] = now
+                            _hb["pct"] = pct
+                            asyncio.create_task(_post_import_hb(
+                                base, _comp_token, job_id,
+                                f"Importing {filename}", "downloading to ClipAI", pct))
+                    except Exception:
+                        pass
+
                 size = await _companion_download(
-                    read_url, {"path": req.path}, headers, dest, int(req.size or 0),
-                    lambda n: _import_progress[import_id].__setitem__("done", n))
+                    read_url, {"path": req.path}, headers, dest, _total, _on_done)
                 if size == 0:
                     raise RuntimeError("imported file is empty")
+                # Final 100% so the Companion bar completes before analysis.
+                asyncio.create_task(_post_import_hb(
+                    base, _comp_token, job_id, f"Importing {filename}", "imported", 100))
                 now = datetime.now(timezone.utc).isoformat()
                 job = JobResult(
                     job_id=job_id, filename=filename, file_path=dest,
