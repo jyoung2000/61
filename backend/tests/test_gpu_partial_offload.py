@@ -65,6 +65,41 @@ def test_disabled_flag_restores_legacy(monkeypatch):
     assert LM.gpu_offload_ladder(XLATE) == [99, 0]
 
 
+# ── VRAM-aware ladder: proactive fit (don't OOM at 99 for a model that
+#    can't fully offload; keep 99 when it fits) ─────────────────────────────
+
+BIG = "qwen2.5:14b"  # ~8.4 GB q4 weights
+
+
+def test_vram_ladder_unknown_falls_back_to_plain(monkeypatch):
+    monkeypatch.setattr(settings, "OLLAMA_SMALL_GPU_PARTIAL_OFFLOAD", True, raising=False)
+    # total<=0 (unknown card) → identical to the plain OOM-probe ladder.
+    assert LM.gpu_offload_ladder_for_vram(BIG, 0) == LM.gpu_offload_ladder(BIG)
+    assert LM.gpu_offload_ladder_for_vram(XLATE, 0) == LM.gpu_offload_ladder(XLATE)
+
+
+def test_vram_ladder_keeps_99_when_model_fits(monkeypatch):
+    monkeypatch.setattr(settings, "OLLAMA_SMALL_GPU_PARTIAL_OFFLOAD", True, raising=False)
+    # A 14B (~8.4 GB) fully fits a 12 GB card → 99 first (loads fully on GPU).
+    assert LM.gpu_offload_ladder_for_vram(BIG, 12.0)[0] == 99
+
+
+def test_vram_ladder_drops_99_when_model_too_big(monkeypatch):
+    monkeypatch.setattr(settings, "OLLAMA_SMALL_GPU_PARTIAL_OFFLOAD", True, raising=False)
+    # A 14B does NOT fit an 8 GB card → never START at 99 (guaranteed OOM);
+    # begin at a partial rung and end at CPU.
+    ladder = LM.gpu_offload_ladder_for_vram(BIG, 8.0)
+    assert 99 not in ladder
+    assert ladder[-1] == 0
+    assert any(0 < x < 99 for x in ladder)
+
+
+def test_vram_ladder_cpu_only_when_no_budget(monkeypatch):
+    monkeypatch.setattr(settings, "OLLAMA_SMALL_GPU_PARTIAL_OFFLOAD", True, raising=False)
+    # A 14B against ~1.5 GB usable can't offload meaningfully → CPU-only.
+    assert LM.gpu_offload_ladder_for_vram(BIG, 2.0) == [0]
+
+
 # ── translator OOM step-down ─────────────────────────────────────────────────
 
 class _FakeResp:

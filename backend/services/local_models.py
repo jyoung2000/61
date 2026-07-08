@@ -299,6 +299,63 @@ def gpu_offload_ladder(model_name: str) -> list[int]:
     return ladder
 
 
+def gpu_offload_ladder_for_vram(
+    model_name: str,
+    total_vram_gb: float,
+    *,
+    reserve_gb: Optional[float] = None,
+    kv_headroom_gb: Optional[float] = None,
+) -> list[int]:
+    """VRAM-aware ``num_gpu`` ladder — like :func:`gpu_offload_ladder`, but sized
+    PROACTIVELY to the card so the FIRST attempt already fits instead of always
+    starting at ``num_gpu=99`` and paying a guaranteed OOM + VRAM-clear + retry
+    for a model that can't fully offload.
+
+    Decision, given the ACTIVE card's TOTAL VRAM (stable — unlike a free-VRAM
+    probe that reads low right after Whisper unloads):
+
+    * ``total_vram_gb <= 0`` (unknown) → the plain ladder (OOM-probe fallback,
+      behavior unchanged for un-probed hosts).
+    * model fully fits (``weights + kv_headroom <= total - reserve``) → the plain
+      ladder: ``99`` first is correct, it loads fully on the GPU in one shot.
+    * model does NOT fully fit → DROP the ``99`` rung (a guaranteed OOM) and start
+      at the largest partial-offload rung that plausibly fits; if essentially no
+      weight budget remains, ``[0]`` (CPU-only) — don't push a doomed GPU load.
+
+    ``num_gpu`` is a layer count; layers-that-fit are approximated as
+    proportional to the weight budget, using the same ``OLLAMA_MIDSIZE_GPU_
+    LAYERS_START`` scale as the base ladder. The OOM step-down still self-tunes
+    from wherever we start, so a slightly-off estimate only costs at most one
+    extra step, never a wrong final placement."""
+    base = gpu_offload_ladder(model_name)
+    if not total_vram_gb or total_vram_gb <= 0:
+        return base
+    w = estimate_model_weights_gb(model_name)
+    if w is None or w <= 0:
+        return base
+    if reserve_gb is None:
+        reserve_gb = float(getattr(settings, "OLLAMA_GPU_BASELINE_RESERVE_GB", 1.2))
+    if kv_headroom_gb is None:
+        kv_headroom_gb = float(getattr(settings, "OLLAMA_GPU_KV_HEADROOM_GB", 0.55))
+    budget = max(0.0, float(total_vram_gb) - max(0.0, reserve_gb))
+    # Fully fits → the base ladder (99 first) is exactly right.
+    if (w + max(0.0, kv_headroom_gb)) <= budget:
+        return base
+    # Doesn't fully fit: never START at 99 (guaranteed OOM). With essentially no
+    # room for weights beyond the KV headroom, go straight to CPU.
+    weight_budget = budget - max(0.0, kv_headroom_gb)
+    if weight_budget <= 0.4:
+        return [0]
+    frac = min(1.0, max(0.0, weight_budget / w))
+    start = int(getattr(settings, "OLLAMA_MIDSIZE_GPU_LAYERS_START", 32))
+    fit_layers = max(1, int(round(start * frac)))
+    trimmed = [x for x in base if 0 < x <= fit_layers]
+    if not trimmed:
+        trimmed = [fit_layers]
+    trimmed.append(0)
+    return trimmed
+
+
 def rank_local_editorial_models(
     model_names, max_params_b: Optional[float] = None
 ) -> list[str]:

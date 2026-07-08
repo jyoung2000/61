@@ -766,12 +766,18 @@ def _is_ollama_oom(text: str) -> bool:
     return any(p in t for p in _OLLAMA_OOM_PATTERNS)
 
 
-def _translation_gpu_ladder(model: str) -> list[int]:
+def _translation_gpu_ladder(model: str, total_vram_gb: float = 0.0) -> list[int]:
     """Partial-GPU-offload ladder for the translation model, starting from the
-    last rung that loaded successfully (so we don't re-OOM at 99 every batch)."""
+    last rung that loaded successfully (so we don't re-OOM at 99 every batch).
+
+    ``total_vram_gb`` (the ACTIVE card's TOTAL VRAM) lets the ladder start at a
+    rung that already FITS instead of a guaranteed-OOM ``99`` for a model too big
+    to fully offload. ``0`` (unknown) keeps the plain OOM-probe ladder."""
     try:
-        from backend.services.local_models import gpu_offload_ladder, _ollama_names_match
-        ladder = gpu_offload_ladder(model)
+        from backend.services.local_models import (
+            gpu_offload_ladder_for_vram, _ollama_names_match,
+        )
+        ladder = gpu_offload_ladder_for_vram(model, total_vram_gb)
     except Exception:
         return [99, 0]
     good = None
@@ -838,7 +844,21 @@ async def _translate_batch_via_ollama(
                   int(getattr(settings, "OLLAMA_TRANSLATION_GPU_NUM_CTX", 2048)))
     gpu_batch = int(getattr(settings, "OLLAMA_TRANSLATION_GPU_NUM_BATCH", 128))
 
-    ladder = _translation_gpu_ladder(model)
+    # Proactive VRAM fit: size the starting rung to the card that will run this.
+    # Remote (Companion) host → its advertised total; local host → torch total;
+    # unknown → 0 (the ladder then keeps its plain OOM-probe fallback).
+    _total_vram_gb = 0.0
+    try:
+        if _active is not None:
+            if ollama_registry.is_local_gpu_host(_active.url):
+                from backend.services.local_models import _total_vram_gb as _tv
+                _total_vram_gb = _tv()
+            elif getattr(_active, "vram_total_mb", 0):
+                _total_vram_gb = _active.vram_total_mb / 1024.0
+    except Exception:
+        _total_vram_gb = 0.0
+
+    ladder = _translation_gpu_ladder(model, _total_vram_gb)
     last_status_err: Optional[Exception] = None
     _host_hops = 0
     async with httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=15.0)) as client:

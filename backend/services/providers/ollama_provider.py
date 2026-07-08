@@ -849,7 +849,8 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
         every call."""
         try:
             from backend.services.local_models import (
-                gpu_offload_ladder, _ollama_names_match,
+                gpu_offload_ladder, gpu_offload_ladder_for_vram,
+                _ollama_names_match, _total_vram_gb,
             )
         except Exception:
             return [99, 0]
@@ -885,7 +886,26 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
             if not (_remote_gpu or self._available_vram_mb >= 6000):
                 return [0]
 
-        ladder = gpu_offload_ladder(model_name)
+        # PROACTIVE VRAM fit: size the starting rung to the ACTIVE card's TOTAL
+        # VRAM so we don't start at num_gpu=99 (and eat a guaranteed OOM + VRAM
+        # clear + 3 s retry) for a model that can't fully offload. Remote hosts
+        # advertise their card's TOTAL in _available_vram_mb; for a local host
+        # use torch's device total (stable, unlike the free-VRAM probe). Unknown
+        # VRAM (0) → gpu_offload_ladder_for_vram falls back to the plain ladder.
+        _remote = False
+        try:
+            from backend.services import ollama_registry as _oreg2
+            _remote = not _oreg2.is_local_gpu_host(self._host)
+        except Exception:
+            _remote = False
+        if _remote and self._available_vram_mb > 0:
+            _total_gb = self._available_vram_mb / 1024.0
+        else:
+            try:
+                _total_gb = _total_vram_gb()
+            except Exception:
+                _total_gb = 0.0
+        ladder = gpu_offload_ladder_for_vram(model_name, _total_gb)
         good = None
         for k, v in self._gpu_layers_good.items():
             try:
