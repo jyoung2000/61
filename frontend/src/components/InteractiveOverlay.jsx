@@ -153,6 +153,17 @@ export default function InteractiveOverlay({ currentTime = 0, clipStart = 0, con
 }
 
 
+// Touch devices get fat, finger-sized handle hit areas (the visible dot stays
+// small). Detected once — pointer type is stable for a session.
+const IO_COARSE_POINTER = typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+  ? window.matchMedia('(pointer: coarse)').matches
+  : false;
+const IO_HANDLE_HIT = IO_COARSE_POINTER ? 30 : 14;   // transparent grab area
+const IO_HANDLE_DOT = IO_COARSE_POINTER ? 15 : 10;   // visible marker
+const IO_ROTATE_HIT = IO_COARSE_POINTER ? 34 : 18;
+const IO_ROTATE_DOT = IO_COARSE_POINTER ? 22 : 16;
+const IO_ACCENT = '#6E7BFF';
+
 // ── Corner / edge handle positions ────────────────────────────────
 const HANDLES = [
   { id: 'nw', cursor: 'nwse-resize', x: 0, y: 0 },
@@ -187,6 +198,10 @@ function InteractiveElement({
   const [isEditing, setIsEditing] = useState(false);
   const editRef = useRef(null);
   const dragState = useRef(null);
+  // Long-press-to-edit (touch): a held press on a text/subtitle item opens
+  // inline edit — the reliable touch equivalent of desktop double-click.
+  const longPressRef = useRef(0);
+  const longPressStartRef = useRef(null);
 
   // Use refs for callbacks/item to keep the useEffect stable during drag operations.
   // Without this, the mousemove/mouseup listeners get torn down and re-added on every
@@ -297,8 +312,26 @@ function InteractiveElement({
       dragIds,
     };
     setIsDragging(true);
+
+    // Touch long-press → inline edit for text/subtitle items (single selection).
+    // A finger held still for 500ms aborts the pending drag and opens the
+    // editor; any movement past 8px cancels it (that's a drag, not an edit).
+    if ((item.type === 'text' || item.type === 'subtitle') && !isLocked
+        && !(selectedItemIds && selectedItemIds.length > 1)) {
+      longPressStartRef.current = { x: e.clientX, y: e.clientY };
+      clearTimeout(longPressRef.current);
+      longPressRef.current = setTimeout(() => {
+        longPressRef.current = 0;
+        longPressStartRef.current = null;
+        dragState.current = null;
+        setIsDragging(false);
+        try { useTimelineStore.temporal.getState().resume(); } catch { /* noop */ }
+        onInteractionRef.current?.(false);
+        setIsEditing(true);
+      }, 500);
+    }
   }, [effectivePos, getContainerRect, onSelect, onInteraction, isLocked,
-      selectedItemIds, allItems, item.id]);
+      selectedItemIds, allItems, item.id, item.type]);
 
   // ── RESIZE ────────────────────────────────────────────
   const handleResizeStart = useCallback((e, handleId) => {
@@ -441,6 +474,15 @@ function InteractiveElement({
     if (!isDragging && !isResizing && !isRotating) return;
 
     const handleMouseMove = (e) => {
+      // Any real movement cancels a pending long-press-to-edit (it's a drag).
+      if (longPressRef.current && longPressStartRef.current) {
+        const lp = longPressStartRef.current;
+        if (Math.hypot(e.clientX - lp.x, e.clientY - lp.y) > 8) {
+          clearTimeout(longPressRef.current);
+          longPressRef.current = 0;
+          longPressStartRef.current = null;
+        }
+      }
       const ds = dragState.current;
       if (!ds) return;
 
@@ -679,6 +721,8 @@ function InteractiveElement({
     };
 
     const handleMouseUp = () => {
+      // A quick tap-release cancels any pending long-press (it was a tap/drag).
+      if (longPressRef.current) { clearTimeout(longPressRef.current); longPressRef.current = 0; longPressStartRef.current = null; }
       // Resume undo history so the final state is recorded as one snapshot
       useTimelineStore.temporal.getState().resume();
       dragState.current = null;
@@ -812,7 +856,7 @@ function InteractiveElement({
             minHeight: 40,
             background: 'rgba(0,0,0,0.6)',
             color: '#fff',
-            border: '2px solid #0A84FF',
+            border: '2px solid #6E7BFF',
             borderRadius: 4,
             padding: '6px 8px',
             fontSize: 14,
@@ -830,7 +874,7 @@ function InteractiveElement({
         <div style={{
           position: 'absolute',
           inset: -1,
-          border: '1px dashed rgba(10, 132, 255, 0.5)',
+          border: '1px dashed rgba(110, 123, 255, 0.5)',
           borderRadius: 2,
           pointerEvents: 'none',
         }} />
@@ -849,12 +893,12 @@ function InteractiveElement({
               position: 'absolute',
               inset: -2,
               border: isPrimarySelection
-                ? '2px solid #0A84FF'
-                : '2px dashed rgba(10, 132, 255, 0.85)',
+                ? '2px solid #6E7BFF'
+                : '2px dashed rgba(110, 123, 255, 0.85)',
               borderRadius: 2,
               pointerEvents: 'auto',
               boxShadow: isPrimarySelection
-                ? '0 0 0 1px rgba(10, 132, 255, 0.3)'
+                ? '0 0 0 1px rgba(110, 123, 255, 0.3)'
                 : undefined,
               cursor: isLocked ? 'not-allowed' : (isDragging ? 'grabbing' : 'grab'),
               background: 'transparent',
@@ -872,7 +916,8 @@ function InteractiveElement({
           centre — that's the "relative to each other" behaviour. */}
       {isPrimarySelection && (
         <>
-          {/* Resize handles */}
+          {/* Resize handles — a large transparent grab area (finger-sized on
+              touch) centred on each corner/edge, with a small visible dot. */}
           {HANDLES.map((h) => (
             <div
               key={h.id}
@@ -880,20 +925,29 @@ function InteractiveElement({
                 position: 'absolute',
                 left: `${h.x * 100}%`,
                 top: `${h.y * 100}%`,
-                width: 10,
-                height: 10,
+                width: IO_HANDLE_HIT,
+                height: IO_HANDLE_HIT,
                 transform: 'translate(-50%, -50%)',
-                background: '#fff',
-                border: '2px solid #0A84FF',
-                borderRadius: h.id.length === 2 ? 2 : '50%', // corners = square, edges = round
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
                 cursor: h.cursor,
                 zIndex: 30,
-                boxShadow: '0 1px 3px rgba(0,0,0,0.3)',
                 pointerEvents: 'auto',
                 touchAction: 'none',
               }}
               onPointerDown={(e) => handleResizeStart(e, h.id)}
-            />
+            >
+              <div style={{
+                width: IO_HANDLE_DOT,
+                height: IO_HANDLE_DOT,
+                background: '#fff',
+                border: `2px solid ${IO_ACCENT}`,
+                borderRadius: h.id.length === 2 ? 2 : '50%', // corners = square, edges = round
+                boxShadow: '0 1px 3px rgba(0,0,0,0.3)',
+                pointerEvents: 'none',
+              }} />
+            </div>
           ))}
 
           {/* Rotation handle (above the element) */}
@@ -912,34 +966,43 @@ function InteractiveElement({
             <div style={{
               width: 1,
               height: 8,
-              background: '#0A84FF',
+              background: IO_ACCENT,
               position: 'absolute',
               bottom: -8,
             }} />
-            {/* Rotation circle handle */}
+            {/* Rotation handle — large transparent grab area, small visible circle */}
             <div
               style={{
-                width: 16,
-                height: 16,
-                borderRadius: '50%',
-                background: '#fff',
-                border: '2px solid #0A84FF',
+                width: IO_ROTATE_HIT,
+                height: IO_ROTATE_HIT,
                 cursor: 'grab',
                 display: 'flex',
                 alignItems: 'center',
                 justifyContent: 'center',
-                boxShadow: '0 1px 4px rgba(0,0,0,0.3)',
                 pointerEvents: 'auto',
                 touchAction: 'none',
               }}
               onPointerDown={handleRotateStart}
               title="Rotate"
             >
-              {/* Rotation icon */}
-              <svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="#0A84FF" strokeWidth="2">
-                <path d="M14 8A6 6 0 1 1 8 2" strokeLinecap="round" />
-                <path d="M8 0l3 2-3 2" strokeLinecap="round" strokeLinejoin="round" />
-              </svg>
+              <div style={{
+                width: IO_ROTATE_DOT,
+                height: IO_ROTATE_DOT,
+                borderRadius: '50%',
+                background: '#fff',
+                border: `2px solid ${IO_ACCENT}`,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                boxShadow: '0 1px 4px rgba(0,0,0,0.3)',
+                pointerEvents: 'none',
+              }}>
+                {/* Rotation icon */}
+                <svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke={IO_ACCENT} strokeWidth="2">
+                  <path d="M14 8A6 6 0 1 1 8 2" strokeLinecap="round" />
+                  <path d="M8 0l3 2-3 2" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+              </div>
             </div>
           </div>
 

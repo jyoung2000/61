@@ -4346,13 +4346,14 @@ input.ve-timecode--input {
   }
 }
 
-/* Very narrow phones: drop the ⌘K / undo / redo affordances from the top bar
-   (all still reachable via the toolbar + keyboard) so Editor + Export + close
-   never get pushed off-screen and clipped. */
+/* Very narrow phones: drop only the undo/redo icons from the top bar (still
+   reachable via the toolbar). ⌘K stays — it is the ONLY touch trigger for the
+   command palette on phones, so hiding it would strand that feature. Editor +
+   Export + close still fit. */
 @media (max-width: 460px) {
   .ve-container .ve-header { gap: 6px; padding: 0 10px; }
-  .ve-topbar__cmdk,
   .ve-topbar__icon { display: none; }
+  .ve-topbar__cmdk { padding: 6px 8px; }
   .ve-topbar__toggle { padding: 5px 9px; }
   .ve-topbar__export { padding: 6px 11px; }
 }
@@ -4360,4 +4361,80 @@ input.ve-timecode--input {
 /* The single-track scrubber can be dense on phones — let its chip row wrap. */
 @media (max-width: 767px) {
   .ve-container .ve-timeline { overflow-x: hidden; }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Touch parity (all devices) — every editor control is a comfortable finger
+   target and the phone/tablet feature set matches desktop. Driven by
+   @media (pointer: coarse) so it applies to any touch device regardless of
+   width, plus a width query for phone-only layout tweaks.
+   ═══════════════════════════════════════════════════════════════════════════ */
+@media (pointer: coarse) {
+  /* Inspector: pills, segmented tabs, preset + select controls */
+  .ve-container .ve-properties__speed-pill,
+  .ve-bottom-sheet .ve-properties__speed-pill { min-height: 40px; padding: 0 14px; font-size: 12px; }
+  .ve-container .ve-properties__tab,
+  .ve-bottom-sheet .ve-properties__tab { min-height: 40px; font-size: 13px; }
+  .ve-container .ve-properties__preset-btn,
+  .ve-bottom-sheet .ve-properties__preset-btn { min-height: 40px; }
+  .ve-container .ve-properties__select,
+  .ve-bottom-sheet .ve-properties__select { min-height: 40px; }
+
+  /* Scrub number field resting target (drag-to-scrub + tap-to-type) */
+  .ve-container .ve-scrub,
+  .ve-bottom-sheet .ve-scrub { min-height: 38px; }
+
+  /* Range sliders — fat thumbs + a taller hit band so a finger can grab them */
+  .ve-container input[type="range"],
+  .ve-bottom-sheet input[type="range"] { height: 22px; }
+  .ve-properties__slider::-webkit-slider-thumb,
+  .ve-effects__slider::-webkit-slider-thumb,
+  .ve-segment-inspector__volume-slider::-webkit-slider-thumb,
+  .ve-multi-timeline__zoom-slider::-webkit-slider-thumb,
+  .ve-volume__slider::-webkit-slider-thumb { width: 22px; height: 22px; margin-top: -9px; }
+  .ve-properties__slider::-moz-range-thumb,
+  .ve-effects__slider::-moz-range-thumb,
+  .ve-segment-inspector__volume-slider::-moz-range-thumb,
+  .ve-multi-timeline__zoom-slider::-moz-range-thumb,
+  .ve-volume__slider::-moz-range-thumb { width: 22px; height: 22px; }
+
+  /* Transport: speed + timecode become real tap targets */
+  .ve-container .ve-speed__btn { min-height: 40px; }
+  .ve-container .ve-speed__option { min-height: 40px; }
+  .ve-container .ve-timecode { min-height: 40px; display: inline-flex; align-items: center; }
+
+  /* Volume level is reachable on touch (no hover on touch devices) */
+  .ve-container .ve-volume__slider-wrap { max-width: 120px; opacity: 1; }
+
+  /* Command palette input never triggers iOS focus-zoom */
+  .ve-palette__input { font-size: 16px; }
+}
+
+/* Ruler drag-to-scrub must not scroll the page (matches the tracks). */
+.ve-timeline__ruler { touch-action: none; }
+
+/* Export dialog is always fully scrollable / reachable on short screens. */
+.ve-container .ve-export-dialog,
+.ve-export-dialog {
+  max-height: calc(100dvh - 32px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-bottom: max(16px, env(safe-area-inset-bottom, 0px));
+}
+
+/* Phone-only layout: rows wrap instead of clipping, controls stay ≥44px. */
+@media (max-width: 767px) {
+  /* Volume slider always visible on phones (was force-hidden) */
+  .ve-volume__slider-wrap { max-width: 120px !important; opacity: 1 !important; }
+  /* Timeline control row wraps + its buttons beat their inline min sizes */
+  .ve-multi-timeline__toolbar { flex-wrap: wrap; }
+  .ve-multi-timeline__toolbar .ve-btn { min-height: 44px !important; min-width: 44px !important; }
+  /* Wider trim handles for fingers */
+  .ve-trim-handle { width: 22px; }
+  /* Zoom slider thumb + press feedback on touch */
+  .ve-multi-timeline__zoom-slider::-webkit-slider-thumb { width: 20px; height: 20px; margin-top: -8px; }
+  .ve-multi-timeline__zoom-slider::-moz-range-thumb { width: 20px; height: 20px; }
+  .ve-multi-timeline__zoom-slider:active::-webkit-slider-thumb { transform: scale(1.2); }
+  /* Track eye/mute/lock a bit larger + more spacing (kept within the lane) */
+  .ve-multi-timeline__track-ctrl { min-width: 30px; min-height: 26px; }
 }

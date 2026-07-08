@@ -169,6 +169,9 @@ export default function SubtitleOverlay({
   // whole selection as a rigid block.
   const [isDraggingSub, setIsDraggingSub] = useState(false);
   const dragRef = useRef(null);
+  // Long-press-to-edit (touch): held press opens inline caption edit.
+  const subLongPressRef = useRef(0);
+  const subLongPressStartRef = useRef(null);
 
   // Check if subtitle track is hidden via the eye icon toggle
   // This IS the single source of truth — settings.subtitlesEnabled syncs TO this
@@ -437,6 +440,20 @@ export default function SubtitleOverlay({
       moved: false,
     };
     setIsDraggingSub(true);
+
+    // Touch long-press → inline caption edit (reliable double-click substitute).
+    subLongPressStartRef.current = { x: e.clientX, y: e.clientY };
+    clearTimeout(subLongPressRef.current);
+    subLongPressRef.current = setTimeout(() => {
+      subLongPressRef.current = 0;
+      subLongPressStartRef.current = null;
+      dragRef.current = null;
+      setIsDraggingSub(false);
+      try { useTimelineStore.temporal.getState().resume(); } catch { /* noop */ }
+      setSelectedItemId(currentTimelineItem.id);
+      setIsEditing(true);
+      setTimeout(() => editRef.current?.focus(), 50);
+    }, 500);
   }, [currentTimelineItem, selectedItemIds, setSelectedItemId,
       toggleSelectedItem, containerRef]);
 
@@ -445,6 +462,15 @@ export default function SubtitleOverlay({
     if (!isDraggingSub) return;
 
     const handleMove = (e) => {
+      // Movement cancels a pending long-press-to-edit (it's a drag).
+      if (subLongPressRef.current && subLongPressStartRef.current) {
+        const lp = subLongPressStartRef.current;
+        if (Math.hypot(e.clientX - lp.x, e.clientY - lp.y) > 8) {
+          clearTimeout(subLongPressRef.current);
+          subLongPressRef.current = 0;
+          subLongPressStartRef.current = null;
+        }
+      }
       const ds = dragRef.current;
       if (!ds) return;
       const dx = e.clientX - ds.startMouseX;
@@ -464,6 +490,7 @@ export default function SubtitleOverlay({
     };
 
     const handleUp = () => {
+      if (subLongPressRef.current) { clearTimeout(subLongPressRef.current); subLongPressRef.current = 0; subLongPressStartRef.current = null; }
       useTimelineStore.temporal.getState().resume();
       dragRef.current = null;
       setIsDraggingSub(false);

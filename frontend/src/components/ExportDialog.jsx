@@ -440,6 +440,10 @@ export default function ExportDialog({
   }, []);
 
   return (
+    <div
+      className="ve-export-backdrop"
+      onPointerDown={(e) => { if (e.target === e.currentTarget && onClose) onClose(); }}
+    >
     <div className="ve-export-dialog" onClick={(e) => e.stopPropagation()}>
       <div className="ve-export-dialog__header">
         <span className="ve-export-dialog__title">Export video</span>
@@ -653,6 +657,7 @@ export default function ExportDialog({
           </>
         )}
       </div>
+    </div>
     </div>
   );
 }

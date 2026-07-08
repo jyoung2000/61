@@ -60,12 +60,18 @@ function laneIndexFromY(laneHs, y) {
   }
   return -1;
 }
+// Touch devices need fatter invisible grab zones — a finger can't reliably
+// land a 14px clip edge or a 16px playhead. Detected once at module load
+// (pointer type effectively never changes mid-session).
+const COARSE_POINTER = typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+  ? window.matchMedia('(pointer: coarse)').matches
+  : false;
 const LABEL_WIDTH = 140;
 const HANDLE_WIDTH = 4;          // slim resting state
 const HANDLE_WIDTH_HOVER = 8;    // fattened on hover for an easy grab
-const HANDLE_HIT_AREA = 14;
+const HANDLE_HIT_AREA = COARSE_POINTER ? 24 : 14;
 const RULER_HEIGHT = 32;
-const PLAYHEAD_GRAB_WIDTH = 16; // px on each side of playhead for grab detection
+const PLAYHEAD_GRAB_WIDTH = COARSE_POINTER ? 26 : 16; // px on each side of playhead for grab detection
 
 const TRACK_COLORS = {
   video: '#3B82F6',
@@ -542,6 +548,10 @@ function TimecodeInput({ playhead, onSeek }) {
 export default function Timeline({ compact = false, onSeek, onItemSelect, onSubtitleVisibilityChange }) {
   const canvasRef = useRef(null);
   const containerRef = useRef(null);
+  // Long-press on a track header opens its context menu on touch (the only
+  // path to track ops — delete/duplicate/recolor — which is right-click only
+  // on desktop).
+  const trackLongPressRef = useRef({ timer: 0, x: 0, y: 0 });
 
   // Stable ref so async filmstrip generations can request a repaint
   // through the latest ``draw`` callback identity.
@@ -2733,6 +2743,24 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
                   e.stopPropagation();
                   setContextMenu({ kind: 'track', x: e.clientX, y: e.clientY, trackId: track.id });
                 }}
+                onPointerDown={(e) => {
+                  if (e.pointerType !== 'touch') return;
+                  const lp = trackLongPressRef.current;
+                  lp.x = e.clientX; lp.y = e.clientY;
+                  clearTimeout(lp.timer);
+                  lp.timer = setTimeout(() => {
+                    lp.timer = 0;
+                    setContextMenu({ kind: 'track', sheet: true, x: lp.x, y: lp.y, trackId: track.id });
+                  }, 500);
+                }}
+                onPointerMove={(e) => {
+                  const lp = trackLongPressRef.current;
+                  if (lp.timer && Math.hypot(e.clientX - lp.x, e.clientY - lp.y) > 10) {
+                    clearTimeout(lp.timer); lp.timer = 0;
+                  }
+                }}
+                onPointerUp={() => { const lp = trackLongPressRef.current; if (lp.timer) { clearTimeout(lp.timer); lp.timer = 0; } }}
+                onPointerCancel={() => { const lp = trackLongPressRef.current; if (lp.timer) { clearTimeout(lp.timer); lp.timer = 0; } }}
                 onClick={isMobileViewport ? () => {
                   // Tap a lane badge on mobile → expand that one lane
                   setExpandedTrackId((cur) => (cur === track.id ? null : track.id));

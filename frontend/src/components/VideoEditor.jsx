@@ -213,6 +213,12 @@ function parseTimecodeInput(str) {
 }
 
 // ── Component ────────────────────────────────────────────────────────────────
+// Touch devices need a fatter invisible edge zone for segment resize-vs-move
+// (a finger can't land an 8px edge). Detected once — pointer type is stable.
+const VE_COARSE_POINTER = typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+  ? window.matchMedia('(pointer: coarse)').matches
+  : false;
+
 const ASPECT_RATIO_OPTIONS = [
   { value: null, label: 'Original', icon: null },
   { value: '16:9', label: '16:9', icon: 'landscape' },
@@ -2602,7 +2608,7 @@ export default function VideoEditor({
   }, [clipStart, effectiveClipEnd, clipDur, trimStartOffset, trimEndOffset, getTimeFromPointer]);
 
   // ── Segment drag-to-resize and drag-to-move ────────
-  const EDGE_THRESHOLD_PX = 8;
+  const EDGE_THRESHOLD_PX = VE_COARSE_POINTER ? 18 : 8;
   const PLAYHEAD_SNAP_PX = 5;
 
   const onSegmentPointerMove = useCallback((e) => {
@@ -3290,9 +3296,10 @@ export default function VideoEditor({
           // In multi-track mode on desktop: clicking the viewport selects the
           // video item (so the user can drag/resize/rotate it). If the video is
           // already selected, deselect and toggle play instead.
-          // On mobile: always toggle play directly — users rely on tapping the
-          // viewport to play/pause, and can select items via the timeline.
-          if (showMultiTrack && videoTimelineItem && !isMobile && !isFullscreen) {
+          // On touch (phone AND tablet): always toggle play directly on a tap —
+          // touch users expect single-tap play/pause and select items via the
+          // timeline, so the desktop "first tap selects" path is skipped.
+          if (showMultiTrack && videoTimelineItem && !isMobile && !isTablet && !isFullscreen) {
             if (storeSelectedItemId === videoTimelineItem.id) {
               setSelectedItemId(null);
               togglePlay();
