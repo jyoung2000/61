@@ -291,17 +291,160 @@ _ws_subscribers: dict[str, list] = {}
 # Cancellation events — set() means "please cancel"
 _cancel_events: dict[str, asyncio.Event] = {}
 
+# The asyncio Task actually running each job's analysis pipeline. Tracking it
+# lets ``request_cancel`` FORCE-cancel a job that is stuck inside a long GPU
+# inference (Whisper / VLM / Perceiver) or subprocess await — cooperative
+# checkpoints alone never fire there, which is why "Force end" used to leave the
+# job pinned on the GPU.
+_analysis_tasks: dict[str, "asyncio.Task"] = {}
+
+# Live child subprocesses (ffmpeg, ffprobe, …) spawned for each job, so a cancel
+# can terminate them immediately instead of waiting for them to exit on their own.
+_job_processes: dict[str, set] = {}
+
+# The AIOrchestrator instance for each running job, so a cancel can unload its
+# GPU-resident provider models (frees VRAM in the container).
+_job_orchestrators: dict[str, object] = {}
+
 
 class CancelledError(Exception):
     """Raised when a job is cancelled by the user."""
 
 
+def register_job_process(job_id: str, proc) -> None:
+    """Track a child process for a job so cancellation can kill it."""
+    if not job_id or proc is None:
+        return
+    _job_processes.setdefault(job_id, set()).add(proc)
+
+
+def unregister_job_process(job_id: str, proc) -> None:
+    procs = _job_processes.get(job_id)
+    if not procs:
+        return
+    procs.discard(proc)
+    if not procs:
+        _job_processes.pop(job_id, None)
+
+
+def register_job_orchestrator(job_id: str, orchestrator) -> None:
+    if job_id and orchestrator is not None:
+        _job_orchestrators[job_id] = orchestrator
+
+
+def _proc_is_alive(p) -> bool:
+    try:
+        if hasattr(p, "returncode"):        # asyncio subprocess
+            return p.returncode is None
+        if hasattr(p, "poll"):              # subprocess.Popen
+            return p.poll() is None
+    except Exception:
+        return False
+    return False
+
+
+def _terminate_job_processes(job_id: str) -> int:
+    """Terminate (then kill) every tracked child process for a job.
+
+    Best-effort and exception-proof: a failure killing one process never
+    prevents the rest from being killed.
+    """
+    procs = _job_processes.pop(job_id, set())
+    killed = 0
+    for p in list(procs):
+        if not _proc_is_alive(p):
+            continue
+        for step in ("terminate", "kill"):
+            try:
+                getattr(p, step)()
+            except ProcessLookupError:
+                break
+            except Exception as e:
+                logger.debug("[%s] %s() on %r failed: %s", job_id, step, p, e)
+            if not _proc_is_alive(p):
+                break
+        killed += 1
+    if killed:
+        logger.info("[%s] terminated %d child process(es) on cancel", job_id, killed)
+    return killed
+
+
+async def _unload_job_gpu(job_id: str) -> None:
+    """Free the GPU/VRAM a cancelled job was holding.
+
+    Unloads the job's AIOrchestrator provider models (Ollama VLM, etc.),
+    releases the reframer's cached Whisper engine, and flushes the torch CUDA
+    allocator. Every step is independently guarded so one failure can't leave
+    VRAM pinned.
+    """
+    orch = _job_orchestrators.pop(job_id, None)
+    if orch is not None:
+        for meth in ("unload_local_models", "unload_all", "unload_models", "shutdown", "aclose", "close"):
+            fn = getattr(orch, meth, None)
+            if not callable(fn):
+                continue
+            try:
+                res = fn()
+                if asyncio.iscoroutine(res):
+                    await asyncio.wait_for(res, timeout=20)
+                logger.info("[%s] orchestrator.%s() freed GPU providers", job_id, meth)
+                break
+            except Exception as e:
+                logger.debug("[%s] orchestrator.%s() failed: %s", job_id, meth, e)
+    try:
+        await _release_whisper_vram(job_id)
+    except Exception as e:
+        logger.debug("[%s] whisper VRAM release on cancel failed: %s", job_id, e)
+    try:
+        release_torch_gpu_memory()
+    except Exception as e:
+        logger.debug("[%s] torch VRAM release on cancel failed: %s", job_id, e)
+    _log_gpu_memory(job_id, "after-cancel")
+
+
 def request_cancel(job_id: str):
-    """Signal a running job to stop at the next checkpoint."""
+    """Forcefully end a running job: signal cooperative checkpoints, kill child
+    processes, cancel the running pipeline task, and free its GPU memory.
+
+    Previously this only set a flag that checkpoints polled — a job stuck inside
+    a GPU inference never reached a checkpoint, so it kept running on the card.
+    Now the cancel is authoritative.
+    """
+    # 1) Cooperative flag — lets any code polling ``is_cancel_requested`` bail.
     ev = _cancel_events.get(job_id)
     if ev:
-        ev.set()
-        logger.info(f"Cancellation requested for job {job_id}")
+        try:
+            ev.set()
+        except Exception as e:
+            logger.debug("[%s] setting cancel event failed: %s", job_id, e)
+    logger.info("Force-cancel requested for job %s", job_id)
+
+    # 2) Kill any child subprocess (ffmpeg/ffprobe) immediately.
+    try:
+        _terminate_job_processes(job_id)
+    except Exception as e:
+        logger.warning("[%s] terminating child processes failed: %s", job_id, e)
+
+    # 3) Cancel the pipeline task so it unwinds out of long awaits / executors.
+    task = _analysis_tasks.get(job_id)
+    if task is not None and not task.done():
+        try:
+            task.cancel()
+            logger.info("[%s] analysis task cancelled", job_id)
+        except Exception as e:
+            logger.warning("[%s] cancelling analysis task failed: %s", job_id, e)
+
+    # 4) Free the GPU. Schedule it on the running loop (endpoints call this from
+    #    async context). When the cancelled task unwinds, run_analysis's cancel
+    #    handler also frees the GPU, so this is a belt-and-suspenders release; if
+    #    there is no running loop we simply rely on that handler.
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_unload_job_gpu(job_id))
+    except RuntimeError:
+        logger.debug("[%s] no running loop for GPU unload — task handler will free it", job_id)
+    except Exception as e:
+        logger.debug("[%s] scheduling GPU unload failed: %s", job_id, e)
 
 
 def is_cancel_requested(job_id: str) -> bool:
@@ -552,6 +695,12 @@ async def run_analysis(job_id: str):
     """Execute the full analysis pipeline for a video job."""
     # Set up cancellation event for this job
     _cancel_events[job_id] = asyncio.Event()
+    # Track the running task so a "Force end" can cancel it out of a stuck
+    # GPU inference / subprocess await, not just flip a flag.
+    try:
+        _analysis_tasks[job_id] = asyncio.current_task()
+    except Exception:
+        pass
     sem = get_semaphore()
 
     # Broadcast immediately so the Analysis page shows status while waiting
@@ -583,17 +732,40 @@ async def run_analysis(job_id: str):
                         (_owner_id or "")[:8],
                     )
                 await _run_analysis_inner(job_id)
-        except CancelledError:
-            logger.info(f"Job {job_id} cancelled by user")
-            await database.update_job_status(
-                job_id,
-                status=JobStatus.CANCELLED,
-                progress_message="Cancelled by user",
-            )
-            await broadcast_ws(job_id, {
-                "type": "cancelled",
-                "message": "Job cancelled by user",
-            })
+        except (CancelledError, asyncio.CancelledError) as ce:
+            # Covers both the cooperative CancelledError (checkpoint) and a
+            # forced asyncio task .cancel() (Force end while stuck in a GPU op).
+            forced = isinstance(ce, asyncio.CancelledError)
+            logger.info("Job %s cancelled by user (%s)", job_id, "forced" if forced else "checkpoint")
+            # Persist the terminal state and notify clients. Shield these from
+            # the in-flight cancellation so the DB isn't left showing "running".
+            try:
+                await asyncio.shield(database.update_job_status(
+                    job_id,
+                    status=JobStatus.CANCELLED,
+                    progress_message="Cancelled by user",
+                ))
+            except Exception as _de:
+                logger.warning("[%s] failed to persist cancelled status: %s", job_id, _de)
+            try:
+                await asyncio.shield(broadcast_ws(job_id, {
+                    "type": "cancelled",
+                    "message": "Job cancelled by user",
+                }))
+            except Exception:
+                pass
+            # Free the GPU right away rather than waiting on the fire-and-forget
+            # task scheduled by request_cancel (which may itself be cancelled).
+            try:
+                await asyncio.shield(_unload_job_gpu(job_id))
+            except Exception as _ge:
+                logger.debug("[%s] GPU unload during cancel failed: %s", job_id, _ge)
+            # A forced task .cancel() must propagate so callers that awaited the
+            # pipeline directly (e.g. the agent's full-pipeline flow) stop too,
+            # instead of continuing as if analysis had succeeded. The cooperative
+            # CancelledError is ours to swallow.
+            if forced:
+                raise
         except Exception as e:
             logger.exception(f"Analysis pipeline failed for {job_id}")
             # Preserve last known progress so the frontend can show where it
@@ -611,11 +783,31 @@ async def run_analysis(job_id: str):
                 "type": "error",
                 "message": f"Analysis failed: {str(e)}",
             })
+            # A failed job should not keep provider models pinned on the GPU.
+            try:
+                await _unload_job_gpu(job_id)
+            except Exception as _ge:
+                logger.debug("[%s] GPU unload after failure failed: %s", job_id, _ge)
         finally:
-            # Stop heartbeat and clean up
-            hb.stop()
+            # Stop heartbeat and clean up. Each step is guarded so a failure in
+            # one never leaks the next (heartbeat, cancel event, task handle,
+            # child processes). GPU unload happens on the cancel/failure paths
+            # above — a normal completion keeps models warm for reuse — so here
+            # we only drop the orchestrator reference.
+            try:
+                hb.stop()
+            except Exception:
+                pass
             _heartbeats.pop(job_id, None)
             _cancel_events.pop(job_id, None)
+            _analysis_tasks.pop(job_id, None)
+            _job_orchestrators.pop(job_id, None)
+            # Kill any child process still alive (e.g. an ffmpeg that outlived
+            # a failed stage).
+            try:
+                _terminate_job_processes(job_id)
+            except Exception as _pe:
+                logger.debug("[%s] process cleanup failed: %s", job_id, _pe)
             # Even when the job didn't finish cleanly, persist whatever
             # stage timings + warnings we collected so the UI can show
             # where it died. Best-effort: any DB error is logged but
@@ -707,6 +899,8 @@ async def _run_analysis_inner(job_id: str):
         custom_prompts=custom_prompts,
         cancel_check=cancel_check,
     )
+    # Expose the orchestrator so a cancel can unload its GPU provider models.
+    register_job_orchestrator(job_id, orchestrator)
 
     # ── Pre-flight: validate AI models are reachable ──
     try:

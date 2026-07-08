@@ -69,6 +69,26 @@ def _check_disk_space(output_path: str, required_mb: int = 500) -> None:
 _STALL_TIMEOUT = 30   # Kill extraction if 0 frames after 30s (was 45)
 
 
+def _kill_proc_safe(proc, hard: bool = False) -> None:
+    """Terminate (or kill) a subprocess without ever raising.
+
+    Used on cancellation teardown so ffmpeg never survives a cancelled job.
+    """
+    if proc is None:
+        return
+    try:
+        if getattr(proc, "returncode", None) is not None:
+            return  # already exited
+    except Exception:
+        pass
+    try:
+        proc.kill() if hard else proc.terminate()
+    except ProcessLookupError:
+        pass
+    except Exception as e:
+        logger.debug("subprocess %s failed: %s", "kill" if hard else "terminate", e)
+
+
 async def _run_subprocess_cancellable(
     cmd: list[str],
     cancel_check: Optional[Callable] = None,
@@ -87,8 +107,18 @@ async def _run_subprocess_cancellable(
     )
 
     if not cancel_check:
-        _, stderr = await proc.communicate()
-        return proc.returncode, stderr
+        try:
+            _, stderr = await proc.communicate()
+            return proc.returncode, stderr
+        except BaseException:
+            # Includes asyncio.CancelledError from a forced "Force end" — make
+            # sure ffmpeg dies instead of being orphaned on the GPU/CPU.
+            _kill_proc_safe(proc)
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5.0)
+            except Exception:
+                pass
+            raise
 
     comm_task = asyncio.ensure_future(proc.communicate())
     try:
@@ -99,13 +129,18 @@ async def _run_subprocess_cancellable(
         _, stderr = comm_task.result()
         return proc.returncode, stderr
     except BaseException:
-        # Cancel requested or other error — kill the subprocess
-        proc.terminate()
+        # Cancel requested (cooperative or forced) or other error — kill the
+        # subprocess. Guard each teardown step so one failure can't swallow
+        # the original exception.
+        _kill_proc_safe(proc)
         try:
             await asyncio.wait_for(proc.wait(), timeout=5.0)
-        except asyncio.TimeoutError:
-            proc.kill()
-        comm_task.cancel()
+        except Exception:
+            _kill_proc_safe(proc, hard=True)
+        try:
+            comm_task.cancel()
+        except Exception:
+            pass
         raise
 
 

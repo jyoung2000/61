@@ -274,12 +274,66 @@ async def get_video(job_id: str):
     return _ok(job.model_dump())
 
 
-@router.delete("/videos/{job_id}", summary="Delete video/job", dependencies=[Depends(verify_api_key)])
-async def delete_video(job_id: str):
-    """Delete a job and all associated files."""
+_ACTIVE_JOB_STATES = (
+    JobStatus.QUEUED,
+    JobStatus.EXTRACTING_FRAMES,
+    JobStatus.TRANSCRIBING,
+    JobStatus.ANALYZING_SCENES,
+    JobStatus.GENERATING_SUMMARY,
+    JobStatus.DETECTING_CLIPS,
+)
+
+
+@router.post("/videos/{job_id}/cancel", summary="Cancel / force-end analysis", dependencies=[Depends(verify_api_key)])
+async def cancel_video(job_id: str):
+    """Forcefully end a running analysis: cancel the pipeline task, kill its
+    child processes, and free the GPU. Idempotent for jobs already terminal."""
     job = await database.load_job(job_id)
     if not job:
         _err("VIDEO_NOT_FOUND", f"No video found with job_id '{job_id}'", 404)
+
+    if job.status not in _ACTIVE_JOB_STATES:
+        # Already finished/cancelled — nothing to stop.
+        return _ok({"job_id": job_id, "status": str(job.status)})
+
+    from backend.services.pipeline import request_cancel
+    # Mark cancelled first so status polls flip immediately, then force-terminate.
+    try:
+        await database.update_job_status(
+            job_id,
+            status=JobStatus.CANCELLED,
+            progress_message="Cancelled by user",
+        )
+    except Exception as e:
+        logger.warning("cancel_video: failed to persist cancelled status for %s: %s", job_id, e)
+    try:
+        request_cancel(job_id)
+    except Exception as e:
+        logger.exception("cancel_video: request_cancel failed for %s: %s", job_id, e)
+        _err("CANCEL_FAILED", f"Failed to end job: {e}", 500)
+    return _ok({"job_id": job_id, "status": "cancelled"})
+
+
+@router.delete("/videos/{job_id}", summary="Delete video/job", dependencies=[Depends(verify_api_key)])
+async def delete_video(job_id: str):
+    """Delete a job and all associated files.
+
+    If the analysis is still running, force-end it first — otherwise the DB
+    record disappears while the pipeline keeps running and holding the GPU.
+    """
+    job = await database.load_job(job_id)
+    if not job:
+        _err("VIDEO_NOT_FOUND", f"No video found with job_id '{job_id}'", 404)
+
+    if job.status in _ACTIVE_JOB_STATES:
+        from backend.services.pipeline import request_cancel
+        try:
+            request_cancel(job_id)
+        except Exception as e:
+            logger.warning("delete_video: request_cancel failed for %s: %s", job_id, e)
+        # Give the pipeline a moment to unwind its task + free VRAM before the
+        # record (and files) are removed.
+        await asyncio.sleep(0.5)
 
     await database.delete_job(job_id)
     return _ok({"job_id": job_id, "deleted": True})

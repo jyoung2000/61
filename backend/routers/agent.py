@@ -707,6 +707,12 @@ async def run_pipeline(req: PipelineRequest, background_tasks: BackgroundTasks):
                 _pipeline_status[pipeline_id]["status"] = "failed"
                 _pipeline_status[pipeline_id]["error"] = job.error if job else "Analysis failed"
                 return
+            # A user "Force end" during analysis cancels the job — stop the whole
+            # pipeline instead of proceeding to clip detection on a dead job.
+            if job.status == JobStatus.CANCELLED:
+                _pipeline_status[pipeline_id]["status"] = "cancelled"
+                _pipeline_status[pipeline_id]["progress_message"] = "Cancelled by user"
+                return
 
             _pipeline_status[pipeline_id]["progress"] = 60
             _pipeline_status[pipeline_id]["progress_message"] = "Analysis complete. Detecting viral clips..."
@@ -868,6 +874,20 @@ async def run_pipeline(req: PipelineRequest, background_tasks: BackgroundTasks):
                     **_pipeline_status[pipeline_id],
                 })
 
+        except asyncio.CancelledError:
+            # Forced "Force end" — mark cancelled and re-raise so the task ends.
+            logger.info("Pipeline %s cancelled by user", pipeline_id)
+            _pipeline_status[pipeline_id]["status"] = "cancelled"
+            _pipeline_status[pipeline_id]["progress_message"] = "Cancelled by user"
+            if req.callback_url:
+                try:
+                    await _send_callback(req.callback_url, {
+                        "event": "pipeline_cancelled",
+                        **_pipeline_status[pipeline_id],
+                    })
+                except Exception:
+                    pass
+            raise
         except Exception as e:
             logger.exception("Pipeline failed: %s", e)
             _pipeline_status[pipeline_id]["status"] = "failed"
