@@ -713,11 +713,16 @@ async fn free_vram() -> Result<serde_json::Value, String> {
 /// a phantom job and frees the VRAM it was holding.
 #[tauri::command]
 async fn end_active_job(state: tauri::State<'_, SharedState>) -> Result<serde_json::Value, String> {
-    state.clear_reported_job("");
+    // Sticky force-end: clear + SUPPRESS the job id so a still-heartbeating
+    // ClipAI can't resurrect the card, and finish its in-flight activity.
+    let ended = state.force_end_job();
     state.job_progress.store(0, std::sync::atomic::Ordering::Relaxed);
     let (n, names) = ollama::unload_all().await;
-    log::info!("end_active_job: cleared job + unloaded {n} model(s)");
-    Ok(serde_json::json!({ "unloaded": n, "models": names }))
+    log::info!(
+        "end_active_job: force-ended {} + unloaded {n} model(s)",
+        ended.as_deref().unwrap_or("(none)")
+    );
+    Ok(serde_json::json!({ "unloaded": n, "models": names, "ended_job": ended }))
 }
 
 #[tauri::command]

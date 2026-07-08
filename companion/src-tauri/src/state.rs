@@ -309,6 +309,13 @@ pub struct AppState {
     /// request reaches us, so the in-flight-request view would freeze; this
     /// heartbeat keeps the GUI bar tracking the container. None until reported.
     pub reported_job: Mutex<Option<ReportedJob>>,
+    /// Job ids the user Force-ended (or that ClipAI signalled ended) → when.
+    /// A Force-ended job must STAY gone even though ClipAI may keep heartbeating
+    /// it for a few more seconds (a local-only stage still running, or a
+    /// cancel that hasn't propagated yet) — without this the very next heartbeat
+    /// resurrects the card, so the button looked like it "did nothing". Entries
+    /// expire (TTL) so a genuinely new job with a fresh id is never blocked.
+    pub suppressed_jobs: Mutex<HashMap<String, u64>>,
 }
 
 /// A job-progress heartbeat pushed by ClipAI (POST /v1/progress) so the GUI
@@ -363,6 +370,7 @@ impl AppState {
             proxy_bound: AtomicBool::new(false),
             proxy_last_error: Mutex::new(String::new()),
             reported_job: Mutex::new(None),
+            suppressed_jobs: Mutex::new(HashMap::new()),
         };
         state.save(); // persist the generated token on first run
         state
@@ -467,13 +475,20 @@ impl AppState {
     }
 
     /// The most recent still-running non-health request, for /v1/health's
-    /// `current_job` field and the dashboard headline.
+    /// `current_job` field and the dashboard headline. A Force-ended job id is
+    /// skipped so a request still in flight when the user ended it can't keep
+    /// headlining the (now-ended) job.
     pub fn current_job(&self) -> Option<ActivityEntry> {
+        let suppressed = self.suppressed_jobs.lock().unwrap();
         self.activity
             .lock()
             .unwrap()
             .iter()
-            .find(|e| e.finished_at_ms.is_none() && e.kind != "health")
+            .find(|e| {
+                e.finished_at_ms.is_none()
+                    && e.kind != "health"
+                    && !suppressed.contains_key(&e.job_id)
+            })
             .cloned()
     }
 
@@ -489,6 +504,17 @@ impl AppState {
     ) {
         self.last_clipai_contact.store(now_ms(), Ordering::Relaxed);
         let now = now_ms();
+        // Drop heartbeats for a job the user Force-ended (or ClipAI ended): it
+        // must not resurrect the card. Prune expired suppressions first so a new
+        // job id is never blocked. TTL is generous (30 min) because a stuck
+        // container can keep heartbeating the SAME job id for a long time.
+        {
+            let mut sup = self.suppressed_jobs.lock().unwrap();
+            sup.retain(|_, ts| now.saturating_sub(*ts) < 1_800_000);
+            if sup.contains_key(job_id) {
+                return;
+            }
+        }
         let mut slot = self.reported_job.lock().unwrap();
         // Preserve the original start time across heartbeats for the same job;
         // a new job_id resets it. This keeps the GUI "elapsed" sane.
@@ -518,6 +544,49 @@ impl AppState {
         if matches {
             *slot = None;
         }
+        // A specific end signal from ClipAI (cancel/delete via the
+        // x-clipai-job-ended header) also SUPPRESSES that job id, so a late
+        // in-flight heartbeat racing the end signal can't bring the card back.
+        if !job_id.is_empty() {
+            self.suppressed_jobs
+                .lock()
+                .unwrap()
+                .insert(job_id.to_string(), now_ms());
+        }
+    }
+
+    /// GUI "Force end": clear the reported job, SUPPRESS its id so a still-
+    /// heartbeating ClipAI can't resurrect it, and mark any in-flight activity
+    /// entries for it finished so the per-job log stops reading as active.
+    /// Returns the ended job id (for logging), if one was showing.
+    pub fn force_end_job(&self) -> Option<String> {
+        // The displayed job is the reported heartbeat if fresh, else the most
+        // recent in-flight proxy request. End whichever is showing.
+        let job_id = {
+            let slot = self.reported_job.lock().unwrap();
+            slot.as_ref().map(|j| j.job_id.clone())
+        }
+        .or_else(|| self.current_job().map(|e| e.job_id));
+
+        *self.reported_job.lock().unwrap() = None;
+
+        if let Some(jid) = job_id.as_ref() {
+            if !jid.is_empty() {
+                self.suppressed_jobs
+                    .lock()
+                    .unwrap()
+                    .insert(jid.clone(), now_ms());
+            }
+            let now = now_ms();
+            let mut feed = self.activity.lock().unwrap();
+            for e in feed.iter_mut() {
+                if &e.job_id == jid && e.finished_at_ms.is_none() {
+                    e.finished_at_ms = Some(now);
+                    e.status = Some(499); // client-closed (force-ended)
+                }
+            }
+        }
+        job_id
     }
 
     /// The reported job if a heartbeat arrived recently (< 45s) — else None so a
