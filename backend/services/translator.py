@@ -935,6 +935,75 @@ async def _translate_batch_via_ollama(
     raise RuntimeError("Ollama translation produced no response")
 
 
+# Preference order for auto-selecting the translation-POLISH model on a paired
+# GPU host — larger / more-multilingual first. Matched loosely (name prefix), so
+# any installed quant/tag of these families qualifies. The first entry that is
+# BOTH installed on the Companion AND fits its VRAM wins.
+_POLISH_MODEL_PREFERENCE = [
+    "qwen2.5:14b-instruct", "qwen2.5:14b",
+    "qwen2.5:7b-instruct", "qwen2.5:7b",
+    "qwen3:8b", "gemma2:9b-instruct", "llama3.1:8b-instruct",
+    "qwen2.5:3b-instruct",
+]
+
+
+async def resolve_translation_polish_model(fallback: str) -> str:
+    """Pick the model for the translation-POLISH (MTPE) pass.
+
+    An explicit ``OLLAMA_TRANSLATION_POLISH_MODEL`` wins. Otherwise, when a
+    paired Companion (remote GPU host) is available, auto-pick the largest
+    suitable instruct model already installed on it — the polish reads far more
+    naturally from a 14B than the light 4B translation model, and the Companion's
+    big card runs it at GPU speed (the host registry routes the call there via
+    ``pick_host(required_model=...)``). Falls back to ``fallback`` (the
+    translation model) when auto is off, there's no Companion, nothing suitable
+    is installed, or on any error — so a small-card-only deployment is unchanged.
+    """
+    pinned = (getattr(settings, "OLLAMA_TRANSLATION_POLISH_MODEL", "") or "").strip()
+    if pinned:
+        return pinned
+    if not bool(getattr(settings, "OLLAMA_TRANSLATION_POLISH_AUTO", True)):
+        return fallback
+    try:
+        from backend.services import ollama_registry as _oreg
+        # Only auto-upgrade when the PRIMARY Ollama host is a remote GPU (the
+        # paired Companion). Both routers — the orchestrator (uses primary_url())
+        # and the offline MTPE path (pick_host prefers primary) — then land the
+        # bigger model on that card. If the primary is the weak local card, an
+        # upsize would spill to CPU and be slower, not better — so keep the light
+        # model there.
+        host = _oreg.primary_host()
+        if host is None or _oreg.is_local_gpu_host(host.url):
+            return fallback
+        status = await _oreg.probe(host)
+        if not status.online or not status.models:
+            return fallback
+        vram_gb = ((getattr(host, "vram_total_mb", 0) or 0) / 1024.0)
+        from backend.services.local_models import (
+            _ollama_names_match, estimate_model_weights_gb,
+        )
+        for pref in _POLISH_MODEL_PREFERENCE:
+            match = next((inst for inst in status.models
+                          if _ollama_names_match(inst, pref)), None)
+            if not match:
+                continue
+            # Respect the host's VRAM when it's known: skip a model that won't
+            # fit fully (it would spill to CPU and be slower, not better).
+            if vram_gb > 0:
+                w = estimate_model_weights_gb(match)
+                if w is not None and (w + 1.0) > vram_gb:
+                    continue
+            if _ollama_names_match(match, fallback):
+                return fallback  # best available IS the light model — no change
+            logger.info(
+                "Translation polish: auto-selected %s on GPU host '%s' for higher "
+                "quality (fallback was %s)", match, host.name, fallback)
+            return match
+    except Exception as e:
+        logger.debug("translation-polish model auto-select skipped (%s)", e)
+    return fallback
+
+
 class _OllamaMTPEClient:
     """Minimal orchestrator-shaped client so ``transcript_polisher.
     correct_transcript`` can post-edit the offline NMT draft with the DEDICATED
@@ -1085,24 +1154,35 @@ async def mtpe_postedit_offline(
 
     num_ctx = int(getattr(settings, "OFFLINE_TRANSLATION_MTPE_NUM_CTX", 8192))
 
+    # Route the polish to the paired Companion GPU with a larger model when one
+    # is available (higher translation quality). When it auto-upgrades, the model
+    # is already confirmed installed on that host, so skip the local availability
+    # pre-check below and let the host registry route the call there.
+    _auto_polish = await resolve_translation_polish_model(model)
+    _polish_upgraded = (_auto_polish or "").strip() != (model or "").strip()
+    model = _auto_polish
+
     # ── Model-availability pre-check + one-line diagnostics ──
     # Confirm the configured translation model is actually pulled on the Ollama
     # host. If it's missing, log an actionable `ollama pull` line and fall back to
     # the raw NMT draft (the completeness backstop) instead of erroring inside the
     # request path. We never auto-pull silently here. A transient list failure is
     # non-fatal — we proceed and let the per-batch fail-soft handle any error.
-    try:
-        from backend.services.local_models import list_ollama_models, _ollama_names_match
-        installed = await list_ollama_models()
-        if installed and not any(_ollama_names_match(m, model) for m in installed):
-            logger.warning(
-                "Local translation model %r is not installed on the Ollama host "
-                "(%s) — falling back to the offline NMT draft. To enable the "
-                "Qwen3 MTPE pass, run:  ollama pull %s",
-                model, host, model)
-            return nmt_segments
-    except Exception as _avail_e:
-        logger.debug("Translation model availability check skipped (%s)", _avail_e)
+    # Skipped when the polish model was auto-upgraded (already verified resident
+    # on the Companion, which may not be the primary host this check inspects).
+    if not _polish_upgraded:
+        try:
+            from backend.services.local_models import list_ollama_models, _ollama_names_match
+            installed = await list_ollama_models()
+            if installed and not any(_ollama_names_match(m, model) for m in installed):
+                logger.warning(
+                    "Local translation model %r is not installed on the Ollama host "
+                    "(%s) — falling back to the offline NMT draft. To enable the "
+                    "Qwen3 MTPE pass, run:  ollama pull %s",
+                    model, host, model)
+                return nmt_segments
+        except Exception as _avail_e:
+            logger.debug("Translation model availability check skipped (%s)", _avail_e)
     logger.info(
         "Local translation engine: model=%s num_ctx=%d host=%s device=ollama-auto "
         "(GPU after Whisper release, CPU fallback on OOM)",

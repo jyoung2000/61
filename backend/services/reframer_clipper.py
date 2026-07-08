@@ -3741,6 +3741,9 @@ class ClipExtractor:
         # Re-test the GPU encoder fresh each export run — a previous job may have
         # disabled it while Ollama was loaded; this one might have the GPU free.
         _gpu_encode_unavailable.clear()
+        global _gpu_fail_count
+        with _gpu_fail_lock:
+            _gpu_fail_count = 0
 
         def _log_ok(idx, c, cn):
             logger.info(
@@ -3824,6 +3827,13 @@ class ClipExtractor:
 # repeating it dozens of times (the "every clip exports twice" symptom when
 # Ollama is holding the 4 GB GPU). Reset at the start of each export run.
 _gpu_encode_unavailable = threading.Event()
+# Count of GPU-encode failures observed this run. The latch above only trips
+# once this reaches CLIP_EXPORT_GPU_FAIL_THRESHOLD — so a single transient NVENC
+# session-cap blip (two clips starting an encode at once) no longer condemns the
+# whole batch to the slow CPU path. Guarded by its lock (parallel encode
+# threads). Reset alongside the latch at the start of each export run.
+_gpu_fail_lock = threading.Lock()
+_gpu_fail_count = 0
 
 
 class _JudgeVerdictCache:
@@ -3968,15 +3978,26 @@ def _export_clip(video_path: str, output_path: str,
             result = subprocess.run(cmd, capture_output=True, timeout=180)
             if result.returncode == 0 and os.path.exists(output_path) \
                     and os.path.getsize(output_path) > 0:
-                # GPU failed but CPU just worked → stop trying NVENC for the rest
-                # of this batch. Latch once (Event is process-wide but reset per
-                # export run), so we log the switch a single time.
+                # GPU failed here but CPU just worked. Count it; only latch to
+                # CPU-for-the-rest once failures cross the threshold, so a lone
+                # transient NVENC session-cap blip doesn't doom the whole batch
+                # to the slow CPU path (a healthy GPU keeps encoding).
                 if _gpu_failed_here and not is_gpu \
                         and not _gpu_encode_unavailable.is_set():
-                    _gpu_encode_unavailable.set()
-                    logger.warning(
-                        "GPU clip encode failed but CPU succeeded — using CPU for "
-                        "the remaining clips this run (GPU likely busy with Ollama)")
+                    try:
+                        _thr = int(getattr(settings, "CLIP_EXPORT_GPU_FAIL_THRESHOLD", 3) or 3)
+                    except Exception:
+                        _thr = 3
+                    global _gpu_fail_count
+                    with _gpu_fail_lock:
+                        _gpu_fail_count += 1
+                        _n_fail = _gpu_fail_count
+                    if _n_fail >= max(1, _thr) and not _gpu_encode_unavailable.is_set():
+                        _gpu_encode_unavailable.set()
+                        logger.warning(
+                            "GPU clip encode failed %d× this run — using CPU for the "
+                            "remaining clips (GPU likely busy / NVENC session cap)",
+                            _n_fail)
                 return True
             if is_gpu:
                 _gpu_failed_here = True

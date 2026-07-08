@@ -102,6 +102,16 @@ class Settings(BaseSettings):
     # GPU. The exact Ollama tag may vary by quant (…-q4_K_M / -q8_0 / -fp16) or a
     # user Modelfile — overridable via env; never hardcode a tag deeper in code.
     OLLAMA_TRANSLATION_MODEL: str = "qwen3:4b-instruct-2507-q4_K_M"
+    # Dedicated model for the TRANSLATION-POLISH (MTPE post-edit) pass. When a
+    # paired Companion GPU is available, the polish reads far more natural with a
+    # LARGER model than the light translation model — and the Companion's 12 GB
+    # card runs it at GPU speed. Blank + OLLAMA_TRANSLATION_POLISH_AUTO on (the
+    # default) means: auto-pick the largest suitable instruct model already
+    # installed on the Companion (qwen2.5:14b → 7b → …), routed there by the host
+    # registry; nothing installed / no Companion → fall back to the translation
+    # model. Set an explicit tag to pin one.
+    OLLAMA_TRANSLATION_POLISH_MODEL: str = ""
+    OLLAMA_TRANSLATION_POLISH_AUTO: bool = True
     # ── Qwen3 translation sampling ──
     # Qwen3 is prone to repetition without a presence/repetition penalty, and for
     # deterministic subtitle JSON we want LOW temperature. These apply ONLY to the
@@ -613,6 +623,18 @@ class Settings(BaseSettings):
     # are cheap) — 0/1 = sequential.
     CLIP_EXPORT_CRF: int = 21
     CLIP_EXPORT_CONCURRENCY: int = 2
+    # How many GPU (NVENC) encode failures to tolerate in one export run before
+    # giving up on the GPU and finishing the batch on CPU. The old behavior
+    # latched to CPU after the FIRST failure — but a single transient NVENC
+    # session-cap blip (common when two clips start encoding at once) then forced
+    # every remaining clip onto the slow CPU path. Tolerate a few blips so a
+    # healthy GPU keeps encoding.
+    CLIP_EXPORT_GPU_FAIL_THRESHOLD: int = 3
+    # Concurrency for the render-plan scene-thumbnail extraction. 0 = auto
+    # (min(16, cpu_count)). Each thumbnail is an independent fast keyframe seek,
+    # so running them in parallel turns hundreds of serial ffmpeg seeks (minutes
+    # on a long video) into a few concurrent waves (seconds).
+    THUMBNAIL_EXTRACT_CONCURRENCY: int = 0
     # Opt-in: skip re-encoding candidate clips entirely and just remux the bytes
     # (``-c copy``). Near-instant (the whole export phase drops from many minutes
     # to seconds), but the cut snaps to the nearest keyframe, so a clip may begin

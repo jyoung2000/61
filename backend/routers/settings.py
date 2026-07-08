@@ -2540,6 +2540,101 @@ def _is_zero_cost(model_data: dict) -> bool:
         return False
 
 
+# Ollama vision-capable families (name-prefix match), shared by the model
+# browser + the available-models list so both agree on which local models can
+# do vision.
+_OLLAMA_VISION_FAMILIES = {
+    "llava", "moondream", "bakllava", "minicpm-v", "llava-llama3", "llava-phi3",
+    "nanollava", "llama3.2-vision", "qwen2.5vl", "qwen2-vl", "qwen2.5-vl",
+    "gemma3", "mistral-small3.1",
+}
+
+
+def _ollama_family_is_vision(model_name: str) -> bool:
+    fam = (model_name or "").split(":")[0].lower()
+    return any(vf in fam for vf in _OLLAMA_VISION_FAMILIES)
+
+
+async def _ollama_models_all_hosts(timeout: float = 5.0) -> list[dict]:
+    """Union of installed Ollama models across ALL enabled registry hosts — the
+    local card AND any paired Companion — so a model freshly pulled on the
+    Companion is searchable even when it isn't the primary host. (The old path
+    queried only ``primary_url()``, hiding companion-only pulls.)
+
+    Each returned dict is a raw ``/api/tags`` model entry plus ``_hosts`` (the
+    host names that have it). Fully fail-soft: an offline / unauthorized host is
+    skipped. Hosts are probed concurrently and results merged by model name.
+    """
+    from backend.services import ollama_registry
+    hosts = ollama_registry.enabled_hosts()
+    if not hosts:
+        _u = (ollama_registry.primary_url() or settings.OLLAMA_HOST or "").rstrip("/")
+        if not _u:
+            return []
+        hosts = [ollama_registry.OllamaHost(id="default", name="Default", url=_u)]
+
+    merged: dict[str, dict] = {}
+
+    async def _one(host):
+        url = ollama_registry.join_url(host.url, "/api/tags")
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.get(url, headers=ollama_registry.auth_headers(host))
+            if resp.status_code != 200:
+                return
+            for m in resp.json().get("models", []) or []:
+                nm = m.get("name", "")
+                if not nm:
+                    continue
+                existing = merged.get(nm)
+                if existing is not None:
+                    if host.name not in existing.get("_hosts", []):
+                        existing.setdefault("_hosts", []).append(host.name)
+                else:
+                    m["_hosts"] = [host.name]
+                    merged[nm] = m
+        except Exception as e:
+            logger.debug("Ollama /api/tags fetch failed for host %s (%s)", host.name, e)
+
+    await asyncio.gather(*[_one(h) for h in hosts], return_exceptions=True)
+    return list(merged.values())
+
+
+def _ollama_model_browser_entries(raw_models: list[dict]) -> tuple[list, list]:
+    """Shape cross-host Ollama ``/api/tags`` dicts into ModelBrowser rows.
+
+    Returns ``(vision_entries, text_entries)`` in the same shape the OpenRouter
+    cache uses (``id``/``name``/``context_length``/``pricing``), so the browser
+    can search local models alongside cloud ones. All Ollama models can do text;
+    vision families also appear in the vision list."""
+    vision, text = [], []
+    for m in raw_models:
+        name = m.get("name", "")
+        if not name:
+            continue
+        details = m.get("details", {}) or {}
+        param_size = details.get("parameter_size", "")
+        quant = details.get("quantization_level", "")
+        size_gb = round((m.get("size", 0) or 0) / (1024 ** 3), 1)
+        hosts = m.get("_hosts") or []
+        label_bits = [b for b in (param_size, quant, f"{size_gb}GB" if size_gb else "") if b]
+        host_bit = f" · {', '.join(hosts)}" if hosts else ""
+        entry = {
+            "id": f"ollama/{name}",
+            "name": f"{name} (Ollama{host_bit})"
+                    + (f" — {' '.join(label_bits)}" if label_bits else ""),
+            "provider": "ollama",
+            "context_length": 0,   # unknown; browser allows ctx==0
+            "pricing": {"prompt": "0", "completion": "0"},
+            "is_free": True,
+            "_hosts": hosts,
+        }
+        if _ollama_family_is_vision(name):
+            vision.append(entry)
+        text.append(entry)
+    return vision, text
+
+
 async def _fetch_openrouter_models() -> list | None:
     """Fetch model list from OpenRouter, using cache if fresh."""
     # Check cache first
@@ -2627,10 +2722,8 @@ def _estimate_cost(model_data: dict, role: str) -> float:
                 completion_price * _TEXT_OUTPUT_TOKENS_10MIN)
 
 
-@router.get("/providers/models")
-async def list_models():
-    """Fetch OpenRouter model list, cached for 24h."""
-    # Check cache
+async def _openrouter_browser_data() -> dict:
+    """The OpenRouter half of the model-browser list (cached 24h)."""
     if os.path.exists(MODEL_CACHE_PATH):
         try:
             with open(MODEL_CACHE_PATH, "r") as f:
@@ -2638,25 +2731,54 @@ async def list_models():
             if time.time() - cache.get("timestamp", 0) < MODEL_CACHE_TTL:
                 cached_data = cache.get("data", {})
                 if cached_data:
-                    return cached_data
+                    return dict(cached_data)
         except Exception:
             pass
-
-    # Fetch from OpenRouter
     if not _key_is_set(settings.OPENROUTER_API_KEY):
         return {"vision_models": [], "text_models": [], "cached": False}
-
     models = await _fetch_openrouter_models()
     if models is None:
         return {"vision_models": [], "text_models": [], "cached": False}
-
-    # Return from the cache that _fetch_openrouter_models just wrote
     try:
         with open(MODEL_CACHE_PATH, "r") as f:
             cache = json.load(f)
-        return cache.get("data", {"vision_models": [], "text_models": [], "cached": True})
+        return dict(cache.get("data", {"vision_models": [], "text_models": [], "cached": True}))
     except Exception:
         return {"vision_models": [], "text_models": [], "cached": False}
+
+
+@router.get("/providers/models")
+async def list_models():
+    """Searchable model list for the browser: the live OpenRouter catalog
+    (cached 24h — click Refresh to force) MERGED with local Ollama models pulled
+    across ALL registry hosts (the local card AND any paired Companion), so
+    newly-added models of either kind are searchable. Ollama models are queried
+    fresh each call (no cache), so a just-pulled Companion model appears at once.
+    """
+    data = await _openrouter_browser_data()
+    vision = list(data.get("vision_models", []) or [])
+    text = list(data.get("text_models", []) or [])
+
+    # Merge cross-host Ollama models (fresh, uncached) so a Companion pull shows.
+    if "ollama" in settings.active_provider_chain:
+        try:
+            _raw = await _ollama_models_all_hosts()
+            _ov, _ot = _ollama_model_browser_entries(_raw)
+            _seen_v = {m.get("id") for m in vision}
+            _seen_t = {m.get("id") for m in text}
+            # Local models first — they're free + immediately usable.
+            vision = [m for m in _ov if m.get("id") not in _seen_v] + vision
+            text = [m for m in _ot if m.get("id") not in _seen_t] + text
+        except Exception as e:
+            logger.debug("model browser: Ollama merge skipped (%s)", e)
+
+    return {
+        "vision_models": vision,
+        "text_models": text,
+        "primary_models": vision,
+        "editorial_models": text,
+        "cached": bool(data.get("cached", False)),
+    }
 
 
 @router.post("/providers/models/refresh")
@@ -3052,61 +3174,64 @@ async def available_models():
     if "ollama" in settings.active_provider_chain:
         _ollama_seen_ids: set[str] = set()
         try:
-            from backend.services import ollama_registry
-            _tags_url = f"{ollama_registry.primary_url() or settings.OLLAMA_HOST}/api/tags"
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.get(_tags_url,
-                                        headers=ollama_registry.headers_for_url(_tags_url))
-                if resp.status_code == 200:
-                    ollama_data = resp.json()
-                    for m in ollama_data.get("models", []):
-                        model_name = m.get("name", "")
-                        model_family = model_name.split(":")[0].lower()
-                        has_vision = any(vf in model_family for vf in _VISION_FAMILIES)
+            from backend.services import ollama_registry  # noqa: F401  (used below)
+            # Enumerate models across ALL enabled registry hosts (local + any
+            # paired Companion), not just the primary — so a model pulled on the
+            # Companion is selectable even when it isn't the primary host.
+            for m in await _ollama_models_all_hosts():
+                model_name = m.get("name", "")
+                if not model_name:
+                    continue
+                model_family = model_name.split(":")[0].lower()
+                has_vision = _ollama_family_is_vision(model_name)
 
-                        size_bytes = m.get("size", 0)
-                        size_gb = round(size_bytes / (1024**3), 1) if size_bytes else 0
-                        details = m.get("details", {})
-                        param_size = details.get("parameter_size", "")
-                        quant = details.get("quantization_level", "")
+                size_bytes = m.get("size", 0)
+                size_gb = round(size_bytes / (1024**3), 1) if size_bytes else 0
+                details = m.get("details", {}) or {}
+                param_size = details.get("parameter_size", "")
+                quant = details.get("quantization_level", "")
+                _hosts = m.get("_hosts") or []
 
-                        desc_parts = ["LOCAL", "FREE"]
-                        if param_size:
-                            desc_parts.append(param_size)
-                        if quant:
-                            desc_parts.append(quant)
-                        if size_gb:
-                            desc_parts.append(f"{size_gb}GB")
-                        desc = " — ".join(desc_parts)
+                desc_parts = ["LOCAL", "FREE"]
+                if param_size:
+                    desc_parts.append(param_size)
+                if quant:
+                    desc_parts.append(quant)
+                if size_gb:
+                    desc_parts.append(f"{size_gb}GB")
+                if _hosts:
+                    desc_parts.append("on " + ", ".join(_hosts))
+                desc = " — ".join(desc_parts)
 
-                        entry = {
-                            "id": f"ollama/{model_name}",
-                            "name": f"{model_name} (Ollama Local)",
-                            "provider": "ollama",
-                            "is_free": True,
-                            "cost_per_hour": 0,
-                            "context_length": 0,
-                            "created": int(time.time()),  # Sort to top as "newest"
-                            "desc": desc,
-                            "speed": "balanced",
-                            "est_time_display": "varies by GPU",
-                            "quality_score": 3,
-                            "quality": "good",
-                        }
+                _host_bit = f" · {', '.join(_hosts)}" if _hosts else ""
+                entry = {
+                    "id": f"ollama/{model_name}",
+                    "name": f"{model_name} (Ollama{_host_bit})",
+                    "provider": "ollama",
+                    "is_free": True,
+                    "cost_per_hour": 0,
+                    "context_length": 0,
+                    "created": int(time.time()),  # Sort to top as "newest"
+                    "desc": desc,
+                    "speed": "balanced",
+                    "est_time_display": "varies by GPU",
+                    "quality_score": 3,
+                    "quality": "good",
+                }
 
-                        _ollama_seen_ids.add(f"ollama/{model_name}")
-                        if has_vision:
-                            compatible, tracking_score = _vision_tracking_compat(f"ollama/{model_name}", 0)
-                            if compatible:
-                                entry["tracking_score"] = tracking_score
-                                if tracking_score > entry.get("quality_score", 0):
-                                    entry["quality_score"] = tracking_score
-                                    entry["quality"] = {1: "minimal", 2: "basic", 3: "good", 4: "excellent", 5: "best"}.get(tracking_score, "good")
-                                vision.append(entry)
-                        # All models can do text
-                        text.append(entry)
-                        if _is_translation_capable(entry["id"]):
-                            translation.append(dict(entry))
+                _ollama_seen_ids.add(f"ollama/{model_name}")
+                if has_vision:
+                    compatible, tracking_score = _vision_tracking_compat(f"ollama/{model_name}", 0)
+                    if compatible:
+                        entry["tracking_score"] = tracking_score
+                        if tracking_score > entry.get("quality_score", 0):
+                            entry["quality_score"] = tracking_score
+                            entry["quality"] = {1: "minimal", 2: "basic", 3: "good", 4: "excellent", 5: "best"}.get(tracking_score, "good")
+                        vision.append(entry)
+                # All models can do text
+                text.append(entry)
+                if _is_translation_capable(entry["id"]):
+                    translation.append(dict(entry))
         except Exception as e:
             logger.warning("Failed to fetch Ollama models for available list: %s", e)
 

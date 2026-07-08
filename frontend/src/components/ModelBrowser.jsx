@@ -51,9 +51,13 @@ export default function ModelBrowser({ onSelect, type = 'editorial' }) {
       result = result.filter((m) => m.id.toLowerCase().includes(q) || m.name.toLowerCase().includes(q));
     }
     if (freeOnly) {
-      result = result.filter((m) => m.id.includes(':free') || (m.pricing?.prompt === '0' && m.pricing?.completion === '0'));
+      result = result.filter((m) => m.id.includes(':free') || m.provider === 'ollama' || (m.pricing?.prompt === '0' && m.pricing?.completion === '0'));
     }
-    return result.slice(0, 50);
+    // Cap the rendered rows so the table stays snappy. When the user is actively
+    // searching, show far more matches (they've already narrowed the set); the
+    // un-searched browse view stays compact. Local Ollama models are merged into
+    // this list by the backend, so both cloud + local models are searchable.
+    return result.slice(0, search.trim() ? 500 : 100);
   }, [list, search, freeOnly, type]);
 
   if (loading) {
@@ -65,7 +69,7 @@ export default function ModelBrowser({ onSelect, type = 'editorial' }) {
       <div style={{ display: 'flex', gap: 8, marginBottom: 12, flexWrap: 'wrap' }}>
         <input
           type="text"
-          placeholder="Search models..."
+          placeholder="Search OpenRouter + Ollama models..."
           value={search}
           onChange={(e) => setSearch(e.target.value)}
           style={{ flex: 1, padding: '6px 10px', borderRadius: 'var(--radius-sm)', fontSize: 13 }}
@@ -82,7 +86,7 @@ export default function ModelBrowser({ onSelect, type = 'editorial' }) {
         <button
           onClick={handleRefresh}
           disabled={refreshing}
-          title="Refresh model list from OpenRouter"
+          title="Refresh model list (OpenRouter catalog + local Ollama pulls)"
           style={{
             padding: '4px 10px',
             background: 'var(--bg-elevated)',

@@ -1171,6 +1171,25 @@ async def correct_transcript(
     if local_only is None:
         local_only = bool(getattr(settings, "SUBTITLE_POLISH_LOCAL_ONLY", True))
 
+    # Translation-polish quality routing: when the PRIMARY Ollama host is a paired
+    # Companion GPU, upsize the polish model to the best one installed there
+    # (e.g. qwen2.5:14b) so the English track reads far more naturally. Only fires
+    # for the translation post-edit on a local Ollama model; no-op on a local-only
+    # card or a cloud (``vendor/model``) override.
+    if (mode == "translation" and model_override
+            and "/" not in str(model_override)
+            and bool(getattr(settings, "OLLAMA_TRANSLATION_POLISH_AUTO", True))):
+        try:
+            from backend.services.translator import resolve_translation_polish_model
+            _upgraded = await resolve_translation_polish_model(model_override)
+            if _upgraded and _upgraded != model_override:
+                logger.info(
+                    "transcript polishing: routing translation polish to %s on the "
+                    "Companion GPU (was %s)", _upgraded, model_override)
+                model_override = _upgraded
+        except Exception:
+            pass
+
     if not settings.TRANSCRIPT_POLISHING_ENABLED or orchestrator is None:
         # No LLM polish available — readability would otherwise hinge entirely
         # on the model. Still restore sentence terminators deterministically so

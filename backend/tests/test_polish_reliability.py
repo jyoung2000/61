@@ -113,8 +113,11 @@ def test_cloud_fallback_rescues_failed_batch(monkeypatch):
 
     monkeypatch.setattr(P, "_cloud_polish_completion", fake_cloud)
     segs = [_seg(i, f"noisy asr line {i} with mistakes") for i in range(5)]
+    # Polish is strictly-local by default (no cloud spend on a local job); this
+    # test exercises the cloud safety net, so opt in explicitly.
     out = asyncio.run(P.correct_transcript(
-        segs, orchestrator=orch, language="en", timeout_per_batch=90.0))
+        segs, orchestrator=orch, language="en", timeout_per_batch=90.0,
+        local_only=False))
     assert cloud_calls, "cloud fallback never invoked"
     assert any("POLISHED" in s.text for s in out), \
         "cloud-polished text did not land in the output"
@@ -135,9 +138,11 @@ def test_cloud_direct_for_openrouter_pinned_model(monkeypatch):
     monkeypatch.setattr(P, "_cloud_polish_completion", fake_cloud)
     monkeypatch.setattr(P, "_cloud_polish_available", lambda: True)
     segs = [_seg(i, f"line {i} here now") for i in range(3)]
+    # cloud-direct only applies when the user opts into cloud polish (the default
+    # is strictly-local); pass local_only=False to exercise it.
     asyncio.run(P.correct_transcript(
         segs, orchestrator=orch, language="en",
-        model_override="anthropic/claude-haiku-4.5"))
+        model_override="anthropic/claude-haiku-4.5", local_only=False))
     assert cloud_calls, "cloud-direct path not used"
     assert not orch.calls, \
         "local chain was called despite an OpenRouter-pinned polish model"
@@ -248,6 +253,13 @@ def test_cleanup_selects_romaji_cues():
 
 
 def test_polish_reliability_flag_defaults():
-    assert settings.SUBTITLE_POLISH_CLOUD_FALLBACK is True
-    assert settings.SUBTITLE_POLISH_CLOUD_MODEL == ""
-    assert settings.SUBTITLE_POLISH_AUTO_GLOSSARY is True
+    # Polish is strictly-local by default: it runs on the local / companion GPU
+    # and does NOT fall back to a paid cloud provider for a local job. Assert on
+    # a FRESH Settings() so a sibling test that mutated the shared singleton can't
+    # flip this result.
+    from backend.config import Settings
+    fresh = Settings()
+    assert fresh.SUBTITLE_POLISH_CLOUD_FALLBACK is False
+    assert fresh.SUBTITLE_POLISH_LOCAL_ONLY is True
+    assert fresh.SUBTITLE_POLISH_CLOUD_MODEL == ""
+    assert fresh.SUBTITLE_POLISH_AUTO_GLOSSARY is True

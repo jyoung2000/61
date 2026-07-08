@@ -391,6 +391,47 @@ def _extract_thumbnails_batch(video_path: str, timestamps: list,
     return written
 
 
+def _extract_thumbnails_parallel(video_path: str, timestamps: list,
+                                 out_paths: list, workers: int = 0) -> int:
+    """Extract per-scene thumbnails CONCURRENTLY via fast keyframe seeks.
+
+    Each thumbnail is an independent ``-ss <t> -i`` fast seek (a fraction of a
+    second), so running them across a thread pool turns hundreds of serial
+    ffmpeg seeks — the ~6.5 min ``bridge_conversion`` tail on a 128-min / 224-
+    scene source — into a few concurrent waves (seconds). This replaces the
+    single-decode ``select``-filter batch, which linearly decoded the windowed
+    span and blew its timeout on long videos, degrading to exactly those serial
+    seeks. Returns the number of thumbnails written; the caller still covers any
+    stragglers with the per-scene fallback.
+    """
+    if not timestamps:
+        return 0
+    if workers <= 0:
+        try:
+            from backend.config import settings as _cs
+            workers = int(getattr(_cs, "THUMBNAIL_EXTRACT_CONCURRENCY", 0) or 0)
+        except Exception:
+            workers = 0
+    if workers <= 0:
+        workers = min(16, max(2, (os.cpu_count() or 4)))
+    workers = max(1, min(workers, len(timestamps)))
+    written = 0
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = [ex.submit(_extract_thumbnail, video_path, ts, op)
+                    for ts, op in zip(timestamps, out_paths)]
+            for f in as_completed(futs):
+                try:
+                    if f.result():
+                        written += 1
+                except Exception:
+                    pass
+    except Exception as exc:  # pool spawn failure — non-fatal, caller falls back
+        logger.warning("parallel thumbnail pass failed: %s", exc)
+    return written
+
+
 def _extract_thumbnail(video_path: str, timestamp: float, out_path: str) -> bool:
     """Best-effort single-frame grab via FFmpeg. Returns True on success."""
     try:
@@ -446,19 +487,22 @@ def to_fez_scenes(perception, reframer_plan, video_path: str, frames_dir: str) -
         dur_ms = int((getattr(perception, "duration_ms", 0) or 0))
         scenes_src = [{"start_ms": 0, "end_ms": dur_ms, "strategy": "adaptive"}]
 
-    # Single-decode thumbnail pre-pass (audit Phase 5.2 follow-up): all
-    # scene thumbnails from ONE ffmpeg run instead of a seek per scene.
+    # Parallel thumbnail pre-pass: all scene thumbnails via concurrent fast
+    # keyframe seeks instead of a seek-per-scene serial loop (or the old
+    # single-decode ``select`` batch that timed out on long videos and degraded
+    # to those serial seeks — the ~6.5 min bridge_conversion tail). Independent
+    # ffmpeg seeks parallelize cleanly; any straggler is covered per-scene below.
     _thumb_paths = [os.path.join(frames_dir, f"scene_{i:04d}.jpg")
                     for i in range(len(scenes_src))]
     _thumb_ts = [max(0.0, _to_int(sc.get("start_ms", 0)) / 1000.0)
                  for sc in scenes_src]
     try:
-        _n_batch = _extract_thumbnails_batch(video_path, _thumb_ts, _thumb_paths)
+        _n_batch = _extract_thumbnails_parallel(video_path, _thumb_ts, _thumb_paths)
         if _n_batch:
-            logger.info("scene thumbnails: %d/%d via single-decode batch",
+            logger.info("scene thumbnails: %d/%d via parallel fast-seek",
                         _n_batch, len(scenes_src))
     except Exception as _bt_err:
-        logger.warning("scene thumbnail batch skipped: %s", _bt_err)
+        logger.warning("scene thumbnail parallel pass skipped: %s", _bt_err)
 
     out = []
     for i, sc in enumerate(scenes_src):
