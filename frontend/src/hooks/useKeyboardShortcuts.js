@@ -44,6 +44,39 @@ export default function useKeyboardShortcuts({
     if (e.target.contentEditable === 'true') return;
     if (e.target.closest && e.target.closest('[contenteditable="true"]')) return;
 
+    // ── Nudge selected WYSIWYG element(s) with arrow keys ──
+    // When a positionable overlay (text / shape / image / subtitle) is
+    // selected, arrows move it in the preview (Shift = larger step, Alt =
+    // fine) instead of seeking. Non-positionable selections (video / audio
+    // clips) fall through to the seek handler below.
+    if (e.code === 'ArrowLeft' || e.code === 'ArrowRight'
+        || e.code === 'ArrowUp' || e.code === 'ArrowDown') {
+      const st = useTimelineStore.getState();
+      const ids = (st.selectedItemIds && st.selectedItemIds.length)
+        ? st.selectedItemIds
+        : (st.selectedItemId ? [st.selectedItemId] : []);
+      const POSITIONABLE = new Set(['text', 'shape', 'image', 'overlay', 'subtitle']);
+      const targets = ids
+        .map((id) => st.items.find((it) => it.id === id))
+        .filter((it) => it && POSITIONABLE.has(it.type)
+          && !(st.tracks.find((t) => t.id === it.trackId)?.locked));
+      if (targets.length) {
+        e.preventDefault();
+        const stepPct = e.shiftKey ? 3 : e.altKey ? 0.1 : 0.5;
+        const dx = e.code === 'ArrowLeft' ? -stepPct : e.code === 'ArrowRight' ? stepPct : 0;
+        const dy = e.code === 'ArrowUp' ? -stepPct : e.code === 'ArrowDown' ? stepPct : 0;
+        const updates = {};
+        for (const it of targets) {
+          const p = it.position || { x: 50, y: 50 };
+          updates[it.id] = { x: p.x + dx, y: p.y + dy };
+        }
+        if (typeof st.setItemPositions === 'function') st.setItemPositions(updates);
+        else for (const it of targets) st.updateItem(it.id, { position: updates[it.id] });
+        return;
+      }
+      // No positionable selection — fall through (Left/Right seek below).
+    }
+
     // ── Arrow nudge with press-and-hold repeat ──
     if (e.code === 'ArrowLeft' || e.code === 'ArrowRight') {
       e.preventDefault();
