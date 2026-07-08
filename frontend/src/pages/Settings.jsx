@@ -43,6 +43,31 @@ const OPT_ROW = {
   whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
 };
 
+// Estimate the VRAM (GB) a local model needs so the user can tell if it fits
+// their GPU. Prefer the real on-disk size (Ollama loads ~that into VRAM);
+// otherwise estimate from the parameter count in the tag + its quantization.
+function estimateModelVramGb(m) {
+  if (!m) return null;
+  if (m.size_gb > 0) return m.size_gb;      // real Ollama size (≈ VRAM weights)
+  if (m.vram_gb > 0) return m.vram_gb;
+  const text = `${m.id || ''} ${m.name || ''} ${m.param_size || ''}`.toLowerCase();
+  const pm = text.match(/(\d+(?:\.\d+)?)\s*b(?![a-z0-9])/); // "3b", "7b", "70b"…
+  if (!pm) return null;
+  const params = parseFloat(pm[1]);
+  if (!(params > 0) || params > 500) return null;
+  // GB of VRAM per billion params by quantization (Ollama defaults to q4).
+  let perB = 0.65;
+  if (/(f16|fp16|bf16)/.test(text)) perB = 2.2;
+  else if (/q8/.test(text)) perB = 1.1;
+  else if (/q6/.test(text)) perB = 0.9;
+  else if (/q5/.test(text)) perB = 0.75;
+  else if (/q4/.test(text)) perB = 0.65;
+  else if (/q3/.test(text)) perB = 0.55;
+  else if (/q2/.test(text)) perB = 0.45;
+  // weights + ~0.8 GB runtime / KV-cache overhead.
+  return Math.round((params * perB + 0.8) * 10) / 10;
+}
+
 // Searchable model picker. Defined at MODULE scope (not inside Settings) so it
 // keeps a stable identity — otherwise every status/sync poll would remount it
 // and drop focus while the user is typing in the search box. The search field
@@ -52,7 +77,7 @@ const OPT_ROW = {
 function ModelDropdown({ ctx, task, models, pendingValue, savedValue, label, desc }) {
   const {
     catalog, loadCatalog, openDropdown, setOpenDropdown, dropdownQuery, setDropdownQuery,
-    handleSelectModel, qualityStars,
+    handleSelectModel, qualityStars, gpuVramGb,
   } = ctx;
   const isChanged = pendingValue !== savedValue;
   const open = openDropdown === task;
@@ -93,7 +118,16 @@ function ModelDropdown({ ctx, task, models, pendingValue, savedValue, label, des
     const price = m.is_free ? '[FREE]' : m.cost_per_hour > 0 ? `[$${m.cost_per_hour.toFixed(3)}/hr]` : '';
     const provider = m.provider && m.provider !== 'local' ? ` (${m.provider})` : '';
     const stars = m.quality_score ? qualityStars(m.quality_score) : '';
-    return [stars, price, (m.name || m.id) + provider].filter(Boolean).join(' ');
+    // For local (Ollama) models, show how much VRAM they need so the user
+    // knows if it fits their GPU. Skip when the name already carries a size
+    // (the GPU-aware "recommended" rows already show "· 6.5GB ⚠VRAM").
+    const isLocal = m.provider === 'ollama' || m.provider === 'local' || (m.id || '').startsWith('ollama/');
+    let vramTag = '';
+    if (isLocal && !/gb/i.test(m.name || '')) {
+      const vram = estimateModelVramGb(m);
+      if (vram) vramTag = ` · needs ~${vram}GB VRAM${gpuVramGb > 0 && vram > gpuVramGb ? ' ⚠' : ''}`;
+    }
+    return [stars, price, (m.name || m.id) + provider + vramTag].filter(Boolean).join(' ');
   };
   const pick = (id) => { handleSelectModel(task, id); setOpenDropdown(null); setDropdownQuery(''); };
 
@@ -1502,6 +1536,7 @@ export default function Settings() {
   const modelDropdownCtx = {
     catalog, loadCatalog, openDropdown, setOpenDropdown, dropdownQuery, setDropdownQuery,
     handleSelectModel, qualityStars,
+    gpuVramGb: localGpu?.vram_gb || 0,
   };
 
   return (

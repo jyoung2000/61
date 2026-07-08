@@ -79,6 +79,10 @@ function VramGauge({ gpu, loadedModels, ollamaAvailable, ollamaError, torchGpu, 
   const usedPct = Math.min(100, (usedBytes / totalBytes) * 100);
   const barColor = usedPct > 85 ? '#ef4444' : usedPct > 60 ? '#f59e0b' : '#22c55e';
   const isPoisoned = gpu.gpu_poisoned;
+  // The server card runs no AI models — it does ffmpeg video decode/encode
+  // (frame extraction, transcode, export). Attribute its VRAM accordingly
+  // instead of the misleading "No models loaded".
+  const isServerGpu = /decode|encode|server/i.test(label || '');
 
   // Build model segments for VRAM bar
   const segments = loadedModels.map((m) => {
@@ -141,7 +145,7 @@ function VramGauge({ gpu, loadedModels, ollamaAvailable, ollamaError, torchGpu, 
   const _unattributed = usedBytes - _segBytes;
   if (_unattributed > 100 * 1024 * 1024 && totalBytes > 0) {
     segments.push({
-      name: 'In use',
+      name: isServerGpu ? 'Decode / encode' : 'In use',
       pct: Math.min(100, (_unattributed / totalBytes) * 100),
       color: '#64748b',
       vram: _unattributed,
@@ -277,7 +281,24 @@ function VramGauge({ gpu, loadedModels, ollamaAvailable, ollamaError, torchGpu, 
         </div>
       )}
       {loadedModels.length === 0 && torchReserved <= 100 * 1024 * 1024 && (
-        <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>No models loaded</div>
+        isServerGpu ? (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 11, padding: '3px 0' }}>
+            <span style={{
+              width: 8, height: 8, borderRadius: 2, flexShrink: 0,
+              background: (gpu.gpu_in_use || _unattributed > 100 * 1024 * 1024) ? '#22c55e' : 'var(--text-muted)',
+            }} />
+            <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--text-primary)' }}>
+              Video decode / encode (ffmpeg)
+            </span>
+            <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--text-muted)', fontSize: 10 }}>
+              {(gpu.gpu_in_use || _unattributed > 100 * 1024 * 1024)
+                ? `active${_unattributed > 0 ? ` · ${formatBytes(_unattributed)}` : ''}`
+                : 'idle — no active job'}
+            </span>
+          </div>
+        ) : (
+          <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>No models loaded</div>
+        )
       )}
 
       <div style={{ display: 'flex', gap: 8 }}>

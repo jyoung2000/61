@@ -3217,6 +3217,12 @@ async def available_models():
                     "est_time_display": "varies by GPU",
                     "quality_score": 3,
                     "quality": "good",
+                    # Surface the on-disk (≈VRAM weights) size + params/quant so
+                    # the dropdown can show how much VRAM the model needs and
+                    # whether it fits the user's GPU.
+                    "size_gb": size_gb or 0,
+                    "param_size": param_size or "",
+                    "quant": quant or "",
                 }
 
                 _ollama_seen_ids.add(f"ollama/{model_name}")
