@@ -1224,10 +1224,6 @@ export default function ClipSEO() {
         gap: !isMobile && layoutMode === 'sidebyside' ? 16 : undefined,
         marginBottom: 20,
         alignItems: !isMobile && layoutMode === 'sidebyside' ? 'flex-start' : undefined,
-        // Full-bleed the editor out of the page padding on desktop so it goes
-        // edge-to-edge (no side bezel); side-by-side keeps its padding.
-        marginLeft: !isMobile && layoutMode === 'editor' ? 'calc(-1 * var(--page-pad))' : undefined,
-        marginRight: !isMobile && layoutMode === 'editor' ? 'calc(-1 * var(--page-pad))' : undefined,
       }}>
         <div style={{
           width: isMobile ? '100%' : layoutMode === 'editor' ? '100%' : undefined,

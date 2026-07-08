@@ -6,6 +6,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { EDITOR_ACTIONS, fuzzyScore } from '../utils/editorActions';
+import { formatKbd } from '../utils/platform';
 
 export default function CommandPalette({ open, onClose, ctx }) {
   const [query, setQuery] = useState('');
@@ -86,7 +87,7 @@ export default function CommandPalette({ open, onClose, ctx }) {
             >
               <span className="ve-palette__category">{a.category}</span>
               <span className="ve-palette__label">{a.label}</span>
-              {a.kbd && <kbd className="ve-palette__kbd">{a.kbd}</kbd>}
+              {a.kbd && <kbd className="ve-palette__kbd">{formatKbd(a.kbd)}</kbd>}
             </button>
           ))}
         </div>

@@ -56,17 +56,63 @@ def _source_video(job_id: str) -> str | None:
     return None
 
 
-def _kick_background(key: str, fn, *args) -> None:
-    """Run a best-effort generation once, in a worker thread, deduped by key."""
+def _prepare_assets(job_id: str) -> None:
+    """One-time editor prep for a job whose assets predate this feature.
+
+    New jobs get faststart at ingest + sprite/peaks at analysis. Jobs analyzed
+    before this shipped have none of it, so the FIRST time the editor opens one
+    we (in the background, best-effort) (1) relocate the moov atom so the video
+    streams from the first bytes, (2) build the thumbnail sprite, (3) build the
+    waveform peaks. Everything is idempotent and skips work already done, so
+    re-opening a fully-prepped job is a cheap set of existence checks.
+    """
+    job_dir = _job_dir(job_id)
+    src = _source_video(job_id)
+    if not src:
+        return
+
+    # 1) Faststart the source in place — the single biggest video-load win for
+    #    a long, non-faststart file (moov currently trails mdat → the browser
+    #    must pull the whole file before it can play or seek).
+    try:
+        from backend.config import settings
+        if getattr(settings, "FFMPEG_FASTSTART", True):
+            from backend.services.faststart import ensure_faststart
+            ensure_faststart(src)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[%s] lazy faststart failed: %s", job_id, e)
+
+    # 2) Thumbnail sprite.
+    if not os.path.isfile(os.path.join(job_dir, "sprite.jpg")):
+        try:
+            from backend.services.filmstrip_generator import generate_sprite
+            generate_sprite(src, job_dir)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[%s] lazy sprite failed: %s", job_id, e)
+
+    # 3) Waveform peaks (prefer the pre-extracted audio.wav over re-decoding).
+    if not os.path.isfile(os.path.join(job_dir, "peaks.json")):
+        try:
+            from backend.services.filmstrip_generator import generate_peaks
+            audio = os.path.join(job_dir, "audio.wav")
+            generate_peaks(audio if os.path.isfile(audio) else src, job_dir)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[%s] lazy peaks failed: %s", job_id, e)
+
+
+def _kick_prep(job_id: str) -> None:
+    """Kick a one-time background prep for a job, deduped so concurrent editor
+    requests (filmstrip.json + waveform.json fire together) share one run."""
+    key = f"{job_id}:prep"
     if key in _GENERATING:
         return
     _GENERATING.add(key)
 
     async def _runner():
         try:
-            await asyncio.to_thread(fn, *args)
+            await asyncio.to_thread(_prepare_assets, job_id)
         except Exception as e:  # noqa: BLE001 — best effort
-            logger.warning("filmstrip background gen failed (%s): %s", key, e)
+            logger.warning("editor asset prep failed (%s): %s", key, e)
         finally:
             _GENERATING.discard(key)
 
@@ -103,11 +149,9 @@ async def get_filmstrip_manifest(
     sprite = os.path.join(_job_dir(job_id), "sprite.jpg")
     if os.path.isfile(manifest) and os.path.isfile(sprite):
         return _conditional_file(manifest, "application/json", if_modified_since)
-    # Not ready — build in the background, tell the editor to fall back.
-    src = _source_video(job_id)
-    if src:
-        from backend.services.filmstrip_generator import generate_sprite
-        _kick_background(f"{job_id}:sprite", generate_sprite, src, _job_dir(job_id))
+    # Not ready — prep faststart+sprite+peaks in the background, tell the editor
+    # to fall back to client-side generation meanwhile.
+    _kick_prep(job_id)
     raise HTTPException(status_code=404, detail="sprite not ready")
 
 
@@ -132,10 +176,7 @@ async def get_waveform_peaks(
     peaks = os.path.join(_job_dir(job_id), "peaks.json")
     if os.path.isfile(peaks):
         return _conditional_file(peaks, "application/json", if_modified_since)
-    # Not ready — prefer the pre-extracted audio.wav, fall back to the source.
-    audio = os.path.join(_job_dir(job_id), "audio.wav")
-    audio_src = audio if os.path.isfile(audio) else _source_video(job_id)
-    if audio_src:
-        from backend.services.filmstrip_generator import generate_peaks
-        _kick_background(f"{job_id}:peaks", generate_peaks, audio_src, _job_dir(job_id))
+    # Not ready — prep faststart+sprite+peaks in the background (shares one run
+    # with the sprite request via the dedupe key).
+    _kick_prep(job_id)
     raise HTTPException(status_code=404, detail="peaks not ready")

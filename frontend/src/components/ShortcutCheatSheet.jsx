@@ -5,6 +5,7 @@
 import React, { useEffect, useMemo, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { EDITOR_ACTIONS } from '../utils/editorActions';
+import { formatKbd } from '../utils/platform';
 import { CloseIcon } from './icons';
 
 export default function ShortcutCheatSheet({ open, onClose }) {
@@ -77,7 +78,7 @@ export default function ShortcutCheatSheet({ open, onClose }) {
               {actions.map((a) => (
                 <div key={a.id} className="ve-cheatsheet__row">
                   <span className="ve-cheatsheet__label">{a.label}</span>
-                  <kbd className="ve-cheatsheet__kbd">{a.kbd}</kbd>
+                  <kbd className="ve-cheatsheet__kbd">{formatKbd(a.kbd)}</kbd>
                 </div>
               ))}
             </div>

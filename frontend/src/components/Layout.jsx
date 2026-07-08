@@ -70,6 +70,10 @@ function shortModel(modelId) {
 
 export default function Layout({ children }) {
   const [collapsed, setCollapsed] = useState(false);
+  // The user's own expand/collapse choice on NORMAL pages. Editor pages force
+  // a collapse for focus mode, but we restore this when leaving so the
+  // auto-collapse never leaks onto Home/Upload/Settings/etc.
+  const userCollapsePref = useRef(false);
   const [activeModel, setActiveModel] = useState(null);
   const location = useLocation();
   const navigate = useNavigate();
@@ -142,11 +146,12 @@ export default function Layout({ children }) {
 
   // Focus mode: collapse the nav rail to icons on the editor pages (Analysis /
   // Clip Editor) so the preview + timeline get the full widescreen width the
-  // user asked for — the 240px rail is the biggest side "bezel". Only forces it
-  // when entering an editor route; the user can expand it back manually, and
-  // every other page keeps the full sidebar.
+  // user asked for — the 240px rail is the biggest side "bezel". On leaving an
+  // editor route we RESTORE the user's own preference (tracked in the toggle
+  // below), so the forced collapse never leaks onto other pages.
   useEffect(() => {
-    if (isSubPage && !isMobile) setCollapsed(true);
+    if (isMobile) return;
+    setCollapsed(isSubPage ? true : userCollapsePref.current);
   }, [isSubPage, isMobile]);
 
   // Poll /api/allocation to detect any active container activity
@@ -267,7 +272,13 @@ export default function Layout({ children }) {
             </span>
           )}
           <button
-            onClick={() => setCollapsed(!collapsed)}
+            onClick={() => {
+              const next = !collapsed;
+              setCollapsed(next);
+              // Only a toggle on a NORMAL page updates the remembered
+              // preference; expanding on an editor page is a one-off.
+              if (!isSubPage) userCollapsePref.current = next;
+            }}
             style={{
               background: 'none',
               border: 'none',
@@ -658,7 +669,10 @@ export default function Layout({ children }) {
           </div>
         </header>
 
-        <div style={{ padding: 'var(--page-pad)', flex: 1 }}>
+        {/* Editor pages run edge-to-edge (no page padding) so the preview +
+            timeline get the full widescreen width; every other page keeps the
+            comfortable --page-pad gutter. */}
+        <div style={{ padding: isSubPage ? 0 : 'var(--page-pad)', flex: 1, minWidth: 0 }}>
           {children}
         </div>
       </main>

@@ -12,6 +12,7 @@
 import React, { cloneElement, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { getActionById } from '../utils/editorActions';
+import { formatKbd } from '../utils/platform';
 
 const SHOW_DELAY_MS = 400;
 const CHAIN_WINDOW_MS = 500;
@@ -78,7 +79,7 @@ export default function Tooltip({ label, kbd, actionId, side = 'top', children }
           role="tooltip"
         >
           <span className="ve-tooltip__label">{text}</span>
-          {chip && <kbd className="ve-tooltip__kbd">{chip}</kbd>}
+          {chip && <kbd className="ve-tooltip__kbd">{formatKbd(chip)}</kbd>}
         </div>,
         document.body,
       )}

@@ -29,6 +29,7 @@ import { hexToRgbString } from '../utils/colorUtils';
 import { applyPreservesPitch } from '../utils/preservesPitch';
 import { runEditorQA, autoFixTrackCompatibility } from '../utils/editorQA';
 import { registerFilmstripSource } from '../utils/filmstrip';
+import { formatKbd } from '../utils/platform';
 import './VideoEditor.css';
 
 // Convert an interleaved [min,max,min,max,…] peaks array (values in -1..1,
@@ -3269,7 +3270,7 @@ export default function VideoEditor({
               onClick={(e) => { e.stopPropagation(); setPaletteOpen(true); }}
               aria-label="Open command palette"
             >
-              ⌘K
+              {formatKbd('⌘K')}
             </button>
           </Tooltip>
           <Tooltip label="Undo" kbd="⌘Z">
@@ -4641,7 +4642,7 @@ export default function VideoEditor({
           <span><kbd>Esc</kbd> Deselect</span>
           <span><kbd>Tab</kbd> Cycle Segments</span>
           {showMultiTrack && <span><kbd>Ctrl+Z</kbd>/<kbd>Ctrl+Shift+Z</kbd> Undo/Redo</span>}
-          {showMultiTrack && <span><kbd>⌘K</kbd> Commands</span>}
+          {showMultiTrack && <span><kbd>{formatKbd('⌘K')}</kbd> Commands</span>}
           {showMultiTrack && <span><kbd>?</kbd> All shortcuts</span>}
         </div>
       )}

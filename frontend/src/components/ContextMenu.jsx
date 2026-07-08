@@ -17,6 +17,7 @@
  */
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
+import { formatKbd } from '../utils/platform';
 
 export default function ContextMenu({ x = 0, y = 0, items = [], onClose, sheet = false }) {
   const menuRef = useRef(null);
@@ -133,7 +134,7 @@ export default function ContextMenu({ x = 0, y = 0, items = [], onClose, sheet =
               {entry.checked ? '✓' : ''}
             </span>
             <span className="ve-context-menu__label">{entry.label}</span>
-            {entry.kbd && <kbd className="ve-context-menu__kbd">{entry.kbd}</kbd>}
+            {entry.kbd && <kbd className="ve-context-menu__kbd">{formatKbd(entry.kbd)}</kbd>}
           </button>
         );
       })}
