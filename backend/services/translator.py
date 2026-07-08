@@ -272,6 +272,29 @@ def _parse_json_array(response: str, expected: int) -> Optional[list[str]]:
     return [strip_llm_preamble(s) for s in out]
 
 
+async def _translation_batch_concurrency() -> int:
+    """How many LLM translation batches to run at once.
+
+    Returns 1 (sequential — the safe default) UNLESS the PRIMARY Ollama host is a
+    paired Companion advertising more than one parallel slot in its Speed profile
+    (Turbo). The advertised ``num_parallel`` from ``/v1/health`` already encodes
+    the profile (Turbo → several, Eco → 1), so >1 means "the Companion GPU can
+    handle concurrent requests." Capped by ``TRANSLATION_PARALLEL_MAX``. A local
+    card or a cloud primary stays sequential (returns 1). Fully fail-soft."""
+    if not bool(getattr(settings, "TRANSLATION_PARALLEL_BATCHES", True)):
+        return 1
+    try:
+        from backend.services import ollama_registry as _oreg
+        host = _oreg.primary_host()
+        if host is None or _oreg.is_local_gpu_host(host.url):
+            return 1
+        n = await _oreg.companion_num_parallel(host)
+        cap = int(getattr(settings, "TRANSLATION_PARALLEL_MAX", 4) or 4)
+        return max(1, min(cap, int(n or 1)))
+    except Exception:
+        return 1
+
+
 async def translate_via_llm(
     segments: list,
     source_language: str,
@@ -380,22 +403,10 @@ async def translate_via_llm(
                 (8 if _is_ollama else 18))
     total = len(segments)
     out_segs: list[TranscriptSegment] = []
-    _any_ok = False
-    for i in range(0, total, BATCH):
-        batch = segments[i: i + BATCH]
-        direct = await _call(batch)
-        if direct is not None:
-            translations = direct
-            _any_ok = True
-        elif not _any_ok and i == 0:
-            # The very first batch failing outright means the editorial model
-            # isn't usable here — bail so the caller falls back cleanly instead
-            # of "translating" every line to itself.
-            logger.info("LLM translate: editorial model returned no usable output "
-                        "— deferring to other translation engines.")
-            return None
-        else:
-            translations = await _translate_batch(batch)
+
+    def _build_segs(batch, translations) -> list:
+        """Apply translations + glossary onto a batch, preserving timing/speaker."""
+        built = []
         for seg, tr in zip(batch, translations):
             txt = (tr or "").strip() or _txt(seg)
             if glossary:
@@ -406,14 +417,70 @@ async def translate_via_llm(
             start = float(seg.get("start", 0.0) if isinstance(seg, dict) else getattr(seg, "start", 0.0) or 0.0)
             end = float(seg.get("end", 0.0) if isinstance(seg, dict) else getattr(seg, "end", 0.0) or 0.0)
             spk = (seg.get("speaker") if isinstance(seg, dict) else getattr(seg, "speaker", None)) or "Speaker 1"
-            out_segs.append(TranscriptSegment(text=txt, start=start, end=end, speaker=spk))
+            built.append(TranscriptSegment(text=txt, start=start, end=end, speaker=spk))
+        return built
+
+    async def _emit_status(done_segs: int):
         if status_callback:
             try:
-                r = status_callback(f"Translating subtitles… ({min(i + BATCH, total)}/{total})")
+                r = status_callback(f"Translating subtitles… ({min(done_segs, total)}/{total})")
                 if asyncio.iscoroutine(r):
                     await r
             except Exception:
                 pass
+
+    # Non-first batch: direct call, else split-and-recurse (never bails).
+    async def _process_one(start) -> list:
+        batch = segments[start: start + BATCH]
+        direct = await _call(batch)
+        translations = direct if direct is not None else await _translate_batch(batch)
+        return _build_segs(batch, translations)
+
+    batch_starts = list(range(0, total, BATCH))
+    # ── Validate the model on batch 0 FIRST: a first-batch outright failure means
+    #    the editorial model isn't usable here — bail so the caller falls back
+    #    cleanly instead of "translating" every line to itself. (Preserved from
+    #    the sequential path; also gates the parallel fan-out below.) ──
+    b0 = batch_starts[0]
+    batch0 = segments[b0: b0 + BATCH]
+    direct0 = await _call(batch0)
+    if direct0 is None:
+        logger.info("LLM translate: editorial model returned no usable output "
+                    "— deferring to other translation engines.")
+        return None
+    results: list = [None] * len(batch_starts)
+    results[0] = _build_segs(batch0, direct0)
+    _done = {"n": 1}
+    await _emit_status(min(BATCH, total))
+
+    rest = list(range(1, len(batch_starts)))
+    _parallel = await _translation_batch_concurrency()
+    if _parallel > 1 and len(rest) > 1:
+        # Fan the remaining batches out across the Companion GPU's advertised
+        # parallel slots (Turbo). Batches are independent (each prompt is built
+        # only from its own lines + the once-computed glossary), so order is
+        # restored by index afterward. Concurrency is bounded to num_parallel, so
+        # total in-flight requests never exceed what the Companion is sized for.
+        logger.info("LLM translate: parallelizing %d batches × %d Companion GPU "
+                    "slots (Turbo)", len(rest), _parallel)
+        _sem = asyncio.Semaphore(_parallel)
+
+        async def _guarded(idx: int):
+            async with _sem:
+                segs = await _process_one(batch_starts[idx])
+                results[idx] = segs
+                _done["n"] += 1
+                await _emit_status(_done["n"] * BATCH)
+
+        await asyncio.gather(*[_guarded(i) for i in rest])
+    else:
+        for idx in rest:
+            results[idx] = await _process_one(batch_starts[idx])
+            _done["n"] += 1
+            await _emit_status(_done["n"] * BATCH)
+
+    for segs in results:
+        out_segs.extend(segs or [])
 
     # ── Completeness cleanup ────────────────────────────────────────────────
     # The model occasionally echoes a hard line (long narration, song lyrics)

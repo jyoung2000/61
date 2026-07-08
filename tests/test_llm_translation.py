@@ -54,6 +54,73 @@ def _segs(n, prefix="日本語の文"):
                               speaker="Speaker 1") for i in range(n)]
 
 
+def test_llm_parallel_batches_preserve_order(monkeypatch):
+    """Turbo-mode fan-out: batches run concurrently but reassemble in source
+    order, 1:1, with timing preserved."""
+    import asyncio
+    from backend.services import translator as T
+
+    monkeypatch.setattr(T.settings, "TRANSLATION_AUTO_GLOSSARY", False, raising=False)
+
+    async def _fake_conc():
+        return 4                                  # pretend a Turbo Companion
+
+    monkeypatch.setattr(T, "_translation_batch_concurrency", _fake_conc)
+
+    class _EchoOrch:
+        def __init__(self):
+            self.inflight = 0
+            self.max_inflight = 0
+
+        async def text_completion(self, prompt, **kwargs):
+            self.inflight += 1
+            self.max_inflight = max(self.max_inflight, self.inflight)
+            await asyncio.sleep(0.01)             # let concurrent batches overlap
+            lines = re.findall(r"^\d+\.\s+(.*)$", prompt, re.M)
+            self.inflight -= 1
+            return json.dumps([f"EN[{ln}]" for ln in lines])
+
+    orch = _EchoOrch()
+    out = _run(translate_via_llm(_segs(40), "ja", "en", orch))   # BATCH=18 → 3 batches
+    assert len(out) == 40
+    # Reassembled in source order (cue i ← source i), not completion order.
+    assert out[0].text == "EN[日本語の文0]"
+    assert out[19].text == "EN[日本語の文19]"
+    assert out[39].text == "EN[日本語の文39]"
+    assert out[7].start == 7.0 and out[7].speaker == "Speaker 1"
+    # The non-first batches actually ran concurrently.
+    assert orch.max_inflight >= 2
+
+
+def test_llm_sequential_when_no_turbo(monkeypatch):
+    """With concurrency 1 (local card / Eco), batches run one at a time."""
+    import asyncio
+    from backend.services import translator as T
+
+    async def _one():
+        return 1
+
+    monkeypatch.setattr(T, "_translation_batch_concurrency", _one)
+
+    class _SeqOrch(_Orch):
+        def __init__(self):
+            super().__init__()
+            self.inflight = 0
+            self.max_inflight = 0
+
+        async def text_completion(self, prompt, **kwargs):
+            self.inflight += 1
+            self.max_inflight = max(self.max_inflight, self.inflight)
+            await asyncio.sleep(0.005)
+            self.inflight -= 1
+            return await super().text_completion(prompt, **kwargs)
+
+    orch = _SeqOrch()
+    out = _run(translate_via_llm(_segs(40), "ja", "en", orch))
+    assert len(out) == 40
+    assert orch.max_inflight == 1                 # strictly sequential
+
+
 def test_cjk_and_fraction_detectors():
     assert _cjk_ratio("宇宙コロニーでの生活に") > 0.9
     assert _cjk_ratio("The opponent was a mobile suit") == 0.0

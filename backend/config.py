@@ -1095,6 +1095,14 @@ class Settings(BaseSettings):
     # out and degrade to tier B anyway) instead of burning the whole budget.
     HYBRID_LOCAL_TRANSLATE_SPEEDUP: float = 2.5
     TRANSLATION_CONTEXT_WINDOW: int = 5         # segments before/after for context
+    # Parallelize LLM translation batches across the Companion GPU's advertised
+    # concurrency (its Speed profile — Turbo → several parallel slots) so a long
+    # subtitle track translates in a fraction of the wall-clock time. Only
+    # engages when the PRIMARY Ollama host is a paired Companion advertising
+    # >1 parallel slots; a local card or a single-slot (Eco) profile stays
+    # sequential. Capped by TRANSLATION_PARALLEL_MAX.
+    TRANSLATION_PARALLEL_BATCHES: bool = True
+    TRANSLATION_PARALLEL_MAX: int = 4
     TRANSLATION_GLOSSARY_ENABLED: bool = True   # per-video KNP glossary support
     # Auto-derive a per-video glossary of recurring proper nouns from the source
     # transcript and feed it to the translator so recurring names render
