@@ -593,7 +593,10 @@ async fn files_read(
     };
     use tokio::io::AsyncReadExt;
     let stream = futures_util::stream::try_unfold(file, |mut f| async move {
-        let mut buf = vec![0u8; 64 * 1024];
+        // 1 MB chunks (not 64 KB): ~16x fewer read/poll/HTTP round-trips, which
+        // is what lets a shared-file pull actually saturate a gigabit LAN
+        // instead of crawling at tens of Mbps.
+        let mut buf = vec![0u8; 1024 * 1024];
         let n = f.read(&mut buf).await?;
         if n == 0 {
             Ok::<_, std::io::Error>(None)

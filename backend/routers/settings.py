@@ -1127,8 +1127,8 @@ async def companion_file_import(req: CompanionImportRequest):
                     body = (await resp.aread())[:200].decode("utf-8", "ignore")
                     raise HTTPException(status_code=resp.status_code,
                                         detail=f"companion read failed: {body}")
-                with open(dest_path, "wb") as f:
-                    async for chunk in resp.aiter_bytes(65536):
+                with open(dest_path, "wb", buffering=4 * 1024 * 1024) as f:
+                    async for chunk in resp.aiter_bytes(1024 * 1024):
                         f.write(chunk)
                         size += len(chunk)
         return size
@@ -1161,8 +1161,10 @@ async def companion_file_import(req: CompanionImportRequest):
                         if resp.status_code != 200:
                             body = (await resp.aread())[:200].decode("utf-8", "ignore")
                             raise RuntimeError(f"companion read {resp.status_code}: {body}")
-                        with open(dest, "wb") as f:
-                            async for chunk in resp.aiter_bytes(262144):
+                        # 1 MB chunks + a big write buffer so the pull can run at
+                        # LAN speed instead of being throttled by tiny reads.
+                        with open(dest, "wb", buffering=4 * 1024 * 1024) as f:
+                            async for chunk in resp.aiter_bytes(1024 * 1024):
                                 f.write(chunk)
                                 size += len(chunk)
                                 _import_progress[import_id]["done"] = size
