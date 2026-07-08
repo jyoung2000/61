@@ -840,8 +840,14 @@ async def _polish_batch(
     mode: str = "asr",
     model_override: Optional[str] = None,
     cloud_direct: bool = False,
+    local_only: bool = False,
 ) -> Optional[list[Optional[str]]]:
     """Polish a single batch via the polish LLM.
+
+    ``local_only`` keeps the batch on the local / companion GPU: the
+    orchestrator call skips cloud providers and the OpenRouter direct
+    fallback is not attempted, so a slow local batch is never silently
+    answered (and billed) by the cloud — the caller keeps the raw draft.
 
     ``model_override`` routes the call to a specific model (the dedicated
     translation model for subtitle polishing) instead of the editorial model;
@@ -868,9 +874,15 @@ async def _polish_batch(
     else:
         try:
             response = await orchestrator.text_completion(
-                full_prompt, timeout=timeout, model_override=model_override)
+                full_prompt, timeout=timeout, model_override=model_override,
+                skip_circuit_breaker=True, local_only=local_only)
         except Exception as e:
             logger.warning("transcript polishing: LLM call failed: %s", e)
+            if local_only:
+                # Strictly-local polish (default): the batch runs on the local /
+                # companion GPU and must NOT fall back to a paid cloud provider.
+                # Keep the raw draft for this batch instead of billing the cloud.
+                return None
             # Local chain exhausted (timeout / circuit breaker / offline
             # chain with Ollama degraded). Cloud safety net — quality must
             # not silently drop to an unpolished draft.
@@ -1118,8 +1130,14 @@ async def correct_transcript(
     source_language: str = "",
     mode: str = "asr",
     model_override: Optional[str] = None,
+    local_only: Optional[bool] = None,
 ) -> list:
     """Polish a transcript using the polish LLM in batches.
+
+    ``local_only`` keeps every batch on the local / companion GPU (no cloud
+    provider, no OpenRouter fallback). ``None`` reads the default from
+    ``SUBTITLE_POLISH_LOCAL_ONLY`` (on by default) so polish never silently
+    bills a cloud provider for a run the user believes is fully local.
 
     ``model_override`` pins every batch to a specific model — used so subtitle
     polishing runs on the dedicated translation model (the multilingual model
@@ -1146,6 +1164,12 @@ async def correct_transcript(
     seg_list = list(segments) if segments else []
     if not seg_list:
         return seg_list
+
+    # Strictly-local polish by default: keep the polish LLM on the local /
+    # companion GPU and never fall back to a paid cloud provider for what the
+    # user runs as a local job.
+    if local_only is None:
+        local_only = bool(getattr(settings, "SUBTITLE_POLISH_LOCAL_ONLY", True))
 
     if not settings.TRANSCRIPT_POLISHING_ENABLED or orchestrator is None:
         # No LLM polish available — readability would otherwise hinge entirely
@@ -1202,8 +1226,9 @@ async def correct_transcript(
     len_min_ratio = 0.6 if preserve_mode else 0.3
     # An OpenRouter-style pinned polish model on a local-only chain would
     # fail per batch before falling back — route it straight to the cloud.
+    # Suppressed under local_only: strictly-local polish never touches the cloud.
     cloud_direct = bool(model_override and "/" in model_override
-                        and _cloud_polish_available())
+                        and not local_only and _cloud_polish_available())
     for idx, batch_pairs in enumerate(batches):
         batch = [pair[0] for pair in batch_pairs]
         # Sliding 3-segment context windows (separate from the
@@ -1232,6 +1257,7 @@ async def correct_transcript(
             language=language, timeout=_batch_timeout,
             glossary_terms=glossary_terms, source_texts=batch_src, mode=mode,
             model_override=model_override, cloud_direct=cloud_direct,
+            local_only=local_only,
         )
 
         for i, (view, orig_obj) in enumerate(batch_pairs):

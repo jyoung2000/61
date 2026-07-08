@@ -51,7 +51,19 @@ class Settings(BaseSettings):
     # batch (Ollama cold-load timeout / circuit breaker / offline chain),
     # retry the batch via OpenRouter — but ONLY when an OpenRouter key is
     # configured (explicit cloud intent). Off = strictly local polish.
-    SUBTITLE_POLISH_CLOUD_FALLBACK: bool = True
+    #
+    # DEFAULT OFF: subtitle polish is meant to run on the local/companion GPU
+    # (the paired 4070 via the Ollama host registry). Silently billing a cloud
+    # provider for a "local" run surprised users with an estimated_cost on a
+    # free job — the polish stays on the companion GPU and simply keeps the raw
+    # draft on the rare batch it can't polish, rather than spending money. Turn
+    # this back on only if you WANT a paid cloud safety net for polish quality.
+    SUBTITLE_POLISH_CLOUD_FALLBACK: bool = False
+    # Keep subtitle polish strictly on the local/companion Ollama GPU: the
+    # polish text_completion call skips cloud providers in the editorial chain
+    # so a slow local batch is never silently answered (and billed) by
+    # OpenRouter/Gemini/etc. Pairs with SUBTITLE_POLISH_CLOUD_FALLBACK above.
+    SUBTITLE_POLISH_LOCAL_ONLY: bool = True
     # Model for that cloud path. Blank = SUBTITLE_POLISH_MODEL when it's an
     # OpenRouter id, else the first efficient-tier shortlist entry.
     SUBTITLE_POLISH_CLOUD_MODEL: str = ""

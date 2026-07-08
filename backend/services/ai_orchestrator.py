@@ -1181,7 +1181,7 @@ class AIOrchestrator:
             except Exception:
                 continue
 
-    async def text_completion(self, prompt: str, max_tokens: int = 4096, timeout: float = 60, job_id: str = "", skip_circuit_breaker: bool = False, model_override: str | None = None) -> str:
+    async def text_completion(self, prompt: str, max_tokens: int = 4096, timeout: float = 60, job_id: str = "", skip_circuit_breaker: bool = False, model_override: str | None = None, local_only: bool = False) -> str:
         """Generic text completion using the configured provider chain.
 
         Used by transcript correction, translation, and other text-only tasks.
@@ -1200,6 +1200,12 @@ class AIOrchestrator:
                 transcript polishing keeps using OPENROUTER_EDITORIAL_MODEL.
                 Ignored for non-OpenRouter providers and when the Ollama
                 downgrade override is already active.
+            local_only: When True, only LOCAL Ollama providers are attempted —
+                cloud providers (OpenRouter/Gemini/Groq/Anthropic) are skipped
+                for this call. Used by subtitle polish so a slow local/companion
+                GPU batch is never silently answered — and billed — by a cloud
+                provider. Fail-soft: the caller keeps the raw draft if no local
+                provider succeeds.
         """
         # Remember if any provider failed specifically due to upstream
         # rate-limiting (HTTP 429) so the caller (e.g. the subtitle translator)
@@ -1209,6 +1215,12 @@ class AIOrchestrator:
         saw_rate_limit = False
         for provider in self._get_active_chain():
             pname = provider.provider_name
+            # Strictly-local polish: skip cloud providers so a slow local /
+            # companion GPU batch is never silently answered (and billed) by a
+            # cloud provider. The caller keeps the raw draft when no local
+            # provider succeeds.
+            if local_only and pname != "ollama":
+                continue
             model_name = provider.text_model_name
             original_model = None
             # Apply model override for Ollama if we've downgraded after failures
