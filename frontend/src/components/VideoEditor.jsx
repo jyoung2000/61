@@ -265,6 +265,17 @@ export default function VideoEditor({
   const [showExportDialog, setShowExportDialog] = useState(false);
   const [showEffectsPanel, setShowEffectsPanel] = useState(false);
   const [showTransitions, setShowTransitions] = useState(false);
+  // ── Store hooks for the redesigned tools bar / editor pane ──
+  // Declared before the callbacks below so their useCallback dependency
+  // arrays don't reference these in the temporal dead zone.
+  const activeTool = useTimelineStore((s) => s.activeTool);
+  const setActiveTool = useTimelineStore((s) => s.setActiveTool);
+  const timelineZoom = useTimelineStore((s) => s.zoom);
+  const setTimelineZoom = useTimelineStore((s) => s.setZoom);
+  const snapEnabled = useTimelineStore((s) => s.snapEnabled);
+  const toggleSnap = useTimelineStore((s) => s.toggleSnap);
+  const addTrackToStore = useTimelineStore((s) => s.addTrack);
+  const splitTimelineItem = useTimelineStore((s) => s.splitItem);
   // ── Redesigned editor pane / chrome state ──
   const [editorTab, setEditorTab] = useState('props'); // 'props'|'subtitles'|'highlights'|'layout'|'media'
   const [settingsSearch, setSettingsSearch] = useState('');
@@ -333,15 +344,6 @@ export default function VideoEditor({
   const updateTimelineItem = useTimelineStore((s) => s.updateItem);
   const timelineTracks = useTimelineStore((s) => s.tracks);
   const timelineMediaLibrary = useTimelineStore((s) => s.mediaLibrary);
-  // ── Store hooks for the redesigned tools bar / editor pane ──
-  const activeTool = useTimelineStore((s) => s.activeTool);
-  const setActiveTool = useTimelineStore((s) => s.setActiveTool);
-  const timelineZoom = useTimelineStore((s) => s.zoom);
-  const setTimelineZoom = useTimelineStore((s) => s.setZoom);
-  const snapEnabled = useTimelineStore((s) => s.snapEnabled);
-  const toggleSnap = useTimelineStore((s) => s.toggleSnap);
-  const addTrackToStore = useTimelineStore((s) => s.addTrack);
-  const splitTimelineItem = useTimelineStore((s) => s.splitItem);
   const { recovered } = useTimelinePersistence(jobId, clipId);
   const encoding = useEncodingManager();
   const isEncoding = useMemo(() => {
