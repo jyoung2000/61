@@ -149,6 +149,57 @@ def _decoding_kwargs(transcribe_callable, condition_on_previous_text=None) -> di
     return {k: v for k, v in desired.items() if k in params}
 
 
+def _detect_language_multiwindow(engine, video_path: str, duration_ms: int):
+    """Vote on the spoken language across several spread-out windows.
+
+    A single first-window probe (Whisper's default) mis-reads intros, logos,
+    music, and silence — a Japanese video was detected as ``en``, which then
+    skipped translation and let Whisper hallucinate English over the JA audio.
+    We decode ~30s at a few points across the runtime and SUM the per-window
+    language probabilities so the language actually spoken wins.
+
+    Returns ``(language, score, detail)`` or ``(None, 0.0, detail)`` when
+    nothing is confident enough to override Whisper's own detection. Best
+    effort: any failure yields ``(None, …)`` so the caller keeps auto-detect.
+    """
+    import tempfile
+    dur_s = max(1, int((duration_ms or 0) / 1000))
+    # Skip the very start (intro/logo/silence); spread probes across the body.
+    if dur_s <= 90:
+        starts = [max(0, dur_s // 3)]
+    else:
+        starts = [int(dur_s * f) for f in (0.15, 0.4, 0.65, 0.85)]
+    votes: dict = {}
+    probed = 0
+    for start in starts:
+        wav = tempfile.mktemp(suffix='.wav')
+        try:
+            subprocess.run(
+                ['ffmpeg', '-y', '-ss', str(start), '-t', '30', '-i', video_path,
+                 '-vn', '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le', wav],
+                capture_output=True, timeout=90)
+            if not os.path.exists(wav) or os.path.getsize(wav) < 2000:
+                continue
+            _seg, _info = engine.transcribe(wav, language=None, vad_filter=True)
+            lang = getattr(_info, 'language', None)
+            prob = float(getattr(_info, 'language_probability', 0.0) or 0.0)
+            probed += 1
+            if lang and prob >= 0.5:
+                votes[lang] = votes.get(lang, 0.0) + prob
+        except Exception:
+            continue
+        finally:
+            try:
+                os.remove(wav)
+            except Exception:
+                pass
+    if not votes:
+        return None, 0.0, f'no confident language over {probed} window(s)'
+    lang, score = max(votes.items(), key=lambda kv: kv[1])
+    detail = ', '.join(f'{k}:{v:.2f}' for k, v in sorted(votes.items(), key=lambda kv: -kv[1]))
+    return lang, score, detail
+
+
 def _vad_parameters() -> dict:
     """VAD tuning shared by the batched and sequential transcribe calls.
 
@@ -1299,42 +1350,29 @@ class AudioIntelligence:
                 log.log_stage('AUDIO',
                     f'Cloud transcription error ({_ct_err}) — using local Whisper')
 
-            # ── Language-detection guard for vocal-stem overrides ──
-            # An isolated vocal stem can fool Whisper's auto language detection:
-            # an OP song with an English chorus ("Just wild beat communication")
-            # reads as 'en' on the DRY vocals even though the episode is
-            # Japanese. That mislabels the whole transcript 'en', which makes
-            # the pipeline SKIP translation and Whisper hallucinate English over
-            # the Japanese audio (observed: looped OP lyrics + drifted cues).
-            # When transcribing a supplied stem with language=auto, detect the
-            # language on the ORIGINAL video audio (music intact — it reliably
-            # reads 'ja') and force it.
-            if audio_path_override and whisper_lang is None:
+            # ── Robust language detection for the auto path ──
+            # Whisper's built-in detection reads only the FIRST window, which
+            # mis-reads intros / logos / music / silence — a Japanese video was
+            # detected as 'en', which then skipped translation and let Whisper
+            # hallucinate English over the JA audio. For any auto job (stem or
+            # not), vote across several spread-out windows of the ORIGINAL video
+            # audio and force the winner. Best-effort; falls back to auto-detect.
+            # Skipped for short clips (< 2 min), where the first-window guess is
+            # reliable and the extra probes aren't worth the time.
+            if whisper_lang is None and (duration_ms or 0) >= 120000:
                 try:
-                    _det_wav = tempfile.mktemp(suffix='.wav')
-                    subprocess.run([
-                        'ffmpeg', '-y', '-i', video_path, '-t', '120', '-vn',
-                        '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le', _det_wav,
-                    ], capture_output=True, timeout=120)
-                    if os.path.exists(_det_wav):
-                        _dseg, _dinfo = self.engine.transcribe(
-                            _det_wav, language=None, vad_filter=False)
-                        _detected = getattr(_dinfo, 'language', None)
-                        _detprob = getattr(_dinfo, 'language_probability', 0.0) or 0.0
-                        try:
-                            os.remove(_det_wav)
-                        except Exception:
-                            pass
-                        if _detected:
-                            whisper_lang = _detected
-                            log.log_stage('AUDIO',
-                                f'Language detected on ORIGINAL audio: '
-                                f'{whisper_lang} ({_detprob:.2f}) — overrides the '
-                                'vocal-stem auto-detect (songs misread as en)')
+                    _lang, _score, _detail = _detect_language_multiwindow(
+                        self.engine, video_path, duration_ms)
+                    if _lang:
+                        whisper_lang = _lang
+                        log.log_stage('AUDIO',
+                            f'Language by multi-window vote: {whisper_lang} '
+                            f'(score {_score:.2f}; {_detail}) — overrides the '
+                            'single-window auto-detect (intros/music misread as en)')
                 except Exception as _ld_err:
                     log.log_stage('AUDIO',
-                        f'Original-audio language detect failed ({_ld_err}) — '
-                        'using vocal-stem auto-detect')
+                        f'Multi-window language detect failed ({_ld_err}) — '
+                        'using single-window auto-detect')
 
             # Pre-flight: the GPU model is already loaded — only the
             # batched-inference workspace is left to allocate. Reload on

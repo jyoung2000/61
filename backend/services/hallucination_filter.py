@@ -12,6 +12,8 @@ both the main and gap-fill transcription passes.
 
 from __future__ import annotations
 
+import re
+
 # Known fixed-phrase hallucinations across the languages we transcribe.
 BOILERPLATE_HALLUCINATIONS = frozenset({
     # English
@@ -43,7 +45,26 @@ BOILERPLATE_HALLUCINATIONS = frozenset({
     '시청해주셔서 감사합니다', '구독과 좋아요', '감사합니다',
     # Chinese
     '请订阅', '谢谢观看', '谢谢大家', '感谢观看',
+    # Transcription/caption vendor credits Whisper invents over intros + music
+    # (e.g. "Transcription by CastingWords", "Subtitles by the amara.org
+    # community"). The exact strings help; the regexes below catch any vendor.
+    'transcription by castingwords', 'transcribed by castingwords',
+    'subtitles by the amara.org community', 'amara.org', 'www.amara.org',
 })
+
+# Attribution "credits" Whisper hallucinates over silence / music / end cards.
+# These are never real dialogue regardless of the vendor named, so match the
+# whole "<credit> by …" / "… by <vendor>" family, not just fixed strings.
+_ATTRIBUTION_RE = re.compile(
+    r'^(?:the\s+)?(?:transcription|transcript|transcribed|subtitles?|subs?|'
+    r'captions?|caption|closed\s+captions?|translation|translated)\s+by\b',
+    re.IGNORECASE,
+)
+_CREDIT_VENDOR_RE = re.compile(
+    r'\bby\s+(?:castingwords|amara\.org|the\s+amara\.org\s+community|'
+    r'rev\.com|gotranscript|otter\.ai|happyscribe|verbit)\b',
+    re.IGNORECASE,
+)
 
 # Punctuation stripped before matching — ASCII plus CJK terminators/quotes so
 # a hallucination ending in 。！？ still matches its bare form.
@@ -56,4 +77,10 @@ def is_boilerplate_hallucination(text: str) -> bool:
     if not text:
         return False
     key = text.strip().lower().strip(_STRIP_CHARS).strip()
-    return key in BOILERPLATE_HALLUCINATIONS
+    if key in BOILERPLATE_HALLUCINATIONS:
+        return True
+    # Attribution credits ("Transcription by CastingWords", "Subtitles by the
+    # Amara.org community", …) — always phantoms, whatever the vendor.
+    if _ATTRIBUTION_RE.search(key) or _CREDIT_VENDOR_RE.search(key):
+        return True
+    return False
