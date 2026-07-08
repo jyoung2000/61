@@ -140,6 +140,15 @@ export default function Layout({ children }) {
   // Detect if this is a sub-page that should show a back button
   const isSubPage = location.pathname.startsWith('/analysis') || location.pathname.startsWith('/seo');
 
+  // Focus mode: collapse the nav rail to icons on the editor pages (Analysis /
+  // Clip Editor) so the preview + timeline get the full widescreen width the
+  // user asked for — the 240px rail is the biggest side "bezel". Only forces it
+  // when entering an editor route; the user can expand it back manually, and
+  // every other page keeps the full sidebar.
+  useEffect(() => {
+    if (isSubPage && !isMobile) setCollapsed(true);
+  }, [isSubPage, isMobile]);
+
   // Poll /api/allocation to detect any active container activity
   // (analysis, transcription, clip detection, exports, etc.)
   const [containerActive, setContainerActive] = useState(false);

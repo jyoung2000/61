@@ -1,4 +1,4 @@
-import React, { useRef, useEffect, useCallback, useMemo, useState } from 'react';
+import React, { useRef, useEffect, useLayoutEffect, useCallback, useMemo, useState } from 'react';
 import useTimelineStore, { getMaxItemDuration, hashGroupId } from '../stores/timelineStore';
 import {
   computeThumbStops,
@@ -587,20 +587,28 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
   // at a time. laneHsRef feeds draw + hit tests (which read via refs).
   const { isMobile: isMobileViewport } = useResponsive();
   const [expandedTrackId, setExpandedTrackId] = useState(null);
-  // Fit-to-window: the px budget the track stack may occupy (matches the
-  // canvas-wrap's 72vh − 96px cap). Lanes shrink uniformly to fit it so
-  // every track is visible without scrolling; tracked on resize.
-  const [fitHeight, setFitHeight] = useState(() => (
-    typeof window !== 'undefined'
-      ? Math.max(200, Math.floor(window.innerHeight * 0.72 - 96))
-      : 0
-  ));
-  useEffect(() => {
-    const update = () => {
-      setFitHeight(Math.max(200, Math.floor(window.innerHeight * 0.72 - 96)));
+  // Fit-to-window: the px budget the track stack may occupy. This MUST be the
+  // real height of the scroll wrap, not a window-based guess — the timeline
+  // lives in a fixed-height panel (``.ve-multitrack__content`` = timelineH),
+  // which is usually shorter than the old ``innerHeight*0.72`` estimate. When
+  // the two disagreed, lanes were sized for the taller guess and overflowed
+  // the shorter panel, producing exactly the vertical scrollbar we don't want.
+  // We measure the wrap directly (ResizeObserver) so lanes shrink to the
+  // actual space and the stack always fits without scrolling.
+  const wrapRef = useRef(null);
+  const [fitHeight, setFitHeight] = useState(0);
+  useLayoutEffect(() => {
+    const el = wrapRef.current;
+    if (!el) return;
+    const measure = () => setFitHeight(Math.max(120, el.clientHeight));
+    measure();
+    const ro = typeof ResizeObserver === 'function' ? new ResizeObserver(measure) : null;
+    if (ro) ro.observe(el);
+    window.addEventListener('resize', measure);
+    return () => {
+      if (ro) ro.disconnect();
+      window.removeEventListener('resize', measure);
     };
-    window.addEventListener('resize', update);
-    return () => window.removeEventListener('resize', update);
   }, []);
   const laneHs = useMemo(
     () => laneHeightsFor(tracks, isMobileViewport, expandedTrackId, fitHeight),
@@ -2698,10 +2706,15 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
           fit; the right-edge track rail then gives a Premiere-style
           overview + jump-to-track affordance. */}
       <div
+        ref={wrapRef}
         className="ve-multi-timeline__canvas-wrap"
         style={{
           position: 'relative',
-          maxHeight: 'calc(72vh - 96px)',
+          // Fill the remaining panel height; lanes are sized (via fitHeight,
+          // measured from this element) to fit exactly, so overflow scroll is
+          // only a backstop for the extreme many-tracks-on-a-tiny-panel case.
+          flex: '1 1 auto',
+          minHeight: 0,
           overflowY: 'auto',
           overflowX: 'hidden',
         }}
@@ -2961,7 +2974,10 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
         <canvas
           ref={canvasRef}
           className="ve-multi-timeline__canvas"
-          style={{ width: '100%', height: Math.max(canvasHeight, 280) }}
+          // Give a few-track canvas a comfortable minimum drop area, but never
+          // taller than the measured wrap — otherwise the 280 floor would
+          // reintroduce a scrollbar on a short panel.
+          style={{ width: '100%', height: Math.max(canvasHeight, Math.min(280, fitHeight || 280)) }}
           onPointerDown={onPointerDown}
           onPointerMove={onPointerMove}
         onPointerLeave={onPointerLeave}

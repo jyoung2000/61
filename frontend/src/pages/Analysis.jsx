@@ -2839,7 +2839,7 @@ export default function Analysis() {
       
 
       {/* Video Player (sticky) — hidden on Transcript tab where we show side-by-side layout */}
-      <div ref={stickyPlayerRef} style={{ position: 'sticky', top: 0, zIndex: 10, background: 'var(--bg-base)', display: (tab === 2 && !showExportPreview) ? 'none' : 'block' }}>
+      <div ref={stickyPlayerRef} style={{ position: 'sticky', top: 0, zIndex: 10, background: 'var(--bg-base)', display: (tab === 2 && !showExportPreview) ? 'none' : 'block', marginLeft: 'calc(-1 * var(--page-pad))', marginRight: 'calc(-1 * var(--page-pad))' }}>
         {showExportPreview ? (
           <div style={{ position: 'relative', width: '100%', maxWidth: '2400px', margin: '0 auto' }}>
             <VideoEditorBoundary>
