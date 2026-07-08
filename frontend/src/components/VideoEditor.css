@@ -4270,3 +4270,53 @@ input.ve-timecode--input {
 .ve-container .ve-error, .ve-container .ve-loading { background: #0F0F11; color: #9A9AA3; }
 
 /* Reduced-motion respect already handled globally */
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Studio preview stage — big, bezel-minimal program monitor (desktop-first)
+   The viewport fills the stage width edge-to-edge for landscape ratios and
+   fills the height for portrait, so the video/canvas dominates and the dark
+   matte around it is as small as the aspect ratio allows. The stage itself is
+   a clean pure-black matte (studio look) rather than the panel grey.
+   ═══════════════════════════════════════════════════════════════════════════ */
+.ve-container .ve-viewport-container:not(.ve-viewport-container--reframe) {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  background: #000;
+  padding: 0;
+  box-shadow: inset 0 -1px 0 rgba(255, 255, 255, 0.05);
+}
+
+/* The player frame gets a subtle studio bezel: a 1px inset ring + soft drop
+   shadow so the canvas edge is crisp against the black matte. */
+.ve-container .ve-viewport:not(.ve-viewport--fullscreen) {
+  border-radius: 6px;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255, 255, 255, 0.06);
+}
+
+/* Desktop: the studio monitor is the hero — a touch of matte around the frame
+   only when the aspect leaves side gaps (portrait clips). */
+@media (min-width: 1024px) {
+  .ve-container .ve-viewport-container:not(.ve-viewport-container--reframe) {
+    padding: 10px 0;
+  }
+}
+
+/* Tablet: slightly tighter matte. */
+@media (min-width: 768px) and (max-width: 1023px) {
+  .ve-container .ve-viewport-container:not(.ve-viewport-container--reframe) {
+    padding: 6px 0;
+  }
+}
+
+/* Phone: the preview sits in the scrolling column; keep the matte flush and
+   let the rounded frame breathe a hair from the screen edges. */
+@media (max-width: 767px) {
+  .ve-container .ve-viewport-container:not(.ve-viewport-container--reframe) {
+    padding: 8px 8px 4px;
+  }
+  .ve-container .ve-viewport:not(.ve-viewport--fullscreen) {
+    border-radius: 10px;
+  }
+}

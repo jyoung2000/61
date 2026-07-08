@@ -3159,6 +3159,16 @@ export default function VideoEditor({
   // crop-via-objectFit path keeps producing identical pixels.
   const previewRatio = reframePreviewActive ? srcRatio : targetRatio;
 
+  // ── Studio preview sizing ──
+  // Fill as much of the stage as possible while keeping the player's aspect
+  // ratio, so the video/canvas dominates on desktop and the dark matte
+  // (bezel) around it is minimized. The height budget drives the size: for
+  // landscape ratios the box grows until width:100% binds (near edge-to-edge,
+  // minimal side matte); for portrait clips it grows until this height binds
+  // (maximal canvas, minimal top/bottom waste). Scales down for tablet/phone
+  // so the timeline and controls stay reachable on smaller screens.
+  const previewMaxVh = compact ? 55 : isMobile ? 50 : isTablet ? 62 : 80;
+
   return (
     <div
       ref={containerRef}
@@ -3252,8 +3262,8 @@ export default function VideoEditor({
         className={`ve-viewport${isFullscreen ? ' ve-viewport--fullscreen' : ''}`}
         style={isFullscreen ? {} : {
           aspectRatio: `${previewRatio}`,
-          maxHeight: compact ? '55vh' : '50vh',
-          maxWidth: compact ? undefined : `calc(50vh * ${previewRatio})`,
+          maxHeight: `${previewMaxVh}vh`,
+          maxWidth: reframePreviewActive ? undefined : `calc(${previewMaxVh}vh * ${previewRatio})`,
           width: '100%',
           margin: reframePreviewActive ? 0 : '0 auto',
         }}
