@@ -164,6 +164,19 @@ def wav_file(tmp_path):
 
 
 def test_pick_model_auto_ladder(monkeypatch):
+    # Default WHISPER_REMOTE_PREFER_ACCURACY=True → full large-v3 even for
+    # English/auto (the Companion GPU can afford the accuracy win); pinned
+    # non-English always uses large-v3.
+    assert remote_whisper_pick_model(None) == "large-v3"
+    assert remote_whisper_pick_model("en") == "large-v3"
+    assert remote_whisper_pick_model("auto") == "large-v3"
+    assert remote_whisper_pick_model("ja") == "large-v3"
+
+
+def test_pick_model_speed_mode(monkeypatch):
+    # Opting into speed (PREFER_ACCURACY=False) drops English/auto to the
+    # pruned turbo decoder; pinned non-English still uses full large-v3.
+    monkeypatch.setattr(settings, "WHISPER_REMOTE_PREFER_ACCURACY", False, raising=False)
     assert remote_whisper_pick_model(None) == "large-v3-turbo"
     assert remote_whisper_pick_model("en") == "large-v3-turbo"
     assert remote_whisper_pick_model("auto") == "large-v3-turbo"
@@ -313,7 +326,8 @@ def test_transcribe_remote_end_to_end(monkeypatch, wav_file, tmp_path):
         assert result["speech_active"]  # 100ms grid populated
         assert result.get("coverage_ledger") is not None
         # Effective model recorded for the compute summary / Settings page.
-        assert ai.model_name == "large-v3-turbo"
+        # Auto ladder with the accuracy-first default → full large-v3.
+        assert ai.model_name == "large-v3"
         assert AudioIntelligence._last_loaded_device == "remote"
     finally:
         server.stop()

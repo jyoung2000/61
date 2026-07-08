@@ -486,8 +486,11 @@ def remote_whisper_pick_model(language: Optional[str]) -> str:
 
     ``WHISPER_REMOTE_MODEL`` wins when set; a user-pinned local model
     (WHISPER_MODEL_USER_SET) is honored next; otherwise the auto ladder
-    requests large-v3-turbo for English/auto jobs and large-v3 for pinned
-    non-English (better multilingual accuracy on a 12 GB card).
+    picks by accuracy. With ``WHISPER_REMOTE_PREFER_ACCURACY`` (the
+    default) every job — English/auto included — requests full large-v3,
+    since the Companion GPU can afford it. Set that flag off to opt into
+    speed: English/auto then drop to the pruned large-v3-turbo decoder
+    while pinned non-English stays on large-v3.
     """
     configured = (getattr(settings, "WHISPER_REMOTE_MODEL", "") or "").strip()
     if configured:
@@ -1293,7 +1296,8 @@ class AudioIntelligence:
                 _remote = _remote_engine.transcribe_wav(audio_path, whisper_lang)
                 if _remote:
                     _result = self._finalize_cloud_transcription(
-                        _remote, audio_path, duration_ms, log, on_progress)
+                        _remote, audio_path, duration_ms, log, on_progress,
+                        pinned_language=whisper_lang)
                     if _result is not None:
                         _result['transcription_provider'] = 'remote'
                         _result['transcription_location'] = 'remote'
@@ -1355,7 +1359,8 @@ class AudioIntelligence:
                         _cloud = transcribe_cloud(audio_path, whisper_lang)
                         if _cloud:
                             _result = self._finalize_cloud_transcription(
-                                _cloud, audio_path, duration_ms, log, on_progress)
+                                _cloud, audio_path, duration_ms, log, on_progress,
+                                pinned_language=whisper_lang)
                             if _result is not None:
                                 if _own_audio:
                                     try:
@@ -1886,13 +1891,20 @@ class AudioIntelligence:
             return {'speech_active': {}, 'segments': [], 'language': ''}
 
     def _finalize_cloud_transcription(self, cloud: dict, audio_path: str,
-                                      duration_ms: int, log, on_progress) -> Optional[dict]:
+                                      duration_ms: int, log, on_progress,
+                                      pinned_language: Optional[str] = None) -> Optional[dict]:
         """Run cloud STT output through the same post chain as local.
 
         Applies the hallucination filter, repetition-loop drop, end clamp
         and forced alignment, then builds speech_active + a coverage
         ledger in the local result schema. Returns None if everything was
         filtered out (caller falls back to local).
+
+        ``pinned_language`` is the language the JOB pinned (the caller's
+        ``whisper_lang``), NOT the script the provider happened to detect.
+        The wrong-script gate only fires when the job actually pinned a
+        language — on an AUTO job it stays off so genuine minority-language
+        speech (English lines inside a mostly-JA video) is never dropped.
         """
         segments = cloud.get('segments') or []
         language = cloud.get('language') or 'unknown'
@@ -1920,9 +1932,13 @@ class AudioIntelligence:
                 entry['is_hallucination'] = True
             elif ns > 0.7 and text:
                 entry['is_hallucination'] = True
-            elif text and _script_on and _wrong_script_for_language(text, language):
-                # Long pure-Latin prose forced onto a pinned CJK job is a
+            elif (text and _script_on and pinned_language
+                  and _wrong_script_for_language(text, pinned_language)):
+                # Long pure-Latin prose forced onto a PINNED CJK job is a
                 # phantom ("See you next time." over a JA musical outro).
+                # Gate on the job's PIN, not the provider-detected language —
+                # on an auto job the pin is None and this stays off so real
+                # English speech inside a JA video survives.
                 entry['is_hallucination'] = True
             elif (text and words and _phantom_on and _phantom is not None
                   and _phantom(words, ns, max_avg_conf=_phantom_max_avg,

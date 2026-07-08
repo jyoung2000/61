@@ -21,6 +21,7 @@ Any failure returns None — the caller falls back to local Whisper.
 from __future__ import annotations
 
 import logging
+import math
 import os
 from typing import Optional
 
@@ -63,6 +64,35 @@ def _vocab_prompt(language: str) -> Optional[str]:
         return None
 
 
+def _word_confidence(w: dict, seg: dict) -> float:
+    """Best-effort per-word confidence in [0, 1].
+
+    Prefer an explicit per-word probability (faster-whisper-style servers
+    return ``probability``; some return ``confidence``). When the provider
+    gives neither (OpenAI ``verbose_json`` omits it), fall back to the
+    segment ``avg_logprob`` mapped through ``exp`` — a phantom cue over
+    music has a very negative avg_logprob → low confidence, which the TACT
+    phantom filter can then act on instead of every word looking equally
+    certain at a flat 0.9.
+    """
+    wc = w.get("probability")
+    if wc is None:
+        wc = w.get("confidence")
+    if wc is None:
+        alp = seg.get("avg_logprob")
+        if alp is not None:
+            try:
+                wc = math.exp(float(alp))
+            except (ValueError, OverflowError):
+                wc = 0.9
+        else:
+            wc = 0.9
+    try:
+        return round(min(1.0, max(0.0, float(wc))), 3)
+    except (TypeError, ValueError):
+        return 0.9
+
+
 def _map_verbose_json(data: dict) -> list:
     """OpenAI-style verbose_json → local segment schema."""
     segments = []
@@ -84,9 +114,7 @@ def _map_verbose_json(data: dict) -> list:
                     "word": (w.get("word") or "").strip(),
                     "start": round(ws, 3),
                     "end": round(float(w.get("end", ws)), 3),
-                    # cloud APIs don't return per-word confidence — use a
-                    # neutral value the TACT phantom filter treats as fine
-                    "confidence": 0.9,
+                    "confidence": _word_confidence(w, seg),
                 })
             wi += 1
             if ws >= s1 - 1e-3:
