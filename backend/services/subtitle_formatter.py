@@ -826,9 +826,9 @@ def enforce_readability(
     if max_duration_ms is None:
         try:
             from backend.config import settings as _ds
-            max_duration_ms = int(getattr(_ds, "SUBTITLE_MAX_DURATION_MS", 9000))
+            max_duration_ms = int(getattr(_ds, "SUBTITLE_MAX_DURATION_MS", 7000))
         except Exception:
-            max_duration_ms = 9000
+            max_duration_ms = 7000   # Netflix maximum per event (7 s)
 
     # Resolve the minimum-text split guard (prevents one-word cues on slow
     # speech). 0 disables it (legacy behaviour).
@@ -1257,13 +1257,12 @@ def _hard_wrap_lines(text: str, max_chars: int, max_lines: int) -> str:
     between glyphs) falls through to a character-by-character wrap.
     Words longer than ``max_chars`` are hard-cut at the boundary.
 
-    ``max_lines`` is accepted for API symmetry with ``_smart_split``
-    but ISN'T enforced — the readability eval scores by longest line
-    length, not by line count, and a 3-line correctly-wrapped event
-    is preferable to a 2-line event whose tail line still exceeds the
-    budget. Subtitle renderers that need a strict line cap (TikTok's
-    1-line profile) handle that at render time via the platform
-    profile, not via the input text.
+    ``max_lines`` IS enforced (Netflix allows at most 2 lines). If the
+    word-wrap produces more lines than allowed, the overflow is folded back
+    into the last kept line — a single slightly-over-budget line is a much
+    smaller subtitle-spec violation than emitting a 3rd line. (Cues that
+    genuinely can't fit in 2 lines should have been split earlier by the
+    duration / CPS passes; this is only the last-resort wrapper.)
     """
     if not text:
         return text
@@ -1286,6 +1285,13 @@ def _hard_wrap_lines(text: str, max_chars: int, max_lines: int) -> str:
             current = unit
     if current:
         lines.append(current)
+    # Enforce the line cap: fold any overflow into the last allowed line so we
+    # never emit more than max_lines (Netflix: ≤ 2).
+    cap = max(1, int(max_lines))
+    if len(lines) > cap:
+        head = lines[:cap - 1]
+        tail = join.join(lines[cap - 1:])
+        lines = head + [tail]
     return "\n".join(lines)
 
 
@@ -1296,9 +1302,7 @@ def compute_readability_report(
     max_cps: Optional[float] = None,
     ideal_cps: Optional[float] = None,
     max_chars_per_line: Optional[int] = None,
-    max_duration_ms: int = 9000,   # Matches the formatter's cap so merged
-                                   # phrase-cues (longer on slow speech) aren't
-                                   # scored as duration violations.
+    max_duration_ms: int = 7000,   # Netflix maximum per event (7 s).
     min_duration_ms: int = 833,
 ) -> dict:
     """Score a subtitle transcript for human readability.
@@ -1341,12 +1345,21 @@ def compute_readability_report(
 
     cjk_share = sum(1 for s in segments if _is_cjk(s.text or "")) / len(segments)
     is_cjk = cjk_share >= 0.4
+    # Grade against the SAME Netflix targets the enforcer uses (from config),
+    # not looser hard-coded numbers — otherwise the score overstates real
+    # Netflix compliance (17 CPS adult Latin / 13 CJK, not 21).
+    try:
+        from backend.config import settings as _rs
+        _cfg_cps = float(getattr(_rs, "SUBTITLE_MAX_CPS", 17.0))
+        _cfg_cpl = int(getattr(_rs, "SUBTITLE_MAX_CHARS_PER_LINE", 42))
+    except Exception:
+        _cfg_cps, _cfg_cpl = 17.0, 42
     if max_cps is None:
-        max_cps = 13.0 if is_cjk else 21.0   # Netflix: 21 CPS adult Latin, 13 CJK
+        max_cps = 13.0 if is_cjk else _cfg_cps       # Netflix adult limit
     if ideal_cps is None:
-        ideal_cps = 10.0 if is_cjk else 17.0  # Netflix: 17 CPS comfortable reading
+        ideal_cps = 10.0 if is_cjk else min(15.0, max_cps)  # comfortable floor
     if max_chars_per_line is None:
-        max_chars_per_line = 16 if is_cjk else 42
+        max_chars_per_line = 16 if is_cjk else _cfg_cpl
 
     cps_ok = 0
     line_ok = 0

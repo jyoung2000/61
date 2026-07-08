@@ -206,12 +206,31 @@ def _vad_parameters() -> dict:
     min_silence 300ms catches brief intra-sentence pauses; speech_pad
     150ms keeps onsets while tightening cue boundaries (audit Phase 3.2).
     """
-    return {
+    params = {
         "min_silence_duration_ms": int(getattr(
             settings, "WHISPER_VAD_MIN_SILENCE_MS", 300)),
         "speech_pad_ms": int(getattr(
             settings, "WHISPER_VAD_SPEECH_PAD_MS", 150)),
     }
+    # Silero speech-onset probability threshold. The 0.5 default drops soft /
+    # whispered / distant speech — a common cause of sparse transcripts. Wiring
+    # WHISPER_VAD_ONSET (previously dead config) lets a lower value recover it.
+    try:
+        onset = float(getattr(settings, "WHISPER_VAD_ONSET", 0) or 0)
+        if 0.0 < onset < 1.0:
+            params["threshold"] = onset
+    except Exception:
+        pass
+    return params
+
+
+def _beam_size() -> int:
+    """Honor WHISPER_BEAM_SIZE (was dead config — the transcribe calls hardcoded
+    5). Higher beams (8-10) capture a few % more words at more VRAM/time."""
+    try:
+        return max(1, int(getattr(settings, "WHISPER_BEAM_SIZE", 5)))
+    except Exception:
+        return 5
 
 
 def _words_degenerate(words: list, start_sec: float, end_sec: float) -> bool:
@@ -1448,7 +1467,7 @@ class AudioIntelligence:
                 segments_iter, info = batched.transcribe(
                     audio_path, batch_size=self._batch_size,
                     language=whisper_lang,
-                    beam_size=5, vad_filter=True,
+                    beam_size=_beam_size(), vad_filter=True,
                     vad_parameters=_vad_parameters(),
                     word_timestamps=True,
                     no_speech_threshold=_ns_threshold,
@@ -1478,7 +1497,7 @@ class AudioIntelligence:
                 _decode = _decoding_kwargs(self.engine.transcribe)
                 segments_iter, info = self.engine.transcribe(
                     audio_path, language=whisper_lang,
-                    beam_size=5, vad_filter=True,
+                    beam_size=_beam_size(), vad_filter=True,
                     vad_parameters=_vad_parameters(),
                     word_timestamps=True,
                     no_speech_threshold=_ns_threshold,
@@ -2549,7 +2568,7 @@ class AudioIntelligence:
                     audio_path, batch_size=self._batch_size,
                     language=whisper_lang,
                     task='translate',  # ← the key difference
-                    beam_size=5, vad_filter=True,
+                    beam_size=_beam_size(), vad_filter=True,
                     vad_parameters=_vad_parameters(),
                     word_timestamps=True,
                     no_speech_threshold=float(getattr(
@@ -2570,7 +2589,7 @@ class AudioIntelligence:
                 segments_iter, info = self.engine.transcribe(
                     audio_path, language=whisper_lang,
                     task='translate',
-                    beam_size=5, vad_filter=True,
+                    beam_size=_beam_size(), vad_filter=True,
                     word_timestamps=True,
                     **_decoding_kwargs(self.engine.transcribe),
                 )

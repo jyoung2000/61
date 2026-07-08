@@ -85,6 +85,12 @@ transformers>=4.40,<5
 # SentencePiece tokenizer for NLLB-200 / Opus-MT NMT translation.
 sentencepiece>=0.1.99
 
+# Latin-script punctuation restoration for the transcript polisher's last-resort
+# pass (restore_punctuation_fallback). Optional at runtime — the code degrades
+# gracefully when absent — but without it a clean English transcript that the
+# LLM polish leaves unchanged ships without sentence boundaries.
+deepmultilingualpunctuation>=1.0.1
+
 # Google Trends fallback tier for the live trend brief (free, no API key). The
 # web-search tier (OpenRouter) is primary; pytrends is the fail-soft fallback.
 # Optional — trend_brief.py degrades to the static lexicon if it's absent.
