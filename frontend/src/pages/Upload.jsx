@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import ProgressBar from '../components/ProgressBar';
 import useResponsive from '../hooks/useResponsive';
 import CloudSourceTabs from '../components/cloud/CloudSourceTabs';
+import '../components/cloud/FileBrowser.css';
 
 const ACCEPTED = 'video/*,.mp4,.mov,.avi,.mkv,.webm,.m4v,.3gp';
 const ACCEPTED_DISPLAY = 'MP4 \u00B7 MOV \u00B7 AVI \u00B7 MKV \u00B7 WEBM \u00B7 M4V \u00B7 3GP';
@@ -987,21 +988,17 @@ export default function Upload() {
         />
       )}
 
-      {/* Drop zone */}
+      {/* Drop zone — local input file browser (file-browser design system) */}
       <div
+        className={`fb-scope fb-dropzone${dragOver ? ' is-dragover' : ''}${uploading ? ' is-disabled' : ''}`}
         onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
         onDragLeave={() => setDragOver(false)}
         onDrop={handleDrop}
         onClick={() => !uploading && fileRef.current?.click()}
-        style={{
-          border: `2px dashed ${dragOver ? 'var(--accent-cyan)' : 'var(--border)'}`,
-          background: dragOver ? 'var(--accent-cyan-dim)' : 'var(--bg-panel)',
-          borderRadius: 'var(--radius-lg)',
-          padding: isMobile ? '36px 16px' : '48px 24px',
-          textAlign: 'center',
-          cursor: uploading ? 'default' : 'pointer',
-          transition: 'all 0.2s ease',
-        }}
+        role="button"
+        tabIndex={uploading ? -1 : 0}
+        onKeyDown={(e) => { if (!uploading && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); fileRef.current?.click(); } }}
+        aria-label="Choose a video to upload"
       >
         {/* No capture attribute — on iOS, capture forces camera-only and hides the library */}
         <input
@@ -1014,22 +1011,40 @@ export default function Upload() {
 
         {!selectedFile ? (
           <>
-            <div style={{ fontSize: 40, marginBottom: 12, opacity: 0.4 }}>&#x2B06;</div>
-            <p style={{ color: 'var(--text-secondary)', marginBottom: 8 }}>
-              {IS_MOBILE ? 'Tap to choose a video' : 'Drag and drop your video here, or click to browse'}
-            </p>
-            <p style={{ color: 'var(--text-muted)', fontSize: 12 }}>
-              {ACCEPTED_DISPLAY}
-            </p>
+            <span className="fb-dropzone__badge">
+              <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M4 14.899A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242" />
+                <path d="M12 12v9" /><path d="m16 16-4-4-4 4" />
+              </svg>
+            </span>
+            <div className="fb-dropzone__title">
+              {IS_MOBILE ? 'Tap to choose a video' : 'Drag & drop your video'}
+            </div>
+            {!IS_MOBILE && (
+              <div style={{ fontSize: 13.5, color: 'var(--fb-ts)' }}>
+                or <span className="fb-dropzone__browse">browse files</span>
+              </div>
+            )}
+            <div className="fb-dropzone__hint">{ACCEPTED_DISPLAY}</div>
           </>
         ) : (
-          <div>
-            <div style={{ fontSize: 14, color: 'var(--text-primary)', marginBottom: 8, fontWeight: 600 }}>
-              {selectedFile.name}
+          <div className="fb-dropzone__file">
+            <span className="fb-icontile">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--fb-ts)" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                <rect x="2" y="3" width="20" height="18" rx="2" /><path d="M7 3v18" /><path d="M17 3v18" /><path d="M2 12h20" /><path d="M2 7.5h5" /><path d="M2 16.5h5" /><path d="M17 7.5h5" /><path d="M17 16.5h5" />
+              </svg>
+            </span>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontSize: 15, fontWeight: 600, color: 'var(--fb-tp)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }} title={selectedFile.name}>
+                {selectedFile.name}
+              </div>
+              <div style={{ fontFamily: 'var(--fb-mono)', fontSize: 12, color: 'var(--fb-tm)', marginTop: 2 }}>
+                {formatBytes(selectedFile.size)}
+              </div>
             </div>
-            <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
-              {formatBytes(selectedFile.size)}
-            </div>
+            <span className="fb-check">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><path d="M20 6 9 17l-5-5" /></svg>
+            </span>
           </div>
         )}
       </div>

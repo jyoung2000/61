@@ -16,11 +16,12 @@ import React, { useCallback, useState } from 'react';
 import { Link } from 'react-router-dom';
 import useCloudProviders from '../../hooks/useCloudProviders';
 import CloudFilePicker from './CloudFilePicker';
+import './FileBrowser.css';
 
 const TABS = [
-  { value: 'local', label: 'Local file', providerName: null },
-  { value: 'google_drive', label: 'Google Drive', providerName: 'google_drive' },
-  { value: 'box', label: 'Box', providerName: 'box' },
+  { value: 'local', label: 'Local file', providerName: null, icon: 'local' },
+  { value: 'google_drive', label: 'Google Drive', providerName: 'google_drive', icon: 'cloud' },
+  { value: 'box', label: 'Box', providerName: 'box', icon: 'box' },
 ];
 
 const PROVIDER_LABELS = {
@@ -28,16 +29,29 @@ const PROVIDER_LABELS = {
   box: 'Box',
 };
 
+// Small inline provider glyphs, matching the file-browser design system.
+function SourceGlyph({ kind }) {
+  const common = { width: 16, height: 16, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.8, strokeLinecap: 'round', strokeLinejoin: 'round', style: { display: 'block' } };
+  if (kind === 'cloud') return (<svg {...common}><path d="M17.5 19a4.5 4.5 0 1 0-1.5-8.74A6 6 0 1 0 6.5 19z" /></svg>);
+  if (kind === 'box') return (<svg {...common}><path d="M22 12H2" /><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z" /><path d="M6 16h.01" /><path d="M10 16h.01" /></svg>);
+  return (<svg {...common}><rect x="2" y="3" width="20" height="14" rx="2" /><path d="M8 21h8" /><path d="M12 17v4" /></svg>);
+}
+
 function tabButtonStyle(active) {
   return {
-    padding: '8px 14px',
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: 7,
+    padding: '8px 13px',
     fontSize: 13,
-    background: active ? 'var(--accent-cyan)' : 'transparent',
-    color: active ? '#000' : 'var(--text-secondary)',
-    border: `1px solid ${active ? 'var(--accent-cyan)' : 'var(--border)'}`,
-    borderRadius: 'var(--radius-sm)',
+    fontWeight: 600,
+    background: active ? 'var(--fb-sel)' : 'var(--fb-field)',
+    color: active ? 'var(--fb-accent)' : 'var(--fb-ts)',
+    border: `1px solid ${active ? 'var(--fb-accent)' : 'transparent'}`,
+    borderRadius: 10,
     cursor: 'pointer',
-    fontWeight: active ? 600 : 400,
+    transition: 'all 120ms ease',
+    whiteSpace: 'nowrap',
   };
 }
 
@@ -137,7 +151,7 @@ export default function CloudSourceTabs({ uploadMetadata, onJobStart }) {
   })();
 
   return (
-    <div style={{ marginBottom: 16 }}>
+    <div className="fb-scope" style={{ marginBottom: 16 }}>
       <div
         role="tablist"
         aria-label="Video source"
@@ -158,9 +172,13 @@ export default function CloudSourceTabs({ uploadMetadata, onJobStart }) {
               onClick={() => handleTabClick(tab)}
               style={tabButtonStyle(active === tab.value)}
             >
+              <SourceGlyph kind={tab.icon} />
               {tab.label}
               {isCloud && provider?.connected && (
-                <span style={{ marginLeft: 6, opacity: 0.75 }}>&bull;</span>
+                <span
+                  title="Connected"
+                  style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--success, #34C759)', flex: 'none' }}
+                />
               )}
             </button>
           );
@@ -205,6 +223,7 @@ export default function CloudSourceTabs({ uploadMetadata, onJobStart }) {
         <CloudFilePicker
           provider={pickerFor}
           providerLabel={PROVIDER_LABELS[pickerFor]}
+          account={providerByName[pickerFor]?.account?.display_name}
           onPick={handlePick}
           onClose={() => setPickerFor(null)}
         />
