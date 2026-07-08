@@ -1,6 +1,7 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import useResponsive from '../hooks/useResponsive';
+import { exportProject, exportProjectBlocking, importProject } from '../utils/projectBundle';
 
 function formatDuration(seconds) {
   if (!seconds) return '-';
@@ -54,6 +55,48 @@ export default function Dashboard() {
   const [bulkBusy, setBulkBusy] = useState(false);
   const navigate = useNavigate();
   const { isMobile } = useResponsive();
+
+  // ── Project import / export ───────────────────────────────────────────────
+  const importInputRef = useRef(null);
+  const [importing, setImporting] = useState(false);
+  const [importPct, setImportPct] = useState(0);
+  const [exportingId, setExportingId] = useState(null);
+  // Delete confirmation modal (single or bulk) with an "export first" option.
+  const [deleteModal, setDeleteModal] = useState(null); // { ids: string[] } | null
+  const [exportBeforeDelete, setExportBeforeDelete] = useState(true);
+
+  const handleExport = (e, jobId) => {
+    if (e) e.stopPropagation();
+    setExportingId(jobId);
+    try { exportProject(jobId); }
+    finally { setTimeout(() => setExportingId(null), 2500); }
+  };
+
+  const handleImportPick = () => importInputRef.current?.click();
+
+  const handleImportFile = async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    setImporting(true);
+    setImportPct(0);
+    try {
+      const res = await importProject(file, setImportPct);
+      navigate(`/analysis/${res.job_id}`);
+    } catch (err) {
+      window.alert(`Import failed: ${err.message || err}`);
+    } finally {
+      setImporting(false);
+      setImportPct(0);
+    }
+  };
+
+  // Export several selected projects (staggered so the browser queues each
+  // download instead of dropping all but the last).
+  const exportSelected = () => {
+    const ids = Array.from(selected);
+    ids.forEach((id, i) => setTimeout(() => exportProject(id), i * 800));
+  };
 
   // Track cancelled job IDs so the 5-second poll never brings them back
   const cancelledIdsRef = React.useRef(new Set());
@@ -110,14 +153,11 @@ export default function Dashboard() {
     setCancelling((prev) => { const n = { ...prev }; delete n[jobId]; return n; });
   };
 
-  const handleDelete = async (e, jobId) => {
-    e.stopPropagation();
-    try {
-      const res = await fetch(`/api/jobs/${jobId}`, { method: 'DELETE' });
-      if (res.ok) {
-        setJobs((prev) => prev.filter((j) => j.job_id !== jobId));
-      }
-    } catch {}
+  const handleDelete = (e, jobId) => {
+    if (e) e.stopPropagation();
+    // Route single deletes through the same confirm modal (offers export first).
+    setExportBeforeDelete(true);
+    setDeleteModal({ ids: [jobId] });
   };
 
   // ── Multi-select bulk delete ──────────────────────────────────────────────
@@ -129,21 +169,41 @@ export default function Dashboard() {
     });
   };
   const exitSelectMode = () => { setSelectMode(false); setSelected(new Set()); };
-  const bulkDelete = async () => {
+  const bulkDelete = () => {
     const ids = Array.from(selected);
     if (!ids.length) return;
-    if (!window.confirm(`Delete ${ids.length} project${ids.length === 1 ? '' : 's'}? This can't be undone.`)) return;
+    setExportBeforeDelete(true);
+    setDeleteModal({ ids });
+  };
+
+  // Runs the confirmed delete. When "export first" is on, each project is
+  // exported (and fully saved) BEFORE deletion; any project whose export
+  // fails is NOT deleted, so nothing is lost.
+  const runDelete = async () => {
+    const ids = deleteModal?.ids || [];
+    setDeleteModal(null);
+    if (!ids.length) return;
     setBulkBusy(true);
-    // Delete concurrently but cap fan-out so we don't hammer the server.
+    let toDelete = ids;
+    if (exportBeforeDelete) {
+      const ok = [];
+      for (const id of ids) {
+        try { await exportProjectBlocking(id); ok.push(id); } catch { /* keep it */ }
+      }
+      if (ok.length < ids.length) {
+        window.alert(`${ids.length - ok.length} export(s) failed — those projects were NOT deleted.`);
+      }
+      toDelete = ok;
+    }
     const CONC = 5;
-    for (let i = 0; i < ids.length; i += CONC) {
-      const batch = ids.slice(i, i + CONC);
+    for (let i = 0; i < toDelete.length; i += CONC) {
+      const batch = toDelete.slice(i, i + CONC);
       await Promise.all(batch.map((id) =>
         fetch(`/api/jobs/${id}`, { method: 'DELETE' }).catch(() => {})));
       setJobs((prev) => prev.filter((j) => !batch.includes(j.job_id)));
     }
     setBulkBusy(false);
-    exitSelectMode();
+    if (selectMode) exitSelectMode();
   };
 
   const [fetchError, setFetchError] = useState(false);
@@ -216,6 +276,69 @@ export default function Dashboard() {
 
   return (
     <div>
+      <input
+        ref={importInputRef}
+        type="file"
+        accept=".zip,application/zip"
+        onChange={handleImportFile}
+        style={{ display: 'none' }}
+      />
+
+      {/* Delete confirmation — offers to export the project(s) first. */}
+      {deleteModal && (
+        <div
+          onClick={() => !bulkBusy && setDeleteModal(null)}
+          style={{
+            position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', zIndex: 1000,
+            display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20,
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              background: 'var(--bg-panel)', border: '1px solid var(--border)',
+              borderRadius: 'var(--radius-lg)', width: 'min(460px, 96vw)', padding: 20,
+            }}
+          >
+            <h3 style={{ margin: '0 0 8px', fontSize: 16 }}>
+              Delete {deleteModal.ids.length} project{deleteModal.ids.length === 1 ? '' : 's'}?
+            </h3>
+            <p style={{ margin: '0 0 14px', fontSize: 13, color: 'var(--text-secondary)' }}>
+              This frees server disk and can&rsquo;t be undone. Export first to keep a
+              portable <code>.clipai.zip</code> you can re-import later.
+            </p>
+            <label style={{ display: 'flex', gap: 8, alignItems: 'flex-start', cursor: 'pointer', marginBottom: 16, fontSize: 13 }}>
+              <input
+                type="checkbox"
+                checked={exportBeforeDelete}
+                onChange={(e) => setExportBeforeDelete(e.target.checked)}
+                style={{ marginTop: 2 }}
+              />
+              <span>
+                <strong>Export before deleting</strong> — download each project as a
+                bundle first. A project is only deleted once its export is saved.
+              </span>
+            </label>
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+              <button
+                onClick={() => setDeleteModal(null)}
+                disabled={bulkBusy}
+                style={{ padding: '8px 14px', background: 'var(--bg-elevated)', color: 'var(--text-secondary)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', fontSize: 13, cursor: 'pointer' }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={runDelete}
+                disabled={bulkBusy}
+                style={{ padding: '8px 16px', background: 'var(--danger)', color: '#fff', border: 'none', borderRadius: 'var(--radius-sm)', fontSize: 13, fontWeight: 600, cursor: bulkBusy ? 'default' : 'pointer' }}
+              >
+                {bulkBusy ? (exportBeforeDelete ? 'Exporting…' : 'Deleting…') : (exportBeforeDelete ? 'Export & Delete' : 'Delete')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Connection error banner */}
       {fetchError && (
         <div style={{
@@ -352,6 +475,23 @@ export default function Dashboard() {
           >
             {selectMode ? 'Done' : 'Multi-select'}
           </button>
+
+          {/* Import a .clipai.zip project bundle. */}
+          {!selectMode && (
+            <button
+              onClick={handleImportPick}
+              disabled={importing}
+              style={{
+                padding: '10px 14px', fontSize: 13, borderRadius: 'var(--radius-md)',
+                background: 'var(--bg-panel)', border: '1px solid var(--border)',
+                color: 'var(--text-secondary)', whiteSpace: 'nowrap',
+                cursor: importing ? 'default' : 'pointer', opacity: importing ? 0.7 : 1,
+              }}
+              title="Import a .clipai.zip project bundle"
+            >
+              {importing ? `Importing… ${importPct}%` : 'Import Project'}
+            </button>
+          )}
         </div>
       )}
 
@@ -372,6 +512,14 @@ export default function Dashboard() {
             style={{ padding: '8px 12px', background: 'var(--bg-elevated)', color: 'var(--text-secondary)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', fontSize: 13, cursor: 'pointer' }}
           >
             Clear
+          </button>
+          <button
+            onClick={exportSelected}
+            disabled={selected.size === 0 || bulkBusy}
+            style={{ padding: '8px 12px', background: 'var(--bg-elevated)', color: 'var(--text-secondary)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', fontSize: 13, cursor: selected.size > 0 && !bulkBusy ? 'pointer' : 'default' }}
+            title="Download each selected project as a .clipai.zip"
+          >
+            Export{selected.size ? ` (${selected.size})` : ''}
           </button>
           <button
             onClick={bulkDelete}
@@ -405,20 +553,34 @@ export default function Dashboard() {
           <p style={{ color: 'var(--text-muted)', marginBottom: 24 }}>
             Drop your first video to get started
           </p>
-          <Link
-            to="/upload"
-            style={{
-              display: 'inline-block',
-              padding: '10px 24px',
-              background: 'var(--accent-cyan)',
-              color: 'var(--bg-base)',
-              fontWeight: 600,
-              borderRadius: 'var(--radius-sm)',
-              textDecoration: 'none',
-            }}
-          >
-            Upload Video
-          </Link>
+          <div style={{ display: 'flex', gap: 10, justifyContent: 'center', flexWrap: 'wrap' }}>
+            <Link
+              to="/upload"
+              style={{
+                display: 'inline-block',
+                padding: '10px 24px',
+                background: 'var(--accent-cyan)',
+                color: 'var(--bg-base)',
+                fontWeight: 600,
+                borderRadius: 'var(--radius-sm)',
+                textDecoration: 'none',
+              }}
+            >
+              Upload Video
+            </Link>
+            <button
+              onClick={handleImportPick}
+              disabled={importing}
+              style={{
+                padding: '10px 24px', background: 'var(--bg-elevated)', color: 'var(--text-secondary)',
+                border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', fontWeight: 600,
+                cursor: importing ? 'default' : 'pointer', opacity: importing ? 0.7 : 1,
+              }}
+              title="Import a .clipai.zip project bundle"
+            >
+              {importing ? `Importing… ${importPct}%` : 'Import Project'}
+            </button>
+          </div>
         </div>
       ) : filteredJobs.length === 0 ? (
         <div style={{
@@ -517,6 +679,22 @@ export default function Dashboard() {
 
                   {/* Action buttons */}
                   <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
+                    {!CANCELLABLE.includes(job.status) && (
+                      <button
+                        onClick={(e) => handleExport(e, job.job_id)}
+                        disabled={exportingId === job.job_id}
+                        style={{
+                          padding: '6px 14px', background: 'var(--bg-elevated)',
+                          border: '1px solid var(--border)', color: 'var(--text-secondary)',
+                          fontSize: 12, fontWeight: 600,
+                          cursor: exportingId === job.job_id ? 'default' : 'pointer',
+                          borderRadius: 'var(--radius-sm)', opacity: exportingId === job.job_id ? 0.7 : 1,
+                        }}
+                        title="Download this project as a .clipai.zip you can re-import later"
+                      >
+                        {exportingId === job.job_id ? 'Preparing…' : 'Export'}
+                      </button>
+                    )}
                     {CANCELLABLE.includes(job.status) && (
                       <button
                         onClick={(e) => handleCancel(e, job.job_id)}

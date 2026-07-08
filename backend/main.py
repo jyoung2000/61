@@ -1118,6 +1118,9 @@ app.include_router(api_v1_router)
 from backend.routers import downloads as downloads_router  # noqa: E402
 app.include_router(downloads_router.router)
 
+from backend.routers import project_bundle as project_bundle_router  # noqa: E402
+app.include_router(project_bundle_router.router)
+
 # Mount MCP server at /mcp (if mcp package is available)
 try:
     from mcp.server.fastmcp import FastMCP
