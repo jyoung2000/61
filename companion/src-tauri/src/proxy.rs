@@ -430,6 +430,15 @@ async fn progress_report(State(ctx): State<ProxyCtx>, headers: HeaderMap) -> Res
     if !authorized(&ctx, &headers) {
         return unauthorized();
     }
+    // A job-ended signal (X-ClipAI-Job-Ended) clears the active-job display at
+    // once — ClipAI sends this when a job completes / fails / is cancelled or
+    // deleted, so the GUI never shows a phantom job for the 45s staleness window.
+    let ended = header_str(&headers, "x-clipai-job-ended");
+    if matches!(ended.trim(), "1" | "true" | "yes") {
+        ctx.state.clear_reported_job(&header_str(&headers, "x-clipai-job-id"));
+        ctx.state.job_progress.store(0, Ordering::Relaxed);
+        return (StatusCode::OK, "ok").into_response();
+    }
     let progress = headers
         .get("x-clipai-progress")
         .and_then(|v| v.to_str().ok())

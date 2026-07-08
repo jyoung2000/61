@@ -494,6 +494,11 @@ async def cancel_job(job_id: str, user: User = Depends(get_current_user)):
         progress_message="Cancelling...",
     )
     request_cancel(job_id)
+    try:
+        from backend.services import companion_progress
+        companion_progress.job_ended(job_id)
+    except Exception:
+        pass
     return {"job_id": job_id, "status": "cancelled"}
 
 
@@ -504,6 +509,11 @@ async def delete_job(job_id: str, user: User = Depends(get_current_user)):
     if job.status not in deletable:
         raise HTTPException(status_code=409, detail="Cancel the job first before deleting")
     await database.delete_job(job_id)
+    try:
+        from backend.services import companion_progress
+        companion_progress.job_ended(job_id)
+    except Exception:
+        pass
     return {"job_id": job_id, "deleted": True}
 
 

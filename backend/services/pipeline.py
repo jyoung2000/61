@@ -3552,7 +3552,9 @@ async def run_analysis(job_id: str):
             _finalizing_jobs.discard(job_id)
             try:
                 from backend.services import companion_progress
-                companion_progress.forget(job_id)
+                # Tell the Companion the job has ended so its active-job display
+                # clears immediately (not after the 45s staleness window).
+                companion_progress.job_ended(job_id)
             except Exception:
                 pass
             try:

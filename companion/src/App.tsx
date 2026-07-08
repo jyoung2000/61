@@ -7,7 +7,7 @@ import {
   CompanionStatus, getStatus, setConfig, regenerateToken,
   installOllama, startOllama, pullModel, pairClipai,
   listModels, deleteModel, InstalledModel,
-  downloadWhisper, refreshSidecar, exportLogs, testClipai, ClipaiTest, freeVram,
+  downloadWhisper, refreshSidecar, exportLogs, testClipai, ClipaiTest, freeVram, endActiveJob,
 } from './api';
 
 // Common Ollama models offered as search suggestions on the Companion.
@@ -482,6 +482,20 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
     }
   };
 
+  const [endingJob, setEndingJob] = useState(false);
+  const doEndJob = async () => {
+    setEndingJob(true);
+    try {
+      await endActiveJob();
+      refresh();
+    } catch (e) {
+      setSyncMsg(`Could not end job: ${e}`);
+      setTimeout(() => setSyncMsg(''), 5000);
+    } finally {
+      setEndingJob(false);
+    }
+  };
+
   const [exporting, setExporting] = useState(false);
   const doExportLogs = async () => {
     setExporting(true);
@@ -760,9 +774,16 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
                 {job.job_id ? ` — job ${job.job_id.slice(0, 8)}` : ''}
               </div>
             </div>
-            <span className="badge live">
-              {status.job_progress != null ? `${status.job_progress}%` : 'Live'}
-            </span>
+            <div className="row" style={{ gap: 8, flexShrink: 0 }}>
+              <span className="badge live">
+                {status.job_progress != null ? `${status.job_progress}%` : 'Live'}
+              </span>
+              <button className="secondary" style={{ padding: '3px 10px' }}
+                onClick={doEndJob} disabled={endingJob}
+                title="Force-end this job on the Companion: clears the display and unloads its models. Use if ClipAI stopped without telling the Companion.">
+                {endingJob ? 'Ending…' : 'Force end'}
+              </button>
+            </div>
           </div>
           {/* Live progress bar for the pipeline ClipAI is running (from
               X-ClipAI-Progress). Indeterminate until ClipAI reports a %. */}

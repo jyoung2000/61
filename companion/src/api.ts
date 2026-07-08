@@ -120,5 +120,6 @@ export interface ClipaiTest {
 export const testClipai = () => invoke<ClipaiTest>('test_clipai');
 /** Unload all resident Ollama models to free GPU VRAM now. */
 export const freeVram = () => invoke<{ unloaded: number; models: string[] }>('free_vram');
+export const endActiveJob = () => invoke<{ unloaded: number; models: string[] }>('end_active_job');
 export const pairClipai = (clipaiUrl: string, apiKey: string) =>
   invoke('pair_clipai', { clipaiUrl, apiKey });

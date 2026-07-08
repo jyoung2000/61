@@ -506,6 +506,20 @@ impl AppState {
         });
     }
 
+    /// Clear the reported active job. When ``job_id`` is non-empty only clears
+    /// it if it matches (so a stale end signal can't wipe a newer job); an empty
+    /// ``job_id`` force-clears whatever is there (the GUI "Force end" button).
+    pub fn clear_reported_job(&self, job_id: &str) {
+        let mut slot = self.reported_job.lock().unwrap();
+        let matches = match slot.as_ref() {
+            Some(j) => job_id.is_empty() || j.job_id == job_id,
+            None => false,
+        };
+        if matches {
+            *slot = None;
+        }
+    }
+
     /// The reported job if a heartbeat arrived recently (< 45s) — else None so a
     /// finished/abandoned job stops driving the bar.
     pub fn reported_job_fresh(&self) -> Option<ReportedJob> {

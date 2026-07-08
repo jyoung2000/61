@@ -54,6 +54,44 @@ def forget(job_id: str) -> None:
     _last_sent.pop(job_id, None)
 
 
+def job_ended(job_id: str) -> None:
+    """Tell the Companion a job has ENDED (completed / failed / cancelled /
+    deleted) so it clears its active-job display immediately, instead of waiting
+    out the 45s staleness timeout. Best-effort; safe to call anywhere."""
+    forget(job_id)
+    try:
+        asyncio.create_task(_post_ended(job_id))
+    except RuntimeError:
+        # No running loop (worker thread) — fire a throwaway loop just for this.
+        try:
+            asyncio.run(_post_ended(job_id))
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+async def _post_ended(job_id: str) -> None:
+    try:
+        import httpx
+        from backend.services import ollama_registry as reg
+
+        host = reg.companion_host()
+        if host is None:
+            return
+        base = reg.companion_base(host)
+        if not base:
+            return
+        headers = {"X-ClipAI-Job-Id": job_id or "", "X-ClipAI-Job-Ended": "1"}
+        token = getattr(host, "token", "") or ""
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            await client.post(f"{base}/v1/progress", headers=headers)
+    except Exception:
+        pass
+
+
 async def _post() -> None:
     try:
         import httpx

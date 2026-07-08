@@ -706,6 +706,20 @@ async fn free_vram() -> Result<serde_json::Value, String> {
     Ok(serde_json::json!({ "unloaded": n, "models": names }))
 }
 
+/// Force-clear a stuck active-job display AND unload resident models. Used by
+/// the GUI "Force end" button when ClipAI reports a job the Companion never
+/// heard finish (e.g. the container was stopped mid-job). Local-only — it does
+/// not command ClipAI (no reverse channel); it just stops the Companion showing
+/// a phantom job and frees the VRAM it was holding.
+#[tauri::command]
+async fn end_active_job(state: tauri::State<'_, SharedState>) -> Result<serde_json::Value, String> {
+    state.clear_reported_job("");
+    state.job_progress.store(0, std::sync::atomic::Ordering::Relaxed);
+    let (n, names) = ollama::unload_all().await;
+    log::info!("end_active_job: cleared job + unloaded {n} model(s)");
+    Ok(serde_json::json!({ "unloaded": n, "models": names }))
+}
+
 #[tauri::command]
 async fn delete_model(model: String) -> Result<(), String> {
     ollama::delete_model(&model).await
@@ -1087,6 +1101,7 @@ pub fn run() {
             export_logs,
             test_clipai,
             free_vram,
+            end_active_job,
             pair_clipai,
         ]);
 
