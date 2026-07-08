@@ -498,6 +498,10 @@ def remote_whisper_pick_model(language: Optional[str]) -> str:
             return pinned
     lang = (language or "auto").strip().lower()
     if lang in ("", "auto", "en", "english"):
+        # The Companion GPU can afford full large-v3 for the accuracy win; only
+        # drop to the pruned turbo decoder when the user opts for speed.
+        if bool(getattr(settings, "WHISPER_REMOTE_PREFER_ACCURACY", True)):
+            return "large-v3"
         return "large-v3-turbo"
     return "large-v3"
 
@@ -1896,12 +1900,37 @@ class AudioIntelligence:
         if not duration_sec and segments:
             duration_sec = max(s['end_sec'] for s in segments)
 
-        # Hallucination filter — same checks as the local loop
+        # Hallucination filter — the SAME stack as the local loop, so the
+        # companion / cloud path is no longer weaker: boilerplate + no_speech
+        # clamp + wrong-script CJK gate + the TACT low-confidence phantom gate.
+        _phantom_on = bool(getattr(settings, "WHISPER_PHANTOM_FILTER_ENABLED", True))
+        _phantom_max_avg = float(getattr(settings, "WHISPER_PHANTOM_MAX_AVG_CONF", 0.40))
+        _phantom_min_frac = float(getattr(settings, "WHISPER_PHANTOM_MIN_LOWCONF_FRAC", 0.80))
+        _phantom_min_ns = float(getattr(settings, "WHISPER_PHANTOM_MIN_NO_SPEECH", 0.50))
+        _script_on = bool(getattr(settings, "WHISPER_SCRIPT_FILTER", True))
+        try:
+            from backend.services.transcript_dedup import is_low_confidence_phantom as _phantom
+        except Exception:
+            _phantom = None
         for entry in segments:
             text = entry.get('text') or ''
+            ns = float(entry.get('no_speech_prob', 0.0) or 0.0)
+            words = entry.get('words') or []
             if _is_boilerplate_hallucination(text):
                 entry['is_hallucination'] = True
-            if entry.get('no_speech_prob', 0.0) > 0.7 and text:
+            elif ns > 0.7 and text:
+                entry['is_hallucination'] = True
+            elif text and _script_on and _wrong_script_for_language(text, language):
+                # Long pure-Latin prose forced onto a pinned CJK job is a
+                # phantom ("See you next time." over a JA musical outro).
+                entry['is_hallucination'] = True
+            elif (text and words and _phantom_on and _phantom is not None
+                  and _phantom(words, ns, max_avg_conf=_phantom_max_avg,
+                               min_lowconf_frac=_phantom_min_frac,
+                               min_no_speech=_phantom_min_ns)):
+                # Short low-confidence cues invented over silence/music that
+                # slip past the no_speech clamp (schema-flexible; no-op when
+                # the provider returns no per-word confidence).
                 entry['is_hallucination'] = True
 
         try:

@@ -338,7 +338,34 @@ async def translate_via_llm(
         except Exception as _g_e:
             logger.debug("auto-glossary skipped: %s", _g_e)
 
-    async def _call(batch) -> Optional[list[str]]:
+    # Surrounding SOURCE lines shown to the model for continuity — reference
+    # only, never re-translated or emitted. Kept short so local models at
+    # ctx=2048 don't truncate the batch itself.
+    _ctx_on = bool(getattr(settings, "TRANSLATION_LLM_CONTEXT", True))
+    _ctx_before_n = max(0, int(getattr(settings, "TRANSLATION_LLM_CONTEXT_BEFORE", 2)))
+    _ctx_after_n = max(0, int(getattr(settings, "TRANSLATION_LLM_CONTEXT_AFTER", 1)))
+
+    def _context_block(before, after) -> str:
+        if not _ctx_on:
+            return ""
+        b = [(_txt(s) or "").strip() for s in (before or [])]
+        a = [(_txt(s) or "").strip() for s in (after or [])]
+        b = [x for x in b if x]
+        a = [x for x in a if x]
+        if not b and not a:
+            return ""
+        parts = [
+            "Surrounding dialogue for CONTINUITY (pronouns, gender, formality, "
+            "tense). Reference only — do NOT translate or output these:\n"
+        ]
+        for x in b:
+            parts.append(f"(before) {x}\n")
+        for x in a:
+            parts.append(f"(after) {x}\n")
+        parts.append("\n")
+        return "".join(parts)
+
+    async def _call(batch, ctx_before=None, ctx_after=None) -> Optional[list[str]]:
         lines = [_txt(s) for s in batch]
         numbered = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(lines))
         prompt = (
@@ -362,6 +389,7 @@ async def translate_via_llm(
             f"- Output ONLY a JSON array of exactly {len(lines)} {tgt_name} strings, in order. "
             "No commentary, no numbering.\n\n"
             f"{_auto_terms}"
+            f"{_context_block(ctx_before, ctx_after)}"
             f"Lines:\n{numbered}"
         )
         try:
@@ -429,10 +457,16 @@ async def translate_via_llm(
             except Exception:
                 pass
 
+    def _ctx_for(start, blen):
+        cb = segments[max(0, start - _ctx_before_n): start] if _ctx_before_n else []
+        ca = segments[start + blen: start + blen + _ctx_after_n] if _ctx_after_n else []
+        return cb, ca
+
     # Non-first batch: direct call, else split-and-recurse (never bails).
     async def _process_one(start) -> list:
         batch = segments[start: start + BATCH]
-        direct = await _call(batch)
+        cb, ca = _ctx_for(start, len(batch))
+        direct = await _call(batch, cb, ca)
         translations = direct if direct is not None else await _translate_batch(batch)
         return _build_segs(batch, translations)
 
@@ -443,7 +477,8 @@ async def translate_via_llm(
     #    the sequential path; also gates the parallel fan-out below.) ──
     b0 = batch_starts[0]
     batch0 = segments[b0: b0 + BATCH]
-    direct0 = await _call(batch0)
+    _cb0, _ca0 = _ctx_for(b0, len(batch0))
+    direct0 = await _call(batch0, _cb0, _ca0)
     if direct0 is None:
         logger.info("LLM translate: editorial model returned no usable output "
                     "— deferring to other translation engines.")

@@ -398,6 +398,12 @@ class Settings(BaseSettings):
     # non-English (multilingual accuracy), unless the user explicitly
     # pinned a model in Settings (WHISPER_MODEL_USER_SET).
     WHISPER_REMOTE_MODEL: str = ""
+    # Prefer accuracy over speed on the paired Companion: request FULL large-v3
+    # (not the pruned large-v3-turbo) even for English/auto jobs. The Companion
+    # is typically a strong desktop GPU (4070/4090) that can absorb the ~2-3×
+    # slower decode for a few % more words — the Netflix-quality trade. Set
+    # False to keep turbo on English. Ignored when WHISPER_REMOTE_MODEL is set.
+    WHISPER_REMOTE_PREFER_ACCURACY: bool = True
     # When True, AI runs ONLY on remote GPUs (a paired Companion): Ollama never
     # falls back to the local-GPU daemon (the weak on-server card), and a flaky
     # remote-Whisper health probe won't silently route transcription to it. If
@@ -1037,6 +1043,14 @@ class Settings(BaseSettings):
     # shorter JSON array faster + more reliably (less timeout risk). 0 = auto
     # (8 for Ollama, 18 for cloud).
     TRANSLATION_LLM_BATCH: int = 0
+    # Show the LLM translator a few surrounding SOURCE lines (reference only,
+    # not re-translated) so pronouns, gender, honorific-driven formality and
+    # tense stay consistent across batch boundaries — the biggest lever for
+    # natural-not-literal output. Kept small on purpose: local Ollama models
+    # often run at ctx=2048, so a large window risks prompt truncation.
+    TRANSLATION_LLM_CONTEXT: bool = True
+    TRANSLATION_LLM_CONTEXT_BEFORE: int = 2   # preceding source lines shown
+    TRANSLATION_LLM_CONTEXT_AFTER: int = 1    # following source lines shown
     # After the offline NMT (FuguMT/NLLB) runs, any cue it left in the source
     # language is re-translated ONE AT A TIME with a plain-text LLM call (robust
     # where the batched JSON path fails on small local models). Cap the number of
