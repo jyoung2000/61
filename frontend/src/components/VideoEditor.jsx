@@ -1797,7 +1797,16 @@ export default function VideoEditor({
           if (cancelled) break;
           const time = clipStart + ((i + 0.5) / NUM) * clipDur;
           tv.currentTime = Math.min(time, (tv.duration || time) - 0.05);
-          await new Promise(r => { tv.onseeked = r; setTimeout(r, 3000); });
+          // Prefer the real `seeked` event; the timeout is only a last-resort
+          // fallback. Deep seeks into a long (2h) video routinely take longer
+          // than 3s, so a short fallback fired first and captured a blank /
+          // previous frame — give it room so we grab the actual frame.
+          await new Promise((r) => {
+            let done = false;
+            const finish = () => { if (!done) { done = true; r(); } };
+            tv.onseeked = finish;
+            setTimeout(finish, 7000);
+          });
           if (cancelled) break;
           try {
             const c = document.createElement('canvas');
