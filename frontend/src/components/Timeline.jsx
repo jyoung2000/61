@@ -105,7 +105,7 @@ function findSnapTarget(candidateTime, items, excludeItemId, playhead, duration,
   return null;
 }
 
-export default function Timeline({ compact = false, onSeek, onItemSelect, onSubtitleVisibilityChange }) {
+export default function Timeline({ compact = false, hideToolbar = false, onSeek, onItemSelect, onSubtitleVisibilityChange }) {
   const canvasRef = useRef(null);
   const containerRef = useRef(null);
 
@@ -1516,6 +1516,7 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
   return (
     <div ref={containerRef} className="ve-multi-timeline" style={{ position: 'relative', height: '100%' }}>
       {/* Toolbar row */}
+      {!hideToolbar && (
       <div className="ve-multi-timeline__toolbar">
         <button
           className="ve-btn"
@@ -1595,6 +1596,7 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
           )}
         </div>
       </div>
+      )}
 
       {/* Canvas area with track header overlay */}
       <div style={{ position: 'relative' }}>

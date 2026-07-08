@@ -1,0 +1,892 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   ClipAI Editor — premium NLE editor theme
+   1:1 port of the ClipAI Editor design mockup.
+
+   This file defines the design tokens, animations, and reusable control
+   primitives (pills, sliders, switches, toggle-buttons, icon-buttons) used by
+   the redesigned VideoEditor and its sub-panels. Everything is scoped under
+   `.cae` so the editor renders the mockup's dark, indigo-accented look
+   regardless of the host app's light/dark theme.
+
+   Hover/active/focus feedback lives here (not inline) because React cannot
+   express :hover / :active inline — this is what makes the UI feel snappy.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.cae {
+  /* ── Surfaces ── */
+  --cae-bg: #0F0F11;          /* app background */
+  --cae-panel: #17171A;       /* top bar, editor pane */
+  --cae-surface: #1D1D21;     /* inputs, pills, chips */
+  --cae-surface-2: #232327;   /* button hover */
+  --cae-surface-3: #26262C;   /* active tab, stepper hover */
+  --cae-lane: #191920;        /* timeline lanes */
+  --cae-lane-sel: #1D1D28;    /* selected track lane */
+  --cae-deep: #141417;        /* export notes, deep wells */
+
+  /* ── Text ── */
+  --cae-text: #ECECEF;
+  --cae-text-2: #9A9AA3;
+  --cae-text-3: #5E5E66;
+  --cae-text-4: #4A4A52;
+  --cae-placeholder: #6E6E76;
+
+  /* ── Accent (indigo) ── */
+  --cae-accent: #6E7BFF;
+  --cae-accent-hover: #7F8BFF;
+  --cae-accent-soft: rgba(110, 123, 255, 0.16);
+  --cae-accent-softer: rgba(110, 123, 255, 0.12);
+  --cae-accent-border: rgba(110, 123, 255, 0.55);
+  --cae-accent-text: #C3CAFF;
+  --cae-accent-text-2: #9DA7FF;
+
+  /* ── Signals ── */
+  --cae-playhead: #FF5C5C;
+  --cae-playhead-2: #F05A5A;
+  --cae-marker: #FFC53D;
+  --cae-amber: #FFB340;
+  --cae-green: #34C77B;
+  --cae-green-2: #4DD0A6;
+  --cae-danger: #FF8A8A;
+  --cae-danger-border: rgba(255, 110, 110, 0.3);
+
+  /* ── Borders ── */
+  --cae-border: rgba(255, 255, 255, 0.08);
+  --cae-border-soft: rgba(255, 255, 255, 0.06);
+  --cae-border-strong: rgba(255, 255, 255, 0.12);
+  --cae-border-hair: rgba(255, 255, 255, 0.10);
+
+  /* ── Motion ── */
+  --cae-trans: all 160ms cubic-bezier(0.25, 1, 0.5, 1);
+  --cae-trans-fast: all 120ms cubic-bezier(0.25, 1, 0.5, 1);
+  --cae-ease-snap: cubic-bezier(0.34, 1.4, 0.64, 1);
+
+  /* ── Type ── */
+  --cae-font: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --cae-mono: ui-monospace, 'SF Mono', Menlo, monospace;
+
+  color: var(--cae-text);
+  font-family: var(--cae-font);
+  -webkit-font-smoothing: antialiased;
+  color-scheme: dark;
+
+  /* ── App-token overrides ──────────────────────────────────────────────
+     Re-map the host app's design tokens to the mockup palette *within the
+     editor only*. This makes every embedded panel that references
+     --text-*, --bg-*, --accent-*, --border, --ve-* (PropertiesPanel,
+     ClipSettingsPanel, Timeline, ExportDialog, EffectsPanel, …) adopt the
+     ClipAI dark/indigo look with zero changes to those components. */
+  --bg-base: var(--cae-bg);
+  --bg-panel: var(--cae-panel);
+  --bg-elevated: var(--cae-surface);
+  --bg-overlay: rgba(0, 0, 0, 0.55);
+  --text-primary: var(--cae-text);
+  --text-secondary: var(--cae-text-2);
+  --text-muted: var(--cae-text-3);
+  --border: var(--cae-border);
+  --border-dim: var(--cae-border-soft);
+  --accent: var(--cae-accent);
+  --accent-cyan: var(--cae-accent);
+  --accent-cyan-dim: var(--cae-accent-softer);
+  --accent-amber: var(--cae-amber);
+  --accent-amber-dim: rgba(255, 179, 64, 0.14);
+  --danger: #EF5B5B;
+
+  /* VideoEditor (ve-*) chrome tokens */
+  --ve-chrome-bg: var(--cae-panel);
+  --ve-chrome-border: var(--cae-border);
+  --ve-accent: var(--cae-accent);
+  --ve-accent-hover: var(--cae-accent-hover);
+  --ve-trim-color: var(--cae-accent);
+  --ve-trim-dimmed: rgba(0, 0, 0, 0.55);
+  --ve-text: var(--cae-text);
+  --ve-text-muted: var(--cae-text-2);
+  --ve-surface: var(--cae-surface);
+  --ve-btn-hover: var(--cae-surface-2);
+  --ve-btn-active: var(--cae-surface-3);
+  --ve-track-bg: var(--cae-lane);
+  --ve-track-border: var(--cae-border);
+  --ve-kbd-bg: var(--cae-surface);
+  --ve-kbd-border: var(--cae-border-strong);
+  --ve-slider-track: #2A2A30;
+  --ve-dropdown-bg: #1B1B1F;
+  --ve-dropdown-shadow: 0 12px 40px rgba(0, 0, 0, 0.6);
+}
+
+/* Force the editor's own background to the mockup base regardless of host
+   light/dark theme, and neutralize the legacy .ve-container chrome so the
+   new .cae layout owns the look. */
+.cae.ve-container {
+  background: var(--cae-bg);
+  border-radius: 0;
+  color: var(--cae-text);
+}
+[data-theme="dark"] .cae.ve-container,
+[data-theme="light"] .cae.ve-container { background: var(--cae-bg); }
+
+.cae *,
+.cae *::before,
+.cae *::after { box-sizing: border-box; }
+
+.cae ::selection { background: rgba(110, 123, 255, 0.4); }
+.cae input::placeholder { color: var(--cae-placeholder); }
+.cae button,
+.cae input,
+.cae select { font-family: inherit; }
+
+/* ── Animations (mirrors mockup helmet) ─────────────────────────────────── */
+@keyframes caeShimmer { 0% { background-position: -500px 0; } 100% { background-position: 500px 0; } }
+@keyframes caeFade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes caeSnap { 0% { opacity: 1; } 100% { opacity: 0; } }
+@keyframes caePop { 0% { opacity: 0; transform: translateY(8px) scale(0.98); } 100% { opacity: 1; transform: translateY(0) scale(1); } }
+@keyframes caePopC { 0% { opacity: 0; transform: translateX(-50%) translateY(8px) scale(0.98); } 100% { opacity: 1; transform: translateX(-50%) translateY(0) scale(1); } }
+@keyframes caeToast { 0% { opacity: 0; transform: translateX(-50%) translateY(10px); } 100% { opacity: 1; transform: translateX(-50%) translateY(0); } }
+@keyframes caeSpin { to { transform: rotate(360deg); } }
+
+@media (prefers-reduced-motion: reduce) {
+  .cae *, .cae *::before, .cae *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* ══ Reusable primitives ═══════════════════════════════════════════════════ */
+
+/* ── Pills (segmented option buttons) ── */
+.cae-pill,
+.cae-pill-sm {
+  border-radius: 8px;
+  font-weight: 600;
+  cursor: pointer;
+  border: 1px solid var(--cae-border);
+  background: var(--cae-surface);
+  color: var(--cae-text-2);
+  transition: var(--cae-trans);
+  white-space: nowrap;
+  line-height: 1.2;
+}
+.cae-pill { padding: 6px 12px; font-size: 12.5px; }
+.cae-pill-sm { padding: 3px 9px; font-size: 10.5px; }
+.cae-pill:hover,
+.cae-pill-sm:hover { color: var(--cae-text); border-color: var(--cae-border-strong); }
+.cae-pill:active,
+.cae-pill-sm:active { transform: scale(0.96); }
+.cae-pill.is-on,
+.cae-pill-sm.is-on {
+  background: var(--cae-accent-soft);
+  border-color: var(--cae-accent-border);
+  color: var(--cae-text);
+}
+.cae-pill:focus-visible,
+.cae-pill-sm:focus-visible {
+  outline: 2px solid var(--cae-accent);
+  outline-offset: 2px;
+}
+
+/* ── Icon / ghost button ── */
+.cae-iconbtn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  color: var(--cae-text-2);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: var(--cae-trans-fast);
+  line-height: 1;
+  padding: 0;
+}
+.cae-iconbtn:hover { background: var(--cae-surface-2); color: var(--cae-text); }
+.cae-iconbtn:active { transform: scale(0.92); }
+.cae-iconbtn:focus-visible { outline: 2px solid var(--cae-accent); outline-offset: 2px; }
+
+/* ── Toggle button (Snap ON / Ripple ON / Editor / Media …) ── */
+.cae-tbtn {
+  padding: 4px 10px;
+  border-radius: 8px;
+  font-size: 10.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+  border: 1px solid var(--cae-border);
+  background: var(--cae-surface);
+  color: var(--cae-text-2);
+  transition: var(--cae-trans);
+}
+.cae-tbtn:hover { color: var(--cae-text); border-color: var(--cae-border-strong); }
+.cae-tbtn:active { transform: scale(0.96); }
+.cae-tbtn.is-on {
+  background: var(--cae-accent-soft);
+  border-color: var(--cae-accent-border);
+  color: var(--cae-text);
+}
+.cae-tbtn:focus-visible { outline: 2px solid var(--cae-accent); outline-offset: 2px; }
+
+/* ── Primary / secondary action buttons ── */
+.cae-btn-primary {
+  background: var(--cae-accent);
+  color: #0F0F11;
+  font-weight: 700;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: var(--cae-trans-fast);
+}
+.cae-btn-primary:hover { background: var(--cae-accent-hover); }
+.cae-btn-primary:active { transform: scale(0.98); }
+.cae-btn-primary:focus-visible { outline: 2px solid var(--cae-accent-hover); outline-offset: 2px; }
+
+.cae-btn-secondary {
+  background: transparent;
+  color: var(--cae-text-2);
+  font-weight: 600;
+  border: 1px solid var(--cae-border-hair);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: var(--cae-trans-fast);
+}
+.cae-btn-secondary:hover { color: var(--cae-text); border-color: var(--cae-border-strong); }
+.cae-btn-secondary:active { transform: scale(0.98); }
+
+.cae-btn-danger {
+  background: transparent;
+  color: var(--cae-danger);
+  font-weight: 600;
+  border: 1px solid var(--cae-danger-border);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: var(--cae-trans-fast);
+}
+.cae-btn-danger:hover { background: rgba(255, 110, 110, 0.08); }
+.cae-btn-danger:active { transform: scale(0.98); }
+
+/* ── Round close button ── */
+.cae-close {
+  width: 24px; height: 24px;
+  border: none;
+  background: var(--cae-surface-2);
+  color: var(--cae-text-2);
+  border-radius: 50%;
+  cursor: pointer;
+  font-size: 10px;
+  flex: none;
+  display: flex; align-items: center; justify-content: center;
+  transition: var(--cae-trans-fast);
+}
+.cae-close:hover { color: var(--cae-text); background: var(--cae-surface-3); }
+.cae-close:active { transform: scale(0.9); }
+
+/* ── Text input ── */
+.cae-input {
+  width: 100%;
+  background: var(--cae-surface);
+  border: 1px solid var(--cae-border);
+  border-radius: 8px;
+  padding: 6px 10px;
+  font-size: 12px;
+  color: var(--cae-text);
+  outline: none;
+  transition: border-color 120ms;
+}
+.cae-input:focus { border-color: var(--cae-accent); }
+
+/* ── Slider (pointer-driven; fill + knob positioned inline) ── */
+.cae-slider {
+  position: relative;
+  display: flex;
+  align-items: center;
+  cursor: pointer;
+  touch-action: none;
+  user-select: none;
+}
+.cae-slider__rail {
+  height: 4px;
+  width: 100%;
+  border-radius: 2px;
+  background: #2A2A30;
+}
+.cae-slider__fill {
+  position: absolute;
+  left: 0;
+  top: 50%;
+  height: 4px;
+  margin-top: -2px;
+  border-radius: 2px;
+  background: var(--cae-accent);
+  pointer-events: none;
+}
+.cae-slider__knob {
+  position: absolute;
+  top: 50%;
+  border-radius: 50%;
+  background: #ECECEF;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
+  pointer-events: none;
+}
+
+/* ── Switch ── */
+.cae-switch {
+  position: relative;
+  width: 40px; height: 24px;
+  border-radius: 12px;
+  border: none;
+  cursor: pointer;
+  background: #2A2A30;
+  transition: background 200ms cubic-bezier(0.25, 1, 0.5, 1);
+  padding: 0;
+  flex: none;
+}
+.cae-switch.is-on { background: var(--cae-accent); }
+.cae-switch:focus-visible { outline: 2px solid var(--cae-accent); outline-offset: 2px; }
+.cae-switch__knob {
+  position: absolute;
+  top: 2px; left: 2px;
+  width: 20px; height: 20px;
+  border-radius: 50%;
+  background: #FFFFFF;
+  transform: translateX(0);
+  transition: transform 260ms var(--cae-ease-snap);
+  display: block;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+}
+.cae-switch.is-on .cae-switch__knob { transform: translateX(16px); }
+
+/* ── Color swatch ── */
+.cae-swatch {
+  width: 26px; height: 26px;
+  border-radius: 50%;
+  cursor: pointer;
+  padding: 0;
+  border: 2px solid rgba(255, 255, 255, 0.15);
+  transition: var(--cae-trans);
+}
+.cae-swatch:hover { transform: scale(1.06); }
+.cae-swatch.is-on {
+  border-color: #ECECEF;
+  box-shadow: 0 0 0 3px rgba(110, 123, 255, 0.35);
+}
+
+/* ── Stepper (− value + for cue start/end) ── */
+.cae-stepper {
+  display: flex;
+  align-items: stretch;
+  border: 1px solid var(--cae-border);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--cae-surface);
+}
+.cae-stepper__btn {
+  width: 26px;
+  border: none;
+  background: transparent;
+  color: var(--cae-text-2);
+  cursor: pointer;
+  font-size: 13px;
+  transition: var(--cae-trans-fast);
+}
+.cae-stepper__btn:hover { background: var(--cae-surface-3); color: var(--cae-text); }
+.cae-stepper__val {
+  flex: 1;
+  display: grid;
+  place-items: center;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  border-left: 1px solid var(--cae-border);
+  border-right: 1px solid var(--cae-border);
+  padding: 6px 0;
+}
+
+/* ── Section header (collapsible) ── */
+.cae-section { border-bottom: 1px solid var(--cae-border-soft); }
+.cae-section__head {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: none;
+  border: none;
+  color: var(--cae-text);
+  font-size: 13px;
+  font-weight: 600;
+  padding: 10px 0;
+  cursor: pointer;
+  text-align: left;
+}
+.cae-section__chev {
+  display: inline-block;
+  transition: transform 200ms cubic-bezier(0.25, 1, 0.5, 1);
+  color: var(--cae-text-3);
+  font-size: 15px;
+  line-height: 1;
+}
+.cae-section__chev.is-open { transform: rotate(90deg); }
+
+/* ── Tabs ── */
+.cae-tabs {
+  display: flex;
+  gap: 2px;
+  background: var(--cae-surface);
+  border-radius: 9px;
+  padding: 3px;
+}
+.cae-tab {
+  flex: 1;
+  padding: 6px 0;
+  border-radius: 7px;
+  font-size: 11px;
+  font-weight: 600;
+  border: none;
+  background: transparent;
+  color: var(--cae-text-2);
+  cursor: pointer;
+  transition: var(--cae-trans);
+  white-space: nowrap;
+}
+.cae-tab:hover { color: var(--cae-text); }
+.cae-tab:active { transform: scale(0.97); }
+.cae-tab.is-on {
+  background: var(--cae-surface-3);
+  color: var(--cae-text);
+  box-shadow: inset 0 0 0 1px var(--cae-border);
+}
+
+/* ── "This clip" pill badge ── */
+.cae-badge {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--cae-accent-text-2);
+  background: var(--cae-accent-softer);
+  padding: 2px 7px;
+  border-radius: 20px;
+  white-space: nowrap;
+}
+
+/* ── Control label row ── */
+.cae-ctl-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 7px;
+}
+.cae-ctl-label__name { font-size: 12px; color: var(--cae-text-2); }
+.cae-ctl-label__val { font-size: 12px; color: var(--cae-text); font-variant-numeric: tabular-nums; }
+
+/* ── Eyebrow (SUBTITLE CUE, REFRAME SEGMENT …) ── */
+.cae-eyebrow {
+  font-size: 10.5px;
+  font-weight: 700;
+  color: var(--cae-text-3);
+  letter-spacing: 0.05em;
+}
+
+/* ── Scrollbars ── */
+.cae ::-webkit-scrollbar { width: 9px; height: 9px; }
+.cae ::-webkit-scrollbar-track { background: transparent; }
+.cae ::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: 5px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+.cae ::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.2); background-clip: padding-box; }
+
+/* ══ Layout regions (redesigned VideoEditor shell) ═════════════════════════ */
+
+/* Container becomes a flex column that owns the mockup look. */
+.cae.ve-container {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+.cae.ve-container--compact { display: block; }
+
+/* ── Top bar ── */
+.cae-topbar {
+  height: 40px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--cae-border);
+  background: var(--cae-panel);
+}
+.cae-topbar__title {
+  font-size: 13px;
+  font-weight: 600;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  max-width: 40vw;
+}
+.cae-kbdbtn {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--cae-text-2);
+  background: var(--cae-surface);
+  border: 1px solid var(--cae-border);
+  border-radius: 7px;
+  padding: 4px 9px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: var(--cae-trans-fast);
+}
+.cae-kbdbtn:hover { color: var(--cae-text); border-color: var(--cae-border-strong); }
+.cae-kbdbtn:active { transform: scale(0.96); }
+
+/* ── Main two-column row ── */
+.cae-main {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+}
+.cae-main--fs { display: block; }
+.cae-stage-col {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow-y: auto;
+  background: var(--cae-bg);
+}
+
+/* ── Row spacing for the existing blocks now living in the stage column ── */
+.cae-stage-col > .ve-viewport { flex: 0 0 auto; }
+
+/* ── Tools bar ── */
+.cae-tools {
+  flex: none;
+  min-height: 34px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 16px;
+  border-top: 1px solid var(--cae-border-soft);
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+.cae-tools__div { width: 1px; height: 14px; background: var(--cae-border); flex: none; }
+.cae-tools__text {
+  border: none;
+  background: transparent;
+  color: var(--cae-text-2);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 600;
+  border-radius: 5px;
+  padding: 3px 6px;
+  white-space: nowrap;
+  transition: var(--cae-trans-fast);
+}
+.cae-tools__text:hover { background: var(--cae-surface-2); color: var(--cae-text); }
+.cae-tools__text:active { transform: scale(0.96); }
+
+.cae-selchip {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  background: var(--cae-accent-softer);
+  border: 1px solid var(--cae-accent-border);
+  border-radius: 7px;
+  padding: 3px 9px;
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--cae-accent-text);
+  white-space: nowrap;
+  max-width: 300px;
+  overflow: hidden;
+}
+.cae-selchip button {
+  border: none;
+  background: transparent;
+  color: var(--cae-accent-text);
+  cursor: pointer;
+  font-size: 10px;
+  padding: 0;
+  flex: none;
+}
+.cae-selchip button:active { transform: scale(0.9); }
+
+.cae-addtrack-menu {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 4px);
+  z-index: 30;
+  background: #1B1B1F;
+  border: 1px solid var(--cae-border-strong);
+  border-radius: 9px;
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 130px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.6);
+}
+.cae-addtrack-menu button {
+  text-align: left;
+  border: none;
+  background: transparent;
+  color: var(--cae-text-2);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: var(--cae-trans-fast);
+}
+.cae-addtrack-menu button:hover { background: var(--cae-surface-2); color: var(--cae-text); }
+
+/* ── Timeline wrap ── */
+.cae-timeline-wrap {
+  flex: none;
+  padding: 4px 12px 8px;
+  border-top: 1px solid var(--cae-border-soft);
+}
+
+/* ── Shortcuts hint ── */
+.cae-hints {
+  flex: none;
+  min-height: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 3px 8px 6px;
+  font-size: 9.5px;
+  color: var(--cae-text-4);
+  white-space: nowrap;
+  overflow-x: auto;
+  flex-wrap: wrap;
+}
+.cae-hints b { color: var(--cae-text-3); font-weight: 700; }
+
+/* ── Editor pane ── */
+.cae-editor-pane {
+  width: clamp(260px, 27vw, 320px);
+  flex: none;
+  border-left: 1px solid var(--cae-border);
+  background: var(--cae-panel);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.cae-pane__head {
+  padding: 10px 14px 8px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+}
+.cae-pane__search { padding: 0 14px 8px; flex: none; }
+.cae-pane__tabs { padding: 0 14px 8px; flex: none; }
+.cae-pane__body { flex: 1; overflow-y: auto; min-height: 0; padding: 0 14px 16px; }
+.cae-pane__subhead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--cae-text-3);
+  padding: 8px 0 6px;
+  border-top: 1px solid var(--cae-border-soft);
+}
+
+/* Editor pane content that comes from reused panels (PropertiesPanel,
+   MediaUploader, EffectsPanel, TransitionPicker) — strip their own outer
+   chrome so they sit cleanly inside the pane. */
+.cae-pane__body > .properties-panel,
+.cae-pane__body > .media-uploader { background: transparent; border: none; }
+
+/* ── Mobile: editor pane as a bottom sheet ── */
+@media (max-width: 767px) {
+  .cae-editor-pane {
+    position: fixed;
+    left: 0; right: 0; bottom: 0;
+    top: auto;
+    width: 100%;
+    height: 82vh;
+    border-left: none;
+    border-top: 1px solid var(--cae-border-strong);
+    border-radius: 16px 16px 0 0;
+    z-index: 60;
+    box-shadow: 0 -12px 40px rgba(0, 0, 0, 0.55);
+    animation: caePop 300ms var(--cae-ease-snap);
+  }
+}
+
+/* ── Mobile floating dock ── */
+.cae-dock {
+  position: fixed;
+  left: 50%;
+  bottom: calc(14px + env(safe-area-inset-bottom));
+  transform: translateX(-50%);
+  display: flex;
+  gap: 4px;
+  background: rgba(23, 23, 26, 0.94);
+  border: 1px solid var(--cae-border-hair);
+  border-radius: 28px;
+  padding: 7px;
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  box-shadow: 0 10px 34px rgba(0, 0, 0, 0.55);
+  z-index: 55;
+}
+.cae-dock__btn {
+  width: 44px; height: 44px;
+  border-radius: 50%;
+  background: transparent;
+  border: none;
+  color: var(--cae-text);
+  cursor: pointer;
+  font-size: 17px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: var(--cae-trans-fast);
+}
+.cae-dock__btn:hover { background: var(--cae-surface-2); }
+.cae-dock__btn:active { transform: scale(0.9); }
+.cae-dock__btn--play { background: #ECECEF; color: #0F0F11; }
+.cae-dock__btn--play:hover { background: #FFFFFF; }
+.cae-dock__btn--export { background: var(--cae-accent); color: #0F0F11; font-weight: 800; }
+.cae-dock__btn--export:hover { background: var(--cae-accent-hover); }
+.cae-dock__pause { display: flex; gap: 3px; }
+.cae-dock__pause i { width: 3px; height: 14px; background: #0F0F11; border-radius: 1px; display: block; }
+.cae-dock__playtri {
+  width: 0; height: 0;
+  border-left: 12px solid #0F0F11;
+  border-top: 8px solid transparent;
+  border-bottom: 8px solid transparent;
+  margin-left: 3px;
+  display: block;
+}
+
+/* ── Toast ── */
+.cae-toast {
+  position: fixed;
+  left: 50%;
+  bottom: 90px;
+  transform: translateX(-50%);
+  background: #232329;
+  border: 1px solid var(--cae-border-strong);
+  color: var(--cae-text);
+  font-size: 12.5px;
+  font-weight: 600;
+  padding: 9px 16px;
+  border-radius: 10px;
+  z-index: 80;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+  animation: caeToast 240ms var(--cae-ease-snap);
+  pointer-events: none;
+}
+
+/* ══ Polish for reused ve-* blocks now living in the ClipAI layout ═════════ */
+
+/* Transport controls bar → mockup transport row */
+.cae .ve-controls {
+  flex: none;
+  border-top: 1px solid var(--cae-border-soft);
+  background: transparent;
+  padding: 4px 16px;
+  gap: 8px;
+}
+.cae .ve-controls .ve-btn {
+  background: transparent;
+  color: var(--cae-text-2);
+  border-radius: 7px;
+  transition: var(--cae-trans-fast);
+}
+.cae .ve-controls .ve-btn:hover { background: var(--cae-surface-2); color: var(--cae-text); }
+.cae .ve-controls .ve-btn--play {
+  background: #ECECEF;
+  color: #0F0F11;
+  width: 30px; height: 30px;
+  border-radius: 50%;
+}
+.cae .ve-controls .ve-btn--play:hover { background: #FFFFFF; }
+.cae .ve-timecode {
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+  color: var(--cae-text);
+  background: transparent;
+}
+
+/* Trim / overview timeline → slim dark lanes */
+.cae .ve-timeline {
+  background: transparent;
+  padding: 4px 16px 2px;
+}
+.cae .ve-timeline__ruler { color: var(--cae-text-3); font-variant-numeric: tabular-nums; }
+.cae .ve-timeline__track,
+.cae .ve-timeline__waveform-track {
+  background: var(--cae-lane);
+  border: 1px solid var(--cae-border-soft);
+  border-radius: 6px;
+}
+.cae .ve-timeline__track-label {
+  color: var(--cae-text-3);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+.cae .ve-timeline__playhead { background: var(--cae-playhead); }
+.cae .ve-trim-handle__grip span { background: var(--cae-accent); }
+
+/* Speed dropdown / menus → dark surface */
+.cae .ve-speed__dropdown {
+  background: #1B1B1F;
+  border: 1px solid var(--cae-border-strong);
+  border-radius: 9px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.6);
+}
+.cae .ve-speed__option:hover { background: var(--cae-surface-2); }
+
+/* Aspect-ratio picker row → tighten to mockup RATIO row */
+.cae .ve-aspect-badge {
+  background: rgba(6, 6, 9, 0.7);
+  color: var(--cae-text);
+  border: 1px solid var(--cae-border);
+}
+
+/* Segment chips + inspector → mockup surfaces */
+.cae .ve-segment-chip {
+  background: var(--cae-surface);
+  border: 1px solid var(--cae-border);
+  border-radius: 6px;
+  color: var(--cae-text-2);
+}
+.cae .ve-segment-inspector {
+  background: var(--cae-surface);
+  border: 1px solid var(--cae-border);
+  border-radius: 10px;
+}
+
+/* Generic ve-btn inside the editor → cae look */
+.cae .ve-btn {
+  color: var(--cae-text-2);
+  border-radius: 7px;
+}
+.cae .ve-btn--active-snap {
+  background: var(--cae-accent-soft);
+  border-color: var(--cae-accent-border);
+  color: var(--cae-text);
+}
+
+/* Multi-track timeline chrome (Timeline.jsx) → dark lanes + heads */
+.cae .ve-multi-timeline__track-header { color: var(--cae-text-2); }
+.cae .ve-multi-timeline__add-track-dropdown,
+.cae .ve-multi-timeline__context-menu {
+  background: #1B1B1F;
+  border: 1px solid var(--cae-border-strong);
+  border-radius: 9px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.6);
+}
+
+/* Encoding overlay */
+.cae .ve-multitrack__encoding-overlay {
+  background: rgba(15, 15, 17, 0.72);
+  backdrop-filter: blur(3px);
+  border-radius: 8px;
+}

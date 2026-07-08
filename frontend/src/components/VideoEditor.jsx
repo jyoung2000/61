@@ -16,9 +16,11 @@ import EffectsPanel from './EffectsPanel';
 import TransitionPicker from './TransitionPicker';
 import ExportDialog from './ExportDialog';
 import InteractiveOverlay from './InteractiveOverlay';
+import EditorSettings from './EditorSettings';
 import { hexToRgbString } from '../utils/colorUtils';
 import { runEditorQA, autoFixTrackCompatibility } from '../utils/editorQA';
 import './VideoEditor.css';
+import './ClipAIEditor.css';
 
 // ── Segment Color Palette ────────────────────────────────────────────────────
 const SEGMENT_COLORS = [
@@ -255,10 +257,68 @@ export default function VideoEditor({
     return w >= 768;
   });
   const [showMediaLibrary, setShowMediaLibrary] = useState(false);
-  const [showProperties, setShowProperties] = useState(false);
+  const [showProperties, setShowProperties] = useState(() => {
+    // Editor pane open by default on desktop (mockup default), collapsed on
+    // small screens where it becomes the bottom sheet.
+    return typeof window !== 'undefined' ? window.innerWidth >= 1024 : true;
+  });
   const [showExportDialog, setShowExportDialog] = useState(false);
   const [showEffectsPanel, setShowEffectsPanel] = useState(false);
   const [showTransitions, setShowTransitions] = useState(false);
+  // ── Redesigned editor pane / chrome state ──
+  const [editorTab, setEditorTab] = useState('props'); // 'props'|'subtitles'|'highlights'|'layout'|'media'
+  const [settingsSearch, setSettingsSearch] = useState('');
+  const [rippleEnabled, setRippleEnabled] = useState(false);
+  const [collapsedSections, setCollapsedSections] = useState({});
+  const [toastMsg, setToastMsg] = useState(null);
+  const toastTimerRef = useRef(null);
+  const [mobileSheet, setMobileSheet] = useState('closed'); // 'closed'|'half'|'full'
+  const [showAddTrackMenu, setShowAddTrackMenu] = useState(false);
+  const showToast = useCallback((msg) => {
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    setToastMsg(msg);
+    toastTimerRef.current = setTimeout(() => setToastMsg(null), 2200);
+  }, []);
+  useEffect(() => () => { if (toastTimerRef.current) clearTimeout(toastTimerRef.current); }, []);
+  const doUndo = useCallback(() => { try { useTimelineStore.temporal.getState().undo(); showToast('Undo'); } catch { /* noop */ } }, [showToast]);
+  const doRedo = useCallback(() => { try { useTimelineStore.temporal.getState().redo(); showToast('Redo'); } catch { /* noop */ } }, [showToast]);
+  const setSetting = useCallback((key, val) => {
+    if (onSettingsChange) onSettingsChange({ ...(settings || {}), [key]: val });
+  }, [settings, onSettingsChange]);
+  const setSettingsBulk = useCallback((patch) => {
+    if (onSettingsChange) onSettingsChange({ ...(settings || {}), ...patch });
+  }, [settings, onSettingsChange]);
+  const toggleSection = useCallback((id) => {
+    setCollapsedSections((c) => ({ ...c, [id]: !c[id] }));
+  }, []);
+  // Ripple-aware delete of the selected timeline item: when ripple is ON,
+  // later items on the same track shift left to close the gap.
+  const rippleDeleteSelected = useCallback(() => {
+    const st = useTimelineStore.getState();
+    const id = st.selectedItemId;
+    if (!id) return;
+    const item = st.items.find((i) => i.id === id);
+    st.removeItem(id);
+    if (rippleEnabled && item) {
+      const dur = (item.end || 0) - (item.start || 0);
+      const later = st.items
+        .filter((i) => i.trackId === item.trackId && i.id !== id && i.start >= item.end - 0.001)
+        .map((i) => i.id);
+      if (later.length && dur > 0) st.moveItems(later, -dur, item.trackId);
+    }
+    showToast(rippleEnabled ? 'Ripple deleted' : 'Removed from timeline');
+  }, [rippleEnabled, showToast]);
+  const splitAtPlayhead = useCallback(() => {
+    const st = useTimelineStore.getState();
+    const at = st.playhead;
+    const it = st.items.find((i) => at > i.start + 0.1 && at < i.end - 0.1 && (i.type === 'video' || i.type === 'audio'));
+    if (it) { splitTimelineItem(it.id, at); showToast('Split at playhead'); }
+    else showToast('Move the playhead over a clip to split');
+  }, [splitTimelineItem, showToast]);
+  const handleFitTimeline = useCallback(() => {
+    setTimelineZoom(1);
+    try { useTimelineStore.getState().setScrollX(0); } catch { /* noop */ }
+  }, [setTimelineZoom]);
   const initFromClip = useTimelineStore((s) => s.initFromClip);
   const setSceneCutsInStore = useTimelineStore((s) => s.setSceneCuts);
   const timelineStoreItems = useTimelineStore((s) => s.items);
@@ -273,6 +333,15 @@ export default function VideoEditor({
   const updateTimelineItem = useTimelineStore((s) => s.updateItem);
   const timelineTracks = useTimelineStore((s) => s.tracks);
   const timelineMediaLibrary = useTimelineStore((s) => s.mediaLibrary);
+  // ── Store hooks for the redesigned tools bar / editor pane ──
+  const activeTool = useTimelineStore((s) => s.activeTool);
+  const setActiveTool = useTimelineStore((s) => s.setActiveTool);
+  const timelineZoom = useTimelineStore((s) => s.zoom);
+  const setTimelineZoom = useTimelineStore((s) => s.setZoom);
+  const snapEnabled = useTimelineStore((s) => s.snapEnabled);
+  const toggleSnap = useTimelineStore((s) => s.toggleSnap);
+  const addTrackToStore = useTimelineStore((s) => s.addTrack);
+  const splitTimelineItem = useTimelineStore((s) => s.splitItem);
   const { recovered } = useTimelinePersistence(jobId, clipId);
   const encoding = useEncodingManager();
   const isEncoding = useMemo(() => {
@@ -2864,19 +2933,43 @@ export default function VideoEditor({
   return (
     <div
       ref={containerRef}
-      className={containerClass}
+      className={`cae ${containerClass}`}
+      data-cae-editor
     >
-      {/* ── Header ── */}
-      {(title || onClose) && !isFullscreen && (
-        <div className="ve-header">
-          <span className="ve-header__title">{title || 'Clip Preview'}</span>
+      {/* ── Top bar ── */}
+      {!isFullscreen && !compact && (
+        <div className="cae-topbar">
+          <div className="cae-topbar__title" title={title || 'Clip Preview'}>{title || 'Clip Preview'}</div>
+          <div style={{ flex: 1 }} />
+          <button
+            type="button"
+            className="cae-kbdbtn"
+            onClick={() => { setShowProperties(true); showToast('Search settings in the Editor pane'); setTimeout(() => document.querySelector('.cae-pane__search input')?.focus(), 30); }}
+            title="Search settings / commands"
+          >⌘K</button>
+          <button type="button" className="cae-iconbtn" style={{ width: 28, height: 28, fontSize: 15 }} onClick={doUndo} aria-label="Undo" title="Undo (⌘Z)">⟲</button>
+          <button type="button" className="cae-iconbtn" style={{ width: 28, height: 28, fontSize: 15 }} onClick={doRedo} aria-label="Redo" title="Redo (⌘⇧Z)">⟳</button>
+          <button
+            type="button"
+            className={`cae-tbtn${showProperties ? ' is-on' : ''}`}
+            onClick={() => setShowProperties((v) => !v)}
+            title="Toggle editor pane"
+          >Editor</button>
+          <button
+            type="button"
+            className="cae-btn-primary"
+            style={{ fontSize: 12.5, padding: '6px 13px' }}
+            onClick={(e) => { e.stopPropagation(); setShowExportDialog(true); }}
+            title="Export"
+          >Export ▾</button>
           {onClose && (
-            <button className="ve-header__close" onClick={onClose} title="Close">
-              <Icon.Close />
-            </button>
+            <button type="button" className="cae-iconbtn" style={{ width: 28, height: 28 }} onClick={onClose} aria-label="Close" title="Close"><Icon.Close /></button>
           )}
         </div>
       )}
+
+      <div className={`cae-main${isFullscreen ? ' cae-main--fs' : ''}`}>
+      <div className="cae-stage-col">
 
       {/* ── Viewport ── */}
       <div
@@ -3944,143 +4037,217 @@ export default function VideoEditor({
         </div>
       </div>
 
-      {/* ── Multi-Track Editor Toggle ── */}
+      {/* ── Tools bar ── */}
       {!compact && (
-        <div className="ve-multitrack-toggle">
+        <div className="cae-tools" onClick={(e) => e.stopPropagation()}>
           <button
-            className={`ve-multitrack-toggle__btn${showMultiTrack ? ' ve-multitrack-toggle__btn--active' : ''}${isProcessing ? ' ve-multitrack-toggle__btn--disabled' : ''}`}
-            onClick={(e) => {
-              e.stopPropagation();
-              if (isProcessing) return;
-              setShowMultiTrack(v => {
-                if (!v) setShowProperties(true); // auto-show properties when opening
-                return !v;
-              });
+            type="button"
+            className={`cae-tbtn${showMultiTrack ? ' is-on' : ''}`}
+            onClick={() => { if (isProcessing) return; setShowMultiTrack((v) => { if (!v) setShowProperties(true); return !v; }); }}
+            title={isProcessing ? 'Available after analysis completes' : 'Toggle multi-track timeline'}
+          >{showMultiTrack ? '≡ Hide multi-track' : '≡ Show multi-track'}</button>
+          <button
+            type="button"
+            className={`cae-tbtn${editorTab === 'media' && showProperties ? ' is-on' : ''}`}
+            onClick={() => { setEditorTab('media'); setShowProperties(true); }}
+          >Media library</button>
+
+          <span className="cae-tools__div" />
+
+          {[['select', 'Select'], ['razor', 'Razor'], ['text', 'Text'], ['shape', 'Shape']].map(([id, label]) => (
+            <button
+              key={id}
+              type="button"
+              className={`cae-pill-sm${activeTool === id ? ' is-on' : ''}`}
+              onClick={() => { setActiveTool(id); if (id === 'text') showToast('Text tool — click the canvas to add text'); }}
+            >{label}</button>
+          ))}
+
+          <span className="cae-tools__div" />
+
+          <button type="button" className="cae-iconbtn" style={{ width: 20, height: 20, fontSize: 13 }} onClick={() => setTimelineZoom(Math.max(0.1, (timelineZoom || 1) - 0.2))} aria-label="Zoom out">{'−'}</button>
+          <div
+            className="cae-slider"
+            style={{ width: 64, height: 20, flex: 'none' }}
+            onPointerDown={(e) => {
+              const rect = e.currentTarget.getBoundingClientRect();
+              const apply = (x) => { const p = Math.max(0, Math.min(1, (x - rect.left) / rect.width)); setTimelineZoom(0.1 + p * 4.9); };
+              apply(e.clientX);
+              const mv = (ev) => apply(ev.clientX);
+              const up = () => { window.removeEventListener('pointermove', mv); window.removeEventListener('pointerup', up); };
+              window.addEventListener('pointermove', mv); window.addEventListener('pointerup', up);
             }}
-            title={isProcessing ? 'Available after analysis completes' : 'Toggle multi-track timeline editor'}
           >
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <rect x="1" y="3" width="22" height="4" rx="1" />
-              <rect x="1" y="10" width="22" height="4" rx="1" />
-              <rect x="1" y="17" width="22" height="4" rx="1" />
-            </svg>
-            {showMultiTrack ? 'Hide Multi-Track' : 'Multi-Track Editor'}
-          </button>
-          {showMultiTrack && (
-            <>
-              <button
-                className={`ve-multitrack-toggle__btn ve-multitrack-toggle__btn--sub${showMediaLibrary ? ' ve-multitrack-toggle__btn--active' : ''}`}
-                onClick={(e) => { e.stopPropagation(); setShowMediaLibrary(v => !v); }}
-              >
-                {showMediaLibrary ? 'Hide Media' : 'Media Library'}
-              </button>
-              <button
-                className={`ve-multitrack-toggle__btn ve-multitrack-toggle__btn--sub${showProperties ? ' ve-multitrack-toggle__btn--active' : ''}`}
-                onClick={(e) => { e.stopPropagation(); setShowProperties(v => !v); }}
-              >
-                {showProperties ? 'Hide Properties' : 'Properties'}
-              </button>
-            </>
-          )}
+            {(() => { const zp = Math.max(0, Math.min(100, (((timelineZoom || 1) - 0.1) / 4.9) * 100)); return (<>
+              <div className="cae-slider__rail" style={{ height: 3 }} />
+              <div className="cae-slider__fill" style={{ width: zp + '%', height: 3, marginTop: -1.5 }} />
+              <div className="cae-slider__knob" style={{ width: 12, height: 12, marginTop: -6, left: `calc(${zp}% - 6px)` }} />
+            </>); })()}
+          </div>
+          <button type="button" className="cae-iconbtn" style={{ width: 20, height: 20, fontSize: 13 }} onClick={() => setTimelineZoom(Math.min(10, (timelineZoom || 1) + 0.2))} aria-label="Zoom in">+</button>
+          <button type="button" className="cae-tools__text" onClick={handleFitTimeline}>Fit</button>
+          <button type="button" className={`cae-tbtn${snapEnabled ? ' is-on' : ''}`} onClick={toggleSnap} title="Toggle snapping (N)">{snapEnabled ? 'Snap ON' : 'Snap OFF'}</button>
+          <button type="button" className={`cae-tbtn${rippleEnabled ? ' is-on' : ''}`} onClick={() => setRippleEnabled((v) => !v)} title="Ripple edits (delete closes the gap)">{rippleEnabled ? 'Ripple ON' : 'Ripple OFF'}</button>
+
+          <div style={{ flex: 1 }} />
+
+          {storeSelectedItemId && (() => {
+            const it = timelineStoreItems.find((i) => i.id === storeSelectedItemId);
+            if (!it) return null;
+            const label = it.type === 'subtitle'
+              ? `Subtitle · “${(it.subtitleText || '').slice(0, 40)}”`
+              : it.type === 'video' ? `Video clip · ${it.name || it.mediaRef || 'clip'}`
+              : `${String(it.type).charAt(0).toUpperCase() + String(it.type).slice(1)}`;
+            return (
+              <span className="cae-selchip">
+                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{label}</span>
+                <button type="button" aria-label="Clear selection" onClick={() => setSelectedItemId(null)} title="Clear selection (Esc)">{'✕'}</button>
+              </span>
+            );
+          })()}
+
+          <div style={{ position: 'relative' }}>
+            <button type="button" className="cae-tools__text" onClick={() => setShowAddTrackMenu((v) => !v)}>+ Track</button>
+            {showAddTrackMenu && (
+              <div className="cae-addtrack-menu">
+                {['video', 'audio', 'overlay', 'subtitle'].map((type) => (
+                  <button key={type} type="button" onClick={() => { addTrackToStore(type); setShowAddTrackMenu(false); showToast(`${type[0].toUpperCase() + type.slice(1)} track added`); }}>
+                    {type.charAt(0).toUpperCase() + type.slice(1)}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
         </div>
       )}
 
-      {/* ── Multi-Track Editor Panels ── */}
-      {showMultiTrack && (
-        <div className="ve-multitrack" style={isEncoding ? { position: 'relative' } : undefined}>
+      {/* ── Multi-track timeline ── */}
+      {showMultiTrack && !compact && (
+        <div className="cae-timeline-wrap" style={isEncoding ? { position: 'relative' } : undefined} onClick={(e) => e.stopPropagation()}>
           {isEncoding && (
             <div className="ve-multitrack__encoding-overlay">
-              <div className="ve-multitrack__encoding-label">
-                Encoding in progress...
-              </div>
+              <div className="ve-multitrack__encoding-label">Encoding in progress...</div>
             </div>
           )}
-          {/* ToolBar */}
-          <div className="ve-multitrack__toolbar">
-            <EditorErrorBoundary name="ToolBar" compact>
-              <ToolBar />
-            </EditorErrorBoundary>
-            <div className="ve-multitrack__toolbar-actions">
+          <EditorErrorBoundary name="Timeline" compact>
+            <Timeline
+              compact={compact}
+              hideToolbar
+              onSeek={handleTimelineSeek}
+              onItemSelect={handleTimelineItemSelect}
+              onSubtitleVisibilityChange={handleTimelineSubtitleVisibility}
+            />
+          </EditorErrorBoundary>
+        </div>
+      )}
+
+      {/* ── Keyboard shortcuts hint ── */}
+      {!compact && (
+        <div className="cae-hints">
+          <span><b>Space</b> Play/Pause</span>
+          <span><b>J/K/L</b> Shuttle</span>
+          <span><b>←/→</b> Frame</span>
+          <span><b>M</b> Mute</span>
+          <span><b>S</b> Split</span>
+          <span><b>Del</b> Remove</span>
+          <span><b>N</b> Snap</span>
+          <span><b>Esc</b> Deselect</span>
+          <span><b>⌘Z</b> Undo</span>
+        </div>
+      )}
+
+      </div>{/* ── /cae-stage-col ── */}
+
+      {/* ── Editor pane ── */}
+      {showProperties && !isFullscreen && !compact && (
+        <div className={`cae-editor-pane${isMobile ? ' cae-editor-pane--sheet' : ''}`} onClick={(e) => e.stopPropagation()}>
+          <div className="cae-pane__head">
+            <div style={{ fontSize: 13, fontWeight: 600 }}>{editorTab === 'media' ? 'Media library' : 'Editor'}</div>
+            <span className="cae-badge">This clip</span>
+            <div style={{ flex: 1 }} />
+            <button type="button" className="cae-btn-secondary" style={{ fontSize: 10.5, padding: '3px 8px' }} onClick={() => { if (settings) { try { localStorage.setItem('clipai-default-settings', JSON.stringify(settings)); } catch { /* noop */ } } showToast('Saved as defaults for new clips'); }} title="Save as defaults for new clips">Set default</button>
+            <button type="button" className="cae-close" onClick={() => setShowProperties(false)} aria-label="Close panel">{'✕'}</button>
+          </div>
+
+          {editorTab !== 'media' && (
+            <div className="cae-pane__search">
+              <input className="cae-input" value={settingsSearch} onChange={(e) => setSettingsSearch(e.target.value)} placeholder="Search settings" aria-label="Search settings" />
+            </div>
+          )}
+
+          <div className="cae-pane__tabs">
+            <div className="cae-tabs" role="tablist" aria-label="Editor sections">
+              {[['props', 'Properties'], ['subtitles', 'Subtitles'], ['highlights', 'Highlights'], ['layout', 'Layout']].map(([id, label]) => (
+                <button key={id} type="button" role="tab" aria-selected={editorTab === id} className={`cae-tab${editorTab === id ? ' is-on' : ''}`} onClick={() => setEditorTab(id)}>{label}</button>
+              ))}
             </div>
           </div>
 
-          {/* Main content area */}
-          <div className="ve-multitrack__content">
-            {/* Media Library Sidebar */}
-            {showMediaLibrary && (
-              <div className="ve-multitrack__sidebar ve-multitrack__sidebar--left">
-                <div className="ve-multitrack__sidebar-header">
-                  <span>Media Library</span>
-                  <button
-                    className="ve-btn"
-                    onClick={() => setShowMediaLibrary(false)}
-                    style={{ minWidth: 24, minHeight: 24, fontSize: 12 }}
-                  >
-                    ✕
-                  </button>
-                </div>
-                <MediaUploader jobId={jobId} />
-              </div>
-            )}
-
-            {/* Center area: timeline always fills available space */}
-            <div className="ve-multitrack__center">
-              {/* Timeline */}
-              <div className="ve-multitrack__timeline">
-                <EditorErrorBoundary name="Timeline" compact>
-                  <Timeline
-                    compact={compact}
-                    onSeek={handleTimelineSeek}
-                    onItemSelect={handleTimelineItemSelect}
-                    onSubtitleVisibilityChange={handleTimelineSubtitleVisibility}
-                  />
-                </EditorErrorBoundary>
-              </div>
-            </div>
-
-            {/* Right Sidebar: Properties + Effects + Transitions stacked */}
-            {showProperties && (
-              <div className="ve-multitrack__sidebar ve-multitrack__sidebar--right">
-                <div className="ve-multitrack__sidebar-header">
-                  <span>Properties</span>
-                  <button
-                    className="ve-btn"
-                    onClick={() => setShowProperties(false)}
-                    style={{ minWidth: 24, minHeight: 24, fontSize: 12 }}
-                  >
-                    ✕
-                  </button>
-                </div>
+          <div className="cae-pane__body">
+            {editorTab === 'props' && (
+              <>
+                <button
+                  type="button"
+                  className="cae-btn-secondary"
+                  style={{ width: '100%', margin: '2px 0 12px', fontSize: 12, padding: '8px 0', color: 'var(--cae-text)' }}
+                  onClick={() => showToast(`Key scene marked at ${formatTimecode(mediaToWallClock(elapsed))}`)}
+                >{'★'} Mark key scene at {formatTimecode(mediaToWallClock(elapsed))}</button>
                 <EditorErrorBoundary name="Properties" compact>
                   <PropertiesPanel compact={compact} settings={settings} onSettingsChange={onSettingsChange} />
                 </EditorErrorBoundary>
-
-                {/* Effects Section (collapsible, inside sidebar) */}
                 {showEffectsPanel && (
-                  <div className="ve-multitrack__sidebar-section">
-                    <div className="ve-multitrack__sidebar-header">
-                      <span>Effects</span>
-                      <button className="ve-btn" onClick={() => setShowEffectsPanel(false)} style={{ minWidth: 24, minHeight: 24, fontSize: 12 }}>✕</button>
-                    </div>
-                    <EditorErrorBoundary name="Effects" compact>
-                      <EffectsPanel />
-                    </EditorErrorBoundary>
+                  <div style={{ marginTop: 12 }}>
+                    <div className="cae-pane__subhead"><span>Effects</span><button type="button" className="cae-close" onClick={() => setShowEffectsPanel(false)} aria-label="Close">{'✕'}</button></div>
+                    <EditorErrorBoundary name="Effects" compact><EffectsPanel /></EditorErrorBoundary>
                   </div>
                 )}
-
-                {/* Transitions Section (collapsible, inside sidebar) */}
                 {showTransitions && (
-                  <div className="ve-multitrack__sidebar-section">
-                    <div className="ve-multitrack__sidebar-header">
-                      <span>Transitions</span>
-                      <button className="ve-btn" onClick={() => setShowTransitions(false)} style={{ minWidth: 24, minHeight: 24, fontSize: 12 }}>✕</button>
-                    </div>
+                  <div style={{ marginTop: 12 }}>
+                    <div className="cae-pane__subhead"><span>Transitions</span><button type="button" className="cae-close" onClick={() => setShowTransitions(false)} aria-label="Close">{'✕'}</button></div>
                     <TransitionPicker />
                   </div>
                 )}
-              </div>
+              </>
+            )}
+
+            {editorTab === 'media' && (
+              <EditorErrorBoundary name="Media" compact><MediaUploader jobId={jobId} /></EditorErrorBoundary>
+            )}
+
+            {(editorTab === 'subtitles' || editorTab === 'highlights' || editorTab === 'layout') && (
+              <EditorSettings
+                tab={editorTab}
+                settings={settings}
+                onChange={setSetting}
+                onBulkChange={setSettingsBulk}
+                speakers={speakers}
+                speakerNames={speakerNames}
+                search={settingsSearch}
+                collapsed={collapsedSections}
+                onToggleSection={toggleSection}
+                onAspectRatioChange={onAspectRatioChange}
+                onApply={() => showToast('Settings applied to clip')}
+                onReset={() => { if (onSettingsChange) onSettingsChange({ ...(settings || {}), ...DEFAULT_CLIP_SETTINGS }); showToast('Reset to defaults'); }}
+                onSetDefault={() => showToast('Saved as defaults for new clips')}
+              />
             )}
           </div>
+        </div>
+      )}
+
+      </div>{/* ── /cae-main ── */}
+
+      {/* ── Mobile floating dock ── */}
+      {isMobile && !isFullscreen && !compact && (
+        <div className="cae-dock">
+          <button type="button" className="cae-dock__btn cae-dock__btn--play" onClick={(e) => { e.stopPropagation(); togglePlay(); }} aria-label="Play or pause">
+            {playing ? <span className="cae-dock__pause"><i /><i /></span> : <span className="cae-dock__playtri" />}
+          </button>
+          <button type="button" className="cae-dock__btn" onClick={(e) => { e.stopPropagation(); splitAtPlayhead(); }} aria-label="Split at playhead">{'⌗'}</button>
+          <button type="button" className="cae-dock__btn" onClick={(e) => { e.stopPropagation(); doUndo(); }} aria-label="Undo">{'⟲'}</button>
+          <button type="button" className="cae-dock__btn" onClick={(e) => { e.stopPropagation(); doRedo(); }} aria-label="Redo">{'⟳'}</button>
+          <button type="button" className="cae-dock__btn" onClick={(e) => { e.stopPropagation(); setShowProperties((v) => !v); }} aria-label="Editor pane">{'≣'}</button>
+          <button type="button" className="cae-dock__btn cae-dock__btn--export" onClick={(e) => { e.stopPropagation(); setShowExportDialog(true); }} aria-label="Export">{'↑'}</button>
         </div>
       )}
 
@@ -4104,19 +4271,9 @@ export default function VideoEditor({
         />
       )}
 
-      {/* ── Keyboard shortcuts hint ── */}
-      {!compact && (
-        <div className="ve-shortcuts">
-          <span><kbd>Space</kbd> Play/Pause</span>
-          <span><kbd>J</kbd>/<kbd>K</kbd>/<kbd>L</kbd> Shuttle</span>
-          <span><kbd>{'\u2190'}</kbd>/<kbd>{'\u2192'}</kbd> Frame</span>
-          <span><kbd>M</kbd> Mute</span>
-          <span><kbd>S</kbd> Split/Add Segment</span>
-          <span><kbd>Del</kbd> Remove Segment</span>
-          <span><kbd>Esc</kbd> Deselect</span>
-          <span><kbd>Tab</kbd> Cycle Segments</span>
-          {showMultiTrack && <span><kbd>Ctrl+Z</kbd>/<kbd>Ctrl+Shift+Z</kbd> Undo/Redo</span>}
-        </div>
+      {/* ── Toast ── */}
+      {toastMsg && (
+        <div className="cae-toast" role="status">{toastMsg}</div>
       )}
     </div>
   );
