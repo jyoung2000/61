@@ -1227,10 +1227,15 @@ export default function ClipSEO() {
       }}>
         <div style={{
           width: isMobile ? '100%' : layoutMode === 'editor' ? '100%' : undefined,
-          maxWidth: !isMobile && layoutMode === 'editor' ? '2400px' : undefined,
           flex: !isMobile && layoutMode === 'sidebyside' ? '1 1 50%' : undefined,
           minWidth: !isMobile && layoutMode === 'sidebyside' ? 0 : undefined,
-          maxWidth: !isMobile && layoutMode === 'sidebyside' ? '60%' : undefined,
+          maxWidth: isMobile
+            ? undefined
+            : layoutMode === 'editor'
+              ? '2400px'
+              : layoutMode === 'sidebyside'
+                ? '60%'
+                : undefined,
           position: !isMobile && layoutMode === 'sidebyside' ? 'sticky' : 'relative',
           top: !isMobile && layoutMode === 'sidebyside' ? 12 : undefined,
           margin: isMobile || layoutMode === 'sidebyside' ? undefined : '0 auto',

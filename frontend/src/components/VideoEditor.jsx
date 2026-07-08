@@ -28,7 +28,34 @@ import MarqueeSelection from './MarqueeSelection';
 import { hexToRgbString } from '../utils/colorUtils';
 import { applyPreservesPitch } from '../utils/preservesPitch';
 import { runEditorQA, autoFixTrackCompatibility } from '../utils/editorQA';
+import { registerFilmstripSource } from '../utils/filmstrip';
 import './VideoEditor.css';
+
+// Convert an interleaved [min,max,min,max,…] peaks array (values in -1..1,
+// as served by /api/jobs/{id}/waveform.json) into ``barCount`` normalized
+// amplitude bars (0..1) for the waveform canvas — same shape the client-side
+// decoder produces, so drawWaveform is agnostic to the source.
+function _peaksToBars(data, barCount) {
+  const pairs = Math.floor(data.length / 2);
+  if (pairs <= 0) return [];
+  const amps = new Array(pairs);
+  for (let i = 0; i < pairs; i++) {
+    amps[i] = Math.max(Math.abs(data[i * 2] || 0), Math.abs(data[i * 2 + 1] || 0));
+  }
+  const bars = [];
+  const per = pairs / barCount;
+  let max = 0.01;
+  for (let b = 0; b < barCount; b++) {
+    const start = Math.floor(b * per);
+    const end = Math.max(start + 1, Math.floor((b + 1) * per));
+    let sum = 0, n = 0;
+    for (let j = start; j < end && j < pairs; j++) { sum += amps[j]; n++; }
+    const v = n ? sum / n : 0;
+    bars.push(v);
+    if (v > max) max = v;
+  }
+  return bars.map((v) => v / max);
+}
 
 // Fraction of a string that is CJK over CJK + Latin letters (mirrors the
 // backend sanitizer / timelineStore / TranscriptViewer). Used to spot
@@ -1598,11 +1625,42 @@ export default function VideoEditor({
     };
   }, [isFullscreen]);
 
+  // ── Filmstrip sprite source ────────────────────────
+  // Map the video src to its job so the timeline can fetch the precomputed
+  // sprite sheet (server-sliced tiles) instead of seeking a hidden <video>
+  // per thumbnail. Harmless if the sprite isn't ready — filmstrip.js falls
+  // back to client-side seeking automatically.
+  useEffect(() => {
+    if (src && jobId) registerFilmstripSource(src, jobId);
+  }, [src, jobId]);
+
   // ── Waveform generation ────────────────────────────
   useEffect(() => {
     if (!src) return;
     let cancelled = false;
     const generateWaveform = async () => {
+      // Prefer server-precomputed peaks: a few-KB JSON that covers the WHOLE
+      // timeline, versus fetching 10MB and running decodeAudioData on the
+      // main thread (which only samples the first ~minutes of a long video
+      // anyway). This is the waveform equivalent of the sprite sheet.
+      if (jobId) {
+        try {
+          const res = await fetch(`/api/jobs/${jobId}/waveform.json`);
+          if (cancelled) return;
+          if (res.ok) {
+            const peaks = await res.json();
+            if (cancelled) return;
+            if (peaks && Array.isArray(peaks.data) && peaks.data.length) {
+              waveformDataRef.current = _peaksToBars(peaks.data, 200);
+              drawWaveform();
+              return;
+            }
+          }
+        } catch {
+          // Peaks not ready / unreachable — fall through to client decode.
+        }
+        if (cancelled) return;
+      }
       try {
         // For large files, fetching the entire video into memory fails.
         // Use a Range request to fetch only the first 10MB — enough for
@@ -1651,7 +1709,7 @@ export default function VideoEditor({
     };
     generateWaveform();
     return () => { cancelled = true; };
-  }, [src]);
+  }, [src, jobId]);
 
   // Live ref so ``drawWaveform`` can read the current playhead WITHOUT
   // listing ``currentTime`` in its dep array. Previously the waveform
@@ -3358,7 +3416,7 @@ export default function VideoEditor({
           src={src}
           tabIndex={-1}
           playsInline
-          preload="auto"
+          preload="metadata"
           style={(() => {
             const hasCustomTransform = (
               videoItemPosition.x !== 50 || videoItemPosition.y !== 50 ||

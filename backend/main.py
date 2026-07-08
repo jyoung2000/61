@@ -34,6 +34,7 @@ from backend.routers import diagnostics as diagnostics_router
 from backend.routers import render_plan as render_plan_router
 from backend.routers import detection_overlay as detection_overlay_router
 from backend.routers import thumbnails as thumbnails_router
+from backend.routers import filmstrip as filmstrip_router
 from backend.routers import share as share_router
 from backend.routers import auth as auth_router
 from backend.routers.api_v1 import router as api_v1_router
@@ -1113,6 +1114,7 @@ app.include_router(diagnostics_router.router)
 app.include_router(render_plan_router.router)
 app.include_router(detection_overlay_router.router)
 app.include_router(thumbnails_router.router)
+app.include_router(filmstrip_router.router)
 app.include_router(share_router.router)
 app.include_router(api_v1_router)
 

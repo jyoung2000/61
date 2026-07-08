@@ -5467,6 +5467,23 @@ async def _run_analysis_inner(job_id: str, resume: bool = False):
     except Exception as _ovre:
         logger.warning("[%s] detection_overlay.json write failed: %s", job_id, _ovre)
 
+    # ── Editor scrub assets: filmstrip sprite + waveform peaks ──
+    # The NLE timeline slices a precomputed sprite sheet and draws a peaks
+    # array instead of seeking a hidden <video> / decoding 10MB in the
+    # browser — that's what makes long-video load feel instant, like
+    # Premiere Web. Both are best-effort sidecars in the job dir, served by
+    # /api/jobs/{id}/filmstrip.json|.jpg and /waveform.json. Generated in a
+    # worker thread (FFmpeg CPU work) so heartbeats/WS keep flowing; the
+    # audio.wav from the Whisper stage lets peaks skip a video re-decode.
+    try:
+        from backend.services.filmstrip_generator import generate_sprite, generate_peaks
+        await asyncio.to_thread(generate_sprite, video_path, job_dir)
+        _peaks_src = audio_path if os.path.exists(audio_path) else video_path
+        await asyncio.to_thread(generate_peaks, _peaks_src, job_dir)
+        logger.info("[%s] filmstrip sprite + waveform peaks written", job_id)
+    except Exception as _fse:
+        logger.warning("[%s] filmstrip/waveform precompute failed: %s", job_id, _fse)
+
     # ── Reframe quality grade (A-F, 0-100 score, per-axis sub-scores) ──
     reframe_report = None
     try:

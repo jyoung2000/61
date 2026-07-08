@@ -217,6 +217,18 @@ async def ingest_video_from_path(
             pass
         raise IngestError(header_err, status_code=422)
 
+    # Relocate the moov atom to the front (lossless stream copy) so the
+    # editor's <video> and the timeline can start playback / seek from the
+    # first bytes instead of pulling the whole file. One-time cost at ingest;
+    # every later open + scrub is faster. Best-effort — on failure the
+    # original file is served unchanged.
+    if getattr(settings, "FFMPEG_FASTSTART", True):
+        try:
+            from backend.services.faststart import ensure_faststart
+            await asyncio.to_thread(ensure_faststart, final_path)
+        except Exception as _fs_err:  # noqa: BLE001
+            logger.warning("faststart remux skipped for %s: %s", final_path, _fs_err)
+
     now = datetime.now(timezone.utc).isoformat()
     job = JobResult(
         job_id=job_id,
