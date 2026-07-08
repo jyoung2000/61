@@ -861,13 +861,29 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
             or _ollama_names_match(self._force_cpu_model, model_name)
         ):
             return [0]
-        # Models known to never fit a small card stay CPU-only.
+        # Big models (7B/8B/13B/14B+) are forced CPU-only ONLY on the small
+        # LOCAL card, where they genuinely can't fit — forcing [0] there skips a
+        # doomed OOM attempt every call. On a paired Companion (a remote GPU,
+        # e.g. a 12 GB 4070) they DO fit, so fall through to the GPU offload
+        # ladder (GPU-first with an OOM-driven step-down) instead of crawling on
+        # the CPU. This is what lets the translation-polish 14B run on the
+        # Companion GPU rather than its CPU. (Mirrors the _get_num_gpu fix.)
         ml = (model_name or "").lower()
         if any(h in ml for h in (
             ":7b", ":8b", ":13b", ":14b", ":34b", ":70b",
             "llava:7b", "llava:13b",
         )):
-            return [0]
+            _remote_gpu = False
+            try:
+                from backend.services import ollama_registry as _oreg
+                _remote_gpu = not _oreg.is_local_gpu_host(self._host)
+            except Exception:
+                _remote_gpu = False
+            # Roomy card (advertised ≥6 GB, companion-aware via _detect_vram) or
+            # any remote Companion host → try the GPU. Otherwise (small local
+            # card) keep the fast CPU-only path.
+            if not (_remote_gpu or self._available_vram_mb >= 6000):
+                return [0]
 
         ladder = gpu_offload_ladder(model_name)
         good = None
