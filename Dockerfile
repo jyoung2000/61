@@ -88,7 +88,7 @@ RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/wh
 # Download YuNet model for face detection fallback (~350KB, one-time)
 # Download lbpcascade_animeface for v2 Phase 6 anime face detection (~110KB)
 RUN mkdir -p /app/backend/models && \
-    curl -sL -o /app/backend/models/face_detection_yunet_2023mar.onnx \
+    curl --retry 4 --retry-delay 5 --retry-all-errors -fsSL -o /app/backend/models/face_detection_yunet_2023mar.onnx \
     "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx" && \
     curl --retry 4 --retry-delay 5 --retry-all-errors -fsSL \
     -o /app/backend/models/lbpcascade_animeface.xml \

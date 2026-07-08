@@ -45,16 +45,30 @@ RUN apt-get update && apt-get install -y \
     libgl1-mesa-glx libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-# Install nv-codec-headers for NVENC/NVDEC support
-RUN cd /tmp && \
-    git clone https://git.videolan.org/git/ffmpeg/nv-codec-headers.git && \
-    cd nv-codec-headers && \
-    make install && \
+# Install nv-codec-headers for NVENC/NVDEC support.
+# git.videolan.org intermittently drops HTTP/2 streams mid-clone
+# ("RPC failed; curl 92 ... INTERNAL_ERROR ... early EOF"), so force HTTP/1.1,
+# shallow-clone, retry, and fall back to the GitHub mirror before failing.
+RUN set -eux; cd /tmp; \
+    for url in \
+      https://github.com/FFmpeg/nv-codec-headers.git \
+      https://git.videolan.org/git/ffmpeg/nv-codec-headers.git; do \
+      for i in 1 2 3; do \
+        rm -rf nv-codec-headers; \
+        if git -c http.version=HTTP/1.1 clone --depth 1 "$url" nv-codec-headers; then \
+          break 2; \
+        fi; \
+        echo "nv-codec-headers clone attempt $i from $url failed; retrying in 5s..."; \
+        sleep 5; \
+      done; \
+    done; \
+    test -d nv-codec-headers/.git || { echo "nv-codec-headers clone failed from all mirrors"; exit 1; }; \
+    cd nv-codec-headers && make install && \
     cd / && rm -rf /tmp/nv-codec-headers
 
 # Build FFmpeg with full hardware acceleration
 RUN cd /tmp && \
-    wget -q https://ffmpeg.org/releases/ffmpeg-7.1.tar.xz && \
+    wget -q --tries=4 --retry-connrefused --waitretry=5 --timeout=60 https://ffmpeg.org/releases/ffmpeg-7.1.tar.xz && \
     tar xf ffmpeg-7.1.tar.xz && \
     cd ffmpeg-7.1 && \
     ./configure \
@@ -140,9 +154,9 @@ RUN pip3 install --upgrade pip && \
 # Download SFace recognition model for identity embeddings (~2MB, one-time)
 # Download lbpcascade_animeface for v2 Phase 6 anime face detection (~110KB)
 RUN mkdir -p /app/backend/models && \
-    curl -sL -o /app/backend/models/face_detection_yunet_2023mar.onnx \
+    curl --retry 4 --retry-delay 5 --retry-all-errors -fsSL -o /app/backend/models/face_detection_yunet_2023mar.onnx \
     "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx" && \
-    curl -sL -o /app/backend/models/face_recognition_sface_2021dec.onnx \
+    curl --retry 4 --retry-delay 5 --retry-all-errors -fsSL -o /app/backend/models/face_recognition_sface_2021dec.onnx \
     "https://github.com/opencv/opencv_zoo/raw/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx" && \
     curl --retry 4 --retry-delay 5 --retry-all-errors -fsSL \
     -o /app/backend/models/lbpcascade_animeface.xml \
