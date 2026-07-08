@@ -243,14 +243,14 @@ function TimelineMinimap({
       // Frosted glass viewport
       ctx.fillStyle = isDark ? 'rgba(255,255,255,0.10)' : 'rgba(0,0,0,0.07)';
       ctx.fillRect(vx, 0, vw, HEIGHT);
-      ctx.strokeStyle = 'var(--accent, #0A84FF)';
-      ctx.fillStyle = 'rgba(10,132,255,0.18)';
+      ctx.strokeStyle = 'var(--accent, #6E7BFF)';
+      ctx.fillStyle = 'rgba(110,123,255,0.18)';
       ctx.fillRect(vx, 0, vw, HEIGHT);
-      ctx.strokeStyle = '#0A84FF';
+      ctx.strokeStyle = '#6E7BFF';
       ctx.lineWidth = 1.5;
       ctx.strokeRect(vx + 0.5, 0.5, vw - 1, HEIGHT - 1);
       // Edge grippers for zoom-drag
-      ctx.fillStyle = '#0A84FF';
+      ctx.fillStyle = '#6E7BFF';
       ctx.fillRect(vx - 1, 8, 2, HEIGHT - 16);
       ctx.fillRect(vx + vw - 1, 8, 2, HEIGHT - 16);
     }
@@ -270,7 +270,7 @@ function TimelineMinimap({
     // Playhead
     const phx = playhead * pxPerSec;
     if (phx >= 0 && phx <= W) {
-      ctx.strokeStyle = '#FF3B30';
+      ctx.strokeStyle = '#FF5C5C';
       ctx.lineWidth = 1.5;
       ctx.beginPath();
       ctx.moveTo(phx, 0);
@@ -531,7 +531,7 @@ function TimecodeInput({ playhead, onSeek }) {
         width: 110,
         background: 'var(--ve-surface, #1a1a1a)',
         color: 'var(--ve-text, #ddd)',
-        border: '1px solid var(--accent, #0A84FF)',
+        border: '1px solid var(--accent, #6E7BFF)',
         borderRadius: 4,
         outline: 'none',
       }}
@@ -1295,9 +1295,9 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
     if (phX >= contentLeft && phX <= canvasW) {
       // Playhead line with subtle glow
       ctx.save();
-      ctx.shadowColor = 'rgba(255, 59, 48, 0.5)';
+      ctx.shadowColor = 'rgba(255, 92, 92, 0.55)';
       ctx.shadowBlur = 6;
-      ctx.strokeStyle = '#FF3B30';
+      ctx.strokeStyle = '#FF5C5C';
       ctx.lineWidth = 2.5;
       ctx.beginPath();
       ctx.moveTo(phX, 0);
@@ -1310,7 +1310,7 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
       // matching the Premiere / Resolve / Final Cut playhead idiom.
       // Wider top reads as a clear drag target; the tip points to the
       // exact frame.
-      ctx.fillStyle = '#FF3B30';
+      ctx.fillStyle = '#FF5C5C';
       ctx.beginPath();
       ctx.moveTo(phX - 11, 0);
       ctx.lineTo(phX + 11, 0);
@@ -1341,7 +1341,7 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
       ctx.shadowColor = 'rgba(0,0,0,0.45)';
       ctx.shadowBlur = 6;
       ctx.shadowOffsetY = 2;
-      ctx.fillStyle = '#FF3B30';
+      ctx.fillStyle = '#FF5C5C';
       ctx.beginPath();
       ctx.roundRect(tipX, tipY, tipW, tipH, 4);
       ctx.fill();
@@ -2748,7 +2748,7 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
                   pointerEvents: 'auto',
                   opacity: isHidden ? 0.5 : (dragTrackIdx === trackIdx ? 0.4 : 1),
                   cursor: 'grab',
-                  borderTop: isDragOver ? '2px solid var(--accent, #0A84FF)' : '2px solid transparent',
+                  borderTop: isDragOver ? '2px solid var(--accent, #6E7BFF)' : '2px solid transparent',
                   transition: 'opacity 0.15s, border-color 0.15s',
                 }}
               >
@@ -2794,7 +2794,7 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
                       style={{
                         fontSize: 10, fontWeight: 500, width: '100%',
                         background: 'var(--ve-surface, #222)', color: 'var(--ve-text, #ccc)',
-                        border: '1px solid var(--accent, #0A84FF)', borderRadius: 2,
+                        border: '1px solid var(--accent, #6E7BFF)', borderRadius: 2,
                         padding: '0 2px', outline: 'none', minWidth: 0,
                       }}
                     />

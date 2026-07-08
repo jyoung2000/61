@@ -3164,8 +3164,71 @@ export default function VideoEditor({
       ref={containerRef}
       className={containerClass}
     >
-      {/* ── Header ── */}
-      {(title || onClose) && !isFullscreen && (
+      {/* ── Header / top bar (design-comp) ── */}
+      {!isFullscreen && !compact && (
+        <div className="ve-header">
+          <span className="ve-header__title">{title || 'ClipAI Editor'}</span>
+          <div className="ve-topbar__spacer" />
+          <Tooltip label="Command palette" kbd="⌘K">
+            <button
+              className="ve-topbar__cmdk"
+              onClick={(e) => { e.stopPropagation(); setPaletteOpen(true); }}
+              aria-label="Open command palette"
+            >
+              ⌘K
+            </button>
+          </Tooltip>
+          <Tooltip label="Undo" kbd="⌘Z">
+            <button
+              className="ve-topbar__icon"
+              onClick={(e) => { e.stopPropagation(); useTimelineStore.temporal.getState().undo(); }}
+              aria-label="Undo"
+            >
+              ⟲
+            </button>
+          </Tooltip>
+          <Tooltip label="Redo" kbd="⌘⇧Z">
+            <button
+              className="ve-topbar__icon"
+              onClick={(e) => { e.stopPropagation(); useTimelineStore.temporal.getState().redo(); }}
+              aria-label="Redo"
+            >
+              ⟳
+            </button>
+          </Tooltip>
+          <Tooltip label={showProperties ? 'Hide editor pane' : 'Show editor pane'}>
+            <button
+              className={`ve-topbar__toggle${showProperties ? ' ve-topbar__toggle--on' : ''}`}
+              onClick={(e) => {
+                e.stopPropagation();
+                if (!showMultiTrack) { setShowMultiTrack(true); setShowProperties(true); return; }
+                setShowProperties((v) => !v);
+              }}
+              aria-pressed={showProperties}
+            >
+              Editor
+            </button>
+          </Tooltip>
+          <Tooltip label="Export">
+            <button
+              className="ve-topbar__export"
+              onClick={(e) => { e.stopPropagation(); setShowExportDialog(true); }}
+              aria-label="Export video"
+            >
+              Export ▾
+            </button>
+          </Tooltip>
+          {onClose && (
+            <Tooltip label="Close">
+              <button className="ve-header__close" onClick={onClose} aria-label="Close editor">
+                <Icon.Close />
+              </button>
+            </Tooltip>
+          )}
+        </div>
+      )}
+      {/* Compact header (embedded previews) keeps the minimal title + close */}
+      {(title || onClose) && !isFullscreen && compact && (
         <div className="ve-header">
           <span className="ve-header__title">{title || 'Clip Preview'}</span>
           {onClose && (
@@ -3430,17 +3493,13 @@ export default function VideoEditor({
 
       {/* ── Aspect Ratio Picker ── */}
       {onAspectRatioChange && (
-        <div style={{
-          display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 4,
+        <div className="ve-ratio-row" style={{
+          display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6,
           padding: '5px 8px', margin: '0 auto',
           maxWidth: compact ? undefined : `calc(50vh * ${targetRatio})`,
           width: '100%',
         }}>
-          <span style={{
-            fontSize: 10, fontWeight: 600, color: 'var(--text-muted, #888)',
-            marginRight: 4, whiteSpace: 'nowrap', textTransform: 'uppercase',
-            letterSpacing: '0.05em',
-          }}>
+          <span className="ve-ratio-label" style={{ marginRight: 2 }}>
             Ratio
           </span>
           {ASPECT_RATIO_OPTIONS.map((opt) => {
@@ -3449,16 +3508,7 @@ export default function VideoEditor({
               <button
                 key={opt.label}
                 onClick={(e) => { e.stopPropagation(); onAspectRatioChange(opt.value); }}
-                style={{
-                  display: 'flex', alignItems: 'center', gap: 3,
-                  padding: '3px 8px', fontSize: 10, fontWeight: isActive ? 700 : 500,
-                  background: isActive ? 'var(--accent-cyan, #0A84FF)' : 'var(--bg-elevated, rgba(0,0,0,0.04))',
-                  color: isActive ? '#fff' : 'var(--text-secondary, #666)',
-                  border: isActive ? '1px solid var(--accent-cyan, #0A84FF)' : '1px solid var(--border-dim, rgba(0,0,0,0.08))',
-                  borderRadius: 'var(--radius-xs, 4px)', cursor: 'pointer',
-                  transition: 'all 0.15s ease',
-                  whiteSpace: 'nowrap',
-                }}
+                className={`ve-ratio-pill${isActive ? ' ve-ratio-pill--on' : ''}`}
                 aria-label={opt.value ? `${opt.value} crop` : 'Original aspect ratio'}
               >
                 {opt.value && (
