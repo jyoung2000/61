@@ -1,6 +1,7 @@
 import React, { useState, useRef, useCallback, useMemo, useEffect } from 'react';
 import useTimelineStore from '../stores/timelineStore';
 import ContextMenu from './ContextMenu';
+import { snapToGuides } from '../utils/goldenGrid';
 
 /**
  * InteractiveOverlay renders selectable, draggable, resizable, and rotatable
@@ -504,8 +505,28 @@ function InteractiveElement({
           }
           setItemPositionsRef.current(updates);
         } else {
-          const newX = ds.startPosX + dxPct;
-          const newY = ds.startPosY + dyPct;
+          let newX = ds.startPosX + dxPct;
+          let newY = ds.startPosY + dyPct;
+          // Magnetic snap to the golden grid, frame centre/edges, and other
+          // elements (Photoshop-style) while the grid is on. Holding Alt
+          // temporarily disables it for free, un-snapped placement.
+          const store = useTimelineStore.getState();
+          if (store.goldenGrid && !e.altKey) {
+            const it = itemRef.current;
+            const sz = it.size || { w: 20, h: 20 };
+            const others = store.items
+              .filter((o) => o.id !== it.id && o.position
+                && o.type !== 'audio' && o.type !== 'subtitle' && o.type !== 'video')
+              .map((o) => ({ x: o.position.x, y: o.position.y, w: o.size?.w || 0, h: o.size?.h || 0 }));
+            const thX = (7 / (ds.containerW || 1)) * 100;
+            const thY = (7 / (ds.containerH || 1)) * 100;
+            const snapped = snapToGuides({ x: newX, y: newY, w: sz.w, h: sz.h, others, thX, thY });
+            newX = snapped.x;
+            newY = snapped.y;
+            store.setSnapGuides(snapped.guides);
+          } else if (store.snapGuides.length) {
+            store.setSnapGuides([]);
+          }
           onUpdateRef.current({
             position: {
               x: Math.max(0, Math.min(100, Math.round(newX * 10) / 10)),
@@ -725,6 +746,8 @@ function InteractiveElement({
       if (longPressRef.current) { clearTimeout(longPressRef.current); longPressRef.current = 0; longPressStartRef.current = null; }
       // Resume undo history so the final state is recorded as one snapshot
       useTimelineStore.temporal.getState().resume();
+      // Clear any live snap guide lines.
+      if (useTimelineStore.getState().snapGuides.length) useTimelineStore.getState().setSnapGuides([]);
       dragState.current = null;
       setIsDragging(false);
       setIsResizing(false);

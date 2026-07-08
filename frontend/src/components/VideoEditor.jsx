@@ -9,6 +9,7 @@ import { usePlayer } from '../contexts/PlayerContext';
 import EditorErrorBoundary from './EditorErrorBoundary';
 import Timeline from './Timeline';
 import TimelineOverlay from './TimelineOverlay';
+import GoldenGridOverlay from './GoldenGridOverlay';
 import ReframePreview from './ReframePreview';
 import ReframeStatsPanel from './ReframeStatsPanel';
 import MediaUploader from './MediaUploader';
@@ -361,6 +362,8 @@ export default function VideoEditor({
   const updateTimelineItem = useTimelineStore((s) => s.updateItem);
   const timelineTracks = useTimelineStore((s) => s.tracks);
   const timelineMediaLibrary = useTimelineStore((s) => s.mediaLibrary);
+  const goldenGrid = useTimelineStore((s) => s.goldenGrid);
+  const toggleGoldenGrid = useTimelineStore((s) => s.toggleGoldenGrid);
   const { recovered } = useTimelinePersistence(jobId, clipId);
   const encoding = useEncodingManager();
   const isEncoding = useMemo(() => {
@@ -3291,6 +3294,22 @@ export default function VideoEditor({
               ⟳
             </button>
           </Tooltip>
+          <Tooltip label={goldenGrid ? 'Hide golden-ratio grid' : 'Golden-ratio grid (snap to align)'} kbd="G">
+            <button
+              className={`ve-topbar__icon${goldenGrid ? ' ve-topbar__icon--on' : ''}`}
+              onClick={(e) => { e.stopPropagation(); toggleGoldenGrid(); }}
+              aria-label="Toggle golden-ratio alignment grid"
+              aria-pressed={goldenGrid}
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round">
+                <rect x="3" y="3" width="18" height="18" rx="1" />
+                <line x1="9.2" y1="3" x2="9.2" y2="21" />
+                <line x1="14.8" y1="3" x2="14.8" y2="21" />
+                <line x1="3" y1="9.2" x2="21" y2="9.2" />
+                <line x1="3" y1="14.8" x2="21" y2="14.8" />
+              </svg>
+            </button>
+          </Tooltip>
           <Tooltip label={showProperties ? 'Hide editor pane' : 'Show editor pane'}>
             <button
               className={`ve-topbar__toggle${showProperties ? ' ve-topbar__toggle--on' : ''}`}
@@ -3484,6 +3503,11 @@ export default function VideoEditor({
             (which default to the topmost track) appear on top of shapes,
             images, and text overlays — matching the track stacking order. */}
         {subtitleOverlay}
+
+        {/* Golden-ratio ("golden canon") alignment grid + live snap guides.
+            Self-hides when toggled off; drawn over the stage so it's correct
+            for the current aspect ratio. */}
+        {!isFullscreen && <GoldenGridOverlay />}
 
         {/* Platform safe-zone preview — toggled from the export dialog */}
         {safeZonePlatform && (

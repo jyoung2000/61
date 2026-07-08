@@ -466,6 +466,14 @@ const useTimelineStore = create(
       zoom: 1.0,
       scrollX: 0,
       snapEnabled: true,
+      // Golden-ratio ("golden canon") alignment grid over the preview. When on,
+      // the φ grid is drawn and dragged elements (overlays + subtitles) snap to
+      // its lines, the frame center/edges, and each other — like Photoshop
+      // guides. Pure UI state (not undo-tracked; excluded from partialize).
+      goldenGrid: false,
+      // Transient snap guide lines highlighted during an active drag:
+      // [{ axis: 'x'|'y', pos: <percent 0-100> }].
+      snapGuides: [],
       // Ripple-edit mode (Premiere ``\``). When true, trimming or
       // moving an item shifts every item that starts at-or-after the
       // dragged item's old end-time by the same delta, so cuts later
@@ -539,6 +547,9 @@ const useTimelineStore = create(
       setZoom: (z) => set({ zoom: Math.max(0.01, Math.min(10, z)) }),
       setScrollX: (x) => set({ scrollX: Math.max(0, x) }),
       toggleSnap: () => set((state) => { state.snapEnabled = !state.snapEnabled; }),
+      toggleGoldenGrid: () => set((state) => { state.goldenGrid = !state.goldenGrid; }),
+      setGoldenGrid: (v) => set((state) => { state.goldenGrid = !!v; }),
+      setSnapGuides: (g) => set((state) => { state.snapGuides = Array.isArray(g) ? g : []; }),
       toggleRipple: () => set((state) => { state.rippleEnabled = !state.rippleEnabled; }),
       setRippleEnabled: (v) => set((state) => { state.rippleEnabled = !!v; }),
       // Shift every item whose start ≥ ``pivot`` by ``deltaSec``. Used

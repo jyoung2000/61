@@ -4203,6 +4203,11 @@ input.ve-timecode--input {
 }
 .ve-container .ve-topbar__icon:hover { background: var(--ve-btn-hover); color: var(--ve-text); }
 .ve-topbar__icon:active { transform: scale(0.94); }
+.ve-container .ve-topbar__icon--on,
+.ve-container .ve-topbar__icon--on:hover {
+  color: var(--ve-on-accent, #fff);
+  background: var(--ve-accent, #6E7BFF);
+}
 .ve-topbar__toggle {
   font-size: 11px; font-weight: 600; padding: 5px 11px; border-radius: 8px;
   cursor: pointer; white-space: nowrap; border: 1px solid var(--ve-chrome-border);

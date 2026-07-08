@@ -127,6 +127,8 @@ export const EDITOR_ACTIONS = [
     run: () => st().setActiveTool('shape') },
   { id: 'toggle-snap', label: 'Toggle snapping', category: 'Tools', kbd: 'N', code: 'KeyN',
     run: () => st().toggleSnap() },
+  { id: 'toggle-golden-grid', label: 'Toggle golden-ratio grid', category: 'Tools', kbd: 'G', code: 'KeyG',
+    run: () => st().toggleGoldenGrid() },
   { id: 'toggle-ripple', label: 'Toggle ripple editing', category: 'Tools', kbd: '\\', code: 'Backslash',
     run: () => st().toggleRipple() },
 

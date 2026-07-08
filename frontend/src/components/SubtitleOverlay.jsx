@@ -3,6 +3,7 @@ import { outlineTextShadow } from '../utils/textOutline';
 import { spokenWindow, isSpokenAt } from '../utils/subtitleTiming';
 import { DEFAULT_SPEAKER_PALETTE, computeSpeakerRates, getCurrentWordIndex } from '../utils/activeWordTiming';
 import useTimelineStore from '../stores/timelineStore';
+import { snapToGuides } from '../utils/goldenGrid';
 
 // ── Backend-matching constants (ass_generator.py / clip_exporter.py) ──────
 const ASPECT_RATIO_DIMS = {
@@ -478,8 +479,35 @@ export default function SubtitleOverlay({
       if (!ds.moved && Math.abs(dx) + Math.abs(dy) > 2) {
         ds.moved = true;
       }
-      const dxPct = (dx / ds.containerW) * 100;
-      const dyPct = (dy / ds.containerH) * 100;
+      let dxPct = (dx / ds.containerW) * 100;
+      let dyPct = (dy / ds.containerH) * 100;
+
+      // Magnetic snap to the golden grid / frame / other elements while the
+      // grid is on (Alt disables). Snap the PRIMARY subtitle's centre, then
+      // shift the whole dragged group by the same correction. Subtitles snap
+      // by centre only (size 0) — their item box is the full frame.
+      const store = useTimelineStore.getState();
+      let guides = [];
+      if (store.goldenGrid && !e.altKey && ds.dragIds.length) {
+        const primaryId = ds.dragIds[0];
+        const sp = ds.startPositions[primaryId];
+        if (sp) {
+          const rawX = sp.x + dxPct;
+          const rawY = sp.y + dyPct;
+          const others = store.items
+            .filter((o) => !ds.dragIds.includes(o.id) && o.position
+              && o.type !== 'audio' && o.type !== 'video')
+            .map((o) => ({ x: o.position.x, y: o.position.y, w: o.size?.w || 0, h: o.size?.h || 0 }));
+          const thX = (7 / ds.containerW) * 100;
+          const thY = (7 / ds.containerH) * 100;
+          const snapped = snapToGuides({ x: rawX, y: rawY, w: 0, h: 0, others, thX, thY });
+          dxPct += snapped.x - rawX;
+          dyPct += snapped.y - rawY;
+          guides = snapped.guides;
+        }
+      }
+      store.setSnapGuides(guides);
+
       const updates = {};
       for (const id of ds.dragIds) {
         const sp = ds.startPositions[id];
@@ -492,6 +520,7 @@ export default function SubtitleOverlay({
     const handleUp = () => {
       if (subLongPressRef.current) { clearTimeout(subLongPressRef.current); subLongPressRef.current = 0; subLongPressStartRef.current = null; }
       useTimelineStore.temporal.getState().resume();
+      if (useTimelineStore.getState().snapGuides.length) useTimelineStore.getState().setSnapGuides([]);
       dragRef.current = null;
       setIsDraggingSub(false);
     };
