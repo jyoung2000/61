@@ -28,7 +28,11 @@ const _ELEMENTS = new Map();      // src -> shared <video> element
 // Server-sprite state, keyed by source URL.
 const _SPRITE_JOB = new Map();    // src -> jobId (explicit registration)
 const _SPRITE = new Map();        // src -> { manifest, img } once ready
-const _SPRITE_PROMISE = new Map();// src -> Promise<{manifest,img}|null> (dedupe)
+const _SPRITE_PROMISE = new Map();// src -> in-flight Promise (dedupe; cleared on settle)
+const _SPRITE_MISS = new Map();   // src -> last-miss timestamp (ms) for retry backoff
+// Long videos generate their sprite in the background AFTER the editor opens,
+// so a first miss must NOT be permanent — retry periodically until it appears.
+const _SPRITE_RETRY_MS = 6000;
 
 const _MAX_CACHE = 600;           // keep the cache bounded
 
@@ -93,11 +97,12 @@ function _loadSprite(src) {
   if (pending) return pending;
 
   const jobId = _deriveJobId(src);
-  if (!jobId) {
-    const p = Promise.resolve(null);
-    _SPRITE_PROMISE.set(src, p);
-    return p;
-  }
+  if (!jobId) return Promise.resolve(null);
+
+  // Back off between misses, but keep retrying — the sprite may still be
+  // generating on the server (long videos) and should be picked up live.
+  const lastMiss = _SPRITE_MISS.get(src);
+  if (lastMiss && (Date.now() - lastMiss) < _SPRITE_RETRY_MS) return Promise.resolve(null);
 
   const base = `/api/jobs/${encodeURIComponent(jobId)}`;
   const p = fetch(`${base}/filmstrip.json`)
@@ -119,7 +124,13 @@ function _loadSprite(src) {
         img.src = `${base}/filmstrip.jpg`;
       });
     })
-    .catch(() => null);
+    .catch(() => null)
+    .then((entry) => {
+      _SPRITE_PROMISE.delete(src);           // allow a future retry
+      if (!entry) _SPRITE_MISS.set(src, Date.now());
+      else _SPRITE_MISS.delete(src);
+      return entry;
+    });
   _SPRITE_PROMISE.set(src, p);
   return p;
 }
@@ -286,6 +297,7 @@ export function disposeFilmstrip(src) {
   }
   _SPRITE.delete(src);
   _SPRITE_PROMISE.delete(src);
+  _SPRITE_MISS.delete(src);
 }
 
 /** How many timestamps to thumbnail across a clip given pixel width. */

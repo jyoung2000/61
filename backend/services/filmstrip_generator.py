@@ -127,22 +127,32 @@ def generate_sprite(source_path: str, out_dir: str) -> Optional[dict]:
         f"scale={layout['tileW']}:{layout['tileH']},"
         f"tile={layout['cols']}x{layout['rows']}"
     )
-    # A single decode-once pass emits the whole packed sheet. -frames:v 1
-    # keeps only the first (and only, for our grid size) tiled output frame.
-    proc = _run(
-        [
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-            "-i", source_path,
-            "-vf", vf,
-            "-frames:v", "1",
-            "-q:v", "5",
-            "-an",
-            tmp_path,
-        ],
-        # A full uniform-sample decode of a long source is the cost here;
-        # generous ceiling so 2h films finish, short clips return instantly.
-        timeout=1800,
-    )
+
+    def _sprite_cmd(fast: bool) -> list:
+        # A single decode-once pass emits the whole packed sheet; -frames:v 1
+        # keeps the first (and only, for our grid size) tiled output frame.
+        # FAST path: GPU-assisted decode (falls back to SW automatically) +
+        # -skip_frame nokey so only keyframes are fully decoded. That turns a
+        # full 2-hour decode into a keyframe scan — dramatically faster, and
+        # keyframe-accurate timestamps are plenty for a scrub filmstrip.
+        pre = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
+        if fast:
+            pre += ["-hwaccel", "auto", "-skip_frame", "nokey"]
+        return pre + ["-i", source_path, "-vf", vf, "-frames:v", "1",
+                      "-q:v", "5", "-an", tmp_path]
+
+    # A full uniform-sample decode of a long source is the cost here; generous
+    # ceiling so 2h films finish, short clips return instantly.
+    proc = _run(_sprite_cmd(fast=True), timeout=1800)
+    if proc.returncode != 0 or not os.path.isfile(tmp_path) or os.path.getsize(tmp_path) == 0:
+        # Fast path unsupported on this box (no HW decoder / codec quirk) —
+        # retry with a plain software full-decode.
+        logger.info("sprite fast path failed (rc=%s), retrying software", proc.returncode)
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        proc = _run(_sprite_cmd(fast=False), timeout=1800)
     if proc.returncode != 0 or not os.path.isfile(tmp_path) or os.path.getsize(tmp_path) == 0:
         logger.warning(
             "sprite ffmpeg failed (rc=%s): %s",

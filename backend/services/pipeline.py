@@ -30,6 +30,10 @@ from backend.services.audio_analyzer import analyze_audio_energy, format_audio_e
 
 logger = logging.getLogger(__name__)
 
+# Strong refs to fire-and-forget background tasks (e.g. editor scrub-asset
+# prep) so the event loop doesn't garbage-collect them mid-run.
+_BACKGROUND_TASKS: set = set()
+
 # Project root — the directory that holds the legacy
 # ``/app/clipper_config.json`` location. Kept for the migration read
 # inside :func:`clipper_config_path`; live writes go to
@@ -3660,6 +3664,36 @@ async def _run_analysis_inner(job_id: str, resume: bool = False):
     job_dir = f"/data/uploads/{job_id}"
     frames_dir = os.path.join(job_dir, "frames")
     audio_path = os.path.join(job_dir, "audio.wav")
+
+    # ── Editor scrub assets (filmstrip sprite + waveform peaks + faststart) ──
+    # Kicked in the BACKGROUND at the very start of analysis, in parallel with
+    # the pipeline, so the timeline filmstrip + waveform are ready soon after
+    # import — not only when analysis finishes — and so faststart never blocks
+    # import. Best-effort; the /api/jobs/{id}/filmstrip.* endpoints lazily
+    # regenerate if this didn't finish. moov relocation makes the sprite's own
+    # seeks (and the editor's <video>) fast.
+    async def _prep_editor_assets():
+        try:
+            from backend.services.faststart import ensure_faststart
+            await asyncio.to_thread(ensure_faststart, video_path)
+        except Exception as _fe:
+            logger.warning("[%s] bg faststart failed: %s", job_id, _fe)
+        try:
+            from backend.services.filmstrip_generator import generate_sprite, generate_peaks
+            await asyncio.to_thread(generate_sprite, video_path, job_dir)
+            _pk_src = audio_path if os.path.exists(audio_path) else video_path
+            await asyncio.to_thread(generate_peaks, _pk_src, job_dir)
+            logger.info("[%s] editor scrub assets ready (background)", job_id)
+        except Exception as _se:
+            logger.warning("[%s] bg sprite/peaks failed: %s", job_id, _se)
+    try:
+        _editor_prep_task = asyncio.get_running_loop().create_task(_prep_editor_assets())
+        # Hold a reference so the fire-and-forget task isn't GC'd mid-run.
+        _BACKGROUND_TASKS.add(_editor_prep_task)
+        _editor_prep_task.add_done_callback(_BACKGROUND_TASKS.discard)
+    except RuntimeError:
+        pass
+
     # Snapshot before this run overwrites it — used to keep the Compute card
     # complete when resuming from an engine checkpoint (some rows can't be
     # rebuilt without a live engine / fresh extraction this run).
@@ -5466,23 +5500,6 @@ async def _run_analysis_inner(job_id: str, resume: bool = False):
         )
     except Exception as _ovre:
         logger.warning("[%s] detection_overlay.json write failed: %s", job_id, _ovre)
-
-    # ── Editor scrub assets: filmstrip sprite + waveform peaks ──
-    # The NLE timeline slices a precomputed sprite sheet and draws a peaks
-    # array instead of seeking a hidden <video> / decoding 10MB in the
-    # browser — that's what makes long-video load feel instant, like
-    # Premiere Web. Both are best-effort sidecars in the job dir, served by
-    # /api/jobs/{id}/filmstrip.json|.jpg and /waveform.json. Generated in a
-    # worker thread (FFmpeg CPU work) so heartbeats/WS keep flowing; the
-    # audio.wav from the Whisper stage lets peaks skip a video re-decode.
-    try:
-        from backend.services.filmstrip_generator import generate_sprite, generate_peaks
-        await asyncio.to_thread(generate_sprite, video_path, job_dir)
-        _peaks_src = audio_path if os.path.exists(audio_path) else video_path
-        await asyncio.to_thread(generate_peaks, _peaks_src, job_dir)
-        logger.info("[%s] filmstrip sprite + waveform peaks written", job_id)
-    except Exception as _fse:
-        logger.warning("[%s] filmstrip/waveform precompute failed: %s", job_id, _fse)
 
     # ── Reframe quality grade (A-F, 0-100 score, per-axis sub-scores) ──
     reframe_report = None
