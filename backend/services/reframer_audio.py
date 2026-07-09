@@ -2193,7 +2193,7 @@ class AudioIntelligence:
                         merged = _cross_validate_segments(
                             sorted(segs + new_segs,
                                    key=lambda s: float(s.get('start_sec', 0) or 0)))
-                        recovered = len(merged) - len(segs)
+                        recovered = max(0, len(merged) - len(segs))
                         result['segments'] = merged
                         # Rebuild speech_active from the merged set.
                         sa = {}
@@ -2203,6 +2203,31 @@ class AudioIntelligence:
                             for t in range(s0, s1, 100):
                                 sa[t] = True
                         result['speech_active'] = sa
+                        # Rebuild the coverage ledger too — the TACT planner reads
+                        # it as the covered-speech map, so a recovered run must be
+                        # marked 'covered_speech' or the planner would redundantly
+                        # gap-fill a region we just recovered.
+                        _dur_s = (duration_ms or 0) / 1000.0
+                        if not _dur_s and merged:
+                            _dur_s = max(float(s.get('end_sec', 0) or 0) for s in merged)
+                        if _dur_s > 0:
+                            led = CoverageLedger(bin_width_ms=20,
+                                                 duration_ms=int(_dur_s * 1000))
+                            for t in range(0, int(_dur_s * 1000), 20):
+                                led.bins[t] = LedgerBin(status='uncovered')
+                            for entry in merged:
+                                for w in entry.get('words') or [
+                                        {'start': entry.get('start_sec', 0),
+                                         'end': entry.get('end_sec', 0),
+                                         'confidence': 0.9}]:
+                                    for t in range(int(float(w.get('start', 0) or 0) * 1000),
+                                                   int(float(w.get('end', 0) or 0) * 1000), 20):
+                                        if t in led.bins:
+                                            led.bins[t] = LedgerBin(
+                                                status='covered_speech',
+                                                source=entry.get('source', 'remote'),
+                                                confidence=w.get('confidence', 0.9))
+                            result['coverage_ledger'] = led
                         # Re-measure coverage after recovery.
                         st = SC.coverage_stats(voice, _covered(merged))
                         result['speech_coverage'] = st
