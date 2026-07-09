@@ -72,24 +72,6 @@ def _wrong_script_for_language(text: str, language) -> bool:
     return (latin / letters) >= 0.60 and (cjk / letters) < 0.10
 
 
-def _cjk_char_count(text: str) -> int:
-    """Count Han / kana / Hangul characters (script proof of CJK speech)."""
-    n = 0
-    for ch in (text or ""):
-        o = ord(ch)
-        if (0x3040 <= o <= 0x30FF        # hiragana + katakana
-                or 0x3400 <= o <= 0x9FFF  # CJK ideographs
-                or 0xAC00 <= o <= 0xD7A3  # Hangul syllables
-                or 0xF900 <= o <= 0xFAFF  # CJK compat ideographs
-                or 0xFF66 <= o <= 0xFF9D):  # half-width katakana
-            n += 1
-    return n
-
-
-def _latin_char_count(text: str) -> int:
-    return sum(1 for ch in (text or "") if "a" <= ch.lower() <= "z")
-
-
 def _collapse_repeated_phrases(text: str) -> str:
     """Collapse an immediate repeat-loop WITHIN a single cue's text.
 
@@ -265,71 +247,6 @@ def _detect_language_multiwindow(engine, video_path: str, duration_ms: int):
     lang, score = max(votes.items(), key=lambda kv: kv[1])
     detail = ', '.join(f'{k}:{v:.2f}' for k, v in sorted(votes.items(), key=lambda kv: -kv[1]))
     return lang, score, detail
-
-
-def _detect_language_remote_multiwindow(remote_engine, video_path: str,
-                                        duration_ms: int, model: str = ""):
-    """Vote on the spoken language via the REMOTE server across several windows.
-
-    The companion (whisper.cpp) auto-detects language from a SINGLE window, so a
-    music intro / breathy dialogue makes it label a Japanese video ``english``
-    and hallucinate English cues over the JA audio. There is no local Whisper
-    engine on the remote path to run ``_detect_language_multiwindow``, so we
-    probe a handful of spread-out 30s windows over the remote endpoint itself,
-    then vote — with a script override: any window whose returned TEXT is
-    dominated by CJK is proof of CJK speech no matter what ``language`` the
-    server reported. Returns ``(language, detail)`` or ``(None, detail)`` so the
-    caller keeps auto-detect on failure.
-    """
-    import tempfile
-    dur_s = max(1, int((duration_ms or 0) / 1000))
-    if dur_s <= 90:
-        starts = [max(0, dur_s // 3)]
-    else:
-        # Skip the intro; spread six probes across the body (long videos drift).
-        starts = [int(dur_s * f) for f in (0.12, 0.3, 0.45, 0.6, 0.75, 0.9)]
-    votes: dict = {}
-    probed = 0
-    for start in starts:
-        wav = tempfile.mktemp(suffix='.wav')
-        try:
-            subprocess.run(
-                ['ffmpeg', '-y', '-ss', str(start), '-t', '30', '-i', video_path,
-                 '-vn', '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le', wav],
-                capture_output=True, timeout=90)
-            if not os.path.exists(wav) or os.path.getsize(wav) < 2000:
-                continue
-            with open(wav, 'rb') as fh:
-                wav_bytes = fh.read()
-            lang, wtext = remote_engine.probe_language(
-                wav_bytes, os.path.basename(wav), model=model)
-            probed += 1
-            cjk = _cjk_char_count(wtext)
-            latin = _latin_char_count(wtext)
-            if cjk >= 8 and cjk >= latin:
-                # Confident CJK window. Keep the server's CJK code when it gave
-                # one (ja/zh/ko); otherwise a mislabeled 'en'/none over CJK text
-                # is Japanese (the dominant CJK STT case; a real zh/ko job still
-                # reports its own code and wins its own windows).
-                key = lang if (lang in _CJK_SCRIPT_LANGS) else "ja"
-                votes[key] = votes.get(key, 0.0) + float(cjk)
-            elif lang:
-                # Weight a Latin-script window by how much it actually said, so
-                # an empty / music window barely counts toward 'en'.
-                votes[lang] = votes.get(lang, 0.0) + float(max(1, len(wtext.strip())))
-        except Exception:
-            continue
-        finally:
-            try:
-                os.remove(wav)
-            except Exception:
-                pass
-    if not votes:
-        return None, f'no language over {probed} remote window(s)'
-    lang, _score = max(votes.items(), key=lambda kv: kv[1])
-    detail = ', '.join(f'{k}:{int(v)}' for k, v in
-                       sorted(votes.items(), key=lambda kv: -kv[1]))
-    return lang, f'{detail} across {probed} remote window(s)'
 
 
 def _vad_parameters() -> dict:
@@ -811,39 +728,6 @@ class RemoteWhisperEngine:
             logger.warning("Remote Whisper chunked upload could not run (%s) — "
                            "falling back to local", e)
             return None
-
-    def probe_language(self, wav_bytes: bytes, filename: str,
-                       model: str = "") -> tuple:
-        """POST a short window and return ``(language, text)`` the server saw.
-
-        Used by the multi-window language vote so the FULL request can PIN a
-        language instead of letting the companion auto-detect per window (which
-        mis-reads music intros / breathy JA audio as English). One attempt, no
-        chunking — a probe that fails is simply skipped by the caller. Uses the
-        SAME model the main pass will load so the companion doesn't thrash
-        between whisper.cpp models.
-        """
-        model = model or self.model or remote_whisper_pick_model(None)
-        data = {
-            "model": model,
-            "response_format": "verbose_json",
-        }
-        headers = self._headers()
-        if model:
-            headers["X-ClipAI-Whisper-Model"] = model
-        ok, payload, _retryable, _detail, _ra = self._post_wav(
-            wav_bytes, filename, data, headers)
-        if not ok or not isinstance(payload, dict):
-            return None, ""
-        lang = payload.get("language")
-        text = payload.get("text") or ""
-        if not text:
-            try:
-                text = " ".join((s.get("text") or "")
-                                for s in (payload.get("segments") or []))
-            except Exception:
-                text = ""
-        return (str(lang).strip().lower() if lang else None), text
 
     def transcribe_wav(self, audio_path: str,
                        language: Optional[str] = None,
@@ -1449,6 +1333,41 @@ class AudioIntelligence:
             audio_size = os.path.getsize(audio_path)
             log.log_stage('AUDIO', f'Audio extracted: {audio_size/1048576:.1f} MB')
 
+            # ── Robust spoken-language pin (auto jobs, >= 2 min) ──
+            # Whisper's own language detection — and the Companion's whisper.cpp
+            # large-v3-turbo especially — mis-reads breathy / sparse-dialogue /
+            # music-heavy audio: a Japanese video was repeatedly detected as
+            # English and hallucinated into English cues, most of which the
+            # no-speech / phantom filters then dropped (so the transcript read as
+            # garbage English AND skipped most of the runtime). Identify the
+            # language straight from the audio with a dedicated classifier
+            # (VoxLingua107 on the server CPU — no Whisper decode, no GPU
+            # contention) and PIN it so every path (remote / cloud / local)
+            # forces the right language. Best-effort: on any failure we keep
+            # Whisper's own auto-detect (the multi-window Whisper vote below
+            # still runs for the local path when this leaves it unset).
+            if whisper_lang is None and (duration_ms or 0) >= 120000:
+                try:
+                    from backend.services.spoken_language_id import (
+                        identify_spoken_language)
+                    _slang, _sdetail = identify_spoken_language(
+                        video_path, duration_ms)
+                    if _slang:
+                        whisper_lang = _slang
+                        log.log_stage('AUDIO',
+                            f'Spoken language identified: {whisper_lang} '
+                            f'({_sdetail}) — pinned before transcription, '
+                            'overrides Whisper auto-detect (which mis-reads '
+                            'breathy/music-heavy audio)')
+                    else:
+                        log.log_stage('AUDIO',
+                            f'Spoken-language ID inconclusive ({_sdetail}) — '
+                            'falling back to Whisper auto-detect')
+                except Exception as _sl_err:
+                    log.log_stage('AUDIO',
+                        f'Spoken-language ID failed ({_sl_err}) — '
+                        'using Whisper auto-detect')
+
             # ── Remote Whisper (LAN server, e.g. the GPU Companion) ──
             # The audio (never the video) goes to the OpenAI-compatible
             # server picked in try_load(); output flows through the SAME
@@ -1460,33 +1379,11 @@ class AudioIntelligence:
                 _remote_engine = (self.engine
                                   if isinstance(self.engine, RemoteWhisperEngine)
                                   else RemoteWhisperEngine())
+                # whisper_lang was already pinned above by the dedicated
+                # spoken-language classifier (VoxLingua107) when the job is auto
+                # — so the companion request forces the right language instead of
+                # letting whisper.cpp's flaky single-pass auto-detect decide.
                 _remote_model = _remote_engine.model or remote_whisper_pick_model(whisper_lang)
-
-                # ── Pin the language BEFORE the full companion request ──
-                # The companion (whisper.cpp) auto-detects from a single window
-                # and mis-reads music intros / breathy dialogue — a Japanese
-                # video came back 'english' and was hallucinated into English
-                # cues over the JA audio. For any auto job, vote across several
-                # windows over the REMOTE endpoint (no local GPU needed) and
-                # PIN the winner so the full request forces the right language.
-                # Best-effort: on failure the companion still auto-detects.
-                if whisper_lang is None and (duration_ms or 0) >= 120000:
-                    try:
-                        _plang, _pdetail = _detect_language_remote_multiwindow(
-                            _remote_engine, video_path, duration_ms, model=_remote_model)
-                        if _plang:
-                            whisper_lang = _plang
-                            _remote_model = (_remote_engine.model
-                                             or remote_whisper_pick_model(whisper_lang))
-                            log.log_stage('AUDIO',
-                                f'Language pinned by remote multi-window vote: '
-                                f'{whisper_lang} ({_pdetail}) — overrides the companion '
-                                'single-window auto-detect (music/intros misread as en)')
-                    except Exception as _rl_err:
-                        log.log_stage('AUDIO',
-                            f'Remote language probe failed ({_rl_err}) — '
-                            'companion will auto-detect')
-
                 log.log_stage('AUDIO',
                     f'Remote Whisper: {_remote_engine.base} '
                     f'model={_remote_model} language={whisper_lang or "auto"}')

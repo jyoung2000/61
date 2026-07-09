@@ -1270,6 +1270,19 @@ class Settings(BaseSettings):
     DIARIZATION_MAX_SPEAKERS: int = 0  # 0 = unlimited (pyannote auto-detects)
     HF_AUTH_TOKEN: str = ""  # HuggingFace token for pyannote model access
 
+    # Spoken-language identification (SpeechBrain VoxLingua107). On an AUTO
+    # source-language job, Whisper's own detection — and the Companion's
+    # whisper.cpp large-v3-turbo especially — mis-reads breathy / sparse-dialogue
+    # / music-heavy audio (a Japanese video was repeatedly detected as English
+    # and hallucinated into English cues). This dedicated ECAPA language
+    # classifier reads the language straight from the audio, independent of any
+    # Whisper decode, and PINS it before transcription. Best-effort: if the
+    # model/deps are unavailable the pipeline falls back to Whisper auto-detect.
+    # ~40 MB one-time fetch; runs on CPU so it never contends for Whisper VRAM.
+    SPOKEN_LANGUAGE_ID_ENABLED: bool = True
+    SPOKEN_LANGUAGE_ID_MODEL: str = "speechbrain/lang-id-voxlingua107-ecapa"
+    SPOKEN_LANGUAGE_ID_WINDOWS: int = 8
+
     # Local audio diarization (SpeechBrain ECAPA) — the no-HF-token fallback used
     # when pyannote can't load. Real audio diarization (not just the visual
     # left/right heuristic), fully offline after a one-time ~80 MB model fetch.
