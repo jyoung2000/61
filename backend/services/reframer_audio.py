@@ -40,6 +40,23 @@ from backend.services.hallucination_filter import (
 _CJK_SCRIPT_LANGS = {"ja", "zh", "ko", "japanese", "chinese", "korean",
                      "yue", "zh-cn", "zh-tw", "ja-jp", "ko-kr"}
 
+# The languages Whisper (large-v3 / large-v3-turbo, and thus the Companion's
+# whisper.cpp) can decode. The spoken-language classifier (VoxLingua107) covers
+# 107 languages — a few of which Whisper does NOT support — so we only PIN a
+# detected language that is in this set; anything else falls back to Whisper's
+# own auto-detect rather than forcing a code the decoder would reject.
+_WHISPER_LANGUAGE_CODES = frozenset({
+    "en", "zh", "de", "es", "ru", "ko", "fr", "ja", "pt", "tr", "pl", "ca",
+    "nl", "ar", "sv", "it", "id", "hi", "fi", "vi", "he", "uk", "el", "ms",
+    "cs", "ro", "da", "hu", "ta", "no", "th", "ur", "hr", "bg", "lt", "la",
+    "mi", "ml", "cy", "sk", "te", "fa", "lv", "bn", "sr", "az", "sl", "kn",
+    "et", "mk", "br", "eu", "is", "hy", "ne", "mn", "bs", "kk", "sq", "sw",
+    "gl", "mr", "pa", "si", "km", "sn", "yo", "so", "af", "oc", "ka", "be",
+    "tg", "sd", "gu", "am", "yi", "lo", "uz", "fo", "ht", "ps", "tk", "nn",
+    "mt", "sa", "lb", "my", "bo", "tl", "mg", "as", "tt", "haw", "ln", "ha",
+    "ba", "jw", "su", "yue",
+})
+
 
 def _wrong_script_for_language(text: str, language) -> bool:
     """True when a cue's script contradicts the PINNED source language.
@@ -1352,13 +1369,19 @@ class AudioIntelligence:
                         identify_spoken_language)
                     _slang, _sdetail = identify_spoken_language(
                         video_path, duration_ms)
-                    if _slang:
+                    if _slang and _slang in _WHISPER_LANGUAGE_CODES:
                         whisper_lang = _slang
                         log.log_stage('AUDIO',
                             f'Spoken language identified: {whisper_lang} '
                             f'({_sdetail}) — pinned before transcription, '
                             'overrides Whisper auto-detect (which mis-reads '
                             'breathy/music-heavy audio)')
+                    elif _slang:
+                        # Detected a language Whisper can't decode — don't force
+                        # a code the decoder would reject; keep auto-detect.
+                        log.log_stage('AUDIO',
+                            f'Spoken language identified as {_slang} ({_sdetail}) '
+                            'but Whisper has no decoder for it — using auto-detect')
                     else:
                         log.log_stage('AUDIO',
                             f'Spoken-language ID inconclusive ({_sdetail}) — '
