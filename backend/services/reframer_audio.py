@@ -1417,6 +1417,14 @@ class AudioIntelligence:
                         _remote, audio_path, duration_ms, log, on_progress,
                         pinned_language=whisper_lang)
                     if _result is not None:
+                        # Voice-gated coverage audit + gap recovery: measure how
+                        # much of the ACTUAL speech (Silero VAD) the transcript
+                        # covers and re-transcribe only the voice-active runs the
+                        # companion missed — never silence. Fully guarded: any
+                        # failure returns the un-recovered result untouched.
+                        _result = self._audit_and_recover_speech(
+                            _result, audio_path, duration_ms, whisper_lang,
+                            _remote_engine, log)
                         _result['transcription_provider'] = 'remote'
                         _result['transcription_location'] = 'remote'
                         # Report the REMOTE model as the effective model so
@@ -2038,6 +2046,7 @@ class AudioIntelligence:
         _phantom_min_frac = float(getattr(settings, "WHISPER_PHANTOM_MIN_LOWCONF_FRAC", 0.80))
         _phantom_min_ns = float(getattr(settings, "WHISPER_PHANTOM_MIN_NO_SPEECH", 0.50))
         _script_on = bool(getattr(settings, "WHISPER_SCRIPT_FILTER", True))
+        _ns_drop = float(getattr(settings, "WHISPER_CLOUD_NO_SPEECH_DROP", 0.7))
         try:
             from backend.services.transcript_dedup import is_low_confidence_phantom as _phantom
         except Exception:
@@ -2048,7 +2057,7 @@ class AudioIntelligence:
             words = entry.get('words') or []
             if _is_boilerplate_hallucination(text):
                 entry['is_hallucination'] = True
-            elif ns > 0.7 and text:
+            elif ns > _ns_drop and text:
                 entry['is_hallucination'] = True
             elif (text and _script_on and pinned_language
                   and _wrong_script_for_language(text, pinned_language)):
@@ -2132,6 +2141,151 @@ class AudioIntelligence:
             'audio_events': [],
             'transcription_provider': cloud.get('provider'),
         }
+
+    def _audit_and_recover_speech(self, result: dict, audio_path: str,
+                                  duration_ms: int, whisper_lang,
+                                  remote_engine, log) -> dict:
+        """Measure speech coverage against an independent voice-activity map and
+        recover the voice-active runs the companion missed.
+
+        'Transcribe the whole video' means 'miss none of the SPEECH' — silence
+        must stay blank (forcing it invents cues). We take a Silero VAD map
+        (bundled with faster-whisper, so it's independent of the companion's
+        decode), report how much of the actual speech the transcript covers, and
+        re-transcribe ONLY the voice-active gaps via the companion. Fully
+        guarded: any failure returns ``result`` unchanged.
+        """
+        try:
+            if not bool(getattr(settings, "SPEECH_COVERAGE_AUDIT_ENABLED", True)):
+                return result
+            from backend.services import speech_coverage as SC
+            voice = SC.voice_activity_regions(audio_path)
+            if not voice:
+                return result  # VAD unavailable — keep behavior unchanged
+
+            def _covered(segs):
+                out = []
+                for s in segs or []:
+                    try:
+                        a = float(s.get('start_sec', s.get('start', 0)) or 0)
+                        b = float(s.get('end_sec', s.get('end', 0)) or 0)
+                        if b > a:
+                            out.append((a, b))
+                    except (TypeError, ValueError):
+                        continue
+                return out
+
+            segs = result.get('segments') or []
+            st = SC.coverage_stats(voice, _covered(segs))
+            result['speech_coverage'] = st
+
+            # ── Voice-gated gap recovery ──
+            recovered = 0
+            if (bool(getattr(settings, "SPEECH_GAP_RECOVERY_ENABLED", True))
+                    and remote_engine is not None):
+                gaps = SC.uncovered_voice_gaps(
+                    voice, _covered(segs),
+                    min_gap_s=float(getattr(settings, "SPEECH_GAP_MIN_SEC", 2.0)))
+                if gaps:
+                    new_segs = self._recover_voice_gaps_remote(
+                        gaps, audio_path, whisper_lang, remote_engine, log)
+                    if new_segs:
+                        merged = _cross_validate_segments(
+                            sorted(segs + new_segs,
+                                   key=lambda s: float(s.get('start_sec', 0) or 0)))
+                        recovered = len(merged) - len(segs)
+                        result['segments'] = merged
+                        # Rebuild speech_active from the merged set.
+                        sa = {}
+                        for entry in merged:
+                            s0 = (int(float(entry.get('start_sec', 0) or 0) * 1000) // 100) * 100
+                            s1 = int(float(entry.get('end_sec', 0) or 0) * 1000) + 100
+                            for t in range(s0, s1, 100):
+                                sa[t] = True
+                        result['speech_active'] = sa
+                        # Re-measure coverage after recovery.
+                        st = SC.coverage_stats(voice, _covered(merged))
+                        result['speech_coverage'] = st
+
+            log.log_stage('AUDIO',
+                f"Speech coverage: {st['coverage_ratio']:.0%} of voice-active "
+                f"audio transcribed ({st['covered_voice_sec']:.0f}s of "
+                f"{st['voice_sec']:.0f}s speech; "
+                f"{int(st['gap_count'])} gap(s), {st['uncovered_voice_sec']:.0f}s "
+                f"left)"
+                + (f" — recovered {recovered} missed cue(s)" if recovered else "")
+                + ". The untranscribed remainder of the runtime is music/silence "
+                "with no speech.")
+        except Exception as e:
+            log.log_stage('AUDIO', f'Speech-coverage audit skipped ({e})')
+        return result
+
+    def _recover_voice_gaps_remote(self, gaps, audio_path, whisper_lang,
+                                   remote_engine, log) -> list:
+        """Re-transcribe voice-active gap runs via the companion and return the
+        clean, offset segments to merge. Bounded by count + total duration; each
+        slice runs through the SAME hallucination filter as the main pass. Any
+        per-gap failure is skipped, never fatal."""
+        import tempfile
+        max_runs = int(getattr(settings, "SPEECH_GAP_RECOVERY_MAX_RUNS", 40))
+        max_total = float(getattr(settings, "SPEECH_GAP_RECOVERY_MAX_TOTAL_SEC", 900.0))
+        # Longest gaps first — that's where the most missed speech is.
+        ordered = sorted(gaps, key=lambda g: (g[1] - g[0]), reverse=True)
+        picked, total = [], 0.0
+        for g in ordered:
+            if len(picked) >= max_runs or total >= max_total:
+                break
+            picked.append(g)
+            total += (g[1] - g[0])
+        if not picked:
+            return []
+        picked.sort(key=lambda g: g[0])
+        log.log_stage('AUDIO',
+            f'Gap recovery: re-transcribing {len(picked)} voice-active run(s) '
+            f'({total:.0f}s) the companion missed')
+        _ns_drop = float(getattr(settings, "WHISPER_CLOUD_NO_SPEECH_DROP", 0.7))
+        out = []
+        for (a, b) in picked:
+            wav = tempfile.mktemp(suffix='.wav')
+            try:
+                # Small pad so a word straddling the boundary isn't clipped.
+                ss = max(0.0, a - 0.20)
+                dur = (b - a) + 0.40
+                subprocess.run(
+                    ['ffmpeg', '-y', '-ss', f'{ss:.3f}', '-t', f'{dur:.3f}',
+                     '-i', audio_path, '-vn', '-ac', '1', '-ar', '16000',
+                     '-c:a', 'pcm_s16le', wav],
+                    capture_output=True, timeout=120)
+                if not os.path.exists(wav) or os.path.getsize(wav) < 2000:
+                    continue
+                part = remote_engine.transcribe_wav(wav, whisper_lang)
+                for seg in (part or {}).get('segments') or []:
+                    text = (seg.get('text') or '').strip()
+                    if not text or _is_boilerplate_hallucination(text):
+                        continue
+                    ns = float(seg.get('no_speech_prob', 0.0) or 0.0)
+                    if ns > _ns_drop:
+                        continue
+                    if (whisper_lang and _wrong_script_for_language(text, whisper_lang)):
+                        continue
+                    # Shift slice-relative timestamps back to absolute video time.
+                    seg['start_sec'] = round(float(seg.get('start_sec', 0) or 0) + ss, 3)
+                    seg['end_sec'] = round(float(seg.get('end_sec', 0) or 0) + ss, 3)
+                    for w in seg.get('words') or []:
+                        for k in ('start', 'end'):
+                            if isinstance(w.get(k), (int, float)):
+                                w[k] = round(w[k] + ss, 3)
+                    seg['source'] = 'gap_recovery'
+                    seg['text'] = _collapse_repeated_phrases(text)
+                    out.append(seg)
+            except Exception:
+                continue
+            finally:
+                try:
+                    os.remove(wav)
+                except Exception:
+                    pass
+        return out
 
     def _redecode_difficult_segments(
         self, audio_path: str, segments: list, whisper_lang, log,

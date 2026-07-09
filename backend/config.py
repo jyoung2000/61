@@ -301,6 +301,36 @@ class Settings(BaseSettings):
     # sub-segments ≤ this length so timestamps stay accurate and the
     # subtitle track never shows a giant block. 0 disables the split.
     WHISPER_GAP_FILL_MAX_SEC: float = 8.0
+
+    # ── Speech-coverage audit + voice-gated gap recovery ──
+    # The remote/Companion path returns a full transcript but had NO gap
+    # recovery and no honest coverage measure — a blank stretch could be
+    # genuine silence OR missed speech and the user couldn't tell. We run an
+    # independent Silero voice-activity map (bundled with faster-whisper) over
+    # the audio, report what fraction of the ACTUAL speech the transcript
+    # covers, and — crucially — re-transcribe only the voice-active runs that
+    # were missed (never silence, so no hallucination flood). This is how we
+    # "transcribe the whole video": miss none of the speech, skip the silence.
+    SPEECH_COVERAGE_AUDIT_ENABLED: bool = True
+    # Opt-in: re-transcribing VAD-detected speech recovers soft/off-mic
+    # dialogue, but Silero can false-fire on loud non-verbal audio (moans /
+    # music), so enabling it trades a little hallucination risk for coverage.
+    # The audit above stays on regardless, so you can SEE the gaps first and
+    # only flip this on if they're real missed speech, not silence.
+    SPEECH_GAP_RECOVERY_ENABLED: bool = False
+    # Only recover a voice-active gap at least this long (short between-word
+    # gaps re-emit the same cue — not worth a round-trip).
+    SPEECH_GAP_MIN_SEC: float = 2.0
+    # Bound the recovery cost: at most this many gap runs and this much total
+    # audio re-sent to the transcription engine (a pathological VAD map can't
+    # explode into hundreds of requests).
+    SPEECH_GAP_RECOVERY_MAX_RUNS: int = 40
+    SPEECH_GAP_RECOVERY_MAX_TOTAL_SEC: float = 900.0
+    # Companion/cloud no_speech_prob above which a returned cue is treated as a
+    # hallucination and dropped. Raise toward 0.85 to KEEP more breathy/quiet
+    # dialogue (fewer drops = more coverage, slightly more risk of a phantom).
+    WHISPER_CLOUD_NO_SPEECH_DROP: float = 0.7
+
     # ── Anti-repetition / anti-hallucination decoding (Task 3) ──
     # condition_on_previous_text feeds each window the previous window's text
     # as a prompt. On music / singing / sparse-speech content (anime OP/ED,
