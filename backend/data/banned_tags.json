@@ -1,0 +1,21 @@
+{
+  "_comment": "Generic discovery tags that platforms now penalize or ignore (2025-2026 algorithm changes). Case-insensitive. 'shorts' is banned as a GENERIC tag on non-YouTube platforms only — #Shorts stays allowed on YouTube via youtube_allowed. The platform-rules self-researcher may update this file's live overlay (banned_tags.live.json in the writable state dir) without code changes.",
+  "banned": [
+    "fyp",
+    "foryou",
+    "foryoupage",
+    "fy",
+    "viral",
+    "viralvideo",
+    "trending",
+    "explore",
+    "explorepage",
+    "reels",
+    "reelsinstagram",
+    "instagood",
+    "shorts"
+  ],
+  "youtube_allowed": [
+    "shorts"
+  ]
+}

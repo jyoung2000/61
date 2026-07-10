@@ -1,7 +1,16 @@
 __pycache__/
 node_modules/
 frontend/dist/
-data/
+# Runtime bind-mount data dir at the repo root (./data/uploads, outputs, logs).
+# NOTE: a bare ``data/`` matches a dir named ``data`` at ANY depth, which
+# silently swallowed backend/data/*.json (committed SEO reference data) — the
+# Dockerfile's data-file assertion then failed every fresh build. Anchor the
+# ignore to the repo root so only ./data is excluded.
+/data/
+# backend/data/ holds COMMITTED SEO reference JSON (banned tags, evergreen
+# trends, platform rules), not runtime state — keep it tracked explicitly.
+!backend/data/
+!backend/data/**
 # Local settings file auto-created by backend/config.py when running outside
 # Docker (tests, local CLI). Can carry user API keys — never commit it.
 .env

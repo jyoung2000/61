@@ -1,0 +1,88 @@
+{
+  "_comment": "Static structured trend fallback (tier 3). Durable guidance only: question hooks, niche-tag mixing, keyword-first captions. NO dated hashtags and NO generic discovery tags (#fyp / #viral / #explorepage are penalized in 2026 and live on the banlist). hashtags stay empty on purpose — content-specific tags come from the clip itself; this tier only supplies hook patterns and search-behavior guidance.",
+  "platforms": {
+    "tiktok": {
+      "hashtags": [],
+      "keywords": [],
+      "hook_formats": [
+        "POV: ...",
+        "nobody talks about ...",
+        "the ... mistake everyone makes",
+        "things I wish I knew before ...",
+        "here's why ... actually works"
+      ],
+      "topics": [],
+      "sounds": []
+    },
+    "youtube_shorts": {
+      "hashtags": [],
+      "keywords": [],
+      "hook_formats": [
+        "How I ... in ...",
+        "Why ... actually works",
+        "... vs ... — which wins?",
+        "I tried ... for 7 days",
+        "The truth about ..."
+      ],
+      "topics": [],
+      "sounds": []
+    },
+    "reels": {
+      "hashtags": [],
+      "keywords": [],
+      "hook_formats": [
+        "Save this if you ...",
+        "3 things about ... nobody tells you",
+        "POV: ...",
+        "the easiest way to ..."
+      ],
+      "topics": [],
+      "sounds": []
+    },
+    "x": {
+      "hashtags": [],
+      "keywords": [],
+      "hook_formats": [
+        "hot take: ...",
+        "unpopular opinion: ...",
+        "the most underrated ...: ..."
+      ],
+      "topics": [],
+      "sounds": []
+    },
+    "facebook": {
+      "hashtags": [],
+      "keywords": [],
+      "hook_formats": [
+        "Can we talk about ...?",
+        "Tag someone who ...",
+        "I didn't expect ... to ..."
+      ],
+      "topics": [],
+      "sounds": []
+    },
+    "linkedin": {
+      "hashtags": [],
+      "keywords": [],
+      "hook_formats": [
+        "Three things I learned from ...",
+        "The biggest mistake I see in ...: ...",
+        "What ... taught me about ..."
+      ],
+      "topics": [],
+      "sounds": []
+    },
+    "youtube": {
+      "hashtags": [],
+      "keywords": [],
+      "hook_formats": [
+        "How to ... (step by step)",
+        "The truth about ...",
+        "... explained in 60 seconds",
+        "... vs ...: an honest comparison"
+      ],
+      "topics": [],
+      "sounds": []
+    }
+  }
+}

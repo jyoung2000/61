@@ -1,0 +1,118 @@
+{
+  "_comment": "Shipped platform SEO rules (verified July 2026 — see docs/SEO_OVERHAUL.md). PLATFORM_PROFILES loads this at startup; a platform_rules.live.json overlay written by the weekly self-researcher takes precedence field-by-field; the hardcoded dict in prompts.py is the last-resort fallback. 'guidance' may be a string or a list of lines (joined with newlines at load).",
+  "as_of": "2026-07",
+  "platforms": {
+    "tiktok": {
+      "label": "TikTok",
+      "title_max": 150,
+      "description_max": 4000,
+      "tag_min": 3,
+      "tag_max": 5,
+      "guidance": [
+        "TIKTOK profile — keyword-first search surface (2026). Discovery is driven by the caption text, the spoken audio (ASR), and on-screen text (OCR); hashtags are only a supporting signal.",
+        "TITLE: the first caption line (≤150 chars). Put the primary search keyword inside the first 50 characters. Lowercase, conversational, references a concrete moment from the clip.",
+        "DESCRIPTION: keyword-rich natural sentences (total ≤4000 chars incl. hashtags). First 50 chars carry the primary keyword; then 1-3 casual sentences adding context the video doesn't say. Hashtags on their own line at the end.",
+        "TAGS: 3-5 TARGETED hashtags tied to the actual subject. Generic discovery tags (#fyp, #foryou, #viral) are penalized/ignored — never use them.",
+        "PLATFORM_TIPS: 1 line on the sound/duet/stitch angle that would amplify this clip."
+      ]
+    },
+    "youtube_shorts": {
+      "label": "YouTube Shorts",
+      "title_max": 100,
+      "description_max": 5000,
+      "tag_min": 3,
+      "tag_max": 5,
+      "guidance": [
+        "YOUTUBE SHORTS profile — keyword-front-loaded, search-discoverable. Shorts can run up to 3 minutes.",
+        "TITLE: ≤100 chars, primary keyword inside the first 50. Title case. #Shorts in the title is OPTIONAL — auto-detection made it unnecessary; add it only when it reads naturally.",
+        "DESCRIPTION: 3-5 sentences; the primary keyword must appear in the first 100 chars (that's what search shows). Reference things actually SAID in the transcript for keyword density. End with 3-5 hashtags mirroring the primary keywords on their own line.",
+        "TAGS: 3-5 description hashtags mirroring the primary keywords. #Shorts allowed here.",
+        "PLATFORM_TIPS: 1 line on the thumbnail moment + the query this should rank for in Shorts search."
+      ]
+    },
+    "reels": {
+      "label": "Instagram Reels",
+      "title_max": 125,
+      "description_max": 2200,
+      "tag_min": 3,
+      "tag_max": 5,
+      "guidance": [
+        "INSTAGRAM REELS profile — keyword-rich captions drive discovery; hashtags are HARD-CAPPED at 5 per post (enforced Dec 2025; some accounts limited to 3).",
+        "TITLE: the first caption line (≤125 chars) — primary keyword inside the first 50 chars, most interesting thing first.",
+        "DESCRIPTION: 2-4 natural-language sentences a real person would write, keyword-first, ≤2200 chars. End with a question/CTA that invites comments, then a line break, then the hashtags IN THE CAPTION (not the first comment).",
+        "TAGS: 3-5 niche mid-tier hashtags tied to the subject. Generic tags (#reels, #explorepage, #viral) are actively discouraged — never use them.",
+        "PLATFORM_TIPS: 1 line on the on-screen text overlay + any trending audio pairing."
+      ]
+    },
+    "instagram": {
+      "label": "Instagram Feed",
+      "title_max": 125,
+      "description_max": 2200,
+      "tag_min": 3,
+      "tag_max": 5,
+      "guidance": [
+        "INSTAGRAM FEED profile — keyword-rich caption, hashtag-light (the 5-hashtag cap applies to feed posts too).",
+        "TITLE: opening hook (≤125 chars), primary keyword early — it's the line before 'more'.",
+        "DESCRIPTION: 2-5 sentences building context in a personal voice. Explicit CTA (\"save this if you...\"). Line break, then hashtags. ≤2200 chars.",
+        "TAGS: 3-5 micro-targeted niche hashtags. No generic discovery tags.",
+        "PLATFORM_TIPS: 1 line on posting window + carousel vs single."
+      ]
+    },
+    "youtube": {
+      "label": "YouTube (Long-form)",
+      "title_max": 70,
+      "description_max": 5000,
+      "tag_min": 5,
+      "tag_max": 10,
+      "guidance": [
+        "YOUTUBE LONG-FORM profile — SEO-optimized for search ranking + watch time.",
+        "TITLE: ≤70 chars (mobile cutoff), primary search keyword front-loaded. Title case. Numbers and brackets perform. No clickbait mismatch.",
+        "DESCRIPTION: 1000-3000 chars. First 100 chars MUST contain the primary keyword (they show in search). Then 2-3 paragraphs weaving in secondary keywords from the transcript, a timestamps section when scenes are available, a CTA paragraph, and hashtags at the bottom.",
+        "TAGS: 5-10 focused hashtags. The first 3 appear above the title — spend them on the highest-value ranking keywords. Mixed case OK.",
+        "PLATFORM_TIPS: 1 line on the thumbnail keyword + the chapter where retention is highest."
+      ]
+    },
+    "x": {
+      "label": "X (Twitter)",
+      "title_max": 280,
+      "description_max": 280,
+      "tag_min": 0,
+      "tag_max": 3,
+      "guidance": [
+        "X / TWITTER profile — the hook IS the post; hashtags are deprioritized.",
+        "TITLE: the post body, ≤280 chars INCLUDING hashtags. One punchy line carrying the primary keyword naturally; optionally a second line of context.",
+        "DESCRIPTION: an alternate longer wording (≤280 chars) — return empty string if the title already says it.",
+        "TAGS: 0-3 hashtags MAX — the best post often has zero. Never stuff.",
+        "PLATFORM_TIPS: 1 line — standalone post, reply to a trending topic, or thread opener."
+      ]
+    },
+    "facebook": {
+      "label": "Facebook",
+      "title_max": 100,
+      "description_max": 63206,
+      "tag_min": 2,
+      "tag_max": 4,
+      "guidance": [
+        "FACEBOOK profile — conversational, comment-bait, low-hashtag.",
+        "TITLE: ≤100 chars; the first 80 are what mobile shows before 'See more' — hook and keyword go there.",
+        "DESCRIPTION: 2-5 sentences in a personal voice, 200-500 chars sweet spot, ending with a question or invitation (comments and shares are the ranking fuel).",
+        "TAGS: 2-4 hashtags — three well-chosen tags beat fifteen.",
+        "PLATFORM_TIPS: 1 line — Reel vs feed video vs boosted post."
+      ]
+    },
+    "linkedin": {
+      "label": "LinkedIn",
+      "title_max": 150,
+      "description_max": 3000,
+      "tag_min": 3,
+      "tag_max": 5,
+      "guidance": [
+        "LINKEDIN profile — professional voice, insight-led, hashtag-light.",
+        "TITLE: insight-led hook ≤150 chars — lead with the takeaway, not the format. No emojis.",
+        "DESCRIPTION: 3-7 sentences as single-line paragraphs (white space wins). Insight → one concrete example from the transcript → a question inviting professional comments. 500-1500 chars.",
+        "TAGS: 3-5 industry-specific hashtags in CamelCase (#ProductDesign) — they drive topic clustering.",
+        "PLATFORM_TIPS: 1 line on the target reader role + personal vs company page."
+      ]
+    }
+  }
+}
