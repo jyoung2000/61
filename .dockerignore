@@ -32,6 +32,11 @@ clipai-env-backup
 frontend/dist/
 frontend/.vite/
 
+# Companion build output — the image builds these itself (companion-builder
+# stage); a stray local cargo/vite build here would ship GBs of context.
+companion/dist/
+companion/src-tauri/target/
+
 # Secrets / env (provided at runtime via compose env_file / bind mount).
 .env
 .env.*
