@@ -299,6 +299,55 @@ def _beam_size() -> int:
         return 5
 
 
+def _wait_for_sibling_audio(final_path: str, part_path: str,
+                            duration_ms: int = 0,
+                            grace_s: float = 20.0,
+                            poll_s: float = 2.0,
+                            sleep=None) -> bool:
+    """Wait for the pipeline's shared ``audio.wav`` to finish extracting.
+
+    The pipeline's ``extract_audio`` writes atomically: ffmpeg streams into
+    ``audio.wav.part.wav`` and the final path appears only via os.replace()
+    when complete. So the transcription thread can safely WAIT instead of
+    re-running the whole preconditioning chain (highpass+afftdn+loudnorm —
+    minutes of duplicated CPU on a long video):
+
+      * final file exists            → ready (True)
+      * ``.part.wav`` marker exists  → extraction in flight; poll until the
+                                       marker disappears (bounded by a
+                                       duration-scaled cap)
+      * neither appears in ``grace_s`` → no pipeline extraction is running
+                                       (standalone engine use) → False
+
+    Returns True when the final file is ready to reuse. Never raises.
+    """
+    _sleep = sleep or _time.sleep
+    dur_s = max(0, int((duration_ms or 0) / 1000))
+    # Cap mirrors extract_audio's own duration-scaled timeout, plus slack.
+    cap_s = max(600.0, dur_s + 180.0)
+    waited = 0.0
+    saw_part = False
+    try:
+        while waited <= cap_s:
+            if os.path.isfile(final_path) and os.path.getsize(final_path) > 1024:
+                return True
+            if os.path.exists(part_path):
+                saw_part = True
+            elif saw_part:
+                # Marker vanished but no final file → extraction failed or was
+                # cleaned up; fall back to self-extraction immediately.
+                return (os.path.isfile(final_path)
+                        and os.path.getsize(final_path) > 1024)
+            elif waited >= grace_s:
+                # Never saw an extraction start — nobody is producing the file.
+                return False
+            _sleep(poll_s)
+            waited += poll_s
+    except Exception:
+        pass
+    return os.path.isfile(final_path) and os.path.getsize(final_path) > 1024
+
+
 def _gap_boost_af_args() -> list:
     """FFmpeg ``-af`` arguments that lift quiet / off-mic speech in a gap
     slice before the retry decode: high-pass out the rumble, denoise, then
@@ -1348,7 +1397,16 @@ class AudioIntelligence:
                 _precondition = bool(getattr(settings, "WHISPER_AUDIO_PRECONDITION", True))
                 _sibling_wav = os.path.join(
                     os.path.dirname(video_path) or ".", "audio.wav")
-                if os.path.isfile(_sibling_wav) and os.path.getsize(_sibling_wav) > 1024:
+                # extract_audio writes atomically (``.part.wav`` → rename), so
+                # the final file is COMPLETE whenever it exists — and when the
+                # pipeline's extraction is still in flight (the extraction↔
+                # perceive overlap), we WAIT for it instead of burning a second
+                # full preconditioning pass on the same audio.
+                _sibling_ready = _wait_for_sibling_audio(
+                    _sibling_wav, _sibling_wav + ".part.wav", duration_ms,
+                    grace_s=float(getattr(
+                        settings, "PIPELINE_SHARED_AUDIO_GRACE_S", 10.0)))
+                if _sibling_ready:
                     audio_path = _sibling_wav
                     _own_audio = False  # shared file — must NOT be deleted below
                     log.log_stage('AUDIO',

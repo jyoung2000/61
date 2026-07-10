@@ -1016,11 +1016,10 @@ async def _batch_prefill_translations(orchestrator, unique_texts, source_lang,
     if not unique_texts:
         return out
     batch_size = max(1, int(getattr(settings, "TRANSLATION_LLM_CLEANUP_BATCH_CUES", 30)))
-    for _b in range(0, len(unique_texts), batch_size):
-        if deadline is not None and _time.monotonic() > deadline:
-            logger.info("[%s] Batched cleanup budget reached (%d done)", job_id, len(out))
-            break
-        batch = unique_texts[_b:_b + batch_size]
+    batches = [unique_texts[_b:_b + batch_size]
+               for _b in range(0, len(unique_texts), batch_size)]
+
+    async def _run_batch(batch: list) -> "list[tuple[str, str]]":
         numbered = "\n".join(f"{k + 1}. {t}" for k, t in enumerate(batch))
         prompt = (
             (terms_block or "")
@@ -1038,9 +1037,31 @@ async def _batch_prefill_translations(orchestrator, unique_texts, source_lang,
         except Exception:
             raw = None
         parsed = _parse_batch_translation_response(raw or "", len(batch))
+        pairs = []
         for src, cand in zip(batch, parsed):
             v = _validate_translation(cand, source_lang)
             if v:
+                pairs.append((src, v))
+        return pairs
+
+    # Batches are independent (each carries its own numbered lines), so run a
+    # small WAVE of them concurrently instead of strictly serially — the wave
+    # size is the concurrency bound, and the budget deadline is re-checked
+    # between waves so an over-budget cleanup still stops promptly. A local
+    # Ollama simply queues the wave server-side (never slower than serial);
+    # cloud providers cut the stage's wall-clock by the wave width.
+    wave = max(1, int(getattr(settings, "TRANSLATION_LLM_CLEANUP_CONCURRENCY", 3)))
+    for _w in range(0, len(batches), wave):
+        if deadline is not None and _time.monotonic() > deadline:
+            logger.info("[%s] Batched cleanup budget reached (%d done)", job_id, len(out))
+            break
+        results = await asyncio.gather(
+            *(_run_batch(b) for b in batches[_w:_w + wave]),
+            return_exceptions=True)
+        for res in results:
+            if isinstance(res, Exception):
+                continue
+            for src, v in res:
                 out[src] = v
     return out
 
@@ -2167,24 +2188,17 @@ async def _auto_generate_clip_seo(
     except Exception:
         pass
 
+    # ── Plan phase (serial, no I/O): decide per clip whether SEO is needed,
+    # slice its transcript, and pre-build the per-platform prompts. Keeping
+    # this synchronous means the concurrent phase below shares NO mutable
+    # state except its own clip_dict (mutated in place, one owner each).
     generated = 0
     failed = 0
-    updated_clips = []
-    _seo_total = len(source_clips)
-    for _seo_idx, clip in enumerate(source_clips, 1):
-        # Visible, throttled progress so the activity log shows the SEO pass
-        # advancing instead of a silent multi-minute gap (the bar already sits
-        # at ~98% post-export; this only updates the message line + keepalive).
-        if _seo_idx == 1 or _seo_idx % 8 == 0 or _seo_idx == _seo_total:
-            set_heartbeat_stage(job_id, "SEO generation")
-            try:
-                await broadcast_ws(job_id, {
-                    "type": "status",
-                    "message": f"Generating SEO for clips… ({_seo_idx}/{_seo_total})",
-                })
-            except Exception:
-                pass
+    updated_clips: list = []
+    work: list = []   # (clip_dict, platform, clip_transcript)
+    for clip in source_clips:
         clip_dict = clip.model_dump() if hasattr(clip, "model_dump") else dict(clip)
+        updated_clips.append(clip_dict)
         platform = _resolve(clip_dict.get("platform"))
 
         # Skip clips that already carry SEO for this platform — the
@@ -2193,11 +2207,9 @@ async def _auto_generate_clip_seo(
         existing = (clip_dict.get("seo_by_platform") or {}).get(platform)
         if existing and (existing.get("title") if isinstance(existing, dict)
                          else getattr(existing, "title", "")):
-            updated_clips.append(clip_dict)
             continue
         if clip_dict.get("seo_title") and platform == _resolve(clip_dict.get("platform")):
             # Legacy SEO already populated for this platform.
-            updated_clips.append(clip_dict)
             continue
 
         start_s = float(clip_dict.get("start_time", 0.0) or 0.0)
@@ -2218,53 +2230,84 @@ async def _auto_generate_clip_seo(
             prompt_cache[platform] = build_platform_seo_prompt(
                 platform, trend_brief=_plat_section,
                 output_language=output_language)
+        work.append((clip_dict, platform, clip_transcript))
+
+    # ── Generate phase: bounded-concurrency fan-out. Each clip's SEO is one
+    # independent LLM round-trip, so running them serially made the stage's
+    # wall-clock N × provider latency. A small semaphore (SEO_PARALLEL_MAX)
+    # runs a few at once — cloud providers absorb it trivially; a local
+    # Ollama simply queues requests server-side, so it is never SLOWER than
+    # the serial order. Results are identical per clip: same prompt, same
+    # caps, same fail-soft handling; updated_clips keeps the source order
+    # because each worker mutates only its own pre-inserted dict.
+    _seo_total = len(work)
+    _done = 0
+    _sem = asyncio.Semaphore(max(1, int(getattr(settings, "SEO_PARALLEL_MAX", 4))))
+
+    async def _gen_one(clip_dict: dict, platform: str, clip_transcript: str):
+        nonlocal generated, failed, _done
         custom_prompts = base_prompts.model_copy(
             update={"seo": prompt_cache[platform]})
-
-        # Re-bind the orchestrator with the per-platform prompt for
-        # this single call. The constructor is cheap (no I/O) so the
-        # per-clip allocation cost is negligible.
+        # Re-bind a fresh orchestrator with the per-platform prompt for this
+        # single call. The constructor is cheap (no I/O), and per-task
+        # instances mean no shared provider state across concurrent calls.
         from backend.services.ai_orchestrator import AIOrchestrator
         platform_orch = AIOrchestrator(
             ws_broadcast=broadcast_ws, custom_prompts=custom_prompts,
         )
-        try:
-            seo, provider = await platform_orch.generate_seo(
-                clip_title=clip_dict.get("title", ""),
-                clip_transcript=clip_transcript,
-                video_summary=video_summary,
-                platform=platform,
-                job_id=job_id,
-            )
-            _brief_tags = []
+        async with _sem:
             try:
-                from backend.services.trend_brief import _requested_platform_keys
-                if _trend_struct is not None:
-                    _sec = (_trend_struct.platforms or {}).get(
-                        _requested_platform_keys(platform)[0])
-                    _brief_tags = list(getattr(_sec, "hashtags", []) or [])
+                seo, provider = await platform_orch.generate_seo(
+                    clip_title=clip_dict.get("title", ""),
+                    clip_transcript=clip_transcript,
+                    video_summary=video_summary,
+                    platform=platform,
+                    job_id=job_id,
+                )
+                _brief_tags = []
+                try:
+                    from backend.services.trend_brief import _requested_platform_keys
+                    if _trend_struct is not None:
+                        _sec = (_trend_struct.platforms or {}).get(
+                            _requested_platform_keys(platform)[0])
+                        _brief_tags = list(getattr(_sec, "hashtags", []) or [])
+                except Exception:
+                    pass
+                capped = enforce_platform_caps(seo.model_dump(), platform,
+                                               brief_hashtags=_brief_tags)
+                seo_record = ClipSEO(**capped)
+                seo_by_plat = dict(clip_dict.get("seo_by_platform") or {})
+                seo_by_plat[platform] = seo_record.model_dump()
+                clip_dict["seo_by_platform"] = seo_by_plat
+                # Mirror into legacy single-platform fields so any reader
+                # that still expects ``clip.seo_title`` keeps working.
+                clip_dict["seo_title"] = capped.get("title", "")
+                clip_dict["seo_description"] = capped.get("description", "")
+                clip_dict["seo_tags"] = capped.get("tags", [])
+                clip_dict["seo_platform_tips"] = capped.get("platform_tips", "")
+                generated += 1
+            except Exception as e:
+                logger.warning(
+                    "[%s] Auto-SEO generation failed for clip %s (%s/%s)",
+                    job_id, clip_dict.get("id"), platform, e,
+                )
+                failed += 1
+        # Visible, throttled progress so the activity log shows the SEO pass
+        # advancing instead of a silent multi-minute gap (the bar already sits
+        # at ~98% post-export; this only updates the message line + keepalive).
+        _done += 1
+        if _done == 1 or _done % 8 == 0 or _done == _seo_total:
+            set_heartbeat_stage(job_id, "SEO generation")
+            try:
+                await broadcast_ws(job_id, {
+                    "type": "status",
+                    "message": f"Generating SEO for clips… ({_done}/{_seo_total})",
+                })
             except Exception:
                 pass
-            capped = enforce_platform_caps(seo.model_dump(), platform,
-                                           brief_hashtags=_brief_tags)
-            seo_record = ClipSEO(**capped)
-            seo_by_plat = dict(clip_dict.get("seo_by_platform") or {})
-            seo_by_plat[platform] = seo_record.model_dump()
-            clip_dict["seo_by_platform"] = seo_by_plat
-            # Mirror into legacy single-platform fields so any reader
-            # that still expects ``clip.seo_title`` keeps working.
-            clip_dict["seo_title"] = capped.get("title", "")
-            clip_dict["seo_description"] = capped.get("description", "")
-            clip_dict["seo_tags"] = capped.get("tags", [])
-            clip_dict["seo_platform_tips"] = capped.get("platform_tips", "")
-            generated += 1
-        except Exception as e:
-            logger.warning(
-                "[%s] Auto-SEO generation failed for clip %s (%s/%s)",
-                job_id, clip_dict.get("id"), platform, e,
-            )
-            failed += 1
-        updated_clips.append(clip_dict)
+
+    if work:
+        await asyncio.gather(*(_gen_one(cd, p, t) for cd, p, t in work))
 
     if generated > 0 or failed > 0:
         await database.update_job_status(job_id, clips=updated_clips)

@@ -496,13 +496,30 @@ class Settings(BaseSettings):
     # Auto-degrades to the sequential order on GPUs under 6 GB total so a
     # 4 GB card never runs Demucs and YOLO at the same time.
     VOCAL_SEPARATION_CONCURRENT: bool = True
-    # Overlap frame extraction with the perceive stage. DISABLED by default: the
-    # concurrent transcription (optimization #1) reads the pipeline's audio.wav,
-    # so extraction must finish first — overlapping it raced the transcription
-    # (reading a half-written WAV → "Too much data for declared Content-Length"
-    # → fell back to LOCAL Whisper, which then fought YOLO for the small card).
-    # Kept as an opt-in flag; the safe wins are #1/#2/#3/#5.
-    PIPELINE_OVERLAP_EXTRACTION: bool = False
+    # Overlap frame+audio extraction with the perceive stage. Historically
+    # DISABLED because the concurrent transcription (optimization #1) could
+    # read a HALF-WRITTEN audio.wav ("Too much data for declared
+    # Content-Length" → local-Whisper fallback fighting YOLO for the card).
+    # That race is fixed: extract_audio now writes ATOMICALLY (ffmpeg streams
+    # into audio.wav.part.wav, os.replace() publishes the complete file) and
+    # the transcription's sibling-reuse WAITS on the in-flight marker instead
+    # of re-extracting — so the overlap is safe and ON by default. On a long
+    # video this hides the whole extraction (incl. the CPU-bound afftdn
+    # denoise chain) behind the face-detection pass AND removes the duplicate
+    # preconditioning ffmpeg run the perceiver used to pay. Set False for the
+    # strictly sequential legacy order.
+    PIPELINE_OVERLAP_EXTRACTION: bool = True
+    # How long the transcription thread waits for evidence that the pipeline
+    # is producing the shared audio.wav (the .part.wav marker or the final
+    # file) before deciding nobody is and self-extracting. Only relevant for
+    # standalone engine use — inside the pipeline the marker appears ~instantly.
+    PIPELINE_SHARED_AUDIO_GRACE_S: float = 10.0
+    # Concurrent per-clip SEO generations in the post-clip Auto-SEO stage.
+    # Each clip's SEO is one independent LLM round-trip; serially the stage
+    # cost N × provider latency. Cloud providers absorb a small fan-out
+    # trivially; a local Ollama queues requests server-side (never slower
+    # than serial). 1 = legacy serial order.
+    SEO_PARALLEL_MAX: int = 4
     FRAME_SAMPLE_RATE: int = 10        # seconds between frames (lower=more detail, slower)
     MAX_CLIP_CANDIDATES: int = 12
 
@@ -1150,6 +1167,11 @@ class Settings(BaseSettings):
     # translate still falls through to the per-cue + cloud-escalation path.
     TRANSLATION_LLM_CLEANUP_BATCH: bool = True
     TRANSLATION_LLM_CLEANUP_BATCH_CUES: int = 30
+    # How many cleanup batches fly concurrently (a WAVE). Batches are
+    # independent numbered-line requests, so a small fan-out cuts the stage's
+    # wall-clock by the wave width on cloud providers; a local Ollama queues
+    # the wave server-side (never slower than serial). 1 = legacy serial.
+    TRANSLATION_LLM_CLEANUP_CONCURRENCY: int = 3
     WHISPER_TRANSLATE_TO_EN: bool = True
     # Whisper-native translate is a second full ASR pass; it's only worth it when
     # it can run on the GPU. Below this much FREE VRAM it would fall back to CPU

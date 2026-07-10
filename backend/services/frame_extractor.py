@@ -1055,10 +1055,18 @@ async def extract_audio(
                 "highpass + loudnorm (most of the coverage benefit)",
                 video_duration / 60.0, denoise_max_min,
             )
+    # ATOMIC write: ffmpeg writes to a ``.part.wav`` sibling and the final
+    # path appears only via os.replace() once the file is COMPLETE. This is
+    # what makes the extraction↔perceive overlap race-free: a concurrent
+    # consumer (the perceiver's audio.wav reuse, the remote-Whisper upload)
+    # can never observe a half-written WAV — it either sees the finished
+    # file or no file (plus the in-flight ``.part.wav`` marker it can wait
+    # on — see reframer_audio's sibling reuse).
+    part_path = output_path + ".part.wav"
     cmd.extend([
         "-acodec", "pcm_s16le",
         "-ar", "16000", "-ac", "1",
-        output_path,
+        part_path,
     ])
     logger.info(
         "FFmpeg audio extraction command (precondition=%s): %s",
@@ -1068,40 +1076,50 @@ async def extract_audio(
     # the growing output file size into a live progress signal.
     expected_bytes = (int((video_duration or 0) * 16000 * 2) + 44
                       if (video_duration and progress_callback) else 0)
-    if progress_callback and expected_bytes > 0:
-        returncode, stderr = await _run_subprocess_with_file_progress(
-            cmd, output_path, expected_bytes, cancel_check, progress_callback)
-    else:
-        returncode, stderr = await _run_subprocess_cancellable(cmd, cancel_check)
-    if returncode != 0:
-        # Preconditioning can fail on unusual container layouts / corrupt
-        # audio streams. Retry once without filters so the analysis can
-        # still proceed — degraded coverage beats a hard failure.
-        if precondition:
-            logger.warning(
-                "Preconditioned audio extraction failed (exit %d). Retrying "
-                "without filters: %s",
-                returncode, _extract_ffmpeg_error(stderr),
-            )
-            fallback_cmd = [
-                "ffmpeg", "-y", "-i", video_path, "-vn",
-                "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
-                output_path,
-            ]
-            returncode, stderr = await _run_subprocess_cancellable(fallback_cmd, cancel_check)
+    try:
+        if progress_callback and expected_bytes > 0:
+            returncode, stderr = await _run_subprocess_with_file_progress(
+                cmd, part_path, expected_bytes, cancel_check, progress_callback)
+        else:
+            returncode, stderr = await _run_subprocess_cancellable(cmd, cancel_check)
         if returncode != 0:
-            error_msg = _extract_ffmpeg_error(stderr)
-            input_mb = os.path.getsize(video_path) / (1024 * 1024) if os.path.exists(video_path) else 0
-            try:
-                free_mb = shutil.disk_usage(os.path.dirname(output_path)).free / (1024 * 1024)
-            except OSError:
-                free_mb = -1
-            logger.error(
-                "ffmpeg audio extraction failed (exit %d)\n"
-                "Input: %s (%.1fMB)\nOutput: %s\nDisk free: %.0fMB\nError: %s",
-                returncode, video_path, input_mb, output_path, free_mb, error_msg,
-            )
-            raise RuntimeError(f"Audio extraction failed:\n{error_msg}")
+            # Preconditioning can fail on unusual container layouts / corrupt
+            # audio streams. Retry once without filters so the analysis can
+            # still proceed — degraded coverage beats a hard failure.
+            if precondition:
+                logger.warning(
+                    "Preconditioned audio extraction failed (exit %d). Retrying "
+                    "without filters: %s",
+                    returncode, _extract_ffmpeg_error(stderr),
+                )
+                fallback_cmd = [
+                    "ffmpeg", "-y", "-i", video_path, "-vn",
+                    "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+                    part_path,
+                ]
+                returncode, stderr = await _run_subprocess_cancellable(fallback_cmd, cancel_check)
+            if returncode != 0:
+                error_msg = _extract_ffmpeg_error(stderr)
+                input_mb = os.path.getsize(video_path) / (1024 * 1024) if os.path.exists(video_path) else 0
+                try:
+                    free_mb = shutil.disk_usage(os.path.dirname(output_path)).free / (1024 * 1024)
+                except OSError:
+                    free_mb = -1
+                logger.error(
+                    "ffmpeg audio extraction failed (exit %d)\n"
+                    "Input: %s (%.1fMB)\nOutput: %s\nDisk free: %.0fMB\nError: %s",
+                    returncode, video_path, input_mb, output_path, free_mb, error_msg,
+                )
+                raise RuntimeError(f"Audio extraction failed:\n{error_msg}")
+        os.replace(part_path, output_path)
+    finally:
+        # Never leave a stale marker behind — a lingering .part.wav would make
+        # a later run's readiness wait spin until its timeout.
+        try:
+            if os.path.exists(part_path):
+                os.remove(part_path)
+        except OSError:
+            pass
     if progress_callback:
         try:
             await progress_callback(1.0)
