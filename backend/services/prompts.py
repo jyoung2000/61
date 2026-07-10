@@ -434,198 +434,303 @@ DEFAULT_SEO_PROMPT = (
 #  and hashtag culture; using the same prompt for all of them produces
 #  generic copy that wins on none of them. The slugs match clip.platform
 #  values the bridge / clipper emit.
+#
+#  DATA-DRIVEN (2026 overhaul): the caps + guidance load from
+#  backend/data/platform_rules.json (shipped, verified July-2026 values) with
+#  a platform_rules.live.json overlay written by the weekly self-researcher
+#  (backend/services/platform_rules_research.py) taking field-level
+#  precedence, and the hardcoded dict below as the last-resort fallback.
+#  Precedence: overlay > shipped file > hardcoded.
 # ═══════════════════════════════════════════════════════════════════════════
 
-PLATFORM_PROFILES: dict[str, dict] = {
+_RULES_SHIPPED_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "data", "platform_rules.json")
+_RULES_OVERLAY_NAME = "platform_rules.live.json"
+
+# Hard fallback — mirrors the shipped platform_rules.json (July-2026 verified:
+# generic discovery tags penalized everywhere, Reels hard-capped at 5 tags,
+# TikTok 3-5 targeted tags / 4000-char keyword-first captions, #Shorts
+# optional). Keep in sync when editing the shipped file.
+_PROFILES_FALLBACK: dict[str, dict] = {
     "tiktok": {
-        "label": "TikTok",
-        "title_max": 150,
-        "description_max": 2200,
-        "tag_min": 5,
-        "tag_max": 8,
+        "label": "TikTok", "title_max": 150, "description_max": 4000,
+        "tag_min": 3, "tag_max": 5,
         "guidance": (
-            "TIKTOK profile — short-form, algorithm-driven, FYP-first.\n"
-            "TITLE: a 1-line hook that lands in the first 3 seconds (≤150 chars). "
-            "Lowercase, conversational, no marketing-speak. Reference a specific "
-            "moment, line, or visual from the clip so curious viewers tap.\n"
-            "DESCRIPTION: 1-2 short sentences then a line break then hashtags. "
-            "Keep the readable text ≤150 chars (TikTok truncates the rest behind 'see more'). "
-            "Hashtags belong INSIDE the description after a line break — TikTok ranks them. "
-            "Total under 2200 chars including hashtags.\n"
-            "TAGS: 5-8 hashtags. Mix one big-discovery tag (#fyp / #foryou / "
-            "#foryoupage) with niche tags tied to the actual subject. Avoid "
-            "tag stuffing — TikTok's algorithm penalises >8 unrelated tags. "
-            "All lowercase.\n"
-            "PLATFORM_TIPS: 1 line on which sound, trend, or duet/stitch "
-            "angle would amplify this clip."
+            "TIKTOK profile — keyword-first search surface (2026). Discovery is "
+            "driven by the caption text, the spoken audio (ASR), and on-screen "
+            "text (OCR); hashtags are only a supporting signal.\n"
+            "TITLE: the first caption line (≤150 chars). Put the primary search "
+            "keyword inside the first 50 characters. Lowercase, conversational, "
+            "references a concrete moment from the clip.\n"
+            "DESCRIPTION: keyword-rich natural sentences (total ≤4000 chars incl. "
+            "hashtags). First 50 chars carry the primary keyword; then 1-3 casual "
+            "sentences adding context the video doesn't say. Hashtags on their own "
+            "line at the end.\n"
+            "TAGS: 3-5 TARGETED hashtags tied to the actual subject. Generic "
+            "discovery tags (#fyp, #foryou, #viral) are penalized/ignored — never "
+            "use them.\n"
+            "PLATFORM_TIPS: 1 line on the sound/duet/stitch angle that would "
+            "amplify this clip."
         ),
     },
     "youtube_shorts": {
-        "label": "YouTube Shorts",
-        "title_max": 100,
-        "description_max": 5000,
-        "tag_min": 3,
-        "tag_max": 6,
+        "label": "YouTube Shorts", "title_max": 100, "description_max": 5000,
+        "tag_min": 3, "tag_max": 5,
         "guidance": (
-            "YOUTUBE SHORTS profile — keyword-front-loaded, search-discoverable.\n"
-            "TITLE: under 100 chars, front-load the primary keyword/topic, end with "
-            "#Shorts. Avoid lowercase-only — title case helps Shorts search. Example: "
-            "\"How I Hit a 12-Foot Wave for the First Time #Shorts\".\n"
-            "DESCRIPTION: 3-5 sentences. First sentence reuses the title keyword and "
-            "describes what the viewer sees in the first 3 seconds (this is what shows "
-            "before 'show more'). Body sentences reference specific things SAID in the "
-            "transcript so the algorithm has keyword density. End with 3-5 hashtags on "
-            "their own line. Include a soft CTA (\"subscribe for more\"). Total 400-800 chars.\n"
-            "TAGS: 3-6 hashtags, MUST include #Shorts as the first tag. Add 2-4 topic "
-            "tags. Mixed case allowed (#Shorts not #shorts).\n"
-            "PLATFORM_TIPS: 1 line on the suggested thumbnail moment + the keyword "
-            "this should rank for in Shorts search."
+            "YOUTUBE SHORTS profile — keyword-front-loaded, search-discoverable. "
+            "Shorts can run up to 3 minutes.\n"
+            "TITLE: ≤100 chars, primary keyword inside the first 50. Title case. "
+            "#Shorts in the title is OPTIONAL — auto-detection made it "
+            "unnecessary; add it only when it reads naturally.\n"
+            "DESCRIPTION: 3-5 sentences; the primary keyword must appear in the "
+            "first 100 chars (that's what search shows). Reference things actually "
+            "SAID in the transcript for keyword density. End with 3-5 hashtags "
+            "mirroring the primary keywords on their own line.\n"
+            "TAGS: 3-5 description hashtags mirroring the primary keywords. "
+            "#Shorts allowed here.\n"
+            "PLATFORM_TIPS: 1 line on the thumbnail moment + the query this "
+            "should rank for in Shorts search."
         ),
     },
     "reels": {
-        "label": "Instagram Reels",
-        "title_max": 125,
-        "description_max": 2200,
-        "tag_min": 15,
-        "tag_max": 20,
+        "label": "Instagram Reels", "title_max": 125, "description_max": 2200,
+        "tag_min": 3, "tag_max": 5,
         "guidance": (
-            "INSTAGRAM REELS profile — caption-driven, emoji-friendly, hashtag-heavy.\n"
-            "TITLE: short hook line (≤125 chars), can use 1-2 emojis. This becomes the "
-            "first line of the caption (the part visible before 'more'), so put the most "
-            "interesting thing first.\n"
-            "DESCRIPTION: 2-4 sentences in a conversational, on-brand voice. Emojis "
-            "welcome but not stuffed. End with a question or CTA that invites comments "
-            "(Reels reward comment velocity). Then a line break, then hashtags. Total "
-            "under 2200 chars.\n"
-            "TAGS: 15-20 hashtags. Mix three reach tiers: 3-4 huge (#reels, #explorepage, "
-            "#viral), 6-8 mid-reach niche, 4-6 specific micro-niche. All lowercase. "
-            "Hashtags inside the caption rank, but a separate line break before them "
-            "keeps the caption readable.\n"
-            "PLATFORM_TIPS: 1 line on the on-screen text overlay that would lift this "
-            "Reel + any trending audio the clip could be paired with."
+            "INSTAGRAM REELS profile — keyword-rich captions drive discovery; "
+            "hashtags are HARD-CAPPED at 5 per post (enforced Dec 2025; some "
+            "accounts limited to 3).\n"
+            "TITLE: the first caption line (≤125 chars) — primary keyword inside "
+            "the first 50 chars, most interesting thing first.\n"
+            "DESCRIPTION: 2-4 natural-language sentences a real person would "
+            "write, keyword-first, ≤2200 chars. End with a question/CTA that "
+            "invites comments, then a line break, then the hashtags IN THE "
+            "CAPTION (not the first comment).\n"
+            "TAGS: 3-5 niche mid-tier hashtags tied to the subject. Generic tags "
+            "(#reels, #explorepage, #viral) are actively discouraged — never use "
+            "them.\n"
+            "PLATFORM_TIPS: 1 line on the on-screen text overlay + any trending "
+            "audio pairing."
         ),
     },
     "instagram": {
-        "label": "Instagram Feed",
-        "title_max": 125,
-        "description_max": 2200,
-        "tag_min": 10,
-        "tag_max": 15,
+        "label": "Instagram Feed", "title_max": 125, "description_max": 2200,
+        "tag_min": 3, "tag_max": 5,
         "guidance": (
-            "INSTAGRAM FEED profile — community-tone, hashtag-balanced.\n"
-            "TITLE: opening hook (≤125 chars), the first line before 'more'. "
-            "Conversational, can carry one emoji.\n"
-            "DESCRIPTION: 2-5 sentences, slightly longer than Reels. Build a story or "
-            "context. End with an explicit CTA (\"save this if you...\", \"comment your "
-            "favorite...\"). Line break, then 10-15 hashtags. Total under 2200 chars.\n"
-            "TAGS: 10-15 hashtags. Heavier on niche than reach — Feed posts don't get "
-            "the same FYP-style virality, so micro-targeted tags matter more. Lowercase.\n"
-            "PLATFORM_TIPS: 1 line on best posting window for this audience + whether "
-            "to push as a carousel or single."
+            "INSTAGRAM FEED profile — keyword-rich caption, hashtag-light (the "
+            "5-hashtag cap applies to feed posts too).\n"
+            "TITLE: opening hook (≤125 chars), primary keyword early — it's the "
+            "line before 'more'.\n"
+            "DESCRIPTION: 2-5 sentences building context in a personal voice. "
+            "Explicit CTA (\"save this if you...\"). Line break, then hashtags. "
+            "≤2200 chars.\n"
+            "TAGS: 3-5 micro-targeted niche hashtags. No generic discovery tags.\n"
+            "PLATFORM_TIPS: 1 line on posting window + carousel vs single."
         ),
     },
     "youtube": {
-        "label": "YouTube (Long-form)",
-        "title_max": 70,
-        "description_max": 5000,
-        "tag_min": 8,
-        "tag_max": 15,
+        "label": "YouTube (Long-form)", "title_max": 70, "description_max": 5000,
+        "tag_min": 5, "tag_max": 10,
         "guidance": (
-            "YOUTUBE LONG-FORM profile — SEO-optimized for search ranking + watch time.\n"
-            "TITLE: ≤70 chars (mobile cutoff). Front-load the primary search keyword. "
-            "Title case. Numbers and brackets perform — e.g. \"How I Built X in 24 Hours "
-            "[Day 1]\". Avoid clickbait; YouTube punishes mismatch.\n"
-            "DESCRIPTION: 1000-3000 chars. Structure:\n"
-            "  • Opening paragraph (2-3 sentences) — first 100 chars MUST contain the "
-            "    primary keyword; they appear in search results.\n"
-            "  • Body — 2-3 paragraphs of what the video covers, with the secondary "
-            "    keywords woven in naturally. Reference actual transcript content.\n"
-            "  • Timestamps section (\"0:00 Intro / 1:30 ...\") when scenes are available.\n"
-            "  • CTA paragraph (subscribe, related videos, mailing list).\n"
-            "  • Hashtags section at the bottom.\n"
-            "TAGS: 8-15 hashtags. The first 3 appear above the title — pick the highest-"
-            "value ranking keywords for those. Mixed case OK.\n"
-            "PLATFORM_TIPS: 1 line on the thumbnail keyword to feature + the suggested "
-            "chapter where retention is highest."
+            "YOUTUBE LONG-FORM profile — SEO-optimized for search ranking + "
+            "watch time.\n"
+            "TITLE: ≤70 chars (mobile cutoff), primary search keyword "
+            "front-loaded. Title case. Numbers and brackets perform. No clickbait "
+            "mismatch.\n"
+            "DESCRIPTION: 1000-3000 chars. First 100 chars MUST contain the "
+            "primary keyword (they show in search). Then 2-3 paragraphs weaving "
+            "in secondary keywords from the transcript, a timestamps section when "
+            "scenes are available, a CTA paragraph, and hashtags at the bottom.\n"
+            "TAGS: 5-10 focused hashtags. The first 3 appear above the title — "
+            "spend them on the highest-value ranking keywords. Mixed case OK.\n"
+            "PLATFORM_TIPS: 1 line on the thumbnail keyword + the chapter where "
+            "retention is highest."
         ),
     },
     "x": {
-        "label": "X (Twitter)",
-        "title_max": 280,
-        "description_max": 280,
-        "tag_min": 0,
-        "tag_max": 3,
+        "label": "X (Twitter)", "title_max": 280, "description_max": 280,
+        "tag_min": 0, "tag_max": 3,
         "guidance": (
-            "X / TWITTER profile — terse, no hashtag stuffing.\n"
-            "TITLE: same as the post body, ≤280 chars total INCLUDING any hashtags. The "
-            "hook IS the post — one punchy line, optionally with a second line for context. "
-            "Lowercase OK. Avoid hashtag stuffing — X demotes posts with >3 hashtags.\n"
-            "DESCRIPTION: an alternate longer version (up to 280 chars) for users who turn "
-            "on the longer reply-thread experience. Optional — return empty string if the "
-            "title already says everything.\n"
-            "TAGS: 0-3 hashtags MAX. Often the best post has zero hashtags and just a "
-            "@-mention or topical phrase.\n"
-            "PLATFORM_TIPS: 1 line on whether the clip should be a standalone post, a "
-            "reply to a trending topic, or the first of a thread."
+            "X / TWITTER profile — the hook IS the post; hashtags are "
+            "deprioritized.\n"
+            "TITLE: the post body, ≤280 chars INCLUDING hashtags. One punchy line "
+            "carrying the primary keyword naturally; optionally a second line of "
+            "context.\n"
+            "DESCRIPTION: an alternate longer wording (≤280 chars) — return empty "
+            "string if the title already says it.\n"
+            "TAGS: 0-3 hashtags MAX — the best post often has zero. Never stuff.\n"
+            "PLATFORM_TIPS: 1 line — standalone post, reply to a trending topic, "
+            "or thread opener."
         ),
     },
     "facebook": {
-        "label": "Facebook",
-        "title_max": 100,
-        "description_max": 63206,
-        "tag_min": 2,
-        "tag_max": 6,
+        "label": "Facebook", "title_max": 100, "description_max": 63206,
+        "tag_min": 2, "tag_max": 4,
         "guidance": (
-            "FACEBOOK profile — conversational, story-driven, low-hashtag.\n"
-            "TITLE: short attention-getter ≤100 chars. The first 80 chars are what shows "
-            "before 'See more' on mobile so put the hook there.\n"
-            "DESCRIPTION: 2-5 sentences in a personal voice. Facebook rewards comments and "
-            "shares, so end with a question or invitation. 200-500 chars is the sweet spot.\n"
-            "TAGS: 2-6 hashtags. Facebook's algorithm doesn't surface hashtags the way "
-            "Instagram/TikTok do — 3 well-chosen tags beats 15. Lowercase.\n"
-            "PLATFORM_TIPS: 1 line on whether this is best posted as a Reel, a feed video, "
-            "or boosted to a specific page audience."
+            "FACEBOOK profile — conversational, comment-bait, low-hashtag.\n"
+            "TITLE: ≤100 chars; the first 80 are what mobile shows before 'See "
+            "more' — hook and keyword go there.\n"
+            "DESCRIPTION: 2-5 sentences in a personal voice, 200-500 chars sweet "
+            "spot, ending with a question or invitation (comments and shares are "
+            "the ranking fuel).\n"
+            "TAGS: 2-4 hashtags — three well-chosen tags beat fifteen.\n"
+            "PLATFORM_TIPS: 1 line — Reel vs feed video vs boosted post."
         ),
     },
     "linkedin": {
-        "label": "LinkedIn",
-        "title_max": 150,
-        "description_max": 3000,
-        "tag_min": 3,
-        "tag_max": 6,
+        "label": "LinkedIn", "title_max": 150, "description_max": 3000,
+        "tag_min": 3, "tag_max": 5,
         "guidance": (
             "LINKEDIN profile — professional voice, insight-led, hashtag-light.\n"
-            "TITLE: thought-leader hook ≤150 chars. Lead with the takeaway / insight, NOT "
-            "the format. Avoid emojis. Examples: \"Three things I learned from shipping X.\"\n"
-            "DESCRIPTION: 3-7 sentences, single-line paragraphs (LinkedIn rewards "
-            "white-space). Lead with the insight, prove it with one specific example from "
-            "the clip's transcript, close with a question that invites professional comments. "
-            "500-1500 chars.\n"
-            "TAGS: 3-6 hashtags. LinkedIn's algorithm uses them for topic clustering — pick "
-            "industry-specific tags (#productdesign, #growthmarketing) over generic ones. "
-            "Camel case (#ProductDesign).\n"
-            "PLATFORM_TIPS: 1 line on the target reader role + whether to post from a "
-            "personal page or company page."
+            "TITLE: insight-led hook ≤150 chars — lead with the takeaway, not the "
+            "format. No emojis.\n"
+            "DESCRIPTION: 3-7 sentences as single-line paragraphs (white space "
+            "wins). Insight → one concrete example from the transcript → a "
+            "question inviting professional comments. 500-1500 chars.\n"
+            "TAGS: 3-5 industry-specific hashtags in CamelCase (#ProductDesign) — "
+            "they drive topic clustering.\n"
+            "PLATFORM_TIPS: 1 line on the target reader role + personal vs "
+            "company page."
         ),
     },
 }
 
-# Default for unknown / "both" / legacy values — falls back to a balanced
-# short-form profile so the generation doesn't silently degrade.
-PLATFORM_PROFILES["both"] = PLATFORM_PROFILES["tiktok"]
-PLATFORM_PROFILES["default"] = PLATFORM_PROFILES["tiktok"]
+# Sanity ranges for any file-loaded rule — a corrupt or hallucinated value
+# must never make it into the live profiles (Part 6 hard requirement).
+_RULE_BOUNDS = {
+    "title_max": (20, 500),
+    "description_max": (100, 100_000),
+    "tag_min": (0, 30),
+    "tag_max": (1, 30),
+}
+
+
+def validate_platform_rule(rule: dict) -> dict:
+    """Return only the sane fields of one platform's rule dict.
+
+    Numeric caps outside ``_RULE_BOUNDS`` (or a tag_min above tag_max) are
+    dropped field-by-field, so a partially-bad overlay still contributes its
+    good fields. ``guidance`` may be a string or a list of lines."""
+    out: dict = {}
+    if not isinstance(rule, dict):
+        return out
+    for key, (lo, hi) in _RULE_BOUNDS.items():
+        try:
+            v = int(rule[key])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if lo <= v <= hi:
+            out[key] = v
+    if ("tag_min" in out and "tag_max" in out
+            and out["tag_min"] > out["tag_max"]):
+        out.pop("tag_min")
+        out.pop("tag_max")
+    label = rule.get("label")
+    if isinstance(label, str) and label.strip():
+        out["label"] = label.strip()
+    guidance = rule.get("guidance")
+    if isinstance(guidance, list):
+        guidance = "\n".join(str(line) for line in guidance)
+    if isinstance(guidance, str) and guidance.strip():
+        out["guidance"] = guidance
+    return out
+
+
+def platform_rules_overlay_path() -> str:
+    """Where the weekly self-researcher writes its live rules overlay."""
+    from backend.services.seo_hygiene import writable_state_dir
+    return os.path.join(writable_state_dir(), _RULES_OVERLAY_NAME)
+
+
+def _read_rules_file(path: str) -> dict:
+    """{platform: validated-partial-rule} from a rules JSON; {} on failure."""
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except Exception:
+        return {}
+    plats = data.get("platforms") if isinstance(data, dict) else None
+    if not isinstance(plats, dict):
+        plats = data.get("rules") if isinstance(data, dict) else None
+    if not isinstance(plats, dict):
+        return {}
+    return {str(k): validate_platform_rule(v) for k, v in plats.items()
+            if str(k) in _PROFILES_FALLBACK and validate_platform_rule(v)}
+
+
+# Provenance for GET /api/seo/intel — which layer each profile came from.
+_PLATFORM_RULES_META: dict = {"source": "builtin", "refreshed": ""}
+
+
+def _load_platform_rules() -> dict[str, dict]:
+    """Compose the effective profiles: hardcoded ← shipped file ← overlay.
+
+    Field-level merge so a partial overlay (e.g. only tag caps) keeps the
+    shipped guidance text. Never raises — the hardcoded fallback always
+    stands underneath."""
+    import copy
+    profiles = copy.deepcopy(_PROFILES_FALLBACK)
+    source = "builtin"
+    refreshed = ""
+    try:
+        shipped = _read_rules_file(_RULES_SHIPPED_FILE)
+        if shipped:
+            source = "shipped"
+            for plat, rule in shipped.items():
+                profiles[plat].update(rule)
+    except Exception as e:
+        logger.warning("platform_rules.json unreadable (%s) — built-in rules", e)
+    try:
+        overlay_path = platform_rules_overlay_path()
+        overlay = _read_rules_file(overlay_path)
+        if overlay:
+            source = "live"
+            for plat, rule in overlay.items():
+                profiles[plat].update(rule)
+            try:
+                with open(overlay_path) as f:
+                    refreshed = str(json.load(f).get("date") or "")
+            except Exception:
+                pass
+    except Exception as e:
+        logger.debug("platform rules overlay skipped (%s)", e)
+    _PLATFORM_RULES_META.update({"source": source, "refreshed": refreshed})
+    # Default for unknown / "both" / legacy values — a balanced short-form
+    # profile so generation doesn't silently degrade.
+    profiles["both"] = profiles["tiktok"]
+    profiles["default"] = profiles["tiktok"]
+    return profiles
+
+
+PLATFORM_PROFILES: dict[str, dict] = _load_platform_rules()
+
+
+def reload_platform_rules() -> None:
+    """Re-read the rules files into the LIVE dict (in place, so every module
+    holding a reference to ``PLATFORM_PROFILES`` sees the update)."""
+    fresh = _load_platform_rules()
+    PLATFORM_PROFILES.clear()
+    PLATFORM_PROFILES.update(fresh)
+
+
+def platform_rules_meta() -> dict:
+    """{'source': 'live'|'shipped'|'builtin', 'refreshed': iso-date} — where
+    the effective rules came from (for /api/seo/intel)."""
+    return dict(_PLATFORM_RULES_META)
 
 
 def build_platform_seo_prompt(platform: str, trend_brief: str = "",
                               output_language: str = "") -> str:
-    """Return the platform-specific SEO prompt for the given platform slug.
+    """Return the platform-specific, KEYWORD-FIRST SEO prompt for a platform.
 
     Falls back to ``PLATFORM_PROFILES['default']`` (TikTok-style) when the
     platform is unknown so a new clip type still gets reasonable output
-    instead of crashing. When ``trend_brief`` is supplied (today's live
-    hashtags / sounds / hook formats / topics) it is injected so the title,
-    caption, tags and hook reflect what's working on the platform RIGHT NOW —
-    not evergreen guesses from the model's stale training data.
+    instead of crashing.
+
+    ``trend_brief`` must be ONLY the requesting platform's section of today's
+    structured brief (rendered text — see
+    ``trend_brief.render_platform_section``), never the combined multi-platform
+    blob: LinkedIn copy shaped by TikTok trends wins on neither platform.
 
     ``output_language`` (the user's subtitle language) forces the title,
     caption, hook and tips to come out in the SAME language as the clip —
@@ -633,60 +738,92 @@ def build_platform_seo_prompt(platform: str, trend_brief: str = "",
     versa — instead of defaulting to the transcript's language.
     """
     profile = PLATFORM_PROFILES.get(platform) or PLATFORM_PROFILES["default"]
-    lang_block = ""
     _lang_name = output_language_name(output_language) or "English"
     lang_block = (
-        f"OUTPUT LANGUAGE — write the TITLE, DESCRIPTION/caption, hook and "
+        f"OUTPUT LANGUAGE — write the TITLE, DESCRIPTION/caption, HOOK and "
         f"PLATFORM_TIPS in {_lang_name} (the language of this clip's subtitles), "
         f"even if the transcript below is in another language. For TAGS, use "
-        f"{_lang_name} hashtags relevant to the clip; standard cross-language "
-        f"discovery tags (#fyp, #shorts) are fine. Never mix languages in the "
-        f"title or caption.\n\n")
+        f"{_lang_name} hashtags relevant to the clip; widely-understood "
+        f"subject tags in another language are fine when they're what users "
+        f"actually search. Never mix languages in the title or caption.\n\n")
     trend_block = ""
     if (trend_brief or "").strip():
         trend_block = (
-            "TODAY'S LIVE TREND BRIEF (use this — it is CURRENT; prefer it over "
-            "anything you 'remember'):\n"
+            "TODAY'S LIVE TREND BRIEF for THIS platform (CURRENT — prefer it "
+            "over anything you 'remember'):\n"
             f"{trend_brief.strip()}\n"
-            "Pull 2-4 relevant CURRENT hashtags from the brief into TAGS (only if "
-            "they genuinely fit the clip — never force an unrelated trend), and "
-            "shape the TITLE/hook with a hook format that's working right now. Do "
-            "NOT mention dates or that you used a trend brief.\n\n"
+            "Use AT MOST 2 trend hashtags from the brief in TAGS, and only if "
+            "they genuinely fit the clip — NEVER force an off-topic trend. When "
+            "one of the brief's hook formats genuinely fits, shape the HOOK "
+            "with it. Prefer the brief's search keywords when picking the "
+            "primary keyword. Do NOT mention dates or that you used a trend "
+            "brief.\n\n"
         )
     return (
         "You write social media captions and tags like a real creator on the "
         "specific platform you're targeting — not a marketer, not a robot. "
         "The text should feel native to that platform's culture.\n\n"
+        "KEYWORD-FIRST METHOD (discovery in 2026 is search-driven):\n"
+        "1. Pick ONE primary search keyword/query — a phrase a real user would "
+        "type into this platform's search bar to find exactly this clip. Choose "
+        "it from the transcript's actual subject (and the trend brief's "
+        "keywords when one genuinely matches).\n"
+        "2. The primary keyword MUST appear within the FIRST 50 characters of "
+        "both the title and the description/caption.\n"
+        "3. Write a HOOK: one on-screen overlay line (≤60 chars) shown over the "
+        "clip's opening frames. It must contain or strongly imply the primary "
+        "keyword — platforms OCR-index on-screen text, so this line is a "
+        "ranking signal, not decoration. Use one of the brief's hook formats "
+        "when it fits; never sacrifice clarity for a format.\n"
+        "4. List 3-8 secondary keywords/queries in \"keywords\".\n\n"
         f"{lang_block}"
         f"{profile['guidance']}\n\n"
         f"{trend_block}"
         "HARD CONSTRAINTS (the validator WILL truncate / reject if you miss):\n"
         f"  • title_max_chars: {profile['title_max']}\n"
         f"  • description_max_chars: {profile['description_max']}\n"
-        f"  • tag_count: {profile['tag_min']}-{profile['tag_max']} hashtags\n\n"
+        f"  • tag_count: {profile['tag_min']}-{profile['tag_max']} hashtags\n"
+        "  • hook_max_chars: 60\n"
+        "  • NEVER use generic discovery tags (#fyp, #foryou, #viral, "
+        "#explorepage, #trending) — platforms penalize them and the validator "
+        "strips them.\n\n"
         "Use the clip's transcript, video summary, and title to ground the copy in "
         "specific things that actually happen in this clip. No generic filler — "
         "every sentence should reference a concrete moment, quote, or visual.\n\n"
         "Return ONLY valid JSON:\n"
         '{"title": "...", "description": "...", "tags": ["#tag1", "#tag2", ...], '
-        '"platform_tips": "..."}'
+        '"platform_tips": "...", "primary_keyword": "...", '
+        '"keywords": ["...", "..."], "hook": "..."}'
     )
 
 
-def enforce_platform_caps(seo_data: dict, platform: str) -> dict:
-    """Trim / pad SEO output so it fits the platform's hard caps.
+def enforce_platform_caps(seo_data: dict, platform: str,
+                          brief_hashtags: "list[str] | None" = None) -> dict:
+    """Trim / scrub SEO output so it fits the platform's hard caps.
 
     The LLM occasionally blows the title/description length even with the
     constraint spelled out in the prompt. This is the last line of defense
-    before the SEO is persisted: title and description get trimmed to the
-    platform cap (preserving the leading words), and the tag list is
-    truncated / padded to the platform's min/max range. Returns a NEW
-    dict — does not mutate the input.
+    before the SEO is persisted:
+
+      * title / description / hook are trimmed to the platform cap at a word
+        boundary. Descriptions get an ellipsis; titles and hooks do NOT — a
+        trailing '…' on a post title reads as truncated bot output.
+      * tags are normalized, case-insensitively deduped (first casing wins)
+        and scrubbed against the generic-tag banlist (``seo_hygiene``) — tags
+        present in today's live brief (``brief_hashtags``) are exempt.
+      * deterministic trend mixing: content-specific tags come first, then up
+        to 2 of the brief's hashtags (when not already present), truncated to
+        the platform ``tag_max``.
+      * a tag count below ``tag_min`` is LOGGED and left as-is — padding with
+        junk tags is worse for ranking than shipping fewer tags.
+
+    Returns a NEW dict — does not mutate the input.
     """
+    from backend.services.seo_hygiene import clean_tags, clean_text_list
     profile = PLATFORM_PROFILES.get(platform) or PLATFORM_PROFILES["default"]
     out = dict(seo_data or {})
 
-    def _trim(text: str, cap: int) -> str:
+    def _trim(text: str, cap: int, ellipsis: bool) -> str:
         if not isinstance(text, str):
             return ""
         if len(text) <= cap:
@@ -697,34 +834,48 @@ def enforce_platform_caps(seo_data: dict, platform: str) -> dict:
         last_space = trimmed.rfind(" ")
         if last_space > cap * 0.6:
             trimmed = trimmed[:last_space]
-        return trimmed.rstrip() + "…"
+        trimmed = trimmed.rstrip()
+        return trimmed + "…" if ellipsis else trimmed
 
-    out["title"] = _trim(out.get("title") or "", profile["title_max"])
-    out["description"] = _trim(out.get("description") or "", profile["description_max"])
+    out["title"] = _trim(out.get("title") or "", profile["title_max"],
+                         ellipsis=False)
+    out["description"] = _trim(out.get("description") or "",
+                               profile["description_max"], ellipsis=True)
 
+    allow = set(brief_hashtags or [])
     tags = out.get("tags") or []
     if not isinstance(tags, list):
         tags = []
-    # Normalise: every tag starts with '#', no spaces, no empty strings.
-    cleaned = []
-    for t in tags:
-        if not isinstance(t, str):
-            t = str(t)
-        t = t.strip()
-        if not t:
-            continue
-        t = t.replace(" ", "")
-        if not t.startswith("#"):
-            t = "#" + t.lstrip("#")
-        if t == "#":
-            continue
-        if t not in cleaned:
-            cleaned.append(t)
+    cleaned = clean_tags(tags, platform, allow=allow)
+
+    # Deterministic trend mixing — in code, not prompt-hope: content tags
+    # first, then up to 2 brief hashtags not already present.
+    if brief_hashtags:
+        have = {t.lstrip("#").lower() for t in cleaned}
+        added = 0
+        for bt in clean_tags(brief_hashtags, platform, allow=allow):
+            if added >= 2:
+                break
+            if bt.lstrip("#").lower() in have:
+                continue
+            cleaned.append(bt)
+            added += 1
+
     if len(cleaned) > profile["tag_max"]:
         cleaned = cleaned[: profile["tag_max"]]
+    if len(cleaned) < profile["tag_min"]:
+        logger.info(
+            "SEO tags below %s tag_min (%d < %d) — leaving as-is (padding "
+            "with junk tags hurts ranking more than fewer tags)",
+            platform, len(cleaned), profile["tag_min"])
     out["tags"] = cleaned
 
     out["platform_tips"] = (out.get("platform_tips") or "").strip()
+    # Keyword-first fields (defensive — providers on the old JSON shape
+    # simply produce empty values here).
+    out["primary_keyword"] = str(out.get("primary_keyword") or "").strip()
+    out["keywords"] = clean_text_list(out.get("keywords"), cap=10)
+    out["hook"] = _trim(str(out.get("hook") or "").strip(), 60, ellipsis=False)
     return out
 
 

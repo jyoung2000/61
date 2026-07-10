@@ -104,13 +104,25 @@ async def export_clip_endpoint(
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    # Populate hook_text from stored clip data if not already set
+    # Populate hook_text from stored clip data if not already set. Prefer the
+    # trend-aware SEO hook for the clip's platform (it carries the primary
+    # search keyword — the on-screen opening text is OCR-indexed by
+    # TikTok/Reels, so this line is ClipAI's OCR-layer SEO advantage), falling
+    # back to the legacy detection-time hook_text.
     if not req.hook_text and job.clips:
         matching_clip = next(
             (c for c in job.clips if c.id == req.clip_id), None
         )
-        if matching_clip and matching_clip.hook_text:
-            req.hook_text = matching_clip.hook_text
+        if matching_clip:
+            seo_hook = ""
+            try:
+                plat = _resolve_seo_platform(None, matching_clip.platform)
+                rec = (matching_clip.seo_by_platform or {}).get(plat)
+                seo_hook = ((rec.get("hook") if isinstance(rec, dict)
+                             else getattr(rec, "hook", "")) or "").strip()
+            except Exception:
+                seo_hook = ""
+            req.hook_text = seo_hook or matching_clip.hook_text or ""
 
     # Parse video resolution for crop/subtitle positioning
     vid_w, vid_h = 1920, 1080
@@ -1550,11 +1562,14 @@ async def _generate_seo_for_platform(
     canonical = _resolve_seo_platform(platform, clip.platform)
     profile = PLATFORM_PROFILES[canonical]
 
-    # Build clip transcript from segments within the clip time range
+    # Build clip transcript from segments OVERLAPPING the clip time range —
+    # matching the sidecar's _captions_for_range semantics. Strict containment
+    # dropped segments straddling the clip boundaries and produced an EMPTY
+    # transcript for short clips whose only segments crossed an edge.
     clip_transcript = "\n".join(
         f"{s.speaker}: {s.text}"
         for s in job.transcript
-        if s.start >= clip.start_time and s.end <= clip.end_time
+        if s.end > clip.start_time and s.start < clip.end_time
     )
     if not clip_transcript:
         clip_transcript = clip.suggested_caption or clip.title
@@ -1566,12 +1581,25 @@ async def _generate_seo_for_platform(
     custom_prompts = load_prompts()
     # Swap the platform-agnostic default with the per-platform prompt for
     # this call only — leaves the user's custom_prompts.json untouched. Inject
-    # today's live trend brief (daily-cached, fail-soft) so the regenerated
-    # title/caption/tags/hook reflect what's trending right now.
+    # ONLY this platform's section of today's structured trend brief (daily-
+    # cached, genre-keyed, fail-soft) so the regenerated title/caption/tags/
+    # hook reflect what's trending right now on THIS platform.
     _trend_brief = ""
+    _brief_hashtags: list[str] = []
     try:
-        from backend.services.trend_brief import get_trend_brief
-        _trend_brief = await get_trend_brief("both", "")
+        from backend.services.trend_brief import (
+            get_trend_brief_struct, render_platform_section,
+            _requested_platform_keys,
+        )
+        _genre = ""
+        if getattr(job, "summary", None) is not None:
+            _genre = (getattr(job.summary, "content_category", "") or "").strip()
+        _struct = await get_trend_brief_struct("both", _genre)
+        _trend_brief = render_platform_section(_struct, canonical)
+        if _struct is not None:
+            _sec = (_struct.platforms or {}).get(
+                _requested_platform_keys(canonical)[0])
+            _brief_hashtags = list(getattr(_sec, "hashtags", []) or [])
     except Exception:
         pass
     # SEO must come out in the clip's subtitle language (target if translated,
@@ -1608,8 +1636,10 @@ async def _generate_seo_for_platform(
 
     # Enforce platform caps as a final guardrail — the LLM will sometimes
     # blow the title length even with the constraint spelled out, and the
-    # validator owns the hard cut so the persisted copy always fits.
-    capped = enforce_platform_caps(seo.model_dump(), canonical)
+    # validator owns the hard cut (plus the banned-tag scrub and the
+    # deterministic trend-tag mixing) so the persisted copy always fits.
+    capped = enforce_platform_caps(seo.model_dump(), canonical,
+                                   brief_hashtags=_brief_hashtags)
     seo_record = ClipSEO(**capped)
 
     # Mutate clip in place — caller is responsible for the surrounding save.
@@ -1628,6 +1658,75 @@ async def _generate_seo_for_platform(
         clip.seo_platform_tips = capped.get("platform_tips", "")
 
     return capped, provider, canonical, profile["label"]
+
+
+@router.get("/seo/intel")
+async def seo_intelligence():
+    """Current SEO intelligence for the ClipSEO page: the effective platform
+    rules (with their source — shipped defaults vs the live self-research
+    overlay — and last refresh date), today's trend-brief summary, and the
+    generic-tag banlist. Best-effort: every section degrades to a safe value
+    rather than failing the endpoint."""
+    from backend.services.prompts import PLATFORM_PROFILES, platform_rules_meta
+
+    rules = {}
+    try:
+        for slug, prof in PLATFORM_PROFILES.items():
+            if slug in ("both", "default"):
+                continue
+            rules[slug] = {
+                "label": prof.get("label", slug),
+                "title_max": prof.get("title_max"),
+                "description_max": prof.get("description_max"),
+                "tag_min": prof.get("tag_min"),
+                "tag_max": prof.get("tag_max"),
+            }
+            if prof.get("notes"):
+                rules[slug]["notes"] = prof["notes"]
+    except Exception:
+        pass
+
+    meta = {}
+    try:
+        meta = platform_rules_meta()
+        from backend.services.platform_rules_research import research_status
+        meta["research"] = research_status()
+    except Exception:
+        pass
+
+    brief_summary = {"available": False}
+    try:
+        from backend.services.trend_brief import read_cached_brief_struct
+        brief = read_cached_brief_struct("both", "")
+        if brief is not None:
+            brief_summary = {
+                "available": True,
+                "source": brief.source,
+                "as_of": brief.as_of,
+                "region": brief.region,
+                "genre": brief.genre or "general",
+                "platforms": {
+                    k: {"hashtags": v.hashtags, "keywords": v.keywords,
+                        "hook_formats": v.hook_formats, "topics": v.topics}
+                    for k, v in (brief.platforms or {}).items()
+                },
+            }
+    except Exception:
+        pass
+
+    banlist: list[str] = []
+    try:
+        from backend.services.seo_hygiene import banned_generic_tags
+        banlist = sorted(banned_generic_tags())
+    except Exception:
+        pass
+
+    return {
+        "platform_rules": rules,
+        "platform_rules_meta": meta,
+        "trend_brief": brief_summary,
+        "banned_tags": banlist,
+    }
 
 
 class GenerateSEORequest(BaseModel):

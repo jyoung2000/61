@@ -91,7 +91,6 @@ sentencepiece>=0.1.99
 # LLM polish leaves unchanged ships without sentence boundaries.
 deepmultilingualpunctuation>=1.0.1
 
-# Google Trends fallback tier for the live trend brief (free, no API key). The
-# web-search tier (OpenRouter) is primary; pytrends is the fail-soft fallback.
-# Optional — trend_brief.py degrades to the static lexicon if it's absent.
-pytrends>=4.9,<5
+# (pytrends removed 2026-07: the repo was archived in April 2025 and the
+# Google trending-searches endpoints it used are gone. The trend brief's
+# tier 2 is now the official YouTube Data API v3 via httpx — no extra dep.)

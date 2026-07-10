@@ -722,22 +722,35 @@ class Settings(BaseSettings):
     CLIP_AVOID_SUBJECTS: str = ""      # topics to skip, comma-separated
     CLIP_DISCOVERY_PROMPT: str = ""    # custom VideoLLaMA3 prompt; "" = built-in default
 
-    # ── Live trend brief (titles/tags/captions/hooks that work TODAY) ──
+    # ── Live trend brief (titles/tags/captions/hooks/keywords that work TODAY) ──
     # Social platforms change day-by-day and an LLM's training data is stale, so
-    # ClipAI fetches a LIVE short-form trend brief (current hashtags / sounds /
-    # hook formats / topics for TikTok + YouTube Shorts) once per day and injects
-    # it into the clip judge + SEO generation. Three tiers, fail-soft: a web-
-    # search model (primary) → Google Trends (free fallback, needs pytrends) →
-    # the static lexicon (last resort). Refreshed daily; cached so it's one
-    # cheap fetch/day reused across every clip. Set False to use the static
-    # lexicon only (no live calls, no cost).
+    # ClipAI fetches a LIVE structured trend brief (per-platform hashtags /
+    # search keywords / hook formats / topics / sounds) once per day per genre
+    # and injects the requesting platform's section into the clip judge + SEO
+    # generation. Three tiers, fail-soft: a web-research model (primary) → the
+    # official YouTube Data API mostPopular chart (needs YOUTUBE_API_KEY) →
+    # the static evergreen file (last resort, clearly labeled). Cached so it's
+    # one cheap fetch/day/genre reused across every clip. Set False to use the
+    # static guidance only (no live calls, no cost).
     LIVE_TRENDS_ENABLED: bool = True
     # OpenRouter web-search model for tier 1. ``perplexity/sonar`` has built-in
     # web search; alternatively append ``:online`` to any model (e.g.
     # ``google/gemini-2.5-flash:online``) to enable OpenRouter's web plugin.
     LIVE_TRENDS_MODEL: str = "perplexity/sonar"
-    LIVE_TRENDS_REGION: str = "united_states"   # Google Trends region (tier 2)
+    # Two-letter region for the tier-1 research query + the tier-2 YouTube API
+    # regionCode (legacy pytrends-style names like "united_states" are mapped).
+    LIVE_TRENDS_REGION: str = "US"
     LIVE_TRENDS_CACHE_HOURS: int = 24           # refresh cadence (trends move daily)
+    # YouTube Data API v3 key for the tier-2 trend source (official, free,
+    # ToS-clean). Empty = tier skipped. https://console.cloud.google.com
+    YOUTUBE_API_KEY: str = ""
+    # ── Self-researching platform SEO rules ──
+    # ClipAI re-verifies each platform's posting rules (hashtag count
+    # guidance, caption/title char limits, generic-tag penalties, keyword
+    # weighting) on this cadence via the web-research model and writes a
+    # sanity-validated overlay (platform_rules.live.json) over the shipped
+    # defaults — so it never ships 2023-era hashtag advice again. 0 disables.
+    PLATFORM_RULES_REFRESH_DAYS: int = 7
 
     # ── Self-hosted mode — route the analysis pipeline to local AI ──
     # The master toggle flips every "auto" engine local; a per-engine

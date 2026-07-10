@@ -131,3 +131,73 @@ def test_falls_back_to_translated_transcript_for_captions():
         assert "TRANSLATED LINE" in body
         # The source line should NOT appear — translated takes precedence.
         assert "Here's what I changed." not in body
+
+
+# ── SEO overhaul: trend source line, hook + primary keyword sections ──────
+
+class _FakeBrief:
+    def __init__(self, source="sonar", as_of="2026-07-09"):
+        self.source = source
+        self.as_of = as_of
+
+
+def test_header_shows_live_trend_source(monkeypatch):
+    import backend.services.trend_brief as TB
+    monkeypatch.setattr(TB, "read_cached_brief_struct",
+                        lambda p, g: _FakeBrief("sonar"))
+    job, clip = _job()
+    txt = cs.format_clip_seo_text(job, clip, "c.mp4", export_info=_EXPORT,
+                                  transcript=job["transcript"])
+    assert "Trend data:    live (sonar) · 2026-07-09" in txt
+
+
+def test_header_shows_static_fallback_honestly(monkeypatch):
+    import backend.services.trend_brief as TB
+    monkeypatch.setattr(TB, "read_cached_brief_struct",
+                        lambda p, g: _FakeBrief("static"))
+    job, clip = _job()
+    txt = cs.format_clip_seo_text(job, clip, "c.mp4", export_info=_EXPORT,
+                                  transcript=job["transcript"])
+    assert "static fallback — set OPENROUTER_API_KEY for live trends" in txt
+
+
+def test_trend_line_failure_never_breaks_the_sidecar(monkeypatch):
+    import backend.services.trend_brief as TB
+    def _boom(p, g):
+        raise RuntimeError("cache exploded")
+    monkeypatch.setattr(TB, "read_cached_brief_struct", _boom)
+    job, clip = _job()
+    txt = cs.format_clip_seo_text(job, clip, "c.mp4", export_info=_EXPORT,
+                                  transcript=job["transcript"])
+    assert "Trend data:" not in txt          # line skipped, sidecar intact
+    assert "VIRAL SCORE" in txt
+
+
+def test_seo_hook_and_primary_keyword_sections(monkeypatch):
+    import backend.services.trend_brief as TB
+    monkeypatch.setattr(TB, "read_cached_brief_struct", lambda p, g: None)
+    job, clip = _job()
+    # clip.platform is "both" → sidecar maps it to the tiktok record.
+    clip["seo_by_platform"]["tiktok"].update({
+        "hook": "the morning habit nobody talks about",
+        "primary_keyword": "morning habit",
+        "keywords": ["morning routine", "fix your focus"],
+    })
+    txt = cs.format_clip_seo_text(job, clip, "c.mp4", export_info=_EXPORT,
+                                  transcript=job["transcript"])
+    # The SEO hook (with the search keyword) beats the legacy hook_text...
+    assert "the morning habit nobody talks about" in txt
+    assert "PRIMARY KEYWORD" in txt and "morning habit" in txt
+    assert "Secondary: morning routine, fix your focus" in txt
+    # ...and the per-platform block prints the keyword/hook lines too.
+    assert "Keyword:     morning habit" in txt
+
+
+def test_legacy_hook_text_still_used_without_seo_hook(monkeypatch):
+    import backend.services.trend_brief as TB
+    monkeypatch.setattr(TB, "read_cached_brief_struct", lambda p, g: None)
+    job, clip = _job()
+    txt = cs.format_clip_seo_text(job, clip, "c.mp4", export_info=_EXPORT,
+                                  transcript=job["transcript"])
+    assert "You're doing mornings wrong." in txt
+    assert "PRIMARY KEYWORD" not in txt      # no keyword data → no section

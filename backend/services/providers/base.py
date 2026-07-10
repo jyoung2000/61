@@ -369,7 +369,12 @@ def build_summary_from_transcript(
 
 
 def normalize_seo_data(data: dict) -> dict:
-    """Merge legacy 'hashtags' field into 'tags' and ensure all tags have # prefix."""
+    """Merge legacy 'hashtags' field into 'tags' and ensure all tags have # prefix.
+
+    Also coerces the keyword-first fields (primary_keyword / keywords / hook)
+    defensively — providers on the OLD JSON shape simply produce the ClipSEO
+    defaults, and a model returning a string where a list belongs never
+    breaks parsing."""
     tags = list(data.get("tags", []))
     # Merge any separate hashtags field into tags
     hashtags = data.pop("hashtags", [])
@@ -380,6 +385,17 @@ def normalize_seo_data(data: dict) -> dict:
                 tags.append(h)
     # Ensure all tags have # prefix
     data["tags"] = [t if t.startswith("#") else f"#{t}" for t in tags]
+    if "primary_keyword" in data:
+        data["primary_keyword"] = str(data.get("primary_keyword") or "").strip()
+    if "hook" in data:
+        data["hook"] = str(data.get("hook") or "").strip()
+    if "keywords" in data:
+        kws = data.get("keywords")
+        if isinstance(kws, str):
+            kws = [k.strip() for k in kws.split(",")]
+        if not isinstance(kws, list):
+            kws = []
+        data["keywords"] = [str(k).strip() for k in kws if str(k).strip()]
     return data
 
 

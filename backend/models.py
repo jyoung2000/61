@@ -382,6 +382,15 @@ class ClipSEO(BaseModel):
     description: str
     tags: list[str] = []
     platform_tips: str = ""
+    # ── Keyword-first SEO (2026 overhaul) ──
+    # The ONE search query this clip should rank for (required in the first
+    # 50 chars of title + description by the prompt contract), secondary
+    # queries, and the on-screen overlay hook line (<=60 chars, OCR-indexed by
+    # TikTok/Reels — fed to the export's opening-frame text). Optional with
+    # defaults so old persisted jobs round-trip unchanged.
+    primary_keyword: str = ""
+    keywords: list[str] = []
+    hook: str = ""
 
 
 class SubtitleSettings(BaseModel):

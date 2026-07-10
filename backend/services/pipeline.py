@@ -2137,16 +2137,35 @@ async def _auto_generate_clip_seo(
     prompt_cache: dict[str, str] = {}
     base_prompts = load_prompts()
 
-    # Fetch TODAY's live short-form trend brief once (daily-cached, fail-soft) so
-    # every clip's SEO — title, caption, tags, hook — reflects what's actually
-    # trending on TikTok / YT Shorts right now, not the model's stale guesses.
-    _trend_brief = ""
+    # Fetch TODAY's structured trend brief once (daily-cached, fail-soft) so
+    # every clip's SEO — title, caption, tags, keywords, hook — reflects what's
+    # actually trending right now, not the model's stale guesses. Genre-keyed:
+    # the summary's content_category selects a genre-specific brief (cached
+    # independently of the generic one warmed at job start).
+    _trend_struct = None
+    _trend_source = "off"
     try:
-        from backend.services.trend_brief import get_trend_brief
-        _trend_brief = await get_trend_brief("both", "")
+        from backend.services.trend_brief import get_trend_brief_struct
+        _genre = ""
+        if job.summary is not None:
+            _genre = (getattr(job.summary, "content_category", "") or "").strip()
+        _trend_struct = await get_trend_brief_struct("both", _genre)
+        if _trend_struct is not None:
+            _trend_source = _trend_struct.source
     except Exception as _tb_err:
         logger.debug("[%s] live trend brief unavailable (%s) — SEO uses evergreen "
                      "patterns", job_id, _tb_err)
+
+    # Truth in output: say ONCE at stage start where the trend data came from
+    # (live research vs static fallback) so "live SEO" is never silently
+    # evergreen.
+    try:
+        await broadcast_ws(job_id, {
+            "type": "status",
+            "message": f"Generating SEO for clips… (live trends: {_trend_source})",
+        })
+    except Exception:
+        pass
 
     generated = 0
     failed = 0
@@ -2188,8 +2207,17 @@ async def _auto_generate_clip_seo(
             clip_transcript = clip_dict.get("suggested_caption") or clip_dict.get("title", "")
 
         if platform not in prompt_cache:
+            # Inject ONLY this platform's section of the structured brief —
+            # LinkedIn copy shaped by TikTok trends wins on neither platform.
+            _plat_section = ""
+            try:
+                from backend.services.trend_brief import render_platform_section
+                _plat_section = render_platform_section(_trend_struct, platform)
+            except Exception:
+                pass
             prompt_cache[platform] = build_platform_seo_prompt(
-                platform, trend_brief=_trend_brief, output_language=output_language)
+                platform, trend_brief=_plat_section,
+                output_language=output_language)
         custom_prompts = base_prompts.model_copy(
             update={"seo": prompt_cache[platform]})
 
@@ -2208,7 +2236,17 @@ async def _auto_generate_clip_seo(
                 platform=platform,
                 job_id=job_id,
             )
-            capped = enforce_platform_caps(seo.model_dump(), platform)
+            _brief_tags = []
+            try:
+                from backend.services.trend_brief import _requested_platform_keys
+                if _trend_struct is not None:
+                    _sec = (_trend_struct.platforms or {}).get(
+                        _requested_platform_keys(platform)[0])
+                    _brief_tags = list(getattr(_sec, "hashtags", []) or [])
+            except Exception:
+                pass
+            capped = enforce_platform_caps(seo.model_dump(), platform,
+                                           brief_hashtags=_brief_tags)
             seo_record = ClipSEO(**capped)
             seo_by_plat = dict(clip_dict.get("seo_by_platform") or {})
             seo_by_plat[platform] = seo_record.model_dump()
@@ -3514,6 +3552,43 @@ def _planner_fingerprint() -> str:
     return ";".join(f"{k}={os.environ.get(k, '')}" for k in _PLANNER_ENV_FLAGS)
 
 
+# Strong refs to in-flight SEO warm-up tasks so the event loop can't GC them
+# mid-flight; done tasks remove themselves.
+_seo_warm_tasks: set = set()
+
+
+def _warm_seo_intelligence(job_id: str) -> None:
+    """Fire-and-forget warm-up of the daily trend brief + the weekly platform
+    rules refresh. Non-blocking; swallows every failure (including 'no event
+    loop running' in sync test contexts)."""
+    async def _warm():
+        try:
+            from backend.services.trend_brief import get_trend_brief
+            await get_trend_brief("both", "")
+        except Exception as e:
+            logger.debug("[%s] trend-brief warm-up skipped (%s)", job_id, e)
+        try:
+            from backend.services.platform_rules_research import (
+                maybe_refresh_platform_rules,
+            )
+            await maybe_refresh_platform_rules()
+        except Exception as e:
+            logger.debug("[%s] platform-rules refresh skipped (%s)", job_id, e)
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # No running loop (sync/test context) — skip rather than warm.
+        logger.debug("[%s] SEO warm-up not scheduled (no event loop)", job_id)
+        return
+    try:
+        task = loop.create_task(_warm())
+        _seo_warm_tasks.add(task)
+        task.add_done_callback(_seo_warm_tasks.discard)
+    except Exception as e:
+        logger.debug("[%s] SEO warm-up not scheduled (%s)", job_id, e)
+
+
 async def run_analysis(job_id: str, resume: bool = False):
     """Execute the full analysis pipeline for a video job.
 
@@ -3530,6 +3605,15 @@ async def run_analysis(job_id: str, resume: bool = False):
     # Set up cancellation event for this job
     _cancel_events[job_id] = asyncio.Event()
     sem = get_semaphore()
+
+    # Warm today's SEO intelligence in the background, alongside everything
+    # else (transcription included): the clip JUDGE reads the trend-brief
+    # cache synchronously and runs BEFORE the auto-SEO stage that used to be
+    # the first warmer — so the first job of each day was judged trend-blind.
+    # Also lazily kicks the weekly platform-rules self-research (throttled on
+    # disk). Fire-and-forget and fail-soft: a trends problem must never slow
+    # or fail the pipeline.
+    _warm_seo_intelligence(job_id)
 
     # Broadcast immediately so the Analysis page shows status while waiting
     # for the semaphore (especially when another analysis is already running)

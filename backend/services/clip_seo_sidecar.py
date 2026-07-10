@@ -103,6 +103,39 @@ def _section(title: str, body) -> str:
     return f"{_RULE}\n{title}\n{_RULE}\n{body}\n\n"
 
 
+def _trend_source_line(job) -> str:
+    """One header line saying where today's trend data came from — truth in
+    output: a static fallback must never masquerade as live. '' when the
+    trend system is disabled or unreadable (best-effort, never raises)."""
+    try:
+        from backend.services.trend_brief import read_cached_brief_struct
+        genre = ""
+        summary = _g(job, "summary")
+        if summary is not None:
+            genre = (_g(summary, "content_category", "") or "").strip()
+        brief = read_cached_brief_struct("both", genre)
+        if brief is None and genre:
+            brief = read_cached_brief_struct("both", "")
+        if brief is None:
+            return ""
+        if (brief.source or "static") == "static":
+            return ("static fallback — set OPENROUTER_API_KEY for live trends")
+        return f"live ({brief.source}) · {brief.as_of}"
+    except Exception:
+        return ""
+
+
+def _seo_record_for_platform(clip):
+    """The clip's per-platform SEO record matching its declared platform
+    (dict or pydantic), or None."""
+    by_plat = _g(clip, "seo_by_platform", {}) or {}
+    plat = str(_g(clip, "platform", "") or "").strip().lower()
+    aliases = {"both": "tiktok", "shorts": "youtube_shorts", "twitter": "x",
+               "instagram_reels": "reels"}
+    plat = aliases.get(plat, plat)
+    return by_plat.get(plat) if isinstance(by_plat, dict) else None
+
+
 def _captions_for_range(transcript, start: float, end: float) -> list[str]:
     """Clip-relative caption lines whose segments overlap ``[start, end]``."""
     lines = []
@@ -144,6 +177,9 @@ def format_clip_seo_text(job, clip, output_basename: str,
     if job_id:
         head.append(f"Job ID:        {job_id}")
     head.append("Generated:     " + datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
+    trend_src = _trend_source_line(job)
+    if trend_src:
+        head.append(f"Trend data:    {trend_src}")
     head.append("")
     head.append("")
 
@@ -182,8 +218,25 @@ def format_clip_seo_text(job, clip, output_basename: str,
     # ── Social caption ──
     body += _section("CAPTION (social post)", _g(clip, "suggested_caption", ""))
 
-    # ── Hook ──
-    body += _section("HOOK", _g(clip, "hook_text", "") or export_info.get("hook_text", ""))
+    # ── Hook ── (prefer the trend-aware SEO hook — it carries the primary
+    # search keyword and is what the export overlays on the opening frames —
+    # falling back to the legacy detection-time hook_text)
+    seo_rec = _seo_record_for_platform(clip)
+    seo_hook = (_g(seo_rec, "hook", "") or "").strip()
+    body += _section("HOOK", seo_hook
+                     or _g(clip, "hook_text", "")
+                     or export_info.get("hook_text", ""))
+
+    # ── Primary keyword ── (the search query this clip is optimized to rank
+    # for; secondary keywords on the next line when present)
+    pk = (_g(seo_rec, "primary_keyword", "") or "").strip()
+    if pk:
+        kws = [str(k).strip() for k in (_g(seo_rec, "keywords", []) or [])
+               if str(k).strip()]
+        pk_block = pk
+        if kws:
+            pk_block += "\nSecondary: " + ", ".join(kws)
+        body += _section("PRIMARY KEYWORD", pk_block)
 
     # ── Tags / hashtags ──
     tags = _clean_tags(_g(clip, "seo_tags", []))
@@ -210,8 +263,14 @@ def format_clip_seo_text(job, clip, output_basename: str,
             d = (_g(rec, "description", "") or "").strip()
             rtags = _clean_tags(_g(rec, "tags", []))
             tips = (_g(rec, "platform_tips", "") or "").strip()
+            pk = (_g(rec, "primary_keyword", "") or "").strip()
+            hk = (_g(rec, "hook", "") or "").strip()
             if t:
                 sub.append(f"  Title:       {t}")
+            if pk:
+                sub.append(f"  Keyword:     {pk}")
+            if hk:
+                sub.append(f"  Hook:        {hk}")
             if d:
                 sub.append(f"  Description: {d}")
             if rtags:

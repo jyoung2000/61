@@ -2885,17 +2885,39 @@ def _build_judge_prompt(candidate: ClipCandidate, transcript_slice: str,
     if avoid_subjects.strip():
         avoid = f"\nUser wants to avoid: {avoid_subjects}"
 
-    # Today's live trend brief (daily-cached; warmed by the SEO stage / a prior
-    # job today). A moment that rides a CURRENT trend/format is more shareable,
-    # so let the judge factor it in. Empty (no nudge) when the cache is cold.
+    # Today's live trend brief (daily-cached; warmed at job start by
+    # _warm_seo_intelligence, so even the first job of the day judges with a
+    # warm cache). A moment that rides a CURRENT trend/format is more
+    # shareable, so let the judge factor it in. Empty (no nudge) when the
+    # cache is cold.
     trend = ""
     try:
-        from backend.services.trend_brief import read_cached_brief
+        from backend.services.trend_brief import (
+            read_cached_brief, read_cached_brief_struct,
+        )
         _tb = read_cached_brief("both", "")
         if _tb:
             trend = ("\n\nTODAY'S SHORT-FORM TREND CONTEXT (favor moments that fit a "
                      "CURRENT trend/format, but never reward an off-topic match):\n"
                      + _tb.strip())
+        # Keyword nudge: platforms ASR-index the spoken audio, so a clip whose
+        # first seconds SPEAK a searchable topic ranks in search. A gentle
+        # tiebreaker only — hook/payoff quality always wins.
+        _bs = read_cached_brief_struct("both", "")
+        _kws: list = []
+        for _plat in ("tiktok", "youtube_shorts"):
+            _sec = (_bs.platforms or {}).get(_plat) if _bs else None
+            for _k in (getattr(_sec, "keywords", None) or []):
+                if _k not in _kws:
+                    _kws.append(_k)
+        if _kws:
+            trend += (
+                "\nSearch nudge: viewers also FIND clips via search — the "
+                "spoken audio is indexed (ASR). Slightly favor candidates "
+                "whose first ~5 seconds speak a searchable keyword/topic "
+                "(today's examples: "
+                + ", ".join(f'"{k}"' for k in _kws[:5])
+                + "), but NEVER let this override hook or payoff quality.")
     except Exception:
         pass
 
