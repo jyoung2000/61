@@ -326,6 +326,16 @@ class Settings(BaseSettings):
     # explode into hundreds of requests).
     SPEECH_GAP_RECOVERY_MAX_RUNS: int = 40
     SPEECH_GAP_RECOVERY_MAX_TOTAL_SEC: float = 900.0
+    # Boost each gap slice before the retry decode: high-pass the rumble out,
+    # denoise, then speechnorm the level up. The recovered gaps are exactly
+    # the spans the main decode dropped as too faint (quiet / whispered /
+    # off-mic dialogue), so lifting them is what makes the retry succeed.
+    # Fail-safe: if the filter chain can't run on the installed ffmpeg the
+    # slice is re-extracted unfiltered.
+    SPEECH_GAP_BOOST_ENABLED: bool = True
+    # Override the boost chain (blank = the tuned default:
+    # highpass=f=80,afftdn=nf=-25,speechnorm=e=6.25:r=0.0001:l=1).
+    SPEECH_GAP_BOOST_FILTER: str = ""
     # Companion/cloud no_speech_prob above which a returned cue is treated as a
     # hallucination and dropped. Raise toward 0.85 to KEEP more breathy/quiet
     # dialogue (fewer drops = more coverage, slightly more risk of a phantom).
@@ -370,6 +380,17 @@ class Settings(BaseSettings):
     WHISPER_REDECODE_LOGPROB: float = -0.8
     WHISPER_REDECODE_MAX_FRAC: float = 0.10
     WHISPER_REDECODE_BEAM: int = 8
+    # ── Filter/coverage tension: VAD-confirmed phantom rescue ──
+    # The TACT phantom gate (below) fires on overwhelmingly low-confidence
+    # cues — but real soft/off-mic speech looks exactly like that. Before a
+    # phantom-flagged cue is dropped, check the independent Silero voice map:
+    # if voice overlaps its span, route it to the difficult-segment redecode
+    # queue instead of dropping (the redecode either rescues the speech or
+    # confirms the drop). VAD-confirmed cues get their own, larger redecode
+    # budget (fraction of segments) so they are never crowded out by the
+    # ordinary low-logprob candidates.
+    WHISPER_PHANTOM_VAD_RESCUE_ENABLED: bool = True
+    WHISPER_REDECODE_VAD_MAX_FRAC: float = 0.25
     # Wrong-script hallucination gate: with the source language pinned (or
     # confidently detected) as CJK, a 4+-word cue of ≥60% Latin letters and
     # <10% CJK is a decode hallucination over music/silence, not speech —
@@ -428,6 +449,16 @@ class Settings(BaseSettings):
     # non-English (multilingual accuracy), unless the user explicitly
     # pinned a model in Settings (WHISPER_MODEL_USER_SET).
     WHISPER_REMOTE_MODEL: str = ""
+    # Send the local path's tuned decode parameters (VAD threshold /
+    # min-silence / speech-pad, no_speech_threshold, anti-repetition decoding
+    # thresholds, beam size) as extra multipart fields on the remote
+    # transcription POST. The Companion sidecar honors them — closing the
+    # sidecar-vs-local parity gap that dropped quiet speech (faster-whisper
+    # defaults: Silero 0.5 / min_silence 2000 ms / no_speech 0.6 /
+    # condition_on_previous_text=True). Other OpenAI-compatible servers
+    # (speaches, whisper.cpp) ignore unknown fields; disable only for a
+    # strict server that rejects extras.
+    WHISPER_REMOTE_SEND_TUNING: bool = True
     # Prefer accuracy over speed on the paired Companion: request FULL large-v3
     # (not the pruned large-v3-turbo) even for English/auto jobs. The Companion
     # is typically a strong desktop GPU (4070/4090) that can absorb the ~2-3×
@@ -943,6 +974,12 @@ class Settings(BaseSettings):
     # platform-specific safe-zone margins for TikTok / Reels / Shorts.
     # Wired into srt_generator + ass_generator as a preprocessing step.
     SUBTITLE_CPS_ENFORCEMENT: bool = True       # enforce reading speed limits
+    # Post-translation CPS / line-length re-check on paths that persist the
+    # translation router's output directly (the manual re-translate
+    # endpoint): translated text is often much longer than the source, so
+    # cues are re-split/re-wrapped when they now exceed the CPS or
+    # chars-per-line caps. The full pipeline runs its own enforcement pass.
+    SUBTITLE_POST_TRANSLATION_CPS_RECHECK: bool = True
     # Netflix uses language-specific reading-speed limits — up to 17 cps adult
     # (13 cps kids) for most languages; 20 is the looser English-USA value. The
     # output here is translated (usually non-English), so 17 is the correct

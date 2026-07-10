@@ -677,6 +677,52 @@ def _resolve_polish_model_override(orchestrator) -> Optional[str]:
     return _resolve_translation_model_override(orchestrator)
 
 
+def recheck_translated_readability(segments):
+    """Post-translation CPS / line-length re-check.
+
+    Translation changes character density dramatically (a CJK → English pass
+    typically doubles the line length), so cues that were readable in the
+    source language can come back over 20 CPS or 42 chars/line. Re-run the
+    ``subtitle_formatter`` pass on the TRANSLATED text so those cues are
+    re-split/re-wrapped.
+
+    The main pipeline already runs its own iterative post-translation
+    enforcement (step (c cont.) in ``_background_post_processing``), AFTER the
+    1:1 source↔draft MT post-edit — so this helper is NOT called inside
+    ``translate_subtitles`` (re-splitting there would break that alignment).
+    It exists for the paths that persist ``translate_subtitles`` output
+    directly — the manual re-translate endpoint — so they can't ship an
+    unreadable translated track. Fail-soft: any error returns the input
+    unchanged.
+    """
+    if not segments:
+        return segments
+    if not bool(getattr(settings, "SUBTITLE_POST_TRANSLATION_CPS_RECHECK", True)):
+        return segments
+    try:
+        from backend.services.subtitle_formatter import enforce_readability
+        from backend.models import TranscriptSegment as _TS
+        models = []
+        for t in segments:
+            if isinstance(t, _TS):
+                models.append(t)
+            else:
+                models.append(_TS(**(t.model_dump()
+                                     if hasattr(t, "model_dump") else dict(t))))
+        return enforce_readability(
+            models,
+            max_cps=float(getattr(settings, "SUBTITLE_MAX_CPS", 20.0)),
+            max_chars_per_line=int(getattr(settings, "SUBTITLE_MAX_CHARS_PER_LINE", 42)),
+            min_duration_ms=int(getattr(settings, "SUBTITLE_MIN_DURATION_MS", 833)),
+            max_duration_ms=int(getattr(settings, "SUBTITLE_MAX_DURATION_MS", 9000)),
+            smart_line_breaks=bool(getattr(settings, "SUBTITLE_SMART_LINE_BREAKS", True)),
+            allow_split=True,
+        )
+    except Exception as _rr_err:
+        logger.warning("Post-translation readability re-check skipped (%s)", _rr_err)
+        return segments
+
+
 async def translate_subtitles(segments, source_lang, target_lang, *, video_path=None,
                               glossary=None, orchestrator=None, status_callback=None,
                               job_id=None, whisper_timeout=None, nmt_timeout=None):

@@ -116,6 +116,31 @@ def coverage_stats(voice_regions: List[Interval],
     }
 
 
+def overlaps_voice(voice_regions: List[Interval],
+                   start_s: float, end_s: float,
+                   min_overlap_s: float = 0.2,
+                   min_overlap_frac: float = 0.3) -> bool:
+    """True when the span ``[start_s, end_s]`` overlaps the voice-activity map
+    by at least ``max(min_overlap_s, min_overlap_frac × span)`` seconds.
+
+    Used by the TACT phantom filter to distinguish an invented cue over
+    silence/music (drop it) from a low-confidence decode of REAL speech
+    (Silero heard voice there — redecode it instead of dropping). The
+    absolute floor keeps a trivial brush against a voice region from
+    counting; the fractional floor scales the requirement up for long cues.
+    """
+    try:
+        a, b = float(start_s), float(end_s)
+    except (TypeError, ValueError):
+        return False
+    if b <= a:
+        return False
+    overlap = 0.0
+    for vs, ve in merge_intervals(voice_regions):
+        overlap += max(0.0, min(b, ve) - max(a, vs))
+    return overlap >= max(min_overlap_s, min_overlap_frac * (b - a))
+
+
 # ── Voice-activity map (Silero VAD via faster-whisper) ─────────────────────
 
 def voice_activity_regions(audio_path: str,

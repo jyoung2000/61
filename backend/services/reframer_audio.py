@@ -299,6 +299,67 @@ def _beam_size() -> int:
         return 5
 
 
+def _gap_boost_af_args() -> list:
+    """FFmpeg ``-af`` arguments that lift quiet / off-mic speech in a gap
+    slice before the retry decode: high-pass out the rumble, denoise, then
+    speechnorm the level up. The gaps being recovered are exactly the spans
+    the main decode already dropped as too faint, so a boosted retry is what
+    gives them a real second chance. Returns ``[]`` when
+    ``SPEECH_GAP_BOOST_ENABLED`` is off (slice extracted unchanged, the
+    pre-boost behavior)."""
+    if not bool(getattr(settings, "SPEECH_GAP_BOOST_ENABLED", True)):
+        return []
+    chain = (getattr(settings, "SPEECH_GAP_BOOST_FILTER", "") or "").strip()
+    if not chain:
+        chain = "highpass=f=80,afftdn=nf=-25,speechnorm=e=6.25:r=0.0001:l=1"
+    return ["-af", chain]
+
+
+def _remote_tuning_fields() -> dict:
+    """Decode-tuning form fields for the remote transcription POST — the SAME
+    tuned values the local path computes (``_vad_parameters()``,
+    ``WHISPER_NO_SPEECH_THRESHOLD``, the ``_decoding_kwargs()`` thresholds,
+    ``_beam_size()``), so the Companion sidecar no longer runs faster-whisper
+    defaults (Silero threshold 0.5, min_silence 2000 ms, no_speech 0.6,
+    condition_on_previous_text=True) that drop quiet speech and skip long
+    stretches the local path would have kept.
+
+    The sidecar treats every field as optional, and other OpenAI-compatible
+    servers (speaches, whisper.cpp) ignore unknown multipart fields, so
+    sending them is backward compatible. ``WHISPER_REMOTE_SEND_TUNING=False``
+    turns them off for a strict server that rejects extra fields.
+    """
+    if not bool(getattr(settings, "WHISPER_REMOTE_SEND_TUNING", True)):
+        return {}
+    try:
+        vad = _vad_parameters()
+        fields = {
+            "beam_size": str(_beam_size()),
+            "vad_min_silence_ms": str(int(vad.get("min_silence_duration_ms", 300))),
+            "vad_speech_pad_ms": str(int(vad.get("speech_pad_ms", 150))),
+            "no_speech_threshold": str(float(getattr(
+                settings, "WHISPER_NO_SPEECH_THRESHOLD", 0.4))),
+            "condition_on_previous_text": (
+                "true" if bool(getattr(
+                    settings, "WHISPER_CONDITION_ON_PREVIOUS_TEXT", False))
+                else "false"),
+            "no_repeat_ngram_size": str(int(getattr(
+                settings, "WHISPER_NO_REPEAT_NGRAM_SIZE", 3))),
+            "log_prob_threshold": str(float(getattr(
+                settings, "WHISPER_LOG_PROB_THRESHOLD", -1.0))),
+            "compression_ratio_threshold": str(float(getattr(
+                settings, "WHISPER_COMPRESSION_RATIO_THRESHOLD", 2.4))),
+            "hallucination_silence_threshold": str(float(getattr(
+                settings, "WHISPER_HALLUCINATION_SILENCE_S", 2.0))),
+        }
+        if "threshold" in vad:
+            fields["vad_threshold"] = str(float(vad["threshold"]))
+        return fields
+    except Exception as e:
+        logger.warning("Remote tuning fields skipped (%s)", e)
+        return {}
+
+
 def _words_degenerate(words: list, start_sec: float, end_sec: float) -> bool:
     """True when a segment's word timestamps are unusable — missing for a
     multi-word text, non-monotonic, or collapsed to zero-width spans.
@@ -770,6 +831,9 @@ class RemoteWhisperEngine:
             "response_format": "verbose_json",
             "timestamp_granularities[]": ["word", "segment"],
         }
+        # Decode-tuning parity with the local path: the Companion sidecar
+        # honors these; other servers ignore the extra multipart fields.
+        data.update(_remote_tuning_fields())
         if translate:
             # whisper.cpp server reads this to run task=translate (→ English).
             data["translate"] = "true"
@@ -1733,6 +1797,7 @@ class AudioIntelligence:
                 #    "So nice", "Hmm."). Reuse the ledger's own low-confidence
                 #    signal to drop them — but only with corroboration, so real
                 #    quiet speech is kept (see is_low_confidence_phantom).
+                _phantom_hit = False
                 if (not is_hallucination and text and words and _phantom_on
                         and is_low_confidence_phantom(
                             words, no_speech_prob,
@@ -1740,6 +1805,7 @@ class AudioIntelligence:
                             min_lowconf_frac=_phantom_min_frac,
                             min_no_speech=_phantom_min_ns)):
                     is_hallucination = True
+                    _phantom_hit = True
 
                 seg_entry = {
                     'start_sec': round(seg.start, 3),
@@ -1751,6 +1817,12 @@ class AudioIntelligence:
                     'avg_logprob': round(float(getattr(
                         seg, 'avg_logprob', 0.0) or 0.0), 3),
                 }
+                if _phantom_hit:
+                    # Remember WHY it was quarantined: a low-confidence phantom
+                    # (not boilerplate/repetition) may still be REAL quiet
+                    # speech — the VAD-confirm pass below checks the voice map
+                    # and routes it to the redecode queue instead of dropping.
+                    seg_entry['phantom'] = True
                 segments.append(seg_entry)
 
                 # Align to 100ms grid for speech_active (backwards compat)
@@ -1782,6 +1854,40 @@ class AudioIntelligence:
                     on_progress(1.0, 'transcript_refine')
                 except TypeError:
                     on_progress(1.0)   # legacy single-arg callback
+            # ── Filter/coverage tension: VAD-confirm phantom-flagged cues ──
+            # The TACT phantom gate protects against invented cues, but it
+            # also fires on REAL quiet speech (low word confidence is exactly
+            # what soft/off-mic dialogue looks like). Before those cues are
+            # dropped, check the independent Silero voice map: a phantom
+            # whose span overlaps confirmed voice is routed to the
+            # low-confidence redecode queue (with a raised budget) instead of
+            # being discarded — the redecode either rescues real speech or
+            # confirms the drop. Non-fatal: any failure leaves the phantom
+            # verdicts unchanged.
+            if (getattr(settings, "WHISPER_REDECODE_ENABLED", True)
+                    and bool(getattr(settings,
+                                     "WHISPER_PHANTOM_VAD_RESCUE_ENABLED", True))
+                    and any(s.get('phantom') for s in segments)):
+                try:
+                    from backend.services import speech_coverage as SC
+                    _voice_map = SC.voice_activity_regions(audio_path)
+                    _n_confirmed = 0
+                    if _voice_map:
+                        for s in segments:
+                            if s.get('phantom') and SC.overlaps_voice(
+                                    _voice_map, s.get('start_sec', 0),
+                                    s.get('end_sec', 0)):
+                                s['vad_confirmed_voice'] = True
+                                _n_confirmed += 1
+                    if _n_confirmed:
+                        log.log_stage('AUDIO',
+                            f'TACT phantom filter: {_n_confirmed} low-confidence '
+                            'cue(s) overlap VAD-confirmed voice — routing to the '
+                            'redecode queue instead of dropping')
+                except Exception as _vr_err:
+                    log.log_stage('AUDIO',
+                        f'Phantom VAD-confirm pass skipped (non-fatal): {_vr_err}')
+
             # ── Two-pass difficult-segment redecode (audit Phase 3.4) ──
             # Hallucination-flagged / low-logprob / degenerate-word-timing
             # segments get one focused sequential re-decode (beam 8,
@@ -2276,11 +2382,25 @@ class AudioIntelligence:
                 # Small pad so a word straddling the boundary isn't clipped.
                 ss = max(0.0, a - 0.20)
                 dur = (b - a) + 0.40
+                # Boost quiet/off-mic speech before the retry decode — these
+                # spans were dropped as too faint the first time, so lift them
+                # (highpass → denoise → speechnorm) for the second chance.
+                boost = _gap_boost_af_args()
                 subprocess.run(
                     ['ffmpeg', '-y', '-ss', f'{ss:.3f}', '-t', f'{dur:.3f}',
-                     '-i', audio_path, '-vn', '-ac', '1', '-ar', '16000',
-                     '-c:a', 'pcm_s16le', wav],
+                     '-i', audio_path, '-vn'] + boost + ['-ac', '1',
+                     '-ar', '16000', '-c:a', 'pcm_s16le', wav],
                     capture_output=True, timeout=120)
+                if boost and (not os.path.exists(wav)
+                              or os.path.getsize(wav) < 2000):
+                    # The boost chain can fail on an ffmpeg build without
+                    # afftdn/speechnorm — retry the slice unfiltered rather
+                    # than lose the gap entirely.
+                    subprocess.run(
+                        ['ffmpeg', '-y', '-ss', f'{ss:.3f}', '-t', f'{dur:.3f}',
+                         '-i', audio_path, '-vn', '-ac', '1', '-ar', '16000',
+                         '-c:a', 'pcm_s16le', wav],
+                        capture_output=True, timeout=120)
                 if not os.path.exists(wav) or os.path.getsize(wav) < 2000:
                     continue
                 part = remote_engine.transcribe_wav(wav, whisper_lang)
@@ -2344,6 +2464,8 @@ class AudioIntelligence:
 
         logprob_floor = float(getattr(settings, 'WHISPER_REDECODE_LOGPROB', -0.8))
         max_frac = float(getattr(settings, 'WHISPER_REDECODE_MAX_FRAC', 0.10))
+        vad_max_frac = float(getattr(
+            settings, 'WHISPER_REDECODE_VAD_MAX_FRAC', 0.25))
         beam = int(getattr(settings, 'WHISPER_REDECODE_BEAM', 8))
 
         def _score(entry):
@@ -2360,9 +2482,19 @@ class AudioIntelligence:
                 candidates.append((i, degenerate))
         if not candidates:
             return 0
-        budget = max(1, int(len(segments) * max_frac))
         candidates.sort(key=lambda c: _score(segments[c[0]]))
-        candidates = candidates[:budget]
+        # VAD-confirmed phantom cues (the voice map says there IS speech under
+        # them) get their own, larger budget: the redecode is their only path
+        # back into the transcript, so they must never be crowded out by — or
+        # crowd out — the ordinary low-logprob candidates.
+        vad_confirmed = [c for c in candidates
+                         if segments[c[0]].get('vad_confirmed_voice')]
+        regular = [c for c in candidates
+                   if not segments[c[0]].get('vad_confirmed_voice')]
+        budget = max(1, int(len(segments) * max_frac))
+        vad_budget = max(1, int(len(segments) * vad_max_frac)) if vad_confirmed else 0
+        candidates = regular[:budget] + vad_confirmed[:vad_budget]
+        candidates.sort(key=lambda c: _score(segments[c[0]]))
 
         _decode = _decoding_kwargs(self.engine.transcribe)
         # The redecode is the LAST chance before the polish LLM — spend
@@ -2423,6 +2555,7 @@ class AudioIntelligence:
                 entry['end_sec'] = round(words[-1]['end'], 3)
             entry['avg_logprob'] = round(new_logprob, 3)
             entry['is_hallucination'] = False
+            entry.pop('phantom', None)
             entry['redecoded'] = True
             replaced += 1
         return replaced

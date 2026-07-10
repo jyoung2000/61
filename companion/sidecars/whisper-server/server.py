@@ -24,6 +24,7 @@ import logging
 import os
 import tempfile
 import threading
+from typing import Optional
 
 from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.responses import JSONResponse, PlainTextResponse
@@ -36,12 +37,85 @@ MODEL_NAME = os.environ.get("WHISPER_MODEL", "large-v3-turbo")
 COMPUTE = os.environ.get("WHISPER_COMPUTE", "float16")
 PORT = int(os.environ.get("WHISPER_PORT", "11510"))
 MODELS_DIR = os.environ.get("WHISPER_MODELS_DIR", "")
+BATCH_SIZE = int(os.environ.get("WHISPER_BATCH_SIZE", "16"))
 
 app = FastAPI(title="ClipAI Companion Whisper Sidecar")
 
 _model = None
+_batched = None
 _model_lock = threading.Lock()
 _device_used = "unknown"
+
+
+def _parse_optional_bool(value):
+    """Parse an optional boolean form field. ``None``/blank → ``None``
+    (leave the engine default untouched)."""
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    return text in ("1", "true", "yes", "on")
+
+
+def _tuned_transcribe_kwargs(
+    transcribe_callable,
+    *,
+    beam_size=None,
+    vad_threshold=None,
+    vad_min_silence_ms=None,
+    vad_speech_pad_ms=None,
+    no_speech_threshold=None,
+    condition_on_previous_text=None,
+    no_repeat_ngram_size=None,
+    log_prob_threshold=None,
+    compression_ratio_threshold=None,
+    hallucination_silence_threshold=None,
+) -> dict:
+    """Tuning kwargs for a transcribe call, filtered to what the installed
+    faster-whisper build accepts (the same feature-detection ClipAI's
+    ``_vocab_bias_kwargs`` uses — only explicit named parameters count, a
+    ``**kwargs`` catch-all does NOT, so an older build never raises on an
+    unknown kwarg).
+
+    Every argument is optional; ``None`` means "leave the loaded build's own
+    default in place", which preserves the sidecar's historical behavior for
+    clients (speaches / whisper.cpp compatibility) that never send the field.
+    """
+    import inspect
+    try:
+        params = inspect.signature(transcribe_callable).parameters
+    except (TypeError, ValueError):
+        return {}
+
+    desired = {}
+    if beam_size is not None:
+        desired["beam_size"] = max(1, int(beam_size))
+    if no_speech_threshold is not None:
+        desired["no_speech_threshold"] = float(no_speech_threshold)
+    if condition_on_previous_text is not None:
+        desired["condition_on_previous_text"] = bool(condition_on_previous_text)
+    if no_repeat_ngram_size is not None:
+        desired["no_repeat_ngram_size"] = max(0, int(no_repeat_ngram_size))
+    if log_prob_threshold is not None:
+        desired["log_prob_threshold"] = float(log_prob_threshold)
+    if compression_ratio_threshold is not None:
+        desired["compression_ratio_threshold"] = float(compression_ratio_threshold)
+    if hallucination_silence_threshold is not None:
+        desired["hallucination_silence_threshold"] = float(
+            hallucination_silence_threshold)
+
+    vad_parameters = {}
+    if vad_threshold is not None and 0.0 < float(vad_threshold) < 1.0:
+        vad_parameters["threshold"] = float(vad_threshold)
+    if vad_min_silence_ms is not None:
+        vad_parameters["min_silence_duration_ms"] = max(0, int(vad_min_silence_ms))
+    if vad_speech_pad_ms is not None:
+        vad_parameters["speech_pad_ms"] = max(0, int(vad_speech_pad_ms))
+    if vad_parameters:
+        desired["vad_parameters"] = vad_parameters
+
+    return {k: v for k, v in desired.items() if k in params}
 
 
 def _load_model():
@@ -69,6 +143,24 @@ def _load_model():
         raise RuntimeError("could not load the whisper model on GPU or CPU")
 
 
+def _load_batched(engine):
+    """Wrap the loaded model in a BatchedInferencePipeline (once). Returns
+    ``None`` when the installed faster-whisper doesn't ship it — callers
+    fall back to the sequential ``engine.transcribe``."""
+    global _batched
+    with _model_lock:
+        if _batched is not None:
+            return _batched
+        try:
+            from faster_whisper import BatchedInferencePipeline
+            _batched = BatchedInferencePipeline(model=engine)
+            logger.info("batched inference pipeline ready (batch_size=%d)", BATCH_SIZE)
+        except Exception as e:  # noqa: BLE001 — sequential fallback
+            logger.info("batched inference unavailable (%s) — sequential decode", e)
+            _batched = None
+        return _batched
+
+
 @app.get("/health")
 def health():
     return {
@@ -88,6 +180,22 @@ async def transcribe(
     prompt: str = Form(""),
     response_format: str = Form("verbose_json"),
     temperature: float = Form(0.0),
+    # ── Optional decode-tuning fields (ClipAI parity) ──
+    # All default to None so a client that never sends them (speaches /
+    # whisper.cpp compatibility) gets the sidecar's historical behavior:
+    # beam_size=5, vad_filter=True with faster-whisper's default VAD and
+    # decoding parameters. ClipAI's RemoteWhisperEngine sends the same tuned
+    # values its local path computes so the two paths decode identically.
+    beam_size: Optional[float] = Form(None),
+    vad_threshold: Optional[float] = Form(None),
+    vad_min_silence_ms: Optional[float] = Form(None),
+    vad_speech_pad_ms: Optional[float] = Form(None),
+    no_speech_threshold: Optional[float] = Form(None),
+    condition_on_previous_text: Optional[str] = Form(None),
+    no_repeat_ngram_size: Optional[float] = Form(None),
+    log_prob_threshold: Optional[float] = Form(None),
+    compression_ratio_threshold: Optional[float] = Form(None),
+    hallucination_silence_threshold: Optional[float] = Form(None),
 ):
     """OpenAI-compatible transcription. The ``model`` form field is
     accepted for schema compatibility but the loaded model serves every
@@ -104,19 +212,49 @@ async def transcribe(
         audio_path = tmp.name
 
     try:
-        kwargs = {
-            "beam_size": 5,
+        base_kwargs = {
             "vad_filter": True,
             "word_timestamps": True,
         }
         if language and language not in ("auto", ""):
-            kwargs["language"] = language
+            base_kwargs["language"] = language
         if prompt:
-            kwargs["initial_prompt"] = prompt
+            base_kwargs["initial_prompt"] = prompt
         if temperature:
-            kwargs["temperature"] = temperature
+            base_kwargs["temperature"] = temperature
 
-        segments_iter, info = engine.transcribe(audio_path, **kwargs)
+        tuning = dict(
+            # The historical hardcoded default; a client-sent beam_size wins.
+            beam_size=5 if beam_size is None else beam_size,
+            vad_threshold=vad_threshold,
+            vad_min_silence_ms=vad_min_silence_ms,
+            vad_speech_pad_ms=vad_speech_pad_ms,
+            no_speech_threshold=no_speech_threshold,
+            condition_on_previous_text=_parse_optional_bool(
+                condition_on_previous_text),
+            no_repeat_ngram_size=no_repeat_ngram_size,
+            log_prob_threshold=log_prob_threshold,
+            compression_ratio_threshold=compression_ratio_threshold,
+            hallucination_silence_threshold=hallucination_silence_threshold,
+        )
+
+        # Batched decode first (large speedup on long uploads), sequential
+        # fallback on any batched failure so a request never dies on it.
+        segments_iter = info = None
+        batched = _load_batched(engine)
+        if batched is not None:
+            try:
+                segments_iter, info = batched.transcribe(
+                    audio_path, batch_size=BATCH_SIZE, **base_kwargs,
+                    **_tuned_transcribe_kwargs(batched.transcribe, **tuning))
+            except Exception as e:  # noqa: BLE001 — sequential fallback
+                logger.warning("batched decode failed (%s) — sequential fallback",
+                               str(e)[:200])
+                segments_iter = info = None
+        if segments_iter is None:
+            segments_iter, info = engine.transcribe(
+                audio_path, **base_kwargs,
+                **_tuned_transcribe_kwargs(engine.transcribe, **tuning))
 
         segments = []
         words = []

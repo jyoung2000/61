@@ -1411,7 +1411,10 @@ async def translate_subtitles(job_id: str, req: TranslateRequest):
     from backend.services.translator import SUPPORTED_LANGUAGES, TranslationFailedError
     from backend.services.nmt_translator import iso_to_flores
     from backend.services.ai_orchestrator import AIOrchestrator
-    from backend.services.pipeline import translate_subtitles as _translate_subtitles
+    from backend.services.pipeline import (
+        translate_subtitles as _translate_subtitles,
+        recheck_translated_readability as _recheck_readability,
+    )
 
     job = await database.load_job(job_id)
     if not job or not job.transcript:
@@ -1443,6 +1446,13 @@ async def translate_subtitles(job_id: str, req: TranslateRequest):
         # The offline NMT fallback couldn't run. Surface an actionable 503
         # rather than a generic 500.
         raise HTTPException(status_code=503, detail=str(e))
+
+    # Post-translation CPS / line-length re-check: translated text is often
+    # much longer than the source (CJK → English roughly doubles it), so
+    # re-split/re-wrap any cue that now reads too fast or over-long before
+    # persisting. (The full pipeline runs its own enforcement pass; this
+    # endpoint stores the router output directly, so it re-checks here.)
+    translated = _recheck_readability(translated)
 
     # Store translated transcript and update subtitle_language
     await database.update_job_status(
