@@ -1363,14 +1363,14 @@ class AudioIntelligence:
                         f' (preconditioning {"on" if _precondition else "off"})...')
                     _extract_cmd = ['ffmpeg', '-y', '-i', video_path, '-vn']
                     if _precondition:
-                        # Duration-aware chain — drop the CPU-bound afftdn FFT
-                        # denoise on long tracks (same rule as the main
-                        # frame_extractor path) so this fallback can't stall for
-                        # 15-20 min on a 2 h video.
+                        # Duration-aware chain — same rule as the main
+                        # frame_extractor path. The cap default is now 0
+                        # (always denoise — coverage over speed); set a
+                        # positive minute count to drop afftdn on long tracks.
                         from backend.services.pipeline_helpers import build_precondition_filters
                         _af = build_precondition_filters(
                             True, (duration_ms or 0) / 1000.0,
-                            float(getattr(settings, "WHISPER_PRECONDITION_DENOISE_MAX_MIN", 45) or 0))
+                            float(getattr(settings, "WHISPER_PRECONDITION_DENOISE_MAX_MIN", 0) or 0))
                         if _af:
                             _extract_cmd += ['-af', _af]
                     _extract_cmd += ['-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le',
@@ -2291,7 +2291,7 @@ class AudioIntelligence:
                     and remote_engine is not None):
                 gaps = SC.uncovered_voice_gaps(
                     voice, _covered(segs),
-                    min_gap_s=float(getattr(settings, "SPEECH_GAP_MIN_SEC", 2.0)))
+                    min_gap_s=float(getattr(settings, "SPEECH_GAP_MIN_SEC", 1.2)))
                 if gaps:
                     new_segs = self._recover_voice_gaps_remote(
                         gaps, audio_path, whisper_lang, remote_engine, log)

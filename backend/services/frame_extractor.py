@@ -1043,7 +1043,7 @@ async def extract_audio(
     if precondition:
         from backend.services.pipeline_helpers import build_precondition_filters
         denoise_max_min = float(getattr(
-            settings, "WHISPER_PRECONDITION_DENOISE_MAX_MIN", 45) or 0)
+            settings, "WHISPER_PRECONDITION_DENOISE_MAX_MIN", 0) or 0)
         af_chain = build_precondition_filters(
             True, video_duration, denoise_max_min)
         if af_chain:

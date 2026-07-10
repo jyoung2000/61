@@ -227,9 +227,33 @@ pub async fn ensure_running(
         model = "large-v3";
     }
     let is_gpu_build = build_kind(&resource_dir, &data_dir) == "gpu";
+    // Tuned decode parity with the ClipAI backend's local faster-whisper path
+    // (see backend/services/reframer_audio.py: _vad_parameters /
+    // _decoding_kwargs / WHISPER_NO_SPEECH_THRESHOLD). Passed to the
+    // faster-whisper sidecar as env vars — zero protocol risk since we launch
+    // that binary ourselves; server.py feature-detects each value against the
+    // installed faster-whisper and a per-request form field still overrides.
+    // whisper.cpp ignores these (it has its own CLI flags above).
+    let fw_tuning: [(&str, String); 8] = [
+        ("WHISPER_BEAM", beam_size.to_string()),
+        ("WHISPER_VAD_ONSET", "0.10".into()),
+        ("WHISPER_VAD_MIN_SILENCE_MS", "300".into()),
+        ("WHISPER_VAD_SPEECH_PAD_MS", "150".into()),
+        ("WHISPER_NO_SPEECH_THRESHOLD", "0.4".into()),
+        ("WHISPER_COND_PREV", "0".into()),
+        ("WHISPER_NO_REPEAT_NGRAM", "3".into()),
+        ("WHISPER_HALLUCINATION_SILENCE_S", "2.0".into()),
+    ];
     // A restart is needed when the model OR the decode settings change, so the
-    // service key folds both in.
-    let service_key = format!("{model}|bs{beam_size}");
+    // service key folds both in — including the env tuning, so editing the
+    // values above (or a Companion upgrade that introduces them) retires a
+    // sidecar still running the old decode parameters.
+    let tuning_key = fw_tuning
+        .iter()
+        .map(|(_, v)| v.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    let service_key = format!("{model}|bs{beam_size}|tune:{tuning_key}");
 
     let mut guard = state.sidecar.lock().await;
     if let Some(handle) = guard.as_mut() {
@@ -284,6 +308,11 @@ pub async fn ensure_running(
             .env("WHISPER_PORT", WHISPER_SIDECAR_PORT.to_string())
             .env("WHISPER_MODELS_DIR", models.to_string_lossy().as_ref())
             .env("HF_HOME", models.to_string_lossy().as_ref());
+        // Decode parity with the backend's tuned local path (folded into
+        // service_key above so a change here restarts the sidecar).
+        for (key, value) in &fw_tuning {
+            cmd.env(key, value);
+        }
     }
     cmd.stdout(Stdio::null()).stderr(Stdio::null());
     let child = cmd

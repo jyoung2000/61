@@ -16,6 +16,20 @@ Configuration (env, set by the Companion per the VRAM budget):
   WHISPER_COMPUTE     ctranslate2 compute type (float16 / int8_float16)
   WHISPER_PORT        listen port (default 11510)
   WHISPER_MODELS_DIR  download/cache dir for model weights
+  WHISPER_BATCH_SIZE  BatchedInferencePipeline batch size (default 16)
+
+Optional decode-tuning env (parity with the ClipAI backend's local path;
+unset = the engine's own defaults, i.e. the historical behavior). Every
+value is feature-detected against the installed faster-whisper before use,
+and a per-request form field overrides the env:
+  WHISPER_BEAM                     beam size (historical default 5)
+  WHISPER_VAD_ONSET                Silero speech threshold (0..1)
+  WHISPER_VAD_MIN_SILENCE_MS       VAD min silence between segments
+  WHISPER_VAD_SPEECH_PAD_MS        VAD padding around speech
+  WHISPER_NO_SPEECH_THRESHOLD      no-speech skip threshold
+  WHISPER_COND_PREV                condition_on_previous_text (0/1, default 1)
+  WHISPER_NO_REPEAT_NGRAM          no_repeat_ngram_size
+  WHISPER_HALLUCINATION_SILENCE_S  silence-gap hallucination guard (seconds)
 """
 from __future__ import annotations
 
@@ -56,6 +70,56 @@ def _parse_optional_bool(value):
     if not text:
         return None
     return text in ("1", "true", "yes", "on")
+
+
+def _env_float(name):
+    """Optional float env var; unset / blank / unparsable → ``None``."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("ignoring unparsable env %s=%r", name, raw)
+        return None
+
+
+def _env_int(name):
+    """Optional int env var; unset / blank / unparsable → ``None``."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    try:
+        return int(float(raw))
+    except ValueError:
+        logger.warning("ignoring unparsable env %s=%r", name, raw)
+        return None
+
+
+def _env_tuning() -> dict:
+    """Decode-tuning defaults from the environment (set by the Companion at
+    launch — see src-tauri/src/sidecar.rs). This is the zero-protocol-risk
+    parity channel: we launch this binary ourselves, so env vars can't 400 on
+    a strict server the way extra multipart fields could.
+
+    Every key is ``None`` when its env var is unset/invalid, which preserves
+    the engine's own defaults exactly (current behavior). A per-request form
+    field still wins over the env value (see ``transcribe``). ``WHISPER_COND_PREV``
+    accepts 0/1; unset keeps faster-whisper's default (1/true).
+    """
+    cond_prev = _env_int("WHISPER_COND_PREV")
+    return {
+        "beam_size": _env_int("WHISPER_BEAM"),
+        "vad_threshold": _env_float("WHISPER_VAD_ONSET"),
+        "vad_min_silence_ms": _env_int("WHISPER_VAD_MIN_SILENCE_MS"),
+        "vad_speech_pad_ms": _env_int("WHISPER_VAD_SPEECH_PAD_MS"),
+        "no_speech_threshold": _env_float("WHISPER_NO_SPEECH_THRESHOLD"),
+        "condition_on_previous_text": (None if cond_prev is None
+                                       else bool(cond_prev)),
+        "no_repeat_ngram_size": _env_int("WHISPER_NO_REPEAT_NGRAM"),
+        "hallucination_silence_threshold": _env_float(
+            "WHISPER_HALLUCINATION_SILENCE_S"),
+    }
 
 
 def _tuned_transcribe_kwargs(
@@ -223,19 +287,38 @@ async def transcribe(
         if temperature:
             base_kwargs["temperature"] = temperature
 
+        # Precedence: per-request form field > launch env (_env_tuning) >
+        # engine default. beam_size keeps its historical hardcoded 5 as the
+        # last resort so a bare request decodes exactly as before.
+        env = _env_tuning()
+        _cond_prev = _parse_optional_bool(condition_on_previous_text)
+        _beam = beam_size if beam_size is not None else env["beam_size"]
         tuning = dict(
-            # The historical hardcoded default; a client-sent beam_size wins.
-            beam_size=5 if beam_size is None else beam_size,
-            vad_threshold=vad_threshold,
-            vad_min_silence_ms=vad_min_silence_ms,
-            vad_speech_pad_ms=vad_speech_pad_ms,
-            no_speech_threshold=no_speech_threshold,
-            condition_on_previous_text=_parse_optional_bool(
-                condition_on_previous_text),
-            no_repeat_ngram_size=no_repeat_ngram_size,
+            beam_size=5 if _beam is None else _beam,
+            vad_threshold=(vad_threshold if vad_threshold is not None
+                           else env["vad_threshold"]),
+            vad_min_silence_ms=(vad_min_silence_ms
+                                if vad_min_silence_ms is not None
+                                else env["vad_min_silence_ms"]),
+            vad_speech_pad_ms=(vad_speech_pad_ms
+                               if vad_speech_pad_ms is not None
+                               else env["vad_speech_pad_ms"]),
+            no_speech_threshold=(no_speech_threshold
+                                 if no_speech_threshold is not None
+                                 else env["no_speech_threshold"]),
+            condition_on_previous_text=(
+                _cond_prev if _cond_prev is not None
+                else env["condition_on_previous_text"]),
+            no_repeat_ngram_size=(no_repeat_ngram_size
+                                  if no_repeat_ngram_size is not None
+                                  else env["no_repeat_ngram_size"]),
+            # Form-only (no env channel): log-prob / compression-ratio floors.
             log_prob_threshold=log_prob_threshold,
             compression_ratio_threshold=compression_ratio_threshold,
-            hallucination_silence_threshold=hallucination_silence_threshold,
+            hallucination_silence_threshold=(
+                hallucination_silence_threshold
+                if hallucination_silence_threshold is not None
+                else env["hallucination_silence_threshold"]),
         )
 
         # Batched decode first (large speedup on long uploads), sequential

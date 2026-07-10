@@ -139,6 +139,164 @@ def test_sidecar_parse_optional_bool(sidecar):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 1a-env. Sidecar: env-var decode parity (set by the Companion launcher)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_ENV_VARS = (
+    "WHISPER_BEAM", "WHISPER_VAD_ONSET", "WHISPER_VAD_MIN_SILENCE_MS",
+    "WHISPER_VAD_SPEECH_PAD_MS", "WHISPER_NO_SPEECH_THRESHOLD",
+    "WHISPER_COND_PREV", "WHISPER_NO_REPEAT_NGRAM",
+    "WHISPER_HALLUCINATION_SILENCE_S",
+)
+
+
+@pytest.fixture()
+def clean_tuning_env(monkeypatch):
+    for var in _ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+    return monkeypatch
+
+
+def test_env_tuning_unset_is_all_none(sidecar, clean_tuning_env):
+    """Unset env = engine defaults everywhere — the historical behavior."""
+    assert all(v is None for v in sidecar._env_tuning().values())
+
+
+def test_env_tuning_parses_the_companion_values(sidecar, clean_tuning_env):
+    m = clean_tuning_env
+    m.setenv("WHISPER_BEAM", "8")
+    m.setenv("WHISPER_VAD_ONSET", "0.10")
+    m.setenv("WHISPER_VAD_MIN_SILENCE_MS", "300")
+    m.setenv("WHISPER_VAD_SPEECH_PAD_MS", "150")
+    m.setenv("WHISPER_NO_SPEECH_THRESHOLD", "0.4")
+    m.setenv("WHISPER_COND_PREV", "0")
+    m.setenv("WHISPER_NO_REPEAT_NGRAM", "3")
+    m.setenv("WHISPER_HALLUCINATION_SILENCE_S", "2.0")
+    env = sidecar._env_tuning()
+    assert env == {
+        "beam_size": 8,
+        "vad_threshold": 0.10,
+        "vad_min_silence_ms": 300,
+        "vad_speech_pad_ms": 150,
+        "no_speech_threshold": 0.4,
+        "condition_on_previous_text": False,
+        "no_repeat_ngram_size": 3,
+        "hallucination_silence_threshold": 2.0,
+    }
+
+
+def test_env_tuning_cond_prev_one_is_true(sidecar, clean_tuning_env):
+    clean_tuning_env.setenv("WHISPER_COND_PREV", "1")
+    assert sidecar._env_tuning()["condition_on_previous_text"] is True
+
+
+def test_env_tuning_invalid_values_ignored(sidecar, clean_tuning_env):
+    """Garbage env never crashes the sidecar — it falls back to defaults."""
+    m = clean_tuning_env
+    m.setenv("WHISPER_VAD_ONSET", "banana")
+    m.setenv("WHISPER_BEAM", "not-a-number")
+    m.setenv("WHISPER_NO_SPEECH_THRESHOLD", "")
+    env = sidecar._env_tuning()
+    assert env["vad_threshold"] is None
+    assert env["beam_size"] is None
+    assert env["no_speech_threshold"] is None
+
+
+def _capture_client(sidecar, monkeypatch):
+    """TestClient wired to a capture engine — records the kwargs the endpoint
+    actually passes to ``engine.transcribe`` (sequential path)."""
+    from types import SimpleNamespace
+    from fastapi.testclient import TestClient
+
+    captured = {}
+
+    class _Engine:
+        def transcribe(self, audio_path, beam_size=5, vad_filter=True,
+                       vad_parameters=None, word_timestamps=False,
+                       no_speech_threshold=0.6,
+                       condition_on_previous_text=True,
+                       no_repeat_ngram_size=0, log_prob_threshold=-1.0,
+                       compression_ratio_threshold=2.4,
+                       hallucination_silence_threshold=None, language=None,
+                       initial_prompt=None, temperature=0.0):
+            captured.clear()
+            captured.update({
+                "beam_size": beam_size,
+                "vad_parameters": vad_parameters,
+                "no_speech_threshold": no_speech_threshold,
+                "condition_on_previous_text": condition_on_previous_text,
+                "no_repeat_ngram_size": no_repeat_ngram_size,
+                "hallucination_silence_threshold": hallucination_silence_threshold,
+            })
+            return iter([]), SimpleNamespace(language="en", duration=1.0)
+
+    monkeypatch.setattr(sidecar, "_load_model", lambda: _Engine())
+    monkeypatch.setattr(sidecar, "_load_batched", lambda engine: None)
+    return TestClient(sidecar.app), captured
+
+
+def _post_wav(client, extra=None):
+    data = {"response_format": "json"}
+    data.update(extra or {})
+    return client.post(
+        "/v1/audio/transcriptions",
+        files={"file": ("probe.wav", b"RIFF0000WAVEfmt ", "audio/wav")},
+        data=data)
+
+
+def test_endpoint_env_applies_when_no_form_fields(sidecar, clean_tuning_env):
+    m = clean_tuning_env
+    m.setenv("WHISPER_BEAM", "8")
+    m.setenv("WHISPER_VAD_ONSET", "0.10")
+    m.setenv("WHISPER_VAD_MIN_SILENCE_MS", "300")
+    m.setenv("WHISPER_NO_SPEECH_THRESHOLD", "0.4")
+    m.setenv("WHISPER_COND_PREV", "0")
+    m.setenv("WHISPER_NO_REPEAT_NGRAM", "3")
+    m.setenv("WHISPER_HALLUCINATION_SILENCE_S", "2.0")
+
+    client, captured = _capture_client(sidecar, m)
+    resp = _post_wav(client)
+    assert resp.status_code == 200
+    assert captured["beam_size"] == 8
+    assert captured["vad_parameters"] == {"threshold": 0.10,
+                                          "min_silence_duration_ms": 300}
+    assert captured["no_speech_threshold"] == 0.4
+    assert captured["condition_on_previous_text"] is False
+    assert captured["no_repeat_ngram_size"] == 3
+    assert captured["hallucination_silence_threshold"] == 2.0
+
+
+def test_endpoint_no_env_no_form_is_legacy_decode(sidecar, clean_tuning_env):
+    """Bare request + bare environment ⇒ the historical decode: beam 5 and
+    the engine's own defaults for everything else."""
+    client, captured = _capture_client(sidecar, clean_tuning_env)
+    resp = _post_wav(client)
+    assert resp.status_code == 200
+    assert captured["beam_size"] == 5
+    assert captured["vad_parameters"] is None            # engine default
+    assert captured["no_speech_threshold"] == 0.6        # signature default
+    assert captured["condition_on_previous_text"] is True
+
+
+def test_endpoint_form_fields_override_env(sidecar, clean_tuning_env):
+    m = clean_tuning_env
+    m.setenv("WHISPER_BEAM", "8")
+    m.setenv("WHISPER_NO_SPEECH_THRESHOLD", "0.4")
+    m.setenv("WHISPER_COND_PREV", "0")
+
+    client, captured = _capture_client(sidecar, m)
+    resp = _post_wav(client, {
+        "beam_size": "10",
+        "no_speech_threshold": "0.55",
+        "condition_on_previous_text": "true",
+    })
+    assert resp.status_code == 200
+    assert captured["beam_size"] == 10
+    assert captured["no_speech_threshold"] == 0.55
+    assert captured["condition_on_previous_text"] is True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 1b. RemoteWhisperEngine sends the local path's tuned values
 # ─────────────────────────────────────────────────────────────────────────────
 

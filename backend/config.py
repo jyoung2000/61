@@ -248,15 +248,18 @@ class Settings(BaseSettings):
     # biggest reason Whisper drops faint speech.
     WHISPER_AUDIO_PRECONDITION: bool = True
     # The afftdn (FFT spectral denoiser) step of the preconditioning chain is
-    # CPU-bound at only a few × realtime — on a 2 h track it alone adds ~15-20
-    # min to the "frame+audio extraction" stage. Because fast GPU frame
-    # extraction finishes long before it, the run LOOKS stuck at the next step
-    # (faces) with no VRAM in use while ffmpeg grinds the audio. highpass +
-    # single-pass loudnorm are far cheaper and carry most of the coverage win,
-    # so on long videos we drop ONLY afftdn. Skip afftdn when the track exceeds
-    # this many minutes; 0 disables the cap (always denoise). No effect when
-    # WHISPER_AUDIO_PRECONDITION is off.
-    WHISPER_PRECONDITION_DENOISE_MAX_MIN: int = 45
+    # CPU-bound at only a few × realtime — on a 2 h track it can add ~15-20
+    # min to the "frame+audio extraction" stage, during which the run LOOKS
+    # stuck at the next step (faces) while ffmpeg grinds the audio. Skip
+    # afftdn when the track exceeds this many minutes; 0 disables the cap
+    # (ALWAYS denoise — the default). Denoising is a real coverage lever on
+    # quiet/noisy speech, and skipping it on long videos was silently costing
+    # transcript coverage exactly where a long runtime hides the loss; the
+    # chain now resamples to 16 kHz FIRST (see build_precondition_filters),
+    # which already cut the afftdn cost ~3× versus when this cap was
+    # introduced. Set a positive number of minutes to restore the speed cap.
+    # No effect when WHISPER_AUDIO_PRECONDITION is off.
+    WHISPER_PRECONDITION_DENOISE_MAX_MIN: int = 0
     # Silero VAD onset sensitivity. 0.15 (faster-whisper default) is
     # conservative and drops whispered / soft speech on realistic
     # content. 0.10 matches silero's published default and catches the
@@ -319,8 +322,10 @@ class Settings(BaseSettings):
     # only flip this on if they're real missed speech, not silence.
     SPEECH_GAP_RECOVERY_ENABLED: bool = False
     # Only recover a voice-active gap at least this long (short between-word
-    # gaps re-emit the same cue — not worth a round-trip).
-    SPEECH_GAP_MIN_SEC: float = 2.0
+    # gaps re-emit the same cue — not worth a round-trip). 1.2 s catches the
+    # short interjections / single-word replies a 2 s floor skipped while
+    # still staying above ordinary between-word pauses.
+    SPEECH_GAP_MIN_SEC: float = 1.2
     # Bound the recovery cost: at most this many gap runs and this much total
     # audio re-sent to the transcription engine (a pathological VAD map can't
     # explode into hundreds of requests).
