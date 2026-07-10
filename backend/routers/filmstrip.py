@@ -71,7 +71,18 @@ def _prepare_assets(job_id: str) -> None:
     if not src:
         return
 
-    # 1) Faststart the source in place — the single biggest video-load win for
+    # 1) COARSE thumbnail sprite first — seek-sampled, seconds even on a
+    #    2-hour source, and it must not wait behind the faststart remux of a
+    #    multi-GB file. The editor gets a filmstrip almost immediately.
+    _had_sprite = os.path.isfile(os.path.join(job_dir, "sprite.jpg"))
+    if not _had_sprite:
+        try:
+            from backend.services.filmstrip_generator import generate_sprite_coarse
+            generate_sprite_coarse(src, job_dir)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[%s] lazy coarse sprite failed: %s", job_id, e)
+
+    # 2) Faststart the source in place — the single biggest video-load win for
     #    a long, non-faststart file (moov currently trails mdat → the browser
     #    must pull the whole file before it can play or seek).
     try:
@@ -82,15 +93,11 @@ def _prepare_assets(job_id: str) -> None:
     except Exception as e:  # noqa: BLE001
         logger.warning("[%s] lazy faststart failed: %s", job_id, e)
 
-    # 2) Thumbnail sprite — coarse FIRST. On a long source the fine sheet
-    #    needs a whole-file keyframe scan (minutes); the seek-sampled coarse
-    #    sheet is ready in seconds, so the editor shows a filmstrip almost
-    #    immediately and transparently upgrades when the fine one lands.
-    if not os.path.isfile(os.path.join(job_dir, "sprite.jpg")):
+    # 3) FINE sprite — the whole-file keyframe scan (minutes on long
+    #    sources); replaces the coarse sheet, the editor swaps it in live.
+    if not _had_sprite:
         try:
-            from backend.services.filmstrip_generator import (
-                generate_sprite, generate_sprite_coarse)
-            generate_sprite_coarse(src, job_dir)
+            from backend.services.filmstrip_generator import generate_sprite
             generate_sprite(src, job_dir)
         except Exception as e:  # noqa: BLE001
             logger.warning("[%s] lazy sprite failed: %s", job_id, e)
@@ -106,7 +113,7 @@ def _prepare_assets(job_id: str) -> None:
         except Exception:
             pass
 
-    # 3) Waveform peaks (prefer the pre-extracted audio.wav over re-decoding).
+    # 4) Waveform peaks (prefer the pre-extracted audio.wav over re-decoding).
     if not os.path.isfile(os.path.join(job_dir, "peaks.json")):
         try:
             from backend.services.filmstrip_generator import generate_peaks

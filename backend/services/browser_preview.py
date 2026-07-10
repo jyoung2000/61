@@ -486,6 +486,14 @@ def _build_ffmpeg_cmd(source_path: str, target_path: str, probe: _ProbeResult,
                 "-pix_fmt", "yuv420p",
             ]
         else:
+            # ``-threads`` cap: the CPU encode runs in the BACKGROUND while
+            # the analysis pipeline (frame extraction, scene detect, local
+            # Whisper/YOLO) needs the cores. Half the machine keeps the
+            # preview building briskly without starving analysis; output
+            # bytes are unaffected (x264 threading is deterministic-quality
+            # at this preset/CRF for our purposes — it changes speed, not
+            # the rate-control targets).
+            _enc_threads = max(2, (os.cpu_count() or 8) // 2)
             video_opts = [
                 "-c:v", "libx264",
                 "-preset", "veryfast",
@@ -499,6 +507,7 @@ def _build_ffmpeg_cmd(source_path: str, target_path: str, probe: _ProbeResult,
                 "-keyint_min", str(gop),
                 "-sc_threshold", "0",
                 "-pix_fmt", "yuv420p",
+                "-threads", str(_enc_threads),
             ]
 
     audio_opts: list[str]
@@ -602,11 +611,15 @@ def _wait_for_peer(target_path: str, lock_path: str, timeout_sec: float = 300.0)
 def _run_ffmpeg(cmd: list[str], target_path: str) -> bool:
     """Run FFmpeg and return True on a non-empty successful output."""
     try:
+        from backend.services.proc_priority import low_priority_popen_kwargs
         proc = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
             timeout=1800,  # 30-minute ceiling — generous for a full re-encode
+            # Below-normal priority: this transcode is background work that
+            # must never steal cores from a live analysis pipeline.
+            **low_priority_popen_kwargs(),
         )
     except (subprocess.SubprocessError, OSError) as e:
         logger.warning("browser_preview: ffmpeg launch failed: %s", e)

@@ -422,6 +422,36 @@ async fn whisper_proxy(State(ctx): State<ProxyCtx>, req: Request<Body>) -> Respo
     }
 }
 
+/// /v1/sidecar/release → shut the whisper sidecar down NOW, freeing its VRAM.
+///
+/// ClipAI calls this the moment a job's transcription stage completes: the
+/// very next pipeline phase (translation / polish / SEO) hammers Ollama on
+/// this same GPU, and on an 8 GB card a resident whisper server (~3-4 GB)
+/// forces Ollama to spill layers to CPU — the LLM phase runs several times
+/// slower until the 15-minute idle reaper finally fires. Releasing eagerly
+/// costs nothing: the next transcription request cold-starts the sidecar
+/// automatically via ensure_running (bounded model reload, self-healing).
+///
+/// Never kills a decode in flight — the whisper slot is acquired first, so a
+/// concurrent transcription simply wins and the caller gets a 409 (it's a
+/// best-effort optimization; ClipAI ignores the result).
+async fn sidecar_release(State(ctx): State<ProxyCtx>, req: Request<Body>) -> Response {
+    if !authorized(&ctx, req.headers()) {
+        return unauthorized();
+    }
+    let Ok(permit) = ctx.state.whisper_slot.try_acquire() else {
+        return (
+            StatusCode::CONFLICT,
+            "a transcription is running — not releasing",
+        )
+            .into_response();
+    };
+    crate::sidecar::shutdown(&ctx.state).await;
+    drop(permit);
+    log::info!("whisper sidecar released on ClipAI's request (VRAM freed for LLM phase)");
+    (StatusCode::OK, "released").into_response()
+}
+
 /// /v1/progress → a lightweight job-progress heartbeat from ClipAI (same
 /// X-ClipAI-* headers the AI routes carry). During local-only pipeline stages
 /// (video decode/frame extraction on the SERVER GPU) no AI request reaches us,
@@ -788,6 +818,7 @@ fn build_router(ctx: ProxyCtx) -> Router {
         .route("/v1/files/list", get(files_list))
         .route("/v1/files/read", get(files_read))
         .route("/v1/progress", post(progress_report))
+        .route("/v1/sidecar/release", post(sidecar_release))
         .route("/v1/audio/transcriptions", post(whisper_proxy))
         .route("/ollama", any(ollama_proxy))
         .route("/ollama/", any(ollama_proxy))

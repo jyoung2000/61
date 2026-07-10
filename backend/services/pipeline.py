@@ -3839,32 +3839,15 @@ async def _run_analysis_inner(job_id: str, resume: bool = False):
     audio_path = os.path.join(job_dir, "audio.wav")
 
     # ── Editor scrub assets (filmstrip sprite + waveform peaks + faststart) ──
-    # Kicked in the BACKGROUND at the very start of analysis, in parallel with
-    # the pipeline, so the timeline filmstrip + waveform are ready soon after
-    # import — not only when analysis finishes — and so faststart never blocks
-    # import. Best-effort; the /api/jobs/{id}/filmstrip.* endpoints lazily
-    # regenerate if this didn't finish. moov relocation makes the sprite's own
-    # seeks (and the editor's <video>) fast.
+    # Kicked in the BACKGROUND at the very start of analysis. The coarse
+    # sprite lands within seconds (editor filmstrip available immediately);
+    # the disk-heavy passes (faststart remux, fine sprite scan, peaks) wait
+    # for extraction's audio.wav so they never fight frame/audio extraction
+    # for the same multi-GB file — see backend/services/editor_assets.py.
+    # Best-effort; the /api/jobs/{id}/filmstrip.* endpoints lazily regenerate.
     async def _prep_editor_assets():
-        try:
-            from backend.services.faststart import ensure_faststart
-            await asyncio.to_thread(ensure_faststart, video_path)
-        except Exception as _fe:
-            logger.warning("[%s] bg faststart failed: %s", job_id, _fe)
-        try:
-            from backend.services.filmstrip_generator import (
-                generate_sprite, generate_sprite_coarse, generate_peaks)
-            # Coarse (seek-sampled) sheet first: seconds, so the timeline has
-            # a filmstrip almost immediately after import. The fine sheet
-            # (whole-file keyframe scan — minutes on a 2h source) replaces it
-            # right after; the editor polls the manifest and swaps live.
-            await asyncio.to_thread(generate_sprite_coarse, video_path, job_dir)
-            await asyncio.to_thread(generate_sprite, video_path, job_dir)
-            _pk_src = audio_path if os.path.exists(audio_path) else video_path
-            await asyncio.to_thread(generate_peaks, _pk_src, job_dir)
-            logger.info("[%s] editor scrub assets ready (background)", job_id)
-        except Exception as _se:
-            logger.warning("[%s] bg sprite/peaks failed: %s", job_id, _se)
+        from backend.services.editor_assets import prepare_editor_assets
+        await prepare_editor_assets(video_path, job_dir, audio_path)
     try:
         _editor_prep_task = asyncio.get_running_loop().create_task(_prep_editor_assets())
         # Hold a reference so the fire-and-forget task isn't GC'd mid-run.
@@ -5044,6 +5027,21 @@ async def _run_analysis_inner(job_id: str, resume: bool = False):
                         else "local_gpu" if _wdev.startswith("cuda")
                         else "cpu")
                 _record_stage_location(job_id, "transcription", _loc)
+                # Transcription is DONE on the Companion — release its whisper
+                # sidecar so the GPU's VRAM is fully available to Ollama for
+                # the LLM-heavy phases that start right now (translation,
+                # polish, summary, SEO). On an 8 GB shared card a resident
+                # whisper server forces the LLM to spill layers to CPU —
+                # several-times-slower generation for the entire phase. Any
+                # later whisper call (native-translate timing pass) simply
+                # cold-restarts the sidecar. Fire-and-forget, best-effort.
+                if (_loc == "remote"
+                        and getattr(settings, "WHISPER_REMOTE_RELEASE_AFTER_TRANSCRIBE", True)):
+                    from backend.services.reframer_audio import remote_whisper_release
+                    _rel_task = asyncio.create_task(
+                        asyncio.to_thread(remote_whisper_release))
+                    _BACKGROUND_TASKS.add(_rel_task)
+                    _rel_task.add_done_callback(_BACKGROUND_TASKS.discard)
         except Exception:
             pass
         # Tag AI inference (vision + text) with the GPU/host that serves it, so

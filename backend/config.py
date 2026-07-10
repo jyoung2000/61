@@ -360,6 +360,12 @@ class Settings(BaseSettings):
     # music-heavy VODs where Silero counts singing as "voice" (huge voice_sec,
     # tiny ratio) but the MC-talk cues the filters kept are perfectly good.
     REMOTE_TRANSCRIPT_MIN_COVERED_S: float = 30.0
+    # Release the Companion's whisper sidecar (freeing its VRAM) the moment a
+    # job's transcription completes, so Ollama on the SAME Companion GPU runs
+    # the translation/polish/SEO phases without spilling layers to CPU. Any
+    # later whisper request cold-restarts the sidecar automatically. Turn off
+    # only if back-to-back jobs make the ~20 s model reload per job noticeable.
+    WHISPER_REMOTE_RELEASE_AFTER_TRANSCRIBE: bool = True
 
     # ── Anti-repetition / anti-hallucination decoding (Task 3) ──
     # condition_on_previous_text feeds each window the previous window's text

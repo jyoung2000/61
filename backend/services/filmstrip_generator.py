@@ -70,7 +70,11 @@ _PEAKS_CHUNK = 4 * 1024 * 1024   # streaming read granularity (bytes)
 
 
 def _run(cmd: list, timeout: int) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, capture_output=True, timeout=timeout)
+    # Every ffmpeg/ffprobe here is a BACKGROUND asset pass that may run while
+    # the analysis pipeline saturates the box — yield the CPU to the pipeline.
+    from backend.services.proc_priority import low_priority_popen_kwargs
+    return subprocess.run(cmd, capture_output=True, timeout=timeout,
+                          **low_priority_popen_kwargs())
 
 
 def _probe_dims_duration(source_path: str) -> Optional[tuple[int, int, float]]:
@@ -424,6 +428,7 @@ def generate_peaks(audio_path: str, out_dir: str, n_peaks: int = _PEAKS_N) -> Op
             est_dur = 0.0
         est_samples = int(est_dur * _PEAKS_SR)
         spp = max(1, est_samples // n_peaks) if est_samples else _PEAKS_SR // 10
+        from backend.services.proc_priority import low_priority_popen_kwargs
         carry = b""
         proc = subprocess.Popen(
             ["ffmpeg", "-v", "error", "-i", audio_path,
@@ -431,6 +436,7 @@ def generate_peaks(audio_path: str, out_dir: str, n_peaks: int = _PEAKS_N) -> Op
              "-ar", str(_PEAKS_SR), "-ac", "1",
              "-f", "s16le", "-"],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            **low_priority_popen_kwargs(),
         )
         try:
             while True:

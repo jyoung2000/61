@@ -78,6 +78,7 @@ def ensure_faststart(path: str, timeout: int = 900) -> bool:
 
     tmp = path + ".faststart.tmp" + ext
     try:
+        from backend.services.proc_priority import low_priority_popen_kwargs
         proc = subprocess.run(
             [
                 "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
@@ -87,6 +88,9 @@ def ensure_faststart(path: str, timeout: int = 900) -> bool:
                 tmp,
             ],
             capture_output=True, timeout=timeout,
+            # Background remux (full-file read+write) — must yield to a live
+            # analysis pipeline streaming the same source file.
+            **low_priority_popen_kwargs(),
         )
         if proc.returncode != 0 or not os.path.isfile(tmp) or os.path.getsize(tmp) == 0:
             logger.warning(

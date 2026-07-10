@@ -692,6 +692,39 @@ def remote_whisper_pick_model(language: Optional[str]) -> str:
     return "large-v3"
 
 
+def remote_whisper_release() -> bool:
+    """Ask the Companion to shut its whisper sidecar down NOW (free VRAM).
+
+    Called right after a job's transcription stage completes: the next
+    pipeline phase (translation/polish/SEO) runs Ollama on the SAME Companion
+    GPU, and a resident whisper server (~3-4 GB) can force the LLM to spill
+    layers to CPU on an 8 GB card — several-times-slower generation until the
+    Companion's 15-minute idle reaper fires. Eager release costs nothing:
+    any later whisper request (native-translate timing pass, a new job)
+    cold-restarts the sidecar automatically.
+
+    Best-effort in every direction: unknown route on an older Companion
+    (404), a decode in flight (409), or any transport error just returns
+    False and nothing changes — the idle reaper remains the backstop.
+    """
+    if not remote_whisper_configured():
+        return False
+    try:
+        import httpx
+        headers = {}
+        token = _remote_whisper_token()
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        r = httpx.post(f"{_remote_whisper_base()}/v1/sidecar/release",
+                       headers=headers, timeout=5.0)
+        if r.status_code == 200:
+            logger.info("Companion whisper sidecar released (VRAM freed for the LLM phase)")
+            return True
+        return False
+    except Exception:
+        return False
+
+
 class RemoteWhisperEngine:
     """OpenAI-compatible remote transcription client.
 
