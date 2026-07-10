@@ -345,6 +345,21 @@ class Settings(BaseSettings):
     # hallucination and dropped. Raise toward 0.85 to KEEP more breathy/quiet
     # dialogue (fewer drops = more coverage, slightly more risk of a phantom).
     WHISPER_CLOUD_NO_SPEECH_DROP: float = 0.7
+    # ── Degenerate remote-decode gate ──
+    # A remote/companion transcript that covers less than MIN_COVERAGE of the
+    # VAD-detected speech on a video with at least MIN_VOICE_S of speech is a
+    # FAILED decode wearing a 200 OK (the whisper.cpp context-loop run: 1725 s
+    # of speech, 257 segments, 254 of them the same line, 0% coverage after
+    # filtering). Rejecting it makes the pipeline fall back to LOCAL Whisper
+    # instead of completing with an empty transcript. Deliberately loose
+    # floors: a genuinely sparse-but-real transcript passes easily.
+    REMOTE_TRANSCRIPT_MIN_COVERAGE: float = 0.15
+    REMOTE_TRANSCRIPT_MIN_VOICE_S: float = 120.0
+    # Absolute floor: even when the coverage RATIO is tiny, a transcript that
+    # still covers this many seconds of real speech is kept. Protects concert /
+    # music-heavy VODs where Silero counts singing as "voice" (huge voice_sec,
+    # tiny ratio) but the MC-talk cues the filters kept are perfectly good.
+    REMOTE_TRANSCRIPT_MIN_COVERED_S: float = 30.0
 
     # ── Anti-repetition / anti-hallucination decoding (Task 3) ──
     # condition_on_previous_text feeds each window the previous window's text

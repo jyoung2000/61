@@ -253,7 +253,9 @@ pub async fn ensure_running(
         .map(|(_, v)| v.as_str())
         .collect::<Vec<_>>()
         .join(",");
-    let service_key = format!("{model}|bs{beam_size}|tune:{tuning_key}");
+    // mc0 = whisper.cpp --max-context 0 (folded in so upgraded Companions
+    // retire a sidecar still running the loop-prone contextual decode).
+    let service_key = format!("{model}|bs{beam_size}|mc0|tune:{tuning_key}");
 
     let mut guard = state.sidecar.lock().await;
     if let Some(handle) = guard.as_mut() {
@@ -296,6 +298,19 @@ pub async fn ensure_running(
         if beam_size > 1 {
             cmd.arg("--beam-size").arg(beam_size.to_string());
         }
+        // Anti-loop parity with the backend's tuned decode
+        // (condition_on_previous_text=False): whisper.cpp conditions each
+        // window on the previous windows' text (prompt_past), which drives the
+        // classic repeated-line hallucination on music-heavy material — a
+        // 128-min anime run returned 257 segments of which 254 were the SAME
+        // line, and the server filtered the transcript to zero.
+        // --max-context 0 zeroes that conditioning. NOTE: --no-context is NOT
+        // a whisper-server CLI flag (unknown args make it print usage and
+        // exit 0, silently killing the sidecar) and the server's no_context
+        // param wouldn't stop within-file conditioning anyway — -mc 0 is the
+        // real lever, and it parses on every shipped build (verified against
+        // v1.7.4, the bundled macOS build, and v1.9.1, the Windows download).
+        cmd.arg("--max-context").arg("0");
         // Flash attention on the CUDA build: faster + lower memory, numerically
         // exact (no quality trade-off) — lets the bigger model + beam fit.
         if is_gpu_build {

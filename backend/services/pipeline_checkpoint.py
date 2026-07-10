@@ -439,6 +439,15 @@ async def save_engine_checkpoint(
     logged and swallowed (the next run just re-runs the engine).
     """
     import asyncio
+    # A signature without a source SHA stamps a checkpoint that can NEVER be
+    # loaded (_signatures_match refuses empty SHAs) — don't spend seconds
+    # writing + gzipping multi-MB files only for verify-after-save to reject
+    # them. One clear line beats a scary-looking ERROR.
+    if not (signature or {}).get("source_sha"):
+        logger.warning(
+            "[%s] Engine checkpoint skipped — no source SHA to key it "
+            "(a checkpoint saved without one can never be resumed)", job_id)
+        return False
     try:
         await asyncio.to_thread(
             _save_sync, job_id, perception, reframer_plan, signature, audio_meta or {})

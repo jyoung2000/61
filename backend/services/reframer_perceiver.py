@@ -834,8 +834,18 @@ class Perceiver:
         if _txn_thread is not None:
             _txn_thread.join()
             _res = _txn["result"]
+            # Accept the concurrent result only when it actually carries a
+            # transcript. An EMPTY remote result (degenerate decode rejected
+            # by the coverage gate, or a silent 200) must trigger the
+            # sequential local pass — the run that shipped 0 segments on a
+            # 128-min video accepted exactly such a result here. Exception:
+            # an empty transcript that carries VAD evidence the audio holds
+            # no substantial speech IS the correct answer — re-decoding
+            # music/silence locally would only waste minutes to confirm it.
             _ok = (_txn["error"] is None and _res is not None
-                   and not _res.get("_remote_failed"))
+                   and not _res.get("_remote_failed")
+                   and (bool(_res.get("segments"))
+                        or bool(_res.get("no_speech_evidence"))))
             if _ok:
                 _apply_audio_result(_res)
                 _txn_done = True

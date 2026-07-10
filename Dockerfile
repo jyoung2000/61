@@ -291,6 +291,13 @@ ${LD_LIBRARY_PATH}
 
 # Copy backend source
 COPY backend/ ./backend/
+# The SEO intelligence layer ships data files (banned tags, evergreen
+# trends, platform rules). A build without them silently degrades to
+# built-in fallbacks at runtime — fail the BUILD instead so a filtered
+# copy or broken context is caught here, not in production logs.
+RUN test -f backend/data/banned_tags.json \
+    && test -f backend/data/evergreen_trends.json \
+    && test -f backend/data/platform_rules.json
 
 # Bake the build identity into the image so the running container can log
 # exactly which commit it was built from (the repo's .git isn't copied, so

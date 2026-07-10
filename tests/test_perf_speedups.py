@@ -16,7 +16,14 @@ import json
 import os
 import tempfile
 
+import sys
+import types
+
 import pytest
+
+# reframer_models imports cv2 at module scope (RenderPlan.load); the
+# tests never touch it — same stub convention as test_remote_whisper.
+sys.modules.setdefault("cv2", types.ModuleType("cv2"))
 
 import backend.database as db
 from backend.config import settings
@@ -325,6 +332,9 @@ def test_checkpoint_signature_shape_unchanged():
         "aspect_ratio": "9:16",
         "vocal_sep_key": "False:htdemucs",
         "planner_fingerprint": "fp",
+        # Added when switching Whisper models started invalidating resumes —
+        # default "" when a caller doesn't pin one.
+        "asr_model": "",
     }
 
 

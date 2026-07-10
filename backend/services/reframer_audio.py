@@ -1052,6 +1052,12 @@ class AudioIntelligence:
         # based on the GPU's total VRAM (4 → batch=4, larger → batch=16).
         # Surfaced as ``self._batch_size`` so ``transcribe()`` uses it.
         self._batch_size = 16
+        # Set when a remote decode ANSWERED but was rejected (filtered to
+        # nothing / degenerate coverage). Re-decoding the same audio on the
+        # same server is deterministic garbage, so try_load() then skips the
+        # remote selection and any retry goes straight to the local ladder.
+        # Instance-scoped: a new job gets a fresh AudioIntelligence.
+        self._remote_decode_rejected = False
 
     def try_load(self, force_local: bool = False) -> bool:
         """Load a transcription engine: remote → local CUDA ladder → CPU.
@@ -1068,7 +1074,19 @@ class AudioIntelligence:
         """
         log = get_logger()
 
-        if not force_local and remote_whisper_configured():
+        if (not force_local and remote_whisper_configured()
+                and getattr(self, '_remote_decode_rejected', False)):
+            # This instance already got a 200-OK decode from the remote server
+            # and REJECTED it (looped/degenerate/filtered-to-nothing). The
+            # same audio would deterministically produce the same garbage —
+            # skip straight to the local ladder instead of paying a second
+            # full remote decode + gap-recovery pass. Applies even in strict
+            # mode: strict guards against a flaky HEALTH PROBE, not against
+            # affirmative evidence the decode itself is bad.
+            log.log_stage('AUDIO',
+                'Remote Whisper skipped: its previous decode of this video '
+                'was rejected as degenerate — using the local ladder')
+        elif not force_local and remote_whisper_configured():
             _strict = bool(getattr(settings, "GPU_STRICT_REMOTE", False))
             _healthy = remote_whisper_healthy()
             # In strict mode we select the remote server even when the quick
@@ -1547,6 +1565,15 @@ class AudioIntelligence:
                         _result = self._audit_and_recover_speech(
                             _result, audio_path, duration_ms, whisper_lang,
                             _remote_engine, log)
+                        # Degenerate-decode gate: a transcript that covers
+                        # almost NONE of the VAD-confirmed speech on a talky
+                        # video is a failed decode (looping whisper.cpp, wrong
+                        # audio, truncated upload) — reject it so the local
+                        # fallback produces a real transcript instead of the
+                        # job completing with 0 segments.
+                        if not self._remote_transcript_acceptable(_result, log):
+                            _result = None
+                    if _result is not None:
                         _result['transcription_provider'] = 'remote'
                         _result['transcription_location'] = 'remote'
                         # Report the REMOTE model as the effective model so
@@ -1559,6 +1586,16 @@ class AudioIntelligence:
                             except Exception:
                                 pass
                         return _result
+                    # The server ANSWERED (200 OK) but its transcript was
+                    # rejected — filtered to nothing, or degenerate per the
+                    # coverage gate. Re-sending the same audio to the same
+                    # server is deterministic: it re-produces the same garbage
+                    # and pays the same gap-recovery pass again. Remember the
+                    # rejection so any retry on this instance (the perceiver's
+                    # sequential pass after remote_only) goes straight to the
+                    # local ladder. Transport failures (no response at all) do
+                    # NOT set this — a flaky network deserves a second try.
+                    self._remote_decode_rejected = True
                 if remote_only:
                     # Concurrent-with-faces path: do NOT load local Whisper here
                     # (it would fight YOLO for the local card). Signal the caller
@@ -2268,6 +2305,57 @@ class AudioIntelligence:
 
         segments = _cross_validate_segments(
             [s for s in segments if not s.get('is_hallucination')])
+        if not segments:
+            # EVERYTHING the provider returned was filtered as hallucinated /
+            # looped / drifted. Whether that is a FAILED decode or simply a
+            # (near-)speech-free video depends on evidence the decode can't
+            # give us — so ask Silero. With substantial VAD-confirmed speech
+            # present, an empty transcript is a failed decode: return None so
+            # the caller runs the local fallback (the 128-min run where
+            # whisper.cpp looped — 257 segments, 254 verbatim repeats —
+            # shipped COMPLETE with no transcript precisely because this case
+            # fell through as success). With little or no detected speech,
+            # empty IS the correct transcript: return a valid empty result so
+            # legitimately speech-free content (a music video, a screencast
+            # with no narration) doesn't pay a redundant local decode.
+            _voice_sec = None
+            try:
+                from backend.services import speech_coverage as SC
+                _voice = SC.voice_activity_regions(audio_path)
+                if _voice:  # [] is ambiguous (no speech OR VAD unavailable)
+                    _voice_sec = sum(b - a for a, b in _voice)
+            except Exception:
+                _voice_sec = None
+            _min_voice = float(getattr(
+                settings, "REMOTE_TRANSCRIPT_MIN_VOICE_S", 120.0))
+            if _voice_sec is not None and _voice_sec < _min_voice:
+                log.log_stage('AUDIO',
+                    f'Cloud transcription empty after filtering, and Silero '
+                    f'found only {_voice_sec:.0f}s of speech in the audio — '
+                    'treating as legitimately speech-free (no local re-decode)')
+                _ledger = CoverageLedger(bin_width_ms=20,
+                                         duration_ms=int(duration_sec * 1000))
+                for _t in range(0, int(duration_sec * 1000), 20):
+                    _ledger.bins[_t] = LedgerBin(status='uncovered')
+                if on_progress:
+                    on_progress(1.0)
+                return {
+                    'speech_active': {},
+                    'segments': [],
+                    'language': language,
+                    'coverage_ledger': _ledger,
+                    'audio_events': [],
+                    'transcription_provider': cloud.get('provider'),
+                    'no_speech_evidence': True,
+                }
+            log.log_stage('AUDIO',
+                'Cloud transcription REJECTED: every returned segment was '
+                'filtered as hallucinated/looped'
+                + (f' while Silero detected {_voice_sec:.0f}s of speech'
+                   if _voice_sec is not None else '')
+                + ' — treating the remote decode as failed so the local '
+                  'fallback can run')
+            return None
 
         speech_active = {}
         for entry in segments:
@@ -2305,6 +2393,68 @@ class AudioIntelligence:
             'audio_events': [],
             'transcription_provider': cloud.get('provider'),
         }
+
+    def _remote_transcript_acceptable(self, result: dict, log) -> bool:
+        """Sanity gate on a remote/companion transcript AFTER filtering + the
+        coverage audit: is this a plausible transcript of the video, or a
+        failed decode wearing a 200 OK?
+
+        Rejects (→ caller falls back to local Whisper) when:
+          * the filtered transcript is EMPTY (unless finalize marked it
+            ``no_speech_evidence`` — VAD confirmed the audio holds no
+            substantial speech, so empty IS the correct transcript), or
+          * the independent Silero voice map found substantial speech
+            (≥ REMOTE_TRANSCRIPT_MIN_VOICE_S) and the transcript covers less
+            than REMOTE_TRANSCRIPT_MIN_COVERAGE of it — the signature of a
+            looped/garbage decode (the whisper.cpp context-loop run: 1725 s of
+            speech, 0% covered after 254 verbatim repeats were filtered).
+
+        Accepts when no coverage evidence exists (audit disabled / VAD
+        unavailable) and the transcript is non-empty — no evidence, no
+        rejection. Never raises.
+        """
+        try:
+            if not (result or {}).get('segments'):
+                if (result or {}).get('no_speech_evidence'):
+                    # Finalize already checked Silero and found (almost) no
+                    # speech — an empty transcript is CORRECT for this audio.
+                    log.log_stage('AUDIO',
+                        'Remote transcript is empty but VAD confirms the audio '
+                        'is (near-)speech-free — accepting the empty transcript')
+                    return True
+                log.log_stage('AUDIO',
+                    'Remote transcript REJECTED: 0 segments after filtering')
+                return False
+            st = (result or {}).get('speech_coverage') or {}
+            voice_sec = float(st.get('voice_sec', 0.0) or 0.0)
+            ratio = float(st.get('coverage_ratio', 1.0) or 0.0)
+            covered = float(st.get('covered_voice_sec', 0.0) or 0.0)
+            min_cov = float(getattr(
+                settings, "REMOTE_TRANSCRIPT_MIN_COVERAGE", 0.15))
+            min_voice = float(getattr(
+                settings, "REMOTE_TRANSCRIPT_MIN_VOICE_S", 120.0))
+            min_covered = float(getattr(
+                settings, "REMOTE_TRANSCRIPT_MIN_COVERED_S", 30.0))
+            # BOTH the ratio and the absolute floor must fail: Silero counts
+            # singing/shouts as voice, and the wrong-script/no-speech filters
+            # intentionally drop lyric cues — so a concert VOD with 90 s of
+            # real MC dialogue against 700 s of sung "voice" has a tiny RATIO
+            # yet a perfectly good transcript. A genuine garbage decode has
+            # both: almost no ratio AND almost no absolute covered speech.
+            if voice_sec >= min_voice and ratio < min_cov and covered < min_covered:
+                logger.warning(
+                    "Remote transcript rejected as degenerate: covers only "
+                    "%.0f%% (%.0fs) of %.0fs VAD-detected speech "
+                    "(floors: %.0f%% / %.0fs)",
+                    ratio * 100, covered, voice_sec, min_cov * 100, min_covered)
+                log.log_stage('AUDIO',
+                    f'Remote transcript REJECTED: covers only {ratio:.0%} '
+                    f'({covered:.0f}s) of {voice_sec:.0f}s of detected speech '
+                    '— degenerate decode; falling back to local Whisper')
+                return False
+        except Exception:
+            return True  # gate must never break a working transcript
+        return True
 
     def _audit_and_recover_speech(self, result: dict, audio_path: str,
                                   duration_ms: int, whisper_lang,
@@ -2396,6 +2546,24 @@ class AudioIntelligence:
                         st = SC.coverage_stats(voice, _covered(merged))
                         result['speech_coverage'] = st
 
+            # Honest tail: only claim the remainder is music/silence when the
+            # transcript actually covered (nearly) all the speech. A low ratio
+            # is a WARNING — the transcript is likely incomplete or the decode
+            # failed, and saying "the rest is silence" at 0% hid a dead run.
+            _ratio = float(st.get('coverage_ratio', 0.0) or 0.0)
+            if _ratio >= 0.85:
+                _tail = (". The untranscribed remainder of the runtime is "
+                         "music/silence with no speech.")
+            elif _ratio >= 0.5:
+                _tail = (". Coverage is below target — some speech may be "
+                         "missing from the transcript.")
+            else:
+                _tail = (". LOW COVERAGE: most detected speech is NOT in the "
+                         "transcript — the decode likely failed or degraded.")
+                logger.warning(
+                    "Speech coverage only %.0f%% of %.0fs detected speech — "
+                    "transcript likely incomplete", _ratio * 100,
+                    float(st.get('voice_sec', 0.0) or 0.0))
             log.log_stage('AUDIO',
                 f"Speech coverage: {st['coverage_ratio']:.0%} of voice-active "
                 f"audio transcribed ({st['covered_voice_sec']:.0f}s of "
@@ -2403,8 +2571,7 @@ class AudioIntelligence:
                 f"{int(st['gap_count'])} gap(s), {st['uncovered_voice_sec']:.0f}s "
                 f"left)"
                 + (f" — recovered {recovered} missed cue(s)" if recovered else "")
-                + ". The untranscribed remainder of the runtime is music/silence "
-                "with no speech.")
+                + _tail)
         except Exception as e:
             log.log_stage('AUDIO', f'Speech-coverage audit skipped ({e})')
         return result

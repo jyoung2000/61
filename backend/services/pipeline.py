@@ -4857,6 +4857,20 @@ async def _run_analysis_inner(job_id: str, resume: bool = False):
     # clips. This is what lets a failed/interrupted job "continue where it left
     # off" instead of re-detecting and re-transcribing from scratch. Bypass
     # with CLIPAI_FORCE_REANALYZE=1.
+    # The signature MUST carry the source SHA or the checkpoint it stamps can
+    # never be loaded (_signatures_match refuses empty SHAs) — the live run
+    # logged "verify-after-save failed" because, with the extraction↔perceive
+    # overlap, ``_source_sha256_local`` is only assigned when the extraction
+    # task JOINS (after perceive), while this signature is built before it.
+    # The background hash task itself finishes in seconds — await it directly.
+    if not _source_sha256_local:
+        try:
+            _source_sha256_local = await _await_source_hash(
+                job_id, _hash_task, video_path) or ""
+        except Exception as _sig_sha_err:
+            logger.info("[%s] source hash unavailable for checkpoint signature "
+                        "(%s) — checkpointing disabled this run",
+                        job_id, _sig_sha_err)
     _engine_ckpt_signature = pipeline_checkpoint.checkpoint_signature(
         source_sha=_source_sha256_local,
         source_language=_engine_source_lang,

@@ -120,7 +120,11 @@ def generate_sprite(source_path: str, out_dir: str) -> Optional[dict]:
     os.makedirs(out_dir, exist_ok=True)
     sprite_path = os.path.join(out_dir, "sprite.jpg")
     manifest_path = os.path.join(out_dir, "sprite.json")
-    tmp_path = sprite_path + ".tmp"
+    # The tmp name must KEEP a .jpg extension — ffmpeg infers the output
+    # muxer from it, and "sprite.jpg.tmp" made every sprite attempt fail
+    # with "Unable to choose an output format" (rc=234), so long videos
+    # got no scrub filmstrip at all.
+    tmp_path = os.path.join(out_dir, "sprite.tmp.jpg")
 
     vf = (
         f"fps=1/{layout['interval']:g},"
