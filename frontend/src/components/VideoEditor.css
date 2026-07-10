@@ -4572,3 +4572,561 @@ input.ve-timecode--input {
 @media (max-width: 767px) {
   .ve-container .ve-editor-body { display: block; }
 }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   POLISH PASS — 2010-Apple material language + metric normalization
+   ───────────────────────────────────────────────────────────────────────────
+   The editor chrome previously mixed seven micro font sizes (7–11px), five
+   border radii (3–14px) and flat single-color surfaces — functional, but the
+   sizing/spacing read as awkward and cheap. This layer (placed LAST so it
+   wins the cascade over the comp theme above) normalizes every metric to a
+   small scale and applies the Snow-Leopard-era Apple material treatment:
+   soft top-lit gradients on chrome bars, a 1px inner top highlight, recessed
+   "wells" for tracks and displays, an LCD-style timecode, capsule buttons
+   with a pressed inset state, and glossy trim handles. Restrained, tactile,
+   precise — nothing glows unless it's interactive.
+
+   METRIC SCALE (the only values this layer uses):
+     type:    10 / 11 / 12 / 13 px   (nothing below 10px anywhere)
+     radius:  6 (chips·wells) / 7 (buttons·pills) / 10 (menus) / 14 (dialogs)
+     heights: 28 (controls) / 36 (transport) / 40 (header) / 44 (touch)
+     space:   4 / 6 / 8 / 12 px rhythm on all chrome padding + gaps
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.ve-container {
+  /* Material tokens (light) */
+  --ve-chrome-grad: linear-gradient(to bottom, #FBFBFD 0%, #F0F0F4 100%);
+  --ve-chrome-topline: rgba(255, 255, 255, 0.9);
+  --ve-face-grad: linear-gradient(to bottom, #FFFFFF 0%, #F4F4F7 100%);
+  --ve-face-grad-hover: linear-gradient(to bottom, #FFFFFF 0%, #ECECF1 100%);
+  --ve-face-pressed: inset 0 1px 2px rgba(0, 0, 0, 0.14);
+  --ve-accent-grad: linear-gradient(to bottom, #7E89FF 0%, #6370F4 100%);
+  --ve-accent-grad-hover: linear-gradient(to bottom, #8B95FF 0%, #6F7CFA 100%);
+  --ve-well-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.10),
+                    inset 0 0 0 0.5px rgba(0, 0, 0, 0.04);
+  --ve-lcd-bg: linear-gradient(to bottom, #E8E8ED 0%, #F2F2F6 100%);
+  --ve-lcd-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.12);
+  --ve-hairline: rgba(0, 0, 0, 0.12);
+}
+
+[data-theme="dark"] .ve-container {
+  --ve-chrome-grad: linear-gradient(to bottom, #1F1F24 0%, #161619 100%);
+  --ve-chrome-topline: rgba(255, 255, 255, 0.055);
+  --ve-face-grad: linear-gradient(to bottom, #2B2B31 0%, #222227 100%);
+  --ve-face-grad-hover: linear-gradient(to bottom, #33333A 0%, #28282E 100%);
+  --ve-face-pressed: inset 0 1px 3px rgba(0, 0, 0, 0.55);
+  --ve-accent-grad: linear-gradient(to bottom, #7A85FF 0%, #5C69E8 100%);
+  --ve-accent-grad-hover: linear-gradient(to bottom, #8791FF 0%, #6774F0 100%);
+  --ve-well-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.5),
+                    inset 0 0 0 0.5px rgba(0, 0, 0, 0.3);
+  --ve-lcd-bg: linear-gradient(to bottom, #0E0E11 0%, #16161A 100%);
+  --ve-lcd-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.6);
+  --ve-hairline: rgba(255, 255, 255, 0.10);
+}
+
+/* ── Chrome bars: top-lit brushed panels ──────────────────────────────────
+   Every horizontal chrome strip shares one material: a soft vertical
+   gradient with a 1px inner top highlight (the classic unified-toolbar
+   look) and a crisp hairline between stacked bars. */
+.ve-container .ve-header,
+.ve-container .ve-controls,
+.ve-container .ve-toolbar,
+.ve-container .ve-multitrack-toggle,
+.ve-container .ve-multitrack__toolbar,
+.ve-container .ve-multi-timeline__toolbar {
+  background: var(--ve-chrome-grad);
+  box-shadow: inset 0 1px 0 var(--ve-chrome-topline);
+}
+
+.ve-container .ve-timeline,
+.ve-container .ve-shortcuts {
+  background: var(--ve-chrome-grad);
+}
+
+/* Uniform bar metrics: an 8/12 rhythm everywhere. */
+.ve-container .ve-header { min-height: 44px; padding: 0 12px; gap: 10px; }
+.ve-container .ve-controls { min-height: 44px; padding: 6px 12px; gap: 6px; }
+.ve-container .ve-controls__transport,
+.ve-container .ve-controls__center,
+.ve-container .ve-controls__right { gap: 6px; }
+.ve-container .ve-toolbar { min-height: 38px; padding: 5px 12px; gap: 4px; }
+.ve-container .ve-multitrack-toggle { padding: 6px 12px; gap: 6px; }
+.ve-container .ve-multitrack__toolbar { padding: 6px 12px; gap: 6px; }
+.ve-container .ve-multi-timeline__toolbar { padding: 6px 12px; gap: 8px; }
+.ve-container .ve-timeline { padding: 8px 14px 8px 44px; }
+
+/* ── Single-clip timeline: recessed track wells ───────────────────────────
+   Tracks read as machined recesses (FCP7 well), not flat rectangles: an
+   inner shadow at the top edge, a hairline ring, and 6px radii. */
+.ve-container .ve-timeline__track,
+.ve-container .ve-timeline__waveform-track {
+  border: none;
+  border-radius: 6px;
+  box-shadow: var(--ve-well-shadow), 0 1px 0 rgba(255, 255, 255, 0.35);
+}
+[data-theme="dark"] .ve-container .ve-timeline__track,
+[data-theme="dark"] .ve-container .ve-timeline__waveform-track {
+  box-shadow: var(--ve-well-shadow), 0 1px 0 rgba(255, 255, 255, 0.03);
+}
+.ve-container .ve-timeline__track { height: 44px; }
+.ve-container .ve-timeline__waveform-track { height: 30px; margin-top: 5px; }
+.ve-container .ve-timeline__thumbnails { border-radius: 6px; }
+.ve-container .ve-timeline__dimmed-left { border-radius: 6px 0 0 6px; }
+.ve-container .ve-timeline__dimmed-right { border-radius: 0 6px 6px 0; }
+
+/* Ruler: readable tabular numerals, quiet but crisp. */
+.ve-container .ve-timeline__ruler {
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
+  padding: 0 0 6px;
+}
+
+/* Track side-labels: was 7px — now legible without shouting. */
+.ve-container .ve-timeline__track-label {
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  left: -32px;
+  opacity: 0.6;
+}
+
+/* ── Trim handles: glossy capsule grips ─────────────────────────────────── */
+.ve-container .ve-trim-handle {
+  width: 12px;
+  background: var(--ve-accent-grad);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.35),
+              inset 0 -1px 0 rgba(0, 0, 0, 0.15),
+              0 0 0 0.5px rgba(0, 0, 0, 0.2);
+}
+.ve-container .ve-trim-handle--left { border-radius: 6px 0 0 6px; }
+.ve-container .ve-trim-handle--right { border-radius: 0 6px 6px 0; }
+.ve-container .ve-trim-handle:hover,
+.ve-container .ve-trim-handle--active {
+  background: var(--ve-accent-grad-hover);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.4),
+              inset 0 -1px 0 rgba(0, 0, 0, 0.15),
+              0 0 10px var(--ve-accent-border);
+}
+.ve-container .ve-trim-handle__grip span {
+  width: 5px;
+  height: 1.5px;
+  background: rgba(255, 255, 255, 0.85);
+  box-shadow: 0 0.5px 0.5px rgba(0, 0, 0, 0.3);
+}
+
+/* Playhead: crisp needle with a machined cap (no fuzzy glow). */
+.ve-container .ve-timeline__playhead {
+  box-shadow: 0 0 0 0.5px rgba(0, 0, 0, 0.25);
+}
+.ve-container .ve-timeline__playhead::after { display: none; }
+
+/* Trim/hover tooltips share one lozenge look. */
+.ve-container .ve-trim-tooltip,
+.ve-container .ve-timeline__hover-tooltip {
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  padding: 2px 7px;
+  border-radius: 5px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+}
+
+/* ── Transport & buttons: tactile capsules ────────────────────────────────
+   Icon buttons stay quiet until touched; bordered pills get a real face
+   (gradient + hairline + top highlight) and a pressed inset. */
+.ve-container .ve-btn {
+  border-radius: 7px;
+  min-width: 30px;
+  min-height: 30px;
+}
+.ve-container .ve-btn:active {
+  box-shadow: var(--ve-face-pressed);
+  transform: none;
+}
+.ve-container .ve-btn--play {
+  width: 38px;
+  height: 38px;
+  border-radius: 9px;
+  background: var(--ve-face-grad);
+  border: 1px solid var(--ve-hairline);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.5),
+              0 1px 2px rgba(0, 0, 0, 0.08);
+}
+[data-theme="dark"] .ve-container .ve-btn--play {
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.07),
+              0 1px 2px rgba(0, 0, 0, 0.3);
+}
+.ve-container .ve-btn--play:hover { background: var(--ve-face-grad-hover); }
+.ve-container .ve-btn--play:active {
+  box-shadow: var(--ve-face-pressed);
+  transform: none;
+}
+
+.ve-container .ve-speed__btn,
+.ve-container .ve-btn--small,
+.ve-container .ve-multitrack-toggle__btn,
+.ve-container .ve-topbar__cmdk,
+.ve-container .ve-topbar__toggle,
+.ve-container .ve-ratio-pill {
+  min-height: 28px;
+  padding: 4px 11px;
+  font-size: 11px;
+  border-radius: 7px;
+  border: 1px solid var(--ve-hairline);
+  background: var(--ve-face-grad);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.5), 0 1px 1px rgba(0, 0, 0, 0.04);
+}
+[data-theme="dark"] .ve-container .ve-speed__btn,
+[data-theme="dark"] .ve-container .ve-btn--small,
+[data-theme="dark"] .ve-container .ve-multitrack-toggle__btn,
+[data-theme="dark"] .ve-container .ve-topbar__cmdk,
+[data-theme="dark"] .ve-container .ve-topbar__toggle,
+[data-theme="dark"] .ve-container .ve-ratio-pill {
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06), 0 1px 1px rgba(0, 0, 0, 0.25);
+}
+.ve-container .ve-speed__btn:hover,
+.ve-container .ve-btn--small:hover,
+.ve-container .ve-multitrack-toggle__btn:hover,
+.ve-container .ve-topbar__cmdk:hover,
+.ve-container .ve-topbar__toggle:hover,
+.ve-container .ve-ratio-pill:hover {
+  background: var(--ve-face-grad-hover);
+}
+.ve-container .ve-speed__btn:active,
+.ve-container .ve-btn--small:active,
+.ve-container .ve-multitrack-toggle__btn:active,
+.ve-container .ve-topbar__cmdk:active,
+.ve-container .ve-topbar__toggle:active,
+.ve-container .ve-ratio-pill:active {
+  box-shadow: var(--ve-face-pressed);
+  transform: none;
+}
+/* Selected pill: accent-tinted face, still dimensional. */
+.ve-container .ve-multitrack-toggle__btn--active,
+.ve-container .ve-speed__btn--active,
+.ve-container .ve-topbar__toggle--on,
+.ve-container .ve-ratio-pill--on {
+  background: var(--ve-accent-dim);
+  border-color: var(--ve-accent-border);
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.06);
+}
+
+/* Primary (Export) buttons: the one saturated element on the chrome. */
+.ve-container .ve-topbar__export,
+.ve-container .ve-export-btn,
+.ve-container .ve-btn--export {
+  min-height: 28px;
+  border-radius: 7px;
+  background: var(--ve-accent-grad) !important;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.28),
+              0 1px 2px rgba(0, 0, 0, 0.15);
+  text-shadow: 0 1px 1px rgba(0, 0, 0, 0.15);
+}
+.ve-container .ve-topbar__export:hover,
+.ve-container .ve-export-btn:hover,
+.ve-container .ve-btn--export:hover {
+  background: var(--ve-accent-grad-hover) !important;
+}
+.ve-container .ve-topbar__export:active,
+.ve-container .ve-export-btn:active,
+.ve-container .ve-btn--export:active {
+  box-shadow: inset 0 2px 3px rgba(0, 0, 0, 0.25);
+  transform: none;
+}
+
+/* ── Timecode: recessed LCD readout ─────────────────────────────────────── */
+.ve-container .ve-timecode {
+  min-height: 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2px 10px;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.01em;
+  color: var(--ve-text);
+  background: var(--ve-lcd-bg);
+  border: 1px solid var(--ve-hairline);
+  border-radius: 6px;
+  box-shadow: var(--ve-lcd-shadow);
+}
+.ve-container .ve-timecode:hover {
+  border-color: var(--ve-accent-border);
+  background: var(--ve-lcd-bg);
+}
+.ve-container input.ve-timecode--input {
+  min-height: 26px;
+  border-radius: 6px;
+  background: var(--ve-lcd-bg);
+  box-shadow: var(--ve-lcd-shadow);
+}
+
+/* Trim info chip matches the LCD family. */
+.ve-container .ve-trim-info {
+  padding: 3px 9px;
+  border-radius: 6px;
+  font-variant-numeric: tabular-nums;
+  opacity: 1;
+}
+
+/* ── Type-scale floor: nothing under 10px ────────────────────────────────
+   Every sub-10px label in the chrome is bumped onto the scale. Hierarchy
+   comes from weight + case + color, not from shrinking text further. */
+.ve-container .ve-segment-chip { font-size: 10px; padding: 4px 10px; border-radius: 6px; border-width: 1px; gap: 5px; min-height: 24px; }
+.ve-container .ve-segment-chip__time,
+.ve-container .ve-segment-chip__summary { font-size: 10px; }
+.ve-container .ve-properties__field-label { font-size: 10px; margin-bottom: 2px; }
+.ve-container .ve-properties__label { font-size: 10px; letter-spacing: 0.06em; margin-bottom: 6px; }
+.ve-container .ve-properties__speed-pill { font-size: 10px; padding: 3px 9px; border-radius: 999px; }
+.ve-container .ve-media-uploader__item-name { font-size: 10px; max-width: 64px; }
+.ve-container .ve-media-uploader__dropzone-hint { font-size: 10px; }
+.ve-container .ve-media-uploader__progress-name,
+.ve-container .ve-media-uploader__progress-pct { font-size: 10px; }
+.ve-container .ve-transition-picker__label { font-size: 10px; }
+.ve-container .ve-volume__label { font-size: 10px; min-width: 30px; font-variant-numeric: tabular-nums; }
+.ve-container .ve-speed__option-label { font-size: 10px; }
+.ve-container .ve-scrub { font-size: 11px; min-height: 26px; padding: 3px 8px; border-radius: 6px; }
+.ve-container .ve-scrub--editing { font-size: 11px; border-radius: 6px; }
+.ve-container .ve-scrub__unit { font-size: 10px; }
+.ve-container .ve-shortcuts { font-size: 10px; gap: 12px; padding: 5px 12px; }
+.ve-container .ve-shortcuts kbd { font-size: 10px; padding: 1px 5px; border-radius: 4px; }
+.ve-container .ve-segment-inspector__time-dur { font-size: 10px; }
+.ve-container .ve-multitrack-toggle__btn--sub { font-size: 10px; padding: 3px 9px; }
+.ve-container .ve-properties__placeholder { font-size: 11px; }
+.ve-container .ve-properties__type-badge { font-size: 10px; padding: 2px 8px; border-radius: 5px; letter-spacing: 0.06em; }
+.ve-container .ve-editor-sidebar__tab { font-size: 11px; padding: 8px; }
+.ve-container .ve-multitrack__sidebar-header { font-size: 10px; letter-spacing: 0.07em; padding: 9px 12px; }
+.ve-container .ve-ratio-label { font-size: 10px; letter-spacing: 0.1em; }
+.ve-container .ve-topbar__cmdk { font-size: 11px; }
+.ve-container .ve-topbar__toggle { font-size: 11px; }
+.ve-container .ve-topbar__export { font-size: 12px; }
+.ve-container .ve-header__title { font-size: 13px; font-weight: 600; letter-spacing: -0.01em; }
+
+/* ── Inspector: aligned rows, calm rhythm ────────────────────────────────── */
+.ve-container .ve-properties { padding: 10px 12px; }
+.ve-container .ve-properties__section { margin-bottom: 14px; }
+.ve-container .ve-properties__row { gap: 8px; }
+.ve-container .ve-properties__input,
+.ve-container .ve-properties__select {
+  min-height: 26px;
+  padding: 4px 8px;
+  font-size: 11px;
+  border-radius: 6px;
+  background: var(--ve-lcd-bg);
+  border: 1px solid var(--ve-hairline);
+  box-shadow: var(--ve-lcd-shadow);
+}
+.ve-container .ve-properties__textarea {
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: var(--ve-lcd-bg);
+  border: 1px solid var(--ve-hairline);
+  box-shadow: var(--ve-lcd-shadow);
+}
+.ve-container .ve-properties__tabs { border-radius: 8px; padding: 2px; box-shadow: var(--ve-well-shadow); background: var(--ve-track-bg); }
+.ve-container .ve-properties__tab { border-radius: 6px; font-size: 11px; min-height: 26px; }
+.ve-container .ve-properties__tab--active {
+  background: var(--ve-face-grad);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.5), 0 1px 2px rgba(0, 0, 0, 0.10);
+}
+[data-theme="dark"] .ve-container .ve-properties__tab--active {
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.07), 0 1px 2px rgba(0, 0, 0, 0.35);
+}
+.ve-container .ve-inspector-row { min-height: 28px; }
+.ve-container .ve-inspector-row__label { font-size: 11px; }
+.ve-container .ve-effects__label,
+.ve-container .ve-effects__value { font-size: 11px; }
+.ve-container .ve-effects__control { margin-bottom: 8px; }
+
+/* ── Menus, pickers, dialogs: one floating material ──────────────────────── */
+.ve-container .ve-speed__dropdown,
+.ve-container .ve-multi-timeline__add-track-dropdown,
+.ve-context-menu {
+  border-radius: 10px;
+  padding: 5px;
+  box-shadow: 0 0 0 0.5px var(--ve-hairline, rgba(0,0,0,0.12)),
+              0 12px 32px rgba(0, 0, 0, 0.22),
+              inset 0 1px 0 rgba(255, 255, 255, 0.35);
+}
+[data-theme="dark"] .ve-container .ve-speed__dropdown,
+[data-theme="dark"] .ve-container .ve-multi-timeline__add-track-dropdown,
+[data-theme="dark"] .ve-context-menu {
+  box-shadow: 0 0 0 0.5px rgba(255, 255, 255, 0.10),
+              0 12px 32px rgba(0, 0, 0, 0.55),
+              inset 0 1px 0 rgba(255, 255, 255, 0.05);
+}
+.ve-container .ve-speed__option { font-size: 11px; min-height: 28px; border-radius: 6px; }
+.ve-context-menu__item { font-size: 12px; min-height: 28px; border-radius: 6px; }
+.ve-context-menu__heading { font-size: 10px; }
+.ve-context-menu__kbd { font-size: 10px; }
+
+.ve-export-dialog { border-radius: 14px; }
+.ve-export-dialog__label { font-size: 10px; letter-spacing: 0.06em; }
+.ve-export-dialog__btn { border-radius: 8px; min-height: 34px; }
+.ve-export-dialog__btn--primary {
+  background: var(--ve-accent-grad, linear-gradient(to bottom, #7E89FF, #6370F4));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.28), 0 1px 2px rgba(0, 0, 0, 0.15);
+}
+.ve-export-dialog__btn--primary:active { box-shadow: inset 0 2px 3px rgba(0, 0, 0, 0.25); }
+
+/* Tooltips + palette inherit the floating material. */
+.ve-tooltip { border-radius: 8px; font-size: 11px; }
+.ve-tooltip__kbd { font-size: 10px; }
+.ve-palette { border-radius: 14px; }
+.ve-palette__category { font-size: 10px; }
+.ve-palette__kbd, .ve-cheatsheet__kbd { font-size: 10px; }
+
+/* ── Multi-track chrome details ──────────────────────────────────────────── */
+.ve-container .ve-multi-timeline__minimap { border-radius: 6px; }
+.ve-container .ve-multi-timeline__zoom-slider {
+  box-shadow: var(--ve-well-shadow);
+  border-radius: 3px;
+}
+.ve-container .ve-multi-timeline__track-ctrl { border-radius: 6px; }
+.ve-container .ve-toolbar__btn { border-radius: 7px; min-height: 30px; font-size: 11px; }
+.ve-container .ve-toolbar__label { font-size: 11px; }
+.ve-container .ve-toolbar__divider { margin: 0 6px; height: 18px; }
+
+/* Media library cards sit on the panel like physical chips. */
+.ve-container .ve-media-uploader__item {
+  border-radius: 7px;
+  padding: 5px;
+  background: var(--ve-face-grad);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.4), 0 1px 2px rgba(0, 0, 0, 0.06);
+}
+[data-theme="dark"] .ve-container .ve-media-uploader__item {
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05), 0 1px 2px rgba(0, 0, 0, 0.3);
+}
+.ve-container .ve-media-uploader__thumb { border-radius: 5px; }
+.ve-container .ve-media-uploader__dropzone { border-radius: 8px; }
+
+/* Segment inspector card: floating panel, aligned controls. */
+.ve-container .ve-segment-inspector {
+  border-radius: 10px;
+  padding: 10px 12px;
+  box-shadow: 0 0 0 0.5px var(--ve-hairline),
+              0 4px 16px rgba(0, 0, 0, 0.10),
+              inset 0 1px 0 rgba(255, 255, 255, 0.35);
+}
+[data-theme="dark"] .ve-container .ve-segment-inspector {
+  box-shadow: 0 0 0 0.5px rgba(255, 255, 255, 0.08),
+              0 4px 20px rgba(0, 0, 0, 0.4),
+              inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+.ve-container .ve-segment-inspector__control-label { font-size: 11px; width: 52px; }
+.ve-container .ve-segment-inspector__volume-value { font-size: 11px; font-variant-numeric: tabular-nums; }
+.ve-container .ve-segment-inspector__speed-pill { font-size: 10px; padding: 3px 10px; }
+.ve-container .ve-segment-inspector__toggle { font-size: 11px; gap: 6px; }
+.ve-container .ve-segment-inspector__done { padding: 5px 14px; font-size: 11px; border-radius: 7px; }
+.ve-container .ve-segment-inspector__time-range { font-size: 11px; font-variant-numeric: tabular-nums; }
+
+/* ── Sliders: aqua-glass thumbs on recessed rails ────────────────────────── */
+.ve-container .ve-properties__slider,
+.ve-container .ve-effects__slider,
+.ve-container .ve-segment-inspector__volume-slider,
+.ve-container .ve-volume__slider {
+  height: 4px;
+  border-radius: 2px;
+  box-shadow: var(--ve-well-shadow);
+}
+.ve-container .ve-properties__slider::-webkit-slider-thumb,
+.ve-container .ve-effects__slider::-webkit-slider-thumb,
+.ve-container .ve-segment-inspector__volume-slider::-webkit-slider-thumb,
+.ve-container .ve-multi-timeline__zoom-slider::-webkit-slider-thumb {
+  background: linear-gradient(to bottom, #FFFFFF 0%, #E8E8ED 100%);
+  border: 0.5px solid rgba(0, 0, 0, 0.25);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9), 0 1px 2px rgba(0, 0, 0, 0.25);
+  width: 13px;
+  height: 13px;
+  margin-top: -4.5px;
+}
+.ve-container .ve-properties__slider::-moz-range-thumb,
+.ve-container .ve-effects__slider::-moz-range-thumb,
+.ve-container .ve-segment-inspector__volume-slider::-moz-range-thumb,
+.ve-container .ve-multi-timeline__zoom-slider::-moz-range-thumb {
+  background: linear-gradient(to bottom, #FFFFFF 0%, #E8E8ED 100%);
+  border: 0.5px solid rgba(0, 0, 0, 0.25);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9), 0 1px 2px rgba(0, 0, 0, 0.25);
+  width: 13px;
+  height: 13px;
+}
+
+/* ── Sidebar tabs: sunken segmented rail underline → clean underline ─────── */
+.ve-container .ve-editor-sidebar__tab--active { border-bottom-width: 2px; }
+
+/* ── Focus: a single, calm ring everywhere ───────────────────────────────── */
+.ve-container button:focus-visible,
+.ve-container [tabindex]:focus-visible,
+.ve-container input:focus-visible,
+.ve-container select:focus-visible {
+  outline: 2px solid var(--ve-accent-border);
+  outline-offset: 1px;
+}
+
+/* ═══ Device fit & feel ═══════════════════════════════════════════════════
+   Desktop gets density; touch gets air. All chrome rows stay tappable and
+   nothing is clipped at any width. */
+
+/* Tablet (768–1023): slightly wider inspector, comfortable pills. */
+@media (min-width: 768px) and (max-width: 1023px) {
+  .ve-container .ve-multitrack__sidebar--right { width: 280px; max-width: 320px; }
+  .ve-container .ve-speed__btn,
+  .ve-container .ve-btn--small,
+  .ve-container .ve-multitrack-toggle__btn { min-height: 32px; }
+}
+
+/* Phone (<768): the chrome relaxes onto a 44px touch grid without becoming
+   cartoonish — bars keep the same material, rows wrap, text stays ≥11px. */
+@media (max-width: 767px) {
+  .ve-container .ve-header { min-height: 48px; }
+  .ve-container .ve-controls { padding: 8px 10px; gap: 6px; row-gap: 8px; }
+  .ve-container .ve-timeline { padding: 8px 12px 10px 40px; }
+  .ve-container .ve-timeline__track { height: 52px; }
+  .ve-container .ve-timeline__waveform-track { height: 34px; }
+  .ve-container .ve-trim-handle { width: 22px; }
+  .ve-container .ve-timecode { min-height: 36px; font-size: 12px; }
+  .ve-container .ve-speed__btn,
+  .ve-container .ve-btn--small,
+  .ve-container .ve-multitrack-toggle__btn,
+  .ve-container .ve-topbar__toggle,
+  .ve-container .ve-ratio-pill { min-height: 40px; padding: 6px 14px; font-size: 12px; }
+  .ve-container .ve-topbar__export { min-height: 40px; padding: 6px 16px; font-size: 13px; }
+  .ve-container .ve-segment-chip { min-height: 36px; font-size: 11px; padding: 6px 12px; }
+  .ve-container .ve-properties__speed-pill { min-height: 36px; }
+  /* The editor bottom edge respects the home-indicator inset. */
+  .ve-container .ve-controls:last-child,
+  .ve-container .ve-multitrack-toggle:last-child {
+    padding-bottom: max(8px, var(--safe-bottom, 0px));
+  }
+}
+
+/* Ultra-narrow (<380): keep the transport centered and unclipped. */
+@media (max-width: 379px) {
+  .ve-container .ve-controls { padding: 6px 8px; }
+  .ve-container .ve-timecode { min-width: 56px; }
+  .ve-container .ve-timeline { padding-left: 36px; }
+}
+
+/* Coarse pointers: the LCD/pill fonts hold at ≥12px so iOS never zooms,
+   and every interactive strip is a real finger target. */
+@media (pointer: coarse) {
+  .ve-container .ve-btn { min-width: 44px; min-height: 44px; }
+  .ve-container .ve-btn--play { width: 48px; height: 48px; border-radius: 12px; }
+  .ve-container .ve-header__close { width: 36px; height: 36px; border-radius: 8px; }
+  .ve-container .ve-segment-inspector__toggle { min-height: 32px; }
+  .ve-container .ve-segment-inspector__toggle input[type="checkbox"] { width: 18px; height: 18px; }
+}
+
+/* Reduced transparency (accessibility): drop the glass, keep the layout. */
+@media (prefers-reduced-transparency: reduce) {
+  .ve-container .ve-header,
+  .ve-container .ve-controls,
+  .ve-container .ve-timeline,
+  .ve-container .ve-toolbar,
+  .ve-container .ve-speed__dropdown,
+  .ve-context-menu,
+  .ve-palette,
+  .ve-bottom-sheet {
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+}

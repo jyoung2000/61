@@ -3666,9 +3666,9 @@ export default function VideoEditor({
           {aspectRatio && (
             <span style={{
               display: 'inline-flex', alignItems: 'center', gap: 3,
-              padding: '2px 6px', fontSize: 9, fontWeight: 600,
+              padding: '3px 8px', fontSize: 10, fontWeight: 600,
               background: 'rgba(10, 132, 255, 0.08)', color: 'var(--accent-cyan, #0A84FF)',
-              border: '1px solid rgba(10, 132, 255, 0.2)', borderRadius: 3,
+              border: '1px solid rgba(10, 132, 255, 0.2)', borderRadius: 6,
             }}>
               <svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5">
                 <rect x="1" y="3" width="14" height="10" rx="1.5" />
@@ -3679,9 +3679,9 @@ export default function VideoEditor({
           {isMuted && (
             <span style={{
               display: 'inline-flex', alignItems: 'center', gap: 3,
-              padding: '2px 6px', fontSize: 9, fontWeight: 600,
+              padding: '3px 8px', fontSize: 10, fontWeight: 600,
               background: 'rgba(255, 59, 48, 0.08)', color: '#FF3B30',
-              border: '1px solid rgba(255, 59, 48, 0.2)', borderRadius: 3,
+              border: '1px solid rgba(255, 59, 48, 0.2)', borderRadius: 6,
             }}>
               <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
                 <path d="M11 5L6 9H2v6h4l5 4V5z" /><line x1="23" y1="9" x2="17" y2="15" /><line x1="17" y1="9" x2="23" y2="15" />
@@ -3692,11 +3692,11 @@ export default function VideoEditor({
           {!isMuted && Math.abs(volume - 100) > 0.5 && (
             <span style={{
               display: 'inline-flex', alignItems: 'center', gap: 3,
-              padding: '2px 6px', fontSize: 9, fontWeight: 600,
+              padding: '3px 8px', fontSize: 10, fontWeight: 600,
               background: volume > 100 ? 'rgba(255, 159, 10, 0.08)' : 'rgba(10, 132, 255, 0.08)',
               color: volume > 100 ? 'var(--accent-amber, #FF9F0A)' : 'var(--accent-cyan, #0A84FF)',
               border: `1px solid ${volume > 100 ? 'rgba(255, 159, 10, 0.2)' : 'rgba(10, 132, 255, 0.2)'}`,
-              borderRadius: 3,
+              borderRadius: 6,
             }}>
               Vol {volume}%
             </span>
@@ -3704,9 +3704,9 @@ export default function VideoEditor({
           {Math.abs(speed - 1.0) > 0.001 && (
             <span style={{
               display: 'inline-flex', alignItems: 'center', gap: 3,
-              padding: '2px 6px', fontSize: 9, fontWeight: 600,
+              padding: '3px 8px', fontSize: 10, fontWeight: 600,
               background: 'rgba(175, 82, 222, 0.08)', color: '#AF52DE',
-              border: '1px solid rgba(175, 82, 222, 0.2)', borderRadius: 3,
+              border: '1px solid rgba(175, 82, 222, 0.2)', borderRadius: 6,
             }}>
               {speed}x Speed
             </span>
@@ -3714,9 +3714,9 @@ export default function VideoEditor({
           {segments.length > 0 && (
             <span style={{
               display: 'inline-flex', alignItems: 'center', gap: 3,
-              padding: '2px 6px', fontSize: 9, fontWeight: 600,
+              padding: '3px 8px', fontSize: 10, fontWeight: 600,
               background: 'rgba(48, 209, 88, 0.08)', color: '#30D158',
-              border: '1px solid rgba(48, 209, 88, 0.2)', borderRadius: 3,
+              border: '1px solid rgba(48, 209, 88, 0.2)', borderRadius: 6,
             }}>
               {segments.length} Segment{segments.length > 1 ? 's' : ''}
             </span>
@@ -3928,9 +3928,9 @@ export default function VideoEditor({
             >
               {/* Segment label */}
               <span className="ve-timeline__segment-label" style={{
-                position: 'absolute', top: 1, left: 3,
-                display: 'flex', alignItems: 'center', gap: 2,
-                fontSize: 7, fontWeight: 700, letterSpacing: '0.04em',
+                position: 'absolute', top: 2, left: 4,
+                display: 'flex', alignItems: 'center', gap: 3,
+                fontSize: 9, fontWeight: 700, letterSpacing: '0.05em',
                 color: segHexColor,
                 textTransform: 'uppercase', lineHeight: 1, pointerEvents: 'none',
                 whiteSpace: 'nowrap', opacity: isSegSelected ? 1 : 0.8,
@@ -4481,8 +4481,8 @@ export default function VideoEditor({
           {/* Active segment indicator */}
           {displaySegment && (
             <span style={{
-              fontSize: 9, fontFamily: 'var(--font-mono, monospace)', padding: '2px 6px',
-              borderRadius: 4,
+              fontSize: 10, fontFamily: 'var(--font-mono, monospace)', padding: '3px 8px',
+              borderRadius: 6,
               background: `${displaySegment.color || SEGMENT_COLORS[0]}18`,
               color: displaySegment.color || SEGMENT_COLORS[0],
               border: `1px solid ${displaySegment.color || SEGMENT_COLORS[0]}40`,
