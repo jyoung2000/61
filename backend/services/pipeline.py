@@ -3852,7 +3852,13 @@ async def _run_analysis_inner(job_id: str, resume: bool = False):
         except Exception as _fe:
             logger.warning("[%s] bg faststart failed: %s", job_id, _fe)
         try:
-            from backend.services.filmstrip_generator import generate_sprite, generate_peaks
+            from backend.services.filmstrip_generator import (
+                generate_sprite, generate_sprite_coarse, generate_peaks)
+            # Coarse (seek-sampled) sheet first: seconds, so the timeline has
+            # a filmstrip almost immediately after import. The fine sheet
+            # (whole-file keyframe scan — minutes on a 2h source) replaces it
+            # right after; the editor polls the manifest and swaps live.
+            await asyncio.to_thread(generate_sprite_coarse, video_path, job_dir)
             await asyncio.to_thread(generate_sprite, video_path, job_dir)
             _pk_src = audio_path if os.path.exists(audio_path) else video_path
             await asyncio.to_thread(generate_peaks, _pk_src, job_dir)

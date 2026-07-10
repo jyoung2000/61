@@ -31,6 +31,36 @@ MAX_SIZES = {
 # Stream buffer size for writing to disk
 _STREAM_BUF = 1024 * 1024  # 1 MB
 
+# Strong refs for fire-and-forget faststart tasks (see _kick_faststart).
+_BG_TASKS: set = set()
+
+
+def _kick_faststart(path: str, media_type: str) -> None:
+    """Background moov relocation for a freshly-uploaded library video.
+
+    Job sources get faststart at analysis time, but library media (multi-track
+    editor clips, overlays) never did — a phone MOV or screen recording with a
+    trailing moov can't start playback until the browser has pulled the WHOLE
+    file, which reads as \"the preview player is broken\" on anything long.
+    Lossless stream-copy, best-effort, never blocks the upload response."""
+    if media_type != "video":
+        return
+    import asyncio
+
+    async def _run():
+        try:
+            from backend.services.faststart import ensure_faststart
+            await asyncio.to_thread(ensure_faststart, path)
+        except Exception as e:  # noqa: BLE001 — best effort
+            logger.debug("media faststart skipped for %s: %s", path, e)
+
+    try:
+        t = asyncio.get_running_loop().create_task(_run())
+        _BG_TASKS.add(t)
+        t.add_done_callback(_BG_TASKS.discard)
+    except RuntimeError:
+        pass
+
 
 def _meta_path(media_dir: str) -> str:
     """Path to the JSON metadata file that stores original filenames."""
@@ -134,6 +164,7 @@ async def upload_media(
     _save_meta(media_dir, meta)
 
     logger.info("Uploaded media %s (%s, %d bytes) for job %s", safe_filename, media_type, total_written, job_id)
+    _kick_faststart(file_path, media_type)
 
     # Build URL for frontend
     url = f"/api/files/{job_id}/media/{safe_filename}"
@@ -194,6 +225,7 @@ async def register_media(
 
     url = f"/api/files/{job_id}/media/{safe_filename}"
     logger.info("Registered media %s (%s, %d bytes) for job %s", safe_filename, media_type, total_size, job_id)
+    _kick_faststart(dest_path, media_type)
 
     return JSONResponse({
         "id": media_id,

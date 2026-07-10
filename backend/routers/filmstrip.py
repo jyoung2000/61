@@ -82,13 +82,29 @@ def _prepare_assets(job_id: str) -> None:
     except Exception as e:  # noqa: BLE001
         logger.warning("[%s] lazy faststart failed: %s", job_id, e)
 
-    # 2) Thumbnail sprite.
+    # 2) Thumbnail sprite — coarse FIRST. On a long source the fine sheet
+    #    needs a whole-file keyframe scan (minutes); the seek-sampled coarse
+    #    sheet is ready in seconds, so the editor shows a filmstrip almost
+    #    immediately and transparently upgrades when the fine one lands.
     if not os.path.isfile(os.path.join(job_dir, "sprite.jpg")):
         try:
-            from backend.services.filmstrip_generator import generate_sprite
+            from backend.services.filmstrip_generator import (
+                generate_sprite, generate_sprite_coarse)
+            generate_sprite_coarse(src, job_dir)
             generate_sprite(src, job_dir)
         except Exception as e:  # noqa: BLE001
             logger.warning("[%s] lazy sprite failed: %s", job_id, e)
+    else:
+        # A sprite exists but may be a leftover COARSE sheet whose fine pass
+        # died (container restart mid-generation). Finish the upgrade.
+        try:
+            import json as _json
+            with open(os.path.join(job_dir, "sprite.json")) as f:
+                if _json.load(f).get("coarse"):
+                    from backend.services.filmstrip_generator import generate_sprite
+                    generate_sprite(src, job_dir)
+        except Exception:
+            pass
 
     # 3) Waveform peaks (prefer the pre-extracted audio.wav over re-decoding).
     if not os.path.isfile(os.path.join(job_dir, "peaks.json")):
@@ -122,8 +138,13 @@ def _kick_prep(job_id: str) -> None:
         _GENERATING.discard(key)
 
 
-def _conditional_file(path: str, media_type: str, if_modified_since: str | None):
-    """FileResponse with 304 handling + aggressive immutable caching."""
+def _conditional_file(path: str, media_type: str, if_modified_since: str | None,
+                      cache_control: str = "public, max-age=2592000"):
+    """FileResponse with 304 handling. The default Cache-Control is a long
+    max-age (the sprite image is cache-busted by ``?v=`` from the manifest);
+    the MANIFEST itself must pass ``no-cache`` so the browser revalidates and
+    picks up the coarse→fine sprite upgrade — a 30-day max-age there froze
+    the first sheet the client ever saw."""
     mtime = datetime.fromtimestamp(os.path.getmtime(path), tz=timezone.utc)
     if if_modified_since:
         try:
@@ -132,7 +153,7 @@ def _conditional_file(path: str, media_type: str, if_modified_since: str | None)
         except Exception:
             pass
     headers = {
-        "Cache-Control": "public, max-age=2592000",  # 30 days; content is content-addressed by job
+        "Cache-Control": cache_control,
         "Last-Modified": format_datetime(mtime, usegmt=True),
         "X-Content-Type-Options": "nosniff",
     }
@@ -148,7 +169,17 @@ async def get_filmstrip_manifest(
     manifest = os.path.join(_job_dir(job_id), "sprite.json")
     sprite = os.path.join(_job_dir(job_id), "sprite.jpg")
     if os.path.isfile(manifest) and os.path.isfile(sprite):
-        return _conditional_file(manifest, "application/json", if_modified_since)
+        # A served coarse manifest means the fine pass may still be pending —
+        # make sure it's (re)kicked even though assets "exist".
+        try:
+            import json as _json
+            with open(manifest) as f:
+                if _json.load(f).get("coarse"):
+                    _kick_prep(job_id)
+        except Exception:
+            pass
+        return _conditional_file(manifest, "application/json",
+                                 if_modified_since, cache_control="no-cache")
     # Not ready — prep faststart+sprite+peaks in the background, tell the editor
     # to fall back to client-side generation meanwhile.
     _kick_prep(job_id)

@@ -3436,7 +3436,12 @@ export default function VideoEditor({
           src={src}
           tabIndex={-1}
           playsInline
-          preload="metadata"
+          // "auto" lets the browser buffer well ahead over the LAN the
+          // moment the editor opens, so first play starts instantly and
+          // short seeks land in the already-buffered window — the single
+          // biggest "feels like a local file" lever for the preview.
+          // (Was "metadata", which defers all media fetching until play.)
+          preload="auto"
           style={(() => {
             const hasCustomTransform = (
               videoItemPosition.x !== 50 || videoItemPosition.y !== 50 ||

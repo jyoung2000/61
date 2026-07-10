@@ -4,6 +4,8 @@ import {
   computeThumbStops,
   ensureThumbnail,
   getCachedThumbnail,
+  hasSpriteReady,
+  FILMSTRIP_UPDATED_EVENT,
 } from '../utils/filmstrip';
 import ContextMenu from './ContextMenu';
 import Tooltip from './Tooltip';
@@ -972,6 +974,13 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
         const stops = visT1 > visT0
           ? computeThumbStops(visT0, visT1, pps, thumbW)
           : [];
+        // With a loaded sprite sheet, slicing tiles is cheap, in-memory and
+        // safe to parallelize — schedule EVERY missing visible tile in this
+        // one pass so the strip fills in a frame or two. The hidden-<video>
+        // fallback must stay serial (concurrent seeks on one element race),
+        // so without a sprite we keep the old one-tile-per-redraw trickle.
+        const spriteReady = hasSpriteReady(mediaSrc);
+        const durationHint = item.end || 0;
         let scheduledRedraw = false;
         for (const t of stops) {
           const tx = contentLeft + t * pps - sx;
@@ -1004,14 +1013,15 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
             ctx.fillStyle = grad;
             ctx.fillRect(tx - thumbW / 2, y + 4, thumbW, innerH);
             ctx.restore();
-            if (!scheduledRedraw) {
-              // Fire one async generation per draw — they share a cache
-              // so subsequent draws hit. We schedule a redraw via the
-              // shared invalidate ref so the latest ``draw`` fn is used.
-              scheduledRedraw = true;
-              ensureThumbnail(mediaSrc, t, thumbW, innerH)
+            if (spriteReady || !scheduledRedraw) {
+              // ensureThumbnail dedupes per (src,t,w,h) so re-scheduling on
+              // every draw is free; redraws are rAF-coalesced by the ref.
+              ensureThumbnail(mediaSrc, t, thumbW, innerH, { durationHint })
                 .then(() => requestRedrawRef.current && requestRedrawRef.current())
                 .catch(() => {});
+            }
+            if (!scheduledRedraw) {
+              scheduledRedraw = true;
               // Keep the shimmer moving while tiles generate
               setTimeout(() => requestRedrawRef.current && requestRedrawRef.current(), 120);
             }
@@ -1572,6 +1582,16 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
     requestRedrawRef.current = draw;
     return () => { requestRedrawRef.current = null; };
   }, [draw]);
+
+  // Redraw when a source's sprite sheet appears or upgrades (coarse→fine):
+  // the tile cache for that source was purged, so the next draw re-slices
+  // from the new sheet. Without this, the sharper filmstrip only showed up
+  // after the user next interacted with the timeline.
+  useEffect(() => {
+    const onFilmstripUpdate = () => { requestRedrawRef.current?.(); };
+    window.addEventListener(FILMSTRIP_UPDATED_EVENT, onFilmstripUpdate);
+    return () => window.removeEventListener(FILMSTRIP_UPDATED_EVENT, onFilmstripUpdate);
+  }, []);
 
   // Resize observer
   useEffect(() => {

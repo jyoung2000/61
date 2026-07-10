@@ -30,9 +30,23 @@ const _SPRITE_JOB = new Map();    // src -> jobId (explicit registration)
 const _SPRITE = new Map();        // src -> { manifest, img } once ready
 const _SPRITE_PROMISE = new Map();// src -> in-flight Promise (dedupe; cleared on settle)
 const _SPRITE_MISS = new Map();   // src -> last-miss timestamp (ms) for retry backoff
+const _SPRITE_FIRST_MISS = new Map(); // src -> first-miss timestamp (ms)
+const _SPRITE_UPGRADE_TIMER = new Map(); // src -> timer id (coarse→fine polling)
 // Long videos generate their sprite in the background AFTER the editor opens,
 // so a first miss must NOT be permanent — retry periodically until it appears.
 const _SPRITE_RETRY_MS = 6000;
+// While a COARSE sheet is being served, poll for the fine replacement.
+const _SPRITE_UPGRADE_POLL_MS = 8000;
+// Hidden-<video> fallback policy for JOB sources: seeking a hidden <video>
+// per thumbnail on a 2-hour file is a storm of Range requests that competes
+// with the preview player — the sprite (coarse in seconds) is the right
+// source. Only allow the legacy fallback when the sprite has been missing
+// for a while AND the source is short enough for seeks to be cheap.
+const _CLIENT_FALLBACK_AFTER_MS = 90_000;
+const _CLIENT_FALLBACK_MAX_DURATION_S = 900;
+// Fired on window whenever a source's sprite appears or upgrades, so canvas
+// timelines can redraw: new CustomEvent('clipai:filmstrip-updated', {detail:{src}})
+export const FILMSTRIP_UPDATED_EVENT = 'clipai:filmstrip-updated';
 
 const _MAX_CACHE = 600;           // keep the cache bounded
 
@@ -85,10 +99,79 @@ function _deriveJobId(src) {
   return m ? m[1] : null;
 }
 
+function _fetchManifest(jobId) {
+  const base = `/api/jobs/${encodeURIComponent(jobId)}`;
+  return fetch(`${base}/filmstrip.json`, { cache: 'no-cache' })
+    .then((res) => (res.ok ? res.json() : null))
+    .catch(() => null);
+}
+
+function _loadSheetImage(jobId, manifest) {
+  const base = `/api/jobs/${encodeURIComponent(jobId)}`;
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.decoding = 'async';
+    img.onload = () => resolve(img);
+    img.onerror = () => resolve(null);
+    // ``v`` cache-busts the long-max-age sheet when a coarse sprite is
+    // upgraded to the fine one (or a re-analysis rebuilds it).
+    img.src = `${base}/filmstrip.jpg?v=${encodeURIComponent(manifest.v || 0)}`;
+  });
+}
+
+function _announceUpdate(src) {
+  try {
+    window.dispatchEvent(new CustomEvent(FILMSTRIP_UPDATED_EVENT, { detail: { src } }));
+  } catch { /* non-browser test env */ }
+}
+
+/**
+ * While a coarse sheet is live, poll the manifest and hot-swap in the fine
+ * sheet the moment the server finishes it. Cache entries for the src are
+ * dropped so the timeline re-slices from the sharper tiles.
+ */
+function _scheduleUpgradePoll(src, jobId) {
+  if (_SPRITE_UPGRADE_TIMER.has(src)) return;
+  const timer = setTimeout(() => {
+    _SPRITE_UPGRADE_TIMER.delete(src);
+    const current = _SPRITE.get(src);
+    if (!current || !current.manifest.coarse) return;
+    _fetchManifest(jobId).then((manifest) => {
+      const cur = _SPRITE.get(src);
+      if (!cur) return;                       // disposed while polling
+      if (!manifest || !manifest.cols || manifest.v === cur.manifest.v) {
+        _scheduleUpgradePoll(src, jobId);     // not upgraded yet — keep polling
+        return;
+      }
+      _loadSheetImage(jobId, manifest).then((img) => {
+        if (!_SPRITE.has(src)) return;
+        if (img) {
+          _SPRITE.set(src, { manifest, img });
+          _dropCachedTiles(src);
+          _announceUpdate(src);
+        }
+        if (manifest.coarse) _scheduleUpgradePoll(src, jobId);
+      });
+    });
+  }, _SPRITE_UPGRADE_POLL_MS);
+  _SPRITE_UPGRADE_TIMER.set(src, timer);
+}
+
+function _dropCachedTiles(src) {
+  for (const k of [..._CACHE.keys()]) {
+    if (k.startsWith(`${src}|`)) {
+      const bitmap = _CACHE.get(k);
+      try { bitmap.close && bitmap.close(); } catch { /* noop */ }
+      _CACHE.delete(k);
+    }
+  }
+}
+
 /**
  * Fetch (once) the sprite manifest + image for ``src``. Resolves to
  * ``{ manifest, img }`` when a usable sprite exists, or ``null`` to signal
- * "fall back to client-side seeking". Never rejects.
+ * "not (yet) available". Never rejects.
  */
 function _loadSprite(src) {
   const ready = _SPRITE.get(src);
@@ -104,38 +187,66 @@ function _loadSprite(src) {
   const lastMiss = _SPRITE_MISS.get(src);
   if (lastMiss && (Date.now() - lastMiss) < _SPRITE_RETRY_MS) return Promise.resolve(null);
 
-  const base = `/api/jobs/${encodeURIComponent(jobId)}`;
-  const p = fetch(`${base}/filmstrip.json`)
-    .then((res) => (res.ok ? res.json() : null))
+  const p = _fetchManifest(jobId)
     .then((manifest) => {
       if (!manifest || !manifest.cols || !manifest.tileW || !manifest.interval) {
         return null;
       }
-      return new Promise((resolve) => {
-        const img = new Image();
-        img.crossOrigin = 'anonymous';
-        img.decoding = 'async';
-        img.onload = () => {
-          const entry = { manifest, img };
-          _SPRITE.set(src, entry);
-          resolve(entry);
-        };
-        img.onerror = () => resolve(null);
-        img.src = `${base}/filmstrip.jpg`;
+      return _loadSheetImage(jobId, manifest).then((img) => {
+        if (!img) return null;
+        const entry = { manifest, img };
+        _SPRITE.set(src, entry);
+        if (manifest.coarse) _scheduleUpgradePoll(src, jobId);
+        _announceUpdate(src);
+        return entry;
       });
     })
     .catch(() => null)
     .then((entry) => {
       _SPRITE_PROMISE.delete(src);           // allow a future retry
-      if (!entry) _SPRITE_MISS.set(src, Date.now());
-      else _SPRITE_MISS.delete(src);
+      if (!entry) {
+        _SPRITE_MISS.set(src, Date.now());
+        if (!_SPRITE_FIRST_MISS.has(src)) _SPRITE_FIRST_MISS.set(src, Date.now());
+      } else {
+        _SPRITE_MISS.delete(src);
+        _SPRITE_FIRST_MISS.delete(src);
+      }
       return entry;
     });
   _SPRITE_PROMISE.set(src, p);
   return p;
 }
 
-function _sliceSprite(entry, t, w, h) {
+/**
+ * Source-rect for ``cover``-fitting a tile into a w×h box: the largest
+ * centered crop of the tile whose aspect matches the target. Pure —
+ * exported for tests.
+ */
+export function computeCoverCrop(tileW, tileH, w, h) {
+  let sw = tileW;
+  let sh = tileH;
+  if (tileW * h > w * tileH) {
+    // tile is wider than target aspect — crop the sides
+    sw = Math.max(1, Math.round((w / h) * tileH));
+  } else {
+    // tile is taller — crop top/bottom
+    sh = Math.max(1, Math.round((h / w) * tileW));
+  }
+  return {
+    sx: Math.floor((tileW - sw) / 2),
+    sy: Math.floor((tileH - sh) / 2),
+    sw,
+    sh,
+  };
+}
+
+// createImageBitmap(img, sx, sy, sw, sh, {resize*}) crops + scales on the
+// compositor with NO JPEG round-trip. The old path drew to an OffscreenCanvas,
+// re-ENCODED it to a JPEG blob, then DECODED that back into a bitmap — two
+// image codecs per tile on the main thread, ~30 tiles per screenful.
+let _bitmapCropBroken = false;
+
+function _sliceSpriteCanvas(entry, t, w, h) {
   const { manifest, img } = entry;
   const idx = Math.max(
     0,
@@ -148,14 +259,39 @@ function _sliceSprite(entry, t, w, h) {
   const off = new OffscreenCanvas(w, h);
   const ctx = off.getContext('2d');
   if (!ctx) return Promise.reject(new Error('OffscreenCanvas 2D context unavailable'));
-  // ``cover``-fit the tile into the target box, matching the client path.
   const scale = Math.max(w / manifest.tileW, h / manifest.tileH);
   const drawW = manifest.tileW * scale;
   const drawH = manifest.tileH * scale;
   const dx = (w - drawW) / 2;
   const dy = (h - drawH) / 2;
   ctx.drawImage(img, sx, sy, manifest.tileW, manifest.tileH, dx, dy, drawW, drawH);
-  return off.convertToBlob({ type: 'image/jpeg', quality: 0.7 }).then(createImageBitmap);
+  return createImageBitmap(off);
+}
+
+function _sliceSprite(entry, t, w, h) {
+  const { manifest, img } = entry;
+  if (_bitmapCropBroken) return _sliceSpriteCanvas(entry, t, w, h);
+  const idx = Math.max(
+    0,
+    Math.min(manifest.count - 1, Math.floor(t / manifest.interval)),
+  );
+  const col = idx % manifest.cols;
+  const row = Math.floor(idx / manifest.cols);
+  const crop = computeCoverCrop(manifest.tileW, manifest.tileH, w, h);
+  return createImageBitmap(
+    img,
+    col * manifest.tileW + crop.sx,
+    row * manifest.tileH + crop.sy,
+    crop.sw,
+    crop.sh,
+    { resizeWidth: w, resizeHeight: h, resizeQuality: 'medium' },
+  ).catch((err) => {
+    // Older Safari lacks crop/resize options — remember and use the canvas
+    // path from now on instead of failing every tile.
+    _bitmapCropBroken = true;
+    console.warn('filmstrip: createImageBitmap crop unsupported, using canvas path', err);
+    return _sliceSpriteCanvas(entry, t, w, h);
+  });
 }
 
 // ── Client-side seeking (fallback) ──────────────────────────────────────────
@@ -231,6 +367,16 @@ export function isFilmstripSupported() {
 }
 
 /**
+ * True when the server sprite for ``src`` is loaded and sliceable RIGHT NOW.
+ * Lets the timeline batch-schedule every missing visible tile in one draw
+ * pass (slicing a loaded sheet is cheap and safe to parallelize) instead of
+ * the one-tile-per-redraw trickle required by the hidden-<video> fallback.
+ */
+export function hasSpriteReady(src) {
+  return _SPRITE.has(src);
+}
+
+/**
  * Get a cached thumbnail synchronously, or ``null`` if it has to be
  * generated. The caller is expected to schedule generation via
  * ``ensureThumbnail`` and trigger a redraw on the returned promise.
@@ -241,11 +387,34 @@ export function getCachedThumbnail(src, t, w, h) {
 }
 
 /**
- * Lazily generate a thumbnail. Prefers the server sprite (slice a tile);
- * falls back to seeking a hidden ``<video>``. Returns the same Promise for
- * repeat calls during generation so we don't do the same work twice.
+ * Decide what to do when no sprite is available (yet) for ``src``.
+ *
+ * Non-job media (no jobId derivable) has no server sprite at all — hidden
+ * <video> capture is the only option, as before. JOB sources DO get a
+ * sprite (a coarse one within seconds on long videos), so falling back to
+ * per-thumbnail seeks would just hammer the container with Range requests
+ * that fight the preview player — the exact "filmstrip never loads on long
+ * videos" failure. We wait for the sprite instead, and only allow the
+ * legacy capture if the sprite has been missing for a long time on a SHORT
+ * source (where seeks are cheap).
  */
-export function ensureThumbnail(src, t, w, h) {
+function _fallbackAllowed(src, durationHint) {
+  if (!_deriveJobId(src)) return true;       // non-job media: only option
+  const firstMiss = _SPRITE_FIRST_MISS.get(src);
+  if (!firstMiss || (Date.now() - firstMiss) < _CLIENT_FALLBACK_AFTER_MS) return false;
+  const dur = Number(durationHint) || 0;
+  return dur > 0 && dur <= _CLIENT_FALLBACK_MAX_DURATION_S;
+}
+
+/**
+ * Lazily generate a thumbnail. Prefers the server sprite (slice a tile);
+ * falls back to seeking a hidden ``<video>`` where allowed (see
+ * ``_fallbackAllowed``). ``opts.durationHint`` — the source duration in
+ * seconds, when the caller knows it — gates that fallback. Returns the same
+ * Promise for repeat calls during generation so we don't do the same work
+ * twice.
+ */
+export function ensureThumbnail(src, t, w, h, opts) {
   if (!src) return Promise.reject(new Error('no src'));
   if (!isFilmstripSupported()) {
     return Promise.reject(new Error('filmstrip thumbnails unsupported on this browser'));
@@ -257,7 +426,16 @@ export function ensureThumbnail(src, t, w, h) {
   if (inflight) return inflight;
 
   const p = _loadSprite(src)
-    .then((entry) => (entry ? _sliceSprite(entry, t, w, h) : _clientCapture(src, t, w, h)))
+    .then((entry) => {
+      if (entry) return _sliceSprite(entry, t, w, h);
+      if (_fallbackAllowed(src, opts && opts.durationHint)) {
+        return _clientCapture(src, t, w, h);
+      }
+      // Sprite still generating server-side — the caller keeps its shimmer
+      // and retries on later draws (the 404 retry/backoff lives in
+      // _loadSprite). Soft, expected rejection.
+      throw new Error('sprite pending');
+    })
     .then((bitmap) => {
       _PENDING.delete(key);
       _CACHE.set(key, bitmap);
@@ -283,21 +461,21 @@ export function ensureThumbnail(src, t, w, h) {
  * changes or the editor unmounts).
  */
 export function disposeFilmstrip(src) {
-  for (const k of [..._CACHE.keys()]) {
-    if (k.startsWith(`${src}|`)) {
-      const bitmap = _CACHE.get(k);
-      try { bitmap.close && bitmap.close(); } catch {}
-      _CACHE.delete(k);
-    }
-  }
+  _dropCachedTiles(src);
   const el = _ELEMENTS.get(src);
   if (el) {
     try { el.remove(); } catch {}
     _ELEMENTS.delete(src);
   }
+  const timer = _SPRITE_UPGRADE_TIMER.get(src);
+  if (timer) {
+    clearTimeout(timer);
+    _SPRITE_UPGRADE_TIMER.delete(src);
+  }
   _SPRITE.delete(src);
   _SPRITE_PROMISE.delete(src);
   _SPRITE_MISS.delete(src);
+  _SPRITE_FIRST_MISS.delete(src);
 }
 
 /** How many timestamps to thumbnail across a clip given pixel width. */
