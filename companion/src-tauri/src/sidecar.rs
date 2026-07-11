@@ -263,6 +263,21 @@ pub async fn ensure_running(
         if alive && handle.model == service_key && healthy().await {
             return Ok(model.to_string());
         }
+        // Say WHY the old sidecar is being retired — this restart used to be
+        // silent, which made an unexplained "whisper sidecar stopped" in the
+        // log impossible to attribute.
+        if !alive {
+            log::warn!(
+                "whisper sidecar process had EXITED on its own (crash?) — starting a fresh one"
+            );
+        } else if handle.model != service_key {
+            log::info!(
+                "restarting whisper sidecar: decode settings changed ({} → {service_key})",
+                handle.model
+            );
+        } else {
+            log::warn!("whisper sidecar unresponsive to /health — restarting it");
+        }
         let _ = handle.child.kill().await;
         *guard = None;
     }
@@ -510,11 +525,13 @@ pub async fn download_whispercpp(
     Err("Runtime Whisper download is Windows-only — macOS builds bundle whisper.cpp.".into())
 }
 
-pub async fn shutdown(state: &AppState) {
+pub async fn shutdown(state: &AppState, reason: &str) {
     if let Some(mut handle) = state.sidecar.lock().await.take() {
         let _ = handle.child.kill().await;
         let _ = handle.child.wait().await;
-        log::info!("whisper sidecar stopped");
+        // Every stop carries its cause: an unattributed bare "whisper sidecar
+        // stopped" in a live log proved undiagnosable (2026-07-11 04:10:57Z).
+        log::info!("whisper sidecar stopped ({reason})");
     }
 }
 
@@ -528,7 +545,7 @@ pub async fn free_gpu(state: &Arc<AppState>, reason: &str) -> (bool, usize) {
     if let Ok(permit) = state.whisper_slot.try_acquire() {
         whisper_stopped = state.sidecar.lock().await.is_some();
         if whisper_stopped {
-            shutdown(state).await;
+            shutdown(state, reason).await;
         }
         drop(permit);
     }
@@ -596,8 +613,7 @@ pub fn spawn_idle_reaper(state: Arc<AppState>) {
                 && last_real > 0
                 && now.saturating_sub(last_real) > idle_min * 60_000
             {
-                log::info!("whisper sidecar idle for {idle_min} min — shutting it down");
-                shutdown(&state).await;
+                shutdown(&state, &format!("idle {idle_min} min backstop")).await;
             }
         }
     });

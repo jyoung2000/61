@@ -211,6 +211,59 @@ def test_opus_unload_frees_cuda(tmp_path, monkeypatch):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Companion sidecar pre-warm (ClipAI side)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_remote_whisper_warm_noops_when_unconfigured(monkeypatch):
+    from backend.services import reframer_audio as ra
+    monkeypatch.setattr(ra, "remote_whisper_configured", lambda: False)
+
+    def _boom():
+        raise AssertionError("warm must not touch the base URL when unconfigured")
+
+    monkeypatch.setattr(ra, "_remote_whisper_base", _boom)
+    ra.remote_whisper_warm()      # must not raise, must not spawn a POST
+
+
+def test_remote_whisper_warm_fires_background_post(monkeypatch):
+    import threading as _t
+    from backend.services import reframer_audio as ra
+    monkeypatch.setattr(ra, "remote_whisper_configured", lambda: True)
+    monkeypatch.setattr(ra, "_remote_whisper_base",
+                        lambda: "http://companion.test:11500")
+    monkeypatch.setattr(ra, "_remote_whisper_token", lambda: "tok")
+    monkeypatch.setattr(ra, "remote_whisper_pick_model",
+                        lambda lang: "large-v3-turbo")
+    posted = {}
+    done = _t.Event()
+
+    class _FakeHttpx:
+        @staticmethod
+        def post(url, headers=None, timeout=None):
+            posted["url"] = url
+            posted["headers"] = headers or {}
+            done.set()
+            return types.SimpleNamespace(status_code=202)
+
+    monkeypatch.setitem(sys.modules, "httpx", _FakeHttpx)
+    ra.remote_whisper_warm()
+    assert done.wait(5.0), "warm POST never fired"
+    assert posted["url"].endswith("/v1/sidecar/warm")
+    assert posted["headers"].get("X-ClipAI-Whisper-Model") == "large-v3-turbo"
+    assert posted["headers"].get("Authorization") == "Bearer tok"
+
+
+def test_selected_path_calls_warm():
+    import inspect
+    from backend.services import reframer_audio as ra
+    src = inspect.getsource(ra)
+    i_sel = src.find("Remote Whisper selected")
+    assert i_sel != -1
+    # The warm CALL follows the selection log line (the def matches earlier).
+    assert src.find("remote_whisper_warm()", i_sel) != -1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Compose: Ollama service tuning
 # ─────────────────────────────────────────────────────────────────────────────
 

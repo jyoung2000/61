@@ -418,6 +418,14 @@ async fn ensure_running_inner(state: &Arc<AppState>) -> Result<bool, String> {
         .env("OLLAMA_MAX_LOADED_MODELS", max_loaded.to_string())
         .env("OLLAMA_NUM_PARALLEL", num_parallel.to_string())
         .env("OLLAMA_KEEP_ALIVE", keep_alive)
+        // Parity with the ClipAI container's Ollama service: flash attention
+        // is numerically exact and speeds up prefill — the polish/MTPE
+        // prompts are long, so prefill is most of each request — and q8_0 KV
+        // halves the cache, which is what lets num_parallel slots fit. The
+        // container has shipped both for weeks; the managed daemon simply
+        // never set them.
+        .env("OLLAMA_FLASH_ATTENTION", "1")
+        .env("OLLAMA_KV_CACHE_TYPE", "q8_0")
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     if overhead > 0 {

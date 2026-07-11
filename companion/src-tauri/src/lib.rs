@@ -385,7 +385,7 @@ async fn set_config(
     if sidecar_restart_needed {
         // The whisper tier may have changed — drop the sidecar; the next
         // transcription lazily starts the right one.
-        sidecar::shutdown(&state).await;
+        sidecar::shutdown(&state, "whisper settings changed").await;
     }
     Ok(serde_json::json!({"ok": true, "ollama_restarted": ollama_restart_needed}))
 }
@@ -461,7 +461,7 @@ async fn download_whisper(
     // Stop any running sidecar first: on Windows a live whisper-server.exe holds
     // a file lock, so re-downloading (e.g. swapping a CPU build for the GPU one)
     // would fail to overwrite it. It restarts lazily on the next request.
-    sidecar::shutdown(&state).await;
+    sidecar::shutdown(&state, "whisper download requested").await;
     let msg = sidecar::download_whispercpp(&app, &dd).await?;
     state
         .sidecar_available
@@ -857,7 +857,7 @@ fn build_tray(app: &tauri::App, state: SharedState) -> tauri::Result<()> {
                 let state = state_for_menu.clone();
                 let app = app.clone();
                 tauri::async_runtime::spawn(async move {
-                    sidecar::shutdown(&state).await;
+                    sidecar::shutdown(&state, "app quit").await;
                     ollama::shutdown(&state).await;
                     app.exit(0);
                 });
@@ -955,7 +955,7 @@ pub fn run() {
                     );
                     // Release any file lock on an existing whisper-server.exe so
                     // the overwrite (CPU→GPU swap) can't fail. No-op if unstarted.
-                    sidecar::shutdown(&state).await;
+                    sidecar::shutdown(&state, "GPU whisper auto-install").await;
                     match sidecar::download_whispercpp(&app_handle, &dd).await {
                         Ok(msg) => log::info!("auto-install whisper: {msg}"),
                         Err(e) => log::warn!(
@@ -1142,7 +1142,7 @@ pub fn run() {
                         let _ = tokio::time::timeout(
                             std::time::Duration::from_secs(3),
                             async {
-                                sidecar::shutdown(&state).await;
+                                sidecar::shutdown(&state, "app exit").await;
                                 ollama::shutdown(&state).await;
                             },
                         )

@@ -446,10 +446,41 @@ async fn sidecar_release(State(ctx): State<ProxyCtx>, req: Request<Body>) -> Res
         )
             .into_response();
     };
-    crate::sidecar::shutdown(&ctx.state).await;
+    crate::sidecar::shutdown(&ctx.state, "ClipAI /v1/sidecar/release").await;
     drop(permit);
     log::info!("whisper sidecar released on ClipAI's request (VRAM freed for LLM phase)");
     (StatusCode::OK, "released").into_response()
+}
+
+/// /v1/sidecar/warm → start the whisper sidecar NOW, in the background.
+///
+/// ClipAI calls this the moment it SELECTS remote Whisper for a job — several
+/// minutes before the WAV upload (frame extraction + language ID run first).
+/// The observed cold path cost the decode ~35 s of server spawn + model load
+/// that this hides entirely inside those earlier stages. Non-blocking: replies
+/// 202 immediately and ensure_running runs on a background task (idempotent —
+/// a healthy sidecar with the same decode settings is left untouched, so
+/// repeated warms are free). Honors pause; never preempts a running decode.
+async fn sidecar_warm(State(ctx): State<ProxyCtx>, req: Request<Body>) -> Response {
+    if !authorized(&ctx, req.headers()) {
+        return unauthorized();
+    }
+    if ctx.state.config.lock().unwrap().paused {
+        return paused();
+    }
+    let requested_model = header_str(req.headers(), "x-clipai-whisper-model");
+    let state = ctx.state.clone();
+    let rd = ctx.resource_dir.clone();
+    let dd = ctx.data_dir.clone();
+    tauri::async_runtime::spawn(async move {
+        match crate::sidecar::ensure_running(&state, rd, dd, &requested_model).await {
+            Ok(model) => log::info!(
+                "whisper sidecar pre-warmed (model={model}) — ready before the audio arrives"
+            ),
+            Err(e) => log::warn!("whisper sidecar pre-warm failed (non-fatal): {e}"),
+        }
+    });
+    (StatusCode::ACCEPTED, "warming").into_response()
 }
 
 /// /v1/gpu/release → free the WHOLE GPU on request: whisper sidecar stopped
@@ -861,6 +892,7 @@ fn build_router(ctx: ProxyCtx) -> Router {
         .route("/v1/files/read", get(files_read))
         .route("/v1/progress", post(progress_report))
         .route("/v1/sidecar/release", post(sidecar_release))
+        .route("/v1/sidecar/warm", post(sidecar_warm))
         .route("/v1/gpu/release", post(gpu_release))
         .route("/v1/audio/transcriptions", post(whisper_proxy))
         .route("/ollama", any(ollama_proxy))

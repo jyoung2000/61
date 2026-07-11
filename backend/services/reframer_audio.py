@@ -692,6 +692,44 @@ def remote_whisper_pick_model(language: Optional[str]) -> str:
     return "large-v3"
 
 
+def remote_whisper_warm() -> None:
+    """Ask the Companion to start its whisper sidecar NOW, in the background.
+
+    Called the moment remote Whisper is SELECTED for a job — several minutes
+    before the WAV upload — so the ~35 s of server spawn + model load happens
+    while frame extraction / language ID run, instead of delaying the decode.
+    Fire-and-forget on a daemon thread (this runs in sync perceiver code);
+    best-effort in every direction: a 404 from an older Companion, pause
+    (503), or any transport error changes nothing — the decode request's own
+    ensure_running remains the fallback.
+    """
+    if not remote_whisper_configured():
+        return
+
+    def _fire():
+        try:
+            import httpx
+            headers = {}
+            token = _remote_whisper_token()
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+            _model = remote_whisper_pick_model(None)
+            if _model:
+                headers["X-ClipAI-Whisper-Model"] = _model
+            r = httpx.post(f"{_remote_whisper_base()}/v1/sidecar/warm",
+                           headers=headers, timeout=5.0)
+            if r.status_code in (200, 202):
+                logger.info(
+                    "Companion whisper sidecar pre-warm requested "
+                    "(model=%s) — loads while extraction runs", _model)
+        except Exception:
+            pass
+
+    import threading
+    threading.Thread(target=_fire, name="clipai-whisper-warm",
+                     daemon=True).start()
+
+
 def remote_whisper_release() -> bool:
     """Ask the Companion to shut its whisper sidecar down NOW (free VRAM).
 
@@ -1138,6 +1176,12 @@ class AudioIntelligence:
                     '(local GPU stays free)'
                     + ('' if _healthy else
                        ' — strict mode: health probe failed but not falling back to the local GPU'))
+                # Pre-warm the Companion's sidecar NOW: language ID + the
+                # audio prep run for minutes before the WAV lands, and the
+                # observed cold path cost the decode ~35 s of server spawn +
+                # model load. Fire-and-forget on a daemon thread; an older
+                # Companion answers 404 and nothing changes.
+                remote_whisper_warm()
                 return True
             log.log_stage('AUDIO',
                 f'Remote Whisper configured ({_remote_whisper_base()}) but '
