@@ -315,12 +315,15 @@ class Settings(BaseSettings):
     # were missed (never silence, so no hallucination flood). This is how we
     # "transcribe the whole video": miss none of the speech, skip the silence.
     SPEECH_COVERAGE_AUDIT_ENABLED: bool = True
-    # Opt-in: re-transcribing VAD-detected speech recovers soft/off-mic
-    # dialogue, but Silero can false-fire on loud non-verbal audio (moans /
-    # music), so enabling it trades a little hallucination risk for coverage.
-    # The audit above stays on regardless, so you can SEE the gaps first and
-    # only flip this on if they're real missed speech, not silence.
-    SPEECH_GAP_RECOVERY_ENABLED: bool = False
+    # Re-transcribe the VAD-confirmed speech runs the main decode missed
+    # (soft / off-mic / whispered dialogue). ON by default: every recovered
+    # cue passes the same hallucination filter, no_speech_prob drop,
+    # wrong-script filter, repeated-phrase collapse and cross-validation as
+    # the main pass, and only voice-ACTIVE runs are ever re-sent — so the
+    # hallucination risk Silero false-fires used to pose is filtered layers
+    # deep. The observed cost of leaving this off was 272 s of real speech
+    # (16% of the audio's dialogue) absent from the transcript.
+    SPEECH_GAP_RECOVERY_ENABLED: bool = True
     # Only recover a voice-active gap at least this long (short between-word
     # gaps re-emit the same cue — not worth a round-trip). 1.2 s catches the
     # short interjections / single-word replies a 2 s floor skipped while
@@ -924,6 +927,16 @@ class Settings(BaseSettings):
     # upgraded model instead DOWNSHIFTS to the base model so coverage stays
     # near-100% within the budget.
     SUBTITLE_POLISH_MAX_S: float = 600.0
+    # Wall-clock ceiling across ALL readability passes of one polish loop
+    # (seconds; 0 = unlimited). SUBTITLE_POLISH_MAX_S bounds a single pass;
+    # without a loop-level cap, 3 passes × 600 s budgets stacked into a
+    # ~30-minute background stage on a slow model.
+    SUBTITLE_POLISH_LOOP_MAX_S: float = 900.0
+    # Minimum %% of cues a polish pass must change for ANOTHER pass to run.
+    # Passes that change almost nothing (the observed 21/1003 → 12 → 15 run)
+    # predict the model has nothing more to give — stop instead of paying a
+    # full extra pass for it.
+    TRANSCRIPT_POLISH_MIN_YIELD_PCT: float = 2.0
     # Subtitle polishing is part of the SUBTITLE pipeline, not the editorial
     # pipeline. When True (default), the transcript/subtitle polish + MT
     # post-edit run on the dedicated translation model

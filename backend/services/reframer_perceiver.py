@@ -880,7 +880,10 @@ class Perceiver:
                 return
             r.speech_active = audio_result.get('speech_active', {})
             r.transcript_segments = audio_result.get('segments', [])
-            r.detected_language = audio_result.get('language', '')
+            # whisper.cpp reports FULL language names ("japanese"); the whole
+            # pipeline keys on ISO 639-1 codes — normalize at the source.
+            from backend.services.language_codes import normalize_lang_code
+            r.detected_language = normalize_lang_code(audio_result.get('language', ''))
             r.coverage_ledger = audio_result.get('coverage_ledger')
             r.audio_events = audio_result.get('audio_events', {})
 

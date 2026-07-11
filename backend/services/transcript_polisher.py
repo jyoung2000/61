@@ -671,6 +671,50 @@ def _coerce_polished_item(x) -> Optional[str]:
     return None
 
 
+# Bare (unquoted) object keys — the observed qwen failure shape is
+# ``{ index: 3, text: "…" }``, which json.loads rejects outright even though
+# the payload is otherwise fine. Quoting just the identifier-shaped keys
+# recovers it. Runs only after strict parsing failed, so it can't corrupt a
+# valid response.
+_BARE_KEY_RE = re.compile(r'([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)')
+_TRAILING_COMMA_RE = re.compile(r',\s*([}\]])')
+
+# One indexed pair inside a broken array: index first, then the text string
+# (with escapes). Used as the last-resort extractor when even the repaired
+# text won't parse (e.g. a truncated tail cuts the array mid-object).
+_INDEXED_PAIR_RE = re.compile(
+    r'["\']?index["\']?\s*:\s*(\d+)\s*,\s*["\']?text["\']?\s*:\s*"((?:[^"\\]|\\.)*)"')
+
+
+def _repair_json(text: str):
+    """Best-effort re-parse of near-JSON: quote bare keys, drop trailing
+    commas. Returns the parsed value or ``None``."""
+    repaired = _BARE_KEY_RE.sub(r'\1"\2"\3', text)
+    repaired = _TRAILING_COMMA_RE.sub(r'\1', repaired)
+    if repaired == text:
+        return None
+    try:
+        return json.loads(repaired)
+    except json.JSONDecodeError:
+        return None
+
+
+def _regex_salvage_indexed(text: str, expected: int) -> Optional[list[Optional[str]]]:
+    """Extract ``{"index": N, "text": "…"}`` pairs from an unparseable
+    response. Each pair's text is decoded as a JSON string (escapes resolved);
+    pairs that fail keep their cue's original text via the ``None`` slot."""
+    quoted = _BARE_KEY_RE.sub(r'\1"\2"\3', text)
+    pairs = []
+    for m in _INDEXED_PAIR_RE.finditer(quoted):
+        try:
+            pairs.append((int(m.group(1)), json.loads('"' + m.group(2) + '"')))
+        except (ValueError, json.JSONDecodeError):
+            continue
+    if not pairs:
+        return None
+    return _slots_from_indexed(pairs, expected)
+
+
 def _parse_polished_response(response: str, expected: int) -> Optional[list[Optional[str]]]:
     """Parse the LLM's JSON array response into ``expected`` slots.
 
@@ -711,7 +755,12 @@ def _parse_polished_response(response: str, expected: int) -> Optional[list[Opti
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
-        return None
+        data = _repair_json(text)
+        if data is None:
+            # Final salvage: pull whatever {"index": N, "text": "..."} pairs
+            # exist out of the broken response before discarding the whole
+            # generation (each discard costs a halve-and-retry round trip).
+            return _regex_salvage_indexed(text, expected)
     # Index-keyed salvage: the prompt asks for {"index": i, "text": ...}
     # objects precisely because small models LOSE COUNT on flat arrays (the
     # observed 15-failures-per-run "bad response shape" waste — each one a

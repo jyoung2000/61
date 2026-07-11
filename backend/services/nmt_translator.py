@@ -109,10 +109,16 @@ _FLORES_CODES = {
 
 
 def iso_to_flores(code: str) -> Optional[str]:
-    """Map an ISO 639-1 code to a Flores-200 code (case-insensitive)."""
+    """Map an ISO 639-1 code to a Flores-200 code (case-insensitive).
+
+    Tolerates full language names ("japanese") and 639-2/3 codes ("jpn") —
+    whisper.cpp reports full names, and an unnormalized name must not knock
+    the pair out of NLLB's map.
+    """
     if not code:
         return None
-    return _FLORES_CODES.get(code.strip().lower())
+    from backend.services.language_codes import normalize_lang_code
+    return _FLORES_CODES.get(normalize_lang_code(code))
 
 
 # ── Script helpers + long-cue chunking ───────────────────────────────────
@@ -942,8 +948,12 @@ class OpusMTTranslator:
 
     def __init__(self, source: str, target: str, *,
                  subdir: str = "opus-mt", model_template: Optional[str] = None):
-        self.source = source.lower()
-        self.target = target.lower()
+        # Normalize to ISO 639-1 — source/target are substituted into HF repo
+        # ids ("staka/fugumt-{src}-{tgt}"), where a full name like "japanese"
+        # produces an invalid repo and a hard download failure.
+        from backend.services.language_codes import normalize_lang_code
+        self.source = normalize_lang_code(source)
+        self.target = normalize_lang_code(target)
         # ``subdir`` + ``model_template`` let a Marian-format *variant* (e.g.
         # FuguMT, staka/fugumt-ja-en — a Japanese-specialised translator) reuse
         # this exact CTranslate2/SentencePiece loader in its own cache dir.
@@ -956,7 +966,8 @@ class OpusMTTranslator:
     @classmethod
     def get(cls, source: str, target: str, *,
             subdir: str = "opus-mt", model_template: Optional[str] = None) -> "OpusMTTranslator":
-        key = (source.lower(), target.lower(), subdir)
+        from backend.services.language_codes import normalize_lang_code
+        key = (normalize_lang_code(source), normalize_lang_code(target), subdir)
         if key not in cls._cache:
             cls._cache[key] = cls(source, target, subdir=subdir, model_template=model_template)
         return cls._cache[key]
@@ -1347,7 +1358,8 @@ def ensure_opus_mt_downloaded(source: str, target: str, *,
     only applies to the shared ``opus-mt`` subdir.
     """
     from backend.config import settings as _settings
-    src, tgt = source.lower(), target.lower()
+    from backend.services.language_codes import normalize_lang_code
+    src, tgt = normalize_lang_code(source), normalize_lang_code(target)
     target_dir = _opus_dir(src, tgt, subdir)
     if os.path.exists(os.path.join(target_dir, "model.bin")):
         if subdir == "opus-mt":

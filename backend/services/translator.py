@@ -1955,6 +1955,14 @@ async def translate_segments_with_fallback(
     Raises ``TranslationFailedError`` when offline translation can't complete,
     so the caller never relabels the untranslated source as a translation.
     """
+    # Normalize to ISO 639-1 first: whisper.cpp reports full language names
+    # ("japanese"), and every downstream consumer — the engine router, HF
+    # model-id templates, the Flores map, the CJK checks — keys on ISO codes.
+    # An unnormalized name previously built the invalid repo id
+    # "staka/fugumt-japanese-en" and hard-failed the whole translation.
+    from backend.services.language_codes import normalize_lang_code
+    source_language = normalize_lang_code(source_language)
+    target_language = normalize_lang_code(target_language)
     if source_language == target_language:
         return segments
 

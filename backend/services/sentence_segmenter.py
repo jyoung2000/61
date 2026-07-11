@@ -279,6 +279,38 @@ def timing_provenance_report(segments: list) -> dict:
     }
 
 
+def _trim_boundary_overlap(prev_text: str, next_text: str) -> tuple[str, int]:
+    """Drop text from the head of ``next_text`` that duplicates the tail of
+    ``prev_text``.
+
+    Whisper's overlapping decode windows re-emit the boundary words in BOTH
+    neighbouring cues; merging the cues verbatim then doubles that text
+    ("端っこから食べれるうん端っこから食べれるうん"). Finds the longest
+    suffix of ``prev_text`` that is also a prefix of ``next_text`` (minimum 4
+    characters, capped at 60 so a pathological cue can't go quadratic; Latin
+    overlaps must end on a word boundary) and returns
+    ``(trimmed_next_text, overlap_chars)``. A short echo ("はい" after "はい")
+    is below the minimum and survives — this only removes decode-window
+    duplication, not genuine repetition.
+    """
+    a = (prev_text or "").strip()
+    b = (next_text or "").strip()
+    if not a or not b:
+        return b, 0
+    max_n = min(len(a), len(b), 60)
+    for n in range(max_n, 3, -1):
+        if a[-n:] != b[:n]:
+            continue
+        rest = b[n:]
+        # Latin scripts: never split a word — the char after the overlap (and
+        # the char before it in prev) must be a boundary.
+        if rest and rest[0].isalnum() and b[n - 1].isalnum() \
+                and not _is_cjk(b[:n]):
+            continue
+        return rest.lstrip(), n
+    return b, 0
+
+
 def resegment_by_sentence(segments: list) -> list:
     """Merge same-speaker neighbours, then re-split at sentence boundaries.
 
@@ -306,12 +338,18 @@ def resegment_by_sentence(segments: list) -> list:
             prev = merged[-1]
             is_cjk = _is_cjk((prev.text or "") + (s.text or ""))
             joiner = "" if is_cjk else " "
-            new_text = ((prev.text or "").strip() + joiner + (s.text or "").strip()).strip()
+            # Whisper's overlapping decode windows repeat the boundary text in
+            # both cues — trim the duplicate before welding, or the merged cue
+            # ships it twice.
+            _s_text, _overlap = _trim_boundary_overlap(prev.text or "", s.text or "")
+            new_text = ((prev.text or "").strip() + joiner + _s_text).strip()
             # Carry words ONLY when both sides have them: a merged block with
             # a PARTIAL word array would rebuild its text exclusively from
-            # the words, silently dropping the words-less side's text.
+            # the words, silently dropping the words-less side's text. After an
+            # overlap trim the word array no longer matches the text — drop it
+            # rather than let a words-based rebuild resurrect the duplicate.
             new_words = ((prev.words or []) + (s.words or [])
-                         if (prev.words and s.words) else None)
+                         if (prev.words and s.words and not _overlap) else None)
             merged[-1] = _new_segment(
                 prev, prev.start, s.end, new_text, new_words)
         else:

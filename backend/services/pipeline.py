@@ -2407,9 +2407,17 @@ async def _polish_transcript_loop(
 
     target_score = float(getattr(settings, "TRANSCRIPT_READABILITY_TARGET", 90.0))
     max_passes = int(getattr(settings, "TRANSCRIPT_READABILITY_MAX_PASSES", 3))
+    # Additional-pass gates. A pass that barely changes anything predicts the
+    # next pass won't either — the observed failure burned 3 × 600 s budgets
+    # changing 21/1003, then 12, then 15 cues. min_yield stops that; the loop
+    # budget caps total wall time across passes regardless.
+    _min_yield = max(0.0, float(getattr(settings, "TRANSCRIPT_POLISH_MIN_YIELD_PCT", 2.0))) / 100.0
+    _loop_budget_s = float(getattr(settings, "SUBTITLE_POLISH_LOOP_MAX_S", 900.0))
+    _loop_started = _time.monotonic()
     best_models = list(polished_models)
     best_report: Optional[dict] = None
     for _pass in range(1, max_passes + 1):
+        _pre_pass_texts = [(getattr(m, "text", "") or "") for m in polished_models]
         try:
             polished_models = await asyncio.wait_for(
                 correct_transcript(
@@ -2462,6 +2470,24 @@ async def _polish_transcript_loop(
             " ✓ target met" if _score is not None and _score >= target_score else "",
         )
         if _score is not None and _score >= target_score:
+            break
+        # Diminishing-returns stop: fraction of cues the pass actually changed.
+        _post = [(getattr(m, "text", "") or "") for m in polished_models]
+        _changed = sum(1 for a, b in zip(_pre_pass_texts, _post) if a != b)
+        _n = max(1, len(_post))
+        if (_pass < max_passes and len(_pre_pass_texts) == len(_post)
+                and (_changed / _n) < _min_yield):
+            logger.info(
+                "[%s] Polish pass %d changed only %d/%d cues (<%.1f%%) — "
+                "stopping further passes (diminishing returns)",
+                job_id, _pass, _changed, _n, _min_yield * 100)
+            break
+        _elapsed = _time.monotonic() - _loop_started
+        if _pass < max_passes and _loop_budget_s > 0 and _elapsed >= _loop_budget_s:
+            logger.info(
+                "[%s] Polish loop wall budget reached (%.0fs ≥ %.0fs) after "
+                "pass %d — keeping best result so far",
+                job_id, _elapsed, _loop_budget_s, _pass)
             break
 
     return best_models, best_report
@@ -2648,14 +2674,15 @@ async def _background_post_processing(
     # non-English audio to English so the default UX matches expectations
     # (upload Japanese → get English subtitles).
     from backend.services.compat_stubs import _last_detected_language
-    target_lang = (job.subtitle_language or "").strip().lower()
-    source_lang = (job.language or "").strip().lower()
+    from backend.services.language_codes import normalize_lang_code
+    target_lang = normalize_lang_code(job.subtitle_language or "")
+    source_lang = normalize_lang_code(job.language or "")
     if source_lang in ("", "auto"):
         # "auto" must resolve to the language Whisper actually detected — otherwise
         # the LLM gets a vague "translate from the source language" prompt and the
         # CJK purity check can't run, which is how half-Japanese tracks slipped
         # through.
-        source_lang = (_last_detected_language.get("lang", "") or "").strip().lower()
+        source_lang = normalize_lang_code(_last_detected_language.get("lang", "") or "")
     if not target_lang and source_lang and source_lang not in ("en", "english"):
         target_lang = "en"
         logger.info(
@@ -5105,9 +5132,10 @@ async def _run_analysis_inner(job_id: str, resume: bool = False):
     # On a RESUMED run no Whisper was loaded (the transcript came from the
     # checkpoint), so this release/keep dance is a no-op and is skipped.
     if not _resumed_from_checkpoint:
-        _det_lang_pp = (getattr(perception, "detected_language", "") or "").strip().lower()
-        _pp_tgt = (job.subtitle_language or "").strip().lower()
-        _pp_src = (job.language or "").strip().lower() or _det_lang_pp
+        from backend.services.language_codes import normalize_lang_code as _nlc
+        _det_lang_pp = _nlc(getattr(perception, "detected_language", "") or "")
+        _pp_tgt = _nlc(job.subtitle_language or "")
+        _pp_src = _nlc(job.language or "") or _det_lang_pp
         if not _pp_tgt and _pp_src and _pp_src not in ("en", "english"):
             _pp_tgt = "en"  # auto-translate non-English → English
         _keep_whisper_for_translate = (
@@ -5266,7 +5294,12 @@ async def _run_analysis_inner(job_id: str, resume: bool = False):
     # block below can pass it to the polisher (CJK-specific rules). It was
     # previously only assigned much later, which raised UnboundLocalError in
     # the polish try/except and silently disabled the LLM polish pass.
-    _detected_lang = getattr(perception, "detected_language", "") or ""
+    # Normalize to ISO 639-1 ("japanese" → "ja"): the polisher's CJK rules,
+    # the translator router and the auto-translate check all key on ISO codes.
+    # (The perceiver normalizes too, but a checkpoint-restored perception from
+    # an older run can still carry whisper.cpp's full language name.)
+    from backend.services.language_codes import normalize_lang_code as _norm_lang
+    _detected_lang = _norm_lang(getattr(perception, "detected_language", "") or "")
 
     # ── Will this job translate? (translate-then-polish decision) ──
     # When a translation pass will follow, we deliberately SKIP the heavy
@@ -5358,8 +5391,9 @@ async def _run_analysis_inner(job_id: str, resume: bool = False):
         # the translator works from clean input AND the shipped source
         # transcript reads cleanly — both benefit. Fail-soft + gated by
         # TRANSLATION_POLISH_SOURCE_FIRST; the full reflow still runs on the
-        # translated text. (_polished_in_critical_path stays False so a
-        # translation FAILURE still triggers the full source polish fallback.)
+        # translated text. When it applies, it COUNTS as the source polish
+        # (_polished_in_critical_path=True): re-running the full multi-pass
+        # loop on translation failure spent ~33 min changing <3% of cues.
         if (settings.AI_TRANSCRIPT_CORRECTION
                 and getattr(settings, "TRANSCRIPT_POLISHING_ENABLED", True)
                 and getattr(settings, "TRANSLATION_POLISH_SOURCE_FIRST", True)
@@ -5378,6 +5412,7 @@ async def _run_analysis_inner(job_id: str, resume: bool = False):
                         p.model_dump() if hasattr(p, "model_dump") else dict(p)
                         for p in _src_polished
                     ]
+                    _polished_in_critical_path = True
                     logger.info(
                         "[%s] Light source-language polish applied before translation "
                         "(%d segments) — translator + shipped source both benefit",

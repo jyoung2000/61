@@ -2527,12 +2527,23 @@ class AudioIntelligence:
             result['speech_coverage'] = st
 
             # ── Voice-gated gap recovery ──
+            # When it can't run over real gaps, SAY WHY: the observed
+            # 84%-coverage run left 272 s of speech unrecovered with zero log
+            # evidence of the skip.
             recovered = 0
-            if (bool(getattr(settings, "SPEECH_GAP_RECOVERY_ENABLED", True))
-                    and remote_engine is not None):
-                gaps = SC.uncovered_voice_gaps(
-                    voice, _covered(segs),
-                    min_gap_s=float(getattr(settings, "SPEECH_GAP_MIN_SEC", 1.2)))
+            gaps = SC.uncovered_voice_gaps(
+                voice, _covered(segs),
+                min_gap_s=float(getattr(settings, "SPEECH_GAP_MIN_SEC", 1.2)))
+            _rec_enabled = bool(getattr(settings, "SPEECH_GAP_RECOVERY_ENABLED", True))
+            if gaps and not _rec_enabled:
+                log.log_stage('AUDIO',
+                    f'Gap recovery skipped ({len(gaps)} voice-active gap(s) '
+                    'uncovered): SPEECH_GAP_RECOVERY_ENABLED is off')
+            elif gaps and remote_engine is None:
+                log.log_stage('AUDIO',
+                    f'Gap recovery skipped ({len(gaps)} voice-active gap(s) '
+                    'uncovered): no remote engine handle on this path')
+            if _rec_enabled and remote_engine is not None:
                 if gaps:
                     new_segs = self._recover_voice_gaps_remote(
                         gaps, audio_path, whisper_lang, remote_engine, log)
@@ -2634,7 +2645,19 @@ class AudioIntelligence:
             f'({total:.0f}s) the companion missed')
         _ns_drop = float(getattr(settings, "WHISPER_CLOUD_NO_SPEECH_DROP", 0.7))
         out = []
+        # Failure accounting: per-slice errors were silently swallowed, which
+        # made a dead/cold sidecar look identical to "the gaps were silence".
+        # Consecutive remote failures with zero successes abort the loop early
+        # (each failed slice costs a full upload timeout) and get reported.
+        _remote_fails = 0
+        _remote_ok = 0
         for (a, b) in picked:
+            if _remote_ok == 0 and _remote_fails >= 3:
+                log.log_stage('AUDIO',
+                    f'Gap recovery aborted: first {_remote_fails} slice '
+                    'uploads all failed (remote engine unreachable?) — '
+                    f'skipping the remaining {len(picked) - _remote_fails} gap(s)')
+                break
             wav = tempfile.mktemp(suffix='.wav')
             try:
                 # Small pad so a word straddling the boundary isn't clipped.
@@ -2662,6 +2685,10 @@ class AudioIntelligence:
                 if not os.path.exists(wav) or os.path.getsize(wav) < 2000:
                     continue
                 part = remote_engine.transcribe_wav(wav, whisper_lang)
+                if not part:
+                    _remote_fails += 1
+                    continue
+                _remote_ok += 1
                 for seg in (part or {}).get('segments') or []:
                     text = (seg.get('text') or '').strip()
                     if not text or _is_boilerplate_hallucination(text):
@@ -2682,12 +2709,17 @@ class AudioIntelligence:
                     seg['text'] = _collapse_repeated_phrases(text)
                     out.append(seg)
             except Exception:
+                _remote_fails += 1
                 continue
             finally:
                 try:
                     os.remove(wav)
                 except Exception:
                     pass
+        log.log_stage('AUDIO',
+            f'Gap recovery finished: {len(out)} cue(s) recovered from '
+            f'{_remote_ok}/{len(picked)} slice(s)'
+            + (f' ({_remote_fails} failed)' if _remote_fails else ''))
         return out
 
     def _redecode_difficult_segments(

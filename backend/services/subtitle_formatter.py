@@ -755,7 +755,14 @@ def _merge_for_readability(
                 and not _is_bracket_marker(prev_txt) and not _is_bracket_marker(txt)
                 and 0.0 <= gap <= eff_gap):
             joiner = "" if (_is_cjk(prev_txt) and _is_cjk(txt)) else " "
-            cand = (prev_txt + joiner + txt).strip()
+            # Whisper's overlapping decode windows re-emit the boundary words
+            # in both cues; welding them verbatim ships the text twice
+            # ("端っこから食べれるうん端っこから食べれるうん"). Trim the
+            # duplicated overlap before joining — same guard as the sentence
+            # resegmenter's merge.
+            from backend.services.sentence_segmenter import _trim_boundary_overlap
+            txt_trimmed, _overlap = _trim_boundary_overlap(prev_txt, txt)
+            cand = (prev_txt + joiner + txt_trimmed).strip()
             cand_end = max(prev.end, seg.end)
             cand_dur = max(0.001, cand_end - prev.start)
             # Only merge when the RESULT is still fully readable: fits a 2-line
@@ -767,7 +774,11 @@ def _merge_for_readability(
                 out[-1] = TranscriptSegment(
                     start=prev.start, end=cand_end, text=cand,
                     speaker=prev.speaker,
-                    words=(list(prev.words or []) + list(seg.words or [])),
+                    # After an overlap trim the concatenated word array no
+                    # longer matches the text — drop it rather than let a
+                    # words-based rebuild resurrect the duplicate.
+                    words=(None if _overlap else
+                           (list(prev.words or []) + list(seg.words or []))),
                     confidence=prev.confidence,
                 )
                 continue
