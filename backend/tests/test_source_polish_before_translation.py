@@ -38,7 +38,7 @@ class _FakeOrch:
 
     async def text_completion(self, prompt, timeout=90.0, **kw):
         self.calls += 1
-        m = re.search(r"return EXACTLY (\d+)", prompt)
+        m = re.search(r"JSON array of (\d+) objects", prompt) or re.search(r"return EXACTLY (\d+)", prompt)
         n = int(m.group(1)) if m else 1
         return json.dumps([f"Polished line {i + 1}." for i in range(n)])
 

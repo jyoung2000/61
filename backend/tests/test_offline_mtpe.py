@@ -84,7 +84,8 @@ def _install_fake_ollama(monkeypatch, *, response=None, capture=None):
             capture["calls"] += 1
         if response is not None:
             return response
-        m = re.search(r"EXACTLY (\d+)", prompt)
+        m = (re.search(r"JSON array of (\d+) objects", prompt)
+             or re.search(r"EXACTLY (\d+)", prompt))
         n = int(m.group(1)) if m else 1
         return json.dumps([f"edited line {i + 1}" for i in range(n)])
 

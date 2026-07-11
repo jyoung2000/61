@@ -28,7 +28,7 @@ class _OneBadElementOrch:
 
     async def text_completion(self, prompt, timeout=90.0, **kw):
         import re
-        m = re.search(r"return EXACTLY (\d+)", prompt)
+        m = re.search(r"JSON array of (\d+) objects", prompt) or re.search(r"return EXACTLY (\d+)", prompt)
         n = int(m.group(1)) if m else 1
         arr = []
         for i in range(n):

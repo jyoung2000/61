@@ -61,10 +61,14 @@ def test_resegment_scrambles_wordless_1to1_cues():
     the cut it falls back to a GLOBAL char-proportional split across the whole
     merged span, erasing the real per-cue timing and the silence between cues.
 
-    Here three equal-length, same-speaker cues have a 56 s silent gap before the
-    last one (a scene change at 60 s). Resegmenting destroys both the gap and
-    the third cue's true 60 s start — the "scrambled timing" the LLM track
-    showed before the pipeline started bypassing this step.
+    Here three equal-length, same-speaker cues have a 56 s silent gap before
+    the last one (a scene change at 60 s). Historically resegment merged all
+    three into one [0, 62] block and char-split it, erasing the gap and
+    pulling the 60 s cue to ~41 s — the "scrambled timing" that made the LLM
+    path bypass this step. The merge is now GAP-GATED (same-speaker merges
+    never bridge a turn-length silence), so the 56 s gap and the third cue's
+    true 60 s start SURVIVE resegmentation. The LLM path's bypass remains a
+    belt-and-braces choice, but the scramble it protected against is fixed.
     """
     segs = [
         TranscriptSegment(text="AAAA.", start=0.0, end=2.0, speaker="S", words=None),
@@ -76,14 +80,13 @@ def test_resegment_scrambles_wordless_1to1_cues():
 
     out = resegment_by_sentence(segs)
 
-    # The same-speaker run is merged into one [0, 62] block and re-split by
-    # character count, so the cues come back CONTIGUOUS — the 56 s gap is gone.
+    # The 56 s gap survives: the merge refuses to bridge a turn-length
+    # silence, so no char-proportional split can smear timing across it.
     gaps = [out[i + 1].start - out[i].end for i in range(len(out) - 1)]
-    assert max(gaps) < 1.0, f"resegment erased the 56 s inter-cue gap: {gaps}"
+    assert max(gaps) >= 56.0, f"gap-gated merge lost the 56 s silence: {gaps}"
 
-    # And the third utterance, which truly starts at 60 s, is pulled forward to
-    # ~41 s (2/3 through 62 s by character count) — far from its real time.
+    # And the third utterance keeps its REAL 60 s start.
     third = next(s for s in out if "CCCC" in s.text)
-    assert third.start < 50.0, (
-        f"resegment moved the 60 s cue to {third.start:.1f}s — confirms the "
-        "timing scramble the LLM path now avoids by skipping this step")
+    assert third.start == 60.0, (
+        f"the 60 s cue moved to {third.start:.1f}s — merge bridged a "
+        "turn-length gap it must never bridge")

@@ -104,16 +104,22 @@ def _split_text_sentences(text: str, is_cjk: bool) -> list[str]:
     return [p.strip() for p in parts if p and p.strip()]
 
 
-def _pause_split_params() -> tuple[bool, float, float]:
-    """Resolve (enabled, pause_seconds, max_cue_seconds) from config."""
+def _pause_split_params() -> tuple[bool, float, float, float]:
+    """Resolve (enabled, pause_s, max_cue_s, turn_pause_s) from config.
+
+    ``turn_pause_s`` is the LONGER silence treated as a speaker-turn boundary:
+    terminator-carrying cues are additionally split there (and same-speaker
+    merges are blocked across it) so two people's lines that Whisper welded
+    into one cue translate as two independent utterances."""
     try:
         from backend.config import settings as _s
         enabled = bool(getattr(_s, "SENTENCE_SPLIT_PAUSE_ENABLED", True))
         pause_s = float(getattr(_s, "SENTENCE_SPLIT_PAUSE_MS", 400)) / 1000.0
         max_cue_s = float(getattr(_s, "SENTENCE_SPLIT_MAX_CUE_MS", 8000)) / 1000.0
+        turn_pause_s = float(getattr(_s, "SENTENCE_SPLIT_TURN_PAUSE_MS", 700)) / 1000.0
     except Exception:
-        enabled, pause_s, max_cue_s = True, 0.4, 8.0
-    return enabled, pause_s, max_cue_s
+        enabled, pause_s, max_cue_s, turn_pause_s = True, 0.4, 8.0, 0.7
+    return enabled, pause_s, max_cue_s, turn_pause_s
 
 
 def _group_has_terminator(group: list) -> bool:
@@ -159,6 +165,20 @@ def _split_segment_by_sentence(seg: TranscriptSegment) -> list[TranscriptSegment
     is_cjk = _is_cjk(seg.text or "")
     words = seg.words or []
 
+    # PARTIAL word arrays must never erase text: after a polish whose word
+    # remap fell below confidence, a merged block can carry words for only
+    # one of its source cues — the word-timed path below rebuilds text
+    # exclusively from the words, silently DROPPING the words-less
+    # neighbour's text before translation. When the words cover well under
+    # the full text, fall back to the text path (char-proportional timing —
+    # the pre-existing fallback) instead of losing content.
+    if words:
+        _joined_chars = sum(
+            len(str(_w_get(w, "word", "") or "").strip()) for w in words)
+        _text_chars = len((seg.text or "").replace(" ", ""))
+        if _text_chars > 0 and _joined_chars < 0.7 * _text_chars:
+            words = []
+
     if not words:
         # No word timing — split text and distribute duration by char length.
         sentences = _split_text_sentences(seg.text, is_cjk)
@@ -191,7 +211,7 @@ def _split_segment_by_sentence(seg: TranscriptSegment) -> list[TranscriptSegment
     # Split such groups — and any terminator group that still runs too long — on
     # acoustic silence using the word timestamps. Word-accurate boundaries with
     # no model. Well-punctuated, normal-length sentences are left untouched.
-    pause_enabled, pause_s, max_cue_s = _pause_split_params()
+    pause_enabled, pause_s, max_cue_s, turn_pause_s = _pause_split_params()
     if pause_enabled:
         refined: list[list] = []
         for grp in sentences:
@@ -204,7 +224,15 @@ def _split_segment_by_sentence(seg: TranscriptSegment) -> list[TranscriptSegment
             if not _group_has_terminator(grp) or grp_dur > max_cue_s:
                 refined.extend(_split_words_by_pause(grp, pause_s, max_cue_s))
             else:
-                refined.append(grp)
+                # Terminator-carrying cues were previously exempt from pause
+                # splitting entirely — but the deterministic punctuation
+                # restorer appends terminators to EVERY CJK cue, which
+                # disarmed the splitter on exactly the two-speaker welded
+                # cues it exists for. Split these too, at the LONGER
+                # turn-pause threshold only: word timestamps must show a
+                # real ≥turn_pause_s silence, so well-punctuated
+                # single-utterance cues are untouched.
+                refined.extend(_split_words_by_pause(grp, turn_pause_s, max_cue_s))
         sentences = refined
 
     if len(sentences) <= 1:
@@ -264,17 +292,28 @@ def resegment_by_sentence(segments: list) -> list:
         TranscriptSegment(**s) if isinstance(s, dict) else s for s in segments
     ]
 
-    # 1. Merge adjacent same-speaker segments (never across speakers).
+    # 1. Merge adjacent same-speaker segments (never across speakers, and
+    #    never across a turn-length silence — a real ≥turn-pause gap between
+    #    same-speaker cues is a natural cue boundary; welding across it is
+    #    what produced the incoherent multi-utterance lines).
+    _, _, _, _turn_pause_s = _pause_split_params()
     merged: list[TranscriptSegment] = []
     for s in segs:
-        if merged and (merged[-1].speaker or "") == (s.speaker or ""):
+        _gap_ok = (not merged
+                   or (float(s.start or 0) - float(merged[-1].end or 0))
+                   < _turn_pause_s)
+        if merged and _gap_ok and (merged[-1].speaker or "") == (s.speaker or ""):
             prev = merged[-1]
             is_cjk = _is_cjk((prev.text or "") + (s.text or ""))
             joiner = "" if is_cjk else " "
             new_text = ((prev.text or "").strip() + joiner + (s.text or "").strip()).strip()
-            new_words = (prev.words or []) + (s.words or [])
+            # Carry words ONLY when both sides have them: a merged block with
+            # a PARTIAL word array would rebuild its text exclusively from
+            # the words, silently dropping the words-less side's text.
+            new_words = ((prev.words or []) + (s.words or [])
+                         if (prev.words and s.words) else None)
             merged[-1] = _new_segment(
-                prev, prev.start, s.end, new_text, new_words or None)
+                prev, prev.start, s.end, new_text, new_words)
         else:
             merged.append(s)
 

@@ -109,7 +109,7 @@ class _EchoOrch:
 
     async def text_completion(self, prompt, timeout=90.0, **kw):
         import re
-        m = re.search(r"return EXACTLY (\d+)", prompt)
+        m = re.search(r"JSON array of (\d+) objects", prompt) or re.search(r"return EXACTLY (\d+)", prompt)
         n = int(m.group(1)) if m else 1
         return json.dumps([
             {"index": i, "text": f"draft line {i + 1}", "source": "日本語のソース"}

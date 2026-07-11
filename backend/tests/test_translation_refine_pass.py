@@ -49,7 +49,7 @@ class _Orch:
         self.calls += 1
         # Count expected array length from either prompt style.
         import re
-        m = re.search(r"return EXACTLY (\d+)", prompt) or re.search(r"(\d+) numbered", prompt)
+        m = re.search(r"JSON array of (\d+) objects", prompt) or re.search(r"return EXACTLY (\d+)", prompt) or re.search(r"(\d+) numbered", prompt)
         n = int(m.group(1)) if m else 1
         if self.calls == 1:
             return json.dumps([f"line {i+1}" for i in range(n)])

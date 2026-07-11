@@ -1012,6 +1012,64 @@ class OpusMTTranslator:
         self._tokenizer = None
         self._loaded = False
 
+    def translate_with_context(
+        self,
+        batch: list[str],
+        context_before: list[str],
+        context_after: list[str],
+        source_lang: str = "",
+        target_lang: str = "",
+        glossary: Optional[dict] = None,
+    ) -> list[str]:
+        """Per-cue contextual translation for the Marian family (FuguMT/Opus).
+
+        The AUTO-selected ja→en engine (FuguMT) previously translated every
+        cue in total isolation, while the context machinery only reached
+        NLLB — and Japanese drops subjects/pronouns, so isolated-cue decoding
+        is exactly what produces wrong-subject / wrong-gender / tense-flipped
+        lines. Mirror of ``NMTTranslator._translate_one_with_context``: up to
+        2 prior SOURCE cues are prepended, the target cue rides in a numbered
+        tag, and the context translation is DISCARDED. When the tag doesn't
+        survive round-trip (or the mini-block exceeds the safe decode chunk),
+        the cue falls back to today's isolated translation — output is never
+        worse than context-free. ``source_lang``/``target_lang`` are accepted
+        for signature parity with NLLB and ignored (the pair is fixed).
+
+        ``context_after`` is unused (Marian decodes left-to-right and the
+        prior-cue window is where the referential payoff is).
+        """
+        if not batch:
+            return []
+        out: list[str] = []
+        prior = [c for c in (context_before or []) if (c or "").strip()]
+        for cue in batch:
+            cue_s = (cue or "").strip()
+            if not cue_s:
+                out.append(cue)
+                prior.append(cue_s)
+                continue
+            translated = None
+            ctx = prior[-2:]
+            if ctx:
+                mini = f"{' '.join(ctx)} {_wrap_numbered_tag(1, cue_s)}"
+                cap = (_MAX_SRC_CHARS_CJK if _looks_cjk(mini)
+                       else _MAX_SRC_CHARS_LATIN)
+                if len(mini) <= cap:
+                    try:
+                        tj = self.translate_batch([mini], glossary=glossary)[0]
+                        rec = _parse_numbered_tags(tj, 1, 2, 1)
+                        if rec and (rec[0] or "").strip():
+                            translated = rec[0]
+                    except Exception as e:
+                        logger.debug(
+                            "OpusMT per-cue context retry failed (%s)", e)
+            if translated is None:
+                tb = self.translate_batch([cue_s], glossary=glossary)
+                translated = tb[0] if (tb and (tb[0] or "").strip()) else cue
+            out.append(translated)
+            prior.append(cue_s)
+        return out
+
     def translate_batch(
         self,
         texts: list[str],

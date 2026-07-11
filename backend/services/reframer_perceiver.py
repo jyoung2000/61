@@ -273,6 +273,18 @@ class Perceiver:
         log.log_stage('PERCEIVE', f'Will analyze {total_samples} samples '
                        f'({self.sample_fps} fps, every {sample_interval_ms:.0f}ms)')
 
+        # Sparse sampling (>1.5 s between looks): the YOLO stride cache would
+        # gate faces with multi-second-old person boxes — run YOLO on EVERY
+        # sample instead. The no-face branch below reuses that same inference
+        # (no duplicate predicts), so this trades a stale gate for a fresh
+        # one at near-zero net cost on long videos.
+        try:
+            if (sample_interval_ms > 1500
+                    and getattr(self.face_detector, '_yolo_stride', 1) > 1):
+                self.face_detector._yolo_stride = 1
+        except Exception:
+            pass
+
         prev_gray_small = None
         prev_hist = None
         recent_raw: List[List[dict]] = []
@@ -397,24 +409,48 @@ class Perceiver:
                 # Reset video position
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
+        # Sequential-vs-seek threshold, SAMPLE-RATE-AWARE. The old flat 60-frame
+        # threshold predates long-video sampling: at 0.23 fps the stride is
+        # ~100-130 frames, so EVERY one of 1800 samples took a hard
+        # CAP_PROP_POS_FRAMES seek — each one rewinds to the previous keyframe
+        # and re-decodes forward (~half a GOP), flushes the demuxer, and resets
+        # the NVDEC pipeline on hw captures. Measured: ~0.5 s of the 0.72 s
+        # per-sample cost was this acquisition path, and the gap>1 grab branch
+        # (whose _track_through_gap LK bridging exists precisely to fix blind
+        # inter-sample stretches) never executed — the direct cause of the
+        # observed 1-2-sample face-track fragmentation. Sizing the threshold
+        # to ~2.5x the actual sampling stride (bounded) decodes the same
+        # target frames via sequential grab() — each source frame decoded
+        # exactly once, no seek flushes — and re-enables the gap tracker.
+        seek_gap = int(getattr(settings, 'REFRAMER_SEEK_GAP_FRAMES', 60))
+        if len(sample_times_ms) >= 2:
+            _diffs = sorted(b - a for a, b in
+                            zip(sample_times_ms, sample_times_ms[1:]))
+            _stride_frames = int(round(
+                (_diffs[len(_diffs) // 2] / 1000.0) * max(r.fps, 1e-6)))
+            _grab_cap = int(getattr(settings, 'REFRAMER_GRAB_MAX_FRAMES', 450))
+            seek_gap = min(max(seek_gap, int(2.5 * _stride_frames)), _grab_cap)
+
+        # Per-bucket wall-time accounting — one summary line at completion so
+        # 'where does each sample's time go' is answerable from the job log
+        # (the 0.72 s/sample regression was invisible without it).
+        import time as _time_mod
+        _tbuck = {'acquire': 0.0, 'detect': 0.0, 'loop': 0.0}
+        _loop_t0 = _time_mod.perf_counter()
+
         for i, time_ms in enumerate(sample_times_ms):
             if self.cancelled:
                 break
 
             # Smart frame reading: sequential grab() for anything up to
-            # ~2x a typical GOP, hard-seek only for genuinely large jumps.
-            #
-            # The old threshold was gap > 5 — but at 5 fps sampling on a
-            # 30 fps video the gap is exactly 6, so EVERY sample seeked.
-            # On long-GOP H.264 each CAP_PROP_POS_FRAMES seek re-decodes
-            # from the previous keyframe (~the whole GOP), making the
-            # perception pass decode each GOP repeatedly. grab() skips
-            # frames without full decode (no color convert / no return),
-            # which is far cheaper than a seek for these small gaps.
+            # ~2.5x the sampling stride (see threshold above), hard-seek only
+            # for genuinely large jumps. grab() skips frames without color
+            # convert / return, which is far cheaper than a seek for these
+            # gaps — and the gap branch bridges them with LK tracking.
+            _t_acq = _time_mod.perf_counter()
             target_frame = int(time_ms / 1000.0 * r.fps)
             current_pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
             gap = target_frame - current_pos
-            seek_gap = int(getattr(settings, 'REFRAMER_SEEK_GAP_FRAMES', 60))
 
             if gap < 0 or gap > seek_gap:
                 # Behind (shouldn't happen) or a genuinely large jump
@@ -430,6 +466,7 @@ class Perceiver:
                 self._track_through_gap(cap, gap, r, det_w, det_h, det_scale)
 
             ret, frame = cap.read()
+            _tbuck['acquire'] += _time_mod.perf_counter() - _t_acq
             if not ret:
                 continue
 
@@ -439,8 +476,10 @@ class Perceiver:
             gray_small = cv2.cvtColor(small_bgr, cv2.COLOR_BGR2GRAY)
 
             # ── Face detection at low res ──
+            _t_det = _time_mod.perf_counter()
             raw_faces = self._detect_faces_fast(
                 gray_small, small_bgr, min_face, max_face, det_w, det_h, det_scale)
+            _tbuck['detect'] += _time_mod.perf_counter() - _t_det
 
             # Temporal smoothing
             recent_raw.append(raw_faces)
@@ -588,25 +627,31 @@ class Perceiver:
                 }
 
             # ── Non-face subject tracking (YOLO-World + saliency) ──
-            # When no face is detected, use YOLO-World for subject detection.
-            # Throttled to every 4th sample (1.25fps) because YOLO-World on
-            # CPU is ~3x slower than yolov8n. Between samples, reuse the last
-            # known person detections (subjects don't teleport in 800ms).
+            # When no face is detected, reuse the subject boxes the face
+            # detector's OWN YOLO pass already computed for this exact frame
+            # (detect() caches the full unsplit class list). The old code ran
+            # a SECOND identical YOLO-World inference here on every 4th
+            # faceless sample — pure duplicate work — and its 1-second
+            # staleness window discarded everything at sparse (>1 s) sampling
+            # strides, leaving the person timeline nearly empty on exactly
+            # the content that needs it most.
             has_faces = bool(tracked)
 
             if not has_faces:
-                # Run YOLO-World every 4th sample, reuse last result between
-                run_yolo_this_frame = (i % 4 == 0) or not hasattr(self, '_last_person_bboxes')
-                if run_yolo_this_frame and self.face_detector._yolo_model is not None:
-                    person_bboxes = self.face_detector._get_person_bboxes(small_bgr)
-                    self._last_person_bboxes = person_bboxes
-                    self._last_person_time = time_ms
-                else:
-                    # Reuse last detection if recent (< 1 second old)
-                    person_bboxes = getattr(self, '_last_person_bboxes', [])
-                    last_t = getattr(self, '_last_person_time', 0)
-                    if time_ms - last_t > 1000:
-                        person_bboxes = []  # too old, don't reuse
+                person_bboxes = list(getattr(
+                    self.face_detector, '_cached_subject_bboxes_all', []) or [])
+                if (not person_bboxes
+                        and getattr(self.face_detector, 'tier', '') != 'yunet'
+                        and self.face_detector._yolo_model is not None):
+                    # DNN/Haar detector tiers never feed the cache (their
+                    # detect() has no YOLO gate) — keep the throttled direct
+                    # call for them. In the yunet tier an empty cache means
+                    # YOLO genuinely found no subjects on its last pass.
+                    if (i % 4 == 0) or not hasattr(self, '_last_person_bboxes'):
+                        person_bboxes = self.face_detector._get_person_bboxes(small_bgr)
+                        self._last_person_bboxes = person_bboxes
+                    else:
+                        person_bboxes = getattr(self, '_last_person_bboxes', [])
                 if person_bboxes:
                     persons = []
                     for px1, py1, px2, py2 in person_bboxes:
@@ -768,6 +813,15 @@ class Perceiver:
                 log.log_stage('PERCEIVE',
                     f'  Face detection {pct}%: {faces_so_far} samples with faces '
                     f'({i+1}/{total_samples} processed)')
+
+        _tbuck['loop'] = _time_mod.perf_counter() - _loop_t0
+        _n = max(1, len(r.face_timeline))
+        _other = max(0.0, _tbuck['loop'] - _tbuck['acquire'] - _tbuck['detect'])
+        log.log_stage('PERCEIVE',
+            f"  Sample-loop timing: {_tbuck['loop']:.0f}s total "
+            f"({_tbuck['loop'] / _n:.2f}s/sample) — acquire "
+            f"{_tbuck['acquire']:.0f}s, detect {_tbuck['detect']:.0f}s, "
+            f"other {_other:.0f}s")
 
         cap.release()
         if on_progress:

@@ -911,6 +911,19 @@ class Settings(BaseSettings):
     # pass-through is used (the legacy behavior).
     TRANSCRIPT_POLISHING_ENABLED: bool = True
     TRANSCRIPT_POLISHING_BATCH_SIZE: int = 15   # segments per LLM call
+    # Polish batches in flight at once. Ollama serves parallel requests
+    # (the Companion advertises num_parallel 3-4 on a 12 GB card), so
+    # pipelining batches multiplies polish throughput with IDENTICAL output —
+    # order is preserved by index. 1 restores the old strictly-serial loop.
+    SUBTITLE_POLISH_CONCURRENCY: int = 3
+    # Wall-clock ceiling for one whole polish pass (seconds; 0 = unlimited).
+    # Polish is an ENHANCEMENT — the observed 43-minute qwen2.5:14b pass on
+    # 851 cues held the entire pipeline hostage. When the budget runs out,
+    # remaining cues keep their draft text (exactly what a failed batch
+    # already does). Combined with the first-batch latency probe, a too-slow
+    # upgraded model instead DOWNSHIFTS to the base model so coverage stays
+    # near-100% within the budget.
+    SUBTITLE_POLISH_MAX_S: float = 600.0
     # Subtitle polishing is part of the SUBTITLE pipeline, not the editorial
     # pipeline. When True (default), the transcript/subtitle polish + MT
     # post-edit run on the dedicated translation model
@@ -1024,6 +1037,13 @@ class Settings(BaseSettings):
     # is present, so a punctuation-less block can't survive as one wall-of-text
     # cue.
     SENTENCE_SPLIT_MAX_CUE_MS: int = 8000
+    # Speaker-turn silence (ms): terminator-carrying cues are ADDITIONALLY
+    # split at word-timed gaps this long (two speakers' lines welded into one
+    # Whisper cue get their own cues), and same-speaker merges never bridge a
+    # gap this long. The machine punctuation restorer also withholds its CJK
+    # terminator when the next cue continues within this gap, so
+    # mid-utterance fragments reach the NMT as one whole sentence.
+    SENTENCE_SPLIT_TURN_PAUSE_MS: int = 700
 
     # ── Subtitle Readability + Safe Zones ──
     # Enforces Netflix-style CPS / line-length / duration limits and
@@ -1426,7 +1446,17 @@ class Settings(BaseSettings):
     # Higher = more merging = fewer speakers. 0.55 over-split music/noisy audio
     # (an AMV clustered into the 8-speaker cap); 0.70 is a steadier default for
     # ECAPA AHC. Raise toward 0.8 to merge more, lower to separate more.
+    # NOTE: speaker-count discovery now uses mean-centered embeddings +
+    # silhouette-selected k (see LOCAL_DIARIZER_SILHOUETTE_FLOOR); this
+    # threshold still applies when a caller pins num_speakers or as a legacy
+    # reference.
     LOCAL_DIARIZER_THRESHOLD: float = 0.70
+    # Minimum mean cosine silhouette required to accept a multi-speaker
+    # split. Below it, the honest answer is ONE speaker — this is what keeps
+    # a single narrator over BGM from being split into phantom speakers,
+    # while the measured 3-voice collapse regime scores well above it at the
+    # true k (0.25+ after per-recording mean-centering vs ~0.03 for one voice).
+    LOCAL_DIARIZER_SILHOUETTE_FLOOR: float = 0.15
 
     # Camera solver (per-shot AutoFlip-style crop planning)
     CLIPAI_CAMERA_SOLVER: str = "on"  # "on" | "off" — env CLIPAI_CAMERA_SOLVER

@@ -1256,7 +1256,7 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
             self._primary_model, self._editorial_model, mode,
         )
 
-    def _get_effective_ctx(self, model_name: str) -> int:
+    def _get_effective_ctx(self, model_name: str, prompt_chars: int = 0) -> int:
         """Return context length safe for available VRAM.
 
         On GTX 1650 (4GB), VRAM is the bottleneck:
@@ -1266,6 +1266,15 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
         When running in CPU-only mode (num_gpu=0), context can be larger
         since KV cache goes to system RAM. But we still cap it to avoid
         excessive prompt sizes that slow generation.
+
+        ``prompt_chars`` (when given) makes the answer PROMPT-AWARE: Ollama
+        silently truncates the prompt HEAD when it exceeds num_ctx — eating
+        the system contract first. The measured failure: subtitle-polish
+        batches on a 12 GB Companion answered with the wrong shape because
+        the flat 2048 GPU cap (sized for the local 4 GB card) truncated
+        their ~2.5k-token prompts. A too-large ctx merely risks an OOM the
+        partial-offload ladder already recovers from; a truncated prompt is
+        GUARANTEED garbage — correctness wins.
         """
         if self._force_cpu:
             # CPU mode — system RAM is plentiful, can use larger context
@@ -1283,19 +1292,37 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
 
         # GPU mode — VRAM is the bottleneck
         detected = self._model_ctx.get(model_name, 0)
-        if detected > 0:
-            return min(detected, 2048)  # Hard cap at 2048 for GPU mode on 4GB GPUs
-
         model_lower = model_name.lower()
-        if "moondream" in model_lower:
-            return 2048  # Moondream only supports 2048 context (n_ctx_train=2048)
+        if detected > 0:
+            base = min(detected, 2048)  # Hard cap at 2048 for GPU mode on 4GB GPUs
+        elif "moondream" in model_lower:
+            base = 2048  # Moondream only supports 2048 context (n_ctx_train=2048)
         elif "llava" in model_lower or "vision" in model_lower:
-            return 2048  # Vision models: keep context small to save VRAM for image embeddings
+            base = 2048  # Vision models: keep context small to save VRAM for image embeddings
         elif any(s in model_lower for s in ["3b", "1b", "0.5b"]):
-            return 2048  # On 4GB GPU: 4096 ctx produces 300MB compute graph → OOM
+            base = 2048  # On 4GB GPU: 4096 ctx produces 300MB compute graph → OOM
         elif any(s in model_lower for s in ["7b", "8b"]):
-            return 2048  # Reduced from 4096 to save VRAM
-        return 2048
+            base = 2048  # Reduced from 4096 to save VRAM
+        else:
+            base = 2048
+
+        if prompt_chars > 0:
+            # ~3 chars/token is a safe floor for mixed EN/CJK; +1024 output room.
+            required = prompt_chars // 3 + 1024
+            if required > base:
+                vram_mb = int(self._available_vram_mb or 0)
+                ceiling = 8192 if vram_mb >= 10_000 else 4096
+                if detected > 0:
+                    ceiling = min(ceiling, detected)  # never exceed training ctx
+                raised = min(((required + 1023) // 1024) * 1024, ceiling)
+                if raised > base:
+                    logger.info(
+                        "num_ctx raised %d → %d for a %d-char prompt on %s "
+                        "(host VRAM %d MB) — head-truncation guaranteed to "
+                        "fail; OOM ladder covers the risk",
+                        base, raised, prompt_chars, model_name, vram_mb)
+                    base = raised
+        return base
 
     async def _detect_capabilities(self):
         """Probe Ollama for model capabilities to adapt prompt sizing."""
@@ -1518,13 +1545,21 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
         text_model = await self._resolve_model_for_active_host(
             self._editorial_model, "text")
 
+        # Prompt-aware ctx sizing needs the host VRAM figure — cached after
+        # the first call, and Companion-aware (advertised card size).
+        try:
+            await self._detect_vram()
+        except Exception:
+            pass
+        _prompt_chars = sum(len(m.get("content") or "") for m in messages)
         payload = {
             "model": text_model,
             "messages": messages,
             "stream": True,
             "options": {
                 "num_predict": max_tokens,
-                "num_ctx": self._get_effective_ctx(self._editorial_model),
+                "num_ctx": self._get_effective_ctx(
+                    self._editorial_model, prompt_chars=_prompt_chars),
                 "num_gpu": gpu_ladder[0],  # first rung (99 = all layers on GPU)
                 "num_batch": _num_batch,  # smaller for 4B+ to lower compute-graph VRAM
                 "num_thread": 4,          # CPU threads for any remaining CPU work

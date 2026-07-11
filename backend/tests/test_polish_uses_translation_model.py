@@ -57,7 +57,7 @@ class _CapturingOrch:
 
     async def text_completion(self, prompt, timeout=90.0, model_override=None, **kw):
         self.overrides.append(model_override)
-        m = re.search(r"return EXACTLY (\d+)", prompt)
+        m = re.search(r"JSON array of (\d+) objects", prompt) or re.search(r"return EXACTLY (\d+)", prompt)
         n = int(m.group(1)) if m else 1
         return json.dumps([f"Polished line {i + 1}." for i in range(n)])
 

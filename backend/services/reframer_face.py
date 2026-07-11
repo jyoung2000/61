@@ -137,6 +137,10 @@ class FaceDetector:
         self._yolo_det_count = 0            # detect() calls since last YOLO run
         self._cached_person_bboxes = []     # carried forward on skipped frames
         self._cached_nonhuman_raw = []
+        # Full unsplit subject list (all classes) from the last real YOLO run —
+        # reused by the perceiver so a faceless sample never pays a SECOND
+        # inference on the exact frame detect() just analyzed.
+        self._cached_subject_bboxes_all = []
 
         if model_dir is None:
             try:
@@ -622,10 +626,20 @@ class FaceDetector:
                 all_faces = []
                 # 1. Full-frame YuNet (cheapest, best for prominent faces)
                 all_faces.extend(self._detect_yunet(frame_bgr, conf))
-                # 2. YOLO-assisted YuNet (only inside person bboxes)
+                # 2. YOLO-assisted YuNet — but only inside person bboxes the
+                # full-frame pass did NOT already cover with a dominant face.
+                # The crop pass upscales sub-320px person crops (~3x pure
+                # upscale work per bbox) just to re-find the same face and
+                # have _dedupe_faces discard it; skipping covered bboxes
+                # keeps recall for UNCOVERED persons identical while the
+                # covering face gets the same +0.05 corroboration bump the
+                # dedupe would have granted.
                 if person_bboxes:
-                    all_faces.extend(
-                        self._detect_yolo_assisted_yunet(frame_bgr, conf, person_bboxes))
+                    _uncovered = self._uncovered_person_bboxes(
+                        person_bboxes, all_faces)
+                    if _uncovered:
+                        all_faces.extend(self._detect_yolo_assisted_yunet(
+                            frame_bgr, conf, _uncovered))
                 # 3. Tiled YuNet (recovers faces in wide group shots).
                 # Adaptive trigger: the 2x2 tiled pass is the most
                 # expensive detector, and it only adds recall for SMALL
@@ -675,9 +689,29 @@ class FaceDetector:
                         all_faces, frame_bgr, person_bboxes)
 
                 # 5. Haar fallback — but NOT if we explicitly rejected
-                #    faces due to nonhuman subjects (would re-find them)
+                #    faces due to nonhuman subjects (would re-find them).
+                # Person-gated: the full-frame cascade (~20-50 ms) used to run
+                # on EVERY faceless sample — a top per-sample cost on
+                # sparse-face content — while its low-confidence singleton
+                # hits get dropped by the perceiver's temporal filter at
+                # sparse sampling anyway. Run it when YOLO says a human IS
+                # present (a hit can be re-confirmed next sample), when no
+                # YOLO gate exists, or as an every-4th blind-spot sweep so a
+                # persistent YOLO miss is still caught.
                 if not all_faces and not nonhuman_bboxes:
-                    return self._detect_haar(frame_bgr)
+                    try:
+                        from backend.config import settings as _settings
+                        _gated = bool(getattr(
+                            _settings, 'REFRAMER_HAAR_FALLBACK_GATED', True))
+                    except Exception:
+                        _gated = True
+                    self._haar_fallback_count = getattr(
+                        self, '_haar_fallback_count', 0) + 1
+                    if (not _gated or person_bboxes
+                            or self._yolo_model is None
+                            or self._haar_fallback_count % 4 == 0):
+                        return self._detect_haar(frame_bgr)
+                    return []
                 return self._dedupe_faces(all_faces) if all_faces else []
             elif self.tier == 'dnn':
                 faces = self._detect_dnn(frame_bgr, conf)
@@ -774,6 +808,7 @@ class FaceDetector:
         # them and force a fresh YOLO pass on the next frame of the new scene.
         self._cached_person_bboxes = []
         self._cached_nonhuman_raw = []
+        self._cached_subject_bboxes_all = []
         self._yolo_det_count = 0
 
     def _update_nonhuman_cache(self, nonhuman_bboxes):
@@ -838,11 +873,13 @@ class FaceDetector:
             return [], []
         person_boxes = []
         nonhuman_boxes = []
+        all_subject_boxes = []
         for r in results:
             for box in r.boxes:
                 x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
                 if x2 - x1 < 30 or y2 - y1 < 30:
                     continue
+                all_subject_boxes.append((x1, y1, x2, y2))
                 if has_world_classes:
                     cls_id = int(box.cls[0])
                     cls_name = (self._yolo_classes[cls_id]
@@ -855,6 +892,11 @@ class FaceDetector:
                 else:
                     # Standard YOLO (class 0 = person)
                     person_boxes.append((x1, y1, x2, y2))
+        # Cache the FULL unsplit subject list (all classes — what
+        # _get_person_bboxes(person_only=False) would return) so the
+        # perceiver's no-face branch can reuse THIS inference instead of
+        # running a second, identical YOLO-World predict on the same frame.
+        self._cached_subject_bboxes_all = all_subject_boxes
         return person_boxes, nonhuman_boxes
 
     def _get_person_bboxes(self, frame_bgr,
@@ -904,6 +946,42 @@ class FaceDetector:
                         continue
                 boxes.append((x1, y1, x2, y2))
         return boxes
+
+    def _uncovered_person_bboxes(self, person_bboxes, faces):
+        """Person bboxes whose head zone is NOT already covered by a DOMINANT
+        full-frame face — only these need the (upscaling) crop re-detection.
+
+        Same containment geometry as ``_gate_by_person_bboxes`` (cx inside the
+        bbox, cy within the top-35%+10%-slack head zone). "Dominant" = the
+        covering face's height is at least half of the head-zone height, so a
+        second smaller head sharing one YOLO box still triggers the crop pass
+        (recall unchanged for the two-heads-in-one-box case). Covering faces
+        receive the +0.05 corroboration bump the crop-pass dedupe would have
+        granted them."""
+        uncovered = []
+        for (px1, py1, px2, py2) in person_bboxes:
+            ph = max(1, py2 - py1)
+            zone_top = py1 - int(ph * 0.10)
+            zone_bot = py1 + int(ph * 0.35)
+            zone_h = max(1, zone_bot - zone_top)
+            covering = None
+            for f in faces:
+                try:
+                    if (px1 <= f['cx'] <= px2 and zone_top <= f['cy'] <= zone_bot
+                            and f.get('h', 0) >= 0.5 * zone_h):
+                        covering = f
+                        break
+                except (KeyError, TypeError):
+                    continue
+            if covering is not None:
+                try:
+                    covering['confidence'] = min(
+                        0.99, float(covering.get('confidence', 0.5)) + 0.05)
+                except (TypeError, ValueError):
+                    pass
+            else:
+                uncovered.append((px1, py1, px2, py2))
+        return uncovered
 
     def _gate_by_person_bboxes(self, faces: List[dict],
                                 person_bboxes: List[Tuple[int, int, int, int]]) -> List[dict]:

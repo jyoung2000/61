@@ -960,6 +960,23 @@ async def _translate_batch_via_ollama(
     except Exception:
         _total_vram_gb = 0.0
 
+    # PROMPT-AWARE ctx floor: Ollama head-truncates any prompt over num_ctx —
+    # losing the instruction contract first, which is how a 15-item batch comes
+    # back with the wrong count. When the prompt itself needs more than the
+    # flat GPU cap, raise the GPU-rung ctx toward what the prompt requires
+    # (bounded by the host's card; the OOM ladder below still protects VRAM).
+    _required_ctx = len(prompt) // 3 + 1024  # ~3 chars/token floor for EN/CJK
+    if _required_ctx > gpu_ctx:
+        _ceiling = 8192 if _total_vram_gb >= 10.0 else 4096
+        _raised = min(int(num_ctx),
+                      min(((_required_ctx + 1023) // 1024) * 1024, _ceiling))
+        if _raised > gpu_ctx:
+            logger.info(
+                "translation num_ctx raised %d → %d for a %d-char prompt "
+                "(host VRAM %.1f GB) — head truncation would break the "
+                "JSON contract", gpu_ctx, _raised, len(prompt), _total_vram_gb)
+            gpu_ctx = _raised
+
     ladder = _translation_gpu_ladder(model, _total_vram_gb)
     last_status_err: Optional[Exception] = None
     _host_hops = 0
@@ -1711,7 +1728,13 @@ async def _translate_via_nmt(
                 s.text for s in segments[start + len(batch): start + len(batch) + context_window]
             ]
             texts = [s.text for s in batch]
-            if isinstance(engine, NMTTranslator):
+            if hasattr(engine, "translate_with_context"):
+                # NLLB *and* Opus-MT/FuguMT: surrounding source cues resolve
+                # dropped subjects/pronouns (Japanese omits them constantly —
+                # isolated-cue decoding was the largest coherence gap on the
+                # default ja→en path). Each engine guards recovery with
+                # numbered tags and falls back per-cue to the isolated
+                # translation, so output is never worse than context-free.
                 translations = engine.translate_with_context(
                     texts, ctx_before, ctx_after,
                     source_language, target_language, glossary=glossary,

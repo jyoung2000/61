@@ -24,6 +24,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 from typing import Any, Callable, Iterable, Optional
 
 from backend.config import settings
@@ -623,9 +624,17 @@ def _build_user_prompt(
         f"{_ctx_block('FOLLOWING CONTEXT', context_after)}"
         f"OPERATIONS TO APPLY:\n{rules_block}\n\n"
         f"{conf_note}"
-        f"SEGMENTS TO POLISH (return EXACTLY {len(batch_items)} strings, one per segment, in order):\n"
+        f"SEGMENTS TO POLISH (one output object per segment):\n"
         f"{json.dumps(batch_items, ensure_ascii=False, indent=2)}\n\n"
-        f"Output ONLY a JSON array of {len(batch_items)} polished strings. "
+        f"Output ONLY a JSON array of {len(batch_items)} objects, one per "
+        f"segment, each shaped {{\"index\": <that segment's index>, "
+        f"\"text\": \"<polished text>\"}}. Include every index from 0 to "
+        f"{len(batch_items) - 1} exactly once, in order. "
+        f"The editing rules NEVER justify changing the number of outputs: "
+        f"when adjacent inputs are duplicates or fragments of one thought, "
+        f"still return one object per index (complete the thought at its "
+        f"first index; give the other index its own remaining content) — "
+        f"never omit or merge indices. "
         f"No markdown, no preamble, no explanation."
     )
     return prompt
@@ -691,8 +700,10 @@ def _parse_polished_response(response: str, expected: int) -> Optional[list[Opti
         if text.endswith("```"):
             text = text[:-3]
         text = text.strip()
-    # Last-resort: extract the first [ ... ] block.
-    if not text.startswith("["):
+    # Last-resort: extract the first [ ... ] block. A bare JSON OBJECT
+    # ({"0": ..., "1": ...} or {"segments": [...]}) passes through to the
+    # dict-salvage path below instead of being rejected here.
+    if not text.startswith("[") and not text.startswith("{"):
         match = re.search(r"\[.*\]", text, re.DOTALL)
         if not match:
             return None
@@ -701,9 +712,30 @@ def _parse_polished_response(response: str, expected: int) -> Optional[list[Opti
         data = json.loads(text)
     except json.JSONDecodeError:
         return None
-    if not isinstance(data, list) or len(data) != expected:
-        # Length mismatch — positional alignment is unreliable, so keep the
-        # whole batch raw (unchanged behavior for this case).
+    # Index-keyed salvage: the prompt asks for {"index": i, "text": ...}
+    # objects precisely because small models LOSE COUNT on flat arrays (the
+    # observed 15-failures-per-run "bad response shape" waste — each one a
+    # full generation discarded). With explicit indices, a response that
+    # merged or dropped lines still salvages every index it did return;
+    # missing indices keep their original text. Exact mapping — no positional
+    # guessing — so this cannot mis-assign a polish to the wrong cue.
+    if isinstance(data, dict):
+        inner = data.get("segments")
+        if isinstance(inner, list):
+            data = inner
+        else:
+            return _slots_from_indexed(list(data.items()), expected)
+    if not isinstance(data, list):
+        return None
+    if data and all(isinstance(x, dict)
+                    and ("index" in x or "i" in x) for x in data):
+        slots = _slots_from_indexed(
+            [(x.get("index", x.get("i")), x) for x in data], expected)
+        if slots is not None:
+            return slots
+    if len(data) != expected:
+        # Un-indexed length mismatch — positional alignment is unreliable, so
+        # keep the whole batch raw (unchanged behavior for this case).
         return None
     out: list[Optional[str]] = []
     for x in data:
@@ -718,6 +750,28 @@ def _parse_polished_response(response: str, expected: int) -> Optional[list[Opti
             continue
         out.append(s)
     return out
+
+
+def _slots_from_indexed(pairs, expected: int) -> Optional[list[Optional[str]]]:
+    """Build ``expected`` slots from (index, value) pairs. Indices outside
+    range and un-coercible values are skipped (their cues keep the original
+    text). Returns ``None`` when NOTHING salvages, so the caller treats the
+    batch as failed exactly as before."""
+    slots: list[Optional[str]] = [None] * expected
+    filled = 0
+    for raw_idx, val in pairs:
+        try:
+            i = int(raw_idx)
+        except (TypeError, ValueError):
+            continue
+        if not (0 <= i < expected):
+            continue
+        s = val if isinstance(val, str) else _coerce_polished_item(val)
+        if s is None or _LEAKED_STRUCT_RE.search(s):
+            continue
+        slots[i] = s
+        filled += 1
+    return slots if filled else None
 
 
 # ── Cloud fallback for the polish LLM (Netflix-quality reliability) ────────
@@ -891,9 +945,14 @@ async def _polish_batch(
                 return None
     polished = _parse_polished_response(response, expected=len(batch))
     if polished is None:
+        # Diagnosable failure: the old message ("expected 15 items") gave no
+        # signal whether the model lost count, merged lines, returned broken
+        # JSON, or had its prompt truncated by the context window — include
+        # what actually came back.
+        _head = re.sub(r"\s+", " ", (response or ""))[:120]
         logger.warning(
-            "transcript polishing: bad response shape (expected %d items)",
-            len(batch),
+            "transcript polishing: bad response shape (expected %d items, "
+            "response_head=%r)", len(batch), _head,
         )
     elif any(p is None for p in polished):
         logger.info(
@@ -987,17 +1046,51 @@ def restore_punctuation_fallback(segments, language: str = "") -> list:
         return seg_list
     if not bool(getattr(settings, "PUNCTUATION_RESTORE_FALLBACK_ENABLED", True)):
         return seg_list
+    # Neighbour-aware CJK terminators. The old per-cue rule stamped '。' on
+    # EVERY unterminated CJK cue — including mid-utterance Whisper fragments
+    # whose continuation starts 0.1-0.3 s later. That fake sentence stop (a)
+    # made the NMT decode each fragment as a finished sentence (the
+    # fragmentary translations in the measured run) and (b) disarmed the
+    # pause-based resegmenter, whose split gate treats a terminator as
+    # authoritative. Append the terminator only when the cue plausibly ENDS
+    # an utterance: a turn-length gap to the next cue, a speaker change, or
+    # being the last cue. Only machine-APPENDED punctuation is affected —
+    # Whisper's and the LLM's own punctuation is never touched, and the
+    # Latin restorer (model-based, context-aware) keeps its behavior.
+    _turn_gap_s = 0.7
+    try:
+        _turn_gap_s = float(getattr(
+            settings, "SENTENCE_SPLIT_TURN_PAUSE_MS", 700)) / 1000.0
+    except Exception:
+        pass
+
+    def _utterance_ends_here(idx: int, view: dict) -> bool:
+        if idx >= len(seg_list) - 1:
+            return True
+        try:
+            nxt = _coerce_segment(seg_list[idx + 1])
+            if (nxt.get("speaker") or "") != (view.get("speaker") or ""):
+                return True
+            gap = float(nxt.get("start") or 0.0) - float(view.get("end") or 0.0)
+            return gap >= _turn_gap_s
+        except Exception:
+            return True   # unknown neighbour — keep the legacy behavior
+
     out: list = []
     n_restored = 0
-    for seg in seg_list:
+    for idx, seg in enumerate(seg_list):
         try:
-            text = (_coerce_segment(seg).get("text") or "")
+            view = _coerce_segment(seg)
+            text = (view.get("text") or "")
             if text.strip() and not _ends_with_terminator(text):
-                new_text = _restore_text_punctuation(text, language)
-                if new_text and new_text != text:
-                    out.append(_emit_segment(seg, new_text))
-                    n_restored += 1
-                    continue
+                _cjk_cue = ((language or "").lower() in _CJK_LANGS
+                            or _is_probably_cjk(text))
+                if not _cjk_cue or _utterance_ends_here(idx, view):
+                    new_text = _restore_text_punctuation(text, language)
+                    if new_text and new_text != text:
+                        out.append(_emit_segment(seg, new_text))
+                        n_restored += 1
+                        continue
         except Exception:
             pass
         out.append(seg)
@@ -1175,7 +1268,10 @@ async def correct_transcript(
     # Companion GPU, upsize the polish model to the best one installed there
     # (e.g. qwen2.5:14b) so the English track reads far more naturally. Only fires
     # for the translation post-edit on a local Ollama model; no-op on a local-only
-    # card or a cloud (``vendor/model``) override.
+    # card or a cloud (``vendor/model``) override. The pre-upgrade model is kept
+    # so the batch loop can DOWNSHIFT back to it when the upgraded model's
+    # measured throughput would blow the polish time budget.
+    _base_model_override = model_override
     if (mode == "translation" and model_override
             and "/" not in str(model_override)
             and bool(getattr(settings, "OLLAMA_TRANSLATION_POLISH_AUTO", True))):
@@ -1248,37 +1344,156 @@ async def correct_transcript(
     # Suppressed under local_only: strictly-local polish never touches the cloud.
     cloud_direct = bool(model_override and "/" in model_override
                         and not local_only and _cloud_polish_available())
-    for idx, batch_pairs in enumerate(batches):
-        batch = [pair[0] for pair in batch_pairs]
+
+    # ── Batch execution: bounded concurrency + wall-clock budget ──
+    # The observed failure this replaces: 851 translated cues → 57 batches run
+    # STRICTLY SEQUENTIALLY against qwen2.5:14b on the Companion = 43 minutes
+    # of pipeline time for a polish that is an enhancement, not a requirement.
+    # Now:
+    #   * batch 0 runs alone (existing cold-load logic, and it calibrates
+    #     per-batch latency);
+    #   * remaining batches run SUBTITLE_POLISH_CONCURRENCY at a time (the
+    #     Companion's Ollama serves parallel requests — resolve_speed gives a
+    #     4070 num_parallel 3-4), identical outputs, ~Nx the throughput;
+    #   * SUBTITLE_POLISH_MAX_S caps the whole pass — when the budget runs
+    #     out, remaining batches keep their draft text (exactly what a failed
+    #     batch already does) instead of holding the pipeline hostage;
+    #   * if batch-0 latency projects a blown budget AND the model was the
+    #     auto-upgraded Companion model, remaining batches downshift to the
+    #     original (smaller, several-times-faster) model — polish coverage
+    #     stays near-100% instead of being budget-truncated;
+    #   * 5 consecutive whole-batch failures aborts the rest (drafts kept) so
+    #     a broken model can't burn GPU-minutes producing garbage.
+    _conc = max(1, int(getattr(settings, "SUBTITLE_POLISH_CONCURRENCY", 3)))
+    _budget_s = float(getattr(settings, "SUBTITLE_POLISH_MAX_S", 600.0))
+    _t_start = time.monotonic()
+    _deadline = (_t_start + _budget_s) if _budget_s > 0 else None
+    _state = {"fail_streak": 0, "aborted": False, "skipped": 0, "done": 0,
+              "model": model_override}
+    batch_results: list[Optional[list[Optional[str]]]] = [None] * len(batches)
+
+    def _ctx_for(idx: int, batch_len: int):
         # Sliding 3-segment context windows (separate from the
         # TRANSLATION_CONTEXT_WINDOW which controls the translator).
         ctx_before_start = max(0, idx * batch_size - 3)
         ctx_before = [v[0] for v in views[ctx_before_start: idx * batch_size]]
         ctx_after_start = (idx + 1) * batch_size
         ctx_after = [v[0] for v in views[ctx_after_start: ctx_after_start + 3]]
-        # Source reference for MTPE, sliced to match this batch (aligned 1:1
-        # with ``segments``). None when no source was threaded in.
         batch_src = None
         if source_texts is not None:
             _bs = idx * batch_size
-            batch_src = source_texts[_bs: _bs + len(batch)]
+            batch_src = source_texts[_bs: _bs + batch_len]
+        return ctx_before, ctx_after, batch_src
 
-        # Cold-load timeout scaling: on a 4 GB card the FIRST batch often
-        # pays a multi-minute Ollama partial-offload model load. The old
-        # flat 90s timeout expired during that load, struck the circuit
-        # breaker three times and killed polish for the whole job. Give
-        # the first batch 3x (capped at 300s); later batches (model warm)
-        # keep the base timeout.
-        _batch_timeout = (min(300.0, timeout_per_batch * 3)
-                          if idx == 0 else timeout_per_batch)
-        polished_texts = await _polish_batch(
+    async def _run_one(idx: int, timeout_s: float) -> None:
+        if _state["aborted"]:
+            _state["skipped"] += 1
+            return
+        if _deadline is not None and time.monotonic() >= _deadline:
+            if not _state["aborted"]:
+                _state["aborted"] = True
+                logger.warning(
+                    "transcript polishing: %.0fs budget exhausted after %d/%d "
+                    "batches — remaining cues keep their draft text "
+                    "(SUBTITLE_POLISH_MAX_S)", _budget_s, _state["done"],
+                    len(batches))
+            _state["skipped"] += 1
+            return
+        batch = [pair[0] for pair in batches[idx]]
+        ctx_before, ctx_after, batch_src = _ctx_for(idx, len(batch))
+        result = await _polish_batch(
             orchestrator, batch, ctx_before, ctx_after,
-            language=language, timeout=_batch_timeout,
+            language=language, timeout=timeout_s,
             glossary_terms=glossary_terms, source_texts=batch_src, mode=mode,
-            model_override=model_override, cloud_direct=cloud_direct,
+            model_override=_state["model"], cloud_direct=cloud_direct,
             local_only=local_only,
         )
+        if (result is None and len(batch) >= 4 and not _state["aborted"]
+                and (_deadline is None or time.monotonic() < _deadline)):
+            # Halve-and-retry, once: half-size arrays are dramatically more
+            # count-reliable for small models AND halve the prompt (so a
+            # context-window truncation stops eating the JSON contract).
+            # translate_via_llm already uses this exact recovery. A half that
+            # still fails keeps its drafts; both halves failing counts as ONE
+            # failure for the breaker.
+            mid = len(batch) // 2
+            halves: list[list[Optional[str]]] = []
+            for lo, hi in ((0, mid), (mid, len(batch))):
+                if _deadline is not None and time.monotonic() >= _deadline:
+                    halves.append([None] * (hi - lo))
+                    continue
+                sub_src = batch_src[lo:hi] if batch_src is not None else None
+                # Retries run after the main call already paid any cold-load,
+                # so they use the BASE timeout even when the main call ran
+                # with the scaled first-batch timeout.
+                half = await _polish_batch(
+                    orchestrator, batch[lo:hi], ctx_before, ctx_after,
+                    language=language, timeout=timeout_per_batch,
+                    glossary_terms=glossary_terms, source_texts=sub_src,
+                    mode=mode, model_override=_state["model"],
+                    cloud_direct=cloud_direct, local_only=local_only,
+                )
+                halves.append(half if half is not None
+                              else [None] * (hi - lo))
+            merged = halves[0] + halves[1]
+            if any(x is not None for x in merged):
+                logger.info(
+                    "transcript polishing: halve-and-retry recovered %d/%d "
+                    "lines of a failed batch",
+                    sum(1 for x in merged if x is not None), len(merged))
+                result = merged
+        batch_results[idx] = result
+        _state["done"] += 1
+        if result is None:
+            _state["fail_streak"] += 1
+            if _state["fail_streak"] >= 5 and not _state["aborted"]:
+                _state["aborted"] = True
+                logger.warning(
+                    "transcript polishing: 5 consecutive batch failures — "
+                    "aborting the remaining batches (drafts kept)")
+        else:
+            _state["fail_streak"] = 0
+        if progress_callback:
+            try:
+                res = progress_callback(
+                    int((_state["done"] / max(1, len(batches))) * 100))
+                if asyncio.iscoroutine(res):
+                    await res
+            except Exception:
+                pass
 
+    # Batch 0 alone: cold-load timeout scaling (on a 4 GB card the FIRST batch
+    # often pays a multi-minute Ollama partial-offload model load; a flat 90s
+    # timeout used to strike the circuit breaker and kill polish for the whole
+    # job) + latency calibration for the downshift decision.
+    _t0 = time.monotonic()
+    await _run_one(0, min(300.0, timeout_per_batch * 3))
+    _first_latency = time.monotonic() - _t0
+    if (len(batches) > 1 and _deadline is not None
+            and _state["model"] and _state["model"] != _base_model_override):
+        _remaining_s = _deadline - time.monotonic()
+        _projected_s = _first_latency * (len(batches) - 1) / _conc
+        if _projected_s > _remaining_s:
+            logger.info(
+                "transcript polishing: %s runs %.0fs/batch — projected %.0fs "
+                "exceeds the %.0fs budget; downshifting remaining batches to "
+                "%s so every cue still gets polished",
+                _state["model"], _first_latency, _projected_s, _remaining_s,
+                _base_model_override)
+            _state["model"] = _base_model_override
+
+    if len(batches) > 1:
+        _sem = asyncio.Semaphore(_conc)
+
+        async def _guarded(idx: int) -> None:
+            async with _sem:
+                await _run_one(idx, timeout_per_batch)
+
+        await asyncio.gather(*(_guarded(i) for i in range(1, len(batches))),
+                             return_exceptions=True)
+
+    for idx, batch_pairs in enumerate(batches):
+        polished_texts = batch_results[idx]
         for i, (view, orig_obj) in enumerate(batch_pairs):
             orig_full = view.get("text", "")
             if polished_texts is None:
@@ -1329,14 +1544,6 @@ async def correct_transcript(
                 else:
                     new_text = cand if cand else orig_full
             polished_out.append(_emit_segment(orig_obj, new_text))
-
-        if progress_callback:
-            try:
-                res = progress_callback(int(((idx + 1) / total) * 100))
-                if asyncio.iscoroutine(res):
-                    await res
-            except Exception:
-                pass
 
     changed = sum(
         1 for old, new in zip(seg_list, polished_out)

@@ -94,6 +94,66 @@ def _absorb_singleton_clusters(X, labels: List[int],
     return labels
 
 
+def _mean_silhouette(D, labels) -> float:
+    """Mean silhouette over a precomputed distance matrix. Points in
+    singleton clusters contribute 0 (the standard convention). Pure numpy."""
+    import numpy as np
+
+    labels = np.asarray(labels)
+    uniq = np.unique(labels)
+    if len(uniq) < 2:
+        return 0.0
+    n = len(labels)
+    scores = np.zeros(n, dtype=np.float64)
+    for i in range(n):
+        own = labels == labels[i]
+        n_own = int(own.sum())
+        if n_own <= 1:
+            continue                      # singleton — convention: s=0
+        a = D[i][own].sum() / (n_own - 1)  # excl. self (D[i][i]=0)
+        b = None
+        for u in uniq:
+            if u == labels[i]:
+                continue
+            mask = labels == u
+            mb = float(D[i][mask].mean())
+            b = mb if b is None else min(b, mb)
+        denom = max(a, b) if b is not None else 0.0
+        scores[i] = ((b - a) / denom) if denom > 0 else 0.0
+    return float(scores.mean())
+
+
+def _smooth_label_flips(X, labels: List[int], margin: float = 0.05) -> List[int]:
+    """Relabel single-cue label flips sandwiched between two runs of the SAME
+    label L — but only when the cue's own-cluster affinity doesn't clearly
+    beat its affinity to L (a real one-cue interjection by a different voice
+    scores well above the margin for its own centroid and is kept). Rows must
+    be in time order. One pass, no cascading; never invents a label."""
+    import numpy as np
+
+    out = list(labels)
+    if len(out) < 3:
+        return out
+    uniq = sorted(set(out))
+    if len(uniq) < 2:
+        return out
+    centroids = {}
+    lab_arr = np.asarray(out)
+    for u in uniq:
+        c = X[lab_arr == u].mean(axis=0)
+        nrm = np.linalg.norm(c)
+        centroids[u] = c / nrm if nrm > 0 else c
+    for i in range(1, len(out) - 1):
+        left, mid, right = out[i - 1], out[i], out[i + 1]
+        if mid == left or left != right:
+            continue
+        own_sim = float(np.dot(X[i], centroids[mid]))
+        alt_sim = float(np.dot(X[i], centroids[left]))
+        if own_sim - alt_sim < margin:
+            out[i] = left
+    return out
+
+
 def _cluster_embeddings(
     embeddings,
     num_speakers: Optional[int] = None,
@@ -104,9 +164,26 @@ def _cluster_embeddings(
     """Cluster L2-normalised embeddings by cosine distance.
 
     With ``num_speakers`` set, cut the dendrogram into exactly that many
-    clusters; otherwise discover the count via a distance ``threshold`` (capped
-    at ``max_speakers``). Returns a 0-based label per input row, in
-    first-appearance order. Pure (numpy + scipy) so it can be tested directly.
+    clusters; otherwise discover the count. Returns a 0-based label per input
+    row (rows in time order), in first-appearance order. Pure (numpy + scipy)
+    so it can be tested directly.
+
+    Two lessons from the 128-min run where 95% of 983 cues collapsed into
+    'Speaker 1' despite three real speakers:
+
+      * ECAPA embeddings of short cues over shared BGM all carry a common
+        recording-channel component that dominates cosine distances — the
+        per-recording MEAN is subtracted (then re-normalised) before
+        clustering, the standard within-recording adaptation.
+      * A fixed 0.70 distance cut is blind to how separable the recording
+        actually is. The dendrogram is now cut at every k in 2..max and the
+        mean cosine SILHOUETTE picks the best k; genuine single-speaker
+        content stays at 1 speaker via the silhouette floor (a collapse
+        regime scores far above the floor, BGM-only similarity far below).
+
+    A final margin-guarded pass relabels single-cue flips sandwiched inside
+    a same-speaker run (label flapping on short cues), never inventing a
+    speaker.
     """
     import numpy as np
 
@@ -120,22 +197,46 @@ def _cluster_embeddings(
     norms = np.linalg.norm(X, axis=1, keepdims=True)
     norms[norms == 0] = 1.0
     X = X / norms
+    # Within-recording adaptation: remove the shared channel/BGM direction.
+    X = X - X.mean(axis=0, keepdims=True)
+    norms = np.linalg.norm(X, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    X = X / norms
 
     from scipy.cluster.hierarchy import fcluster, linkage
-    from scipy.spatial.distance import pdist
+    from scipy.spatial.distance import pdist, squareform
 
     dists = pdist(X, metric="cosine")
     Z = linkage(dists, method="average")
     if num_speakers and int(num_speakers) >= 1:
         k = min(int(num_speakers), n)
-        labels = fcluster(Z, t=k, criterion="maxclust")
+        labels = [int(x) for x in fcluster(Z, t=k, criterion="maxclust")]
     else:
-        labels = fcluster(Z, t=float(threshold), criterion="distance")
-        if int(labels.max()) > max_speakers:
-            labels = fcluster(Z, t=max_speakers, criterion="maxclust")
+        try:
+            from backend.config import settings as _settings
+            _floor = float(getattr(
+                _settings, "LOCAL_DIARIZER_SILHOUETTE_FLOOR", 0.15))
+        except Exception:
+            _floor = 0.15
+        D = squareform(dists)
+        best_k, best_score, best_labels = 1, -1.0, None
+        for k in range(2, min(max_speakers, n - 1) + 1):
+            lab_k = fcluster(Z, t=k, criterion="maxclust")
+            if int(lab_k.max()) < 2:
+                continue
+            score = _mean_silhouette(D, lab_k)
+            if score > best_score:
+                best_k, best_score, best_labels = k, score, lab_k
+        if best_labels is None or best_score < _floor:
+            # No separation evidence — honest single speaker beats an
+            # arbitrary threshold split.
+            labels = [0] * n
+        else:
+            labels = [int(x) for x in best_labels]
         # Fold lone-cue clusters (noise / music outliers) into the nearest real
         # speaker so they don't surface as phantom speakers.
-        labels = _absorb_singleton_clusters(X, [int(x) for x in labels], min_cues)
+        labels = _absorb_singleton_clusters(X, labels, min_cues)
+        labels = _smooth_label_flips(X, labels)
     return _relabel_first_appearance([int(x) for x in labels])
 
 
@@ -381,6 +482,12 @@ class LocalEmbeddingDiarizer:
                 embeddings, num_speakers=num_speakers, threshold=self.threshold)
             n_spk = len(set(labels))
             timeline = _build_timeline(kept_spans, labels)
+            # Exact per-cue labels (lossless — the timeline above is a 200 ms
+            # bin approximation of these). Consumers that know the cue spans
+            # can match against this instead of re-deriving by bin overlap.
+            self.last_cue_labels = [
+                (float(a), float(b), f"SPEAKER_{int(lab):02d}")
+                for (a, b), lab in zip(kept_spans, labels)]
             logger.info(
                 "Local diarizer: %d speaker(s) over %d speech cues (ECAPA, no HF token)",
                 n_spk, len(kept_spans),
