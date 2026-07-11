@@ -216,6 +216,7 @@ async fn get_status(
             "vram_buffer_gb": config.vram_buffer_gb,
             "ollama_keep_alive": config.ollama_keep_alive,
             "sidecar_idle_min": config.sidecar_idle_min,
+            "gpu_idle_free_min": config.gpu_idle_free_min,
             "paused": config.paused,
             "paired_clipai_url": config.paired_clipai_url,
             "name": config.name,
@@ -271,6 +272,7 @@ struct ConfigPatch {
     vram_budget_gb: Option<f32>,
     ollama_keep_alive: Option<String>,
     sidecar_idle_min: Option<u32>,
+    gpu_idle_free_min: Option<u32>,
     paused: Option<bool>,
     name: Option<String>,
     setup_complete: Option<bool>,
@@ -306,6 +308,10 @@ async fn set_config(
         }
         if let Some(v) = patch.sidecar_idle_min {
             cfg.sidecar_idle_min = v.clamp(1, 24 * 60);
+        }
+        if let Some(v) = patch.gpu_idle_free_min {
+            // 0 = auto-free off (whisper-only backstop still applies).
+            cfg.gpu_idle_free_min = v.clamp(0, 24 * 60);
         }
         if let Some(v) = patch.paused {
             cfg.paused = v;
@@ -526,6 +532,7 @@ pub(crate) async fn build_diagnostics_report(state: &AppState, whisper_build: &s
     let _ = writeln!(r, "Effective VRAM given: {:.1} GB", budget);
     let _ = writeln!(r, "Ollama keep-alive:    {}", cfg.ollama_keep_alive);
     let _ = writeln!(r, "Sidecar idle (min):   {}", cfg.sidecar_idle_min);
+    let _ = writeln!(r, "GPU auto-free (min):  {}", cfg.gpu_idle_free_min);
     let _ = writeln!(r, "Paired ClipAI URL:    {}",
         if cfg.paired_clipai_url.is_empty() { "(none — added manually in ClipAI, or not paired)".into() }
         else { cfg.paired_clipai_url.clone() });
@@ -697,32 +704,38 @@ async fn test_clipai(state: tauri::State<'_, SharedState>) -> Result<serde_json:
     }))
 }
 
-/// Unload all resident Ollama models to free GPU VRAM right now (e.g. before
-/// gaming). Returns how many were unloaded.
+/// Free the WHOLE GPU right now (e.g. before gaming): unload every resident
+/// Ollama model AND stop the whisper sidecar (skipped only when a decode is
+/// mid-flight). Previously this button evicted Ollama models but left the
+/// whisper server holding its VRAM until the idle reaper.
 #[tauri::command]
-async fn free_vram() -> Result<serde_json::Value, String> {
-    let (n, names) = ollama::unload_all().await;
-    log::info!("free_vram: unloaded {n} model(s): {}", names.join(", "));
-    Ok(serde_json::json!({ "unloaded": n, "models": names }))
+async fn free_vram(state: tauri::State<'_, SharedState>) -> Result<serde_json::Value, String> {
+    let st: SharedState = state.inner().clone();
+    let (whisper_stopped, n) = sidecar::free_gpu(&st, "Free GPU memory button").await;
+    Ok(serde_json::json!({ "unloaded": n, "whisper_stopped": whisper_stopped }))
 }
 
-/// Force-clear a stuck active-job display AND unload resident models. Used by
-/// the GUI "Force end" button when ClipAI reports a job the Companion never
-/// heard finish (e.g. the container was stopped mid-job). Local-only — it does
-/// not command ClipAI (no reverse channel); it just stops the Companion showing
-/// a phantom job and frees the VRAM it was holding.
+/// Force-clear a stuck active-job display AND free the GPU (Ollama models
+/// unloaded + whisper sidecar stopped). Used by the GUI "Force end" button
+/// when ClipAI reports a job the Companion never heard finish (e.g. the
+/// container was stopped mid-job). Local-only — it does not command ClipAI
+/// (no reverse channel); it just stops the Companion showing a phantom job
+/// and frees the VRAM it was holding.
 #[tauri::command]
 async fn end_active_job(state: tauri::State<'_, SharedState>) -> Result<serde_json::Value, String> {
     // Sticky force-end: clear + SUPPRESS the job id so a still-heartbeating
     // ClipAI can't resurrect the card, and finish its in-flight activity.
     let ended = state.force_end_job();
     state.job_progress.store(0, std::sync::atomic::Ordering::Relaxed);
-    let (n, names) = ollama::unload_all().await;
+    let st: SharedState = state.inner().clone();
+    let (whisper_stopped, n) = sidecar::free_gpu(&st, "Force end button").await;
     log::info!(
-        "end_active_job: force-ended {} + unloaded {n} model(s)",
+        "end_active_job: force-ended {} + unloaded {n} model(s), whisper_stopped={whisper_stopped}",
         ended.as_deref().unwrap_or("(none)")
     );
-    Ok(serde_json::json!({ "unloaded": n, "models": names, "ended_job": ended }))
+    Ok(serde_json::json!({
+        "unloaded": n, "whisper_stopped": whisper_stopped, "ended_job": ended,
+    }))
 }
 
 #[tauri::command]

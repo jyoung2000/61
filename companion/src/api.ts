@@ -42,6 +42,9 @@ export interface CompanionStatus {
     vram_buffer_gb: number;
     ollama_keep_alive: string;
     sidecar_idle_min: number;
+    /** Minutes of real-work idleness before the WHOLE GPU is auto-freed
+     *  (whisper sidecar stopped + Ollama models evicted). 0 = off. */
+    gpu_idle_free_min: number;
     paused: boolean;
     paired_clipai_url: string;
     name: string;
@@ -119,7 +122,9 @@ export interface ClipaiTest {
 /** Test whether a ClipAI container is properly connected to this companion. */
 export const testClipai = () => invoke<ClipaiTest>('test_clipai');
 /** Unload all resident Ollama models to free GPU VRAM now. */
-export const freeVram = () => invoke<{ unloaded: number; models: string[] }>('free_vram');
-export const endActiveJob = () => invoke<{ unloaded: number; models: string[] }>('end_active_job');
+export const freeVram = () =>
+  invoke<{ unloaded: number; whisper_stopped: boolean }>('free_vram');
+export const endActiveJob = () =>
+  invoke<{ unloaded: number; whisper_stopped: boolean; ended_job: string | null }>('end_active_job');
 export const pairClipai = (clipaiUrl: string, apiKey: string) =>
   invoke('pair_clipai', { clipaiUrl, apiKey });

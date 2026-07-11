@@ -452,6 +452,32 @@ async fn sidecar_release(State(ctx): State<ProxyCtx>, req: Request<Body>) -> Res
     (StatusCode::OK, "released").into_response()
 }
 
+/// /v1/gpu/release → free the WHOLE GPU on request: whisper sidecar stopped
+/// (skipped, never killed, when a decode holds the slot) AND every resident
+/// Ollama model evicted. The full-scope sibling of /v1/sidecar/release, for
+/// ClipAI's end-of-work hooks and tests. Best-effort by design — the response
+/// reports what was actually freed.
+async fn gpu_release(State(ctx): State<ProxyCtx>, req: Request<Body>) -> Response {
+    if !authorized(&ctx, req.headers()) {
+        return unauthorized();
+    }
+    let (inflight, _) = ctx.state.real_work_snapshot();
+    if inflight {
+        return (
+            StatusCode::CONFLICT,
+            "work is in flight — not releasing",
+        )
+            .into_response();
+    }
+    let (whisper_stopped, unloaded) =
+        crate::sidecar::free_gpu(&ctx.state, "clipai /v1/gpu/release").await;
+    Json(serde_json::json!({
+        "whisper_stopped": whisper_stopped,
+        "ollama_unloaded": unloaded,
+    }))
+    .into_response()
+}
+
 /// /v1/progress → a lightweight job-progress heartbeat from ClipAI (same
 /// X-ClipAI-* headers the AI routes carry). During local-only pipeline stages
 /// (video decode/frame extraction on the SERVER GPU) no AI request reaches us,
@@ -467,6 +493,22 @@ async fn progress_report(State(ctx): State<ProxyCtx>, headers: HeaderMap) -> Res
     if matches!(ended.trim(), "1" | "true" | "yes") {
         ctx.state.clear_reported_job(&header_str(&headers, "x-clipai-job-id"));
         ctx.state.job_progress.store(0, Ordering::Relaxed);
+        // The job is OVER — free the GPU promptly instead of letting models
+        // sit out the keep-alive / sidecar windows. A short grace absorbs
+        // back-to-back queued jobs: if ANY new real request (or a fresh
+        // heartbeat from another job) lands during it, skip — the idle
+        // reaper remains the backstop.
+        let st = ctx.state.clone();
+        tauri::async_runtime::spawn(async move {
+            let job_mark = st.last_job_ms.load(Ordering::Relaxed);
+            tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+            let (inflight, _) = st.real_work_snapshot();
+            let moved = st.last_job_ms.load(Ordering::Relaxed) != job_mark;
+            let other_job = st.reported_job_fresh().is_some();
+            if !inflight && !moved && !other_job {
+                crate::sidecar::free_gpu(&st, "job ended").await;
+            }
+        });
         return (StatusCode::OK, "ok").into_response();
     }
     let progress = headers
@@ -819,6 +861,7 @@ fn build_router(ctx: ProxyCtx) -> Router {
         .route("/v1/files/read", get(files_read))
         .route("/v1/progress", post(progress_report))
         .route("/v1/sidecar/release", post(sidecar_release))
+        .route("/v1/gpu/release", post(gpu_release))
         .route("/v1/audio/transcriptions", post(whisper_proxy))
         .route("/ollama", any(ollama_proxy))
         .route("/ollama/", any(ollama_proxy))

@@ -31,6 +31,13 @@ pub struct Config {
     pub ollama_keep_alive: String,
     /// Minutes of inactivity before the whisper sidecar exits.
     pub sidecar_idle_min: u32,
+    /// Minutes after the last REAL request (transcription / inference — health
+    /// probes and /api/tags polls don't count) before the Companion frees the
+    /// WHOLE GPU: whisper sidecar stopped AND every resident Ollama model
+    /// evicted. This is what returns the card to games/other apps quickly
+    /// after a job or a quick test instead of holding models for the full
+    /// keep-alive / sidecar windows. 0 disables the auto-free.
+    pub gpu_idle_free_min: u32,
     /// "Pause sharing" tray toggle — proxy answers 503 to everything.
     pub paused: bool,
     /// The ClipAI server this Companion is paired with (display only).
@@ -136,6 +143,7 @@ impl Default for Config {
             vram_budget_gb: 0.0, // 0 = auto (total minus ~1 GB headroom)
             ollama_keep_alive: "10m".into(),
             sidecar_idle_min: 15,
+            gpu_idle_free_min: 3,
             paused: false,
             paired_clipai_url: String::new(),
             name: default_name(),
@@ -291,7 +299,13 @@ pub struct AppState {
     /// Serializes GPU-heavy whisper work: one transcription at a time.
     pub whisper_slot: tokio::sync::Semaphore,
     /// Last time any proxied request finished (ms epoch) — idle shutdown.
+    /// NOTE: refreshed by EVERY request, probes included — do NOT use this
+    /// for GPU-idle decisions (the GUI + ClipAI poll /v1/health and /api/tags
+    /// constantly, so it never goes stale). Use ``real_work_snapshot()``.
     pub last_request_ms: AtomicU64,
+    /// ``last_job_ms`` value the GPU auto-free last acted on, so one idle
+    /// period frees the GPU exactly once (no /api/ps churn every reaper tick).
+    pub last_gpu_free_marker: AtomicU64,
     /// True while a transcription request is in flight.
     pub whisper_busy: AtomicBool,
     /// Whether the whisper sidecar binary shipped with this build (set once
@@ -365,6 +379,7 @@ impl AppState {
             last_auto_baseline_mb: AtomicU64::new(u64::MAX),
             whisper_slot: tokio::sync::Semaphore::new(1),
             last_request_ms: AtomicU64::new(now_ms()),
+            last_gpu_free_marker: AtomicU64::new(0),
             whisper_busy: AtomicBool::new(false),
             sidecar_available: AtomicBool::new(false),
             proxy_bound: AtomicBool::new(false),
@@ -601,6 +616,37 @@ impl AppState {
     pub fn serving_jobs(&self) -> bool {
         let last = self.last_job_ms.load(Ordering::Relaxed);
         last > 0 && now_ms().saturating_sub(last) < 60_000
+    }
+
+    /// ``(in_flight, last_real_ms)`` for GPU-idle decisions: whether any REAL
+    /// (non-probe) request is running right now, and when the last one ended.
+    ///
+    /// This exists because ``last_request_ms`` is refreshed by every request
+    /// INCLUDING the /v1/health and /api/tags probes the GUI and ClipAI poll
+    /// constantly — keyed on it, the "idle" reaper never saw idleness and the
+    /// whisper sidecar could sit on VRAM indefinitely. Here probes are
+    /// excluded: streamed generations count as in-flight until their BODY
+    /// completes (relay_tracked's drop-guard), and ``last_job_ms`` (stamped at
+    /// the START of real work) backstops entries evicted from the capped feed.
+    pub fn real_work_snapshot(&self) -> (bool, u64) {
+        let mut inflight = self.whisper_busy.load(Ordering::Relaxed);
+        let mut last_done: u64 = 0;
+        let feed = self.activity.lock().unwrap();
+        for e in feed.iter() {
+            let probe = e.kind == "health"
+                || e.path.ends_with("/api/tags")
+                || e.path.ends_with("/api/ps")
+                || e.path.ends_with("/api/version");
+            if probe {
+                continue;
+            }
+            match e.finished_at_ms {
+                None => inflight = true,
+                Some(t) => last_done = last_done.max(t),
+            }
+        }
+        drop(feed);
+        (inflight, last_done.max(self.last_job_ms.load(Ordering::Relaxed)))
     }
 
     /// Activity grouped by ClipAI job id, newest job first, so the GUI can show
@@ -849,5 +895,72 @@ pub fn whisper_tier_for_request(requested: &str, budget_gb: f32) -> (&'static st
         3 => ("large-v3-turbo", "float16"),
         2 => ("medium", "int8_float16"),
         _ => ("small", "int8_float16"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_state() -> AppState {
+        // Unique dir per test run so save() writes never collide.
+        let dir = std::env::temp_dir().join(format!(
+            "clipai-companion-test-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        AppState::load(dir)
+    }
+
+    /// The "models linger forever" bug: /v1/health + /api/tags probes must
+    /// NOT count as GPU activity, or the idle reapers never fire while the
+    /// GUI (or ClipAI's host registry) is polling.
+    #[test]
+    fn probes_do_not_count_as_real_work() {
+        let st = test_state();
+        let a = st.begin_activity("health", "/v1/health", "", "", "");
+        st.end_activity(a, 200);
+        let b = st.begin_activity("ollama", "/api/tags", "", "", "");
+        st.end_activity(b, 200);
+        let (inflight, last_real) = st.real_work_snapshot();
+        assert!(!inflight);
+        assert_eq!(last_real, 0, "probes must leave the idle clock untouched");
+    }
+
+    #[test]
+    fn unfinished_real_work_reads_as_inflight() {
+        let st = test_state();
+        let _a = st.begin_activity("ollama", "/api/generate", "job1", "", "translate");
+        let (inflight, _) = st.real_work_snapshot();
+        assert!(inflight, "a streaming generation must block the auto-free");
+    }
+
+    #[test]
+    fn finished_real_work_stamps_the_idle_clock() {
+        let st = test_state();
+        let a = st.begin_activity("whisper", "/v1/audio/transcriptions", "job1", "", "");
+        st.end_activity(a, 200);
+        let (inflight, last_real) = st.real_work_snapshot();
+        assert!(!inflight);
+        assert!(last_real > 0);
+        // A later probe must not advance the clock.
+        let before = last_real;
+        let p = st.begin_activity("health", "/v1/health", "", "", "");
+        st.end_activity(p, 200);
+        let (_, after) = st.real_work_snapshot();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn whisper_busy_flag_reads_as_inflight() {
+        let st = test_state();
+        st.whisper_busy.store(true, Ordering::Relaxed);
+        let (inflight, _) = st.real_work_snapshot();
+        assert!(inflight);
+    }
+
+    #[test]
+    fn gpu_idle_free_min_defaults_on() {
+        assert_eq!(Config::default().gpu_idle_free_min, 3);
     }
 }

@@ -470,9 +470,12 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
     setSyncMsg('Freeing GPU memory…');
     try {
       const r = await freeVram();
-      setSyncMsg(r.unloaded > 0
-        ? `Freed ${r.unloaded} model${r.unloaded === 1 ? '' : 's'} from VRAM ✓`
-        : 'No models were resident — VRAM already free');
+      const parts: string[] = [];
+      if (r.unloaded > 0) parts.push(`${r.unloaded} model${r.unloaded === 1 ? '' : 's'}`);
+      if (r.whisper_stopped) parts.push('whisper server');
+      setSyncMsg(parts.length
+        ? `Freed ${parts.join(' + ')} from VRAM ✓`
+        : 'Nothing was resident — VRAM already free');
       setTimeout(() => { setSyncMsg(''); refresh(); }, 1500);
     } catch (e) {
       setSyncMsg(`Could not free VRAM: ${e}`);

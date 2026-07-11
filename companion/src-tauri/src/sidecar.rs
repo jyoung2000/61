@@ -518,21 +518,83 @@ pub async fn shutdown(state: &AppState) {
     }
 }
 
-/// Background reaper: stop the sidecar after the configured idle period.
+/// Free everything ClipAI-related on the GPU: stop the whisper sidecar (only
+/// when no decode holds the slot — an in-flight transcription always wins)
+/// and evict every resident Ollama model (keep_alive=0 per model). Safe to
+/// call any time; both halves are no-ops when there's nothing to free.
+/// Returns ``(whisper_stopped, ollama_models_unloaded)``.
+pub async fn free_gpu(state: &Arc<AppState>, reason: &str) -> (bool, usize) {
+    let mut whisper_stopped = false;
+    if let Ok(permit) = state.whisper_slot.try_acquire() {
+        whisper_stopped = state.sidecar.lock().await.is_some();
+        if whisper_stopped {
+            shutdown(state).await;
+        }
+        drop(permit);
+    }
+    let (n, names) = crate::ollama::unload_all().await;
+    if whisper_stopped || n > 0 {
+        log::info!(
+            "GPU freed ({reason}): whisper_stopped={whisper_stopped}, ollama_unloaded={n}{}",
+            if n > 0 {
+                format!(" [{}]", names.join(", "))
+            } else {
+                String::new()
+            }
+        );
+    }
+    (whisper_stopped, n)
+}
+
+/// Background reaper: return the GPU to the desktop when ClipAI goes quiet.
+///
+/// Two timers, both keyed on REAL work (``real_work_snapshot``) — the old
+/// implementation keyed on ``last_request_ms``, which every /v1/health and
+/// /api/tags PROBE refreshes; with the GUI open or ClipAI polling its host
+/// registry, "idle" never elapsed and the whisper sidecar sat on VRAM
+/// indefinitely. That is the "models linger on the GPU after the test" bug.
+///
+///   * ``gpu_idle_free_min`` (default 3, 0=off): after that many minutes with
+///     no transcription/inference running or finishing, free the WHOLE GPU —
+///     whisper sidecar stopped AND all resident Ollama models evicted. Fires
+///     once per idle period (marker), so it never churns /api/ps while idle.
+///   * ``sidecar_idle_min`` (default 15): whisper-only backstop for setups
+///     that disable the full auto-free.
 pub fn spawn_idle_reaper(state: Arc<AppState>) {
     // Use Tauri's runtime handle, not `tokio::spawn`: this is called from the
     // synchronous `setup` hook (main thread, no Tokio runtime in context), so
     // a bare `tokio::spawn` panics with "there is no reactor running".
     tauri::async_runtime::spawn(async move {
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-            let idle_min = state.config.lock().unwrap().sidecar_idle_min.max(1) as u64;
-            let last = state.last_request_ms.load(Ordering::Relaxed);
-            let busy = state.whisper_busy.load(Ordering::Relaxed);
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            let (idle_min, free_min) = {
+                let cfg = state.config.lock().unwrap();
+                (cfg.sidecar_idle_min.max(1) as u64, cfg.gpu_idle_free_min as u64)
+            };
+            let (inflight, last_real) = state.real_work_snapshot();
+            if inflight {
+                continue;
+            }
+            let now = crate::state::now_ms();
+
+            // Whole-GPU auto-free (whisper + Ollama), once per idle period.
+            if free_min > 0
+                && last_real > 0
+                && now.saturating_sub(last_real) > free_min * 60_000
+                && state.last_gpu_free_marker.load(Ordering::Relaxed) != last_real
+            {
+                state
+                    .last_gpu_free_marker
+                    .store(last_real, Ordering::Relaxed);
+                free_gpu(&state, &format!("idle {free_min} min")).await;
+                continue;
+            }
+
+            // Whisper-only backstop (kept for gpu_idle_free_min=0 setups).
             let has_sidecar = state.sidecar.lock().await.is_some();
             if has_sidecar
-                && !busy
-                && crate::state::now_ms().saturating_sub(last) > idle_min * 60_000
+                && last_real > 0
+                && now.saturating_sub(last_real) > idle_min * 60_000
             {
                 log::info!("whisper sidecar idle for {idle_min} min — shutting it down");
                 shutdown(&state).await;
