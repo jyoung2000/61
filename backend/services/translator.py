@@ -1717,8 +1717,10 @@ async def _translate_via_nmt(
     context_window = max(0, min(20, int(getattr(settings, "TRANSLATION_CONTEXT_WINDOW", 5))))
     out: list[TranscriptSegment] = []
     try:
-        # Batch in groups of 16 to keep memory + decode time bounded.
-        BATCH = 16
+        # Batch size trades memory for CT2 worker parallelism — the engines
+        # now decode a whole batch in one call across inter_threads workers,
+        # so bigger batches directly cut wall time on multi-core hosts.
+        BATCH = max(4, int(getattr(settings, "NMT_BATCH_SIZE", 32)))
         for start in range(0, len(segments), BATCH):
             batch = segments[start: start + BATCH]
             ctx_before = [
@@ -1735,12 +1737,16 @@ async def _translate_via_nmt(
                 # default ja→en path). Each engine guards recovery with
                 # numbered tags and falls back per-cue to the isolated
                 # translation, so output is never worse than context-free.
-                translations = engine.translate_with_context(
+                # to_thread: the CT2 decode is seconds of pure CPU per batch —
+                # it must not block the event loop (heartbeats, websockets).
+                translations = await asyncio.to_thread(
+                    engine.translate_with_context,
                     texts, ctx_before, ctx_after,
                     source_language, target_language, glossary=glossary,
                 )
             else:
-                translations = engine.translate_batch(texts, glossary=glossary)
+                translations = await asyncio.to_thread(
+                    engine.translate_batch, texts, glossary=glossary)
             out.extend(_apply_batch_translations(batch, translations))
             _done = min(start + len(batch), len(segments))
             # Granular progress in the processing log (mirrors the LLM path at

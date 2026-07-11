@@ -3551,8 +3551,16 @@ class ClipExtractor:
             if _time.monotonic() - loop_start > BUDGET_S:
                 return idx, c, None  # time budget exhausted
 
-            keyframes = _extract_keyframes_b64(
-                self.video_path, c.start_s, c.end_s, n_frames=4)
+            # Skip the 4 ffmpeg keyframe seeks once the judge model is known
+            # to reject images — the observed run paid them for all 130
+            # candidates (a 2 h source, ~4 seeks each) while every judgement
+            # after the first was text-only anyway. That waste is what blew
+            # the 240 s budget at 43/130 judged.
+            if getattr(judge, "_vision_unsupported", False):
+                keyframes = []
+            else:
+                keyframes = _extract_keyframes_b64(
+                    self.video_path, c.start_s, c.end_s, n_frames=4)
             signal_summary = (
                 f"signal_score={c.signal_score:.3f}, "
                 f"source={c.source}, "

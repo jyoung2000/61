@@ -735,7 +735,10 @@ class Settings(BaseSettings):
     # N clip encodes in parallel (independent ffmpeg jobs; the small 9:16 frames
     # are cheap) — 0/1 = sequential.
     CLIP_EXPORT_CRF: int = 21
-    CLIP_EXPORT_CONCURRENCY: int = 2
+    # 3 concurrent NVENC sessions is safe on every consumer NVIDIA driver
+    # (the historical floor is 3); the observed 2-wide run kept the encoder
+    # ~60% idle between session setups on 60-120 s clips.
+    CLIP_EXPORT_CONCURRENCY: int = 3
     # How many GPU (NVENC) encode failures to tolerate in one export run before
     # giving up on the GPU and finishing the batch on CPU. The old behavior
     # latched to CPU after the FIRST failure — but a single transient NVENC
@@ -932,6 +935,24 @@ class Settings(BaseSettings):
     # without a loop-level cap, 3 passes × 600 s budgets stacked into a
     # ~30-minute background stage on a slow model.
     SUBTITLE_POLISH_LOOP_MAX_S: float = 900.0
+    # ── Perceiver acquisition pipelining ──
+    # Run all cv2 frame acquisition (seek/grab/read/downscale) on a dedicated
+    # reader thread feeding a small bounded queue, so frame I/O overlaps
+    # detection instead of alternating with it. Measured 301 s acquire vs
+    # 319 s detect on a 42-min video — near-total overlap, identical frames
+    # and outputs. False restores the serial interleaved loop.
+    REFRAMER_PIPELINED_ACQUISITION: bool = True
+    REFRAMER_ACQUIRE_QUEUE_DEPTH: int = 4
+
+    # ── Offline NMT throughput ──
+    # CTranslate2 worker threads for the CPU Marian/Opus engines. The batched
+    # decode path splits each batch across inter_threads workers; 0 = auto
+    # (half the cores, capped at 4). intra_threads 0 keeps CT2's default.
+    NMT_CT2_INTER_THREADS: int = 0
+    NMT_CT2_INTRA_THREADS: int = 0
+    # Cues per NMT batch. The engines decode a whole batch in ONE CT2 call
+    # now, so this directly scales multi-core utilization.
+    NMT_BATCH_SIZE: int = 32
     # Minimum %% of cues a polish pass must change for ANOTHER pass to run.
     # Passes that change almost nothing (the observed 21/1003 → 12 → 15 run)
     # predict the model has nothing more to give — stop instead of paying a

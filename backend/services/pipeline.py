@@ -3627,6 +3627,51 @@ def _planner_fingerprint() -> str:
 _seo_warm_tasks: set = set()
 
 
+def _warm_translation_model(job_id: str, after: Optional[asyncio.Task] = None) -> None:
+    """Fire-and-forget: load the Ollama translation model into VRAM as soon
+    as the Companion's whisper sidecar releases (``after``), while faces are
+    still being detected. The polish/MTPE stages that follow then start on a
+    warm model instead of paying the cold load + first-batch probe latency.
+    Non-blocking; swallows every failure — a missed warm-up just means the
+    old cold-start behavior."""
+    async def _warm():
+        try:
+            if after is not None:
+                try:
+                    await after     # VRAM must actually be free first
+                except Exception:
+                    pass
+            model = (getattr(settings, "OLLAMA_TRANSLATION_MODEL", "") or "").strip()
+            if not model or not (getattr(settings, "OLLAMA_HOST", "") or "").strip():
+                return
+            from backend.services import ollama_registry as _reg
+            host = await _reg.pick_host(required_model=model)
+            if host is None:
+                return
+            import httpx
+            async with httpx.AsyncClient(timeout=180.0) as client:
+                await client.post(
+                    f"{str(host.url).rstrip('/')}/api/generate",
+                    json={"model": model, "prompt": "ok", "stream": False,
+                          "options": {"num_predict": 1}})
+            logger.info(
+                "[%s] Translation model %s pre-warmed on %s — polish/MTPE "
+                "skip the cold load", job_id, model, host.name or host.url)
+        except Exception as e:
+            logger.debug("[%s] translation-model warm-up skipped (%s)", job_id, e)
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    try:
+        task = loop.create_task(_warm())
+        _seo_warm_tasks.add(task)
+        task.add_done_callback(_seo_warm_tasks.discard)
+    except Exception as e:
+        logger.debug("[%s] translation warm-up not scheduled (%s)", job_id, e)
+
+
 def _warm_seo_intelligence(job_id: str) -> None:
     """Fire-and-forget warm-up of the daily trend brief + the weekly platform
     rules refresh. Non-blocking; swallows every failure (including 'no event
@@ -5069,6 +5114,11 @@ async def _run_analysis_inner(job_id: str, resume: bool = False):
                         asyncio.to_thread(remote_whisper_release))
                     _BACKGROUND_TASKS.add(_rel_task)
                     _rel_task.add_done_callback(_BACKGROUND_TASKS.discard)
+                    # Chain a translation-model warm-up behind the release:
+                    # the freed VRAM loads qwen while the pipeline is still
+                    # in the repair/bridge/fusion stages, so the first
+                    # polish batch runs on a hot model.
+                    _warm_translation_model(job_id, after=_rel_task)
         except Exception:
             pass
         # Tag AI inference (vision + text) with the GPU/host that serves it, so
@@ -5198,73 +5248,78 @@ async def _run_analysis_inner(job_id: str, resume: bool = False):
     # corrected plan is what exports, overlays and per-clip grades see; the
     # post-run ReframeReport then shows the post-repair numbers.
     cancel_check()
-    try:
-        if bool(getattr(settings, "REFRAMER_PROBLEM_REPAIR", True)):
-            await _update_progress(
-                job_id, JobStatus.ANALYZING_SCENES, 59,
-                "Repairing flagged reframe windows (dense re-detection)...",
-                heartbeat_label="reframe repair",
-            )
-            from backend.services.reframer_repair import repair_high_problem_windows
-            _repair_stats = await asyncio.to_thread(
-                repair_high_problem_windows, video_path, reframer_plan, perception)
-            if _repair_stats.get("keyframes_inserted"):
-                logger.info(
-                    "[%s] Reframe repair: %d corrective keyframe(s) across %d "
-                    "window(s), %d dense detection sample(s) added",
-                    job_id, _repair_stats["keyframes_inserted"],
-                    _repair_stats["windows"], _repair_stats["samples_added"])
-    except Exception as _rr_err:
-        logger.warning("[%s] Reframe repair skipped: %s", job_id, _rr_err)
-
-    # ── Bridge — convert reframer output into Fez data contracts ──
-    cancel_check()
     await _update_progress(
-        job_id, JobStatus.ANALYZING_SCENES, 60,
-        "Converting analysis into render plan + scenes...",
-        heartbeat_label="render plan conversion",
+        job_id, JobStatus.ANALYZING_SCENES, 59,
+        "Repairing reframe windows + preparing render plan...",
+        heartbeat_label="reframe repair",
     )
-    async with _stage_timer(job_id, "bridge_conversion"):
-        # Run the whole bridge OFF the event loop. to_fez_scenes decodes
-        # scene thumbnails with ffmpeg (minutes on a 2-hour source when the
-        # batch pass degrades to per-scene seeks) and running it inline froze
-        # the loop: no heartbeats, and the 60% update above only REACHED the
-        # browser when the bridge finished — the observed "silent 34m→42m,
-        # then CONVERT appears with an 8m-stale clock" from the 2026-07-03
-        # 21:32 run.
-        def _run_bridge():
-            rp = to_fez_render_plan(
-                reframer_plan, perception,
-                src_w=source_width, src_h=source_height,
-                target_w=1080, target_h=1920,
-                fps=video_fps, total_duration=video_duration,
-            )
-            sc = to_fez_scenes(
-                perception, reframer_plan,
-                video_path=video_path, frames_dir=frames_dir,
-            )
-            tr = to_fez_transcript(
-                perception.transcript_segments,
-                getattr(perception, "speaker_timeline", None),
-            )
-            st = to_fez_subject_track(perception, reframer_plan)
-            return rp, sc, tr, st
 
-        render_plan, scenes, transcript, subject_track = (
-            await asyncio.to_thread(_run_bridge))
+    # The transcript conversion is cheap and has NO dependency on the repair
+    # or the plan — hoist it so the speaker-fusion + LLM polish chain below
+    # can start immediately, OVERLAPPED with the repair + bridge work.
+    transcript = await asyncio.to_thread(
+        to_fez_transcript,
+        perception.transcript_segments,
+        getattr(perception, "speaker_timeline", None),
+    )
+    # Snapshot the RAW (unpolished) transcript now — before the LLM polish /
+    # dedup / translation cleanup below rewrites ``transcript`` — so the UI
+    # can offer both the polished and the raw Whisper output for download.
+    if transcript:
+        try:
+            _raw_dicts = [
+                t.model_dump() if hasattr(t, "model_dump") else dict(t)
+                for t in transcript
+            ]
+            await database.update_job_status(job_id, raw_transcript=_raw_dicts)
+        except Exception as _rt_err:
+            logger.debug("[%s] could not save raw transcript: %s", job_id, _rt_err)
 
-        # Snapshot the RAW (unpolished) transcript now — before the LLM polish /
-        # dedup / translation cleanup below rewrites ``transcript`` — so the UI
-        # can offer both the polished and the raw Whisper output for download.
-        if transcript:
-            try:
-                _raw_dicts = [
-                    t.model_dump() if hasattr(t, "model_dump") else dict(t)
-                    for t in transcript
-                ]
-                await database.update_job_status(job_id, raw_transcript=_raw_dicts)
-            except Exception as _rt_err:
-                logger.debug("[%s] could not save raw transcript: %s", job_id, _rt_err)
+    # ── Repair + bridge as ONE background task, overlapped with the
+    # transcript chain (speaker fusion → voiceprint → source polish) below.
+    # Both sides are independent: repair mutates the PLAN + face timeline
+    # (read again only after the join), the transcript chain reads only
+    # ``perception.transcript_segments`` / speaker_timeline. Joined before
+    # anything touches render_plan/scenes/subject_track. On the observed run
+    # this hides the ~3 min repair+bridge inside the multi-minute polish.
+    async def _repair_and_bridge():
+        try:
+            if bool(getattr(settings, "REFRAMER_PROBLEM_REPAIR", True)):
+                from backend.services.reframer_repair import repair_high_problem_windows
+                _repair_stats = await asyncio.to_thread(
+                    repair_high_problem_windows, video_path, reframer_plan, perception)
+                if _repair_stats.get("keyframes_inserted"):
+                    logger.info(
+                        "[%s] Reframe repair: %d corrective keyframe(s) across %d "
+                        "window(s), %d dense detection sample(s) added",
+                        job_id, _repair_stats["keyframes_inserted"],
+                        _repair_stats["windows"], _repair_stats["samples_added"])
+        except Exception as _rr_err:
+            logger.warning("[%s] Reframe repair skipped: %s", job_id, _rr_err)
+
+        # Bridge — convert reframer output into Fez data contracts. Runs OFF
+        # the event loop: to_fez_scenes decodes scene thumbnails with ffmpeg
+        # (minutes on a 2-hour source when the batch pass degrades to
+        # per-scene seeks); inline it froze heartbeats (2026-07-03 21:32 run).
+        # Must run AFTER repair — it reads the corrected plan.
+        async with _stage_timer(job_id, "bridge_conversion"):
+            def _run_bridge():
+                rp = to_fez_render_plan(
+                    reframer_plan, perception,
+                    src_w=source_width, src_h=source_height,
+                    target_w=1080, target_h=1920,
+                    fps=video_fps, total_duration=video_duration,
+                )
+                sc = to_fez_scenes(
+                    perception, reframer_plan,
+                    video_path=video_path, frames_dir=frames_dir,
+                )
+                st = to_fez_subject_track(perception, reframer_plan)
+                return rp, sc, st
+
+            return await asyncio.to_thread(_run_bridge)
+
+    _plan_prep_task = asyncio.create_task(_repair_and_bridge())
 
     # Loud, visible signal when transcription came back empty. Without a
     # transcript the pipeline silently skips subtitle translation AND produces
@@ -5672,6 +5727,15 @@ async def _run_analysis_inner(job_id: str, resume: bool = False):
                 job_id, _rd_err,
             )
 
+    # ── Join the overlapped repair + bridge task ──
+    # Everything from here on reads render_plan / scenes / subject_track (and
+    # the repair-corrected reframer_plan), so this is the convergence point.
+    # The task normally finished long ago — the transcript chain above runs
+    # for minutes; a crash inside it surfaces here exactly as it would have
+    # inline.
+    cancel_check()
+    render_plan, scenes, subject_track = await _plan_prep_task
+
     # JobResult has no render_plan field, so persist the plan as a sidecar
     # JSON the /api/jobs/{id}/render_plan endpoint can serve to the NLE editor.
     # Built + serialized in a worker thread: these sidecars reach tens of MB on
@@ -5937,33 +6001,53 @@ async def _run_analysis_inner(job_id: str, resume: bool = False):
     _summary_transcript = transcript
     if _pp_result and _pp_result.get("translated") and _pp_result.get("target_transcript"):
         _summary_transcript = _pp_result["target_transcript"]
-    async with _stage_timer(job_id, "summary"):
+
+    async def _generate_summary_stage():
+        _s = None
+        async with _stage_timer(job_id, "summary"):
+            try:
+                _sr = await orchestrator.generate_summary(
+                    _summary_transcript, scenes, job_id, tier=tier,
+                    output_language=(_pp_result or {}).get("output_lang", ""))
+                _s = _sr[0] if isinstance(_sr, tuple) else _sr
+            except Exception as _se:
+                logger.warning(
+                    "[%s] VLM summary failed (%s) — falling back to transcript summary",
+                    job_id, _se,
+                )
+        _s_dict = _s.model_dump() if hasattr(_s, "model_dump") else _s
+        if _s is None or not has_real_summary_content(_s_dict):
+            try:
+                _s = VideoSummary(**build_summary_from_transcript(
+                    _summary_transcript, scenes))
+            except Exception:
+                _s = VideoSummary(
+                    overview="Summary unavailable for this video.",
+                    key_topics=[], tone="neutral",
+                    estimated_audience="general", content_category="generic",
+                )
+        # Persist so the post-clip Auto-SEO (which reads job.summary for
+        # prompt context) sees it.
         try:
-            _sr = await orchestrator.generate_summary(
-                _summary_transcript, scenes, job_id, tier=tier,
-                output_language=(_pp_result or {}).get("output_lang", ""))
-            summary = _sr[0] if isinstance(_sr, tuple) else _sr
-        except Exception as _se:
-            logger.warning(
-                "[%s] VLM summary failed (%s) — falling back to transcript summary",
-                job_id, _se,
-            )
-    summary_dict = summary.model_dump() if hasattr(summary, "model_dump") else summary
-    if summary is None or not has_real_summary_content(summary_dict):
-        try:
-            summary = VideoSummary(**build_summary_from_transcript(_summary_transcript, scenes))
-        except Exception:
-            summary = VideoSummary(
-                overview="Summary unavailable for this video.",
-                key_topics=[], tone="neutral",
-                estimated_audience="general", content_category="generic",
-            )
-    # Persist the summary so the post-clip Auto-SEO (which reads job.summary for
-    # prompt context) sees it.
-    try:
-        await database.update_job_status(job_id, summary=summary)
-    except Exception as _sum_err:
-        logger.debug("[%s] summary persist skipped: %s", job_id, _sum_err)
+            await database.update_job_status(job_id, summary=_s)
+        except Exception as _sum_err:
+            logger.debug("[%s] summary persist skipped: %s", job_id, _sum_err)
+        return _s
+
+    # Cloud-editorial rigs: the summary (cloud text + throttled vision) and
+    # the clip stage don't share a local GPU, so run the summary CONCURRENT
+    # with clip detection and join it before Auto-SEO reads it. Local-
+    # editorial rigs keep today's strict ordering — the summary VLM and the
+    # clip judge must hand the one small card to each other, and overlapping
+    # them just makes Ollama thrash model loads.
+    _summary_task = None
+    if not _editorial_is_local:
+        _summary_task = asyncio.create_task(_generate_summary_stage())
+        logger.info(
+            "[%s] Summary started concurrently with clip detection "
+            "(cloud editorial — no local-GPU handoff needed)", job_id)
+    else:
+        summary = await _generate_summary_stage()
 
 
     # ── Clip detection (reframer clipper) ──
@@ -6178,6 +6262,22 @@ async def _run_analysis_inner(job_id: str, resume: bool = False):
         except Exception as _ce:
             logger.exception("[%s] Clip extraction failed: %s", job_id, _ce)
             clips = []
+
+    # ── Join the concurrent summary (cloud-editorial path) ──
+    # Auto-SEO below reads job.summary for prompt context, and the COMPLETE
+    # save persists ``summary`` — both need the task finished. On the
+    # sequential (local-editorial) path this is a no-op.
+    if _summary_task is not None:
+        try:
+            summary = await _summary_task
+        except Exception as _st_err:
+            logger.warning("[%s] Concurrent summary task failed (%s) — "
+                           "falling back to transcript summary", job_id, _st_err)
+            try:
+                summary = VideoSummary(**build_summary_from_transcript(
+                    _summary_transcript, scenes))
+            except Exception:
+                summary = None
 
     # ── Post-clip translation finishers (caption refresh + Auto-SEO) ──
     # These need the clips, so they run here — AFTER extraction. They can never

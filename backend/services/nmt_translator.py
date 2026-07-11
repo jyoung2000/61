@@ -999,7 +999,26 @@ class OpusMTTranslator:
                 f"Opus-MT model {self.source}-{self.target} not downloaded at {path}."
             )
         device = "cpu"  # Opus-MT runs faster on CPU for small batches.
-        self._translator = ctranslate2.Translator(path, device=device, compute_type="int8")
+        # Worker parallelism: translate_batch() now sends REAL multi-example
+        # batches, and inter_threads workers decode sub-batches concurrently —
+        # this is where the per-cue → batched rewrite's wall-time win comes
+        # from on a multi-core host. 0 = auto (half the cores, capped at 4,
+        # so the pipeline's other stages keep breathing room).
+        from backend.config import settings as _s
+        inter = int(getattr(_s, "NMT_CT2_INTER_THREADS", 0) or 0)
+        if inter <= 0:
+            inter = max(1, min(4, (os.cpu_count() or 4) // 2))
+        intra = int(getattr(_s, "NMT_CT2_INTRA_THREADS", 0) or 0)
+        kwargs = {"inter_threads": inter}
+        if intra > 0:
+            kwargs["intra_threads"] = intra
+        try:
+            self._translator = ctranslate2.Translator(
+                path, device=device, compute_type="int8", **kwargs)
+        except TypeError:
+            # Very old CT2 without the threading kwargs — load plain.
+            self._translator = ctranslate2.Translator(
+                path, device=device, compute_type="int8")
         tok_file = None
         for name in ("source.spm", "sentencepiece.bpe.model", "spiece.model"):
             cand = os.path.join(path, name)
@@ -1051,34 +1070,52 @@ class OpusMTTranslator:
         """
         if not batch:
             return []
-        out: list[str] = []
         prior = [c for c in (context_before or []) if (c or "").strip()]
-        for cue in batch:
+        # Pass 1: build every cue's context mini-block up front. ``prior``
+        # grows with the batch's own earlier SOURCE cues, so each mini is
+        # byte-identical to what the old serial loop produced — only the CT2
+        # calls are batched (2 calls total instead of up to 2 per cue), which
+        # is where the multi-core speedup comes from.
+        cues: list[str] = []
+        minis: dict[int, str] = {}
+        for idx, cue in enumerate(batch):
             cue_s = (cue or "").strip()
-            if not cue_s:
-                out.append(cue)
-                prior.append(cue_s)
-                continue
-            translated = None
-            ctx = prior[-2:]
-            if ctx:
-                mini = f"{' '.join(ctx)} {_wrap_numbered_tag(1, cue_s)}"
-                cap = (_MAX_SRC_CHARS_CJK if _looks_cjk(mini)
-                       else _MAX_SRC_CHARS_LATIN)
-                if len(mini) <= cap:
-                    try:
-                        tj = self.translate_batch([mini], glossary=glossary)[0]
-                        rec = _parse_numbered_tags(tj, 1, 2, 1)
-                        if rec and (rec[0] or "").strip():
-                            translated = rec[0]
-                    except Exception as e:
-                        logger.debug(
-                            "OpusMT per-cue context retry failed (%s)", e)
-            if translated is None:
-                tb = self.translate_batch([cue_s], glossary=glossary)
-                translated = tb[0] if (tb and (tb[0] or "").strip()) else cue
-            out.append(translated)
+            cues.append(cue_s)
+            if cue_s:
+                ctx = prior[-2:]
+                if ctx:
+                    mini = f"{' '.join(ctx)} {_wrap_numbered_tag(1, cue_s)}"
+                    cap = (_MAX_SRC_CHARS_CJK if _looks_cjk(mini)
+                           else _MAX_SRC_CHARS_LATIN)
+                    if len(mini) <= cap:
+                        minis[idx] = mini
             prior.append(cue_s)
+        out: list[Optional[str]] = [None] * len(batch)
+        # One batched call for all context blocks…
+        if minis:
+            keys = list(minis)
+            try:
+                tjs = self.translate_batch([minis[k] for k in keys],
+                                           glossary=glossary)
+            except Exception as e:
+                logger.debug("OpusMT batched context translation failed (%s)", e)
+                tjs = [""] * len(keys)
+            for k, tj in zip(keys, tjs):
+                rec = _parse_numbered_tags(tj or "", 1, 2, 1)
+                if rec and (rec[0] or "").strip():
+                    out[k] = rec[0]
+        # …and one batched call for the isolated fallbacks (tag didn't
+        # survive, block over the cap, or no context yet) — output is never
+        # worse than context-free, exactly as before.
+        rest = [i for i, c in enumerate(cues) if out[i] is None and c]
+        if rest:
+            tb = self.translate_batch([cues[i] for i in rest],
+                                      glossary=glossary)
+            for i, t in zip(rest, tb or []):
+                out[i] = t if (t or "").strip() else batch[i]
+        for i in range(len(batch)):
+            if out[i] is None:
+                out[i] = batch[i]      # empty cues pass through untouched
         return out
 
     def translate_batch(
@@ -1086,40 +1123,91 @@ class OpusMTTranslator:
         texts: list[str],
         glossary: Optional[dict] = None,
     ) -> list[str]:
+        """Translate ``texts`` in REAL CT2 batches.
+
+        The old loop sent one example per ``translate_batch`` call, so a
+        1,000-cue transcript paid ~1,000 sequential decodes on a single
+        worker. All chunks are now encoded up front and decoded in one call
+        per decode-length bucket, letting CT2's inter/intra-thread workers
+        run examples concurrently. Per-example inputs, beam size and decode
+        caps are unchanged (bucket caps only round UP, never truncate), so
+        outputs match the serial path; any batch-level failure falls back to
+        per-chunk decoding for just that bucket.
+        """
         if not texts:
             return []
         if not self._loaded:
             self.load()
         tgt_cjk = self.target.split("-")[0] in ("ja", "zh", "ko", "yue")
-        results: list[str] = []
+        # Pass 1: chunk + encode everything.
+        plan: list[Optional[list[int]]] = []   # per text: global chunk ids
+        chunk_tokens: list[list[str]] = []
+        chunk_maxdec: list[int] = []
         for raw in texts:
             text = (raw or "").strip()
             if not text:
-                results.append(raw)
+                plan.append(None)
                 continue
             try:
                 src_cjk = _looks_cjk(text)
                 max_chars = _MAX_SRC_CHARS_CJK if src_cjk else _MAX_SRC_CHARS_LATIN
                 chunks = _split_for_nmt(text, max_chars, src_cjk) or [text]
-                joiner = "" if tgt_cjk else " "
-                parts: list[str] = []
+                ids = []
                 for ch in chunks:
                     tokens = self._tokenizer.encode_as_pieces(ch)
-                    max_dec = min(512, max(128, len(tokens) * 3))
-                    output = _ct2_translate_batch(
-                        self._translator,
-                        [tokens + ["</s>"]],
-                        beam_size=5,
-                        max_decoding_length=max_dec,
-                    )
-                    parts.append(self._tokenizer.decode(output[0].hypotheses[0]))
-                translated = (joiner.join(p for p in parts if p).strip()) or text
-                if glossary:
-                    translated = apply_glossary(text, translated, glossary)
-                results.append(translated)
+                    ids.append(len(chunk_tokens))
+                    chunk_tokens.append(tokens + ["</s>"])
+                    chunk_maxdec.append(min(512, max(128, len(tokens) * 3)))
+                plan.append(ids)
             except Exception as e:
-                logger.warning("Opus-MT: translation failed (%s)", e)
+                logger.warning("Opus-MT: encode failed (%s)", e)
+                plan.append(None)
+        # Pass 2: decode, bucketed by decode-length cap (rounded up to 128s
+        # so a handful of calls covers the batch; a cap can only grow, and
+        # the anti-repetition kwargs still guard runaway decodes).
+        decoded: dict[int, str] = {}
+        buckets: dict[int, list[int]] = {}
+        for i, md in enumerate(chunk_maxdec):
+            buckets.setdefault(((md + 127) // 128) * 128, []).append(i)
+        for cap, idxs in sorted(buckets.items()):
+            try:
+                outs = _ct2_translate_batch(
+                    self._translator,
+                    [chunk_tokens[i] for i in idxs],
+                    beam_size=5,
+                    max_decoding_length=cap,
+                    max_batch_size=8,
+                )
+                for i, o in zip(idxs, outs):
+                    decoded[i] = self._tokenizer.decode(o.hypotheses[0])
+            except Exception as e:
+                logger.warning(
+                    "Opus-MT: batched decode failed (%s) — retrying that "
+                    "bucket per chunk", e)
+                for i in idxs:
+                    try:
+                        o = _ct2_translate_batch(
+                            self._translator, [chunk_tokens[i]],
+                            beam_size=5, max_decoding_length=chunk_maxdec[i])
+                        decoded[i] = self._tokenizer.decode(o[0].hypotheses[0])
+                    except Exception as e2:
+                        logger.warning("Opus-MT: translation failed (%s)", e2)
+        # Pass 3: reassemble per input text.
+        results: list[str] = []
+        joiner = "" if tgt_cjk else " "
+        for raw, ids in zip(texts, plan):
+            if ids is None:
                 results.append(raw)
+                continue
+            if any(i not in decoded for i in ids):
+                results.append(raw)     # a chunk failed → keep the original
+                continue
+            text = (raw or "").strip()
+            translated = (joiner.join(
+                decoded[i] for i in ids if decoded[i]).strip()) or text
+            if glossary:
+                translated = apply_glossary(text, translated, glossary)
+            results.append(translated)
         return results
 
 

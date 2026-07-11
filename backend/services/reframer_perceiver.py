@@ -438,42 +438,19 @@ class Perceiver:
         _tbuck = {'acquire': 0.0, 'detect': 0.0, 'loop': 0.0}
         _loop_t0 = _time_mod.perf_counter()
 
-        for i, time_ms in enumerate(sample_times_ms):
+        for (i, time_ms, small_bgr, gray_small, gap_grays) in self._iter_samples(
+                cap, sample_times_ms, r, det_w, det_h, det_scale, seek_gap,
+                _tbuck):
             if self.cancelled:
                 break
 
-            # Smart frame reading: sequential grab() for anything up to
-            # ~2.5x the sampling stride (see threshold above), hard-seek only
-            # for genuinely large jumps. grab() skips frames without color
-            # convert / return, which is far cheaper than a seek for these
-            # gaps — and the gap branch bridges them with LK tracking.
-            _t_acq = _time_mod.perf_counter()
-            target_frame = int(time_ms / 1000.0 * r.fps)
-            current_pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
-            gap = target_frame - current_pos
-
-            if gap < 0 or gap > seek_gap:
-                # Behind (shouldn't happen) or a genuinely large jump
-                cap.set(cv2.CAP_PROP_POS_FRAMES, min(target_frame, r.total_frames - 1))
-            elif gap > 1:
-                # Skip forward by grabbing without decoding — but bridge the
-                # gap with LIGHTWEIGHT TRACKING when the last sample had
-                # faces. At 0.14-0.23 samples/s on long videos the camera
-                # path is pure interpolation for up to 7s between looks; LK
-                # optical flow on a few of the already-grabbed frames turns
-                # those blind stretches into real subject positions (the
-                # dominant source of HIGH face_missing problems).
-                self._track_through_gap(cap, gap, r, det_w, det_h, det_scale)
-
-            ret, frame = cap.read()
-            _tbuck['acquire'] += _time_mod.perf_counter() - _t_acq
-            if not ret:
-                continue
-
-            # Downscale ONCE — INTER_LINEAR is 2x faster than INTER_AREA
-            # and visually identical at this scale ratio
-            small_bgr = cv2.resize(frame, (det_w, det_h), interpolation=cv2.INTER_LINEAR)
-            gray_small = cv2.cvtColor(small_bgr, cv2.COLOR_BGR2GRAY)
+            # LK bridge over the frames retrieved inside the inter-sample
+            # grab gap (see _track_through_gap docstring) — identical
+            # tracking, now fed by the reader thread's already-decoded grays
+            # so the acquisition I/O overlaps detection instead of
+            # alternating with it.
+            if gap_grays:
+                self._track_through_gap(gap_grays, r, det_w, det_h, det_scale)
 
             # ── Face detection at low res ──
             _t_det = _time_mod.perf_counter()
@@ -1355,31 +1332,145 @@ class Perceiver:
         except Exception:
             return None
 
-    def _track_through_gap(self, cap, gap: int, r, det_w: int, det_h: int,
+    def _iter_samples(self, cap, sample_times_ms, r, det_w: int, det_h: int,
+                      det_scale: float, seek_gap: int, tbuck: dict):
+        """Yield ``(i, time_ms, small_bgr, gray_small, gap_grays)`` per sample.
+
+        All cv2 acquisition — seek/grab positioning, the inter-sample gap
+        retrieves for LK tracking, the sample read, downscale and grayscale —
+        lives here. In pipelined mode (REFRAMER_PIPELINED_ACQUISITION,
+        default on) it runs on a dedicated reader thread feeding a small
+        bounded queue, so frame I/O overlaps detection instead of alternating
+        with it (measured 301 s acquire vs 319 s detect on a 42-min video —
+        near-total overlap). Serial mode yields inline with identical
+        semantics. ``gap_grays`` carries the downscaled grays retrieved
+        inside the grab gap (with timestamps) for the consumer-side
+        ``_track_through_gap`` bridge; frames and outputs are byte-identical
+        to the old interleaved loop either way.
+        """
+        max_retrieves = int(getattr(settings, 'REFRAMER_TRACK_POINTS_PER_GAP', 3))
+        retrieves_on = (bool(getattr(settings, 'REFRAMER_INTER_SAMPLE_TRACKING', True))
+                        and max_retrieves > 0)
+        fps = max(1e-6, float(getattr(r, 'fps', 0) or 0))
+        import time as _t
+
+        def _acquire(i, time_ms):
+            t0 = _t.perf_counter()
+            # Smart frame reading: sequential grab() for anything up to
+            # ~2.5x the sampling stride, hard-seek only for genuinely large
+            # jumps (gap > seek_gap). grab() skips frames without color
+            # convert / return, which is far cheaper than a seek.
+            target_frame = int(time_ms / 1000.0 * fps)
+            current_pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+            gap = target_frame - current_pos
+            gap_grays: list = []
+            if gap < 0 or gap > seek_gap:
+                cap.set(cv2.CAP_PROP_POS_FRAMES,
+                        min(target_frame, r.total_frames - 1))
+            elif gap > 1:
+                n_skip = gap - 1
+                stride = max(1, (n_skip + max_retrieves) // (max_retrieves + 1))
+                for j in range(n_skip):
+                    if not cap.grab():
+                        break
+                    if retrieves_on and (j + 1) % stride == 0:
+                        # Retrieve + downscale a few in-gap frames for the LK
+                        # bridge. Unconditional (the old path skipped them
+                        # when the last sample had no faces) so the consumer
+                        # never misses a bridge — the extra cost is ≤3 small
+                        # resizes per gap, hidden inside the overlap.
+                        try:
+                            ok2, frame2 = cap.retrieve()
+                            if ok2 and frame2 is not None:
+                                small2 = cv2.resize(
+                                    frame2, (det_w, det_h),
+                                    interpolation=cv2.INTER_LINEAR)
+                                gray2 = cv2.cvtColor(small2, cv2.COLOR_BGR2GRAY)
+                                t_ms2 = int(cap.get(cv2.CAP_PROP_POS_FRAMES)
+                                            / fps * 1000.0)
+                                gap_grays.append((t_ms2, gray2))
+                        except Exception:
+                            pass
+            ret, frame = cap.read()
+            if not ret:
+                tbuck['acquire'] += _t.perf_counter() - t0
+                return None
+            # Downscale ONCE — INTER_LINEAR is 2x faster than INTER_AREA
+            # and visually identical at this scale ratio.
+            small_bgr = cv2.resize(frame, (det_w, det_h),
+                                   interpolation=cv2.INTER_LINEAR)
+            gray_small = cv2.cvtColor(small_bgr, cv2.COLOR_BGR2GRAY)
+            tbuck['acquire'] += _t.perf_counter() - t0
+            return (i, time_ms, small_bgr, gray_small, gap_grays)
+
+        if not bool(getattr(settings, 'REFRAMER_PIPELINED_ACQUISITION', True)):
+            for i, time_ms in enumerate(sample_times_ms):
+                if self.cancelled:
+                    return
+                item = _acquire(i, time_ms)
+                if item is not None:
+                    yield item
+            return
+
+        import queue as _queue
+        import threading as _threading
+        q: "_queue.Queue" = _queue.Queue(
+            maxsize=max(1, int(getattr(settings,
+                                       'REFRAMER_ACQUIRE_QUEUE_DEPTH', 4))))
+        abort = {'flag': False}
+
+        def _producer():
+            try:
+                for i, time_ms in enumerate(sample_times_ms):
+                    if self.cancelled or abort['flag']:
+                        break
+                    item = _acquire(i, time_ms)
+                    if item is not None:
+                        q.put(item)
+            except Exception as e:
+                logger.warning("Frame-reader thread failed (%s) — remaining "
+                               "samples skipped", e)
+            finally:
+                q.put(None)
+
+        th = _threading.Thread(target=_producer, name='clipai-frame-reader',
+                               daemon=True)
+        th.start()
+        try:
+            while True:
+                item = q.get()
+                if item is None:
+                    break
+                if self.cancelled:
+                    continue    # drain so the reader can exit
+                yield item
+        finally:
+            # Consumer abandoned early — stop the reader and unblock its put.
+            abort['flag'] = True
+            try:
+                while True:
+                    q.get_nowait()
+            except _queue.Empty:
+                pass
+
+    def _track_through_gap(self, gap_grays, r, det_w: int, det_h: int,
                            det_scale: float) -> None:
         """Bridge the inter-sample gap with LK optical-flow face tracking.
 
-        The sampling loop grab()s ``gap-1`` frames between detection samples
-        without decoding them. When the previous sample had faces, retrieve a
-        few of those frames (up to REFRAMER_TRACK_POINTS_PER_GAP, ~evenly
-        spaced), track each face's box forward with pyramidal Lucas-Kanade on
-        the downscaled grays, and append the tracked positions to
-        ``r.face_timeline`` (marked ``tracked: True``, confidence decayed).
-        Detection cost is unchanged — grab() already decoded these frames;
-        this adds only a retrieve + resize + sparse LK per tracked frame.
-        Fail-soft: any error degrades to the plain grab() skip.
+        The acquisition path grab()s the frames between detection samples
+        without decoding them and retrieves a few (up to
+        REFRAMER_TRACK_POINTS_PER_GAP, ~evenly spaced) as downscaled grays.
+        When the previous sample had faces, track each face's box forward
+        with pyramidal Lucas-Kanade across those grays and append the tracked
+        positions to ``r.face_timeline`` (marked ``tracked: True``,
+        confidence decayed). Fail-soft: any error degrades to a plain skip.
         """
-        n_skip = gap - 1
-        if n_skip <= 0:
+        if not gap_grays:
             return
         prev_gray = getattr(self, '_last_gray_small', None)
         last_ms = getattr(self, '_last_sample_ms', None)
         prev_faces = (r.face_timeline.get(last_ms) or []) if last_ms is not None else []
-        max_retrieves = int(getattr(settings, 'REFRAMER_TRACK_POINTS_PER_GAP', 3))
-        if (not bool(getattr(settings, 'REFRAMER_INTER_SAMPLE_TRACKING', True))
-                or prev_gray is None or not prev_faces or max_retrieves <= 0):
-            for _ in range(n_skip):
-                cap.grab()
+        if prev_gray is None or not prev_faces:
             return
 
         # Working boxes in detection space.
@@ -1396,28 +1487,13 @@ class Perceiver:
             except (KeyError, TypeError, ValueError):
                 continue
         if not cur:
-            for _ in range(n_skip):
-                cap.grab()
             return
 
-        stride = max(1, (n_skip + max_retrieves) // (max_retrieves + 1))
-        fps = max(1e-6, float(getattr(r, 'fps', 0) or 0))
-        for j in range(n_skip):
-            if not cap.grab():
-                return
-            if (j + 1) % stride != 0 or not cur:
-                continue
-            # Tracking is opportunistic — any failure just skips this frame;
-            # the grab loop above stays authoritative so the read position
-            # is never left short of the next sample.
+        for (t_ms, gray2) in gap_grays:
+            if not cur:
+                break
+            # Tracking is opportunistic — any failure just skips this frame.
             try:
-                ok, frame2 = cap.retrieve()
-                if not ok or frame2 is None:
-                    continue
-                small2 = cv2.resize(frame2, (det_w, det_h),
-                                    interpolation=cv2.INTER_LINEAR)
-                gray2 = cv2.cvtColor(small2, cv2.COLOR_BGR2GRAY)
-                t_ms = int(cap.get(cv2.CAP_PROP_POS_FRAMES) / fps * 1000.0)
                 moved = []
                 entries = []
                 for fbox in cur:
