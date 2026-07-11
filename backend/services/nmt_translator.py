@@ -998,27 +998,71 @@ class OpusMTTranslator:
             raise FileNotFoundError(
                 f"Opus-MT model {self.source}-{self.target} not downloaded at {path}."
             )
-        device = "cpu"  # Opus-MT runs faster on CPU for small batches.
-        # Worker parallelism: translate_batch() now sends REAL multi-example
-        # batches, and inter_threads workers decode sub-batches concurrently —
-        # this is where the per-cue → batched rewrite's wall-time win comes
-        # from on a multi-core host. 0 = auto (half the cores, capped at 4,
-        # so the pipeline's other stages keep breathing room).
         from backend.config import settings as _s
+        # Device: "Opus-MT runs faster on CPU" was true for the old one-cue-
+        # per-call pattern; the batched decode saturates a GPU properly, and
+        # the Marian family is tiny (~200-300 MB int8). Mirror NLLB's gate:
+        # CUDA only when it's genuinely free (translation runs after Whisper
+        # released its VRAM), CPU otherwise, and a CUDA load failure retries
+        # on CPU so the GPU path is never fatal.
+        device = (getattr(_s, "NMT_OPUS_DEVICE", "auto") or "auto").lower()
+        min_free_gb = float(getattr(_s, "NMT_OPUS_CUDA_MIN_FREE_GB", 1.0))
+        if device == "auto":
+            device = "cpu"
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    free_gb = torch.cuda.mem_get_info()[0] / 1_073_741_824
+                    if free_gb >= min_free_gb:
+                        device = "cuda"
+                        logger.info(
+                            "Opus-MT: device=auto → cuda (%.1f GB VRAM free ≥ "
+                            "%.1f GB floor for %s int8)",
+                            free_gb, min_free_gb, self.hf_repo)
+                    else:
+                        logger.info(
+                            "Opus-MT: device=auto → cpu (%.1f GB VRAM free < "
+                            "%.1f GB floor — CPU is the OOM-safe choice)",
+                            free_gb, min_free_gb)
+            except Exception:
+                device = "cpu"
+        # Worker parallelism (CPU): translate_batch() now sends REAL multi-
+        # example batches, and inter_threads workers decode sub-batches
+        # concurrently — this is where the per-cue → batched rewrite's
+        # wall-time win comes from on a multi-core host. 0 = auto (half the
+        # cores, capped at 4, so the pipeline's other stages keep breathing
+        # room). On CUDA a single worker is correct.
         inter = int(getattr(_s, "NMT_CT2_INTER_THREADS", 0) or 0)
         if inter <= 0:
             inter = max(1, min(4, (os.cpu_count() or 4) // 2))
         intra = int(getattr(_s, "NMT_CT2_INTRA_THREADS", 0) or 0)
-        kwargs = {"inter_threads": inter}
-        if intra > 0:
+        kwargs = {"inter_threads": inter} if device == "cpu" else {}
+        if device == "cpu" and intra > 0:
             kwargs["intra_threads"] = intra
+        compute = "int8_float16" if device == "cuda" else "int8"
+
+        def _load(dev, ct, kw):
+            try:
+                return ctranslate2.Translator(
+                    path, device=dev, compute_type=ct, **kw)
+            except TypeError:
+                # Very old CT2 without the threading kwargs — load plain.
+                return ctranslate2.Translator(path, device=dev, compute_type=ct)
+
         try:
-            self._translator = ctranslate2.Translator(
-                path, device=device, compute_type="int8", **kwargs)
-        except TypeError:
-            # Very old CT2 without the threading kwargs — load plain.
-            self._translator = ctranslate2.Translator(
-                path, device=device, compute_type="int8")
+            self._translator = _load(device, compute, kwargs)
+        except Exception as e:
+            if device == "cuda":
+                logger.warning(
+                    "Opus-MT: CUDA load failed (%s) — retrying on CPU "
+                    "(slower but safe)", e)
+                device = "cpu"
+                self._translator = _load(
+                    "cpu", "int8", {"inter_threads": inter})
+            else:
+                raise
+        self._device = device
         tok_file = None
         for name in ("source.spm", "sentencepiece.bpe.model", "spiece.model"):
             cand = os.path.join(path, name)
@@ -1041,6 +1085,16 @@ class OpusMTTranslator:
         self._translator = None
         self._tokenizer = None
         self._loaded = False
+        # Return the VRAM to the pool when the CUDA path was used — the clip
+        # judge / Ollama stages that follow want the card back.
+        if getattr(self, "_device", "cpu") == "cuda":
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+            self._device = "cpu"
 
     def translate_with_context(
         self,

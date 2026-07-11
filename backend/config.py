@@ -935,6 +935,14 @@ class Settings(BaseSettings):
     # without a loop-level cap, 3 passes × 600 s budgets stacked into a
     # ~30-minute background stage on a slow model.
     SUBTITLE_POLISH_LOOP_MAX_S: float = 900.0
+    # Run speaker diarization on a background thread DURING the face pass in
+    # BOTH remote- and local-whisper modes (it used to be remote-only). The
+    # standalone/local path joins the thread before local Whisper loads, so
+    # the small GPU is never shared with a still-running diarization — the
+    # multi-minute ECAPA pass just hides inside the face loop instead of
+    # running after it. False restores the fully sequential local order.
+    DIARIZE_CONCURRENT_WITH_FACES: bool = True
+
     # ── Perceiver acquisition pipelining ──
     # Run all cv2 frame acquisition (seek/grab/read/downscale) on a dedicated
     # reader thread feeding a small bounded queue, so frame I/O overlaps
@@ -953,6 +961,14 @@ class Settings(BaseSettings):
     # Cues per NMT batch. The engines decode a whole batch in ONE CT2 call
     # now, so this directly scales multi-core utilization.
     NMT_BATCH_SIZE: int = 32
+    # Marian/Opus/FuguMT device. "auto" uses CUDA when at least
+    # NMT_OPUS_CUDA_MIN_FREE_GB of VRAM is free at load time (translation
+    # runs after Whisper released the card; the model is ~200-300 MB int8 so
+    # the floor is mostly decode workspace) and falls back to CPU otherwise —
+    # a CUDA load failure also retries on CPU, so the GPU path is never
+    # fatal. The engine unloads + frees the VRAM when the stage finishes.
+    NMT_OPUS_DEVICE: str = "auto"
+    NMT_OPUS_CUDA_MIN_FREE_GB: float = 1.0
     # Minimum %% of cues a polish pass must change for ANOTHER pass to run.
     # Passes that change almost nothing (the observed 21/1003 → 12 → 15 run)
     # predict the model has nothing more to give — stop instead of paying a

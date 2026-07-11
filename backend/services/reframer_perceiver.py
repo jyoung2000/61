@@ -217,16 +217,19 @@ class Perceiver:
 
         # ── Optimization #2: overlap speaker diarization with the visual pass ──
         # Diarization is audio-only — it doesn't need faces or the transcript
-        # until we LINK tracks to speakers — so run pyannote on a background
-        # thread concurrently with the face loop. Its models are tiny and
-        # co-reside with YOLO on the local card. Gated on remote Whisper so the
-        # single-GPU path keeps its safe sequential ordering (local Whisper would
-        # otherwise contend with a still-running diarization). Worst case we just
-        # join and wait — never slower than the old order; the local-embedding
-        # fallback (needs the transcript) still runs sequentially below.
+        # until we LINK tracks to speakers — so run it on a background thread
+        # concurrently with the face loop. Its models are tiny and co-reside
+        # with YOLO on the local card. This used to be gated on remote Whisper
+        # (local Whisper would contend with a still-running diarization);
+        # standalone runs — the whole reason the gate existed — instead JOIN
+        # the diar thread right before local Whisper loads, which preserves
+        # the GPU exclusivity while still hiding the multi-minute diarization
+        # inside the face pass. Worst case we just join and wait — never
+        # slower than the old order; the local-embedding fallback (needs the
+        # transcript) still runs sequentially below.
         _diar: dict = {"timeline": None, "error": None}
         _diar_thread = None
-        if _txn_remote:
+        if bool(getattr(settings, 'DIARIZE_CONCURRENT_WITH_FACES', True)):
             import threading as _threading_d
 
             def _run_diar(dur_ms=r.duration_ms):
@@ -900,6 +903,16 @@ class Perceiver:
                                   'sequential pass now (local GPU is free)')
 
         if not _txn_done:
+            # Local Whisper is about to claim the GPU — the concurrent
+            # diarization thread must finish first (this is the sequential-
+            # ordering guarantee the old remote-only gate provided). On
+            # remote-whisper runs this branch isn't reached, and the diar
+            # join below handles the normal case.
+            if _diar_thread is not None and _diar_thread.is_alive():
+                log.log_stage('PERCEIVE',
+                              'Waiting for concurrent diarization to finish '
+                              'before local Whisper loads (GPU handoff)')
+                _diar_thread.join()
             _stem_path = self.transcribe_audio_path
             if callable(_stem_path):
                 try:

@@ -109,13 +109,19 @@ services:
       # needs the card; this only stops ACCIDENTAL expiry.
       - OLLAMA_KEEP_ALIVE=30m
       - OLLAMA_MAX_LOADED_MODELS=1
-      - OLLAMA_NUM_PARALLEL=1
+      # 2 (was 1): the polish / MTPE / SEO stages send up to 3 requests in
+      # flight, but num_parallel=1 serialized them server-side — the client-
+      # side concurrency only ever materialized on the Companion. Two slots
+      # fit the 3B q4 editorial model comfortably: weights (~1.8GB, shared)
+      # + 2× q8_0 KV caches + compute graph stay inside the budget below.
+      - OLLAMA_NUM_PARALLEL=2
       # Force Ollama to use all available GPU layers
       - OLLAMA_GPU_LAYERS=-1
-      # Set VRAM budget to leave headroom (GTX 1650 = 4GB, reserve 1GB for system/CUDA overhead)
-      # The compute graph allocation (~300MB) must fit on top of weights + KV cache.
-      # With 3.0GB budget: weights(1.8GB) + KV(38MB) + compute(300MB) = 2.14GB fits.
-      - OLLAMA_MAX_VRAM=3221225472
+      # VRAM budget (GTX 1650 = 4GB; headless card, so ~700MB covers the
+      # CUDA context + allocator slack). The compute graph (~300MB) must fit
+      # on top of weights + KV caches. 3.3GiB: weights(1.8GB) + 2×KV +
+      # compute(300MB) fits with margin.
+      - OLLAMA_MAX_VRAM=3543348019
       # Enable flash attention for memory efficiency
       - OLLAMA_FLASH_ATTENTION=1
       # Reduce KV cache to fit in VRAM
@@ -137,8 +143,12 @@ services:
             - driver: nvidia
               device_ids: ['${CLIPAI_GPU_ID:-GPU-08b18de7-af3b-aa16-9b88-d214ab78711c}']
               capabilities: [gpu, compute]
-    # Add CPU quota to fix the cgroup parsing warning
-    cpus: '4.0'
+    # NO CPU quota: the old `cpus: '4.0'` (added to silence a cosmetic
+    # cgroup parsing warning) hard-capped generation whenever a model
+    # partially offloads to CPU — the NORM on a 4GB card, and exactly when
+    # speed matters most. Ollama now uses all host cores when it spills.
+    # Re-add `cpus:` here if this box runs latency-sensitive services that
+    # must not be crowded out.
     healthcheck:
       test: ["CMD", "ollama", "list"]
       interval: 10s

@@ -14,6 +14,14 @@ from backend.models import JobStatus
 # preventing the main process from corrupting the CUDA driver state.
 os.environ.setdefault("CUDA_MODULE_LOADING", "LAZY")
 
+# ── Per-library CPU thread caps ──
+# Applied BEFORE the heavy imports below so the OMP/BLAS env vars bind at
+# import time (torch/cv2 also get runtime setters inside). The pipeline runs
+# several CPU-heavy jobs concurrently; uncapped, each grabs every core and
+# the combined workload thrashes. See backend/services/cpu_threads.py.
+from backend.services.cpu_threads import apply_thread_caps
+apply_thread_caps()
+
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
