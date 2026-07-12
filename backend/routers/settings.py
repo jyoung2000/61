@@ -879,8 +879,21 @@ async def _sync_companion_whisper(comp) -> dict:
         out = {"model": model, "beam_size": beam, "quality": quality}
         changed = False
         if model and model != getattr(settings, "WHISPER_MODEL", ""):
-            settings.WHISPER_MODEL = model
-            changed = True
+            if bool(getattr(settings, "WHISPER_MODEL_USER_SET", False)):
+                # The user PINNED a model in this container's Settings. That
+                # pin is authoritative and rides to the Companion on every
+                # transcription request (X-ClipAI-Whisper-Model) — mirroring
+                # the Companion's currently-loaded model back over it here
+                # silently REVERTED the user's choice (the observed
+                # large-v3 → turbo bounce right after saving), and
+                # _persist_user_settings then wrote the revert to disk.
+                logger.debug(
+                    "Companion whisper sync: keeping user-pinned WHISPER_MODEL=%r "
+                    "(Companion currently runs %r)",
+                    getattr(settings, "WHISPER_MODEL", ""), model)
+            else:
+                settings.WHISPER_MODEL = model
+                changed = True
         if beam > 0 and beam != int(getattr(settings, "WHISPER_BEAM_SIZE", 0) or 0):
             settings.WHISPER_BEAM_SIZE = beam
             changed = True

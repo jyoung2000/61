@@ -868,11 +868,16 @@ pub fn whisper_tier_for_budget(budget_gb: f32) -> (&'static str, &'static str) {
     }
 }
 
-/// Rank a whisper model family: 3=large/turbo, 2=medium, 1=small/base/tiny.
+/// Rank a whisper model family: 4=full large, 3=turbo, 2=medium,
+/// 1=small/base/tiny. Full large-v3 and large-v3-turbo are DIFFERENT tiers —
+/// the old shared rank made a user's explicit large-v3 pick silently coerce
+/// back to turbo, so the model change never "went through".
 fn whisper_rank(name: &str) -> u8 {
     let n = name.to_lowercase();
-    if n.contains("large") || n.contains("turbo") {
+    if n.contains("turbo") {
         3
+    } else if n.contains("large") {
+        4
     } else if n.contains("medium") {
         2
     } else {
@@ -884,14 +889,30 @@ fn whisper_rank(name: &str) -> u8 {
 /// `X-ClipAI-Whisper-Model` header) while never exceeding what the VRAM budget
 /// can fit on this GPU. Keeps the Companion loading the same model family the
 /// ClipAI server picked — so transcription quality matches — but caps it so a
-/// big model can never OOM a small budget. Empty `requested` ⇒ budget default.
+/// big model can never OOM a small budget. Empty `requested` ⇒ budget default
+/// (turbo — the speed-optimal choice stays the default; full large-v3 runs
+/// only when explicitly requested or via quality="max"). An explicit turbo
+/// pick is never upgraded: ranks cap in both directions, preserving the
+/// user's choice.
 pub fn whisper_tier_for_request(requested: &str, budget_gb: f32) -> (&'static str, &'static str) {
     let (cap_model, cap_compute) = whisper_tier_for_budget(budget_gb);
     if requested.trim().is_empty() {
         return (cap_model, cap_compute);
     }
-    let rank = whisper_rank(requested).min(whisper_rank(cap_model));
+    // Budget ceiling by rank. Full large-v3 is ~3.1 GB of fp16 weights plus
+    // beam-search KV — the same ≥8 GB floor the quality="max" upgrade uses.
+    let allowed: u8 = if budget_gb >= 8.0 {
+        4
+    } else if budget_gb >= 6.0 {
+        3
+    } else if budget_gb >= 3.0 {
+        2
+    } else {
+        1
+    };
+    let rank = whisper_rank(requested).min(allowed);
     match rank {
+        4 => ("large-v3", "float16"),
         3 => ("large-v3-turbo", "float16"),
         2 => ("medium", "int8_float16"),
         _ => ("small", "int8_float16"),
@@ -962,5 +983,38 @@ mod tests {
     #[test]
     fn gpu_idle_free_min_defaults_on() {
         assert_eq!(Config::default().gpu_idle_free_min, 3);
+    }
+
+    /// The "model change doesn't go through" bug: an explicit large-v3 pick
+    /// was rank-coerced back to turbo, so the request header changed nothing.
+    #[test]
+    fn requested_full_large_v3_is_honored_on_a_big_budget() {
+        let (model, compute) = whisper_tier_for_request("large-v3", 9.5);
+        assert_eq!(model, "large-v3");
+        assert_eq!(compute, "float16");
+    }
+
+    #[test]
+    fn requested_full_large_v3_caps_to_turbo_on_a_small_budget() {
+        let (model, _) = whisper_tier_for_request("large-v3", 6.5);
+        assert_eq!(model, "large-v3-turbo", "7 GB can't hold full large-v3 + beam KV");
+    }
+
+    #[test]
+    fn requested_turbo_is_never_upgraded() {
+        let (model, _) = whisper_tier_for_request("large-v3-turbo", 12.0);
+        assert_eq!(model, "large-v3-turbo", "an explicit speed pick must stick");
+    }
+
+    #[test]
+    fn empty_request_keeps_the_budget_default() {
+        let (model, _) = whisper_tier_for_request("", 9.5);
+        assert_eq!(model, "large-v3-turbo", "auto stays the speed-optimal turbo");
+    }
+
+    #[test]
+    fn medium_request_stays_medium_regardless_of_budget() {
+        let (model, _) = whisper_tier_for_request("medium", 12.0);
+        assert_eq!(model, "medium");
     }
 }
