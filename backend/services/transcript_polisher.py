@@ -931,6 +931,37 @@ def _note_cloud_fallback_used(model: str) -> None:
         pass
 
 
+async def _evict_model(model: str) -> None:
+    """Unload ``model`` from the primary Ollama host (keep_alive=0).
+
+    Used when the polish pass abandons an auto-upgraded model after batch 0:
+    without an explicit eviction Ollama keeps the (usually partially-offloaded)
+    big model resident for its keep_alive window, and the light model the pass
+    downshifted to gets starved into partial offload beside it. Fail-soft —
+    any error just leaves Ollama's own keep_alive to clean up eventually."""
+    try:
+        import httpx
+        from backend.services import ollama_registry as reg
+        host = await reg.pick_host(required_model=model)
+        if host is None:
+            host = reg.primary_host()
+        if host is None:
+            return
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.post(
+                reg.join_url(host.url, "/api/generate"),
+                headers=reg.auth_headers(host),
+                json={"model": model, "keep_alive": 0},
+            )
+        logger.info(
+            "transcript polishing: evicted abandoned upgrade model %s from "
+            "'%s' (HTTP %s) so the downshifted model gets the whole GPU",
+            model, host.name or host.url, r.status_code)
+    except Exception as e:
+        logger.debug("transcript polishing: eviction of %s skipped (%s)",
+                     model, e)
+
+
 async def _polish_batch(
     orchestrator,
     batch: list[dict],
@@ -1529,7 +1560,17 @@ async def correct_transcript(
                 "%s so every cue still gets polished",
                 _state["model"], _first_latency, _projected_s, _remaining_s,
                 _base_model_override)
+            _too_slow = _state["model"]
             _state["model"] = _base_model_override
+            # EVICT the abandoned upgrade immediately (keep_alive=0). A model
+            # that was too slow for batch 0 was almost certainly partially
+            # offloaded — and Ollama keeps it resident (keep_alive ~10 min,
+            # max_loaded 2), starving the light model we just downshifted to
+            # into partial offload TOO. The observed run: 14b at 90 s/batch →
+            # downshift → the 4b still crawled at ~45 s/batch beside the
+            # resident 14b, and the budget died at 31/62 batches. Fire-and-
+            # forget: eviction failing only means today's (slow) behavior.
+            asyncio.ensure_future(_evict_model(_too_slow))
 
     if len(batches) > 1:
         _sem = asyncio.Semaphore(_conc)

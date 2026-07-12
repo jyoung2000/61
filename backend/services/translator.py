@@ -1171,6 +1171,40 @@ _POLISH_MODEL_PREFERENCE = [
 ]
 
 
+async def _companion_vram_budget_gb() -> float:
+    """The Companion's live Ollama VRAM budget (GB) from its /v1/health, or
+    0.0 when unknown. Cached ~60 s — the budget only moves when the user
+    changes speed settings or the Whisper sidecar starts/stops."""
+    import time as _t
+    global _COMPANION_BUDGET_CACHE
+    now = _t.monotonic()
+    cached_at, cached_val = _COMPANION_BUDGET_CACHE
+    if now - cached_at < 60.0:
+        return cached_val
+    val = 0.0
+    try:
+        from backend.services.reframer_audio import (
+            _remote_whisper_base, _remote_whisper_token,
+        )
+        base = _remote_whisper_base()
+        if base:
+            headers = {}
+            tok = _remote_whisper_token()
+            if tok:
+                headers["Authorization"] = f"Bearer {tok}"
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                r = await client.get(f"{base}/v1/health", headers=headers)
+                if r.status_code == 200:
+                    val = float((r.json() or {}).get("vram_budget_gb", 0) or 0)
+    except Exception:
+        val = 0.0
+    _COMPANION_BUDGET_CACHE = (now, val)
+    return val
+
+
+_COMPANION_BUDGET_CACHE: tuple[float, float] = (-1e9, 0.0)
+
+
 async def resolve_translation_polish_model(fallback: str) -> str:
     """Pick the model for the translation-POLISH (MTPE) pass.
 
@@ -1203,6 +1237,18 @@ async def resolve_translation_polish_model(fallback: str) -> str:
         if not status.online or not status.models:
             return fallback
         vram_gb = ((getattr(host, "vram_total_mb", 0) or 0) / 1024.0)
+        # The registry rarely knows the card size (probe is /api/tags only),
+        # but the Companion's /v1/health reports its LIVE Ollama VRAM budget
+        # (card minus the resident Whisper sidecar + overhead). The observed
+        # failure: 12 GB card, but budget was 7 GB — the auto-picked 14b
+        # partial-offloaded at 90 s/batch and starved the pass. Prefer the
+        # live budget; keep total-VRAM as fallback.
+        try:
+            budget_gb = await _companion_vram_budget_gb()
+            if budget_gb and budget_gb > 0:
+                vram_gb = budget_gb
+        except Exception:
+            pass
         from backend.services.local_models import (
             _ollama_names_match, estimate_model_weights_gb,
         )
@@ -1213,10 +1259,21 @@ async def resolve_translation_polish_model(fallback: str) -> str:
                 continue
             # Respect the host's VRAM when it's known: skip a model that won't
             # fit fully (it would spill to CPU and be slower, not better).
+            # +1.5 GB covers KV cache (num_parallel × num_ctx) + runtime.
+            w = estimate_model_weights_gb(match)
             if vram_gb > 0:
-                w = estimate_model_weights_gb(match)
-                if w is not None and (w + 1.0) > vram_gb:
+                if w is not None and (w + 1.5) > vram_gb:
+                    logger.info(
+                        "Translation polish: skipping %s — %.1f GB weights "
+                        "won't fit the Companion's %.1f GB Ollama budget "
+                        "(would partial-offload and run slower, not better)",
+                        match, w or 0.0, vram_gb)
                     continue
+            elif w is not None and w > float(getattr(
+                    settings, "TRANSLATION_POLISH_UNKNOWN_VRAM_MAX_GB", 6.0)):
+                # Budget unknown: be conservative — an oversized pick costs
+                # minutes (partial offload), an undersized one costs nothing.
+                continue
             if _ollama_names_match(match, fallback):
                 return fallback  # best available IS the light model — no change
             logger.info(

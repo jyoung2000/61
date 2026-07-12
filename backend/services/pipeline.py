@@ -230,7 +230,11 @@ def _build_compute_summary(engine, perception) -> dict:
                                f"GPU ({rem} frames remote, {loc} local fallback)"),
                 }
             else:
-                on_gpu = bool(det_dev) and det_dev != "cpu"
+                # ``det_dev`` is ultralytics-style: the CUDA device INDEX (0,
+                # 1, ...) or the string 'cpu'. ``bool(0)`` is False, so the
+                # old truthiness check reported a GPU detector running on
+                # cuda:0 as "cpu" and fired the scary CPU-fallback warning.
+                on_gpu = det_dev is not None and str(det_dev) != "cpu"
                 _tail = f" ({rem} frames via Companion)" if rem else ""
                 summary["face_detection"] = {
                     "device": "cuda:0" if on_gpu else "cpu",
@@ -1232,6 +1236,17 @@ async def _llm_cleanup_untranslated(segments, source_lang, target_lang,
                 _cache[src_text] = t
             elif t == "":  # previously attempted and failed
                 continue
+            # Same deterministic output failsafes the main translate path
+            # applies — this per-cue recovery bypassed them, and its raw
+            # answers shipped invented "MECA:"/"MIKA:" speaker labels.
+            try:
+                from backend.services.translator import (
+                    clamp_runaway_translation as _rc_clamp,
+                    strip_invented_speaker_labels as _rc_strip,
+                )
+                t = _rc_clamp(_rc_strip(t, src_text), src_text)
+            except Exception:
+                pass
             if glossary:
                 for k, v in glossary.items():
                     ks, vs = (k or "").strip(), (v or "").strip()

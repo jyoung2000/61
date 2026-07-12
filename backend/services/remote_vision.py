@@ -97,6 +97,16 @@ class RemoteVisionDetector:
             if self._healthy:
                 logger.info("Remote vision sidecar available at %s — "
                             "face detection offloads to the Companion GPU", base)
+            elif r.status_code == 404:
+                # The route doesn't exist: this Companion build predates the
+                # vision sidecar. That can't change without an app update, so
+                # stop re-probing every 60 s for the rest of the process
+                # (the observed run logged a 404 every minute, all job long).
+                self._disabled = True
+                logger.info(
+                    "Companion at %s has no vision endpoint (HTTP 404) — its "
+                    "app build predates vision offload. Face detection stays "
+                    "local; update the Companion app to enable offload.", base)
         except Exception:
             self._healthy = False
         return self._healthy

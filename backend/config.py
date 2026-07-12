@@ -1277,6 +1277,10 @@ class Settings(BaseSettings):
     # back to whole sentences under the cap. Ratio 0 disables the clamp.
     TRANSLATION_MAX_EXPANSION_RATIO: float = 4.0
     TRANSLATION_MAX_EXPANSION_CHARS: int = 200
+    # Polish auto-upgrade ceiling when the Companion's VRAM budget can't be
+    # read: only models whose weights fit under this go on the big card blind.
+    # (When /v1/health answers, its live vram_budget_gb is used instead.)
+    TRANSLATION_POLISH_UNKNOWN_VRAM_MAX_GB: float = 6.0
     # Show the LLM translator a few surrounding SOURCE lines (reference only,
     # not re-translated) so pronouns, gender, honorific-driven formality and
     # tense stay consistent across batch boundaries — the biggest lever for
