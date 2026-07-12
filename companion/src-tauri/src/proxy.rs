@@ -514,6 +514,22 @@ async fn vision_health(State(ctx): State<ProxyCtx>, req: Request<Body>) -> Respo
     if !crate::vision::available(&ctx.resource_dir, &ctx.data_dir) {
         return (StatusCode::NOT_FOUND, "no vision sidecar installed").into_response();
     }
+    // Honor the user's Speed settings: eco profile / a small VRAM budget
+    // keep face detection on the ClipAI server (ClipAI treats any non-200
+    // as "stay local", so this degrades silently and safely).
+    {
+        let (profile, budget) = (
+            ctx.state.config.lock().unwrap().speed_profile.clone(),
+            ctx.state.effective_budget_gb(),
+        );
+        if !crate::vision::allowed(&profile, budget) {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "vision offload disabled by speed settings (eco profile or <5 GB budget)",
+            )
+                .into_response();
+        }
+    }
     match crate::vision::ensure_running(
         &ctx.state, ctx.resource_dir.clone(), ctx.data_dir.clone()).await
     {

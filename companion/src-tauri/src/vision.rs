@@ -98,3 +98,36 @@ pub async fn shutdown(state: &AppState, reason: &str) {
         log::info!("vision sidecar stopped ({reason})");
     }
 }
+
+/// Whether the vision offload is allowed under the user's speed settings.
+///
+/// * "eco" reserves the card for other apps — vision stays on the ClipAI
+///   server (exactly the pre-offload behavior).
+/// * The VRAM budget must leave room for YOLO-World (~1 GB) NEXT TO a
+///   concurrent whisper decode (~3 GB fp16 turbo) — below 5 GB the offload
+///   would fight the transcription for memory, so it stays local.
+pub fn allowed(profile: &str, budget_gb: f32) -> bool {
+    profile != "eco" && budget_gb >= 5.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::allowed;
+
+    #[test]
+    fn eco_profile_keeps_vision_local() {
+        assert!(!allowed("eco", 12.0));
+    }
+
+    #[test]
+    fn small_budget_keeps_vision_local() {
+        assert!(!allowed("turbo", 4.0));
+    }
+
+    #[test]
+    fn auto_and_turbo_allow_vision_with_room() {
+        assert!(allowed("auto", 9.5));
+        assert!(allowed("turbo", 9.5));
+        assert!(allowed("balanced", 6.0));
+    }
+}
