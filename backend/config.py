@@ -964,6 +964,19 @@ class Settings(BaseSettings):
     SENTENCE_MERGE_MAX_CUE_S: float = 12.0
     SENTENCE_MERGE_MAX_CHARS: int = 280
 
+    # ── Companion vision offload + model placement ──
+    # Face detection offloads to the Companion's vision sidecar when its
+    # /v1/vision/health answers; otherwise (older Companion, sidecar not
+    # installed, mid-run crash) everything runs locally exactly as before.
+    # The breaker permanently drops to local for the run after this many
+    # consecutive remote failures.
+    REMOTE_VISION_ENABLED: bool = True
+    REMOTE_VISION_TIMEOUT_S: float = 10.0
+    REMOTE_VISION_BREAKER_FAILS: int = 5
+    # Pull the pipeline's Ollama models onto the Companion in the background
+    # when they're missing there (throttled; failures never touch the job).
+    COMPANION_AUTOPULL_MODELS: bool = True
+
     # ── Perceiver acquisition pipelining ──
     # Run all cv2 frame acquisition (seek/grab/read/downscale) on a dedicated
     # reader thread feeding a small bounded queue, so frame I/O overlaps

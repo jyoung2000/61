@@ -1,0 +1,5 @@
+fastapi
+uvicorn
+ultralytics>=8.2
+opencv-python-headless
+numpy

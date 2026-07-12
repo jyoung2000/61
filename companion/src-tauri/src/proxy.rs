@@ -500,6 +500,56 @@ async fn sidecar_warm(State(ctx): State<ProxyCtx>, req: Request<Body>) -> Respon
     (StatusCode::ACCEPTED, "warming").into_response()
 }
 
+/// /v1/vision/health → 200 when the vision sidecar is (or can be) serving.
+/// Lazily STARTS the sidecar: ClipAI only probes this when face detection is
+/// about to run, so the probe doubles as the warm-up. 404 when no vision
+/// binary is installed — ClipAI then keeps detection local, no error.
+async fn vision_health(State(ctx): State<ProxyCtx>, req: Request<Body>) -> Response {
+    if !authorized(&ctx, req.headers()) {
+        return unauthorized();
+    }
+    if ctx.state.config.lock().unwrap().paused {
+        return paused();
+    }
+    if !crate::vision::available(&ctx.resource_dir, &ctx.data_dir) {
+        return (StatusCode::NOT_FOUND, "no vision sidecar installed").into_response();
+    }
+    match crate::vision::ensure_running(
+        &ctx.state, ctx.resource_dir.clone(), ctx.data_dir.clone()).await
+    {
+        Ok(()) => (StatusCode::OK, "ok").into_response(),
+        Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
+    }
+}
+
+/// /v1/vision/detect → forward one frame to the vision sidecar. Any failure
+/// maps to a plain error status; ClipAI's client counts failures and falls
+/// back to local inference (breaker after a few in a row).
+async fn vision_detect(State(ctx): State<ProxyCtx>, req: Request<Body>) -> Response {
+    if !authorized(&ctx, req.headers()) {
+        return unauthorized();
+    }
+    if ctx.state.config.lock().unwrap().paused {
+        return paused();
+    }
+    let body = match axum::body::to_bytes(req.into_body(), 32 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("bad body: {e}")).into_response(),
+    };
+    let upstream = ctx
+        .client
+        .post(format!("{}/v1/vision/detect", crate::vision::vision_url()))
+        .header("content-type", "application/json")
+        .body(body.to_vec())
+        .send()
+        .await;
+    match upstream {
+        Ok(resp) => relay(resp),
+        Err(e) => (StatusCode::BAD_GATEWAY, format!("vision sidecar failed: {e}"))
+            .into_response(),
+    }
+}
+
 /// /v1/gpu/release → free the WHOLE GPU on request: whisper sidecar stopped
 /// (skipped, never killed, when a decode holds the slot) AND every resident
 /// Ollama model evicted. The full-scope sibling of /v1/sidecar/release, for
@@ -910,6 +960,8 @@ fn build_router(ctx: ProxyCtx) -> Router {
         .route("/v1/progress", post(progress_report))
         .route("/v1/sidecar/release", post(sidecar_release))
         .route("/v1/sidecar/warm", post(sidecar_warm))
+        .route("/v1/vision/health", get(vision_health))
+        .route("/v1/vision/detect", post(vision_detect))
         .route("/v1/gpu/release", post(gpu_release))
         .route("/v1/audio/transcriptions", post(whisper_proxy))
         .route("/ollama", any(ollama_proxy))

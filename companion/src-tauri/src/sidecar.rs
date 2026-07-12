@@ -549,6 +549,7 @@ pub async fn free_gpu(state: &Arc<AppState>, reason: &str) -> (bool, usize) {
         }
         drop(permit);
     }
+    crate::vision::shutdown(state, reason).await;
     let (n, names) = crate::ollama::unload_all().await;
     if whisper_stopped || n > 0 {
         log::info!(

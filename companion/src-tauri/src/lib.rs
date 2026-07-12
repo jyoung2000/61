@@ -12,6 +12,7 @@ pub mod pairing;
 pub mod proxy;
 pub mod sidecar;
 pub mod state;
+pub mod vision;
 
 use serde::Deserialize;
 use state::AppState;

@@ -3757,6 +3757,14 @@ async def run_analysis(job_id: str, resume: bool = False):
     # disk). Fire-and-forget and fail-soft: a trends problem must never slow
     # or fail the pipeline.
     _warm_seo_intelligence(job_id)
+    # Make sure the Companion actually HAS the models the LLM stages want —
+    # the registry prefers it, but only for installed models; a missing
+    # llava/qwen silently lands those stages on the small local card.
+    try:
+        from backend.services.companion_models import ensure_companion_models
+        ensure_companion_models(job_id)
+    except Exception:
+        pass
 
     # Broadcast immediately so the Analysis page shows status while waiting
     # for the semaphore (especially when another analysis is already running)
