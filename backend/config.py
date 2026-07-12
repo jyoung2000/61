@@ -955,6 +955,15 @@ class Settings(BaseSettings):
     # running after it. False restores the fully sequential local order.
     DIARIZE_CONCURRENT_WITH_FACES: bool = True
 
+    # ── Sentence-merge ceilings ──
+    # resegment_by_sentence merges same-speaker neighbours before re-splitting
+    # at sentence boundaries — but unpunctuated ASR can't be re-split, so an
+    # uncapped merge chain produced 30-40 s paragraph cues in the shipped
+    # subtitles. No merge may exceed these; longer content stays as separate
+    # cues (the readability enforcer still merges/extends within ITS caps).
+    SENTENCE_MERGE_MAX_CUE_S: float = 12.0
+    SENTENCE_MERGE_MAX_CHARS: int = 280
+
     # ── Perceiver acquisition pipelining ──
     # Run all cv2 frame acquisition (seek/grab/read/downscale) on a dedicated
     # reader thread feeding a small bounded queue, so frame I/O overlaps

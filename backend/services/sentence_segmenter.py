@@ -329,11 +329,27 @@ def resegment_by_sentence(segments: list) -> list:
     #    same-speaker cues is a natural cue boundary; welding across it is
     #    what produced the incoherent multi-utterance lines).
     _, _, _, _turn_pause_s = _pause_split_params()
+    from backend.config import settings
+    _max_merge_s = float(getattr(settings, "SENTENCE_MERGE_MAX_CUE_S", 12.0))
+    _max_merge_chars = int(getattr(settings, "SENTENCE_MERGE_MAX_CHARS", 280))
     merged: list[TranscriptSegment] = []
     for s in segs:
         _gap_ok = (not merged
                    or (float(s.start or 0) - float(merged[-1].end or 0))
                    < _turn_pause_s)
+        # Never merge past a duration/length ceiling: the re-split below relies
+        # on sentence terminators, and unpunctuated ASR (raw Japanese cues
+        # before polish) can't be re-split — an uncapped same-speaker chain
+        # with <0.7 s gaps produced 30-40 s paragraph cues that survived all
+        # the way into the export (950 → 488 pre-translate collapse). Capping
+        # the merge keeps worst-case cues subtitle-sized even when the
+        # sentence splitter has nothing to split on.
+        if merged and _gap_ok and (merged[-1].speaker or "") == (s.speaker or ""):
+            _cand_dur = float(s.end or 0) - float(merged[-1].start or 0)
+            _cand_len = len((merged[-1].text or "")) + len((s.text or ""))
+            if _cand_dur > _max_merge_s or _cand_len > _max_merge_chars:
+                merged.append(s)
+                continue
         if merged and _gap_ok and (merged[-1].speaker or "") == (s.speaker or ""):
             prev = merged[-1]
             is_cjk = _is_cjk((prev.text or "") + (s.text or ""))

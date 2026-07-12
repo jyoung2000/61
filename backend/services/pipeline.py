@@ -3131,6 +3131,34 @@ async def _background_post_processing(
                     "%d segments%s)",
                     job_id, target_lang, len(translated),
                     ", source-aligned" if _src_texts is not None else "")
+                # Route the post-edit to the best registry host that actually
+                # HAS the polish model (the Companion GPU when paired). The
+                # observed run polished at ~21 s/batch and exhausted its 600 s
+                # budget with 307/488 cues left raw — consistent with the
+                # provider sitting on a failed-over/local host where the 4B
+                # model spills to CPU — while the translate pass on the
+                # Companion ran ~10× faster. Explicit + logged so the next
+                # log names the serving host either way.
+                try:
+                    _pol_model = _resolve_polish_model_override(orchestrator)
+                    _oll_prov = getattr(orchestrator, "_providers", {}).get("ollama")
+                    if _pol_model and _oll_prov is not None and hasattr(_oll_prov, "_host"):
+                        from backend.services import ollama_registry as _poreg
+                        _ph = await _poreg.pick_host(required_model=_pol_model)
+                        if _ph is not None:
+                            if str(_ph.url) != str(_oll_prov._host):
+                                logger.info(
+                                    "[%s] AI post-edit host re-pinned: %s → %s "
+                                    "(first healthy host with %s)",
+                                    job_id, _oll_prov._host, _ph.url, _pol_model)
+                                _oll_prov._host = _ph.url
+                            else:
+                                logger.info(
+                                    "[%s] AI post-edit host: %s (has %s)",
+                                    job_id, _ph.name or _ph.url, _pol_model)
+                except Exception as _ph_err:
+                    logger.debug("[%s] post-edit host pin skipped: %s",
+                                 job_id, _ph_err)
                 try:
                     _pol = await asyncio.wait_for(
                         _mtpe(

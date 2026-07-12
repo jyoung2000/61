@@ -373,3 +373,22 @@ def test_recover_logs_summary_on_success(monkeypatch, tmp_path):
     assert out[0]["start_sec"] == pytest.approx(4.9, abs=0.01)
     assert out[0]["source"] == "gap_recovery"
     assert any("Gap recovery finished: 2 cue(s)" in l for l in log.lines), log.lines
+
+
+def test_resegment_merge_respects_duration_cap():
+    """Unpunctuated same-speaker chains must not weld into paragraph cues —
+    the 2026-07-12 run merged 950 → 488 with 30-40 s blobs that survived to
+    the export. No merged cue may exceed SENTENCE_MERGE_MAX_CUE_S."""
+    from backend.services.sentence_segmenter import resegment_by_sentence
+    from backend.config import settings as _s
+    cap = float(getattr(_s, "SENTENCE_MERGE_MAX_CUE_S", 12.0))
+    # 20 unpunctuated 2.5s cues, 0.1s gaps, same speaker: an uncapped merge
+    # would produce one ~50s cue that nothing downstream can re-split.
+    segs = [{"start": i * 2.6, "end": i * 2.6 + 2.5,
+             "text": "これはテストの発話です", "speaker": "S1"}
+            for i in range(20)]
+    out = resegment_by_sentence(segs)
+    assert len(out) >= 4
+    for s in out:
+        assert (s.end - s.start) <= cap + 2.6, (
+            f"cue {s.start}-{s.end} exceeds the merge cap")
