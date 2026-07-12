@@ -126,3 +126,37 @@ def test_companion_models_throttles(monkeypatch):
     # A second _ensure within the throttle window must not re-pull — covered
     # implicitly by the timestamp guard; just pin the constant is sane.
     assert cm.THROTTLE_S >= 3600
+
+
+def test_compute_summary_shows_face_detection():
+    """The Compute indicator must show face detection's device — the old
+    perception.face_detector read was never attached, so the row silently
+    vanished from every run."""
+    from backend.services.pipeline import _build_compute_summary
+
+    p = types.SimpleNamespace(detection_device="cuda:0",
+                              detection_remote_frames=0,
+                              detection_local_frames=1745)
+    s = _build_compute_summary(types.SimpleNamespace(), p)
+    assert s["face_detection"]["device"] == "cuda:0"
+
+    p2 = types.SimpleNamespace(detection_device="cuda:0",
+                               detection_remote_frames=1700,
+                               detection_local_frames=45)
+    s2 = _build_compute_summary(types.SimpleNamespace(), p2)
+    assert s2["face_detection"]["device"] == "cuda:companion"
+    assert "1700 frames remote" in s2["face_detection"]["detail"]
+
+    p3 = types.SimpleNamespace(detection_device="cpu",
+                               detection_remote_frames=0,
+                               detection_local_frames=10)
+    s3 = _build_compute_summary(types.SimpleNamespace(), p3)
+    assert s3["face_detection"]["device"] == "cpu"
+
+
+def test_perceiver_stashes_detection_telemetry():
+    import inspect
+    from backend.services import reframer_perceiver as rp
+    src = inspect.getsource(rp)
+    assert "r.detection_device" in src
+    assert "r.detection_remote_frames" in src

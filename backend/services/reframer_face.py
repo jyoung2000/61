@@ -377,7 +377,9 @@ class FaceDetector:
                 conf=float(kwargs.get('conf', 0.25)),
                 max_det=int(kwargs.get('max_det', 20)))
             if _res is not None:
+                self._remote_frames = getattr(self, '_remote_frames', 0) + 1
                 return _res
+        self._local_frames = getattr(self, '_local_frames', 0) + 1
         try:
             return self._yolo_model.predict(*args, device=self._yolo_device, **kwargs)
         except Exception as e:

@@ -1051,6 +1051,16 @@ class Perceiver:
         # summary (u2netp vs spectral-stack vs spectral usage over the clip).
         r.saliency_source_counts = dict(self._saliency_source_counts)
 
+        # Face-detection compute telemetry for the Compute card. The card
+        # used to read ``perception.face_detector`` — an attribute that was
+        # never attached to the RESULT (the detector lives on the Perceiver
+        # and its models are released before the pipeline reads it), so the
+        # face-detection row silently never appeared. Stash plain values.
+        fd = getattr(self, 'face_detector', None)
+        r.detection_device = getattr(fd, '_yolo_device', None) if fd else None
+        r.detection_remote_frames = int(getattr(fd, '_remote_frames', 0) or 0) if fd else 0
+        r.detection_local_frames = int(getattr(fd, '_local_frames', 0) or 0) if fd else 0
+
         return r
 
     def _release_perception_models(self) -> None:

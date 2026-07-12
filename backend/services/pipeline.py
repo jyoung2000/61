@@ -213,16 +213,30 @@ def _build_compute_summary(engine, perception) -> dict:
     except Exception:
         pass
 
-    # YOLO-World subject detector (reframer perceiver)
+    # Face detection (YuNet + YOLO-World). Reads the plain telemetry the
+    # perceiver stashes on the RESULT — the old ``perception.face_detector``
+    # attribute was never attached to the result object, so this row
+    # silently never appeared in the Compute card (the reported bug: "face
+    # detection does not show on the GPU pipeline diagnostic indicator").
     try:
-        fd = getattr(perception, "face_detector", None)
-        yolo_dev = getattr(fd, "_yolo_device", None) if fd is not None else None
-        if yolo_dev is not None:
-            on_gpu = yolo_dev != "cpu"
-            summary["yolo_world"] = {
-                "device": "cuda:0" if on_gpu else "cpu",
-                "detail": "YOLO-World v2 scene-aware subject detector",
-            }
+        det_dev = getattr(perception, "detection_device", None)
+        rem = int(getattr(perception, "detection_remote_frames", 0) or 0)
+        loc = int(getattr(perception, "detection_local_frames", 0) or 0)
+        if det_dev is not None or rem or loc:
+            if rem and rem >= loc:
+                summary["face_detection"] = {
+                    "device": "cuda:companion",
+                    "detail": (f"YuNet + YOLO-World offloaded to the Companion "
+                               f"GPU ({rem} frames remote, {loc} local fallback)"),
+                }
+            else:
+                on_gpu = bool(det_dev) and det_dev != "cpu"
+                _tail = f" ({rem} frames via Companion)" if rem else ""
+                summary["face_detection"] = {
+                    "device": "cuda:0" if on_gpu else "cpu",
+                    "detail": "YuNet + YOLO-World scene-aware subject "
+                              f"detector{_tail}",
+                }
     except Exception:
         pass
 
