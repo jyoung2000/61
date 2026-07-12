@@ -469,15 +469,32 @@ async fn sidecar_warm(State(ctx): State<ProxyCtx>, req: Request<Body>) -> Respon
         return paused();
     }
     let requested_model = header_str(req.headers(), "x-clipai-whisper-model");
+    // Record the warm as REAL work (kind "whisper", not a probe): it stamps
+    // the idle clock so the reaper backstop on a long-idle machine can't
+    // shut the freshly warmed sidecar down before the job's first heartbeat
+    // arrives — and it shows up in the activity feed.
+    let activity = ctx.state.begin_activity(
+        "whisper",
+        "/v1/sidecar/warm",
+        &header_str(req.headers(), "x-clipai-job-id"),
+        &header_str(req.headers(), "x-clipai-job-title"),
+        &header_str(req.headers(), "x-clipai-stage"),
+    );
     let state = ctx.state.clone();
     let rd = ctx.resource_dir.clone();
     let dd = ctx.data_dir.clone();
     tauri::async_runtime::spawn(async move {
         match crate::sidecar::ensure_running(&state, rd, dd, &requested_model).await {
-            Ok(model) => log::info!(
-                "whisper sidecar pre-warmed (model={model}) — ready before the audio arrives"
-            ),
-            Err(e) => log::warn!("whisper sidecar pre-warm failed (non-fatal): {e}"),
+            Ok(model) => {
+                state.end_activity(activity, 200);
+                log::info!(
+                    "whisper sidecar pre-warmed (model={model}) — ready before the audio arrives"
+                );
+            }
+            Err(e) => {
+                state.end_activity(activity, 502);
+                log::warn!("whisper sidecar pre-warm failed (non-fatal): {e}");
+            }
         }
     });
     (StatusCode::ACCEPTED, "warming").into_response()

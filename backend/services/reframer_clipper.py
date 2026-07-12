@@ -3555,8 +3555,15 @@ class ClipExtractor:
             # to reject images — the observed run paid them for all 130
             # candidates (a 2 h source, ~4 seeks each) while every judgement
             # after the first was text-only anyway. That waste is what blew
-            # the 240 s budget at 43/130 judged.
-            if getattr(judge, "_vision_unsupported", False):
+            # the 240 s budget at 43/130 judged. A FallbackJudge wraps the
+            # real judges, so check the wrapper AND its inner judges.
+            _vision_off = any(
+                getattr(j, "_vision_unsupported", False)
+                for j in (judge, getattr(judge, "primary", None),
+                          getattr(judge, "fallback", None))
+                if j is not None
+            )
+            if _vision_off:
                 keyframes = []
             else:
                 keyframes = _extract_keyframes_b64(

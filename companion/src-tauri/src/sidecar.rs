@@ -592,6 +592,19 @@ pub fn spawn_idle_reaper(state: Arc<AppState>) {
             if inflight {
                 continue;
             }
+            // An ACTIVE ClipAI job (fresh /v1/progress heartbeats, sent every
+            // ~1.5 s while a job runs) means the GPU is about to be needed —
+            // do NOT idle-free mid-job. The observed failure: the 3-min free
+            // fired during the container's local extraction stage, evicting
+            // the models (and the pre-warmed whisper sidecar) minutes before
+            // the pipeline needed them, forcing cold reloads mid-job. ClipAI
+            // still hands VRAM around explicitly (/v1/sidecar/release after
+            // transcription), and the job-ended grace free + these reapers
+            // (heartbeats go stale 45 s after a dead container) remain the
+            // cleanup for every other case.
+            if state.reported_job_fresh().is_some() {
+                continue;
+            }
             let now = crate::state::now_ms();
 
             // Whole-GPU auto-free (whisper + Ollama), once per idle period.

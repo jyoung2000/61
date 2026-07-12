@@ -230,12 +230,16 @@ def test_judge_skips_keyframes_when_vision_unsupported():
     import inspect
     from backend.services import reframer_clipper as rc
     src = inspect.getsource(rc)
-    # The worker must consult the judge's vision flag BEFORE paying the
-    # 4-ffmpeg-seek keyframe extraction.
+    # The worker must consult the judge's vision flag (including a
+    # FallbackJudge's INNER judges) BEFORE paying the 4-ffmpeg-seek keyframe
+    # extraction.
     assert '_vision_unsupported' in src
-    idx_gate = src.find('if getattr(judge, "_vision_unsupported", False)')
+    idx_gate = src.find('getattr(j, "_vision_unsupported", False)')
     idx_extract = src.find("_extract_keyframes_b64(\n                    self.video_path")
     assert idx_gate != -1 and idx_extract != -1 and idx_gate < idx_extract
+    # The gate must inspect the wrapper's primary/fallback, not just the top
+    # object — a FallbackJudge never carries the flag itself.
+    assert 'getattr(judge, "primary", None)' in src
 
 
 # ─────────────────────────────────────────────────────────────────────────────
