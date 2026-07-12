@@ -32,6 +32,38 @@ from backend.services.reframer_diarizer import SpeakerDiarizer
 logger = logging.getLogger("clipai.reframer_perceiver")
 
 
+def _emit_txn_event(on_progress, hint: str) -> None:
+    """Send a transcription-lifecycle phase hint through the engine progress
+    callback so the FRONTEND Processing Log shows Whisper starting and
+    completing (these events previously lived only in the server log, so a
+    fast concurrent decode looked identical to a skipped one). Fail-soft:
+    a legacy single-arg callback or any error is ignored."""
+    if on_progress is None:
+        return
+    try:
+        on_progress(1.0, hint)
+    except TypeError:
+        pass
+    except Exception:
+        pass
+
+
+def _txn_done_hint(audio_result) -> str:
+    """Build a ``txn_done:<segments>:<lang>:<coverage_pct>`` hint from an
+    audio result dict."""
+    r = audio_result or {}
+    n = len(r.get('segments') or [])
+    lang = str(r.get('language') or '')
+    cov = ''
+    try:
+        _st = r.get('speech_coverage') or {}
+        if _st.get('coverage_ratio') is not None:
+            cov = str(int(round(100 * float(_st['coverage_ratio']))))
+    except Exception:
+        cov = ''
+    return f"txn_done:{n}:{lang}:{cov}"
+
+
 class Perceiver:
     """
     Stage 1: Extract faces, scenes, motion from video.
@@ -214,6 +246,7 @@ class Perceiver:
                 'PERCEIVE',
                 'Remote Whisper transcription started CONCURRENTLY with face '
                 'detection (runs on the Companion GPU — no local VRAM contention)')
+            _emit_txn_event(on_progress, 'txn_started')
 
         # ── Optimization #2: overlap speaker diarization with the visual pass ──
         # Diarization is audio-only — it doesn't need faces or the transcript
@@ -889,6 +922,7 @@ class Perceiver:
                 log.log_stage('PERCEIVE',
                               'Remote Whisper transcript ready (ran concurrently '
                               'with face detection)')
+                _emit_txn_event(on_progress, _txn_done_hint(_res))
             else:
                 # Concurrent remote attempt failed/deferred — run the normal
                 # (local-capable) pass sequentially now that the local GPU is
@@ -901,6 +935,7 @@ class Perceiver:
                     log.log_stage('PERCEIVE',
                                   'Remote transcription deferred — running the '
                                   'sequential pass now (local GPU is free)')
+                _emit_txn_event(on_progress, 'txn_failed')
 
         if not _txn_done:
             # Local Whisper is about to claim the GPU — the concurrent
@@ -920,11 +955,17 @@ class Perceiver:
                 except Exception:
                     _stem_path = None
             if self.audio_intel.try_load():
-                _apply_audio_result(self.audio_intel.transcribe(
+                _emit_txn_event(on_progress, 'txn_started')
+                _seq_res = self.audio_intel.transcribe(
                     self.path, r.duration_ms,
                     language=self.source_language,
                     on_progress=on_progress,
-                    audio_path_override=_stem_path))
+                    audio_path_override=_stem_path)
+                _apply_audio_result(_seq_res)
+                _emit_txn_event(
+                    on_progress,
+                    _txn_done_hint(_seq_res)
+                    if (_seq_res or {}).get('segments') else 'txn_failed')
 
         # ── Speaker diarization (audio-based) ──
         # Phase hint: diarization can run for many minutes with no per-item

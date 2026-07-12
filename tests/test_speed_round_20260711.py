@@ -292,3 +292,26 @@ def test_speed_round_config_defaults():
     assert f["NMT_BATCH_SIZE"].default == 32
     assert f["NMT_CT2_INTER_THREADS"].default == 0
     assert f["CLIP_EXPORT_CONCURRENCY"].default == 3
+
+
+def test_txn_lifecycle_hints():
+    """Whisper start/complete must surface as frontend Processing Log events
+    — a fast concurrent decode previously looked identical to a skipped one."""
+    from backend.services.reframer_perceiver import _txn_done_hint, _emit_txn_event
+    h = _txn_done_hint({"segments": [1, 2, 3], "language": "ja",
+                        "speech_coverage": {"coverage_ratio": 0.86}})
+    assert h == "txn_done:3:ja:86"
+    assert _txn_done_hint(None) == "txn_done:0::"
+    seen = []
+    _emit_txn_event(lambda f, hint: seen.append(hint), "txn_started")
+    assert seen == ["txn_started"]
+    _emit_txn_event(lambda f: seen.append("legacy"), "txn_started")  # no raise
+    _emit_txn_event(None, "txn_started")                             # no raise
+
+
+def test_pipeline_relays_txn_hints_to_frontend():
+    import inspect
+    from backend.services import pipeline as pl
+    src = inspect.getsource(pl)
+    assert "if hint.startswith('txn_')" in src
+    assert "Transcription complete" in src

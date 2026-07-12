@@ -4784,6 +4784,34 @@ async def _run_analysis_inner(job_id: str, resume: bool = False):
         frac = max(0.0, min(1.0, frac))
         hint = str(pargs[1]) if len(pargs) > 1 and pargs[1] else ""
 
+        # Transcription lifecycle events → visible Processing Log steps.
+        # These used to live only in the server log ([AUDIO] lines), so the
+        # frontend showed the WHISPER stage flip past in seconds with no
+        # evidence transcription ran — indistinguishable from the run where
+        # it genuinely produced nothing. Broadcast-only (no % write), so the
+        # concurrent face-percent flow can't go backwards.
+        if hint.startswith('txn_'):
+            if hint == 'txn_started':
+                _ev = "Whisper transcription started (runs concurrently with face detection)"
+            elif hint.startswith('txn_done:'):
+                _p = (hint.split(':') + ["", "", ""])[1:4]
+                _ev = f"✓ Transcription complete — {_p[0]} segments"
+                if _p[1]:
+                    _ev += f" [{_p[1]}]"
+                if _p[2]:
+                    _ev += f", {_p[2]}% speech coverage"
+            else:   # txn_failed / txn_deferred
+                _ev = ("⚠ Remote transcription did not return a usable "
+                       "transcript — falling back")
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    broadcast_ws(job_id, {"type": "status", "message": _ev}),
+                    _loop,
+                )
+            except Exception:
+                pass
+            return
+
         pct_int = None
         msg = ""
         hb_label = ""
