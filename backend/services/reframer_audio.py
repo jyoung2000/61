@@ -777,12 +777,33 @@ class RemoteWhisperEngine:
     whisper.cpp server (``--inference-path /v1/audio/transcriptions``).
     """
 
-    TIMEOUT_S = 600  # generous — a 2 h WAV upload + decode on the LAN
+    # Base request timeout. The REAL per-request timeout scales with the
+    # audio duration (see _timeout_for) — a fixed 600 s ceiling silently
+    # killed every whole-file decode longer than ~40 min of audio: the
+    # observed 128-min video needs ~25-30 min on turbo (more on full
+    # large-v3), the client abandoned the request at 10 min, the retries
+    # collided with the Companion still decoding the abandoned job, and the
+    # whole pipeline continued WITHOUT a transcript.
+    TIMEOUT_S = 600
 
     def __init__(self, model: str = ""):
         self.base = _remote_whisper_base()
         self.model = model
         self.api_key = _remote_whisper_token()
+
+    @staticmethod
+    def _timeout_for(wav_bytes: bytes) -> float:
+        """Request timeout scaled to the payload's audio duration.
+
+        16 kHz mono s16 PCM ⇒ 32,000 bytes/second. Budget one×realtime of
+        decode per audio second (full large-v3 beam-5 runs ~0.5-0.7×RT on a
+        mid-range GPU; turbo ~0.25) plus a base for upload + model load,
+        clamped to a hard cap. Every knob has a config override."""
+        base = float(getattr(settings, "WHISPER_REMOTE_TIMEOUT_BASE_S", 600.0))
+        per_min = float(getattr(settings, "WHISPER_REMOTE_TIMEOUT_PER_AUDIO_MIN_S", 60.0))
+        cap = float(getattr(settings, "WHISPER_REMOTE_TIMEOUT_MAX_S", 10800.0))
+        audio_min = len(wav_bytes) / 32000.0 / 60.0
+        return max(base, min(cap, base + audio_min * per_min))
 
     def _headers(self) -> dict:
         headers = {}
@@ -801,7 +822,7 @@ class RemoteWhisperEngine:
     MIN_CHUNK_SECONDS = 120     # don't chunk finer than this
 
     def _post_wav(self, wav_bytes: bytes, filename: str, data: dict,
-                  headers: dict) -> tuple:
+                  headers: dict, timeout_s: Optional[float] = None) -> tuple:
         """ONE upload attempt with an EXACT Content-Length — the body is bytes
         in memory, so it can never race a file that's still being written (the
         "Too much data for declared Content-Length" failure). Returns
@@ -811,7 +832,8 @@ class RemoteWhisperEngine:
             files = {"file": (filename, wav_bytes, "audio/wav")}
             resp = httpx.post(
                 f"{self.base}/v1/audio/transcriptions",
-                headers=headers, data=data, files=files, timeout=self.TIMEOUT_S)
+                headers=headers, data=data, files=files,
+                timeout=timeout_s if timeout_s else self.TIMEOUT_S)
         except Exception as e:  # network / connection reset / timeout
             return (False, None, True, f"{type(e).__name__}: {str(e)[:120]}", 0.0)
         if resp.status_code == 200:
@@ -834,12 +856,23 @@ class RemoteWhisperEngine:
                             headers: dict, language, model,
                             offset_s: float = 0.0) -> Optional[dict]:
         """Upload one WAV payload with retries + backoff; map to the local
-        schema and shift timestamps by ``offset_s`` (for chunked uploads)."""
+        schema and shift timestamps by ``offset_s`` (for chunked uploads).
+
+        The request timeout scales with the payload's audio duration, and a
+        503-busy answer waits WITHOUT consuming an upload attempt (bounded by
+        its own patience budget): the GPU finishing another decode is not an
+        upload failure, and burning the 3 attempts on instant 503s is exactly
+        how a long video ended transcript-less."""
         from backend.services.cloud_transcription import _map_verbose_json
         last = ""
-        for attempt in range(1, self.UPLOAD_RETRIES + 1):
+        timeout_s = self._timeout_for(wav_bytes)
+        busy_budget_s = float(getattr(settings, "WHISPER_REMOTE_BUSY_WAIT_S", 600.0))
+        busy_waited = 0.0
+        attempt = 0
+        while attempt < self.UPLOAD_RETRIES:
+            attempt += 1
             ok, payload, retryable, detail, retry_after = self._post_wav(
-                wav_bytes, filename, data, headers)
+                wav_bytes, filename, data, headers, timeout_s=timeout_s)
             if ok:
                 segs = _map_verbose_json(payload) or []
                 if offset_s:
@@ -856,6 +889,19 @@ class RemoteWhisperEngine:
             last = detail
             if not retryable:
                 break
+            if "503" in detail and busy_waited < busy_budget_s:
+                # Busy is patience, not failure: the GPU is finishing another
+                # decode (possibly one WE abandoned on a timeout). Wait it out
+                # on its own budget and DON'T consume an upload attempt.
+                wait = retry_after if retry_after > 0 else 10.0
+                busy_waited += wait
+                attempt -= 1
+                logger.info(
+                    "Remote Whisper busy (503) — waiting %.0fs (%.0f/%.0fs busy "
+                    "budget) without consuming a retry", wait, busy_waited,
+                    busy_budget_s)
+                _time.sleep(wait)
+                continue
             if attempt < self.UPLOAD_RETRIES:
                 wait = retry_after if retry_after > 0 else min(8.0, 1.5 * attempt)
                 logger.info("Remote Whisper upload attempt %d/%d failed (%s) — "
@@ -979,6 +1025,10 @@ class RemoteWhisperEngine:
                            audio_path, e)
             return None
 
+        logger.info(
+            "Remote Whisper upload: %.1f MB (%.0f min audio) — request timeout %.0fs",
+            len(wav_bytes) / (1024 * 1024), len(wav_bytes) / 32000.0 / 60.0,
+            self._timeout_for(wav_bytes))
         result = self._transcribe_payload(
             wav_bytes, os.path.basename(audio_path), data, headers, language, model)
         if result is None:

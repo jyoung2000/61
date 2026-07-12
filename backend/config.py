@@ -344,6 +344,18 @@ class Settings(BaseSettings):
     # Override the boost chain (blank = the tuned default:
     # highpass=f=80,afftdn=nf=-25,speechnorm=e=6.25:r=0.0001:l=1).
     SPEECH_GAP_BOOST_FILTER: str = ""
+    # ── Remote Whisper transport budgets ──
+    # Per-request timeout = BASE + audio_minutes × PER_AUDIO_MIN, capped at
+    # MAX. The old fixed 600 s ceiling silently killed every whole-file decode
+    # longer than ~40 min of audio (large-v3 beam-5 runs ~0.5-0.7× realtime;
+    # turbo ~0.25×) — the job then continued WITHOUT a transcript. One×realtime
+    # per audio minute covers the slowest supported model with margin.
+    WHISPER_REMOTE_TIMEOUT_BASE_S: float = 600.0
+    WHISPER_REMOTE_TIMEOUT_PER_AUDIO_MIN_S: float = 60.0
+    WHISPER_REMOTE_TIMEOUT_MAX_S: float = 10800.0
+    # How long a 503-busy Companion is waited out (its GPU finishing another
+    # decode) before it counts against the upload retries.
+    WHISPER_REMOTE_BUSY_WAIT_S: float = 600.0
     # Companion/cloud no_speech_prob above which a returned cue is treated as a
     # hallucination and dropped. Raise toward 0.85 to KEEP more breathy/quiet
     # dialogue (fewer drops = more coverage, slightly more risk of a phantom).
