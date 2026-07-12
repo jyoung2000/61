@@ -295,6 +295,84 @@ async def _translation_batch_concurrency() -> int:
         return 1
 
 
+# ── Deterministic per-line output sanitizers (LLM translation failsafes) ────
+# Small local translators occasionally emit screenplay formatting ("MECA: ...",
+# "Mechanoid: ...") for plain dialogue, and sometimes free-run past the source
+# line into a paragraph of invented continuation (a hallucination-loop source
+# region translated "creatively"). Both are deterministic to detect against the
+# source line, so fix them here instead of hoping a later LLM pass does.
+
+# A speaker-label token: one capitalized word (or an ALL-CAPS tag) + colon.
+_SPK_LABEL = r"(?:[A-Z][\w'’.-]{1,20}|[A-Z]{2,8})"
+_SPK_LEAD_RE = re.compile(rf"^\s*{_SPK_LABEL}:\s+")
+_SPK_MID_RE = re.compile(rf"([.!?…]\s+){_SPK_LABEL}:\s+")
+_SENT_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+")
+
+
+def strip_invented_speaker_labels(text: str, source: str) -> str:
+    """Remove screenplay-style ``Name:`` labels the model invented.
+
+    Only fires when the SOURCE line contains no colon (ASCII or fullwidth) —
+    a colon construct in the translation of a colon-free source is model-added
+    formatting, not content. Leading labels and labels re-appearing after
+    sentence punctuation are both stripped. Fail-soft: never empties a cue.
+    """
+    if not text:
+        return text
+    src = source or ""
+    if ":" in src or "：" in src:
+        return text
+    out = _SPK_LEAD_RE.sub("", text)
+    out = _SPK_MID_RE.sub(r"\1", out)
+    out = out.strip()
+    return out if out else text
+
+
+def clamp_runaway_translation(text: str, source: str) -> str:
+    """Cut a translation that ballooned far past its source line.
+
+    A subtitle translation legitimately expands ~2–2.5× when going CJK→Latin;
+    beyond ``TRANSLATION_MAX_EXPANSION_RATIO`` (default 4×, with a
+    ``TRANSLATION_MAX_EXPANSION_CHARS`` floor of 200 so short lines are never
+    touched) the tail is a model free-run, not a translation — the observed
+    failure shipped a ~1400-char paragraph in a 5-second cue. Whole sentences
+    are kept up to the cap; the first sentence always survives."""
+    if not text:
+        return text
+    src_len = len((source or "").strip())
+    try:
+        floor = int(getattr(settings, "TRANSLATION_MAX_EXPANSION_CHARS", 200))
+        ratio = float(getattr(settings, "TRANSLATION_MAX_EXPANSION_RATIO", 4.0))
+    except (TypeError, ValueError):
+        floor, ratio = 200, 4.0
+    if ratio <= 0:      # explicit off switch
+        return text
+    cap = max(floor, int(src_len * ratio))
+    if len(text) <= cap:
+        return text
+    kept: list[str] = []
+    used = 0
+    for sent in _SENT_SPLIT_RE.split(text.strip()):
+        if kept and used + len(sent) + 1 > cap:
+            break
+        kept.append(sent)
+        used += len(sent) + 1
+    out = " ".join(kept).strip()
+    if len(out) > cap:
+        # The FIRST "sentence" alone blew the cap (an unbroken run-on) — hard
+        # cut at the last word boundary under the cap.
+        cut = out[:cap]
+        sp = cut.rfind(" ")
+        out = (cut[:sp] if sp > cap // 2 else cut).rstrip()
+    if not out:
+        out = text[:cap].rstrip()
+    logger.warning(
+        "Translation runaway clamped: %d chars for a %d-char source line "
+        "(cap %d) — kept %d chars of whole sentences",
+        len(text), src_len, cap, len(out))
+    return out
+
+
 async def translate_via_llm(
     segments: list,
     source_language: str,
@@ -437,6 +515,13 @@ async def translate_via_llm(
         built = []
         for seg, tr in zip(batch, translations):
             txt = (tr or "").strip() or _txt(seg)
+            # Deterministic failsafes against small-model output artifacts:
+            # invented "Name:" screenplay labels and free-run continuations
+            # that balloon one cue into a paragraph (both verified against
+            # the source line, so real content is never touched).
+            _src_line = _txt(seg)
+            txt = strip_invented_speaker_labels(txt, _src_line)
+            txt = clamp_runaway_translation(txt, _src_line)
             if glossary:
                 for k, v in glossary.items():
                     ks, vs = (k or "").strip(), (v or "").strip()

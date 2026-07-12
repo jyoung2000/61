@@ -284,6 +284,15 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
         # actually runs fully on this card). Populated on first use and reused
         # so translation's hundreds of per-batch calls never re-probe VRAM.
         self._gpu_fit_cache: dict[str, str] = {}
+        # Sticky per-model num_ctx high-water mark. Ollama tears down and
+        # reloads the model runner whenever a request's num_ctx differs from
+        # the loaded one — a polish pass whose prompts flap 3072↔4096 per
+        # request turns every batch into a model reload (observed: ~80 s/batch
+        # + 90 s timeouts on a warmed 4070 that translates the same cues in
+        # seconds). Once a prompt needs a bigger ctx, keep serving that model
+        # at the raised size for the rest of the session so the runner loads
+        # ONCE and every parallel slot stays warm.
+        self._sticky_num_ctx: dict[str, int] = {}
         self._vram_checked: bool = False
         self._available_vram_mb: int = 0
         # Cached GPU availability detection
@@ -1306,6 +1315,12 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
         else:
             base = 2048
 
+        # Sticky high-water mark FIRST: after one prompt raises this model's
+        # ctx, keep serving the model at that size — small follow-up prompts
+        # must not bounce num_ctx back down (each distinct value is a full
+        # Ollama runner reload that serializes the whole parallel batch pass).
+        base = max(base, self._sticky_num_ctx.get(model_name, 0))
+
         if prompt_chars > 0:
             # ~3 chars/token is a safe floor for mixed EN/CJK; +1024 output room.
             required = prompt_chars // 3 + 1024
@@ -1314,14 +1329,22 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                 ceiling = 8192 if vram_mb >= 10_000 else 4096
                 if detected > 0:
                     ceiling = min(ceiling, detected)  # never exceed training ctx
-                raised = min(((required + 1023) // 1024) * 1024, ceiling)
+                # Coarse power-of-two buckets (4096 / 8192), NOT 1024-granular:
+                # nearby prompt sizes must land in the SAME bucket so a batch
+                # pass with 5.5k–8.5k-char prompts issues ONE reload, not one
+                # per size. The extra KV headroom is cheap; the thrash was not.
+                raised = 4096 if required <= 4096 else 8192
+                raised = min(raised, ceiling)
                 if raised > base:
                     logger.info(
                         "num_ctx raised %d → %d for a %d-char prompt on %s "
-                        "(host VRAM %d MB) — head-truncation guaranteed to "
-                        "fail; OOM ladder covers the risk",
+                        "(host VRAM %d MB) — sticky for this model; "
+                        "head-truncation guaranteed to fail, OOM ladder "
+                        "covers the risk",
                         base, raised, prompt_chars, model_name, vram_mb)
                     base = raised
+        if base > self._sticky_num_ctx.get(model_name, 0):
+            self._sticky_num_ctx[model_name] = base
         return base
 
     async def _detect_capabilities(self):

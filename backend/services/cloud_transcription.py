@@ -103,22 +103,39 @@ def _map_verbose_json(data: dict) -> list:
         s1 = float(seg.get("end", s0))
         text = (seg.get("text") or "").strip()
         words = []
-        # words come as a flat list; attribute them to segments by time
-        while wi < len(api_words):
-            w = api_words[wi]
-            ws = float(w.get("start", 0.0))
-            if ws >= s1 - 1e-3 and wi < len(api_words) - 1:
-                break
-            if ws >= s0 - 0.05:
+        # whisper.cpp's server nests words PER SEGMENT (token-level pieces
+        # with start/end when token_timestamps is on) instead of OpenAI's
+        # flat top-level list. Read that shape first — dropping these words
+        # left every remote segment word-less, which disabled word-timed
+        # source resegmentation AND the hybrid timing projection downstream.
+        for w in (seg.get("words") or []):
+            surf = (w.get("word") or "").strip()
+            ws, we = w.get("start"), w.get("end")
+            if surf and isinstance(ws, (int, float)) and isinstance(we, (int, float)):
                 words.append({
-                    "word": (w.get("word") or "").strip(),
-                    "start": round(ws, 3),
-                    "end": round(float(w.get("end", ws)), 3),
+                    "word": surf,
+                    "start": round(float(ws), 3),
+                    "end": round(float(we), 3),
                     "confidence": _word_confidence(w, seg),
                 })
-            wi += 1
-            if ws >= s1 - 1e-3:
-                break
+        # words come as a flat list; attribute them to segments by time
+        # (skipped when the nested per-segment shape already provided them)
+        if not words:
+            while wi < len(api_words):
+                w = api_words[wi]
+                ws = float(w.get("start", 0.0))
+                if ws >= s1 - 1e-3 and wi < len(api_words) - 1:
+                    break
+                if ws >= s0 - 0.05:
+                    words.append({
+                        "word": (w.get("word") or "").strip(),
+                        "start": round(ws, 3),
+                        "end": round(float(w.get("end", ws)), 3),
+                        "confidence": _word_confidence(w, seg),
+                    })
+                wi += 1
+                if ws >= s1 - 1e-3:
+                    break
         segments.append({
             "start_sec": round(s0, 3),
             "end_sec": round(s1, 3),

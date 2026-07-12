@@ -3199,6 +3199,26 @@ async def _background_post_processing(
                             logger.info(
                                 "[%s] AI post-edit DONE on LLM-translated text",
                                 job_id)
+                    # The post-edit can reintroduce the same small-model
+                    # artifacts the translator guards against (invented
+                    # "Name:" labels, free-run continuations) — re-run the
+                    # deterministic sanitizers while source alignment holds.
+                    if _src_texts is not None and len(_src_texts) == len(translated):
+                        try:
+                            from backend.services.translator import (
+                                clamp_runaway_translation as _clamp_rt,
+                                strip_invented_speaker_labels as _strip_spk,
+                            )
+                            for _si, _seg in enumerate(translated):
+                                _t0 = getattr(_seg, "text", "") or ""
+                                _t1 = _clamp_rt(
+                                    _strip_spk(_t0, _src_texts[_si]),
+                                    _src_texts[_si])
+                                if _t1 != _t0:
+                                    _seg.text = _t1
+                        except Exception as _san_err:
+                            logger.debug("[%s] post-edit sanitize skipped: %s",
+                                         job_id, _san_err)
                 except asyncio.TimeoutError:
                     logger.warning(
                         "[%s] AI post-edit on LLM output timed out — keeping "

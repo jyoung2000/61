@@ -996,6 +996,13 @@ class RemoteWhisperEngine:
             "model": model,
             "response_format": "verbose_json",
             "timestamp_granularities[]": ["word", "segment"],
+            # whisper.cpp server: per-word start/end only exist when
+            # token_timestamps is on. Current builds default it on, but older
+            # ones (≤1.7.x) default OFF and silently return words with no
+            # timing — which cascaded into a fully split-proof translated
+            # track (hybrid timing tier B had zero word-timed source cues).
+            # Explicit is compatible everywhere; unknown fields are ignored.
+            "token_timestamps": "true",
         }
         # Decode-tuning parity with the local path: the Companion sidecar
         # honors these; other servers ignore the extra multipart fields.

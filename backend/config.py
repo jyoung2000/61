@@ -1270,6 +1270,13 @@ class Settings(BaseSettings):
     # shorter JSON array faster + more reliably (less timeout risk). 0 = auto
     # (8 for Ollama, 18 for cloud).
     TRANSLATION_LLM_BATCH: int = 0
+    # Per-line output failsafes for the LLM translator (deterministic, checked
+    # against the source line). A translation longer than
+    # max(EXPANSION_CHARS, source_chars × EXPANSION_RATIO) is a model free-run
+    # (the observed failure: a ~1400-char paragraph in a 5 s cue) — it is cut
+    # back to whole sentences under the cap. Ratio 0 disables the clamp.
+    TRANSLATION_MAX_EXPANSION_RATIO: float = 4.0
+    TRANSLATION_MAX_EXPANSION_CHARS: int = 200
     # Show the LLM translator a few surrounding SOURCE lines (reference only,
     # not re-translated) so pronouns, gender, honorific-driven formality and
     # tense stay consistent across batch boundaries — the biggest lever for
