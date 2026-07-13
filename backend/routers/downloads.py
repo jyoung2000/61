@@ -319,7 +319,17 @@ async def companion_refresh():
     if not github or not github.get("platforms"):
         return {"status": "error",
                 "message": "No companion-v* release found on GitHub "
-                           f"({GITHUB_REPO}) — nothing to fetch."}
+                           f"({GITHUB_REPO}) — nothing to fetch. The "
+                           "companion-release workflow builds it: check the "
+                           "repo's Actions tab — if runs fail instantly "
+                           "before any step executes, GitHub is refusing to "
+                           "start hosted runners for the account (billing / "
+                           "spending limit / Actions permissions) and needs "
+                           "fixing there first. Offline alternative: rebuild "
+                           "the container with --build-arg "
+                           "COMPANION_BUILD_FROM_SOURCE=1 to bake the Windows "
+                           "installer locally; this card then serves it "
+                           "without GitHub."}
     _refresh_state.update({"active": True, "message": "starting…", "updated": False})
     threading.Thread(target=_refresh_worker, args=(github,),
                      daemon=True, name="companion-cache-refresh").start()
