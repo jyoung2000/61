@@ -42,6 +42,29 @@ fn header_str(headers: &HeaderMap, name: &str) -> String {
         .to_string()
 }
 
+/// `own < expected`, comparing tolerant semver triples ("0.2.0", "v0.2").
+/// Unparseable/empty `expected` never reports an update (a plain probe with
+/// no handshake header must not flag anything).
+fn version_lt(own: &str, expected: &str) -> bool {
+    fn triple(s: &str) -> Option<(u32, u32, u32)> {
+        let digits: Vec<u32> = s
+            .split(|c: char| !c.is_ascii_digit())
+            .filter(|p| !p.is_empty())
+            .filter_map(|p| p.parse().ok())
+            .collect();
+        match digits.as_slice() {
+            [] => None,
+            [a] => Some((*a, 0, 0)),
+            [a, b] => Some((*a, *b, 0)),
+            [a, b, c, ..] => Some((*a, *b, *c)),
+        }
+    }
+    match (triple(own), triple(expected)) {
+        (Some(o), Some(e)) => o < e,
+        _ => false,
+    }
+}
+
 /// Record ClipAI's overall job progress (X-ClipAI-Progress, 0-100) so the GUI
 /// can show a live bar for the work it's serving.
 fn note_progress(state: &AppState, headers: &HeaderMap) {
@@ -933,9 +956,28 @@ async fn health(State(ctx): State<ProxyCtx>, headers: HeaderMap) -> Response {
         };
         ollama_bytes / (1024 * 1024) + whisper_mb
     };
+    // Version handshake: ClipAI sends the Companion version its build was
+    // released alongside. When that's NEWER than this install, say so in the
+    // response (ClipAI's Processing Log warns the user) and log it here once
+    // per process so the desktop-side logs explain degraded offloads too.
+    let expected = header_str(&headers, "x-clipai-expected-companion");
+    let update_available = version_lt(env!("CARGO_PKG_VERSION"), &expected);
+    if update_available {
+        use std::sync::atomic::AtomicBool;
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            log::warn!(
+                "ClipAI expects Companion v{expected} but this install is v{} — \
+                 update the Companion app (newer offload routes 404 until then)",
+                env!("CARGO_PKG_VERSION")
+            );
+        }
+    }
     let body = serde_json::json!({
         "service": "clipai-gpu-companion",
         "version": env!("CARGO_PKG_VERSION"),
+        "update_available": update_available,
+        "expected_version": expected,
         "gpu_name": gpu.gpu_name,
         "vram_total_mb": gpu.vram_total_mb,
         "clipai_vram_mb": clipai_vram_mb,
@@ -1036,5 +1078,35 @@ pub async fn serve(ctx: ProxyCtx) {
                 tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::version_lt;
+
+    #[test]
+    fn older_install_flags_update() {
+        assert!(version_lt("0.1.0", "0.2.0"));
+        assert!(version_lt("0.1.9", "0.2.0"));
+    }
+
+    #[test]
+    fn same_or_newer_does_not_flag() {
+        assert!(!version_lt("0.2.0", "0.2.0"));
+        assert!(!version_lt("0.3.0", "0.2.0"));
+        assert!(!version_lt("1.0.0", "0.9.9"));
+    }
+
+    #[test]
+    fn missing_or_garbage_expected_never_flags() {
+        assert!(!version_lt("0.1.0", ""));
+        assert!(!version_lt("0.1.0", "latest"));
+    }
+
+    #[test]
+    fn tolerant_formats() {
+        assert!(version_lt("v0.1.0", "companion-v0.2.0"));
+        assert!(version_lt("0.1", "0.1.1"));
     }
 }

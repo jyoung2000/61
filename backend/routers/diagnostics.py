@@ -667,6 +667,7 @@ async def _companion_gpu_block(local_loaded_models: list[dict]) -> dict | None:
         whisper_model = ""
         health_gpu_name = ""
         busy = False
+        app_version = ""
         try:
             async with httpx.AsyncClient(timeout=4) as client:
                 resp = await client.get(f"{base}/v1/health", headers=headers)
@@ -678,6 +679,7 @@ async def _companion_gpu_block(local_loaded_models: list[dict]) -> dict | None:
                     whisper_model = ((h.get("backends") or {}).get("whisper_model") or "")
                     health_gpu_name = (h.get("gpu_name") or "").strip()
                     busy = bool(h.get("busy"))
+                    app_version = (h.get("version") or "").strip()
         except Exception:
             pass
         primary = ollama_registry.primary_host()
@@ -724,12 +726,25 @@ async def _companion_gpu_block(local_loaded_models: list[dict]) -> dict | None:
         clipai_mb = clipai_vram_mb if clipai_vram_mb > 0 else models_vram_mb
         clipai_mb = min(clipai_mb, used_mb)
         other_apps_mb = max(0, used_mb - clipai_mb)
+        # Version handshake for the GPU panel: is this Companion install
+        # older than the container's expected release?
+        try:
+            from backend.services.companion_version import (
+                EXPECTED_COMPANION_VERSION, is_outdated,
+            )
+            _ver_outdated = bool(st.online) and is_outdated(app_version)
+            _expected_ver = EXPECTED_COMPANION_VERSION
+        except Exception:
+            _ver_outdated, _expected_ver = False, ""
         return {
             "online": bool(st.online),
             "paused": bool(getattr(st, "paused", False)),
             "is_primary": is_primary,
             "gpu_name": health_gpu_name or host.gpu_name or "Companion GPU",
             "name": host.name,
+            "app_version": app_version,
+            "expected_app_version": _expected_ver,
+            "app_outdated": _ver_outdated,
             "vram_total_bytes": vram_total_mb * MB,
             "vram_free_bytes": vram_free_mb * MB,
             "vram_used_bytes": used_mb * MB,

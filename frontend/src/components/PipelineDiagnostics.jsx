@@ -515,6 +515,18 @@ export default function PipelineDiagnostics({ showTestRunner = true } = {}) {
             {companion.whisper_model && companion.online !== false && (
               <span>Whisper: {companion.whisper_model}</span>
             )}
+            {companion.app_version && companion.online !== false && (
+              companion.app_outdated ? (
+                <span
+                  style={{ color: 'var(--warning, #f59e0b)', fontWeight: 600 }}
+                  title={`This Companion install is v${companion.app_version}, but this ClipAI build expects v${companion.expected_app_version}. Newer GPU offloads (vision, warm-up) are unavailable until it's updated — download the installer from Settings → GPU Companion.`}
+                >
+                  ⚠ App v{companion.app_version} — update available (v{companion.expected_app_version})
+                </span>
+              ) : (
+                <span>App v{companion.app_version}</span>
+              )
+            )}
           </div>
         </div>
       )}

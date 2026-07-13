@@ -3814,6 +3814,15 @@ async def run_analysis(job_id: str, resume: bool = False):
         ensure_companion_models(job_id)
     except Exception:
         pass
+    # Version handshake: an OUTDATED Companion app fails silently (its proxy
+    # just 404s the routes it doesn't have — vision offload, warm-up), so
+    # compare its /v1/health version against what this build expects and put
+    # a visible warning in the Processing Log naming the fix.
+    try:
+        from backend.services.companion_version import check_companion_version
+        check_companion_version(job_id)
+    except Exception:
+        pass
 
     # Broadcast immediately so the Analysis page shows status while waiting
     # for the semaphore (especially when another analysis is already running)
