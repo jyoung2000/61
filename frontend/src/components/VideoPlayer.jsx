@@ -197,19 +197,27 @@ export default function VideoPlayer({ src, clipStart, clipEnd, onTimeUpdate, asp
     setDisplayTime(t);
   };
 
+  // Holds the teardown for an in-flight scrub so a mid-drag unmount (e.g.
+  // navigating away from the Analysis page while still holding the bar) can't
+  // leave orphaned window listeners.
+  const dragCleanupRef = useRef(null);
   const onSeekPointerDown = (e) => {
     e.preventDefault();
     seekToX(e.clientX);
     const onMove = (ev) => seekToX(ev.clientX);
-    const onUp = () => {
+    const teardown = () => {
       window.removeEventListener('pointermove', onMove);
-      window.removeEventListener('pointerup', onUp);
-      window.removeEventListener('pointercancel', onUp);
+      window.removeEventListener('pointerup', teardown);
+      window.removeEventListener('pointercancel', teardown);
+      dragCleanupRef.current = null;
     };
     window.addEventListener('pointermove', onMove);
-    window.addEventListener('pointerup', onUp);
-    window.addEventListener('pointercancel', onUp);
+    window.addEventListener('pointerup', teardown);
+    window.addEventListener('pointercancel', teardown);
+    dragCleanupRef.current = teardown;
   };
+  // Remove any active scrub listeners if we unmount before pointerup fires.
+  useEffect(() => () => { dragCleanupRef.current?.(); }, []);
 
   // Fast-forward / rewind by a fixed step — the standard touch affordance.
   const skip = (delta) => {
