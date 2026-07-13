@@ -934,6 +934,18 @@ class Settings(BaseSettings):
     # pipelining batches multiplies polish throughput with IDENTICAL output —
     # order is preserved by index. 1 restores the old strictly-serial loop.
     SUBTITLE_POLISH_CONCURRENCY: int = 3
+    # Neighbor-context window (cues each side) in a polish batch prompt. The
+    # blocks are ~half the prompt; when the batch is SOURCE-ALIGNED each line
+    # already carries its own source ref, so the wide window is redundant —
+    # ALIGNED uses a slim window to ~halve the prompt and roughly double
+    # throughput (the observed run polished only 211/930 cues in-budget
+    # because every call carried ±3 neighbors on top of the source refs).
+    SUBTITLE_POLISH_CONTEXT: int = 3            # ASR / non-aligned mode
+    SUBTITLE_POLISH_CONTEXT_ALIGNED: int = 1    # source-aligned translation polish
+    # Polish the neediest batches first (ranked by Whisper low-confidence cue
+    # count) so a budget-limited pass fixes the garbled cues, not just the
+    # first third of the track.
+    SUBTITLE_POLISH_WORST_FIRST: bool = True
     # Wall-clock ceiling for one whole polish pass (seconds; 0 = unlimited).
     # Polish is an ENHANCEMENT — the observed 43-minute qwen2.5:14b pass on
     # 851 cues held the entire pipeline hostage. When the budget runs out,
@@ -941,7 +953,10 @@ class Settings(BaseSettings):
     # already does). Combined with the first-batch latency probe, a too-slow
     # upgraded model instead DOWNSHIFTS to the base model so coverage stays
     # near-100% within the budget.
-    SUBTITLE_POLISH_MAX_S: float = 600.0
+    # 720 s (+2 min headroom over the old 600): with the slim aligned prompt
+    # roughly doubling throughput, a 930-cue track now finishes well inside
+    # this, and worst-first ordering spends any shortfall on the needy cues.
+    SUBTITLE_POLISH_MAX_S: float = 720.0
     # Wall-clock ceiling across ALL readability passes of one polish loop
     # (seconds; 0 = unlimited). SUBTITLE_POLISH_MAX_S bounds a single pass;
     # without a loop-level cap, 3 passes × 600 s budgets stacked into a

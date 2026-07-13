@@ -1,6 +1,6 @@
 [package]
 name = "clipai-companion"
-version = "0.2.1"
+version = "0.2.2"
 description = "ClipAI GPU Companion — share a desktop GPU (Ollama + Whisper) with a ClipAI server over the LAN"
 authors = ["ClipAI"]
 license = "MIT"
@@ -36,6 +36,10 @@ hostname = "0.4"
 log = "0.4"
 env_logger = "0.11"
 chrono = { version = "0.4", features = ["serde"] }
+# Verify the self-update installer against the server's published SHA-256
+# before executing it (both already in the tree as transitive deps).
+sha2 = "0.10"
+hex = "0.4"
 
 # Windows Job Object API — used to tie the managed Ollama/whisper children to
 # the Companion's lifetime so they die when it exits (even on Task-Manager kill).

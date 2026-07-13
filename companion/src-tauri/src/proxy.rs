@@ -198,10 +198,53 @@ fn relay_tracked(upstream: reqwest::Response, state: Arc<AppState>, activity: u6
         .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
 }
 
-/// /ollama/* → strip the prefix, forward to the local daemon.
-/// Learn the calling ClipAI's base URL: peer IP (from ConnectInfo) + the
-/// X-ClipAI-Port header the container attaches. No header → no-op.
-fn note_clipai_origin(state: &AppState, headers: &HeaderMap, ext: &axum::http::Extensions) {
+/// Receiver-side validation of an ``X-ClipAI-Origin`` value before it can
+/// become the self-update download base. The header is attacker-influenceable
+/// (any token-holder can send it), so beyond the scheme we cap the length and
+/// reject anything that isn't a clean bare origin: no whitespace/control chars,
+/// no embedded credentials (``user:pass@host`` userinfo), no path/query/fragment
+/// — the value is only ever used as ``{base}/api/downloads/...`` so a trailing
+/// path or userinfo has no legitimate purpose and only serves to obscure the
+/// real host that a downloaded installer would be fetched (and run) from.
+fn plausible_clipai_origin(s: &str) -> bool {
+    if s.len() > 255 || !(s.starts_with("http://") || s.starts_with("https://")) {
+        return false;
+    }
+    let rest = s
+        .strip_prefix("http://")
+        .or_else(|| s.strip_prefix("https://"))
+        .unwrap_or("");
+    // A single trailing slash is legitimate (paired_base trims it); anything
+    // beyond the authority is not.
+    let rest = rest.strip_suffix('/').unwrap_or(rest);
+    // Authority only — reject once we hit a path/query/fragment delimiter, and
+    // reject userinfo (`@`) so the shown host can't be spoofed.
+    if rest.is_empty() || rest.contains('@') {
+        return false;
+    }
+    !rest
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '/' | '?' | '#' | '\\'))
+}
+
+/// Learn the calling ClipAI's reachable base URL from an inbound request, so
+/// self-update works even for MANUALLY-added pairings (no GUI pair step).
+/// Priority:
+///   1. ``X-ClipAI-Origin`` — the container's own base URL when it knows it
+///      (most reliable; immune to Docker NAT rewriting the source IP).
+///   2. peer IP (ConnectInfo) + ``X-ClipAI-Port`` — the common Unraid case
+///      where the container's outbound traffic is SNAT'd to the host LAN IP.
+/// No usable signal → no-op.
+fn note_clipai_origin(state: &AppState, headers: &HeaderMap, addr: Option<SocketAddr>) {
+    let origin = headers
+        .get("x-clipai-origin")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| plausible_clipai_origin(s));
+    if let Some(url) = origin {
+        state.note_clipai_origin(url);
+        return;
+    }
     let Some(port) = headers
         .get("x-clipai-port")
         .and_then(|v| v.to_str().ok())
@@ -209,8 +252,8 @@ fn note_clipai_origin(state: &AppState, headers: &HeaderMap, ext: &axum::http::E
     else {
         return;
     };
-    if let Some(ci) = ext.get::<axum::extract::ConnectInfo<SocketAddr>>() {
-        let ip = ci.0.ip();
+    if let Some(sa) = addr {
+        let ip = sa.ip();
         let url = if ip.is_ipv6() {
             format!("http://[{ip}]:{port}")
         } else {
@@ -224,7 +267,11 @@ async fn ollama_proxy(State(ctx): State<ProxyCtx>, req: Request<Body>) -> Respon
     if !authorized(&ctx, req.headers()) {
         return unauthorized();
     }
-    note_clipai_origin(&ctx.state, req.headers(), req.extensions());
+    let _peer = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0);
+    note_clipai_origin(&ctx.state, req.headers(), _peer);
     if ctx.state.config.lock().unwrap().paused {
         return paused();
     }
@@ -925,10 +972,23 @@ async fn logs_export(State(ctx): State<ProxyCtx>, headers: HeaderMap) -> Respons
 }
 
 /// /v1/health → status JSON for ClipAI's probes + the pairing handshake.
-async fn health(State(ctx): State<ProxyCtx>, headers: HeaderMap) -> Response {
+async fn health(
+    State(ctx): State<ProxyCtx>,
+    // Read the peer address SOFTLY (Option), mirroring `ollama_proxy`. A hard
+    // `ConnectInfo` extractor would 500 the whole route — before auth — if the
+    // router were ever served without `into_make_service_with_connect_info`
+    // (e.g. a future unix-socket bind or an in-process test harness). The
+    // origin-learning below is best-effort, so absence just means "don't learn."
+    peer: Option<axum::extract::ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+) -> Response {
     if !authorized(&ctx, &headers) {
         return unauthorized();
     }
+    // Health probes fire constantly even when no job is running, so learning
+    // the ClipAI origin here means self-update knows the server address as
+    // soon as the two are talking — no job required.
+    note_clipai_origin(&ctx.state, &headers, peer.map(|ci| ci.0));
     let activity = ctx.state.begin_activity("health", "/v1/health", "", "", "");
     let gpu = ctx.state.gpu.lock().unwrap().clone();
     let config = ctx.state.config_snapshot();
@@ -1141,5 +1201,38 @@ mod version_tests {
     fn tolerant_formats() {
         assert!(version_lt("v0.1.0", "companion-v0.2.0"));
         assert!(version_lt("0.1", "0.1.1"));
+    }
+}
+
+#[cfg(test)]
+mod origin_tests {
+    use super::plausible_clipai_origin;
+
+    #[test]
+    fn accepts_clean_origins() {
+        assert!(plausible_clipai_origin("http://192.168.8.5:1353"));
+        assert!(plausible_clipai_origin("https://clipai.lan:1353"));
+        // A single trailing slash is fine (paired_base trims it).
+        assert!(plausible_clipai_origin("http://192.168.8.5:1353/"));
+    }
+
+    #[test]
+    fn rejects_userinfo_and_paths() {
+        // Userinfo could disguise the real host a downloaded installer runs from.
+        assert!(!plausible_clipai_origin("http://evil.lan@192.168.8.5:1353"));
+        // Anything beyond the authority is not a base origin.
+        assert!(!plausible_clipai_origin("http://192.168.8.5:1353/api/x"));
+        assert!(!plausible_clipai_origin("http://192.168.8.5:1353?q=1"));
+        assert!(!plausible_clipai_origin("http://host\\evil"));
+    }
+
+    #[test]
+    fn rejects_bad_scheme_whitespace_and_overlong() {
+        assert!(!plausible_clipai_origin("ftp://192.168.8.5"));
+        assert!(!plausible_clipai_origin("192.168.8.5:1353"));
+        assert!(!plausible_clipai_origin("http://host with space"));
+        assert!(!plausible_clipai_origin("http://")); // no authority
+        let long = format!("http://{}", "a".repeat(300));
+        assert!(!plausible_clipai_origin(&long));
     }
 }

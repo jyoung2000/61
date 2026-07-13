@@ -66,6 +66,13 @@ def clipai_headers() -> dict:
     setups."""
     import os as _os
     headers = {"X-ClipAI-Port": _os.environ.get("CLIPAI_PORT", "1353")}
+    # Explicit override for networks where the source IP the Companion sees is
+    # NOT the address it can reach us at (custom bridges, macvlan, reverse
+    # proxies). Set CLIPAI_PUBLIC_URL to the http(s)://host:port the Companion
+    # PC uses to reach ClipAI; the Companion prefers it over peer-IP inference.
+    _pub = (_os.environ.get("CLIPAI_PUBLIC_URL", "") or "").strip()
+    if _pub.startswith("http://") or _pub.startswith("https://"):
+        headers["X-ClipAI-Origin"] = _header_safe(_pub, 200)
     job_id = _job_id.get()
     if job_id:
         headers["X-ClipAI-Job-Id"] = _header_safe(job_id, 80)

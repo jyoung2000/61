@@ -1452,13 +1452,27 @@ async def correct_transcript(
               "model": model_override}
     batch_results: list[Optional[list[Optional[str]]]] = [None] * len(batches)
 
+    # Context-window size. The neighbor blocks are the fat in each prompt
+    # (~half of a ~6000-char batch), and the observed run polished only
+    # 211/930 cues (23%) in the 600 s budget because every call carried
+    # ±3 neighbors on TOP of the per-line source ref. When the batch is
+    # source-aligned, each line already has its own ground-truth source
+    # line, so a wide neighbor window is redundant — shrink it to
+    # SUBTITLE_POLISH_CONTEXT_ALIGNED (default 1) to ~halve the prompt and
+    # roughly double throughput. Non-aligned (ASR) mode keeps the wider
+    # window since it has no per-line reference.
+    _ctx_n = (int(getattr(settings, "SUBTITLE_POLISH_CONTEXT_ALIGNED", 1))
+              if source_texts is not None
+              else int(getattr(settings, "SUBTITLE_POLISH_CONTEXT", 3)))
+    _ctx_n = max(0, _ctx_n)
+
     def _ctx_for(idx: int, batch_len: int):
-        # Sliding 3-segment context windows (separate from the
-        # TRANSLATION_CONTEXT_WINDOW which controls the translator).
-        ctx_before_start = max(0, idx * batch_size - 3)
-        ctx_before = [v[0] for v in views[ctx_before_start: idx * batch_size]]
+        ctx_before_start = max(0, idx * batch_size - _ctx_n)
+        ctx_before = ([v[0] for v in views[ctx_before_start: idx * batch_size]]
+                      if _ctx_n else [])
         ctx_after_start = (idx + 1) * batch_size
-        ctx_after = [v[0] for v in views[ctx_after_start: ctx_after_start + 3]]
+        ctx_after = ([v[0] for v in views[ctx_after_start: ctx_after_start + _ctx_n]]
+                     if _ctx_n else [])
         batch_src = None
         if source_texts is not None:
             _bs = idx * batch_size
@@ -1579,7 +1593,49 @@ async def correct_transcript(
             async with _sem:
                 await _run_one(idx, timeout_per_batch)
 
-        await asyncio.gather(*(_guarded(i) for i in range(1, len(batches))),
+        # ── Worst-first ordering ──────────────────────────────────────────
+        # The budget routinely runs out before every batch is polished
+        # (observed: 35/62). Left-to-right, that means the LAST third of the
+        # track ships raw — but "needs polish" isn't positional. Rank each
+        # remaining batch by how many of its cues Whisper was UNSURE about
+        # (avg_logprob below the redecode threshold = the "Hand kimchi",
+        # romaji-fragment, word-salad lines), and polish the neediest batches
+        # FIRST. Context windows are still read from the full ``views`` array
+        # by absolute index, so reordering EXECUTION doesn't change any
+        # batch's neighbors — only which cues win the budget. Ties keep
+        # natural order for stable context/logs.
+        _lp_thr = float(getattr(settings, "WHISPER_REDECODE_LOGPROB", -0.8))
+
+        def _neediness(idx: int) -> int:
+            score = 0
+            for pair in batches[idx]:
+                v = pair[0]
+                try:
+                    lp = v.get("avg_logprob")
+                    if lp is not None and float(lp) < _lp_thr:
+                        score += 1
+                        continue
+                except (TypeError, ValueError):
+                    pass
+                # Fallback signal when confidence is absent: a very short cue
+                # or one still carrying source-script glyphs is likelier junk.
+                t = (v.get("text") or "").strip()
+                if len(t) <= 3:
+                    score += 1
+            return score
+
+        _rest = list(range(1, len(batches)))
+        if bool(getattr(settings, "SUBTITLE_POLISH_WORST_FIRST", True)):
+            _scored = [(idx, _neediness(idx)) for idx in _rest]
+            if any(s for _, s in _scored):
+                _rest = [idx for idx, _ in
+                         sorted(_scored, key=lambda p: (-p[1], p[0]))]
+                logger.info(
+                    "transcript polishing: worst-first order — %d batch(es) "
+                    "carry low-confidence cues, polishing those before the "
+                    "budget runs out", sum(1 for _, s in _scored if s))
+
+        await asyncio.gather(*(_guarded(i) for i in _rest),
                              return_exceptions=True)
 
     for idx, batch_pairs in enumerate(batches):

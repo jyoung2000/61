@@ -608,19 +608,21 @@ dependencies = [
 
 [[package]]
 name = "clipai-companion"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "axum",
  "chrono",
  "dirs 5.0.1",
  "env_logger",
  "futures-util",
+ "hex",
  "hostname",
  "log",
  "rand 0.8.6",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2",
  "socket2 0.5.10",
  "tauri",
  "tauri-build",

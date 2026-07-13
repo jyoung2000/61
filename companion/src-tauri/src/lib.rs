@@ -776,12 +776,30 @@ const UPDATE_PLATFORM: &str = "mac";
 #[cfg(not(target_os = "macos"))]
 const UPDATE_PLATFORM: &str = "windows";
 
+/// Best-effort fetch of the published installer SHA-256 for this platform from
+/// ClipAI's manifest, used to integrity-check the download before running it.
+/// Returns None if the manifest can't be fetched/parsed or carries no hash —
+/// the caller then falls back to the size-only gate.
+async fn fetch_installer_sha256(client: &reqwest::Client, base: &str) -> Option<String> {
+    let url = format!("{base}/api/downloads/companion/manifest");
+    let resp = client.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let manifest: serde_json::Value = resp.json().await.ok()?;
+    manifest["platforms"][UPDATE_PLATFORM]["sha256"]
+        .as_str()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 #[tauri::command]
 async fn check_app_update(
     state: tauri::State<'_, SharedState>,
 ) -> Result<serde_json::Value, String> {
     let base = paired_base(&state.inner().clone())?;
     let url = format!("{base}/api/downloads/companion/manifest");
+    log::info!("self-update: checking manifest at {url}");
     let resp = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -789,10 +807,18 @@ async fn check_app_update(
         .get(&url)
         .send()
         .await
-        .map_err(|e| format!("could not reach the ClipAI server ({e})"))?;
+        // Name the exact URL tried so a wrong learned address is obvious. The
+        // usual cause on an odd network: the address the container reaches us
+        // from ({base}) isn't the address WE reach ClipAI at — use "Pair now"
+        // to set the ClipAI URL explicitly and override the inference.
+        .map_err(|e| format!(
+            "Couldn't reach ClipAI at {base} ({e}). If that address is wrong, \
+             click \"Pair now\" and paste your ClipAI URL + key to set it \
+             explicitly."))?;
     if !resp.status().is_success() {
-        return Err(format!("ClipAI answered HTTP {} for the installer \
-                            manifest", resp.status()));
+        return Err(format!(
+            "ClipAI at {base} answered HTTP {} for the installer manifest.",
+            resp.status()));
     }
     let manifest: serde_json::Value = resp.json().await.map_err(|e| format!("{e}"))?;
     let latest = manifest["version"].as_str().unwrap_or("").to_string();
@@ -810,6 +836,7 @@ async fn check_app_update(
         "filename": entry["filename"].as_str().unwrap_or(""),
         "size": entry["size"].as_u64().unwrap_or(0),
         "source": entry["source"].as_str().unwrap_or(""),
+        "sha256": entry["sha256"].as_str().unwrap_or(""),
     }))
 }
 
@@ -819,12 +846,20 @@ async fn install_app_update(
     state: tauri::State<'_, SharedState>,
 ) -> Result<String, String> {
     let base = paired_base(&state.inner().clone())?;
-    let url = format!("{base}/api/downloads/companion/{UPDATE_PLATFORM}");
-    log::info!("self-update: downloading installer from {url}");
-    let resp = reqwest::Client::builder()
+    let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(600))
         .build()
-        .map_err(|e| format!("{e}"))?
+        .map_err(|e| format!("{e}"))?;
+    // First, learn the installer's AUTHORITATIVE sha256 from the manifest. In
+    // the honest path ClipAI computed this by verifying the installer against
+    // the GitHub release manifest before serving it, so a byte-for-byte match
+    // means we're about to run exactly what GitHub released. Best-effort: a
+    // manifest hiccup or a hand-dropped installer with no published hash falls
+    // back to the size-only gate (logged), rather than blocking the update.
+    let expected_sha256 = fetch_installer_sha256(&client, &base).await;
+    let url = format!("{base}/api/downloads/companion/{UPDATE_PLATFORM}");
+    log::info!("self-update: downloading installer from {url}");
+    let resp = client
         .get(&url)
         .send()
         .await
@@ -861,6 +896,30 @@ async fn install_app_update(
             "downloaded file is implausibly small ({} bytes) — not running it",
             bytes.len()
         ));
+    }
+    // Integrity gate: the installer is about to be EXECUTED, so when the server
+    // publishes a hash we refuse to run bytes that don't match it. This closes
+    // the "corrupted download or on-path rewrite over the plaintext LAN hop
+    // slips through a size-only check" gap. No published hash → size gate only.
+    if let Some(expected) = expected_sha256.as_deref().filter(|h| !h.is_empty()) {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        let got = hex::encode(hasher.finalize());
+        if !got.eq_ignore_ascii_case(expected) {
+            return Err(format!(
+                "installer integrity check FAILED — the download does not match the \
+                 hash ClipAI published (expected {expected}, got {got}). Refusing to \
+                 run it. This usually means a corrupted download or a tampered network \
+                 path; try again, or use \"Pair now\" to set your ClipAI URL explicitly."
+            ));
+        }
+        log::info!("self-update: installer sha256 verified ({got})");
+    } else {
+        log::warn!(
+            "self-update: ClipAI published no installer sha256 — running on the size \
+             check alone (hand-dropped installer or older manifest)"
+        );
     }
     let path = std::env::temp_dir().join(&filename);
     tokio::fs::write(&path, &bytes)
