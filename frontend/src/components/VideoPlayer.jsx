@@ -2,6 +2,7 @@ import React, { useRef, useState, useEffect, useMemo } from 'react';
 import { processKeyframes, interpolateSubjectX, isDynamic, subjectXToCenterPct, safeSubjectX } from '../utils/subjectTracking';
 import useResponsive from '../hooks/useResponsive';
 import { usePlayer } from '../contexts/PlayerContext';
+import { seekPct, clampTime, controlsVisible as computeControlsVisible } from '../utils/playerControls';
 
 const ASPECT_RATIO_VALUES = {
   '16:9': 16 / 9,
@@ -20,9 +21,14 @@ function formatTime(seconds) {
 }
 
 export default function VideoPlayer({ src, clipStart, clipEnd, onTimeUpdate, aspectRatio, sourceWidth = 1920, sourceHeight = 1080, subjectX = 50, scenes, sceneCuts = null, initialTime }) {
-  const { isMobile } = useResponsive();
+  const { isMobile, isTablet, isTouch } = useResponsive();
+  // Touch surfaces (phone, tablet, touch-laptop) have no hover and a coarse
+  // pointer — controls must be persistent + finger-sized there, hover-fade on a
+  // mouse. One flag drives every affordance so the UX is consistent per device.
+  const touch = isMobile || isTablet || isTouch;
   const videoRef = useRef(null);
   const containerRef = useRef(null);
+  const seekBarRef = useRef(null);
   const [playing, setPlaying] = useState(false);
   const [displayTime, setDisplayTime] = useState(0);
   const [duration, setDuration] = useState(0);
@@ -177,13 +183,41 @@ export default function VideoPlayer({ src, clipStart, clipEnd, onTimeUpdate, asp
     }
   };
 
-  const seek = (e) => {
+  // Draggable scrubbing driven by Pointer Events (unifies mouse + touch + pen),
+  // so a press-drag on the bar scrubs continuously — not just a single tap-seek.
+  // ``touchAction: 'none'`` on the bar stops the browser from stealing the drag
+  // for page-scroll on touch. A bare tap still seeks: the initial pointerdown
+  // does one ``seekToX`` before any move.
+  const seekToX = (clientX) => {
+    const video = videoRef.current;
+    const bar = seekBarRef.current;
+    if (!video || !bar || !duration) return;
+    const t = seekPct(clientX, bar.getBoundingClientRect()) * duration;
+    video.currentTime = t;
+    setDisplayTime(t);
+  };
+
+  const onSeekPointerDown = (e) => {
+    e.preventDefault();
+    seekToX(e.clientX);
+    const onMove = (ev) => seekToX(ev.clientX);
+    const onUp = () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onUp);
+    };
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onUp);
+  };
+
+  // Fast-forward / rewind by a fixed step — the standard touch affordance.
+  const skip = (delta) => {
     const video = videoRef.current;
     if (!video) return;
-    const rect = e.currentTarget.getBoundingClientRect();
-    const pct = (e.clientX - rect.left) / rect.width;
-    video.currentTime = pct * duration;
-    setDisplayTime(pct * duration);
+    const t = clampTime(video.currentTime + delta, duration || video.duration || 0);
+    video.currentTime = t;
+    setDisplayTime(t);
   };
 
   const seekTo = (time) => {
@@ -265,6 +299,26 @@ export default function VideoPlayer({ src, clipStart, clipEnd, onTimeUpdate, asp
   };
 
   const progress = duration ? (displayTime / duration) * 100 : 0;
+
+  // On touch there's no hover, so controls must be persistent (like the native
+  // player bar); on a mouse they fade in on hover, and always show while paused
+  // so the player never looks dead. When hidden they must not eat taps meant for
+  // play/pause on the video, hence pointerEvents follows visibility.
+  const controlsVisible = computeControlsVisible({ hovered, touch, playing });
+  const playheadSize = touch ? 20 : 12;
+  const touchBtn = {
+    background: 'none',
+    border: 'none',
+    color: 'var(--video-controls-text)',
+    cursor: 'pointer',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    fontSize: touch ? 22 : 16,
+    padding: touch ? 8 : 4,
+    minWidth: touch ? 44 : undefined,
+    minHeight: touch ? 44 : undefined,
+  };
 
   // Aspect ratio awareness — match ClipPreview / ClipSEO behavior
   const srcRatio = sourceWidth / sourceHeight;
@@ -417,107 +471,145 @@ export default function VideoPlayer({ src, clipStart, clipEnd, onTimeUpdate, asp
           left: 0,
           right: 0,
           background: 'var(--video-gradient)',
-          padding: '24px 16px 12px',
-          opacity: hovered ? 1 : 0,
+          padding: touch ? '28px 12px 10px' : '24px 16px 12px',
+          opacity: controlsVisible ? 1 : 0,
+          pointerEvents: controlsVisible ? 'auto' : 'none',
           transition: 'opacity 0.2s ease',
         }}
       >
-        {/* Seek bar */}
+        {/* Seek bar \u2014 the outer element is a tall, finger-sized hit target
+            (padding), the inner element is the thin visible track. Pointer
+            Events + touchAction:none give draggable scrubbing on every device. */}
         <div
-          onClick={seek}
+          onPointerDown={onSeekPointerDown}
           style={{
-            height: isMobile ? 8 : 4,
-            background: 'var(--bg-elevated)',
-            cursor: 'pointer',
             position: 'relative',
-            marginBottom: 8,
-            borderRadius: 4,
+            padding: `${touch ? 12 : 6}px 0`,
+            marginBottom: touch ? 2 : 6,
+            cursor: 'pointer',
+            touchAction: 'none',
           }}
         >
-          {/* Clip markers */}
-          {clipStart !== undefined && clipEnd !== undefined && duration > 0 && (
-            <div
-              style={{
-                position: 'absolute',
-                left: `${(clipStart / duration) * 100}%`,
-                width: `${((clipEnd - clipStart) / duration) * 100}%`,
-                height: '100%',
-                background: 'var(--amber-dim)',
-                borderLeft: '2px solid var(--accent-amber)',
-                borderRight: '2px solid var(--accent-amber)',
-              }}
-            />
-          )}
           <div
+            ref={seekBarRef}
             style={{
-              height: '100%',
-              width: `${progress}%`,
-              background: 'var(--accent-cyan)',
+              height: touch ? 6 : 4,
+              background: 'var(--bg-elevated)',
               position: 'relative',
+              borderRadius: 4,
             }}
           >
+            {/* Clip markers */}
+            {clipStart !== undefined && clipEnd !== undefined && duration > 0 && (
+              <div
+                style={{
+                  position: 'absolute',
+                  left: `${(clipStart / duration) * 100}%`,
+                  width: `${((clipEnd - clipStart) / duration) * 100}%`,
+                  height: '100%',
+                  background: 'var(--amber-dim)',
+                  borderLeft: '2px solid var(--accent-amber)',
+                  borderRight: '2px solid var(--accent-amber)',
+                }}
+              />
+            )}
             <div
               style={{
-                position: 'absolute',
-                right: -4,
-                top: -4,
-                width: 12,
-                height: 12,
-                borderRadius: '50%',
+                height: '100%',
+                width: `${progress}%`,
                 background: 'var(--accent-cyan)',
+                position: 'relative',
               }}
-            />
+            >
+              <div
+                style={{
+                  position: 'absolute',
+                  right: -(playheadSize / 2),
+                  top: '50%',
+                  transform: 'translateY(-50%)',
+                  width: playheadSize,
+                  height: playheadSize,
+                  borderRadius: '50%',
+                  background: 'var(--accent-cyan)',
+                  // A ring + shadow make the fatter touch thumb read as grabbable
+                  // and keep it visible over bright frames.
+                  boxShadow: touch
+                    ? '0 0 0 3px var(--video-bg), 0 1px 4px rgba(0,0,0,0.5)'
+                    : undefined,
+                }}
+              />
+            </div>
           </div>
         </div>
 
         {/* Control buttons */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: touch ? 4 : 12 }}>
+          {/* Rewind 10s */}
+          <button
+            onClick={() => skip(-10)}
+            aria-label="Rewind 10 seconds"
+            title="Back 10s"
+            style={{ ...touchBtn, fontSize: touch ? 18 : 15 }}
+          >
+            {'\u23EA'}
+          </button>
+
           <button
             onClick={togglePlay}
-            style={{
-              background: 'none',
-              border: 'none',
-              color: 'var(--video-controls-text)',
-              fontSize: isMobile ? 22 : 18,
-              padding: isMobile ? 8 : 4,
-              minHeight: isMobile ? 44 : undefined,
-            }}
+            aria-label={playing ? 'Pause' : 'Play'}
+            style={{ ...touchBtn, fontSize: touch ? 24 : 18 }}
           >
             {playing ? '\u23F8' : '\u25B6'}
           </button>
 
-          <span style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--text-secondary)' }}>
+          {/* Fast-forward 10s */}
+          <button
+            onClick={() => skip(10)}
+            aria-label="Forward 10 seconds"
+            title="Forward 10s"
+            style={{ ...touchBtn, fontSize: touch ? 18 : 15 }}
+          >
+            {'\u23E9'}
+          </button>
+
+          <span style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--text-secondary)', whiteSpace: 'nowrap' }}>
             {formatTime(displayTime)} / {formatTime(duration)}
           </span>
 
           <div style={{ flex: 1 }} />
 
-          {/* Volume */}
-          <input
-            type="range"
-            min="0"
-            max="1"
-            step="0.1"
-            value={volume}
-            onChange={(e) => {
-              const v = parseFloat(e.target.value);
-              setVolume(v);
-              if (videoRef.current) videoRef.current.volume = v;
-            }}
-            style={{ width: 60, accentColor: 'var(--accent-cyan)' }}
-          />
+          {/* Volume \u2014 hidden on phones (native slider is fiddly + space-tight),
+              kept on tablet/desktop. */}
+          {!isMobile && (
+            <input
+              type="range"
+              min="0"
+              max="1"
+              step="0.1"
+              value={volume}
+              onChange={(e) => {
+                const v = parseFloat(e.target.value);
+                setVolume(v);
+                if (videoRef.current) videoRef.current.volume = v;
+              }}
+              style={{ width: 60, accentColor: 'var(--accent-cyan)' }}
+            />
+          )}
 
           {/* Speed */}
           <button
             onClick={changeSpeed}
+            aria-label={`Playback speed ${speed}x`}
             style={{
               background: 'var(--bg-elevated)',
               border: '1px solid var(--border)',
               color: 'var(--text-secondary)',
-              padding: isMobile ? '6px 12px' : '2px 8px',
+              padding: touch ? '8px 12px' : '2px 8px',
               borderRadius: 'var(--radius-sm)',
-              fontSize: isMobile ? 13 : 11,
+              fontSize: touch ? 13 : 11,
               fontFamily: 'var(--font-mono)',
+              minHeight: touch ? 44 : undefined,
+              cursor: 'pointer',
             }}
           >
             {speed}x
@@ -526,14 +618,8 @@ export default function VideoPlayer({ src, clipStart, clipEnd, onTimeUpdate, asp
           {/* Fullscreen */}
           <button
             onClick={toggleFullscreen}
-            style={{
-              background: 'none',
-              border: 'none',
-              color: 'var(--text-secondary)',
-              fontSize: isMobile ? 20 : 16,
-              padding: isMobile ? 8 : 4,
-              minHeight: isMobile ? 44 : undefined,
-            }}
+            aria-label={isFullscreen ? 'Exit fullscreen' : 'Fullscreen'}
+            style={{ ...touchBtn, color: 'var(--text-secondary)', fontSize: touch ? 20 : 16 }}
           >
             {isFullscreen ? '\u2715' : '\u26F6'}
           </button>

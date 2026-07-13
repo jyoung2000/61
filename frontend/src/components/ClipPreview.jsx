@@ -278,7 +278,10 @@ export default function ClipPreview({
   jobId = null,
   clipIndex = null,
 }) {
-  const { isMobile } = useResponsive();
+  const { isMobile, isTablet, isTouch } = useResponsive();
+  // Touch surfaces get a fatter, easier-to-grab scrub thumb + hit target, kept
+  // consistent with VideoPlayer's preview controls.
+  const touch = isMobile || isTablet || isTouch;
   const fgVideoRef = useRef(null);
   const splitBottomVideoRef = useRef(null);
   const containerRef = useRef(null);
@@ -1513,25 +1516,36 @@ export default function ClipPreview({
         padding: isMobile ? '8px 12px' : '6px 12px',
         ...(videoReady ? {} : { opacity: 0.3, pointerEvents: 'none' }),
       }}>
-        {/* Draggable seek bar */}
+        {/* Draggable seek bar — outer = finger-sized hit target (padding),
+            inner = thin visible track; keeps the scrub thumb easy to grab on
+            touch without a thick bar on desktop. */}
         <div
-          ref={seekBarRef}
           onPointerDown={onSeekPointerDown}
           style={{
-            height: isMobile ? 8 : 6, background: 'var(--border)', cursor: 'pointer',
-            position: 'relative', borderRadius: 4, marginBottom: 8, touchAction: 'none',
+            position: 'relative', cursor: 'pointer', touchAction: 'none',
+            padding: `${touch ? 11 : 5}px 0`, marginBottom: touch ? 2 : 4,
           }}
         >
-          <div style={{
-            height: '100%', width: `${progress}%`,
-            background: 'var(--accent-cyan)', borderRadius: 3,
-            position: 'relative',
-          }}>
+          <div
+            ref={seekBarRef}
+            style={{
+              height: touch ? 6 : 6, background: 'var(--border)',
+              position: 'relative', borderRadius: 4,
+            }}
+          >
             <div style={{
-              position: 'absolute', right: -5, top: -3,
-              width: 12, height: 12, borderRadius: '50%',
-              background: 'var(--accent-cyan)',
-            }} />
+              height: '100%', width: `${progress}%`,
+              background: 'var(--accent-cyan)', borderRadius: 3,
+              position: 'relative',
+            }}>
+              <div style={{
+                position: 'absolute', right: -((touch ? 18 : 12) / 2),
+                top: '50%', transform: 'translateY(-50%)',
+                width: touch ? 18 : 12, height: touch ? 18 : 12, borderRadius: '50%',
+                background: 'var(--accent-cyan)',
+                boxShadow: touch ? '0 0 0 3px var(--video-bg), 0 1px 4px rgba(0,0,0,0.5)' : undefined,
+              }} />
+            </div>
           </div>
         </div>
 
