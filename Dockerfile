@@ -104,6 +104,18 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     fi; \
     exit 0
 
+## Stage 1d: Companion installer as a standalone export target
+# Lets you build JUST the Windows installer straight to a local dir WITHOUT
+# rebuilding the whole ClipAI image (the slow Rust/MSVC cross-compile is
+# then decoupled from every ClipAI update):
+#   DOCKER_BUILDKIT=1 docker build --target companion-artifacts \
+#     --build-arg COMPANION_BUILD_FROM_SOURCE=1 -f Dockerfile \
+#     -o ./data/companion-cache .
+# ``scratch`` so ONLY the .exe + manifest.json land in the output dir. Not a
+# dependency of the runtime stage, so normal builds never build it.
+FROM scratch AS companion-artifacts
+COPY --from=companion-builder /out/ /
+
 ## Stage 2: Runtime
 FROM python:3.11-slim
 
