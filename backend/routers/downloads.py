@@ -79,10 +79,27 @@ def _read_manifest(directory: str) -> Optional[dict]:
         return None
 
 
+def _installer_rank(name: str, path: str) -> tuple:
+    """Sort key for choosing among several installers of one platform:
+    highest embedded version wins, then the newest file. The old
+    first-alphabetical pick served ``..._0.1.0_...exe`` FOREVER once a
+    ``..._0.2.0_...exe`` landed beside it (0.1.0 sorts first), so every
+    "update" re-downloaded the stale build."""
+    ver = tuple(int(p) for p in (_version_from_filename(name) or "0").split(".")
+                if p.isdigit()) or (0,)
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        mtime = 0.0
+    return (ver, mtime)
+
+
 def _scan_installers(directory: str) -> dict:
     """Map platform → {filename, size, path} from the installer FILES present in
     ``directory``. This — not a manifest.json — is the source of truth for what
-    can be served, so independently produced installers coexist in one folder."""
+    can be served, so independently produced installers coexist in one folder.
+    When several installers of the same platform coexist (an updated build
+    copied next to an old one), the NEWEST version is served."""
     found: dict = {}
     try:
         names = sorted(os.listdir(directory))
@@ -91,15 +108,19 @@ def _scan_installers(directory: str) -> dict:
     for name in names:
         ext = os.path.splitext(name)[1].lower()
         platform = _EXT_PLATFORM.get(ext)
-        if not platform or platform in found:
+        if not platform:
             continue
         path = os.path.join(directory, name)
-        if os.path.isfile(path):
-            found[platform] = {
-                "filename": name,
-                "size": os.path.getsize(path),
-                "path": path,
-            }
+        if not os.path.isfile(path):
+            continue
+        prev = found.get(platform)
+        if prev and _installer_rank(prev["filename"], prev["path"]) >= _installer_rank(name, path):
+            continue
+        found[platform] = {
+            "filename": name,
+            "size": os.path.getsize(path),
+            "path": path,
+        }
     return found
 
 
@@ -180,13 +201,22 @@ def _merged_view(github: Optional[dict]) -> dict:
     platforms = {}
     version = ""
     for key in ("windows", "mac", "windows_msi"):
-        for source, files, manifest in (
-            ("cached", cache_files, cache_manifest),
-            ("baked", baked_files, baked_manifest),
-        ):
-            f = files.get(key)
-            if not f:
-                continue
+        # Newest version wins across sources (a stale cached installer used
+        # to shadow a fresher baked build because "cached" was tried first).
+        candidates = [
+            (source, files, manifest)
+            for source, files, manifest in (
+                ("cached", cache_files, cache_manifest),
+                ("baked", baked_files, baked_manifest),
+            )
+            if files.get(key)
+        ]
+        candidates.sort(
+            key=lambda c: _installer_rank(c[1][key]["filename"], c[1][key]["path"]),
+            reverse=True,
+        )
+        for source, files, manifest in candidates[:1]:
+            f = files[key]
             entry = {"filename": f["filename"], "size": f["size"], "source": source}
             m_entry = (manifest.get("platforms") or {}).get(key) if manifest else None
             if m_entry and os.path.basename(m_entry.get("filename", "")) == f["filename"]:
@@ -194,8 +224,8 @@ def _merged_view(github: Optional[dict]) -> dict:
                     entry["sha256"] = m_entry["sha256"]
             platforms[key] = entry
             if not version:
-                version = (manifest.get("version", "") if manifest else "") \
-                    or _version_from_filename(f["filename"])
+                version = _version_from_filename(f["filename"]) \
+                    or (manifest.get("version", "") if manifest else "")
             break
         else:
             gh_entry = ((github or {}).get("platforms") or {}).get(key)
@@ -234,16 +264,19 @@ async def companion_download(platform: str):
     if key not in ("windows", "mac", "windows_msi"):
         raise HTTPException(status_code=404, detail=f"unknown platform {platform!r}")
 
-    for directory in (CACHE_DIR, BAKED_DIR):
-        path = _local_asset(directory, key)
-        if path:
-            filename = os.path.basename(path)
-            ext = os.path.splitext(filename)[1].lower()
-            return FileResponse(
-                path,
-                media_type=_CONTENT_TYPES.get(ext, "application/octet-stream"),
-                filename=filename,
-            )
+    # Newest wins ACROSS both locations: a stale cached copy must never
+    # shadow a fresher image-baked build (the docker-cp publish flow leaves
+    # old versions in the cache dir beside new ones).
+    candidates = [p for p in (_local_asset(d, key) for d in (CACHE_DIR, BAKED_DIR)) if p]
+    if candidates:
+        path = max(candidates, key=lambda p: _installer_rank(os.path.basename(p), p))
+        filename = os.path.basename(path)
+        ext = os.path.splitext(filename)[1].lower()
+        return FileResponse(
+            path,
+            media_type=_CONTENT_TYPES.get(ext, "application/octet-stream"),
+            filename=filename,
+        )
 
     github = await _github_latest_manifest()
     gh_entry = ((github or {}).get("platforms") or {}).get(key) or {}

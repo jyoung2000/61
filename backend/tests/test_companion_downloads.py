@@ -193,3 +193,30 @@ def test_refresh_verifies_sha256(dirs, monkeypatch):
     D._refresh_worker(bad)
     assert not (cache / "Companion_0.5.0.exe").exists()
     assert "failed" in D._refresh_state["message"]
+
+
+def test_newer_installer_wins_beside_a_stale_one(dirs, no_github):
+    """The observed field failure: docker-cp publishes the fresh installer
+    NEXT TO the old one in the cache dir, and the alphabetical first-pick
+    served ..._0.1.0_...exe forever (0.1.0 sorts before 0.2.0) — so every
+    "update" the user downloaded was the same stale build."""
+    _, cache = dirs
+    _write_release(cache, "0.1.0", {"windows": "Companion_0.1.0.exe"})
+    _write_release(cache, "0.2.0", {"windows": "Companion_0.2.0.exe"})
+    out = asyncio.run(D.companion_manifest())
+    assert out["version"] == "0.2.0"
+    assert out["platforms"]["windows"]["filename"] == "Companion_0.2.0.exe"
+    resp = asyncio.run(D.companion_download("windows"))
+    assert resp.path.endswith("Companion_0.2.0.exe")
+
+
+def test_fresh_baked_beats_stale_cache(dirs, no_github):
+    """A stale cached copy must never shadow a fresher image-baked build."""
+    baked, cache = dirs
+    _write_release(cache, "0.1.0", {"windows": "Companion_0.1.0.exe"})
+    _write_release(baked, "0.2.0", {"windows": "Companion_0.2.0.exe"})
+    out = asyncio.run(D.companion_manifest())
+    assert out["version"] == "0.2.0"
+    assert out["platforms"]["windows"]["source"] == "baked"
+    resp = asyncio.run(D.companion_download("windows"))
+    assert resp.path.endswith("Companion_0.2.0.exe")
