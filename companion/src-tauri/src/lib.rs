@@ -739,6 +739,150 @@ async fn end_active_job(state: tauri::State<'_, SharedState>) -> Result<serde_js
     }))
 }
 
+/// ── App self-update (served by the paired ClipAI container) ─────────────
+/// The container's /api/downloads/companion/* routes hold the newest
+/// installer (GitHub-release cache or an image-baked from-source build), so
+/// the Companion can update ITSELF over the LAN with no GitHub dependency:
+/// check compares the manifest version against this build; install downloads
+/// the platform installer to a temp file, launches it, and exits the app so
+/// the installer can replace files. Both fail-soft with actionable errors.
+
+fn paired_base(state: &SharedState) -> Result<String, String> {
+    let url = state
+        .config_snapshot()
+        .paired_clipai_url
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
+    if url.is_empty() {
+        return Err("Not paired with a ClipAI server yet — pair first (the \
+                    update is downloaded from your ClipAI container)"
+            .into());
+    }
+    Ok(url)
+}
+
+#[cfg(target_os = "macos")]
+const UPDATE_PLATFORM: &str = "mac";
+#[cfg(not(target_os = "macos"))]
+const UPDATE_PLATFORM: &str = "windows";
+
+#[tauri::command]
+async fn check_app_update(
+    state: tauri::State<'_, SharedState>,
+) -> Result<serde_json::Value, String> {
+    let base = paired_base(&state.inner().clone())?;
+    let url = format!("{base}/api/downloads/companion/manifest");
+    let resp = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("{e}"))?
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("could not reach the ClipAI server ({e})"))?;
+    if !resp.status().is_success() {
+        return Err(format!("ClipAI answered HTTP {} for the installer \
+                            manifest", resp.status()));
+    }
+    let manifest: serde_json::Value = resp.json().await.map_err(|e| format!("{e}"))?;
+    let latest = manifest["version"].as_str().unwrap_or("").to_string();
+    let entry = &manifest["platforms"][UPDATE_PLATFORM];
+    let has_installer = entry.is_object();
+    let current = env!("CARGO_PKG_VERSION");
+    let update_available =
+        has_installer && !latest.is_empty() && crate::proxy::version_lt(current, &latest);
+    Ok(serde_json::json!({
+        "current": current,
+        "latest": latest,
+        "update_available": update_available,
+        "installer_available": has_installer,
+        "platform": UPDATE_PLATFORM,
+        "filename": entry["filename"].as_str().unwrap_or(""),
+        "size": entry["size"].as_u64().unwrap_or(0),
+        "source": entry["source"].as_str().unwrap_or(""),
+    }))
+}
+
+#[tauri::command]
+async fn install_app_update(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, SharedState>,
+) -> Result<String, String> {
+    let base = paired_base(&state.inner().clone())?;
+    let url = format!("{base}/api/downloads/companion/{UPDATE_PLATFORM}");
+    log::info!("self-update: downloading installer from {url}");
+    let resp = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(600))
+        .build()
+        .map_err(|e| format!("{e}"))?
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("download failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "no installer available (HTTP {}) — on the ClipAI side, run \
+             \"Check for Companion updates\" in Settings → GPU Companion, or \
+             rebuild the container with COMPANION_BUILD_FROM_SOURCE=1",
+            resp.status()
+        ));
+    }
+    // Filename from Content-Disposition, else a platform default.
+    let fallback = if UPDATE_PLATFORM == "mac" {
+        "ClipAI-GPU-Companion-update.dmg"
+    } else {
+        "ClipAI-GPU-Companion-update.exe"
+    };
+    let filename = resp
+        .headers()
+        .get("content-disposition")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split("filename=").nth(1))
+        .map(|v| v.trim_matches(&['"', ' '][..]).to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| fallback.to_string());
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("download interrupted: {e}"))?;
+    if bytes.len() < 1_000_000 {
+        // A real installer is tens of MB; a tiny body is an error page.
+        return Err(format!(
+            "downloaded file is implausibly small ({} bytes) — not running it",
+            bytes.len()
+        ));
+    }
+    let path = std::env::temp_dir().join(&filename);
+    tokio::fs::write(&path, &bytes)
+        .await
+        .map_err(|e| format!("could not save installer: {e}"))?;
+    log::info!(
+        "self-update: launching installer {} ({} MB) and exiting so it can \
+         replace the app",
+        path.display(),
+        bytes.len() / (1024 * 1024)
+    );
+    #[cfg(target_os = "macos")]
+    std::process::Command::new("open")
+        .arg(&path)
+        .spawn()
+        .map_err(|e| format!("could not open installer: {e}"))?;
+    #[cfg(not(target_os = "macos"))]
+    std::process::Command::new(&path)
+        .spawn()
+        .map_err(|e| format!("could not launch installer: {e}"))?;
+    // Give the GUI a moment to render the "installer started" state, then
+    // exit — the RunEvent::Exit handler stops Ollama/whisper children so the
+    // installer can replace every file.
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        handle.exit(0);
+    });
+    Ok(path.display().to_string())
+}
+
 #[tauri::command]
 async fn delete_model(model: String) -> Result<(), String> {
     ollama::delete_model(&model).await
@@ -1122,6 +1266,8 @@ pub fn run() {
             free_vram,
             end_active_job,
             pair_clipai,
+            check_app_update,
+            install_app_update,
         ]);
 
     // Build first (so a build failure — e.g. missing WebView2 — is logged, not

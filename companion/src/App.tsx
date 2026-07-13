@@ -8,6 +8,7 @@ import {
   installOllama, startOllama, pullModel, pairClipai,
   listModels, deleteModel, InstalledModel,
   downloadWhisper, refreshSidecar, exportLogs, testClipai, ClipaiTest, freeVram, endActiveJob,
+  checkAppUpdate, installAppUpdate, AppUpdateCheck,
 } from './api';
 
 // Common Ollama models offered as search suggestions on the Companion.
@@ -496,6 +497,47 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
       setTimeout(() => setSyncMsg(''), 5000);
     } finally {
       setEndingJob(false);
+    }
+  };
+
+  // ── App self-update (installer served by the paired ClipAI container) ──
+  const [updateInfo, setUpdateInfo] = useState<AppUpdateCheck | null>(null);
+  const [updateMsg, setUpdateMsg] = useState('');
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [installingUpdate, setInstallingUpdate] = useState(false);
+  const doCheckUpdate = async (quiet = false) => {
+    setCheckingUpdate(true);
+    if (!quiet) setUpdateMsg('');
+    try {
+      const info = await checkAppUpdate();
+      setUpdateInfo(info);
+      if (!quiet && !info.update_available) {
+        setUpdateMsg(info.installer_available
+          ? `Up to date — v${info.current} is the newest installer your ClipAI serves.`
+          : 'Your ClipAI server has no Companion installer yet — on the server, run "Check for Companion updates" in Settings → GPU Companion (or rebuild the container with COMPANION_BUILD_FROM_SOURCE=1).');
+      }
+    } catch (e) {
+      if (!quiet) setUpdateMsg(String(e));
+    } finally {
+      setCheckingUpdate(false);
+    }
+  };
+  // One quiet check shortly after launch so the button shows a badge when an
+  // update is already waiting on the paired server. Failures stay silent.
+  useEffect(() => {
+    const t = setTimeout(() => { doCheckUpdate(true); }, 4000);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  const doInstallUpdate = async () => {
+    setInstallingUpdate(true);
+    setUpdateMsg('Downloading the installer from your ClipAI server…');
+    try {
+      const path = await installAppUpdate();
+      setUpdateMsg(`Installer started (${path}) — this app will close so it can update. Reopen it when the installer finishes.`);
+    } catch (e) {
+      setUpdateMsg(String(e));
+      setInstallingUpdate(false);
     }
   };
 
@@ -1382,6 +1424,38 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
             </p>
           </>
         )}
+      </div>
+
+      <div className="panel">
+        <div className="row spread">
+          <h2>App updates</h2>
+          <button className="secondary" onClick={() => doCheckUpdate()} disabled={checkingUpdate}
+            title="Ask your paired ClipAI server which Companion installer it's serving and compare it to this app's version">
+            {checkingUpdate ? 'Checking…' : 'Check for updates'}
+          </button>
+        </div>
+        <p className="muted small" style={{ marginTop: 4 }}>
+          This app is v{updateInfo?.current || '…'}
+          {updateInfo?.latest ? ` — your ClipAI serves v${updateInfo.latest}` : ''}.
+          Updates download from your ClipAI server over the LAN (no GitHub needed once
+          the server has the installer).
+        </p>
+        {updateInfo?.update_available && (
+          <div className="row" style={{ gap: 10, alignItems: 'center' }}>
+            <button onClick={doInstallUpdate} disabled={installingUpdate}
+              title="Downloads the installer from ClipAI, launches it, and closes this app so it can update in place">
+              {installingUpdate
+                ? 'Updating…'
+                : `⬆ Update to v${updateInfo.latest}`}
+            </button>
+            <span className="muted small">
+              {updateInfo.filename}
+              {updateInfo.size ? ` · ${(updateInfo.size / (1024 * 1024)).toFixed(0)} MB` : ''}
+              {updateInfo.source ? ` · from the server's ${updateInfo.source} copy` : ''}
+            </span>
+          </div>
+        )}
+        {updateMsg && <p className="muted small" style={{ marginTop: 6 }}>{updateMsg}</p>}
       </div>
 
       <div className="panel">

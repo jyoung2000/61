@@ -128,3 +128,18 @@ export const endActiveJob = () =>
   invoke<{ unloaded: number; whisper_stopped: boolean; ended_job: string | null }>('end_active_job');
 export const pairClipai = (clipaiUrl: string, apiKey: string) =>
   invoke('pair_clipai', { clipaiUrl, apiKey });
+
+/** Self-update: what installer the paired ClipAI container is serving. */
+export interface AppUpdateCheck {
+  current: string;
+  latest: string;
+  update_available: boolean;
+  installer_available: boolean;
+  platform: string;
+  filename: string;
+  size: number;
+  source: string;
+}
+export const checkAppUpdate = () => invoke<AppUpdateCheck>('check_app_update');
+/** Download the installer from ClipAI, launch it, and exit this app. */
+export const installAppUpdate = () => invoke<string>('install_app_update');

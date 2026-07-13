@@ -44,8 +44,9 @@ fn header_str(headers: &HeaderMap, name: &str) -> String {
 
 /// `own < expected`, comparing tolerant semver triples ("0.2.0", "v0.2").
 /// Unparseable/empty `expected` never reports an update (a plain probe with
-/// no handshake header must not flag anything).
-fn version_lt(own: &str, expected: &str) -> bool {
+/// no handshake header must not flag anything). Also used by the GUI's
+/// self-update check (lib.rs) against the paired ClipAI's installer manifest.
+pub(crate) fn version_lt(own: &str, expected: &str) -> bool {
     fn triple(s: &str) -> Option<(u32, u32, u32)> {
         let digits: Vec<u32> = s
             .split(|c: char| !c.is_ascii_digit())
