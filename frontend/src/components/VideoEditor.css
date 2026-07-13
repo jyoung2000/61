@@ -1683,9 +1683,7 @@ input.ve-timecode--input {
   min-height: 320px;
   display: flex;
   flex-direction: column;
-  background:
-    linear-gradient(to bottom, rgba(0,0,0,0.04) 0, transparent 12px),
-    var(--ve-track-bg, rgba(0,0,0,0.02));
+  background: var(--ve-track-bg, rgba(0,0,0,0.02));
 }
 
 .ve-multi-timeline__toolbar {
@@ -3010,11 +3008,7 @@ input.ve-timecode--input {
   transition: background-color 0.12s ease, transform 0.12s ease;
 }
 .ve-multi-timeline__track-header:hover {
-  background: linear-gradient(
-    to right,
-    rgba(127, 127, 127, 0.06),
-    rgba(127, 127, 127, 0.0)
-  );
+  background: rgba(127, 127, 127, 0.06);
 }
 .ve-multi-timeline__track-ctrl {
   transition: opacity var(--dur-fast) var(--ease-out-quart), background-color var(--dur-fast) var(--ease-out-quart), transform var(--dur-fast) var(--ease-out-quart);
@@ -4580,11 +4574,12 @@ input.ve-timecode--input {
    border radii (3–14px) and flat single-color surfaces — functional, but the
    sizing/spacing read as awkward and cheap. This layer (placed LAST so it
    wins the cascade over the comp theme above) normalizes every metric to a
-   small scale and applies the Snow-Leopard-era Apple material treatment:
-   soft top-lit gradients on chrome bars, a 1px inner top highlight, recessed
-   "wells" for tracks and displays, an LCD-style timecode, capsule buttons
-   with a pressed inset state, and glossy trim handles. Restrained, tactile,
-   precise — nothing glows unless it's interactive.
+   small scale and applies a FLAT, current-macOS material: solid chrome
+   surfaces separated by hairlines, flat button faces whose states change by
+   fill (hover slightly darker, pressed darker still — no gloss, no bevel,
+   no gradient anywhere in the chrome), quiet solid wells for tracks and
+   displays, and a solid accent for primary actions. Depth comes only from
+   soft drop shadows on floating layers (menus, dialogs, tooltips).
 
    METRIC SCALE (the only values this layer uses):
      type:    10 / 11 / 12 / 13 px   (nothing below 10px anywhere)
@@ -4594,40 +4589,40 @@ input.ve-timecode--input {
    ═══════════════════════════════════════════════════════════════════════════ */
 
 .ve-container {
-  /* Material tokens (light) */
-  --ve-chrome-grad: linear-gradient(to bottom, #FBFBFD 0%, #F0F0F4 100%);
-  --ve-chrome-topline: rgba(255, 255, 255, 0.9);
-  --ve-face-grad: linear-gradient(to bottom, #FFFFFF 0%, #F4F4F7 100%);
-  --ve-face-grad-hover: linear-gradient(to bottom, #FFFFFF 0%, #ECECF1 100%);
-  --ve-face-pressed: inset 0 1px 2px rgba(0, 0, 0, 0.14);
-  --ve-accent-grad: linear-gradient(to bottom, #7E89FF 0%, #6370F4 100%);
-  --ve-accent-grad-hover: linear-gradient(to bottom, #8B95FF 0%, #6F7CFA 100%);
-  --ve-well-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.10),
-                    inset 0 0 0 0.5px rgba(0, 0, 0, 0.04);
-  --ve-lcd-bg: linear-gradient(to bottom, #E8E8ED 0%, #F2F2F6 100%);
-  --ve-lcd-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.12);
+  /* Material tokens (light) — flat solids only. The *-grad names are kept
+     so every consumer below stays valid, but they now resolve to single
+     colors. Pressed = a flat darkening overlay (inset spread fill), never
+     a bevel. Wells/LCDs = solid recessed tints ringed by a hairline. */
+  --ve-chrome-grad: #F5F5F7;
+  --ve-chrome-topline: transparent;
+  --ve-face-grad: #FFFFFF;
+  --ve-face-grad-hover: #F0F0F3;
+  --ve-face-pressed: inset 0 0 0 999px rgba(0, 0, 0, 0.07);
+  --ve-accent-grad: #6370F4;
+  --ve-accent-grad-hover: #707CF7;
+  --ve-well-shadow: inset 0 0 0 0.5px rgba(0, 0, 0, 0.08);
+  --ve-lcd-bg: #EFEFF2;
+  --ve-lcd-shadow: none;
   --ve-hairline: rgba(0, 0, 0, 0.12);
 }
 
 [data-theme="dark"] .ve-container {
-  --ve-chrome-grad: linear-gradient(to bottom, #1F1F24 0%, #161619 100%);
-  --ve-chrome-topline: rgba(255, 255, 255, 0.055);
-  --ve-face-grad: linear-gradient(to bottom, #2B2B31 0%, #222227 100%);
-  --ve-face-grad-hover: linear-gradient(to bottom, #33333A 0%, #28282E 100%);
-  --ve-face-pressed: inset 0 1px 3px rgba(0, 0, 0, 0.55);
-  --ve-accent-grad: linear-gradient(to bottom, #7A85FF 0%, #5C69E8 100%);
-  --ve-accent-grad-hover: linear-gradient(to bottom, #8791FF 0%, #6774F0 100%);
-  --ve-well-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.5),
-                    inset 0 0 0 0.5px rgba(0, 0, 0, 0.3);
-  --ve-lcd-bg: linear-gradient(to bottom, #0E0E11 0%, #16161A 100%);
-  --ve-lcd-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.6);
+  --ve-chrome-grad: #1B1B1F;
+  --ve-chrome-topline: transparent;
+  --ve-face-grad: #28282D;
+  --ve-face-grad-hover: #303036;
+  --ve-face-pressed: inset 0 0 0 999px rgba(255, 255, 255, 0.06);
+  --ve-accent-grad: #5C69E8;
+  --ve-accent-grad-hover: #6774F0;
+  --ve-well-shadow: inset 0 0 0 0.5px rgba(255, 255, 255, 0.07);
+  --ve-lcd-bg: #111114;
+  --ve-lcd-shadow: none;
   --ve-hairline: rgba(255, 255, 255, 0.10);
 }
 
-/* ── Chrome bars: top-lit brushed panels ──────────────────────────────────
-   Every horizontal chrome strip shares one material: a soft vertical
-   gradient with a 1px inner top highlight (the classic unified-toolbar
-   look) and a crisp hairline between stacked bars. */
+/* ── Chrome bars: flat solid panels ───────────────────────────────────────
+   Every horizontal chrome strip shares one flat surface color; stacked
+   bars separate by their existing hairline borders, nothing else. */
 .ve-container .ve-header,
 .ve-container .ve-controls,
 .ve-container .ve-toolbar,
@@ -4635,7 +4630,7 @@ input.ve-timecode--input {
 .ve-container .ve-multitrack__toolbar,
 .ve-container .ve-multi-timeline__toolbar {
   background: var(--ve-chrome-grad);
-  box-shadow: inset 0 1px 0 var(--ve-chrome-topline);
+  box-shadow: none;
 }
 
 .ve-container .ve-timeline,
@@ -4655,18 +4650,14 @@ input.ve-timecode--input {
 .ve-container .ve-multi-timeline__toolbar { padding: 6px 12px; gap: 8px; }
 .ve-container .ve-timeline { padding: 8px 14px 8px 44px; }
 
-/* ── Single-clip timeline: recessed track wells ───────────────────────────
-   Tracks read as machined recesses (FCP7 well), not flat rectangles: an
-   inner shadow at the top edge, a hairline ring, and 6px radii. */
+/* ── Single-clip timeline: quiet flat track wells ─────────────────────────
+   Tracks are flat tinted rectangles ringed by a hairline — no inner
+   shadows, no bottom-lip highlight. */
 .ve-container .ve-timeline__track,
 .ve-container .ve-timeline__waveform-track {
   border: none;
   border-radius: 6px;
-  box-shadow: var(--ve-well-shadow), 0 1px 0 rgba(255, 255, 255, 0.35);
-}
-[data-theme="dark"] .ve-container .ve-timeline__track,
-[data-theme="dark"] .ve-container .ve-timeline__waveform-track {
-  box-shadow: var(--ve-well-shadow), 0 1px 0 rgba(255, 255, 255, 0.03);
+  box-shadow: var(--ve-well-shadow);
 }
 .ve-container .ve-timeline__track { height: 44px; }
 .ve-container .ve-timeline__waveform-track { height: 30px; margin-top: 5px; }
@@ -4690,28 +4681,24 @@ input.ve-timecode--input {
   opacity: 0.6;
 }
 
-/* ── Trim handles: glossy capsule grips ─────────────────────────────────── */
+/* ── Trim handles: flat accent grips ────────────────────────────────────── */
 .ve-container .ve-trim-handle {
   width: 12px;
   background: var(--ve-accent-grad);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.35),
-              inset 0 -1px 0 rgba(0, 0, 0, 0.15),
-              0 0 0 0.5px rgba(0, 0, 0, 0.2);
+  box-shadow: 0 0 0 0.5px rgba(0, 0, 0, 0.2);
 }
 .ve-container .ve-trim-handle--left { border-radius: 6px 0 0 6px; }
 .ve-container .ve-trim-handle--right { border-radius: 0 6px 6px 0; }
 .ve-container .ve-trim-handle:hover,
 .ve-container .ve-trim-handle--active {
   background: var(--ve-accent-grad-hover);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.4),
-              inset 0 -1px 0 rgba(0, 0, 0, 0.15),
-              0 0 10px var(--ve-accent-border);
+  box-shadow: 0 0 0 0.5px rgba(0, 0, 0, 0.2);
 }
 .ve-container .ve-trim-handle__grip span {
   width: 5px;
   height: 1.5px;
   background: rgba(255, 255, 255, 0.85);
-  box-shadow: 0 0.5px 0.5px rgba(0, 0, 0, 0.3);
+  box-shadow: none;
 }
 
 /* Playhead: crisp needle with a machined cap (no fuzzy glow). */
@@ -4730,9 +4717,9 @@ input.ve-timecode--input {
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
 }
 
-/* ── Transport & buttons: tactile capsules ────────────────────────────────
-   Icon buttons stay quiet until touched; bordered pills get a real face
-   (gradient + hairline + top highlight) and a pressed inset. */
+/* ── Transport & buttons: flat faces ──────────────────────────────────────
+   Icon buttons stay quiet until touched; bordered pills are flat fills
+   with a hairline — hover darkens the fill, pressed darkens it more. */
 .ve-container .ve-btn {
   border-radius: 7px;
   min-width: 30px;
@@ -4748,12 +4735,7 @@ input.ve-timecode--input {
   border-radius: 9px;
   background: var(--ve-face-grad);
   border: 1px solid var(--ve-hairline);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.5),
-              0 1px 2px rgba(0, 0, 0, 0.08);
-}
-[data-theme="dark"] .ve-container .ve-btn--play {
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.07),
-              0 1px 2px rgba(0, 0, 0, 0.3);
+  box-shadow: none;
 }
 .ve-container .ve-btn--play:hover { background: var(--ve-face-grad-hover); }
 .ve-container .ve-btn--play:active {
@@ -4773,15 +4755,7 @@ input.ve-timecode--input {
   border-radius: 7px;
   border: 1px solid var(--ve-hairline);
   background: var(--ve-face-grad);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.5), 0 1px 1px rgba(0, 0, 0, 0.04);
-}
-[data-theme="dark"] .ve-container .ve-speed__btn,
-[data-theme="dark"] .ve-container .ve-btn--small,
-[data-theme="dark"] .ve-container .ve-multitrack-toggle__btn,
-[data-theme="dark"] .ve-container .ve-topbar__cmdk,
-[data-theme="dark"] .ve-container .ve-topbar__toggle,
-[data-theme="dark"] .ve-container .ve-ratio-pill {
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06), 0 1px 1px rgba(0, 0, 0, 0.25);
+  box-shadow: none;
 }
 .ve-container .ve-speed__btn:hover,
 .ve-container .ve-btn--small:hover,
@@ -4800,26 +4774,26 @@ input.ve-timecode--input {
   box-shadow: var(--ve-face-pressed);
   transform: none;
 }
-/* Selected pill: accent-tinted face, still dimensional. */
+/* Selected pill: flat accent-tinted face. */
 .ve-container .ve-multitrack-toggle__btn--active,
 .ve-container .ve-speed__btn--active,
 .ve-container .ve-topbar__toggle--on,
 .ve-container .ve-ratio-pill--on {
   background: var(--ve-accent-dim);
   border-color: var(--ve-accent-border);
-  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.06);
+  box-shadow: none;
 }
 
-/* Primary (Export) buttons: the one saturated element on the chrome. */
+/* Primary (Export) buttons: the one saturated element on the chrome —
+   a flat accent fill, no gloss, no text shadow. */
 .ve-container .ve-topbar__export,
 .ve-container .ve-export-btn,
 .ve-container .ve-btn--export {
   min-height: 28px;
   border-radius: 7px;
   background: var(--ve-accent-grad) !important;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.28),
-              0 1px 2px rgba(0, 0, 0, 0.15);
-  text-shadow: 0 1px 1px rgba(0, 0, 0, 0.15);
+  box-shadow: none;
+  text-shadow: none;
 }
 .ve-container .ve-topbar__export:hover,
 .ve-container .ve-export-btn:hover,
@@ -4829,7 +4803,7 @@ input.ve-timecode--input {
 .ve-container .ve-topbar__export:active,
 .ve-container .ve-export-btn:active,
 .ve-container .ve-btn--export:active {
-  box-shadow: inset 0 2px 3px rgba(0, 0, 0, 0.25);
+  box-shadow: var(--ve-face-pressed);
   transform: none;
 }
 
@@ -4926,10 +4900,7 @@ input.ve-timecode--input {
 .ve-container .ve-properties__tab { border-radius: 6px; font-size: 11px; min-height: 26px; }
 .ve-container .ve-properties__tab--active {
   background: var(--ve-face-grad);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.5), 0 1px 2px rgba(0, 0, 0, 0.10);
-}
-[data-theme="dark"] .ve-container .ve-properties__tab--active {
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.07), 0 1px 2px rgba(0, 0, 0, 0.35);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
 }
 .ve-container .ve-inspector-row { min-height: 28px; }
 .ve-container .ve-inspector-row__label { font-size: 11px; }
@@ -4944,15 +4915,13 @@ input.ve-timecode--input {
   border-radius: 10px;
   padding: 5px;
   box-shadow: 0 0 0 0.5px var(--ve-hairline, rgba(0,0,0,0.12)),
-              0 12px 32px rgba(0, 0, 0, 0.22),
-              inset 0 1px 0 rgba(255, 255, 255, 0.35);
+              0 12px 32px rgba(0, 0, 0, 0.22);
 }
 [data-theme="dark"] .ve-container .ve-speed__dropdown,
 [data-theme="dark"] .ve-container .ve-multi-timeline__add-track-dropdown,
 [data-theme="dark"] .ve-context-menu {
   box-shadow: 0 0 0 0.5px rgba(255, 255, 255, 0.10),
-              0 12px 32px rgba(0, 0, 0, 0.55),
-              inset 0 1px 0 rgba(255, 255, 255, 0.05);
+              0 12px 32px rgba(0, 0, 0, 0.55);
 }
 .ve-container .ve-speed__option { font-size: 11px; min-height: 28px; border-radius: 6px; }
 .ve-context-menu__item { font-size: 12px; min-height: 28px; border-radius: 6px; }
@@ -4963,10 +4932,10 @@ input.ve-timecode--input {
 .ve-export-dialog__label { font-size: 10px; letter-spacing: 0.06em; }
 .ve-export-dialog__btn { border-radius: 8px; min-height: 34px; }
 .ve-export-dialog__btn--primary {
-  background: var(--ve-accent-grad, linear-gradient(to bottom, #7E89FF, #6370F4));
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.28), 0 1px 2px rgba(0, 0, 0, 0.15);
+  background: var(--ve-accent-grad, #6370F4);
+  box-shadow: none;
 }
-.ve-export-dialog__btn--primary:active { box-shadow: inset 0 2px 3px rgba(0, 0, 0, 0.25); }
+.ve-export-dialog__btn--primary:active { box-shadow: var(--ve-face-pressed, inset 0 0 0 999px rgba(0, 0, 0, 0.07)); }
 
 /* Tooltips + palette inherit the floating material. */
 .ve-tooltip { border-radius: 8px; font-size: 11px; }
@@ -4986,15 +4955,15 @@ input.ve-timecode--input {
 .ve-container .ve-toolbar__label { font-size: 11px; }
 .ve-container .ve-toolbar__divider { margin: 0 6px; height: 18px; }
 
-/* Media library cards sit on the panel like physical chips. */
+/* Media library cards: flat chips with a soft resting shadow. */
 .ve-container .ve-media-uploader__item {
   border-radius: 7px;
   padding: 5px;
   background: var(--ve-face-grad);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.4), 0 1px 2px rgba(0, 0, 0, 0.06);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
 }
 [data-theme="dark"] .ve-container .ve-media-uploader__item {
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05), 0 1px 2px rgba(0, 0, 0, 0.3);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
 }
 .ve-container .ve-media-uploader__thumb { border-radius: 5px; }
 .ve-container .ve-media-uploader__dropzone { border-radius: 8px; }
@@ -5004,13 +4973,11 @@ input.ve-timecode--input {
   border-radius: 10px;
   padding: 10px 12px;
   box-shadow: 0 0 0 0.5px var(--ve-hairline),
-              0 4px 16px rgba(0, 0, 0, 0.10),
-              inset 0 1px 0 rgba(255, 255, 255, 0.35);
+              0 4px 16px rgba(0, 0, 0, 0.10);
 }
 [data-theme="dark"] .ve-container .ve-segment-inspector {
   box-shadow: 0 0 0 0.5px rgba(255, 255, 255, 0.08),
-              0 4px 20px rgba(0, 0, 0, 0.4),
-              inset 0 1px 0 rgba(255, 255, 255, 0.04);
+              0 4px 20px rgba(0, 0, 0, 0.4);
 }
 .ve-container .ve-segment-inspector__control-label { font-size: 11px; width: 52px; }
 .ve-container .ve-segment-inspector__volume-value { font-size: 11px; font-variant-numeric: tabular-nums; }
@@ -5019,7 +4986,7 @@ input.ve-timecode--input {
 .ve-container .ve-segment-inspector__done { padding: 5px 14px; font-size: 11px; border-radius: 7px; }
 .ve-container .ve-segment-inspector__time-range { font-size: 11px; font-variant-numeric: tabular-nums; }
 
-/* ── Sliders: aqua-glass thumbs on recessed rails ────────────────────────── */
+/* ── Sliders: flat white knobs on flat rails (current-macOS look) ────────── */
 .ve-container .ve-properties__slider,
 .ve-container .ve-effects__slider,
 .ve-container .ve-segment-inspector__volume-slider,
@@ -5032,9 +4999,9 @@ input.ve-timecode--input {
 .ve-container .ve-effects__slider::-webkit-slider-thumb,
 .ve-container .ve-segment-inspector__volume-slider::-webkit-slider-thumb,
 .ve-container .ve-multi-timeline__zoom-slider::-webkit-slider-thumb {
-  background: linear-gradient(to bottom, #FFFFFF 0%, #E8E8ED 100%);
+  background: #FFFFFF;
   border: 0.5px solid rgba(0, 0, 0, 0.25);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9), 0 1px 2px rgba(0, 0, 0, 0.25);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
   width: 13px;
   height: 13px;
   margin-top: -4.5px;
@@ -5043,9 +5010,9 @@ input.ve-timecode--input {
 .ve-container .ve-effects__slider::-moz-range-thumb,
 .ve-container .ve-segment-inspector__volume-slider::-moz-range-thumb,
 .ve-container .ve-multi-timeline__zoom-slider::-moz-range-thumb {
-  background: linear-gradient(to bottom, #FFFFFF 0%, #E8E8ED 100%);
+  background: #FFFFFF;
   border: 0.5px solid rgba(0, 0, 0, 0.25);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9), 0 1px 2px rgba(0, 0, 0, 0.25);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
   width: 13px;
   height: 13px;
 }
@@ -5131,8 +5098,8 @@ input.ve-timecode--input {
   }
 }
 
-/* ═══ Control-parity pass: every remaining button + slider joins the
-   dimensional material system (nothing ships flat). ═══════════════════════ */
+/* ═══ Control-parity pass: every remaining button + slider joins the same
+   flat material system (no stragglers with their own treatment). ═════════ */
 
 /* Header close, error retry, effects reset, cheatsheet close: quiet icon
    buttons that gain a face on hover and a real pressed state. */
@@ -5152,12 +5119,7 @@ input.ve-timecode--input {
   border-radius: 7px;
   border: 1px solid var(--ve-hairline);
   background: var(--ve-face-grad);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.5), 0 1px 1px rgba(0, 0, 0, 0.04);
-}
-[data-theme="dark"] .ve-container .ve-error__retry,
-[data-theme="dark"] .ve-container .ve-media-uploader__add-btn,
-[data-theme="dark"] .ve-container .ve-export-dialog__btn--secondary {
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06), 0 1px 1px rgba(0, 0, 0, 0.25);
+  box-shadow: none;
 }
 .ve-container .ve-error__retry:hover,
 .ve-container .ve-media-uploader__add-btn:hover,
@@ -5177,19 +5139,19 @@ input.ve-timecode--input {
   min-height: 26px;
 }
 
-/* Accent action buttons (apply trim, inspector done, preset): the accent
-   gradient family with gloss + pressed inset. */
+/* Accent action buttons (apply trim, inspector done, preset): flat accent
+   fills — hover brightens, pressed darkens flatly. */
 .ve-container .ve-apply-trim {
   min-height: 28px;
   border-radius: 7px;
   border: 1px solid var(--ve-accent-border);
   background: var(--ve-accent-dim);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.25);
+  box-shadow: none;
 }
 .ve-container .ve-apply-trim:hover {
   background: var(--ve-accent-grad);
   color: #fff;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.28), 0 1px 2px rgba(0, 0, 0, 0.15);
+  box-shadow: none;
 }
 .ve-container .ve-apply-trim:active { box-shadow: var(--ve-face-pressed); transform: none; }
 
@@ -5197,12 +5159,12 @@ input.ve-timecode--input {
 .ve-container .ve-properties__preset-btn {
   min-height: 28px;
   border-radius: 7px;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.28), 0 1px 2px rgba(0, 0, 0, 0.12);
-  text-shadow: 0 1px 1px rgba(0, 0, 0, 0.12);
+  box-shadow: none;
+  text-shadow: none;
 }
 .ve-container .ve-segment-inspector__done:active,
 .ve-container .ve-properties__preset-btn:active {
-  box-shadow: inset 0 2px 3px rgba(0, 0, 0, 0.25);
+  box-shadow: var(--ve-face-pressed);
   transform: none;
 }
 .ve-container .ve-properties__preset-btn { font-size: 11px; padding: 7px 12px; }
@@ -5213,35 +5175,35 @@ input.ve-timecode--input {
 .ve-export-dialog__mode-btn,
 .ve-export-dialog__quality-pill {
   border-radius: 8px;
-  background: var(--ve-face-grad, linear-gradient(to bottom, #FFFFFF, #F4F4F7));
+  background: var(--ve-face-grad, #FFFFFF);
   border: 1px solid var(--ve-hairline, rgba(0, 0, 0, 0.12));
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.5), 0 1px 1px rgba(0, 0, 0, 0.04);
+  box-shadow: none;
   min-height: 34px;
 }
 .ve-export-dialog__mode-btn--active,
 .ve-container .ve-export-dialog__mode-btn--active {
   background: var(--ve-accent-dim, rgba(110, 123, 255, 0.14));
   border-color: var(--ve-accent-border, rgba(110, 123, 255, 0.5));
-  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.06);
+  box-shadow: none;
 }
 .ve-export-dialog__quality-pill--active {
-  background: var(--ve-accent-grad, linear-gradient(to bottom, #7E89FF, #6370F4));
+  background: var(--ve-accent-grad, #6370F4);
   border-color: transparent;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.28), 0 1px 2px rgba(0, 0, 0, 0.15);
+  box-shadow: none;
   color: #fff;
 }
 .ve-export-dialog__platform-chip {
   min-height: 28px;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.35);
+  box-shadow: none;
 }
 
 /* Transition picker tiles: chip faces with a selected accent ring. */
 .ve-container .ve-transition-picker__item,
 .ve-transition-picker__item {
   border-radius: 7px;
-  background: var(--ve-face-grad, linear-gradient(to bottom, #FFFFFF, #F4F4F7));
+  background: var(--ve-face-grad, #FFFFFF);
   border: 1px solid var(--ve-hairline, rgba(0, 0, 0, 0.10));
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.4), 0 1px 1px rgba(0, 0, 0, 0.04);
+  box-shadow: none;
   min-height: 44px;
 }
 .ve-transition-picker__item--active {
@@ -5250,24 +5212,23 @@ input.ve-timecode--input {
 }
 .ve-transition-picker__dur-pill { border-radius: 999px; min-height: 24px; padding: 2px 10px; }
 .ve-transition-picker__dur-pill--active {
-  background: var(--ve-accent-grad, linear-gradient(to bottom, #7E89FF, #6370F4));
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.28);
+  background: var(--ve-accent-grad, #6370F4);
+  box-shadow: none;
 }
 
-/* Volume slider: the one slider that stayed flat — now a miniature of the
-   glass family (slim rail, small glass knob). */
+/* Volume slider: same flat family (slim rail, small flat white knob). */
 .ve-container .ve-volume__slider::-webkit-slider-thumb {
-  background: linear-gradient(to bottom, #FFFFFF 0%, #E9E9EE 100%);
+  background: #FFFFFF;
   border: 0.5px solid rgba(0, 0, 0, 0.3);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9), 0 1px 2px rgba(0, 0, 0, 0.25);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
   width: 11px;
   height: 11px;
   margin-top: -4px;
 }
 .ve-container .ve-volume__slider::-moz-range-thumb {
-  background: linear-gradient(to bottom, #FFFFFF 0%, #E9E9EE 100%);
+  background: #FFFFFF;
   border: 0.5px solid rgba(0, 0, 0, 0.3);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9), 0 1px 2px rgba(0, 0, 0, 0.25);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
   width: 11px;
   height: 11px;
 }

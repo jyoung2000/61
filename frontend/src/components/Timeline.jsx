@@ -919,16 +919,11 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
       const actualW = Math.min(w, canvasW - clipX);
       const clipW = Math.min(Math.max(actualW, 4), availableW || actualW);
 
-      // Subtle vertical gradient — top is lighter, bottom darker. Reads
-      // as depth without competing with the track-color identity.
+      // Flat fill — selection/hover state changes opacity, not shading.
       const bodyY = y + 3;
       const bodyH = laneH - 6;
-      const grad = ctx.createLinearGradient(0, bodyY, 0, bodyY + bodyH);
-      const alphaTop = (isSelected || isMultiSelected) ? 'F0' : (isHovered ? 'C0' : '99');
-      const alphaBot = (isSelected || isMultiSelected) ? 'C0' : (isHovered ? '95' : '6A');
-      grad.addColorStop(0, color + alphaTop);
-      grad.addColorStop(1, color + alphaBot);
-      ctx.fillStyle = grad;
+      const bodyAlpha = (isSelected || isMultiSelected) ? 'E0' : (isHovered ? 'B0' : '85');
+      ctx.fillStyle = color + bodyAlpha;
 
       // Soft drop shadow when selected — only the selected item gets
       // the shadow so it visibly "lifts" off the lane.
@@ -1203,15 +1198,10 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
             const sBodyH = cropLaneH - 8;
             const sRr = 4;
 
-            // Vertical gradient — same depth treatment as the main
-            // segments so the crop track reads as part of the same
-            // visual system rather than a flat tag strip.
-            const sGrad = ctx.createLinearGradient(0, sBodyY, 0, sBodyY + sBodyH);
-            const aTop = isSelCrop ? 'F0' : (isHoverCrop ? 'C0' : '99');
-            const aBot = isSelCrop ? 'C0' : (isHoverCrop ? '85' : '5A');
-            sGrad.addColorStop(0, baseColor + aTop);
-            sGrad.addColorStop(1, baseColor + aBot);
-            ctx.fillStyle = sGrad;
+            // Flat fill — same treatment as the main segments so the crop
+            // track reads as part of the same visual system.
+            const sAlpha = isSelCrop ? 'E0' : (isHoverCrop ? 'B0' : '80');
+            ctx.fillStyle = baseColor + sAlpha;
 
             if (isSelCrop) {
               ctx.save();
