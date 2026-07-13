@@ -57,8 +57,15 @@ def _header_safe(value: str, limit: int = 180) -> str:
 
 
 def clipai_headers() -> dict:
-    """``X-ClipAI-*`` headers for the current job, or ``{}`` outside a job."""
-    headers = {}
+    """``X-ClipAI-*`` headers for the current job, or the identity headers
+    alone outside a job.
+
+    ``X-ClipAI-Port`` is ALWAYS attached: the Companion combines it with the
+    connection's peer IP to learn this server's reachable base URL, which
+    powers its self-update download for manually-added (never GUI-paired)
+    setups."""
+    import os as _os
+    headers = {"X-ClipAI-Port": _os.environ.get("CLIPAI_PORT", "1353")}
     job_id = _job_id.get()
     if job_id:
         headers["X-ClipAI-Job-Id"] = _header_safe(job_id, 80)

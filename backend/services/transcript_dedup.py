@@ -377,6 +377,37 @@ def _collapse_text_repetition(text: str, *, min_word_run: int = 3, keep_run: int
     return " ".join(out) if changed else raw
 
 
+# A letter repeated 5+ times in a row (case-insensitive: "Uuuuuu",
+# "AAAAAAAAAAAA", "Eeeeeee") -- non-verbal vocalization the ASR stretched into
+# a wall of glyphs. Netflix-style subs cap these; keep 3 so the cue still
+# reads as a sound, not a scream of characters.
+_CHAR_RUN_RE = re.compile(r"([A-Za-z])(\1{4,})", re.IGNORECASE)
+
+
+def collapse_char_runs(
+    segments: list,
+    text_key: str = "text",
+    *,
+    keep: int = 3,
+) -> tuple[list, int]:
+    """Collapse runs of one repeated letter to ``keep`` glyphs per cue.
+
+    Targets stretched vocalizations on the TRANSLATED track ("Uuuuuuuuuu.",
+    "AAAAAAAAAA AIBON") that read as noise walls in the export. Real English
+    words never contain 5 identical consecutive letters, so text is safe.
+    Order/timing untouched; markers skipped. Returns ``(segments, changed)``."""
+    changed = 0
+    for seg in segments or []:
+        raw = (_seg_get(seg, text_key, "") or "")
+        if not raw or _is_marker_text(raw):
+            continue
+        new = _CHAR_RUN_RE.sub(lambda m: m.group(1) + m.group(2)[: keep - 1], raw)
+        if new != raw:
+            _seg_set(seg, text_key, new)
+            changed += 1
+    return segments, changed
+
+
 def collapse_intra_cue_repetition(
     segments: list,
     text_key: str = "text",

@@ -29,7 +29,11 @@ import MarqueeSelection from './MarqueeSelection';
 import { hexToRgbString } from '../utils/colorUtils';
 import { applyPreservesPitch } from '../utils/preservesPitch';
 import { runEditorQA, autoFixTrackCompatibility } from '../utils/editorQA';
-import { registerFilmstripSource } from '../utils/filmstrip';
+import {
+  registerFilmstripSource,
+  ensureThumbnail,
+  FILMSTRIP_UPDATED_EVENT,
+} from '../utils/filmstrip';
 import { formatKbd } from '../utils/platform';
 import './VideoEditor.css';
 
@@ -1835,60 +1839,57 @@ export default function VideoEditor({
   }, []);
 
   useEffect(() => {
-    if (!src || !videoReady || clipDur <= 0) return;
+    // Sprite-backed filmstrip. The old implementation seeked a hidden
+    // <video> 15 times into the source — on a 2-hour remote file each deep
+    // seek is a multi-second Range-request storm that competes with the
+    // preview player, the 15s load timeout regularly fired first, and the
+    // whole strip silently stayed BLANK (`catch {}`). The server sprite
+    // (precomputed at analysis; lazily rebuilt by /api/jobs/{id}/filmstrip.*)
+    // slices all 15 tiles from one cached JPEG in milliseconds; while it's
+    // still generating, ensureThumbnail rejects softly and we retry.
+    if (!src || clipDur <= 0) return;
     let cancelled = false;
-    const generate = async () => {
-      try {
-        const tv = document.createElement('video');
-        tv.muted = true;
-        tv.preload = 'auto';
-        tv.src = src;
-        await new Promise((resolve, reject) => {
-          tv.onloadeddata = resolve;
-          tv.onerror = () => reject();
-          setTimeout(() => reject(), 15000);
-        });
-        if (cancelled) { tv.src = ''; return; }
-        const NUM = 15;
-        const vw = tv.videoWidth || 320;
-        const vh = tv.videoHeight || 180;
-        const tH = 60;
-        const tW = Math.round(tH * (vw / vh));
-        const canvases = [];
-        for (let i = 0; i < NUM; i++) {
-          if (cancelled) break;
-          const time = clipStart + ((i + 0.5) / NUM) * clipDur;
-          tv.currentTime = Math.min(time, (tv.duration || time) - 0.05);
-          // Prefer the real `seeked` event; the timeout is only a last-resort
-          // fallback. Deep seeks into a long (2h) video routinely take longer
-          // than 3s, so a short fallback fired first and captured a blank /
-          // previous frame — give it room so we grab the actual frame.
-          await new Promise((r) => {
-            let done = false;
-            const finish = () => { if (!done) { done = true; r(); } };
-            tv.onseeked = finish;
-            setTimeout(finish, 7000);
-          });
-          if (cancelled) break;
-          try {
-            const c = document.createElement('canvas');
-            c.width = tW; c.height = tH;
-            const tctx = c.getContext && c.getContext('2d');
-            if (!tctx) { canvases.push(null); continue; }
-            tctx.drawImage(tv, 0, 0, tW, tH);
-            canvases.push(c);
-          } catch { canvases.push(null); }
-        }
-        tv.src = ''; tv.load();
-        if (!cancelled && canvases.some(Boolean)) {
-          thumbnailsRef.current = canvases;
-          drawThumbnails();
-        }
-      } catch { /* thumbnails are optional */ }
+    let retryTimer = null;
+    const NUM = 15;
+    const tH = 60;
+    const tW = Math.round(tH * (16 / 9));
+    const canvases = new Array(NUM).fill(null);
+    thumbnailsRef.current = canvases;
+    const fill = () => {
+      if (cancelled) return;
+      let pending = false;
+      canvases.forEach((have, i) => {
+        if (have) return;
+        const time = clipStart + ((i + 0.5) / NUM) * clipDur;
+        pending = true;
+        ensureThumbnail(src, time, tW, tH, { durationHint: clipStart + clipDur })
+          .then((bmp) => {
+            if (cancelled || !bmp) return;
+            canvases[i] = bmp;
+            drawThumbnails();
+          })
+          .catch(() => { /* sprite pending — the retry below re-asks */ });
+      });
+      // Sprite may still be generating server-side (long videos build it in
+      // the background) — keep re-asking until every tile is in.
+      if (pending) retryTimer = setTimeout(fill, 6500);
     };
-    generate();
-    return () => { cancelled = true; thumbnailsRef.current = []; };
-  }, [src, videoReady, clipStart, clipDur, drawThumbnails]);
+    fill();
+    // Coarse→fine upgrade (or late sprite): stale tiles were dropped by the
+    // util; clear ours and refill from the new sheet.
+    const onUpdate = (e) => {
+      if (cancelled || !e?.detail || e.detail.src !== src) return;
+      canvases.fill(null);
+      fill();
+    };
+    window.addEventListener(FILMSTRIP_UPDATED_EVENT, onUpdate);
+    return () => {
+      cancelled = true;
+      if (retryTimer) clearTimeout(retryTimer);
+      window.removeEventListener(FILMSTRIP_UPDATED_EVENT, onUpdate);
+      thumbnailsRef.current = [];
+    };
+  }, [src, clipStart, clipDur, drawThumbnails]);
 
   // Redraw thumbnails on resize
   useEffect(() => {

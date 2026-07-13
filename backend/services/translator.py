@@ -312,15 +312,20 @@ _SENT_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+")
 def strip_invented_speaker_labels(text: str, source: str) -> str:
     """Remove screenplay-style ``Name:`` labels the model invented.
 
-    Only fires when the SOURCE line contains no colon (ASCII or fullwidth) —
-    a colon construct in the translation of a colon-free source is model-added
-    formatting, not content. Leading labels and labels re-appearing after
-    sentence punctuation are both stripped. Fail-soft: never empties a cue.
+    Fires when the SOURCE line contains no colon (ASCII or fullwidth) — a
+    colon construct in the translation of a colon-free source is model-added
+    formatting, not content. A source colon only PROTECTS the label when the
+    source also contains Latin script: a purely CJK source line can never
+    legitimately yield a Latin ``MECA:`` prefix, so a Japanese ``：`` (or a
+    Whisper-emitted ``名前:``) must not shield the invented English label —
+    the observed leak kept "MECA:" through four runs because of exactly that.
+    Leading labels and labels re-appearing after sentence punctuation are
+    both stripped. Fail-soft: never empties a cue.
     """
     if not text:
         return text
     src = source or ""
-    if ":" in src or "：" in src:
+    if (":" in src or "：" in src) and re.search(r"[A-Za-z]", src):
         return text
     out = _SPK_LEAD_RE.sub("", text)
     out = _SPK_MID_RE.sub(r"\1", out)

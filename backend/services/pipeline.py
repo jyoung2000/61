@@ -1192,49 +1192,71 @@ async def _llm_cleanup_untranslated(segments, source_lang, target_lang,
                         job_id, len(_pre), len(_uniq))
             except Exception as _batch_err:
                 logger.info("[%s] Batched cleanup pre-pass skipped: %s", job_id, _batch_err)
+        # Translate the remaining unique leftovers CONCURRENTLY (the Companion
+        # serves num_parallel slots — the old strictly-serial loop paid one
+        # full round trip per cue and was a visible multi-minute tail).
+        # Results land in _cache; the apply loop below then never awaits.
+        _todo = []
+        _seen_todo = set()
+        for i in leftover_idx:
+            _st = _txt(segments[i]).strip()
+            if _st and _st not in _cache and _st not in _seen_todo:
+                _seen_todo.add(_st)
+                _todo.append(_st)
+
+        async def _recover_one(src_text: str) -> None:
+            if _budget > 0 and _time.monotonic() - _t0 > _budget:
+                return  # budget reached — leave uncached (draft kept)
+            prompt = (
+                (_terms_block or "")
+                + f"Translate this subtitle line into natural, fluent {_tgt_name}. "
+                f"Reply with ONLY the {_tgt_name} translation — no quotes, no "
+                f"notes, do not repeat the original.\n\n{src_text}")
+            # ``except Exception`` only — a real cancel (CancelledError, a
+            # BaseException) still propagates and stops the run.
+            resp = None
+            try:
+                resp = await orchestrator.text_completion(
+                    prompt, timeout=60, job_id=job_id or "", skip_circuit_breaker=True)
+            except Exception:
+                resp = None
+            t = _validate_translation(resp, source_lang)
+            if not t:
+                # Local chain dead OR it echoed the source back (the 21:32
+                # run: 6/17 flagged cues shipped because qwen2.5:3b echoed
+                # romaji and the cloud net only caught EXCEPTIONS, not
+                # echoes). Any unusable local answer escalates to the
+                # cloud polish model — these are a handful of cues.
+                try:
+                    from backend.services.transcript_polisher import (
+                        _cloud_polish_completion)
+                    t = _validate_translation(
+                        await _cloud_polish_completion(prompt, 60), source_lang)
+                except Exception:
+                    t = ""
+            _cache[src_text] = t or ""
+
+        if _todo:
+            _rec_sem = asyncio.Semaphore(
+                max(1, int(getattr(settings, "TRANSLATION_LLM_CLEANUP_CONCURRENCY", 3))))
+
+            async def _guarded_recover(s: str) -> None:
+                async with _rec_sem:
+                    await _recover_one(s)
+
+            await asyncio.gather(*(_guarded_recover(s) for s in _todo),
+                                 return_exceptions=False)
+            if _budget > 0 and _time.monotonic() - _t0 > _budget:
+                logger.warning("[%s] LLM cleanup budget reached (%d unique done)",
+                               job_id, len(_cache))
+
         for i in leftover_idx:
             cur = segments[i]
             src_text = _txt(cur).strip()
             if not src_text:
                 continue
             t = _cache.get(src_text)
-            if t is None:  # not attempted yet
-                if _budget > 0 and _time.monotonic() - _t0 > _budget:
-                    logger.warning("[%s] LLM cleanup budget reached (%d unique done)",
-                                   job_id, len(_cache))
-                    break
-                prompt = (
-                    (_terms_block or "")
-                    + f"Translate this subtitle line into natural, fluent {_tgt_name}. "
-                    f"Reply with ONLY the {_tgt_name} translation — no quotes, no "
-                    f"notes, do not repeat the original.\n\n{src_text}")
-                # ``except Exception`` only — a real cancel (CancelledError, a
-                # BaseException) still propagates and stops the run.
-                resp = None
-                try:
-                    resp = await orchestrator.text_completion(
-                        prompt, timeout=60, job_id=job_id or "", skip_circuit_breaker=True)
-                except Exception:
-                    resp = None
-                t = _validate_translation(resp, source_lang)
-                if not t:
-                    # Local chain dead OR it echoed the source back (the 21:32
-                    # run: 6/17 flagged cues shipped because qwen2.5:3b echoed
-                    # romaji and the cloud net only caught EXCEPTIONS, not
-                    # echoes). Any unusable local answer escalates to the
-                    # cloud polish model — these are a handful of cues.
-                    try:
-                        from backend.services.transcript_polisher import (
-                            _cloud_polish_completion)
-                        t = _validate_translation(
-                            await _cloud_polish_completion(prompt, 60), source_lang)
-                    except Exception:
-                        t = ""
-                if not t:
-                    _cache[src_text] = ""
-                    continue
-                _cache[src_text] = t
-            elif t == "":  # previously attempted and failed
+            if not t:  # failed / budget-skipped — the draft cue stands
                 continue
             # Same deterministic output failsafes the main translate path
             # applies — this per-cue recovery bypassed them, and its raw
@@ -3188,6 +3210,19 @@ async def _background_post_processing(
                 except Exception as _ph_err:
                     logger.debug("[%s] post-edit host pin skipped: %s",
                                  job_id, _ph_err)
+                # Live progress: this pass is the longest silent block in the
+                # whole XLATE stage (observed ~11 min with NOTHING in the
+                # Processing Log between the two recovery lines) — surface
+                # per-batch progress so it reads as work, not a hang.
+                async def _polish_progress(pct: int):
+                    try:
+                        await _update_progress(
+                            job_id, JobStatus.TRANSLATING, 68,
+                            f"Polishing translated subtitles… ({int(pct)}%)",
+                            heartbeat_label="subtitle translation")
+                    except Exception:
+                        pass
+                _pe_t0 = _time.monotonic()
                 try:
                     _pol = await asyncio.wait_for(
                         _mtpe(
@@ -3196,6 +3231,7 @@ async def _background_post_processing(
                             source_texts=_src_texts, source_language=source_lang,
                             mode="translation",
                             model_override=_resolve_polish_model_override(orchestrator),
+                            progress_callback=_polish_progress,
                         ),
                         timeout=max(600, len(translated) * 8),
                     )
@@ -3212,8 +3248,8 @@ async def _background_post_processing(
                         else:
                             translated = _pol
                             logger.info(
-                                "[%s] AI post-edit DONE on LLM-translated text",
-                                job_id)
+                                "[%s] AI post-edit DONE on LLM-translated text "
+                                "in %.0fs", job_id, _time.monotonic() - _pe_t0)
                     # The post-edit can reintroduce the same small-model
                     # artifacts the translator guards against (invented
                     # "Name:" labels, free-run continuations) — re-run the
@@ -3431,6 +3467,14 @@ async def _background_post_processing(
                         _tl,
                         min_word_run=int(getattr(settings, "SUBTITLE_INTRA_CUE_MIN_WORD_RUN", 4)),
                     )
+                # Stretched vocalizations ("Uuuuuuuuuu.", "AAAAAAAA") → capped
+                # at 3 glyphs so moans/screams read as sounds, not glyph walls.
+                if getattr(settings, "SUBTITLE_VOCALIZATION_COLLAPSE", True):
+                    from backend.services.transcript_dedup import collapse_char_runs
+                    _tl, _vc = collapse_char_runs(_tl)
+                    if _vc:
+                        logger.info("[%s] Vocalization collapse: %d cue(s) shortened",
+                                    job_id, _vc)
                 if _used_whisper_native or _used_llm:
                     # Block-level safety net: drop a whole run of cues that
                     # reappears later (a source double-pass that survived into the

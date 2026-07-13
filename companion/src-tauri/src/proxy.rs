@@ -199,10 +199,32 @@ fn relay_tracked(upstream: reqwest::Response, state: Arc<AppState>, activity: u6
 }
 
 /// /ollama/* → strip the prefix, forward to the local daemon.
+/// Learn the calling ClipAI's base URL: peer IP (from ConnectInfo) + the
+/// X-ClipAI-Port header the container attaches. No header → no-op.
+fn note_clipai_origin(state: &AppState, headers: &HeaderMap, ext: &axum::http::Extensions) {
+    let Some(port) = headers
+        .get("x-clipai-port")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u16>().ok())
+    else {
+        return;
+    };
+    if let Some(ci) = ext.get::<axum::extract::ConnectInfo<SocketAddr>>() {
+        let ip = ci.0.ip();
+        let url = if ip.is_ipv6() {
+            format!("http://[{ip}]:{port}")
+        } else {
+            format!("http://{ip}:{port}")
+        };
+        state.note_clipai_origin(url);
+    }
+}
+
 async fn ollama_proxy(State(ctx): State<ProxyCtx>, req: Request<Body>) -> Response {
     if !authorized(&ctx, req.headers()) {
         return unauthorized();
     }
+    note_clipai_origin(&ctx.state, req.headers(), req.extensions());
     if ctx.state.config.lock().unwrap().paused {
         return paused();
     }
@@ -1058,7 +1080,17 @@ pub async fn serve(ctx: ProxyCtx) {
                 ctx.state.proxy_bound.store(true, Ordering::Relaxed);
                 *ctx.state.proxy_last_error.lock().unwrap() = String::new();
                 log::info!("companion proxy listening on {addr}");
-                if let Err(e) = axum::serve(listener, build_router(ctx.clone())).await {
+                // ConnectInfo gives handlers the peer address, which (with the
+                // X-ClipAI-Port header) lets the Companion LEARN the ClipAI
+                // server's URL from inbound traffic — self-update then works
+                // even for manually-added (never GUI-paired) setups.
+                if let Err(e) = axum::serve(
+                    listener,
+                    build_router(ctx.clone())
+                        .into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .await
+                {
                     log::error!("proxy server exited: {e} — rebinding");
                 }
                 ctx.state.proxy_bound.store(false, Ordering::Relaxed);

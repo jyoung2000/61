@@ -163,9 +163,12 @@ def test_allcaps_label_is_stripped():
     ) == "How many calories do you think this has?"
 
 
-def test_source_with_colon_is_left_alone():
+def test_source_with_latin_colon_is_left_alone():
+    # A source colon only protects when the source carries Latin script —
+    # a purely CJK source can't legitimately yield a Latin "NAME:" prefix
+    # (tightened after "MECA:" survived four runs behind a ja "：").
     txt = "Warning: do not eat this."
-    assert strip_invented_speaker_labels(txt, "警告：これを食べないで") == txt
+    assert strip_invented_speaker_labels(txt, "Warning: これを食べないで") == txt
 
 
 def test_strip_never_empties_a_cue():

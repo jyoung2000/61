@@ -1435,7 +1435,7 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
           </button>
         </div>
         <p className="muted small" style={{ marginTop: 4 }}>
-          This app is v{updateInfo?.current || '…'}
+          This app is v{status.app_version || updateInfo?.current || '…'}
           {updateInfo?.latest ? ` — your ClipAI serves v${updateInfo.latest}` : ''}.
           Updates download from your ClipAI server over the LAN (no GitHub needed once
           the server has the installer).

@@ -34,6 +34,8 @@ export interface JobLog {
 }
 
 export interface CompanionStatus {
+  /** This app's own version (CARGO_PKG_VERSION). */
+  app_version: string;
   config: {
     token: string;
     port: number;

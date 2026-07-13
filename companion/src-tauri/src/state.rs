@@ -283,6 +283,11 @@ pub struct AppState {
     /// ms epoch of the last authenticated request from a ClipAI server (any
     /// proxy route). Drives the "ClipAI connected" indicator.
     pub last_clipai_contact: AtomicU64,
+    /// ClipAI base URL learned from inbound traffic (peer IP + the
+    /// X-ClipAI-Port header). Lets self-update work when the pairing was done
+    /// MANUALLY on the ClipAI side (endpoint+token pasted there), which never
+    /// sets ``paired_clipai_url`` here. Runtime-only, not persisted.
+    pub seen_clipai_url: Mutex<String>,
     /// ms epoch of the last REAL job request (inference/transcription) — i.e.
     /// not a /api/tags, /api/ps or /v1/health probe. Distinguishes "serving
     /// jobs" from merely "reachable" so the UI can say which is happening.
@@ -374,6 +379,7 @@ impl AppState {
             incoming_pulls: Mutex::new(HashMap::new()),
             app_started_ms: now_ms(),
             last_clipai_contact: AtomicU64::new(0),
+            seen_clipai_url: Mutex::new(String::new()),
             last_job_ms: AtomicU64::new(0),
             job_progress: AtomicU64::new(u64::MAX),
             gpu_baseline_used_mb: AtomicU64::new(0),
@@ -421,6 +427,23 @@ impl AppState {
 
     pub fn last_clipai_contact_ms(&self) -> u64 {
         self.last_clipai_contact.load(Ordering::Relaxed)
+    }
+
+    /// Remember the ClipAI base URL inferred from an inbound request.
+    pub fn note_clipai_origin(&self, url: String) {
+        if url.is_empty() {
+            return;
+        }
+        let mut cur = self.seen_clipai_url.lock().unwrap();
+        if *cur != url {
+            log::info!("ClipAI server address learned from inbound traffic: {url}");
+            *cur = url;
+        }
+    }
+
+    /// The learned ClipAI base URL ("" when no tagged request has arrived).
+    pub fn seen_clipai_url(&self) -> String {
+        self.seen_clipai_url.lock().unwrap().clone()
     }
 
     /// Record progress of a model pull flowing through the proxy.

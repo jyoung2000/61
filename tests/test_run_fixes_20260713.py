@@ -155,9 +155,10 @@ def test_evict_helper_uses_keepalive_zero():
 def test_recovery_path_sanitizes_llm_output():
     from backend.services import pipeline
     src = inspect.getsource(pipeline)
-    i = src.find("previously attempted and failed")
+    # Anchor on the (now concurrent) recovery apply loop.
+    i = src.find("async def _recover_one")
     assert i > 0
-    window = src[i:i + 1200]
+    window = src[i:i + 4000]
     assert "strip_invented_speaker_labels" in window
     assert "clamp_runaway_translation" in window
 

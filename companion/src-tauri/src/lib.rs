@@ -209,6 +209,7 @@ async fn get_status(
         }
     };
     Ok(serde_json::json!({
+        "app_version": env!("CARGO_PKG_VERSION"),
         "config": {
             "token": config.token,
             "port": config.port,
@@ -754,12 +755,20 @@ fn paired_base(state: &SharedState) -> Result<String, String> {
         .trim()
         .trim_end_matches('/')
         .to_string();
-    if url.is_empty() {
-        return Err("Not paired with a ClipAI server yet — pair first (the \
-                    update is downloaded from your ClipAI container)"
-            .into());
+    if !url.is_empty() {
+        return Ok(url);
     }
-    Ok(url)
+    // Manually-added setups (endpoint+token pasted into ClipAI) never pair
+    // from this side — fall back to the address learned from inbound traffic.
+    let seen = state.seen_clipai_url();
+    if !seen.is_empty() {
+        return Ok(seen.trim_end_matches('/').to_string());
+    }
+    Err("This Companion doesn't know your ClipAI server's address yet. \
+         Either use \"Pair now\" (paste the ClipAI URL + API key), or update \
+         the ClipAI container — new builds identify themselves on every \
+         request and the address is learned automatically."
+        .into())
 }
 
 #[cfg(target_os = "macos")]

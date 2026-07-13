@@ -1281,6 +1281,11 @@ class Settings(BaseSettings):
     # read: only models whose weights fit under this go on the big card blind.
     # (When /v1/health answers, its live vram_budget_gb is used instead.)
     TRANSLATION_POLISH_UNKNOWN_VRAM_MAX_GB: float = 6.0
+    # Concurrency for the per-cue untranslated-leftover recovery (the Companion
+    # serves num_parallel slots; the old serial loop was a multi-minute tail).
+    TRANSLATION_LLM_CLEANUP_CONCURRENCY: int = 3
+    # Cap stretched vocalizations ("Uuuuuuuu") at 3 glyphs on the translated track.
+    SUBTITLE_VOCALIZATION_COLLAPSE: bool = True
     # Show the LLM translator a few surrounding SOURCE lines (reference only,
     # not re-translated) so pronouns, gender, honorific-driven formality and
     # tense stay consistent across batch boundaries — the biggest lever for
