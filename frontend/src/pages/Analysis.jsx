@@ -980,6 +980,13 @@ export default function Analysis() {
               (Array.isArray(data.translated_transcript) && data.translated_transcript.length)
                 ? data.translated_transcript
                 : (prev.translated_transcript || data.translated_transcript),
+            // raw_transcript is snapshotted mid-pipeline like the two above, so a
+            // stale/slow full GET (serialized before the snapshot) must not null
+            // out the value the /transcripts poll already delivered — keep it.
+            raw_transcript:
+              (Array.isArray(data.raw_transcript) && data.raw_transcript.length)
+                ? data.raw_transcript
+                : (prev.raw_transcript || data.raw_transcript),
           };
         });
         fetchJobRetryRef.current = 0;

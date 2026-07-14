@@ -170,11 +170,19 @@ _SALAD_SEP_RE = re.compile(r"\s*[·•]\s*|\s+\|\s+")
 
 # Japanese onomatopoeia / interjections that leak as romaji. Extends the
 # ``_ROMAJI_HINTS`` lexicon with short slang the ratio test (3+ tokens) misses.
+# Unambiguous romaji onomatopoeia — safe to flag for a Japanese OR auto/unknown
+# source (these are essentially never real English words).
 _ROMAJI_ONOMATOPOEIA = {
-    "banzai", "dame", "ecchi", "etchi", "kamon", "nonko", "kuri", "korikori",
-    "puncha", "kimochi", "itai", "yada", "muri", "gaman", "kyaa", "uwaa",
-    "doki", "dokidoki", "kora", "ara", "eeto", "puru", "purupuru", "nurunuru",
-    "gucha", "guchi", "yamete", "hazukashii", "kimochii", "oppai", "chinchin",
+    "banzai", "ecchi", "etchi", "kamon", "nonko", "kuri", "korikori",
+    "puncha", "kimochi", "kyaa", "uwaa", "dokidoki", "puru", "purupuru",
+    "nurunuru", "gucha", "guchi", "yamete", "hazukashii", "kimochii",
+    "oppai", "chinchin",
+}
+# Romaji that ALSO reads as real English or a common name ("dame", "ara",
+# "kora", "yada", "itai", "muri", "doki"). Only flag these when the source is
+# DECLARED Japanese — for an auto/unknown source they may be genuine English.
+_ROMAJI_ONOMATOPOEIA_JA_ONLY = {
+    "dame", "ara", "kora", "yada", "itai", "muri", "gaman", "doki", "eeto",
 }
 # Japanese words that ARE valid English loanwords — never flag these.
 _ROMAJI_LOANWORD_OK = {
@@ -218,16 +226,18 @@ def _word_salad_reason(text: str):
 
 
 def _is_mora_reduplication(t: str) -> bool:
-    """korikori / purupuru / dokidoki — a mora word repeated verbatim. Essentially
-    never an English word (minus a tiny allowlist)."""
+    """korikori / purupuru / dokidoki — a 2+-mora word repeated verbatim.
+    Requires len>=6 (half >=3 chars) so 2-letter-mora NAMES that happen to
+    reduplicate — Nana, Mimi, Kiki, Momo, Gigi, Coco, Lulu (all 4 chars) — are
+    NOT treated as onomatopoeia. Real reduplicative onomatopoeia are 6-8 chars."""
     w = (t or "").lower()
-    if len(w) < 4 or len(w) % 2 != 0:
+    if len(w) < 6 or len(w) % 2 != 0:
         return False
     h = len(w) // 2
     if w[:h] != w[h:]:
         return False
     if w in {"bonbon", "couscous", "tutu", "cancan", "yoyo", "dodo",
-             "papa", "mama", "haha", "nono", "tomtom", "beriberi"}:
+             "papa", "mama", "haha", "nono", "tomtom", "beriberi", "murmur"}:
         return False
     return bool(_MORA_WORD.match(w[:h]))
 
@@ -246,21 +256,26 @@ def _romaji_leak_reason(text, source_language="", glossary_terms=frozenset()):
     content = [w for w in re.findall(r"[A-Za-zāēīōū']+", text or "")
                if len(w) >= 2 and w.lower() not in glossary_terms
                and w.lower() not in _ROMAJI_LOANWORD_OK]
-    if not content:
+    # A romaji LEAK is a SHORT cue that is almost entirely Japanese — NOT a name
+    # or word embedded in a full English sentence. Gating the whole check on a
+    # short cue means "My grandmother Nana baked cookies." is never touched.
+    limit = 2 if strict else 3
+    if not (1 <= len(content) <= limit):
         return None
-    for w in content:  # (a) reduplication — near-certain romaji
+    low = [w.lower() for w in content]
+    # (a) reduplication onomatopoeia (korikori/dokidoki) — near-certain romaji.
+    for w in low:
         if _is_mora_reduplication(w):
             return "romaji-reduplication"
-    # (b) a SHORT cue that is entirely mora words with >=1 curated onomatopoeia
-    limit = 2 if strict else 3
-    if 1 <= len(content) <= limit:
-        low = [w.lower() for w in content]
-        all_mora = all(
-            (w in _ROMAJI_ONOMATOPOEIA)
-            or (len(w) >= 3 and _MORA_WORD.match(w) and w not in _ROMAJI_AMBIG)
-            for w in low)
-        if all_mora and any(w in _ROMAJI_ONOMATOPOEIA for w in low):
-            return "romaji-onomatopoeia"
+    # (b) curated onomatopoeia. Ambiguous-with-English words are consulted ONLY
+    #     for a declared-Japanese source (not auto/unknown).
+    lex = _ROMAJI_ONOMATOPOEIA if strict else (_ROMAJI_ONOMATOPOEIA | _ROMAJI_ONOMATOPOEIA_JA_ONLY)
+    all_mora = all(
+        (w in lex)
+        or (len(w) >= 3 and _MORA_WORD.match(w) and w not in _ROMAJI_AMBIG)
+        for w in low)
+    if all_mora and any(w in lex for w in low):
+        return "romaji-onomatopoeia"
     return None
 
 
@@ -278,10 +293,13 @@ def is_garbled_translation(text, source_language="", glossary_terms=frozenset())
 
 
 def collapse_separator_salad(text, source: str = "") -> str:
-    """Deterministic last-resort net: if TEXT is separator word-salad, strip the
-    separators + dedup repeated words into a plain string; fall back to the SOURCE
-    cue only if nothing usable remains — a '·' pile must never ship."""
-    if not _word_salad_reason(text):
+    """Deterministic last-resort net for the MIDDOT/BULLET word-salad (a model
+    echoing the glossary template — near-zero false positive): strip the
+    separators + dedup into a plain string; fall back to the SOURCE cue only if
+    nothing usable remains. A pipe "A | B | C" list is deliberately NOT mutated
+    here — it can be a legit on-screen menu, so only the (non-destructive)
+    re-translate selection considers it."""
+    if _word_salad_reason(text) != "middot-salad":
         return text
     parts = [p.strip() for p in _SALAD_SEP_RE.split(text) if p.strip()]
     seen, out = set(), []

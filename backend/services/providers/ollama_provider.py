@@ -1327,8 +1327,11 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
             _params = _pp(model_name)
         except Exception:
             _params = None
-        if _params is not None and _params >= float(
-                getattr(settings, "TRANSLATION_LARGE_MODEL_MIN_PARAMS_B", 10.0)):
+        # Vision models keep their deliberately SMALL ctx (image embeddings need
+        # the VRAM) — the large-ctx floor is for text translation/editorial only.
+        _is_vision_model = any(s in model_lower for s in ("vision", "llava", "moondream", "vl"))
+        if (not _is_vision_model and _params is not None and _params >= float(
+                getattr(settings, "TRANSLATION_LARGE_MODEL_MIN_PARAMS_B", 10.0))):
             _large_ctx = int(getattr(settings, "TRANSLATION_LARGE_NUM_CTX", 8192) or 8192)
             if detected > 0:
                 _large_ctx = min(_large_ctx, detected)

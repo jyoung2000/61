@@ -243,14 +243,16 @@ async def get_transcripts(job_id: str, user: User = Depends(get_current_user)):
     # every poll for a bloated transcript. ``_tt`` is the display-sanitized
     # translated track (storage itself is left untouched — see above).
     # ``raw_transcript`` (the direct pre-polish Whisper output) rides this poll
-    # too. It IS persisted (pipeline snapshots it) and IS on the full GET, but
-    # the completed-job UI keeps itself fresh from THIS lightweight endpoint —
-    # so without it here the "Download raw transcript" button never receives its
-    # data and never renders.
+    # so the completed-job "Download raw transcript" button gets its data (the UI
+    # refreshes from THIS lightweight endpoint, not the heavy full GET). It's the
+    # largest single track (per-word timestamps) and only the completed view
+    # consumes it, so we ONLY include it once the job is terminal — running polls
+    # stay small, and the status->complete re-fetch delivers it exactly once.
+    _terminal = getattr(job, "status", None) in (JobStatus.COMPLETE, JobStatus.FAILED)
     _src_rows, _tt_rows, _raw_rows = await asyncio.to_thread(
         lambda: (_dump(getattr(job, "transcript", [])),
                  _dump(_tt),
-                 _dump(getattr(job, "raw_transcript", []))))
+                 _dump(getattr(job, "raw_transcript", [])) if _terminal else []))
 
     return {
         "job_id": job_id,

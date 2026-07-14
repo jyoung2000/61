@@ -53,15 +53,34 @@ def test_capitalized_ratio_bounds():
 # ── Romaji leak ─────────────────────────────────────────────────────────────
 
 def test_romaji_onomatopoeia_flagged_ja_source():
-    for w in ["Banzai", "Dame", "Puncha", "Kuri", "Etchi", "Nonko", "Kamon"]:
+    for w in ["Banzai", "Puncha", "Kuri", "Etchi", "Nonko", "Kamon"]:
         assert garble_reason(w, JA) is not None, w
+
+
+def test_ambiguous_words_only_flag_for_declared_japanese():
+    # "Dame"/"Ara"/"Kora" are also real English/names, so they flag ONLY for a
+    # declared-Japanese source, never for an auto/unknown one.
+    for w in ["Dame", "Ara", "Kora", "Yada"]:
+        assert garble_reason(w, "ja") is not None, w        # declared ja → caught
+        assert garble_reason(w, "auto") is None, w          # auto → not flagged
+        assert garble_reason(w, "") is None, w              # unknown → not flagged
 
 
 def test_romaji_reduplication_flagged():
     assert garble_reason("Korikori", JA) == "romaji-reduplication"
-    assert _is_mora_reduplication("purupuru") is True
-    assert _is_mora_reduplication("dokidoki") is True
-    assert _is_mora_reduplication("bonbon") is False   # English allowlist
+    assert _is_mora_reduplication("purupuru") is True    # 8 chars
+    assert _is_mora_reduplication("dokidoki") is True     # 8 chars
+    assert _is_mora_reduplication("bonbon") is False      # English allowlist
+
+
+def test_reduplicated_names_are_not_flagged():
+    # 4-char reduplicated NAMES (2-letter mora doubled) must NOT be onomatopoeia.
+    for n in ["Nana", "Mimi", "Kiki", "Momo", "Gigi", "Coco", "Lulu"]:
+        assert _is_mora_reduplication(n) is False, n
+        assert garble_reason(n, JA) is None, n
+    # …even inside a full, correct English sentence.
+    assert garble_reason("My grandmother Nana baked us cookies.", JA) is None
+    assert garble_reason("Mimi and Kiki went to the park.", "auto") is None
 
 
 def test_romaji_negatives_are_name_safe():
@@ -93,6 +112,13 @@ def test_collapse_separator_salad_strips_middots():
     assert out  # never empty
     # A clean line is returned unchanged.
     assert collapse_separator_salad("A normal line.") == "A normal line."
+
+
+def test_collapse_does_not_mutate_pipe_menu():
+    # A pipe list can be a legit on-screen menu — the deterministic net only
+    # rewrites the middot/bullet glossary-echo salad, never a pipe list.
+    menu = "Home | Products | About | Contact | Blog"
+    assert collapse_separator_salad(menu) == menu
 
 
 def test_collapse_falls_back_to_source_when_nothing_usable():
