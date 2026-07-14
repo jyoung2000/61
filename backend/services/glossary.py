@@ -94,7 +94,11 @@ def build_recurring_terms_block(terms: list, target_lang: str = "the target lang
     terms = [str(t).strip() for t in (terms or []) if str(t).strip()]
     if not terms:
         return ""
-    joined = " · ".join(terms)
+    # Join with ", " NOT " · ": a small model that fails a cue sometimes echoes
+    # this very template back as its "translation", and a middot-joined list is
+    # the exact word-salad garble we then have to detect + repair downstream.
+    # A comma list carries the same meaning with no salad template to mimic.
+    joined = ", ".join(terms)
     return (
         "RECURRING NAMES & TERMS — keep these consistent:\n"
         f"  {joined}\n"

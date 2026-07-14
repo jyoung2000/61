@@ -242,9 +242,15 @@ async def get_transcripts(job_id: str, user: User = Depends(get_current_user)):
     # cues (each with per-word timestamps) is heavy enough to stall the loop on
     # every poll for a bloated transcript. ``_tt`` is the display-sanitized
     # translated track (storage itself is left untouched — see above).
-    _src_rows, _tt_rows = await asyncio.to_thread(
+    # ``raw_transcript`` (the direct pre-polish Whisper output) rides this poll
+    # too. It IS persisted (pipeline snapshots it) and IS on the full GET, but
+    # the completed-job UI keeps itself fresh from THIS lightweight endpoint —
+    # so without it here the "Download raw transcript" button never receives its
+    # data and never renders.
+    _src_rows, _tt_rows, _raw_rows = await asyncio.to_thread(
         lambda: (_dump(getattr(job, "transcript", [])),
-                 _dump(_tt)))
+                 _dump(_tt),
+                 _dump(getattr(job, "raw_transcript", []))))
 
     return {
         "job_id": job_id,
@@ -254,6 +260,7 @@ async def get_transcripts(job_id: str, user: User = Depends(get_current_user)):
         "language": getattr(job, "language", "") or "",
         "transcript": _src_rows,
         "translated_transcript": _tt_rows,
+        "raw_transcript": _raw_rows,
         # The video summary rides this lightweight poll too. It is persisted
         # mid-pipeline but otherwise only reaches the UI via the full (often
         # multi-MB) GET /jobs/{id} — the very request too large/slow to land over

@@ -1043,21 +1043,27 @@ export default function Analysis() {
       const t = await res.json();
       const tt = Array.isArray(t.translated_transcript) ? t.translated_transcript : [];
       const tr = Array.isArray(t.transcript) ? t.transcript : [];
+      const rw = Array.isArray(t.raw_transcript) ? t.raw_transcript : [];
       const summary = t.summary || null;
       setJob((prev) => {
         if (!prev) return prev;
         const sameTT = (tt.length || 0) === (prev.translated_transcript?.length || 0);
         const sameTR = (tr.length || 0) === (prev.transcript?.length || 0);
+        // The raw (pre-polish) transcript rides this poll too — the completed-
+        // job UI keeps itself fresh from here, so the "Download raw transcript"
+        // button only gets its data (and renders) once this delivers it.
+        const sameRaw = (rw.length || 0) === (prev.raw_transcript?.length || 0);
         // The summary is persisted mid-pipeline but only reaches the UI
         // reliably through THIS lightweight poll (the full job fetch is too
         // big to land over a tunnel). Adopt it the moment it arrives so the
         // Summary tab stops sitting on "Generating summary…" forever.
         const gotSummary = !!summary && !prev.summary;
-        if (sameTT && sameTR && !gotSummary) return prev;
+        if (sameTT && sameTR && sameRaw && !gotSummary) return prev;
         return {
           ...prev,
           transcript: tr.length ? tr : prev.transcript,
           translated_transcript: tt.length ? tt : (prev.translated_transcript || []),
+          raw_transcript: rw.length ? rw : (prev.raw_transcript || []),
           summary: summary || prev.summary,
         };
       });

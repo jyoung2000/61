@@ -138,6 +138,40 @@ def _recency_bonus(name: str) -> int:
     return bonus
 
 
+def translation_plan(model_name, n_cues, *, is_ollama=True, companion_parallel=1) -> dict:
+    """Batch size / num_ctx / client-concurrency for one subtitle-translation run,
+    keyed on the model's SIZE.
+
+    A large model (>= ``TRANSLATION_LARGE_MODEL_MIN_PARAMS_B``, e.g. gemma3:12b)
+    is decode-bound and can only really serve one KV slot in a modest VRAM
+    budget, so the 4B-tuned "small batch, fan out across parallel slots" plan
+    makes it re-prefill the fixed prompt prefix hundreds of times. For a large
+    model we return a FEWER-but-BIGGER-batches, single-slot plan at a larger
+    context; small models keep the exact prior behaviour.
+
+    Note: sizing is by model tag ONLY — NOT the container's local VRAM. A large
+    model runs on the paired Companion GPU, whose VRAM the container can't see
+    (it would read its own small card), and a 12B can't load on a tiny card
+    anyway, so the tag is the reliable signal. ``num_ctx`` here is advisory; the
+    Ollama provider applies the actual ctx floor (also keyed on model size).
+    Pure + deterministic for unit testing."""
+    from backend.config import settings
+    n = max(1, int(n_cues or 1))
+    cp = max(1, int(companion_parallel or 1))
+    small_batch = int(getattr(settings, "TRANSLATION_LLM_BATCH", 0) or 0) or (8 if is_ollama else 18)
+    small_ctx = int(getattr(settings, "OLLAMA_TRANSLATION_GPU_NUM_CTX", 2048) or 2048)
+    params = _parse_params_b(model_name or "")
+    thr = float(getattr(settings, "TRANSLATION_LARGE_MODEL_MIN_PARAMS_B", 10.0))
+    is_large = params is not None and params >= thr
+    if not is_large:
+        return {"batch": min(small_batch, n), "num_ctx": small_ctx, "concurrency": cp}
+    return {
+        "batch": min(int(getattr(settings, "TRANSLATION_LLM_BATCH_LARGE", 20) or 20), n),
+        "num_ctx": int(getattr(settings, "TRANSLATION_LARGE_NUM_CTX", 8192) or 8192),
+        "concurrency": min(cp, max(1, int(getattr(settings, "TRANSLATION_LARGE_CONCURRENCY", 1) or 1))),
+    }
+
+
 def qwen3_translation_options(model_name: str) -> dict:
     """Qwen3-family sampling options for the dedicated translation path.
 

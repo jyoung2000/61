@@ -1269,6 +1269,16 @@ class Settings(BaseSettings):
     # it's treated as untranslated romaji (0.6 cleanly separated real romaji from
     # English on the audited output).
     TRANSLATION_ROMAJI_DETECT_THRESHOLD: float = 0.6
+    # ── Garble detection (word-salad + romaji-leak translated cues) ──────────
+    # A small model sometimes ships a cue that IS in the target script but is
+    # nonsense: a middot/bullet/pipe-joined single-word list (it echoed the
+    # glossary's own separator template), or a transliterated onomatopoeia
+    # ("Korikori"). These pass the still-source-language check, so a dedicated
+    # detector flags them for a re-translate + a deterministic de-salad net.
+    TRANSLATION_GARBLE_DETECT_ENABLED: bool = True
+    TRANSLATION_SALAD_MIN_PARTS: int = 5          # >= this many separator parts…
+    TRANSLATION_SALAD_SINGLE_WORD_FRAC: float = 0.8  # …mostly single words…
+    TRANSLATION_SALAD_CAP_RATIO: float = 0.5      # …and title-cased ⇒ a word list
     # Per-batch timeout for LLM subtitle translation (a CEILING — never slows the
     # fast path; a fast GPU batch returns in seconds regardless). A small model
     # on a low-VRAM GPU needs far more than the old 5 s/segment / 60 s floor; too
@@ -1285,6 +1295,17 @@ class Settings(BaseSettings):
     # shorter JSON array faster + more reliably (less timeout risk). 0 = auto
     # (8 for Ollama, 18 for cloud).
     TRANSLATION_LLM_BATCH: int = 0
+    # ── Large translation model throughput ──────────────────────────────────
+    # A big model (12B+) is decode-bound and CANNOT hold several parallel KV
+    # caches in a modest budget, so the small-batch/high-fan-out plan that suits
+    # a 4B makes it re-prefill the fixed glossary+context+JSON prompt hundreds of
+    # times at a tiny ctx. For models at/above this size we switch to FEWER,
+    # LARGER batches at a LARGER context on a SINGLE slot — far fewer round-trips,
+    # no head-truncation. Small models are unaffected (identical old behaviour).
+    TRANSLATION_LARGE_MODEL_MIN_PARAMS_B: float = 10.0
+    TRANSLATION_LLM_BATCH_LARGE: int = 20        # 918 cues → ~46 batches, not 115
+    TRANSLATION_LARGE_NUM_CTX: int = 8192        # room for a 20-line batch + output
+    TRANSLATION_LARGE_CONCURRENCY: int = 1       # one KV slot; don't fan out a 12B
     # Per-line output failsafes for the LLM translator (deterministic, checked
     # against the source line). A translation longer than
     # max(EXPANSION_CHARS, source_chars × EXPANSION_RATIO) is a model free-run

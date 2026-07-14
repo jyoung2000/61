@@ -1315,6 +1315,25 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
         else:
             base = 2048
 
+        # Large models (12B+) run on the paired Companion GPU, NOT this
+        # container's small card — so we do NOT gate this on local VRAM (which
+        # reads the wrong GPU and would keep a Companion-hosted 12B pinned at
+        # 2048). A big model gets a larger base ctx so a multi-line translation
+        # batch isn't head-truncated at 2048 and doesn't force a per-batch runner
+        # reload. Capped by the model's training ctx when known. A 12B can't load
+        # on a tiny card at all, so there's no real small-card OOM path to guard.
+        try:
+            from backend.services.local_models import _parse_params_b as _pp
+            _params = _pp(model_name)
+        except Exception:
+            _params = None
+        if _params is not None and _params >= float(
+                getattr(settings, "TRANSLATION_LARGE_MODEL_MIN_PARAMS_B", 10.0)):
+            _large_ctx = int(getattr(settings, "TRANSLATION_LARGE_NUM_CTX", 8192) or 8192)
+            if detected > 0:
+                _large_ctx = min(_large_ctx, detected)
+            base = max(base, _large_ctx)
+
         # Sticky high-water mark FIRST: after one prompt raises this model's
         # ctx, keep serving the model at that size — small follow-up prompts
         # must not bounce num_ctx back down (each distinct value is a full

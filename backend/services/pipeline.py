@@ -1119,8 +1119,18 @@ async def _llm_cleanup_untranslated(segments, source_lang, target_lang,
         # transliterated ROMAJI — the old _cjk_ratio-only filter never even
         # selected romaji cues ("Nametotte ageru kara.") for cleanup, so they
         # shipped in the English track.
+        # Also re-translate structural word-salad cues (a "·"/"•"/"|"-joined
+        # single-word list — a small model echoing the glossary template). This
+        # is a zero-false-positive structural check, so it's safe to add to the
+        # universal recovery net across every translation path.
+        try:
+            from backend.services.translator import _word_salad_reason as _wsr
+        except Exception:
+            _wsr = lambda _t: None
         leftover_idx = [i for i, s in enumerate(segments)
-                        if _is_untranslated(_txt(s), source_lang)]
+                        if _is_untranslated(_txt(s), source_lang)
+                        or (getattr(settings, "TRANSLATION_GARBLE_DETECT_ENABLED", True)
+                            and _wsr(_txt(s)))]
         if not leftover_idx:
             return segments
 

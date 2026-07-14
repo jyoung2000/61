@@ -157,6 +157,145 @@ def _is_untranslated(text: str, source_language: str = "") -> bool:
     return False
 
 
+# ── Garble detection: word-salad + romaji-leak translated cues ──────────────
+# Two failure classes escape ``_is_untranslated``: (1) STRUCTURAL word-salad — a
+# cue that is a middot/bullet/pipe-joined list of single words (a small model
+# echoing the auto-glossary's own separator-joined template as its
+# "translation"); (2) ROMAJI LEAK — Japanese onomatopoeia/interjections
+# transliterated instead of translated ("Korikori", "Banzai", "Dame"). Both are
+# deterministic: flag them for a re-translate, and de-salad deterministically as
+# a guaranteed net so a "·" pile can never ship.
+
+_SALAD_SEP_RE = re.compile(r"\s*[·•]\s*|\s+\|\s+")
+
+# Japanese onomatopoeia / interjections that leak as romaji. Extends the
+# ``_ROMAJI_HINTS`` lexicon with short slang the ratio test (3+ tokens) misses.
+_ROMAJI_ONOMATOPOEIA = {
+    "banzai", "dame", "ecchi", "etchi", "kamon", "nonko", "kuri", "korikori",
+    "puncha", "kimochi", "itai", "yada", "muri", "gaman", "kyaa", "uwaa",
+    "doki", "dokidoki", "kora", "ara", "eeto", "puru", "purupuru", "nurunuru",
+    "gucha", "guchi", "yamete", "hazukashii", "kimochii", "oppai", "chinchin",
+}
+# Japanese words that ARE valid English loanwords — never flag these.
+_ROMAJI_LOANWORD_OK = {
+    "sushi", "ramen", "tokyo", "kyoto", "osaka", "karate", "judo", "sumo",
+    "ninja", "samurai", "sake", "kimono", "tsunami", "manga", "anime",
+    "sensei", "senpai", "katana", "geisha", "futon", "bento", "sudoku",
+    "origami", "wasabi", "sayonara", "arigato", "kawaii", "otaku", "emoji",
+}
+
+
+def _capitalized_ratio(text: str) -> float:
+    """Share of alpha tokens (len>=2) that start uppercase. ~0.1 for a normal
+    sentence, ~0.9 for a title-cased word list. 0.0 below 4 tokens."""
+    toks = [t for t in re.findall(r"[A-Za-z][A-Za-z'’-]+", text or "") if len(t) >= 2]
+    if len(toks) < 4:
+        return 0.0
+    return sum(1 for t in toks if t[0].isupper()) / len(toks)
+
+
+def _word_salad_reason(text: str):
+    """Reason string if TEXT is a separator-joined single-word list, else None.
+    Source-independent structural test. Deliberately EXCLUDES hyphen/em-dash from
+    the separator set (legit dialogue uses "—"); only middot/bullet/pipe count."""
+    t = (text or "").strip()
+    if not t:
+        return None
+    parts = [p for p in _SALAD_SEP_RE.split(t) if p.strip()]
+    if len(parts) < 2:
+        return None
+    wc = [len(re.findall(r"\w+", p)) for p in parts]
+    single_frac = sum(1 for c in wc if c <= 1) / len(wc)
+    # Middot/bullet are near-zero-frequency in real prose → conclusive.
+    if (t.count("·") + t.count("•")) >= 3 and single_frac >= 0.6:
+        return "middot-salad"
+    _min = int(getattr(settings, "TRANSLATION_SALAD_MIN_PARTS", 5))
+    _sw = float(getattr(settings, "TRANSLATION_SALAD_SINGLE_WORD_FRAC", 0.8))
+    _cap = float(getattr(settings, "TRANSLATION_SALAD_CAP_RATIO", 0.5))
+    if len(parts) >= _min and single_frac >= _sw and _capitalized_ratio(t) >= _cap:
+        return "wordlist-salad"
+    return None
+
+
+def _is_mora_reduplication(t: str) -> bool:
+    """korikori / purupuru / dokidoki — a mora word repeated verbatim. Essentially
+    never an English word (minus a tiny allowlist)."""
+    w = (t or "").lower()
+    if len(w) < 4 or len(w) % 2 != 0:
+        return False
+    h = len(w) // 2
+    if w[:h] != w[h:]:
+        return False
+    if w in {"bonbon", "couscous", "tutu", "cancan", "yoyo", "dodo",
+             "papa", "mama", "haha", "nono", "tomtom", "beriberi"}:
+        return False
+    return bool(_MORA_WORD.match(w[:h]))
+
+
+def _romaji_leak_reason(text, source_language="", glossary_terms=frozenset()):
+    """Reason string if an English TEXT leaks romaji Japanese, else None.
+    Precision-first + name-safe: gated to a Japanese/auto source, exempts the
+    recurring-terms glossary + valid loanwords, and the short-cue branch requires
+    at least one curated-onomatopoeia hit so a lone unknown name is never flagged."""
+    if not bool(getattr(settings, "TRANSLATION_ROMAJI_DETECT_ENABLED", True)):
+        return None
+    src = (source_language or "").lower()
+    if not (src in _JA_SOURCE or src in ("", "auto", "unknown")):
+        return None
+    strict = src not in _JA_SOURCE
+    content = [w for w in re.findall(r"[A-Za-zāēīōū']+", text or "")
+               if len(w) >= 2 and w.lower() not in glossary_terms
+               and w.lower() not in _ROMAJI_LOANWORD_OK]
+    if not content:
+        return None
+    for w in content:  # (a) reduplication — near-certain romaji
+        if _is_mora_reduplication(w):
+            return "romaji-reduplication"
+    # (b) a SHORT cue that is entirely mora words with >=1 curated onomatopoeia
+    limit = 2 if strict else 3
+    if 1 <= len(content) <= limit:
+        low = [w.lower() for w in content]
+        all_mora = all(
+            (w in _ROMAJI_ONOMATOPOEIA)
+            or (len(w) >= 3 and _MORA_WORD.match(w) and w not in _ROMAJI_AMBIG)
+            for w in low)
+        if all_mora and any(w in _ROMAJI_ONOMATOPOEIA for w in low):
+            return "romaji-onomatopoeia"
+    return None
+
+
+def garble_reason(text, source_language="", glossary_terms=frozenset()):
+    """Reason a TRANSLATED cue is garbled (word-salad or romaji-leak), else None.
+    Still-CJK stays owned by ``_is_untranslated``; recovery selection ORs both."""
+    if not bool(getattr(settings, "TRANSLATION_GARBLE_DETECT_ENABLED", True)):
+        return None
+    return (_word_salad_reason(text)
+            or _romaji_leak_reason(text, source_language, glossary_terms))
+
+
+def is_garbled_translation(text, source_language="", glossary_terms=frozenset()) -> bool:
+    return garble_reason(text, source_language, glossary_terms) is not None
+
+
+def collapse_separator_salad(text, source: str = "") -> str:
+    """Deterministic last-resort net: if TEXT is separator word-salad, strip the
+    separators + dedup repeated words into a plain string; fall back to the SOURCE
+    cue only if nothing usable remains — a '·' pile must never ship."""
+    if not _word_salad_reason(text):
+        return text
+    parts = [p.strip() for p in _SALAD_SEP_RE.split(text) if p.strip()]
+    seen, out = set(), []
+    for p in parts:
+        key = p.lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(p)
+    joined = " ".join(out).strip()
+    if len(joined) < 2:
+        return (source or "").strip() or joined
+    return joined
+
+
 def fraction_untranslated(segments, target_language: str, source_language: str = "") -> float:
     """Fraction of cues still written in the source language.
 
@@ -509,10 +648,28 @@ async def translate_via_llm(
         _chain = orchestrator._get_active_chain() if orchestrator else []
         _is_ollama = bool(_chain) and getattr(_chain[0], "provider_name", "") == "ollama"
     except Exception:
+        _chain = []
         _is_ollama = False
-    BATCH = int(getattr(settings, "TRANSLATION_LLM_BATCH", 8 if _is_ollama else 18) or
-                (8 if _is_ollama else 18))
     total = len(segments)
+    # Size-aware plan: a large model (12B+) gets FEWER, BIGGER batches on a
+    # SINGLE slot (it can't hold parallel KV caches in a modest budget and was
+    # re-prefilling the fixed prompt prefix on every tiny batch); small models
+    # keep their small-batch/high-fan-out behaviour unchanged. The plan reads the
+    # Companion's advertised parallelism ONCE and caps concurrency for big models.
+    _eff_model = model_override or (getattr(_chain[0], "text_model_name", "") if _chain else "")
+    try:
+        _companion_parallel = await _translation_batch_concurrency()
+    except Exception:
+        _companion_parallel = 1
+    from backend.services.local_models import translation_plan as _tplan, _parse_params_b
+    _plan = _tplan(_eff_model, total, is_ollama=_is_ollama, companion_parallel=_companion_parallel)
+    BATCH = max(1, int(_plan.get("batch") or (8 if _is_ollama else 18)))
+    if _eff_model and (_parse_params_b(_eff_model) or 0) >= float(
+            getattr(settings, "TRANSLATION_LARGE_MODEL_MIN_PARAMS_B", 10.0)):
+        logger.info(
+            "LLM translate: large model %s → batch %d, concurrency %d "
+            "(fewer/bigger batches, single slot)",
+            _eff_model, BATCH, int(_plan.get("concurrency") or 1))
     out_segs: list[TranscriptSegment] = []
 
     def _build_segs(batch, translations) -> list:
@@ -527,6 +684,10 @@ async def translate_via_llm(
             _src_line = _txt(seg)
             txt = strip_invented_speaker_labels(txt, _src_line)
             txt = clamp_runaway_translation(txt, _src_line)
+            # Guaranteed net: a "·"/"•"/"|"-joined word-salad (a model echoing the
+            # glossary template) can NEVER ship — de-salad it deterministically
+            # here, even when no LLM re-translate is reachable.
+            txt = collapse_separator_salad(txt, _src_line)
             if glossary:
                 for k, v in glossary.items():
                     ks, vs = (k or "").strip(), (v or "").strip()
@@ -579,7 +740,10 @@ async def translate_via_llm(
     await _emit_status(min(BATCH, total))
 
     rest = list(range(1, len(batch_starts)))
-    _parallel = await _translation_batch_concurrency()
+    # Concurrency from the size-aware plan: small models fan out across the
+    # Companion's advertised slots; a large model is pinned to a single slot
+    # (it can't hold parallel KV caches, so fan-out only queues + thrashes ctx).
+    _parallel = int(_plan.get("concurrency") or 1)
     if _parallel > 1 and len(rest) > 1:
         # Fan the remaining batches out across the Companion GPU's advertised
         # parallel slots (Turbo). Batches are independent (each prompt is built
@@ -616,18 +780,30 @@ async def translate_via_llm(
     # NOTHING is left in the source language. (Runs only when the target is
     # non-CJK.)
     if (target_language or "").lower() not in _CJK_LANGS:
+        # Recurring-terms glossary (lowercased) so the romaji-leak check never
+        # flags a real recurring name as garble.
+        try:
+            from backend.services.glossary import extract_recurring_terms as _ert
+            _gloss_terms = frozenset(
+                (w or "").lower() for w in _ert(segments, source_language) if w)
+        except Exception:
+            _gloss_terms = frozenset()
         for _pass in range(3):
+            # Re-translate cues still in the source language OR garbled (word-salad
+            # / romaji-leak) — one loop covers all failure classes.
             idxs = [i for i, s in enumerate(out_segs)
-                    if _is_untranslated(s.text or "", source_language)]
+                    if _is_untranslated(s.text or "", source_language)
+                    or is_garbled_translation(s.text or "", source_language, _gloss_terms)]
             if not idxs:
                 break
-            logger.info("LLM translate: re-translating %d cue(s) still in the "
-                        "source language (pass %d)", len(idxs), _pass + 1)
+            logger.info("LLM translate: re-translating %d cue(s) still source-"
+                        "language or garbled (pass %d)", len(idxs), _pass + 1)
             redo = await _translate_batch([out_segs[i] for i in idxs])
             for i, tr in zip(idxs, redo):
                 t = (tr or "").strip()
-                # Accept the redo only if it's no longer source-language.
-                if t and not _is_untranslated(t, source_language):
+                # Accept the redo only if it's neither source-language NOR garbled.
+                if (t and not _is_untranslated(t, source_language)
+                        and not is_garbled_translation(t, source_language, _gloss_terms)):
                     if glossary:
                         for k, v in glossary.items():
                             ks, vs = (k or "").strip(), (v or "").strip()
