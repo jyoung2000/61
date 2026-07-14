@@ -38,6 +38,14 @@ pub struct Config {
     /// after a job or a quick test instead of holding models for the full
     /// keep-alive / sidecar windows. 0 disables the auto-free.
     pub gpu_idle_free_min: u32,
+    /// SECONDS after the last real request before the whole-GPU auto-free fires
+    /// — the fast, primary knob (``gpu_idle_free_min`` is the coarser fallback).
+    /// Default 45: as soon as no job or test is in progress, the GPU is handed
+    /// back promptly instead of lingering for minutes. The in-flight and the
+    /// 45 s job-heartbeat guards still prevent any mid-job / mid-test eviction,
+    /// so this only fires when the Companion is genuinely idle. When > 0 it wins
+    /// over ``gpu_idle_free_min``; set BOTH to 0 to disable the auto-free.
+    pub gpu_idle_free_sec: u32,
     /// "Pause sharing" tray toggle — proxy answers 503 to everything.
     pub paused: bool,
     /// The ClipAI server this Companion is paired with (display only).
@@ -144,6 +152,7 @@ impl Default for Config {
             ollama_keep_alive: "10m".into(),
             sidecar_idle_min: 15,
             gpu_idle_free_min: 3,
+            gpu_idle_free_sec: 45,
             paused: false,
             paired_clipai_url: String::new(),
             name: default_name(),

@@ -219,6 +219,7 @@ async fn get_status(
             "ollama_keep_alive": config.ollama_keep_alive,
             "sidecar_idle_min": config.sidecar_idle_min,
             "gpu_idle_free_min": config.gpu_idle_free_min,
+            "gpu_idle_free_sec": config.gpu_idle_free_sec,
             "paused": config.paused,
             "paired_clipai_url": config.paired_clipai_url,
             "name": config.name,
@@ -275,6 +276,7 @@ struct ConfigPatch {
     ollama_keep_alive: Option<String>,
     sidecar_idle_min: Option<u32>,
     gpu_idle_free_min: Option<u32>,
+    gpu_idle_free_sec: Option<u32>,
     paused: Option<bool>,
     name: Option<String>,
     setup_complete: Option<bool>,
@@ -314,6 +316,11 @@ async fn set_config(
         if let Some(v) = patch.gpu_idle_free_min {
             // 0 = auto-free off (whisper-only backstop still applies).
             cfg.gpu_idle_free_min = v.clamp(0, 24 * 60);
+        }
+        if let Some(v) = patch.gpu_idle_free_sec {
+            // Fast idle-free window in seconds (primary knob). 0 = fall back to
+            // the minutes knob; capped at 1 h.
+            cfg.gpu_idle_free_sec = v.clamp(0, 3600);
         }
         if let Some(v) = patch.paused {
             cfg.paused = v;
@@ -535,6 +542,7 @@ pub(crate) async fn build_diagnostics_report(state: &AppState, whisper_build: &s
     let _ = writeln!(r, "Ollama keep-alive:    {}", cfg.ollama_keep_alive);
     let _ = writeln!(r, "Sidecar idle (min):   {}", cfg.sidecar_idle_min);
     let _ = writeln!(r, "GPU auto-free (min):  {}", cfg.gpu_idle_free_min);
+    let _ = writeln!(r, "GPU auto-free (sec):  {}", cfg.gpu_idle_free_sec);
     let _ = writeln!(r, "Paired ClipAI URL:    {}",
         if cfg.paired_clipai_url.is_empty() { "(none — added manually in ClipAI, or not paired)".into() }
         else { cfg.paired_clipai_url.clone() });

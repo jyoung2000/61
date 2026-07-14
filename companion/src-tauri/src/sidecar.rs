@@ -564,6 +564,17 @@ pub async fn free_gpu(state: &Arc<AppState>, reason: &str) -> (bool, usize) {
     (whisper_stopped, n)
 }
 
+/// Whole-GPU idle-free window in milliseconds from the two config knobs. The
+/// seconds knob is primary (fast, default 45 s); the minutes knob is the coarse
+/// fallback used only when seconds is 0. Both 0 → 0 (auto-free disabled).
+pub(crate) fn effective_free_ms(free_sec: u32, free_min: u32) -> u64 {
+    if free_sec > 0 {
+        free_sec as u64 * 1_000
+    } else {
+        free_min as u64 * 60_000
+    }
+}
+
 /// Background reaper: return the GPU to the desktop when ClipAI goes quiet.
 ///
 /// Two timers, both keyed on REAL work (``real_work_snapshot``) — the old
@@ -584,10 +595,16 @@ pub fn spawn_idle_reaper(state: Arc<AppState>) {
     // a bare `tokio::spawn` panics with "there is no reactor running".
     tauri::async_runtime::spawn(async move {
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-            let (idle_min, free_min) = {
+            // Poll every 10 s so a sub-minute idle-free window is honored
+            // promptly — while idle these ticks are cheap in-memory snapshot
+            // reads, and the free itself fires once per idle period (marker).
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            let (idle_min, free_ms) = {
                 let cfg = state.config.lock().unwrap();
-                (cfg.sidecar_idle_min.max(1) as u64, cfg.gpu_idle_free_min as u64)
+                (
+                    cfg.sidecar_idle_min.max(1) as u64,
+                    effective_free_ms(cfg.gpu_idle_free_sec, cfg.gpu_idle_free_min),
+                )
             };
             let (inflight, last_real) = state.real_work_snapshot();
             if inflight {
@@ -609,15 +626,16 @@ pub fn spawn_idle_reaper(state: Arc<AppState>) {
             let now = crate::state::now_ms();
 
             // Whole-GPU auto-free (whisper + Ollama), once per idle period.
-            if free_min > 0
+            if free_ms > 0
                 && last_real > 0
-                && now.saturating_sub(last_real) > free_min * 60_000
+                && now.saturating_sub(last_real) > free_ms
                 && state.last_gpu_free_marker.load(Ordering::Relaxed) != last_real
             {
                 state
                     .last_gpu_free_marker
                     .store(last_real, Ordering::Relaxed);
-                free_gpu(&state, &format!("idle {free_min} min")).await;
+                let secs = free_ms / 1_000;
+                free_gpu(&state, &format!("idle {secs}s")).await;
                 continue;
             }
 
@@ -631,4 +649,27 @@ pub fn spawn_idle_reaper(state: Arc<AppState>) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod free_window_tests {
+    use super::effective_free_ms;
+
+    #[test]
+    fn seconds_knob_is_primary() {
+        // Default: 45 s free window (prompt free once no job/test is running).
+        assert_eq!(effective_free_ms(45, 3), 45_000);
+        assert_eq!(effective_free_ms(10, 3), 10_000);
+    }
+
+    #[test]
+    fn falls_back_to_minutes_when_seconds_zero() {
+        assert_eq!(effective_free_ms(0, 3), 180_000);
+        assert_eq!(effective_free_ms(0, 1), 60_000);
+    }
+
+    #[test]
+    fn both_zero_disables_auto_free() {
+        assert_eq!(effective_free_ms(0, 0), 0);
+    }
 }
