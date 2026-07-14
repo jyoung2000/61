@@ -994,10 +994,16 @@ mod tests {
     }
 
     fn load_with_json(raw: &str) -> Config {
+        // Unique per call: now_ms() collides under parallel test execution
+        // (two tests in the same millisecond would share a dir and clobber each
+        // other's companion.json), so add a process-global sequence counter.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "clipai-companion-mig-{}-{}",
+            "clipai-companion-mig-{}-{}-{}",
             std::process::id(),
-            now_ms()
+            now_ms(),
+            seq,
         ));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("companion.json"), raw).unwrap();
