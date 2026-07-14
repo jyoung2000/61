@@ -1556,7 +1556,14 @@ export default function VideoEditor({
       // preservePitch effect re-applies this when the item toggles.)
       applyPreservesPitch(video, previewPreservePitch);
     };
-    const onCanPlay = () => {
+    // Clear the loading spinner as soon as we can render the frame. This must
+    // NOT wait for ``canplay`` (readyState 3): with ``preload='metadata'`` on
+    // touch the browser stops at HAVE_METADATA and only reaches HAVE_CURRENT_DATA
+    // (first frame, readyState 2) via the clipStart seek — it may never fire
+    // ``canplay`` until the user hits play. So we also mark ready on
+    // ``loadeddata`` / ``seeked`` (first decodable frame), which is exactly when
+    // the spinner should lift. Idempotent — safe to fire from several events.
+    const markReady = () => {
       setVideoReady(true);
       setVideoInteractive(true);
       setVideoSlow(false);
@@ -1565,13 +1572,15 @@ export default function VideoEditor({
         setVideoDuration(video.duration);
       }
     };
-    // Watchdog: if the element hasn't become playable within 30s it's stuck
-    // (commonly a large non-faststart source over a tunnel, where the browser
-    // must pull the whole file before it can start). Surface an "open directly"
-    // escape instead of an endless spinner. Cleared the moment canplay fires.
+    // Watchdog: if the element hasn't even produced a first frame within 30s
+    // it's stuck (commonly a large non-faststart source over a tunnel, where the
+    // browser must pull much of the file first). Surface an "open directly"
+    // escape instead of an endless spinner. Checks readyState < 2 (no frame yet)
+    // rather than < 3 so it doesn't false-trip on touch, where ``metadata``
+    // preload legitimately never reaches ``canplay`` before the user plays.
     setVideoSlow(false);
     let _watchdog = setTimeout(() => {
-      if ((videoRef.current?.readyState ?? 0) < 3) setVideoSlow(true);
+      if ((videoRef.current?.readyState ?? 0) < 2) setVideoSlow(true);
     }, 30000);
     const onError = () => {
       // Retry once on transient failures (partial content, stale range)
@@ -1588,19 +1597,18 @@ export default function VideoEditor({
       }
     };
     video.addEventListener('loadedmetadata', onMetadata);
-    video.addEventListener('canplay', onCanPlay);
+    video.addEventListener('canplay', markReady);
+    video.addEventListener('loadeddata', markReady);
+    video.addEventListener('seeked', markReady);
     video.addEventListener('durationchange', onDuration);
     video.addEventListener('error', onError);
-    // If already past canplay when effect runs (e.g. cached)
-    if (video.readyState >= 3) {
-      setVideoReady(true);
-      setVideoInteractive(true);
-      if (_watchdog) { clearTimeout(_watchdog); _watchdog = null; }
-      if (video.duration && isFinite(video.duration)) {
-        setVideoDuration(video.duration);
-      }
+    // If already advanced when the effect runs (e.g. cached / re-mount):
+    if (video.readyState >= 2) {
+      // First frame available — clear the spinner and unlock everything.
+      markReady();
     } else if (video.readyState >= 1) {
-      // Have metadata but not yet playable — seeking already works.
+      // Have metadata but no frame yet — seeking already works, so unlock
+      // the timeline/transport but keep the spinner until the frame lands.
       setVideoInteractive(true);
       if (video.duration && isFinite(video.duration)) {
         setVideoDuration(video.duration);
@@ -1609,7 +1617,9 @@ export default function VideoEditor({
     return () => {
       if (_watchdog) { clearTimeout(_watchdog); _watchdog = null; }
       video.removeEventListener('loadedmetadata', onMetadata);
-      video.removeEventListener('canplay', onCanPlay);
+      video.removeEventListener('canplay', markReady);
+      video.removeEventListener('loadeddata', markReady);
+      video.removeEventListener('seeked', markReady);
       video.removeEventListener('durationchange', onDuration);
       video.removeEventListener('error', onError);
     };

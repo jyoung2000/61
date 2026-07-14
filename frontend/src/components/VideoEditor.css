@@ -4389,15 +4389,20 @@ input.ve-timecode--input {
 .ve-container .ve-header__title { min-width: 0; }
 
 /* Keep every ratio pill on ONE line. If the row is narrower than the pills
-   (small phones), scroll horizontally rather than wrapping 4:5 onto a second
-   row — the aspect options stay aligned in a single strip. */
+   (small phones, or a portrait ratio that shrinks the frame width on desktop),
+   scroll horizontally rather than wrapping 4:5 onto a second row — the aspect
+   options stay aligned in a single strip. The scrollbar is only hidden on
+   touch (swipe-scrollable); desktop keeps it so overflowed pills stay reachable
+   with a mouse. */
 .ve-ratio-row {
   flex-wrap: nowrap;
   overflow-x: auto;
-  scrollbar-width: none;
   -webkit-overflow-scrolling: touch;
 }
-.ve-ratio-row::-webkit-scrollbar { display: none; }
+@media (pointer: coarse) {
+  .ve-ratio-row { scrollbar-width: none; }
+  .ve-ratio-row::-webkit-scrollbar { display: none; }
+}
 
 /* Toolbars / control rows scroll horizontally on small screens rather than
    being clipped by the container. */
