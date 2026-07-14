@@ -330,7 +330,10 @@ export default function VideoEditor({
   // separate header row above it.
   headerExtras = null,
 }) {
-  const { isMobile, isTablet } = useResponsive();
+  const { isMobile, isTablet, isTouch } = useResponsive();
+  // No-hover / coarse-pointer surfaces: gate autoplay + touch affordances off
+  // this, independent of viewport width (a wide tablet is still "touch").
+  const touchDevice = isMobile || isTablet || isTouch;
   const viewportClass = isMobile ? 'mobile' : isTablet ? 'tablet' : 'desktop';
 
   // Resizable panel sizes — persisted per viewport class (2.5).
@@ -764,6 +767,14 @@ export default function VideoEditor({
   const [timecodeInput, setTimecodeInput] = useState('');
   const timecodeInputRef = useRef(null);
   const [videoReady, setVideoReady] = useState(false);
+  // ``videoReady`` requires ``canplay`` (readyState >= 3) which, on a long
+  // source over a slow link (mobile / powerline), can take a very long time —
+  // and while it's false the timeline + transport are locked, so the user
+  // "can't scrub / it does nothing." Seeking only needs metadata (duration +
+  // seekable), so a lighter ``videoInteractive`` flag (readyState >= 1) unlocks
+  // scrubbing/seek/skip as soon as the duration is known, without waiting for a
+  // full playable buffer. The spinner still keys off ``videoReady``.
+  const [videoInteractive, setVideoInteractive] = useState(false);
   const [videoError, setVideoError] = useState(false);
   // True when the <video> hasn't reached canplay within the watchdog window —
   // it's effectively stuck (a non-faststart big file over a tunnel, or an
@@ -1533,6 +1544,9 @@ export default function VideoEditor({
       if (video.duration && isFinite(video.duration)) {
         setVideoDuration(video.duration);
       }
+      // Duration + seekable are known now — unlock scrubbing/seek immediately,
+      // don't wait for a full playable buffer (which is slow on mobile).
+      setVideoInteractive(true);
       // Seek to clipStart so the first frame is visible immediately
       if (video.currentTime === 0 && clipStart > 0) {
         video.currentTime = clipStart;
@@ -1544,6 +1558,7 @@ export default function VideoEditor({
     };
     const onCanPlay = () => {
       setVideoReady(true);
+      setVideoInteractive(true);
       setVideoSlow(false);
       if (_watchdog) { clearTimeout(_watchdog); _watchdog = null; }
       if (video.duration && isFinite(video.duration)) {
@@ -1579,12 +1594,14 @@ export default function VideoEditor({
     // If already past canplay when effect runs (e.g. cached)
     if (video.readyState >= 3) {
       setVideoReady(true);
+      setVideoInteractive(true);
       if (_watchdog) { clearTimeout(_watchdog); _watchdog = null; }
       if (video.duration && isFinite(video.duration)) {
         setVideoDuration(video.duration);
       }
     } else if (video.readyState >= 1) {
-      // Have metadata but not yet playable
+      // Have metadata but not yet playable — seeking already works.
+      setVideoInteractive(true);
       if (video.duration && isFinite(video.duration)) {
         setVideoDuration(video.duration);
       }
@@ -1604,11 +1621,14 @@ export default function VideoEditor({
     if (!video || clipStart === undefined || clipStart === null) return;
     video.currentTime = clipStart;
     setCurrentTime(clipStart);
-    // Only auto-play if video is ready (has enough data to begin playback)
-    if (video.readyState >= 3) {
+    // Only auto-play if the video is ready AND we're not on a touch device.
+    // Auto-playing a long source over a slow link (mobile / powerline) buffers
+    // aggressively and the user sees it "loop the first second"; mobile users
+    // expect to tap play themselves (and OSes block audible autoplay anyway).
+    if (video.readyState >= 3 && !touchDevice) {
       video.play().then(() => setPlaying(true)).catch(() => {});
     }
-  }, [clipStart, clipEnd]);
+  }, [clipStart, clipEnd, touchDevice]);
 
   // ── Lightbox (fullscreen) escape + body scroll lock ───
   // The fullscreen button opens a custom in-app lightbox instead of using the
@@ -3442,7 +3462,11 @@ export default function VideoEditor({
           // short seeks land in the already-buffered window — the single
           // biggest "feels like a local file" lever for the preview.
           // (Was "metadata", which defers all media fetching until play.)
-          preload="auto"
+          // On touch, though, the link is often slow (mobile / powerline) and
+          // "auto" saturates it buffering a long source — so there we use
+          // "metadata": duration loads fast (editor is interactive right away)
+          // and playback buffers on demand instead of hogging the connection.
+          preload={touchDevice ? 'metadata' : 'auto'}
           style={(() => {
             const hasCustomTransform = (
               videoItemPosition.x !== 50 || videoItemPosition.y !== 50 ||
@@ -3731,7 +3755,7 @@ export default function VideoEditor({
       )}
 
       {/* ── Timeline ── */}
-      <div className="ve-timeline" style={videoReady ? undefined : { opacity: 0.3, pointerEvents: 'none' }}>
+      <div className="ve-timeline" style={videoInteractive ? undefined : { opacity: 0.3, pointerEvents: 'none' }}>
         {/* Ruler — clickable for Premiere-style seek */}
         <div
           className="ve-timeline__ruler"
@@ -4315,24 +4339,24 @@ export default function VideoEditor({
 
       {/* ── Controls bar ── */}
       <div className={`ve-controls${compact ? ' ve-controls--compact' : ''}${effectiveSegment ? ' ve-controls--segment-mode' : ''}`}
-        style={videoReady ? undefined : { opacity: 0.4, pointerEvents: 'none' }}
+        style={videoInteractive ? undefined : { opacity: 0.4, pointerEvents: 'none' }}
       >
         {/* Transport row: centered on all devices */}
         <div className="ve-controls__transport">
           <Tooltip label="Back 5s" kbd="J">
-            <button className="ve-btn" onClick={(e) => { e.stopPropagation(); skipTime(-5); }} disabled={!videoReady}>
+            <button className="ve-btn" onClick={(e) => { e.stopPropagation(); skipTime(-5); }} disabled={!videoInteractive}>
               <Icon.SkipBack />
             </button>
           </Tooltip>
 
           <Tooltip actionId="play-pause">
-            <button className="ve-btn ve-btn--play" onClick={(e) => { e.stopPropagation(); togglePlay(); }} disabled={!videoReady}>
+            <button className="ve-btn ve-btn--play" onClick={(e) => { e.stopPropagation(); togglePlay(); }} disabled={!videoInteractive}>
               {playing ? <Icon.Pause /> : <Icon.Play />}
             </button>
           </Tooltip>
 
           <Tooltip label="Forward 5s" kbd="L">
-            <button className="ve-btn" onClick={(e) => { e.stopPropagation(); skipTime(5); }} disabled={!videoReady}>
+            <button className="ve-btn" onClick={(e) => { e.stopPropagation(); skipTime(5); }} disabled={!videoInteractive}>
               <Icon.SkipForward />
             </button>
           </Tooltip>

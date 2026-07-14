@@ -4388,8 +4388,16 @@ input.ve-timecode--input {
 .ve-container .ve-header { flex-wrap: nowrap; min-width: 0; }
 .ve-container .ve-header__title { min-width: 0; }
 
-/* Ratio pill row wraps instead of clipping when many ratios + label crowd. */
-.ve-ratio-row { flex-wrap: wrap; row-gap: 6px; }
+/* Keep every ratio pill on ONE line. If the row is narrower than the pills
+   (small phones), scroll horizontally rather than wrapping 4:5 onto a second
+   row — the aspect options stay aligned in a single strip. */
+.ve-ratio-row {
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  scrollbar-width: none;
+  -webkit-overflow-scrolling: touch;
+}
+.ve-ratio-row::-webkit-scrollbar { display: none; }
 
 /* Toolbars / control rows scroll horizontally on small screens rather than
    being clipped by the container. */
@@ -5056,6 +5064,23 @@ input.ve-timecode--input {
   .ve-container .ve-multitrack-toggle__btn,
   .ve-container .ve-topbar__toggle,
   .ve-container .ve-ratio-pill { min-height: 40px; padding: 6px 14px; font-size: 12px; }
+  /* Slimmer pills + tighter gap so all five ratios + label fit the strip. */
+  .ve-container .ve-ratio-pill { padding: 7px 10px; gap: 3px; flex: 0 0 auto; }
+  .ve-container .ve-ratio-row { gap: 4px; }
+  /* Volume slider: a real, consistent touch target on mobile — a thin visible
+     track with a fat, grabbable thumb (the 3px desktop bar is unusable by
+     finger and some mobile browsers render the bare input at the wrong height). */
+  .ve-container .ve-volume__slider { height: 22px; background: transparent; }
+  .ve-container .ve-volume__slider::-webkit-slider-runnable-track {
+    height: 4px; border-radius: 2px; background: var(--ve-slider-track);
+  }
+  .ve-container .ve-volume__slider::-webkit-slider-thumb {
+    width: 16px; height: 16px; margin-top: -6px;
+  }
+  .ve-container .ve-volume__slider::-moz-range-track {
+    height: 4px; border-radius: 2px; background: var(--ve-slider-track);
+  }
+  .ve-container .ve-volume__slider::-moz-range-thumb { width: 16px; height: 16px; }
   .ve-container .ve-topbar__export { min-height: 40px; padding: 6px 16px; font-size: 13px; }
   .ve-container .ve-segment-chip { min-height: 36px; font-size: 11px; padding: 6px 12px; }
   .ve-container .ve-properties__speed-pill { min-height: 36px; }
