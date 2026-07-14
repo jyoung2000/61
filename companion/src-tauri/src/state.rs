@@ -374,7 +374,26 @@ impl AppState {
         let config_path = config_dir.join("companion.json");
         let config = std::fs::read_to_string(&config_path)
             .ok()
-            .and_then(|raw| serde_json::from_str::<Config>(&raw).ok())
+            .map(|raw| {
+                // Was ``gpu_idle_free_sec`` actually written to disk, or is it
+                // about to be filled by the serde default (45)?
+                let had_free_sec = serde_json::from_str::<serde_json::Value>(&raw)
+                    .ok()
+                    .and_then(|v| v.get("gpu_idle_free_sec").cloned())
+                    .is_some();
+                let mut cfg = serde_json::from_str::<Config>(&raw).unwrap_or_default();
+                // Migration: a config predating this field gets the 45 s default,
+                // which would silently override an explicit ``gpu_idle_free_min``
+                // — re-enabling the auto-free for someone who set it to 0 ("off"),
+                // or overriding a custom minutes value. Preserve their intent:
+                // when the key was absent AND they'd changed the minutes knob away
+                // from its old default (3), let the minutes knob govern by zeroing
+                // the new one. Fresh / default-3 configs keep the new 45 s default.
+                if !had_free_sec && cfg.gpu_idle_free_min != 3 {
+                    cfg.gpu_idle_free_sec = 0;
+                }
+                cfg
+            })
             .unwrap_or_default();
         let state = Self {
             config: Mutex::new(config),
@@ -966,6 +985,52 @@ mod tests {
             now_ms()
         ));
         AppState::load(dir)
+    }
+
+    #[test]
+    fn default_idle_free_is_45s() {
+        // A fresh install (no config file) frees the GPU ~45 s after idle.
+        assert_eq!(test_state().config.lock().unwrap().gpu_idle_free_sec, 45);
+    }
+
+    fn load_with_json(raw: &str) -> Config {
+        let dir = std::env::temp_dir().join(format!(
+            "clipai-companion-mig-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("companion.json"), raw).unwrap();
+        let cfg = AppState::load(dir.clone()).config.lock().unwrap().clone();
+        let _ = std::fs::remove_dir_all(&dir);
+        cfg
+    }
+
+    #[test]
+    fn migration_preserves_explicit_disable() {
+        // A pre-existing config that turned the auto-free OFF (min=0) and never
+        // had the seconds field must STAY off after upgrade, not silently
+        // re-enable at the 45 s default.
+        let cfg = load_with_json(r#"{"gpu_idle_free_min": 0}"#);
+        assert_eq!(cfg.gpu_idle_free_min, 0);
+        assert_eq!(cfg.gpu_idle_free_sec, 0, "disabled must survive upgrade");
+    }
+
+    #[test]
+    fn migration_preserves_custom_minutes() {
+        // A custom minutes value (e.g. 30) is preserved, not overridden by 45 s.
+        let cfg = load_with_json(r#"{"gpu_idle_free_min": 30}"#);
+        assert_eq!(cfg.gpu_idle_free_sec, 0);
+    }
+
+    #[test]
+    fn migration_leaves_default_configs_on_the_fast_path() {
+        // An old config that kept the default minutes (3) upgrades to 45 s.
+        let cfg = load_with_json(r#"{"gpu_idle_free_min": 3}"#);
+        assert_eq!(cfg.gpu_idle_free_sec, 45);
+        // And an explicit seconds value is always honored verbatim.
+        let cfg2 = load_with_json(r#"{"gpu_idle_free_min": 0, "gpu_idle_free_sec": 20}"#);
+        assert_eq!(cfg2.gpu_idle_free_sec, 20);
     }
 
     /// The "models linger forever" bug: /v1/health + /api/tags probes must

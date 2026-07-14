@@ -583,10 +583,12 @@ pub(crate) fn effective_free_ms(free_sec: u32, free_min: u32) -> u64 {
 /// registry, "idle" never elapsed and the whisper sidecar sat on VRAM
 /// indefinitely. That is the "models linger on the GPU after the test" bug.
 ///
-///   * ``gpu_idle_free_min`` (default 3, 0=off): after that many minutes with
-///     no transcription/inference running or finishing, free the WHOLE GPU —
-///     whisper sidecar stopped AND all resident Ollama models evicted. Fires
-///     once per idle period (marker), so it never churns /api/ps while idle.
+///   * ``gpu_idle_free_sec`` (default 45, primary) / ``gpu_idle_free_min``
+///     (coarse fallback, default 3): after that idle window with no
+///     transcription/inference running or finishing, free the WHOLE GPU —
+///     whisper sidecar stopped AND all resident Ollama models evicted. The
+///     seconds knob wins when > 0 (see ``effective_free_ms``); both 0 disables
+///     it. Fires once per idle period (marker), so it never churns /api/ps.
 ///   * ``sidecar_idle_min`` (default 15): whisper-only backstop for setups
 ///     that disable the full auto-free.
 pub fn spawn_idle_reaper(state: Arc<AppState>) {
