@@ -1341,6 +1341,14 @@ class Settings(BaseSettings):
     # fine again — but 4096 is the safe default for an unmanaged Ollama.)
     TRANSLATION_LARGE_NUM_CTX: int = 4096
     TRANSLATION_LARGE_CONCURRENCY: int = 1       # one KV slot; don't fan out a 12B
+    # Make the large translation model FIT on the paired Companion GPU. On a
+    # shared budget (the measured 4070: 9.5 GB, with a ~2 GB editorial 3B left
+    # resident) a 12B q4 loads PARTIALLY on the CPU → 45-65 s/batch instead of
+    # ~18 s. Ollama never migrates an already-placed model, so before the first
+    # large-model batch we evict every other model from the Companion Ollama and
+    # let the 12B reload into the now-free budget (fully GPU-resident). One clean
+    # reload beats ~13 min of CPU-spilled decoding. Set False to disable.
+    TRANSLATION_LARGE_EVICT_OTHERS: bool = True
     # Per-line output failsafes for the LLM translator (deterministic, checked
     # against the source line). A translation longer than
     # max(EXPANSION_CHARS, source_chars × EXPANSION_RATIO) is a model free-run

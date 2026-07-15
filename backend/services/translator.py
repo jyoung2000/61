@@ -799,12 +799,31 @@ async def translate_via_llm(
     from backend.services.local_models import translation_plan as _tplan, _parse_params_b
     _plan = _tplan(_eff_model, total, is_ollama=_is_ollama, companion_parallel=_companion_parallel)
     BATCH = max(1, int(_plan.get("batch") or (8 if _is_ollama else 18)))
-    if _eff_model and (_parse_params_b(_eff_model) or 0) >= float(
-            getattr(settings, "TRANSLATION_LARGE_MODEL_MIN_PARAMS_B", 10.0)):
+    _is_large_model = bool(_eff_model) and (_parse_params_b(_eff_model) or 0) >= float(
+        getattr(settings, "TRANSLATION_LARGE_MODEL_MIN_PARAMS_B", 10.0))
+    if _is_large_model:
         logger.info(
             "LLM translate: large model %s → batch %d, concurrency %d "
             "(fewer/bigger batches, single slot)",
             _eff_model, BATCH, int(_plan.get("concurrency") or 1))
+        # Make the 12B FIT: evict every OTHER model from the (Companion) Ollama so
+        # it reloads into the FULL VRAM budget on batch 0 instead of spilling
+        # layers to the CPU beside a resident 3B editorial model (the measured
+        # 4070 run: 45-65 s/batch → ~24 min). Ollama won't migrate an already-
+        # placed model, so this clears everything and lets batch 0 reload the 12B
+        # clean. One cold reload (already covered by the scaled first-batch
+        # timeout) beats ~13 min of CPU-spilled decoding. Fail-soft.
+        if _is_ollama and bool(getattr(settings, "TRANSLATION_LARGE_EVICT_OTHERS", True)):
+            try:
+                _prov = (getattr(orchestrator, "_providers", {}) or {}).get("ollama") \
+                    if orchestrator else None
+                if _prov is not None and hasattr(_prov, "clear_vram"):
+                    await _prov.clear_vram()   # except_model=None → evict all
+                    logger.info("LLM translate: cleared Companion VRAM so %s loads "
+                                "GPU-resident (avoids the CPU spill)", _eff_model)
+            except Exception as _ev_e:
+                logger.debug("LLM translate: pre-translation VRAM clear skipped (%s)",
+                             _ev_e)
     out_segs: list[TranscriptSegment] = []
 
     def _build_segs(batch, translations) -> list:
