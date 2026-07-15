@@ -61,10 +61,13 @@ def test_one_bad_index_keeps_original_rest_polished(monkeypatch):
     # Good indices polished.
     assert out[0].text == "Polished line 0."
     assert out[2].text == "Polished line 2."
-    # Bad index (1) kept its ORIGINAL text AND words verbatim.
-    assert out[1].text == "raw line one"
+    # Bad index (1) kept its ORIGINAL content AND words verbatim — the casing net
+    # capitalizes the kept-raw line's sentence start (it follows a terminated
+    # cue) but preserves the words unchanged (a casing edit moves no characters).
+    assert out[1].text == "Raw line one"
     assert out[1].words is not None and len(out[1].words) == 3
     assert out[1].words[0].start == 1.0
+    assert out[1].words[0].word == "raw"          # word timings untouched
     # No leaked dict reached any output.
     assert all("index" not in (s.text or "") and "{" not in (s.text or "") for s in out)
     # Timing preserved on all.
@@ -84,4 +87,6 @@ def test_whole_batch_failure_still_keeps_all_raw(monkeypatch):
     segs = [_seg(0.0, 1.0, "one"), _seg(1.0, 2.0, "two")]
     out = asyncio.run(P.correct_transcript(
         list(segs), _GarbageOrch(), language="en", mode="translation"))
-    assert [s.text for s in out] == ["one", "two"]
+    # Raw drafts kept (no LLM substitution); the deterministic casing net still
+    # capitalizes the opening cue while the continuation ("two") stays lowercase.
+    assert [s.text for s in out] == ["One", "two"]

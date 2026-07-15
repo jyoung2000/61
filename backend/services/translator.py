@@ -314,6 +314,92 @@ def collapse_separator_salad(text, source: str = "") -> str:
     return joined
 
 
+# ── Deterministic sentence-start casing net ─────────────────────────────────
+# A budget-truncated or outright-failed LLM polish/translate ships the RAW draft
+# (the measured Gundam run: polish timed out → every cue shipped unpolished),
+# which routinely carries lowercase sentence starts and a bare lowercase "i".
+# This restores them WITHOUT a model — and, critically, WITHOUT breaking the
+# common subtitle pattern where ONE sentence is split across cues (the second
+# cue legitimately begins lowercase: "…my passionate," / "undying feelings").
+# The capital is added only at a REAL sentence boundary, judged from the
+# previous cue's ending, so a continuation cue keeps its lowercase start.
+
+# Sentence-final punctuation. Includes the CJK stops so a mixed track still
+# detects boundaries; trailing closing quotes/brackets are peeled first.
+_SENT_TERMINATORS = ".!?…。！？"
+_SENT_CLOSERS = "\"'”’)]»】」』"
+# Standalone English pronoun "i" (also i'm/i'll/i've/i'd — the apostrophe is a
+# word boundary). The negative lookahead leaves the Latin abbreviation "i.e."
+# alone. Case-sensitive so an existing "I" is never touched.
+_LONE_I_RE = re.compile(r"\bi\b(?!\.)")
+
+
+def _prev_cue_ends_sentence(prev: str) -> bool:
+    """True when PREV (a previous cue's text) ends a sentence — so the cue after
+    it begins a new one. Trailing closing quotes / brackets are peeled first."""
+    s = (prev or "").rstrip()
+    while s and s[-1] in _SENT_CLOSERS:
+        s = s[:-1].rstrip()
+    return bool(s) and s[-1] in _SENT_TERMINATORS
+
+
+def _cap_first_alpha(text: str) -> str:
+    """Uppercase the FIRST Latin letter of TEXT, skipping leading punctuation /
+    quotes / dashes / music glyphs. Leaves a non-Latin lead (CJK / Cyrillic /
+    Greek) and an intentional camelCase brand ("iPhone", "eBay") alone, and
+    never lowercases."""
+    for i, c in enumerate(text):
+        if not c.isalpha():
+            continue
+        if ord(c) >= 0x250:          # first letter is non-Latin → leave the cue
+            return text
+        if not c.islower():          # already capitalized
+            return text
+        nxt = text[i + 1] if i + 1 < len(text) else ""
+        if nxt.isalpha() and nxt.isupper() and ord(nxt) < 0x250:
+            return text              # camelCase brand (iPhone / eBay / iOS)
+        up = c.upper()
+        if len(up) != 1:             # e.g. "ß"→"SS": would change length — skip
+            return text
+        return text[:i] + up + text[i + 1:]
+    return text                      # no Latin letter at all
+
+
+def fix_subtitle_casing(texts, language: str = ""):
+    """Restore sentence-start capitals + the "I" pronoun across an ordered cue
+    list, deterministically. Returns a new list of strings (same length).
+
+    Rules:
+      • A cue's first Latin letter is capitalized ONLY when it starts a new
+        sentence — the FIRST cue, or one whose PREVIOUS cue ended with a
+        sentence terminator. A cue continuing after a comma / mid-clause keeps
+        its lowercase start (subtitles split one sentence across cues).
+      • The English pronoun "i" (and i'm/i'll/i've/i'd) → "I" everywhere (gated
+        to an English target so Italian/… "i" articles are untouched).
+      • Never lowercases; never recases a still-source-language (CJK) cue.
+    No-op on a CJK target or when ``SUBTITLE_CASING_FIX_ENABLED`` is off."""
+    out = [(t or "") for t in texts]
+    if not bool(getattr(settings, "SUBTITLE_CASING_FIX_ENABLED", True)):
+        return out
+    if (language or "").lower() in _CJK_LANGS:
+        return out
+    _en = (language or "").lower().startswith("en")
+    prev_final = True                # the first cue begins a sentence
+    for i, s in enumerate(out):
+        if not s.strip():            # blank cue: preserve the boundary state
+            continue
+        if _cjk_ratio(s) > 0.30:     # still source-language → never recase
+            prev_final = _prev_cue_ends_sentence(s)
+            continue
+        if _en:
+            s = _LONE_I_RE.sub("I", s)
+        if prev_final:
+            s = _cap_first_alpha(s)
+        out[i] = s
+        prev_final = _prev_cue_ends_sentence(s)
+    return out
+
+
 def fraction_untranslated(segments, target_language: str, source_language: str = "") -> float:
     """Fraction of cues still written in the source language.
 
@@ -882,6 +968,26 @@ async def translate_via_llm(
         except Exception as _ref_e:
             logger.warning("LLM translate: self-refinement pass failed (%s) — "
                            "keeping the pre-refine translation", _ref_e)
+
+    # ── Deterministic casing net ────────────────────────────────────────────
+    # Last line of defense for when the downstream post-edit is skipped or times
+    # out (the raw draft then ships): restore sentence-start capitals + the "I"
+    # pronoun WITHOUT a model, respecting cross-cue sentence splits. No-op for a
+    # CJK target. Idempotent — safe even when the post-edit later runs it again.
+    if out_segs and (target_language or "").lower() not in _CJK_LANGS:
+        try:
+            _recased = fix_subtitle_casing([_txt(s) for s in out_segs], target_language)
+            _ncap = 0
+            for i, seg in enumerate(out_segs):
+                if _recased[i] != _txt(seg):
+                    out_segs[i] = TranscriptSegment(
+                        text=_recased[i], start=seg.start, end=seg.end,
+                        speaker=seg.speaker)
+                    _ncap += 1
+            if _ncap:
+                logger.info("LLM translate: casing net fixed %d cue(s)", _ncap)
+        except Exception as _cap_e:
+            logger.debug("LLM translate: casing net skipped (%s)", _cap_e)
 
     return out_segs
 

@@ -387,6 +387,25 @@ def _emit_segment(orig, new_text: str):
         return obj
 
 
+def _retext_only(orig, new_text: str):
+    """Replace a segment's text WITHOUT remapping word timestamps. Valid only for
+    a POSITION-PRESERVING edit (e.g. a casing-only change) where no character
+    moves, so the original word boundaries — and their timings — stay correct.
+    Round-trips both dict and Pydantic shapes."""
+    if isinstance(orig, dict):
+        out = dict(orig)
+        out["text"] = new_text
+        return out
+    try:
+        return orig.model_copy(update={"text": new_text})
+    except Exception:
+        try:
+            setattr(orig, "text", new_text)
+        except Exception:
+            pass
+        return orig
+
+
 def _light_filler_strip(text: str, language: str) -> str:
     """Pure-Python filler/whitespace cleanup — used as a baseline pass even
     when the LLM is unavailable, and as a guard inside the LLM path so the
@@ -1720,4 +1739,26 @@ async def correct_transcript(
     # (especially CJK). Restore them deterministically so the resegmenter isn't
     # left guessing on un-punctuated cues. No-op for already-terminated cues.
     polished_out = restore_punctuation_fallback(polished_out, language=language)
+    # ── Casing net ──────────────────────────────────────────────────────────
+    # A budget-truncated batch keeps its raw draft text (awkward, inconsistent
+    # casing). Restore sentence-start capitals + the "I" pronoun deterministically
+    # so those cues never ship lowercase. Cross-cue aware (a continuation cue
+    # keeps its lowercase start); no-op on a CJK track. Runs AFTER punctuation
+    # restore so terminators are in place to mark sentence boundaries.
+    if (language or "").lower() not in _CJK_LANGS:
+        try:
+            from backend.services.translator import fix_subtitle_casing
+            _texts = [(_coerce_segment(s).get("text") or "") for s in polished_out]
+            _recased = fix_subtitle_casing(_texts, language)
+            _ncap = 0
+            for i, seg in enumerate(polished_out):
+                if _recased[i] != _texts[i]:
+                    # Casing is position-preserving → keep word timings verbatim.
+                    polished_out[i] = _retext_only(seg, _recased[i])
+                    _ncap += 1
+            if _ncap:
+                logger.info("transcript polishing: casing net fixed %d cue(s)",
+                            _ncap)
+        except Exception as _ce:
+            logger.debug("transcript polishing: casing net skipped (%s)", _ce)
     return polished_out

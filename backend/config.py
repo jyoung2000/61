@@ -1279,6 +1279,13 @@ class Settings(BaseSettings):
     TRANSLATION_SALAD_MIN_PARTS: int = 5          # >= this many separator parts…
     TRANSLATION_SALAD_SINGLE_WORD_FRAC: float = 0.8  # …mostly single words…
     TRANSLATION_SALAD_CAP_RATIO: float = 0.5      # …and title-cased ⇒ a word list
+    # ── Deterministic sentence-start casing net ──────────────────────────────
+    # When a polish/translate post-edit is skipped or times out, the raw draft
+    # ships with lowercase sentence starts and a bare "i". This model-free net
+    # restores sentence-start capitals + the "I" pronoun, respecting cross-cue
+    # sentence splits (a continuation cue keeps its lowercase start). No-op on a
+    # CJK target.
+    SUBTITLE_CASING_FIX_ENABLED: bool = True
     # Per-batch timeout for LLM subtitle translation (a CEILING — never slows the
     # fast path; a fast GPU batch returns in seconds regardless). A small model
     # on a low-VRAM GPU needs far more than the old 5 s/segment / 60 s floor; too

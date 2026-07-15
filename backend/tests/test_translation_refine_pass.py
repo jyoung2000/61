@@ -77,14 +77,16 @@ def test_refine_off_no_extra_call(monkeypatch):
     orch = _Orch()
     out = _run(orch, monkeypatch, TRANSLATION_LLM_REFINE_PASS=False)
     assert orch.calls == 1                     # translation only — no refine call
-    assert [s.text for s in out] == ["line 1", "line 2"]
+    # Casing net capitalizes the opening cue; "line 2" continues it (no
+    # terminator on "Line 1") so it stays lowercase.
+    assert [s.text for s in out] == ["Line 1", "line 2"]
 
 
 def test_refine_on_runs_once_and_applies(monkeypatch):
     orch = _Orch(refine_out=["polished one", "polished two"])
     out = _run(orch, monkeypatch, TRANSLATION_LLM_REFINE_PASS=True)
     assert orch.calls >= 2                      # translation + at least one refine
-    assert [s.text for s in out] == ["polished one", "polished two"]
+    assert [s.text for s in out] == ["Polished one", "polished two"]
     # Timing preserved, cue count 1:1.
     assert len(out) == 2
     assert out[0].start == 0.0 and out[1].end == 2.0
@@ -94,5 +96,6 @@ def test_refine_reverts_on_source_language_regression(monkeypatch):
     # Refine output puts text back in the source script → must be rejected.
     orch = _Orch(refine_out=["ソースに戻る", "また日本語"])
     out = _run(orch, monkeypatch, TRANSLATION_LLM_REFINE_PASS=True)
-    # Kept the clean pre-refine English translation, not the regressed refine.
-    assert [s.text for s in out] == ["line 1", "line 2"]
+    # Kept the clean pre-refine English translation, not the regressed refine
+    # (casing net capitalizes the opening cue).
+    assert [s.text for s in out] == ["Line 1", "line 2"]

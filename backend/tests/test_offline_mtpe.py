@@ -103,7 +103,8 @@ def test_mtpe_preserves_cue_count_and_timing(monkeypatch):
         assert o.start == d.start and o.end == d.end    # timing preserved
         assert o.speaker == d.speaker
         assert o.text != d.text                         # text was post-edited
-        assert o.text.startswith("edited line")
+        # (the casing net capitalizes the opening cue → compare case-insensitively)
+        assert o.text.lower().startswith("edited line")
 
 
 def test_mtpe_uses_raised_num_ctx_8192(monkeypatch):
