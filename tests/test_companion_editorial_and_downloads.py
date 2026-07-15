@@ -56,6 +56,39 @@ def test_editorial_cap_failsoft_on_registry_error(monkeypatch):
     assert LM._effective_editorial_max_params_b() == 3.0
 
 
+# ── Fix 1b: an EXPLICIT editorial pick wins over the auto-selection cap ──────
+
+def test_explicit_editorial_pick_honored_above_cap(monkeypatch):
+    import asyncio
+    import backend.services.local_models as LM
+    import backend.services.ollama_registry as REG
+    from backend.config import settings
+    monkeypatch.setattr(settings, "OFFLINE_EDITORIAL_MAX_PARAMS_B", 4.0, raising=False)
+    monkeypatch.setattr(settings, "OFFLINE_EDITORIAL_SMALL_GPU_GB", 5.5, raising=False)
+    monkeypatch.setattr(REG, "companion_host", lambda: None)   # isolate: cap applies
+    monkeypatch.setattr(LM, "_total_vram_gb", lambda: 3.7)     # small local card
+    monkeypatch.setattr(settings, "OLLAMA_EDITORIAL_MODEL",
+                        "gemma3:12b-it-q4_K_M", raising=False)
+    installed = ["gemma3:12b-it-q4_K_M", "qwen3:4b-instruct-2507-q4_K_M", "qwen2.5:3b"]
+    got = asyncio.run(LM.select_local_editorial_models(limit=2, model_names=installed))
+    assert got[0] == "gemma3:12b-it-q4_K_M"      # explicit 12B pick wins despite the cap
+
+
+def test_auto_editorial_still_capped_without_explicit_pick(monkeypatch):
+    import asyncio
+    import backend.services.local_models as LM
+    import backend.services.ollama_registry as REG
+    from backend.config import settings
+    monkeypatch.setattr(settings, "OFFLINE_EDITORIAL_MAX_PARAMS_B", 4.0, raising=False)
+    monkeypatch.setattr(settings, "OFFLINE_EDITORIAL_SMALL_GPU_GB", 5.5, raising=False)
+    monkeypatch.setattr(REG, "companion_host", lambda: None)
+    monkeypatch.setattr(LM, "_total_vram_gb", lambda: 3.7)
+    monkeypatch.setattr(settings, "OLLAMA_EDITORIAL_MODEL", "", raising=False)  # auto
+    installed = ["gemma3:12b-it-q4_K_M", "qwen2.5:3b-instruct"]
+    got = asyncio.run(LM.select_local_editorial_models(limit=2, model_names=installed))
+    assert "gemma3:12b-it-q4_K_M" not in got     # auto-select still respects the cap
+
+
 # ── Fix 2: Companion installer endpoints are public (Update button 401) ─────
 
 def test_companion_installer_reads_are_public():

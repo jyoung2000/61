@@ -471,12 +471,19 @@ async def select_local_editorial_models(
     if not ranked:
         fb = (getattr(settings, "OLLAMA_EDITORIAL_MODEL", "") or "").strip()
         return [fb][:limit] if fb else []
-    # The explicitly-configured editorial model wins over auto-ranking when it's
-    # actually installed — an operator who set OLLAMA_EDITORIAL_MODEL to a
-    # specific tag should get it, not whatever the heuristic ranks first.
+    # An EXPLICIT editorial pick that is actually installed wins OUTRIGHT — even
+    # if it exceeds the auto-selection VRAM cap. That cap only exists to stop
+    # AUTO-selection from choosing a model too big for the local card; it must
+    # NOT override a user who deliberately picked a specific model. The bug it
+    # replaces: on a paired Companion the user picks gemma3:12b for Editorial,
+    # but the local-card cap drops the 12B from `ranked`, the configured match
+    # fails, and it silently falls back to a 4B (the "editorial won't change to
+    # gemma3" symptom). Match against the RAW installed list, not capped `ranked`.
     configured = (getattr(settings, "OLLAMA_EDITORIAL_MODEL", "") or "").strip()
     if configured:
-        match = next((n for n in ranked if _ollama_names_match(n, configured)), None)
-        if match and ranked[0] != match:
-            ranked = [match] + [n for n in ranked if n != match]
+        installed = next(
+            (n for n in (names or []) if _ollama_names_match(n, configured)), None)
+        if installed:
+            rest = [n for n in ranked if not _ollama_names_match(n, installed)]
+            return ([installed] + rest)[:limit]
     return ranked[:limit]
