@@ -210,6 +210,7 @@ async fn get_status(
     };
     Ok(serde_json::json!({
         "app_version": env!("CARGO_PKG_VERSION"),
+        "app_build": env!("CLIPAI_BUILD_ID"),
         "config": {
             "token": config.token,
             "port": config.port,
@@ -523,7 +524,7 @@ pub(crate) async fn build_diagnostics_report(state: &AppState, whisper_build: &s
     let mut r = String::new();
     let _ = writeln!(r, "================ ClipAI GPU Companion — Diagnostics Report ================");
     let _ = writeln!(r, "Generated:     {}", fmt_ms(now));
-    let _ = writeln!(r, "App version:   {}", env!("CARGO_PKG_VERSION"));
+    let _ = writeln!(r, "App version:   {} ({})", env!("CARGO_PKG_VERSION"), env!("CLIPAI_BUILD_ID"));
     let _ = writeln!(r, "Platform:      {} / {}", std::env::consts::OS, std::env::consts::ARCH);
     let _ = writeln!(r, "Log file:      {}", log_file_path().display());
     let _ = writeln!(r, "App started:   {}  (uptime {})",
@@ -833,11 +834,19 @@ async fn check_app_update(
     let entry = &manifest["platforms"][UPDATE_PLATFORM];
     let has_installer = entry.is_object();
     let current = env!("CARGO_PKG_VERSION");
-    let update_available =
-        has_installer && !latest.is_empty() && crate::proxy::version_lt(current, &latest);
+    let current_build = env!("CLIPAI_BUILD_ID");
+    // Build identity of the served installer (the ClipAI repo's git SHA baked
+    // into the manifest). Comparing it lets a from-source rebuild that reused
+    // the same semver still count as an update — otherwise the button says
+    // "up to date" forever and the new binary never lands.
+    let latest_build = manifest["build_id"].as_str().unwrap_or("").to_string();
+    let update_available = has_installer
+        && crate::proxy::should_update(current, current_build, &latest, &latest_build);
     Ok(serde_json::json!({
         "current": current,
         "latest": latest,
+        "current_build": current_build,
+        "latest_build": latest_build,
         "update_available": update_available,
         "installer_available": has_installer,
         "platform": UPDATE_PLATFORM,

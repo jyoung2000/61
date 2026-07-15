@@ -210,6 +210,28 @@ def test_newer_installer_wins_beside_a_stale_one(dirs, no_github):
     assert resp.path.endswith("Companion_0.2.0.exe")
 
 
+def test_manifest_surfaces_build_id(dirs, no_github):
+    """The from-source build stamps the ClipAI git SHA into the manifest as
+    build_id; the merged manifest must surface it so the Companion's Update
+    button can offer a same-semver rebuild (different SHA = newer build)."""
+    _baked, cache = dirs
+    m = _write_release(cache, "0.2.4", {"windows": "Companion_0.2.4.exe"})
+    m["build_id"] = "abc1234"
+    (cache / "manifest.json").write_text(json.dumps(m))
+    out = asyncio.run(D.companion_manifest())
+    assert out["version"] == "0.2.4"
+    assert out["build_id"] == "abc1234"
+
+
+def test_manifest_build_id_empty_when_absent(dirs, no_github):
+    """An older manifest without build_id yields an empty string, never a
+    KeyError — the Companion then falls back to the size/semver gate."""
+    _baked, cache = dirs
+    _write_release(cache, "0.2.0", {"windows": "Companion_0.2.0.exe"})
+    out = asyncio.run(D.companion_manifest())
+    assert out["build_id"] == ""
+
+
 def test_fresh_baked_beats_stale_cache(dirs, no_github):
     """A stale cached copy must never shadow a fresher image-baked build."""
     baked, cache = dirs

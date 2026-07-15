@@ -513,7 +513,7 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
       setUpdateInfo(info);
       if (!quiet && !info.update_available) {
         setUpdateMsg(info.installer_available
-          ? `Up to date — v${info.current} is the newest installer your ClipAI serves.`
+          ? `Up to date — v${info.current}${info.current_build ? ` (build ${info.current_build})` : ''} is the newest installer your ClipAI serves.`
           : 'Your ClipAI server has no Companion installer yet — on the server, run "Check for Companion updates" in Settings → GPU Companion (or rebuild the container with COMPANION_BUILD_FROM_SOURCE=1).');
       }
     } catch (e) {
@@ -1446,7 +1446,11 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
               title="Downloads the installer from ClipAI, launches it, and closes this app so it can update in place">
               {installingUpdate
                 ? 'Updating…'
-                : `⬆ Update to v${updateInfo.latest}`}
+                : (updateInfo.latest && updateInfo.latest !== updateInfo.current
+                    ? `⬆ Update to v${updateInfo.latest}`
+                    // Same version, newer build (from-source rebuild) — say so
+                    // instead of "Update to v0.2.4" while already on 0.2.4.
+                    : `⬆ Install the latest build${updateInfo.latest_build ? ` (${updateInfo.latest_build})` : ''}`)}
             </button>
             <span className="muted small">
               {updateInfo.filename}

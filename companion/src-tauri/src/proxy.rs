@@ -66,6 +66,40 @@ pub(crate) fn version_lt(own: &str, expected: &str) -> bool {
     }
 }
 
+/// Decide whether the paired ClipAI is serving a build we should install.
+///
+/// The Update button used to gate purely on semver (`version_lt`), so a
+/// from-source rebuild that reused the SAME version (0.2.4 → 0.2.4) reported
+/// "up to date" forever and the freshly-built binary — editorial fix and all —
+/// never reached the app. Now the decision is:
+///   * a strictly-NEWER semver always updates (normal release path);
+///   * a LOWER semver never updates (never downgrade);
+///   * at an EQUAL or incomparable semver, a DIFFERENT non-empty build id
+///     updates too — a from-source rebuild carries a fresh git SHA, so the
+///     same-version rebuild is still installable.
+/// Converges: once installed, the running id equals the served id → no re-offer.
+pub(crate) fn should_update(
+    current_ver: &str,
+    current_id: &str,
+    latest_ver: &str,
+    latest_id: &str,
+) -> bool {
+    if version_lt(current_ver, latest_ver) {
+        return true; // strictly newer release
+    }
+    if version_lt(latest_ver, current_ver) {
+        return false; // older release — never downgrade
+    }
+    // Equal (or incomparable) semver → fall back to build identity. An empty or
+    // "unknown"/"source" served id can't prove a newer build, so it never flags.
+    let latest_id = latest_id.trim();
+    let current_id = current_id.trim();
+    !latest_id.is_empty()
+        && !latest_id.eq_ignore_ascii_case("unknown")
+        && !latest_id.eq_ignore_ascii_case("source")
+        && !latest_id.eq_ignore_ascii_case(current_id)
+}
+
 /// Record ClipAI's overall job progress (X-ClipAI-Progress, 0-100) so the GUI
 /// can show a live bar for the work it's serving.
 fn note_progress(state: &AppState, headers: &HeaderMap) {
@@ -1201,6 +1235,43 @@ mod version_tests {
     fn tolerant_formats() {
         assert!(version_lt("v0.1.0", "companion-v0.2.0"));
         assert!(version_lt("0.1", "0.1.1"));
+    }
+}
+
+#[cfg(test)]
+mod update_decision_tests {
+    use super::should_update;
+
+    #[test]
+    fn newer_semver_updates_regardless_of_id() {
+        assert!(should_update("0.2.4", "aaaaaaa", "0.2.5", "aaaaaaa"));
+        assert!(should_update("0.2.4", "aaaaaaa", "0.3.0", ""));
+    }
+
+    #[test]
+    fn lower_semver_never_downgrades() {
+        assert!(!should_update("0.3.0", "aaaaaaa", "0.2.9", "bbbbbbb"));
+    }
+
+    #[test]
+    fn same_semver_different_build_updates() {
+        // The from-source-rebuild case: version unchanged, git SHA changed.
+        assert!(should_update("0.2.4", "aaaaaaa", "0.2.4", "bbbbbbb"));
+    }
+
+    #[test]
+    fn same_semver_same_build_converges() {
+        // After installing, ids match → no perpetual re-offer.
+        assert!(!should_update("0.2.4", "abcdef1", "0.2.4", "abcdef1"));
+        assert!(!should_update("0.2.4", "ABCDEF1", "0.2.4", "abcdef1")); // case-insensitive
+    }
+
+    #[test]
+    fn placeholder_or_empty_served_id_never_flags() {
+        // A build with no real identity can't prove it's newer.
+        assert!(!should_update("0.2.4", "abcdef1", "0.2.4", ""));
+        assert!(!should_update("0.2.4", "abcdef1", "0.2.4", "unknown"));
+        assert!(!should_update("0.2.4", "abcdef1", "0.2.4", "source"));
     }
 }
 

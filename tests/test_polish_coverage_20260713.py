@@ -139,7 +139,7 @@ def test_companion_version_bumped_and_synced():
                       open(os.path.join(REPO, "companion", "src-tauri", "Cargo.toml"),
                            encoding="utf-8").read(), re.M).group(1)
     from backend.services.companion_version import EXPECTED_COMPANION_VERSION
-    assert cargo == EXPECTED_COMPANION_VERSION == "0.2.3"
+    assert cargo == EXPECTED_COMPANION_VERSION == "0.2.4"
 
 
 # ── 3. Self-update hardening (adversarial-review CONFIRMED HIGH findings) ────

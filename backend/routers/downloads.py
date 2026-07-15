@@ -200,6 +200,7 @@ def _merged_view(github: Optional[dict]) -> dict:
     baked_files = _scan_installers(BAKED_DIR)
     platforms = {}
     version = ""
+    build_id = ""
     for key in ("windows", "mac", "windows_msi"):
         # Newest version wins across sources (a stale cached installer used
         # to shadow a fresher baked build because "cached" was tried first).
@@ -226,6 +227,11 @@ def _merged_view(github: Optional[dict]) -> dict:
             if not version:
                 version = _version_from_filename(f["filename"]) \
                     or (manifest.get("version", "") if manifest else "")
+            # Carry the build id from the SAME manifest that supplied the
+            # winning installer — it's what the Companion's Update button
+            # compares against its own build to catch same-semver rebuilds.
+            if not build_id and manifest:
+                build_id = (manifest.get("build_id", "") or "").strip()
             break
         else:
             gh_entry = ((github or {}).get("platforms") or {}).get(key)
@@ -235,6 +241,8 @@ def _merged_view(github: Optional[dict]) -> dict:
                 platforms[key] = entry
     if not version:
         version = ((cache_manifest or baked_manifest or github or {}).get("version", ""))
+    if not build_id:
+        build_id = ((cache_manifest or baked_manifest or github or {}).get("build_id", "") or "").strip()
     # A from-source image-build installer (companion-builder Dockerfile
     # stage) marks its manifest — the UI explains the whisper-sidecar
     # difference vs official releases.
@@ -242,6 +250,7 @@ def _merged_view(github: Optional[dict]) -> dict:
         (cache_manifest or baked_manifest or {}).get("built_from_source", False))
     return {
         "version": version,
+        "build_id": build_id,
         "platforms": platforms,
         "built_from_source": built_from_source,
         "github_repo": GITHUB_REPO,

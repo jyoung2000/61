@@ -60,10 +60,17 @@ def main(out_dir: str) -> int:
     except Exception:
         pass
 
+    # Build identity: the ClipAI repo's short git SHA the Docker build passed in
+    # (CLIPAI_COMPANION_BUILD_ID). The Companion's Update button compares it to
+    # the running binary's own build id, so a from-source rebuild that reused
+    # the same semver is still recognised as a newer build. Empty/"unknown"
+    # (a build with no SHA) simply never proves a same-version update.
+    build_id = (os.environ.get("CLIPAI_COMPANION_BUILD_ID", "") or "").strip()
     manifest = {
         "version": version,
         "tag": f"companion-v{version}",
         "published_at": "",
+        "build_id": build_id,
         # Marks these as image/local-build fallbacks. Official companion-v*
         # release assets (fetched by the companion-fetch stage or the
         # "Fetch from GitHub" refresh) overwrite this manifest when present.

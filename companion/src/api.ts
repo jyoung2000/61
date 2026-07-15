@@ -139,6 +139,10 @@ export const pairClipai = (clipaiUrl: string, apiKey: string) =>
 export interface AppUpdateCheck {
   current: string;
   latest: string;
+  /** Build id (git SHA) of the running app and of the served installer. Lets a
+   *  from-source rebuild at the same version still be offered as an update. */
+  current_build?: string;
+  latest_build?: string;
   update_available: boolean;
   installer_available: boolean;
   platform: string;
