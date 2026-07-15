@@ -654,15 +654,24 @@ async def translate_via_llm(
     # (not per-batch) so names render consistently and coined nouns are
     # transliterated, not translated into ordinary words. Content-agnostic.
     _auto_terms = ""
-    if getattr(settings, "TRANSLATION_AUTO_GLOSSARY", True):
-        try:
-            from backend.services.glossary import build_translation_glossary_block
-            _auto_terms = build_translation_glossary_block(segments, source_language, tgt_name)
+    try:
+        from backend.services.glossary import (
+            build_translation_glossary_block, load_custom_vocabulary_terms)
+        _user_vocab = load_custom_vocabulary_terms()
+        _use_auto = bool(getattr(settings, "TRANSLATION_AUTO_GLOSSARY", True))
+        # Build the glossary block when auto-derivation is on OR the user typed
+        # names — so an explicit custom vocabulary is honored even with auto off.
+        # When auto is off, pass no segments so ONLY the user's names seed it.
+        if _use_auto or _user_vocab:
+            _auto_terms = build_translation_glossary_block(
+                segments if _use_auto else [], source_language, tgt_name,
+                user_terms=_user_vocab)
             if _auto_terms:
-                logger.info("LLM translate: attached recurring-terms glossary "
-                            "(%d term chars) for consistency", len(_auto_terms))
-        except Exception as _g_e:
-            logger.debug("auto-glossary skipped: %s", _g_e)
+                logger.info("LLM translate: attached names glossary (%d term chars, "
+                            "%d user term(s)) for consistency",
+                            len(_auto_terms), len(_user_vocab))
+    except Exception as _g_e:
+        logger.debug("auto-glossary skipped: %s", _g_e)
 
     # Surrounding SOURCE lines shown to the model for continuity — reference
     # only, never re-translated or emitted. Kept short so local models at
@@ -884,12 +893,15 @@ async def translate_via_llm(
     # NOTHING is left in the source language. (Runs only when the target is
     # non-CJK.)
     if (target_language or "").lower() not in _CJK_LANGS:
-        # Recurring-terms glossary (lowercased) so the romaji-leak check never
-        # flags a real recurring name as garble.
+        # Recurring-terms glossary + the user's custom vocabulary (both
+        # lowercased) so the romaji-leak check never flags a real name as garble.
         try:
-            from backend.services.glossary import extract_recurring_terms as _ert
+            from backend.services.glossary import (
+                extract_recurring_terms as _ert, load_custom_vocabulary_terms)
             _gloss_terms = frozenset(
-                (w or "").lower() for w in _ert(segments, source_language) if w)
+                (w or "").lower()
+                for w in list(_ert(segments, source_language))
+                + list(load_custom_vocabulary_terms()) if w)
         except Exception:
             _gloss_terms = frozenset()
         for _pass in range(3):

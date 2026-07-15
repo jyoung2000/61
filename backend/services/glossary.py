@@ -110,12 +110,54 @@ def build_recurring_terms_block(terms: list, target_lang: str = "the target lang
     )
 
 
+def load_custom_vocabulary_terms() -> list[str]:
+    """The user's global custom-vocabulary glossary (authoritative proper-noun
+    spellings), or ``[]``. Lazy + fail-soft + gated by ``CUSTOM_VOCABULARY_ENABLED``
+    so this module stays importable without the settings / vocabulary deps and
+    degrades to the auto-derived list when the feature is off or unreadable."""
+    try:
+        from backend.config import settings
+        if not bool(getattr(settings, "CUSTOM_VOCABULARY_ENABLED", True)):
+            return []
+        from backend.services.custom_vocabulary import load_vocabulary
+        return list(load_vocabulary() or [])
+    except Exception:
+        return []
+
+
+def merge_glossary_terms(user_terms, auto_terms, cap: int = 40) -> list[str]:
+    """User terms first (authoritative), then auto-derived terms not already
+    present — case-insensitive dedupe, order-preserving, capped at ``cap``."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for t in list(user_terms or []) + list(auto_terms or []):
+        term = str(t or "").strip()
+        key = term.lower()
+        if not term or key in seen:
+            continue
+        seen.add(key)
+        out.append(term)
+        if len(out) >= cap:
+            break
+    return out
+
+
 def build_translation_glossary_block(
     segments, source_lang: str = "", target_lang: str = "the target language",
-    max_terms: int = 40,
+    max_terms: int = 40, user_terms: Optional[list] = None,
 ) -> str:
-    """Convenience: extract + format in one call (empty string when nothing recurs)."""
-    return build_recurring_terms_block(
-        extract_recurring_terms(segments, source_lang, max_terms=max_terms),
-        target_lang,
-    )
+    """Extract + format the recurring-terms glossary in one call (empty string
+    when there is nothing to pin).
+
+    ``user_terms`` supplies the user's authoritative canonical spellings (the
+    global custom vocabulary). When ``None`` they are auto-loaded, so EVERY
+    translation path gets the user's names without threading them through — a
+    name that Whisper mis-heard, that appears only once, or that is katakana in
+    the source (so the model would guess the romanization) is still pinned to
+    the exact spelling the user typed. User terms rank first and the merged list
+    is capped at ``max_terms`` to keep the per-batch prompt bounded."""
+    if user_terms is None:
+        user_terms = load_custom_vocabulary_terms()
+    auto = extract_recurring_terms(segments, source_lang, max_terms=max_terms)
+    merged = merge_glossary_terms(user_terms, auto, cap=max_terms)
+    return build_recurring_terms_block(merged, target_lang)

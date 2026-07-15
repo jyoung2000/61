@@ -2251,7 +2251,7 @@ export default function Settings() {
                       Custom Vocabulary
                     </div>
                     <div style={{ fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.4 }}>
-                      Bias transcription toward jargon, names, acronyms, and brand terms — one term per line. The single biggest accuracy lever for unfamiliar proper nouns.
+                      Names, jargon, acronyms, and brand terms — one per line. Applied across the whole pipeline: biases transcription, and pins each name to your exact spelling when translating and polishing (so "Zechs" never drifts to "Zeks"). The single biggest accuracy lever for unfamiliar proper nouns.
                     </div>
                   </div>
                   <div
