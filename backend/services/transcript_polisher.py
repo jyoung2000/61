@@ -1445,6 +1445,23 @@ async def correct_transcript(
     #   * 5 consecutive whole-batch failures aborts the rest (drafts kept) so
     #     a broken model can't burn GPU-minutes producing garbage.
     _conc = max(1, int(getattr(settings, "SUBTITLE_POLISH_CONCURRENCY", 3)))
+    # Size-aware concurrency (mirrors the translation pass): a large model (12B+)
+    # can't serve several parallel requests in a modest VRAM budget. Fanning out
+    # SUBTITLE_POLISH_CONCURRENCY at it makes every polish request time out
+    # ("all providers failed for text completion") — the polish silently fails
+    # and the RAW translation ships (awkward, inconsistent casing). Pin big
+    # models to a single slot so the polish actually completes.
+    try:
+        from backend.services.local_models import _parse_params_b as _pp
+        _mp = _pp(model_override or "")
+    except Exception:
+        _mp = None
+    if _mp is not None and _mp >= float(
+            getattr(settings, "TRANSLATION_LARGE_MODEL_MIN_PARAMS_B", 10.0)):
+        _conc = min(_conc, max(1, int(getattr(settings, "TRANSLATION_LARGE_CONCURRENCY", 1))))
+        logger.info("transcript polishing: large model %s → concurrency %d "
+                    "(single slot, avoids parallel-request timeouts)",
+                    model_override, _conc)
     _budget_s = float(getattr(settings, "SUBTITLE_POLISH_MAX_S", 600.0))
     _t_start = time.monotonic()
     _deadline = (_t_start + _budget_s) if _budget_s > 0 else None
