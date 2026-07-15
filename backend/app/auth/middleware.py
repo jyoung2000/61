@@ -72,6 +72,17 @@ _PUBLIC_EXACT = {
     "/api/auth/bootstrap",
     "/health",
     "/healthz",
+    # GPU Companion self-update: the Companion is a non-browser LAN peer with no
+    # session cookie, so it 401'd on the installer manifest ("answered HTTP 401
+    # Unauthorized for the installer manifest") and its Update button never
+    # worked. These are READ-ONLY installer artifacts (version metadata + the
+    # public app binary, sha256-verified by the Companion) — safe to serve
+    # unauthenticated over the LAN. The admin refresh (POST /companion/refresh)
+    # is deliberately NOT here, so it stays behind auth.
+    "/api/downloads/companion/manifest",
+    "/api/downloads/companion/windows",
+    "/api/downloads/companion/windows_msi",
+    "/api/downloads/companion/mac",
 }
 
 _PUBLIC_PREFIXES = (

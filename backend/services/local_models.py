@@ -81,6 +81,19 @@ def _effective_editorial_max_params_b() -> float:
     configured = float(getattr(settings, "OFFLINE_EDITORIAL_MAX_PARAMS_B", 4.0))
     small_gb = float(getattr(settings, "OFFLINE_EDITORIAL_SMALL_GPU_GB", 5.5))
     small_cap = float(getattr(settings, "OFFLINE_EDITORIAL_SMALL_GPU_MAX_PARAMS_B", 3.0))
+    # A paired GPU Companion hosts the editorial model on ITS big GPU (e.g. a
+    # 12 GB 4070), NOT this container's small card. The param cap (and the
+    # small-GPU downshift below) reads the LOCAL VRAM, so on a 4 GB 1650 it drops
+    # an explicitly-picked 12B editorial model from the ranking — which then
+    # silently falls back to a 3B (the measured symptom: user selects gemma3:12b
+    # for Editorial, active model stays qwen2.5:3b). When a Companion is paired,
+    # lift the cap entirely so the big remote GPU's models are eligible.
+    try:
+        from backend.services.ollama_registry import companion_host
+        if companion_host() is not None:
+            return float("inf")
+    except Exception:
+        pass
     if small_gb <= 0:
         return configured
     total = _total_vram_gb()
