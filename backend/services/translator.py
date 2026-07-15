@@ -752,6 +752,28 @@ async def translate_via_llm(
         mid = len(batch) // 2                      # split on failure and recurse
         return (await _translate_batch(batch[:mid])) + (await _translate_batch(batch[mid:]))
 
+    async def _recover_first(batch) -> tuple:
+        """Batch-0 split-and-retry WITH a usability sentinel.
+
+        The first batch is a zero-tolerance gate: one big 20-line request that
+        misses on the strict count / a truncated-JSON parse / a timeout used to
+        return None and discard the ENTIRE LLM translation — silently dropping
+        the whole job to the far weaker offline NMT (FuguMT). This mirrors
+        ``_translate_batch``'s recursive halving, but ALSO reports whether ANY
+        sub-call actually produced LLM output, so a genuinely dead model still
+        bails cleanly while a working model that merely fumbled the big first
+        array is recovered instead of thrown away. Returns
+        ``(translations, any_call_succeeded)``."""
+        direct = await _call(batch)
+        if direct is not None:
+            return direct, True
+        if len(batch) <= 1:                        # keep source rather than drop
+            return [_txt(s) for s in batch], False
+        mid = len(batch) // 2
+        left, lo = await _recover_first(batch[:mid])
+        right, ro = await _recover_first(batch[mid:])
+        return left + right, (lo or ro)
+
     # Smaller batches on a local model: a 3B model on a small GPU generates a
     # short JSON array far faster + more reliably than an 18-line one, so each
     # batch is much less likely to hit the timeout (the failure that dropped the
@@ -843,12 +865,25 @@ async def translate_via_llm(
     batch0 = segments[b0: b0 + BATCH]
     _cb0, _ca0 = _ctx_for(b0, len(batch0))
     direct0 = await _call(batch0, _cb0, _ca0)
-    if direct0 is None:
-        logger.info("LLM translate: editorial model returned no usable output "
-                    "— deferring to other translation engines.")
-        return None
+    if direct0 is not None:
+        first_segs = _build_segs(batch0, direct0)
+    else:
+        # A single large first batch that missed on count/parse/timeout must NOT
+        # throw away a WORKING model (that silently drops the whole job to weak
+        # offline NMT). Split-and-retry like every other batch; only bail to NMT
+        # when NO sub-call at any granularity produced LLM output.
+        translations0, any_ok = await _recover_first(batch0)
+        if not any_ok:
+            logger.info("LLM translate: editorial model returned no usable output "
+                        "even after split-and-retry — deferring to other "
+                        "translation engines.")
+            return None
+        logger.info("LLM translate: first %d-line batch missed but recovered via "
+                    "split-and-retry — keeping the LLM path (not FuguMT)",
+                    len(batch0))
+        first_segs = _build_segs(batch0, translations0)
     results: list = [None] * len(batch_starts)
-    results[0] = _build_segs(batch0, direct0)
+    results[0] = first_segs
     _done = {"n": 1}
     await _emit_status(min(BATCH, total))
 
