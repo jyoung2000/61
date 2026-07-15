@@ -210,6 +210,35 @@ class ReframeEngine:
             f'  Keyframes: {len(self.plan.keyframes)}\n'
             f'  Strategies: {[s["strategy"] for s in self.plan.strategy_log]}')
 
+        # Reframe debug bundle — a machine-readable JOIN of the per-scene
+        # signals/params/strategy + crop trajectory + timing, written next to
+        # the JSONL trace so a bad reframe is inspectable without re-running.
+        # Serialize-only + fail-soft: never changes reframing, never raises.
+        try:
+            from backend.config import settings as _settings
+            _tp = getattr(self.tracer, 'path', '') or ''
+            if bool(getattr(_settings, 'REFRAMER_DEBUG_JSON', True)) and _tp:
+                from backend.services.reframe_debug import write_reframe_debug_bundle
+                _perc_summary = {
+                    'src_w': perc.src_w, 'src_h': perc.src_h, 'fps': perc.fps,
+                    'duration_ms': perc.duration_ms,
+                    'face_samples_with_detections': n_faces,
+                    'scene_cuts': len(perc.scene_cuts),
+                    'transcript_segments': n_segs,
+                    'is_live_action': getattr(perc, 'is_live_action', None),
+                    'detected_language': lang,
+                    'saliency_source_counts': dict(
+                        getattr(perc, 'saliency_source_counts', {}) or {}),
+                } if perc else {}
+                write_reframe_debug_bundle(
+                    os.path.join(os.path.dirname(_tp), 'reframe_debug.json'),
+                    self.plan,
+                    perception_summary=_perc_summary,
+                    tracer_counts=dict(getattr(self.tracer, 'counts', {}) or {}),
+                    total_elapsed=total_elapsed)
+        except Exception as _dbg_e:
+            self.log.log_stage('ENGINE', f'reframe debug bundle skipped: {_dbg_e}')
+
         # Final tracer summary + close. Done in a try/finally so even a
         # raise on the way out flushes the trace to disk for diagnosis.
         self.tracer.close(summary={

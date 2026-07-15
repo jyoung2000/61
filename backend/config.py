@@ -599,6 +599,15 @@ class Settings(BaseSettings):
     # frame, so framing density is unchanged; subjects don't teleport in one
     # ~0.8s sample. 2 ≈ halves the YOLO cost; 1 restores every-frame detection.
     REFRAMER_YOLO_STRIDE: int = 2
+    # ── Reframe debug bundle ─────────────────────────────────────────────────
+    # Write a machine-readable reframe_debug.json next to the JSONL trace at the
+    # end of ReframeEngine.analyze(): per-scene measured signals + derived params
+    # + chosen strategy + human-readable flags, the crop-x keyframe trajectory,
+    # a perception summary, tracer event counts, and a decision summary (strategy
+    # histogram, keyframe jitter, no-subject/fallback scenes). Serialize-only +
+    # fail-soft — makes a bad reframe diagnosable without a re-run. Cheap; on by
+    # default. Only writes when a trace path exists for the job.
+    REFRAMER_DEBUG_JSON: bool = True
     # On a STATIC frame with no face, no person, AND no motion (a title card /
     # logo / credits), spectral saliency latches onto the highest-contrast EDGE
     # (e.g. a centered logo's wing-tip) and mis-frames the crop off to the side.
