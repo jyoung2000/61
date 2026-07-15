@@ -794,12 +794,17 @@ async def provider_status():
     # fetched above so the banner/chips show the model that will actually run.
     if settings.resolve_ai_source("editorial") == "local":
         try:
-            from backend.services.local_models import rank_local_editorial_models
+            from backend.services.local_models import select_local_editorial_models
             _ollama_models = (statuses.get("ollama", {}) or {}).get("models_loaded", []) or []
-            _ranked = rank_local_editorial_models(_ollama_models)
-            if _ranked:
-                active_editorial_model = _ranked[0]
-                active_summary_model = _ranked[0]
+            # Use the SAME selector the pipeline uses so the banner matches what
+            # actually runs: it honors an explicit OLLAMA_EDITORIAL_MODEL pick over
+            # the small-GPU param cap (the cap reads the LOCAL card, but editorial
+            # can run on a paired Companion GPU). Falls back to the ranker's top.
+            _picked = await select_local_editorial_models(
+                limit=1, model_names=_ollama_models)
+            if _picked:
+                active_editorial_model = _picked[0]
+                active_summary_model = _picked[0]
         except Exception:
             pass
     # Offline Mode (or a per-engine "local" override) routes clip detection to

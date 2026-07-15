@@ -29,9 +29,19 @@ log(){ local t=$(( $(date +%s) - START )); printf '\n[all] %02d:%02d %s\n' $((t/
 
 if docker compose version >/dev/null 2>&1; then DC="docker compose"; else DC="docker-compose"; fi
 export DOCKER_BUILDKIT=1 COMPOSE_DOCKER_CLI_BUILD=1
+# Clean-rebuild escape hatch: CLIPAI_NOCACHE=1 forces --no-cache so a suspected
+# stale layer can never serve old code (slower). BuildKit already invalidates
+# layers on any changed file, so this is only for paranoia / a reported mismatch.
+NOCACHE=""; [ "${CLIPAI_NOCACHE:-0}" = "1" ] && NOCACHE="--no-cache"
 
 log "pulling latest ($BRANCH)…"
-git fetch origin "$BRANCH"            || { log "git fetch FAILED"; exit 1; }
+# Retry the fetch — a transient network blip must not leave you on old code.
+_fetched=""
+for _i in 1 2 3 4; do
+  if git fetch origin "$BRANCH"; then _fetched=1; break; fi
+  log "git fetch failed (attempt $_i) — retrying in $((2 ** _i))s"; sleep $((2 ** _i))
+done
+[ -z "$_fetched" ] && { log "git fetch FAILED after 4 tries — check the network"; exit 1; }
 git reset --hard "origin/$BRANCH"     || { log "git reset FAILED"; exit 1; }
 export BUILD_SHA="$(git rev-parse --short HEAD)"
 export BUILD_SUBJECT="$(git log -1 --pretty=%s)"
@@ -39,7 +49,7 @@ EXPECTED="$(grep -m1 '^version' companion/src-tauri/Cargo.toml | sed -E 's/.*"([
 log "commit $BUILD_SHA — building container + Companion v$EXPECTED (from source; needs internet)"
 
 ( while :; do sleep 60; log "…still building ($(( ($(date +%s)-START)/60 ))m elapsed)"; done ) & HB=$!
-if ! $DC build --progress=plain --build-arg COMPANION_BUILD_FROM_SOURCE=1 app; then
+if ! $DC build $NOCACHE --build-arg COMPANION_BUILD_FROM_SOURCE=1 app; then
   kill "$HB" 2>/dev/null || true
   log "BUILD FAILED — error is above (the Companion cross-build needs outbound internet)"
   exit 1
@@ -57,8 +67,27 @@ for _ in $(seq 1 45); do
 done
 [ -z "$up" ] && { log "app never came up — check: docker logs clipai-app"; exit 1; }
 
-log "container is up — confirming the new build shipped:"
-docker logs --tail 300 clipai-app 2>&1 | grep -m1 'ClipAI build:' || log "(build banner not in logs yet)"
+log "verifying the running container is the commit we just pulled…"
+# The banner ("ClipAI build: <sha>") can lag a few seconds after start, and the
+# baked /app/BUILD_INFO is authoritative regardless — check both, with a short
+# wait. This is the proof-of-freshness that stops a silent stale run.
+RUN_SHA=""
+for _ in $(seq 1 15); do
+  RUN_SHA="$(docker exec clipai-app sh -c 'head -1 /app/BUILD_INFO 2>/dev/null' 2>/dev/null | tr -d '[:space:]')"
+  [ -z "$RUN_SHA" ] && RUN_SHA="$(docker logs --tail 400 clipai-app 2>&1 \
+      | grep -m1 'ClipAI build:' | sed -E 's/.*ClipAI build:[[:space:]]*([0-9a-f]+).*/\1/')"
+  [ -n "$RUN_SHA" ] && break
+  sleep 2
+done
+if [ -n "$RUN_SHA" ] && [ "${RUN_SHA:0:7}" = "${BUILD_SHA:0:7}" ]; then
+  log "UP TO DATE ✓ — container is running $BUILD_SHA (latest on $BRANCH)"
+elif [ -n "$RUN_SHA" ]; then
+  log "MISMATCH ✗ — container reports '$RUN_SHA' but latest is '$BUILD_SHA'."
+  log "    A cached layer may have served stale code. Force a clean rebuild:"
+  log "    CLIPAI_NOCACHE=1 bash update-all.sh"
+else
+  log "(could not read the container build id yet — check: docker exec clipai-app cat /app/BUILD_INFO)"
+fi
 
 log "publishing the fresh Companion installer…"
 mkdir -p ./data/companion-cache

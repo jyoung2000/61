@@ -89,6 +89,23 @@ def test_auto_editorial_still_capped_without_explicit_pick(monkeypatch):
     assert "gemma3:12b-it-q4_K_M" not in got     # auto-select still respects the cap
 
 
+# ── Fix 1c: the ACTIVE-MODELS banner uses the pick-honoring selector ────────
+
+def test_active_models_display_uses_pick_honoring_selector():
+    """The provider_status banner must resolve editorial via
+    select_local_editorial_models (which honors an explicit OLLAMA_EDITORIAL_MODEL
+    over the local-card cap), NOT the raw rank_local_editorial_models — otherwise
+    the banner shows a 3B/4B while the pipeline actually runs the picked 12B
+    (the "still doesnt show gemma 3" symptom)."""
+    import inspect
+    import backend.routers.settings as S
+    src = inspect.getsource(S.provider_status)
+    # The editorial-display block resolves through the pick-honoring selector…
+    assert "select_local_editorial_models" in src
+    # …and does NOT reach for the raw ranker there (which ignores the pick).
+    assert "rank_local_editorial_models" not in src
+
+
 # ── Fix 2: Companion installer endpoints are public (Update button 401) ─────
 
 def test_companion_installer_reads_are_public():
