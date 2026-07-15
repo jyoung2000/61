@@ -80,10 +80,14 @@ _MORA_WORD = re.compile(
     re.IGNORECASE,
 )
 # Short romaji tokens that are ALSO ordinary English words — never count these as
-# Japanese evidence on their own (keeps English lines from being flagged).
+# Japanese evidence on their own (keeps English lines from being flagged). The
+# second row are common mora-compatible English words that were flagging plainly
+# English cues ("Are you alright?" → are+you read as romaji ≥0.6 → a needless
+# re-translate). They are near-useless as Japanese evidence in isolation.
 _ROMAJI_AMBIG = {
     "a", "i", "o", "no", "to", "na", "ka", "me", "he", "we", "so", "re",
     "in", "on", "an", "at", "it", "is", "be", "as", "or", "up", "us",
+    "are", "you", "man", "one", "some", "same", "name", "here", "see", "made",
 }
 _JA_SOURCE = {"ja", "jpn", "japanese", "ja-jp"}
 
@@ -104,8 +108,19 @@ def _romaji_token_stats(toks: list) -> float:
     if len(toks) < 3:
         return 0.0
     jp = 0
-    for t in toks:
+    for idx, t in enumerate(toks):
         if t.lower() in _ROMAJI_AMBIG:
+            continue
+        # A capitalized MID-sentence token is a RETAINED PROPER NOUN — a character
+        # name the translation deliberately keeps ("Ririna", "Hiirō", "Zex") or an
+        # honorific glued to one ("Ririna-sama" tokenises to Ririna + sama). Those
+        # mora-match but are NOT untranslated Japanese; counting them flagged fully
+        # English name-bearing cues ("you should ask Ririna-sama") and burned
+        # re-translation passes on them. The FIRST token is exempt: a leading
+        # capital is just sentence case, so a genuinely romaji opener ("Nani de
+        # koko soko?") is still counted. Real untranslated romaji is lowercase
+        # phonetic mid-line ("yamete kudasai"), so this only sheds name noise.
+        if idx != 0 and t[:1].isupper():
             continue
         if len(t) >= 3 and _MORA_WORD.match(t):
             jp += 1

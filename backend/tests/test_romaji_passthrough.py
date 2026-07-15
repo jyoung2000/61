@@ -76,6 +76,33 @@ def test_cjk_still_flagged_any_source():
     assert _is_untranslated("これはテストです", "ja")
 
 
+# ── Regression: fully-English cues that KEEP a romaji name/honorific ─────────
+# The run-36 log flagged these plainly-English lines as "still source-language"
+# (the mora test read "are"/"you"/"Ririna"/"sama" as romaji), firing 3 wasteful
+# 12B re-translation passes and a scary "could not be converted" warning. A
+# retained proper noun / honorific is not untranslated Japanese.
+NAME_BEARING_ENGLISH = [
+    "Are you alright?",
+    "Are you soldiers?",
+    "you should ask Ririna-sama.",
+    "Nice to meet you, Hiirō-kun.",
+    "Ririna-sama, here it is.",
+    "Nice shot, Lieutenant Zex!",
+]
+
+
+def test_name_bearing_english_not_flagged_for_ja_source():
+    for line in NAME_BEARING_ENGLISH:
+        assert not _is_untranslated(line, "ja"), line
+
+
+def test_genuine_romaji_still_flagged_after_name_fix():
+    # The fix must not blunt real detection: lowercase phonetic Japanese stays
+    # flagged even though it may open with a Capitalized first word.
+    for line in ROMAJI:
+        assert _is_untranslated(line, "ja"), line
+
+
 def test_fraction_untranslated_counts_romaji_for_ja_source():
     segs = [{"text": t} for t in (ROMAJI[:2] + ENGLISH[:2])]  # 2 romaji, 2 english
     # Japanese source → romaji counted → 50%.
