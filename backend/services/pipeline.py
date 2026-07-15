@@ -695,6 +695,24 @@ def _resolve_polish_model_override(orchestrator) -> Optional[str]:
     return _resolve_translation_model_override(orchestrator)
 
 
+def _llm_translation_model_is_large(orchestrator) -> bool:
+    """True when the configured LLM translation model is a LARGE model (>=
+    TRANSLATION_LARGE_MODEL_MIN_PARAMS_B, e.g. gemma3:12b). A large model's raw
+    translation is already professional MTPE-grade output, so the redundant —
+    and slow — post-edit over it can be skipped. Fail-soft: returns False (keep
+    the post-edit) on any resolution error."""
+    try:
+        model = _resolve_translation_model_override(orchestrator) or ""
+        if not model:
+            return False
+        from backend.services.local_models import _parse_params_b
+        params = _parse_params_b(model)
+        return params is not None and params >= float(
+            getattr(settings, "TRANSLATION_LARGE_MODEL_MIN_PARAMS_B", 10.0))
+    except Exception:
+        return False
+
+
 def recheck_translated_readability(segments):
     """Post-translation CPS / line-length re-check.
 
@@ -3177,6 +3195,22 @@ async def _background_post_processing(
                 logger.info("[%s] AI post-edit skipped — the LLM produced the "
                             "translation directly (TRANSLATION_POLISH_LLM_OUTPUT "
                             "off)", job_id)
+            elif _used_llm and _llm_translation_model_is_large(orchestrator) \
+                    and bool(getattr(settings, "TRANSLATION_SKIP_POSTEDIT_LARGE_MODEL", True)):
+                # A LARGE model (12B+) translated the subtitles directly — its
+                # output is already professional MTPE-grade prose (the measured
+                # Gundam run: coherent, meaning-accurate English). A SECOND
+                # large-model pass over it is redundant AND the single biggest
+                # time sink: on the paired 4070 (9.5 GB budget) that pass spilled
+                # to CPU and hit "all providers failed", burning ~13 min to polish
+                # only 38/277 cues. Skip it — the deterministic nets (casing,
+                # de-salad, glossary) already ran inside translate_via_llm. A
+                # SMALL-model (4B) translation still gets the post-edit below,
+                # where it genuinely fixes typos / word-salad.
+                logger.info(
+                    "[%s] AI post-edit skipped — a large model translated "
+                    "directly; its output is already polished (skips a redundant "
+                    "12B pass, ~13 min on the measured run)", job_id)
             elif _used_llm:
                 # The 4B local translator's raw output IS the track viewers
                 # read, and it ships typos ("bigdest", "Pantss") and word-salad

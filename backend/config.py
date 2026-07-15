@@ -1078,6 +1078,15 @@ class Settings(BaseSettings):
     # final"), which shipped the 4B translator's raw typos and word-salad
     # untouched — the source polish never touches the English viewers read.
     TRANSLATION_POLISH_LLM_OUTPUT: bool = True
+    # …but a LARGE translation model (12B+) already produces professional MTPE
+    # output, so a second large-model pass over it is redundant AND the single
+    # biggest time sink (the measured 12B post-edit spilled to CPU, hit "all
+    # providers failed", and burned ~13 min to polish 38/277 cues). When True,
+    # skip the post-edit for a large-model LLM translation (a small-model 4B
+    # translation still gets it, where it fixes real typos/word-salad). The
+    # deterministic casing/de-salad/glossary nets already run inside
+    # translate_via_llm, so the shipped track stays clean.
+    TRANSLATION_SKIP_POSTEDIT_LARGE_MODEL: bool = True
     TRANSCRIPT_FILLER_REMOVAL: bool = False     # remove um, uh, like, you know
     TRANSCRIPT_SENTENCE_REPAIR: bool = True     # fix run-on/fragmented sentences
     # Default ON: tells the polisher to keep every spoken word and only
@@ -1320,7 +1329,17 @@ class Settings(BaseSettings):
     # no head-truncation. Small models are unaffected (identical old behaviour).
     TRANSLATION_LARGE_MODEL_MIN_PARAMS_B: float = 10.0
     TRANSLATION_LLM_BATCH_LARGE: int = 20        # 918 cues → ~46 batches, not 115
-    TRANSLATION_LARGE_NUM_CTX: int = 8192        # room for a 20-line batch + output
+    # num_ctx for the large-model path. MUST leave the KV cache fitting inside the
+    # Companion's VRAM budget or Ollama spills layers to CPU and the whole 12B
+    # crawls. The measured Gundam run: a 12B q4 (~7.2 GB) + an 8192-ctx fp16 KV
+    # (~2 GB) exceeded the paired 4070's 9.5 GB budget → CPU spill → 60-90 s/batch
+    # translation AND "all providers failed" polish timeouts. A 20-line batch +
+    # glossary + context is ~1.3k tokens, so 4096 is ample headroom while halving
+    # the KV so the 12B stays fully GPU-resident (~15-20 s/batch). The prompt-
+    # aware raise still bumps ctx for an unusually long batch. (If the Companion's
+    # Ollama runs flash-attention + q8 KV, or its VRAM budget is raised, 8192 is
+    # fine again — but 4096 is the safe default for an unmanaged Ollama.)
+    TRANSLATION_LARGE_NUM_CTX: int = 4096
     TRANSLATION_LARGE_CONCURRENCY: int = 1       # one KV slot; don't fan out a 12B
     # Per-line output failsafes for the LLM translator (deterministic, checked
     # against the source line). A translation longer than

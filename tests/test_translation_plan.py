@@ -21,7 +21,7 @@ def test_small_model_unchanged():
 def test_large_model_gets_big_batch_single_slot():
     p = translation_plan("gemma3:12b-it-q4_K_M", 918, is_ollama=True, companion_parallel=3)
     assert p["batch"] == 20          # 918 → ~46 batches, not 115
-    assert p["num_ctx"] == 8192      # room for a 20-line batch + output
+    assert p["num_ctx"] == 4096      # fits a 12B's KV in the Companion budget (was 8192 → CPU spill)
     assert p["concurrency"] == 1     # a 12B serves one slot — don't fan out
 
 
