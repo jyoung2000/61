@@ -19,6 +19,7 @@ from dataclasses import dataclass, field, asdict
 from typing import List, Optional, Tuple, Callable, Dict
 from pathlib import Path
 
+from backend.config import settings
 from backend.services.reframer_models import (
     ReframeLogger, get_logger, reset_logger, RenderPlan,
     interpolate_x, clamp_x, _face_overlaps_person,
@@ -258,13 +259,21 @@ class Smoother:
                 i += 1
                 continue
 
-            # Collect run of same-direction eased moves within 2.5s —
+            # Collect run of same-direction eased moves within the window —
             # stop at any centering-tagged keyframe so it stays in place.
+            # 2.5s (configurable) — the code shipped at 1.5s while its own
+            # comment documented 2.5s, and the measured path still stuttered
+            # (jerk 4693, stability 74 on the 24-min eval): three same-direction
+            # steps 1.6-2.4s apart survived as separate mini-pans. The wider
+            # window folds those into one cinematic move; centering keyframes
+            # still break the run so face-coverage nudges stay in place.
+            _consol_window_s = float(getattr(
+                settings, "REFRAMER_PAN_CONSOLIDATE_WINDOW_S", 2.5))
             run_end = i
             for j in range(i + 1, len(merged)):
                 nxt = merged[j]
                 dt_total = (nxt['time_ms'] - prev['time_ms']) / 1000.0
-                if dt_total > 1.5:
+                if dt_total > _consol_window_s:
                     break
                 if nxt.get('transition') != 'ease_in_out':
                     break
@@ -333,7 +342,14 @@ class Smoother:
         # without re-introducing the original jitter problem. Centering-
         # tagged keyframes are skipped unconditionally so the eval's
         # middle-third check still passes on faces near the edge.
-        drift_threshold = max(10, int(plan.crop_w * 0.05))
+        # 8% of crop width with a 15px floor — the values this comment block
+        # documents (the code shipped at 0.05/10px, so ~5-8% wobble survived
+        # and read as jitter: stability 74, hold_ratio 80.8% on the 24-min
+        # eval). Centering-tagged keyframes bypass this pass entirely, so the
+        # face-coverage machinery is untouched. Configurable for tuning
+        # against reframe_debug.json without a rebuild.
+        _drift_pct = float(getattr(settings, "REFRAMER_DRIFT_SUPPRESS_PCT", 0.08))
+        drift_threshold = max(15, int(plan.crop_w * _drift_pct))
         stabilized = [consolidated[0]]
         drift_suppressed = 0
         for i in range(1, len(consolidated)):

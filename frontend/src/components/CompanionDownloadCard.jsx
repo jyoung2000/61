@@ -169,6 +169,11 @@ export default function CompanionDownloadCard({ isMobile = false }) {
       if (data.status === 'started') {
         showToast(`Fetching Companion installers (v${data.target_version || '?'})…`, 'success');
         setTimeout(load, 5000);
+      } else if (data.status === 'local') {
+        // From-source setup: the meaningful check is served-vs-paired-Companion,
+        // not GitHub. "Update available" is good news, not an error.
+        showToast(data.message,
+          data.companion?.update_available ? 'success' : 'info');
       } else {
         showToast(data.message || 'No installers to fetch yet', 'error');
       }

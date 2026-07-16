@@ -350,29 +350,122 @@ def _refresh_worker(github: dict):
         _refresh_state["active"] = False
 
 
+async def _probe_paired_companion() -> dict:
+    """Best-effort: the paired GPU Companion's running version (and build id,
+    when its build is new enough to report one) from ``/v1/health``. Never
+    raises — {'paired': False} when there is no companion or it's unreachable."""
+    try:
+        from backend.services import ollama_registry as reg
+        comp = reg.companion_host()
+        if comp is None:
+            return {"paired": False}
+        base = reg.companion_base(comp)
+        if not base:
+            return {"paired": False}
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get(f"{base}/v1/health",
+                                 headers=dict(reg.auth_headers(comp) or {}))
+        if r.status_code != 200:
+            return {"paired": True, "reachable": False, "url": base}
+        data = r.json() or {}
+        if data.get("service") != "clipai-gpu-companion":
+            return {"paired": True, "reachable": False, "url": base}
+        return {
+            "paired": True,
+            "reachable": True,
+            "url": base,
+            "version": (data.get("version") or "").strip(),
+            "build": (data.get("build") or "").strip(),
+        }
+    except Exception as e:
+        logger.debug("companion probe for refresh failed: %s", e)
+        return {"paired": False}
+
+
+def _companion_update_available(remote: dict, served_version: str,
+                                served_build: str) -> bool:
+    """Same decision the Companion's own Update button makes (proxy.rs
+    should_update): a strictly-newer served semver updates; a lower one never
+    does; at an equal semver a DIFFERENT non-empty build id updates too."""
+    from backend.services.companion_version import parse_version
+    if not remote.get("reachable"):
+        return False
+    run_v = parse_version(remote.get("version"))
+    srv_v = parse_version(served_version)
+    if run_v < srv_v:
+        return True
+    if srv_v < run_v:
+        return False
+    run_b = (remote.get("build") or "").strip().lower()
+    srv_b = (served_build or "").strip().lower()
+    return bool(srv_b and srv_b not in ("unknown", "source")
+                and run_b and run_b != srv_b)
+
+
 @router.post("/companion/refresh")
 async def companion_refresh():
-    """Admin action: pull the newest release installers into the persistent
-    cache (``/config/companion-cache``) so an existing container serves new
-    Companion versions without an image rebuild."""
+    """Admin "Check for updates": (1) compare the PAIRED Companion's running
+    version/build against what this server serves — that's the update that
+    actually matters on a from-source setup; (2) when GitHub has a newer
+    companion-v* release, pull it into the persistent cache. A from-source
+    install with no GitHub releases is NORMAL, not an error."""
     if _refresh_state["active"]:
         return {"status": "already_running", **_refresh_state}
     github = await _github_latest_manifest(force=True)
-    if not github or not github.get("platforms"):
-        return {"status": "error",
-                "message": "No companion-v* release found on GitHub "
-                           f"({GITHUB_REPO}) — nothing to fetch. The "
-                           "companion-release workflow builds it: check the "
-                           "repo's Actions tab — if runs fail instantly "
-                           "before any step executes, GitHub is refusing to "
-                           "start hosted runners for the account (billing / "
-                           "spending limit / Actions permissions) and needs "
-                           "fixing there first. Offline alternative: rebuild "
-                           "the container with --build-arg "
-                           "COMPANION_BUILD_FROM_SOURCE=1 to bake the Windows "
-                           "installer locally; this card then serves it "
-                           "without GitHub."}
-    _refresh_state.update({"active": True, "message": "starting…", "updated": False})
-    threading.Thread(target=_refresh_worker, args=(github,),
-                     daemon=True, name="companion-cache-refresh").start()
-    return {"status": "started", "target_version": github.get("version", "")}
+    local = _merged_view(github)
+    served_version = local.get("version", "")
+    served_build = local.get("build_id", "")
+    has_local = any((v or {}).get("source") in ("cached", "baked")
+                    for v in (local.get("platforms") or {}).values())
+    remote = await _probe_paired_companion()
+    update_available = _companion_update_available(
+        remote, served_version, served_build)
+    companion_info = {**remote, "update_available": update_available}
+
+    if github and github.get("platforms"):
+        _refresh_state.update({"active": True, "message": "starting…",
+                               "updated": False})
+        threading.Thread(target=_refresh_worker, args=(github,),
+                         daemon=True, name="companion-cache-refresh").start()
+        return {"status": "started",
+                "target_version": github.get("version", ""),
+                "companion": companion_info}
+
+    if has_local:
+        srv = f"v{served_version}" + (f" (build {served_build})" if served_build else "")
+        if update_available:
+            msg = (f"Update available — the paired Companion at "
+                   f"{remote.get('url', '?')} is running "
+                   f"v{remote.get('version') or '?'} and this server hosts "
+                   f"{srv}. On the GPU PC, open the Companion app and click "
+                   f"Update (it downloads from this server over the LAN).")
+        elif remote.get("reachable"):
+            msg = (f"Paired Companion is up to date — it runs "
+                   f"v{remote.get('version') or '?'} and this server hosts "
+                   f"{srv}. New builds appear here after the container "
+                   f"updates (bash update-all.sh).")
+        else:
+            msg = (f"This server hosts Companion {srv} (built from source). "
+                   f"No paired Companion answered the version probe — open "
+                   f"the Companion app on the GPU PC and use its Update "
+                   f"button, or check pairing. (GitHub has no companion-v* "
+                   f"release — normal for from-source builds.)")
+        return {"status": "local", "message": msg,
+                "served_version": served_version,
+                "served_build": served_build,
+                "companion": companion_info}
+
+    return {"status": "error",
+            "message": "No companion-v* release found on GitHub "
+                       f"({GITHUB_REPO}) — nothing to fetch. The "
+                       "companion-release workflow builds it: check the "
+                       "repo's Actions tab — if runs fail instantly "
+                       "before any step executes, GitHub is refusing to "
+                       "start hosted runners for the account (billing / "
+                       "spending limit / Actions permissions) and needs "
+                       "fixing there first. Offline alternative: rebuild "
+                       "the container with --build-arg "
+                       "COMPANION_BUILD_FROM_SOURCE=1 to bake the Windows "
+                       "installer locally; this card then serves it "
+                       "without GitHub.",
+            "companion": companion_info}

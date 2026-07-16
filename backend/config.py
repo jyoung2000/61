@@ -608,6 +608,15 @@ class Settings(BaseSettings):
     # fail-soft — makes a bad reframe diagnosable without a re-run. Cheap; on by
     # default. Only writes when a trace path exists for the job.
     REFRAMER_DEBUG_JSON: bool = True
+    # Smoother anti-jitter tuning (measured against ReframeReport stability /
+    # jerk / hold_ratio; adjust with reframe_debug.json in hand, no rebuild).
+    # Drift suppression: eased moves smaller than this fraction of crop width
+    # (15px floor) are dropped — sub-threshold wobble reads as jitter, never as
+    # intentional re-framing. Centering-tagged keyframes are always exempt.
+    REFRAMER_DRIFT_SUPPRESS_PCT: float = 0.08
+    # Pan consolidation: same-direction eased steps within this window collapse
+    # into ONE cinematic pan (stuttery 3-step pans were surviving at 1.5s).
+    REFRAMER_PAN_CONSOLIDATE_WINDOW_S: float = 2.5
     # On a STATIC frame with no face, no person, AND no motion (a title card /
     # logo / credits), spectral saliency latches onto the highest-contrast EDGE
     # (e.g. a centered logo's wing-tip) and mis-frames the crop off to the side.

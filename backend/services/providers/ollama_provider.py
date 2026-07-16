@@ -963,8 +963,12 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
             # needless downgrades to a smaller quant (a quality regression).
             if not _oreg.is_local_gpu_host(self._host):
                 await self._detect_vram()
+                # Remote card size unknown (health probe missed) → 0 skips the
+                # fit check below entirely. Falling back to the LOCAL card here
+                # judged a 12GB Companion by this server's 3.6GB 1650 and logged
+                # a false "won't fit, will spill to CPU" warning mid-run.
                 total_vram = (self._available_vram_mb / 1024.0
-                              if self._available_vram_mb > 0 else _total_vram_gb())
+                              if self._available_vram_mb > 0 else 0.0)
             else:
                 total_vram = _total_vram_gb()
             if total_vram > 0:

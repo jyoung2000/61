@@ -195,6 +195,86 @@ def test_refresh_verifies_sha256(dirs, monkeypatch):
     assert "failed" in D._refresh_state["message"]
 
 
+# ── "Check for updates" on a from-source setup (no GitHub releases) ─────────
+# The button used to be GitHub-only, so a from-source install always errored
+# ("No companion-v* release found") even when this server HOSTED a newer build
+# and the paired Companion was out of date — the one comparison that matters.
+
+def _paired(version="0.2.3", build="", reachable=True):
+    async def probe():
+        if not reachable:
+            return {"paired": True, "reachable": False, "url": "http://gpu:11500"}
+        return {"paired": True, "reachable": True, "url": "http://gpu:11500",
+                "version": version, "build": build}
+    return probe
+
+
+def test_refresh_local_reports_update_available(dirs, no_github, monkeypatch):
+    _baked, cache = dirs
+    m = _write_release(cache, "0.2.4", {"windows": "Companion_0.2.4.exe"})
+    m["build_id"] = "abc1234"
+    (cache / "manifest.json").write_text(json.dumps(m))
+    monkeypatch.setattr(D, "_probe_paired_companion", _paired("0.2.3"))
+    out = asyncio.run(D.companion_refresh())
+    assert out["status"] == "local"
+    assert out["companion"]["update_available"] is True
+    assert "Update available" in out["message"]
+    assert "0.2.3" in out["message"] and "0.2.4" in out["message"]
+
+
+def test_refresh_local_same_version_new_build_flags_update(dirs, no_github, monkeypatch):
+    """A from-source rebuild reuses the semver — a different build id must
+    still count as an update (same rule as the Companion's own button)."""
+    _baked, cache = dirs
+    m = _write_release(cache, "0.2.4", {"windows": "Companion_0.2.4.exe"})
+    m["build_id"] = "new5678"
+    (cache / "manifest.json").write_text(json.dumps(m))
+    monkeypatch.setattr(D, "_probe_paired_companion",
+                        _paired("0.2.4", build="old1234"))
+    out = asyncio.run(D.companion_refresh())
+    assert out["status"] == "local"
+    assert out["companion"]["update_available"] is True
+
+
+def test_refresh_local_up_to_date(dirs, no_github, monkeypatch):
+    _baked, cache = dirs
+    m = _write_release(cache, "0.2.4", {"windows": "Companion_0.2.4.exe"})
+    m["build_id"] = "abc1234"
+    (cache / "manifest.json").write_text(json.dumps(m))
+    monkeypatch.setattr(D, "_probe_paired_companion",
+                        _paired("0.2.4", build="abc1234"))
+    out = asyncio.run(D.companion_refresh())
+    assert out["status"] == "local"
+    assert out["companion"]["update_available"] is False
+    assert "up to date" in out["message"]
+
+
+def test_refresh_local_companion_unreachable(dirs, no_github, monkeypatch):
+    _baked, cache = dirs
+    _write_release(cache, "0.2.4", {"windows": "Companion_0.2.4.exe"})
+    monkeypatch.setattr(D, "_probe_paired_companion", _paired(reachable=False))
+    out = asyncio.run(D.companion_refresh())
+    assert out["status"] == "local"     # informative, NOT an error
+    assert out["companion"]["update_available"] is False
+
+
+def test_refresh_error_only_when_nothing_anywhere(dirs, no_github, monkeypatch):
+    async def _none():
+        return {"paired": False}
+    monkeypatch.setattr(D, "_probe_paired_companion", _none)
+    out = asyncio.run(D.companion_refresh())
+    assert out["status"] == "error"     # no GitHub AND no local installer
+
+
+def test_refresh_never_downgrades(dirs, no_github, monkeypatch):
+    """Paired Companion runs NEWER than the served installer → no update."""
+    _baked, cache = dirs
+    _write_release(cache, "0.2.4", {"windows": "Companion_0.2.4.exe"})
+    monkeypatch.setattr(D, "_probe_paired_companion", _paired("0.3.0"))
+    out = asyncio.run(D.companion_refresh())
+    assert out["companion"]["update_available"] is False
+
+
 def test_newer_installer_wins_beside_a_stale_one(dirs, no_github):
     """The observed field failure: docker-cp publishes the fresh installer
     NEXT TO the old one in the cache dir, and the alphabetical first-pick

@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 from typing import Optional
 
 import httpx
@@ -750,13 +751,21 @@ async def translate_via_llm(
             # first batch also pays the model load. Generous + configurable.
             _per_seg = float(getattr(settings, "TRANSLATION_LLM_SECONDS_PER_SEGMENT", 12.0))
             _floor = float(getattr(settings, "TRANSLATION_LLM_TIMEOUT_FLOOR", 180.0))
+            _t0 = time.monotonic()
             resp = await orchestrator.text_completion(
                 prompt, timeout=max(_floor, len(batch) * _per_seg), job_id=job_id,
                 model_override=model_override)
         except Exception as e:
             logger.warning("LLM translate: call failed (%s)", e)
             return None
-        return _parse_json_array(resp, expected=len(batch))
+        parsed = _parse_json_array(resp, expected=len(batch))
+        # Per-batch wall time makes the dominant XLATE cost measurable from the
+        # log alone (e.g. "batches are 85s ⇒ the Companion Ollama runs without
+        # flash-attn" vs "batch 0 alone was slow ⇒ cold load + lyric retry").
+        logger.info("LLM translate: batch of %d lines in %.1fs (%s)",
+                    len(batch), time.monotonic() - _t0,
+                    "ok" if parsed is not None else "parse-miss")
+        return parsed
 
     async def _translate_batch(batch) -> list[str]:
         out = await _call(batch)

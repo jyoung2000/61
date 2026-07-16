@@ -1093,6 +1093,9 @@ async fn health(
     let body = serde_json::json!({
         "service": "clipai-gpu-companion",
         "version": env!("CARGO_PKG_VERSION"),
+        // Build identity (git SHA) — lets ClipAI's "Check for updates" tell a
+        // same-version from-source rebuild apart from the running install.
+        "build": env!("CLIPAI_BUILD_ID"),
         "update_available": update_available,
         "expected_version": expected,
         "gpu_name": gpu.gpu_name,
