@@ -275,6 +275,127 @@ def test_refresh_never_downgrades(dirs, no_github, monkeypatch):
     assert out["companion"]["update_available"] is False
 
 
+# ── Remote push-update: trigger + progress from the container UI ────────────
+
+class _FakeResp:
+    def __init__(self, code, body=None):
+        self.status_code = code
+        self._body = body or {}
+
+    def json(self):
+        return self._body
+
+
+class _FakeClient:
+    """Stands in for httpx.AsyncClient; maps URL suffix → response/exception."""
+
+    def __init__(self, routes):
+        self._routes = routes
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def _dispatch(self, url):
+        for suffix, resp in self._routes.items():
+            if url.endswith(suffix):
+                if isinstance(resp, Exception):
+                    raise resp
+                return resp
+        raise AssertionError(f"unexpected URL {url}")
+
+    async def post(self, url, headers=None):
+        return await self._dispatch(url)
+
+    async def get(self, url, headers=None):
+        return await self._dispatch(url)
+
+
+@pytest.fixture
+def paired_reg(monkeypatch):
+    from backend.services import ollama_registry as reg
+
+    class _Comp:
+        pass
+    monkeypatch.setattr(reg, "companion_host", lambda: _Comp())
+    monkeypatch.setattr(reg, "companion_base", lambda c: "http://gpu:11500")
+    monkeypatch.setattr(reg, "auth_headers", lambda c: {"Authorization": "Bearer t"})
+
+
+def _fake_httpx(monkeypatch, routes):
+    monkeypatch.setattr(D.httpx, "AsyncClient",
+                        lambda timeout=None: _FakeClient(routes))
+
+
+def test_push_update_no_companion(monkeypatch):
+    from backend.services import ollama_registry as reg
+    monkeypatch.setattr(reg, "companion_host", lambda: None)
+    out = asyncio.run(D.companion_push_update())
+    assert out["status"] == "error"
+
+
+def test_push_update_started(paired_reg, monkeypatch):
+    _fake_httpx(monkeypatch, {"/v1/update/install": _FakeResp(200, {"started": True})})
+    out = asyncio.run(D.companion_push_update())
+    assert out["status"] == "started"
+
+
+def test_push_update_unsupported_on_old_build(paired_reg, monkeypatch):
+    """A pre-0.2.5 Companion has no /v1/update routes (404) — the response must
+    say the ONE manual update unlocks remote updates, not just error out."""
+    _fake_httpx(monkeypatch, {"/v1/update/install": _FakeResp(404)})
+    out = asyncio.run(D.companion_push_update())
+    assert out["status"] == "unsupported"
+    assert "0.2.5" in out["message"]
+
+
+def test_push_update_busy_mid_job(paired_reg, monkeypatch):
+    _fake_httpx(monkeypatch, {
+        "/v1/update/install": _FakeResp(409, {"error": "a job is running"})})
+    out = asyncio.run(D.companion_push_update())
+    assert out["status"] == "busy"
+
+
+def test_push_status_restarting_when_unreachable(dirs, paired_reg, monkeypatch):
+    """The offline window while the installer swaps files is 'restarting',
+    never an error — the UI keeps polling through it."""
+    _fake_httpx(monkeypatch, {
+        "/v1/update/status": ConnectionError("refused")})
+    out = asyncio.run(D.companion_push_update_status())
+    assert out["state"] == "restarting"
+
+
+def test_push_status_done_when_back_on_served_build(dirs, paired_reg, monkeypatch):
+    _baked, cache = dirs
+    m = _write_release(cache, "0.2.5", {"windows": "Companion_0.2.5.exe"})
+    m["build_id"] = "abc1234"
+    (cache / "manifest.json").write_text(json.dumps(m))
+    _fake_httpx(monkeypatch, {
+        "/v1/update/status": _FakeResp(200, {
+            "state": "idle", "app_version": "0.2.5", "app_build": "abc1234"})})
+    out = asyncio.run(D.companion_push_update_status())
+    assert out["state"] == "done"
+    assert out["up_to_date"] is True
+
+
+def test_push_status_downloading_passthrough(dirs, paired_reg, monkeypatch):
+    _baked, cache = dirs
+    m = _write_release(cache, "0.2.5", {"windows": "Companion_0.2.5.exe"})
+    m["build_id"] = "abc1234"
+    (cache / "manifest.json").write_text(json.dumps(m))
+    _fake_httpx(monkeypatch, {
+        "/v1/update/status": _FakeResp(200, {
+            "state": "downloading", "progress_pct": 42.0,
+            "downloaded_mb": 84.0, "total_mb": 200.0,
+            "app_version": "0.2.4", "app_build": "old1234"})})
+    out = asyncio.run(D.companion_push_update_status())
+    assert out["state"] == "downloading"
+    assert out["progress_pct"] == 42.0
+    assert out["up_to_date"] is False
+
+
 def test_newer_installer_wins_beside_a_stale_one(dirs, no_github):
     """The observed field failure: docker-cp publishes the fresh installer
     NEXT TO the old one in the cache dir, and the alphabetical first-pick

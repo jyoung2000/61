@@ -1005,6 +1005,69 @@ async fn logs_export(State(ctx): State<ProxyCtx>, headers: HeaderMap) -> Respons
         .into_response()
 }
 
+/// POST /v1/update/install → REMOTE self-update, triggered from ClipAI's web
+/// UI so the user never has to be at the GPU PC. Kicks off the same download →
+/// sha256-verify → install cycle as the app's own Update button, but with a
+/// SILENT (NSIS /S) install + automatic relaunch. Returns immediately; the
+/// caller polls /v1/update/status, and must treat the short offline window
+/// while the installer swaps files as "installing", not an error.
+async fn update_install(
+    State(ctx): State<ProxyCtx>,
+    peer: Option<axum::extract::ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+    // Learn/refresh the ClipAI origin so paired_base() resolves even on
+    // manually-paired setups (mirrors the health handler).
+    note_clipai_origin(&ctx.state, &headers, peer.map(|ci| ci.0));
+    // Refuse mid-job: killing the app under an active transcription/inference
+    // fails that job confusingly. The caller shows this and retries when idle.
+    if let Some(job) = ctx.state.current_job() {
+        return (
+            StatusCode::CONFLICT,
+            axum::Json(serde_json::json!({
+                "started": false,
+                "error": format!(
+                    "a job is running on this GPU ({}) — retry when it finishes",
+                    job.job_title),
+            })),
+        )
+            .into_response();
+    }
+    let state = ctx.state.clone();
+    tauri::async_runtime::spawn(async move {
+        match crate::perform_self_update(&state, true).await {
+            Ok(path) => {
+                log::info!(
+                    "remote self-update: installer launched ({path}) — exiting \
+                     so it can replace the app (relaunch is scripted)"
+                );
+                // Let the status endpoint serve "launching" briefly, then exit.
+                // process::exit skips the Tauri exit handler, but the Windows
+                // kill-on-close job object still reaps the managed Ollama /
+                // whisper children (remote update is Windows-only).
+                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                std::process::exit(0);
+            }
+            Err(e) => log::error!("remote self-update failed: {e}"),
+        }
+    });
+    axum::Json(serde_json::json!({"started": true})).into_response()
+}
+
+/// GET /v1/update/status → progress of a remote-triggered (or GUI) update.
+async fn update_status(
+    State(ctx): State<ProxyCtx>,
+    headers: HeaderMap,
+) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+    axum::Json(crate::update_status_json()).into_response()
+}
+
 /// /v1/health → status JSON for ClipAI's probes + the pairing handshake.
 async fn health(
     State(ctx): State<ProxyCtx>,
@@ -1140,6 +1203,8 @@ fn build_router(ctx: ProxyCtx) -> Router {
         .route("/v1/sidecar/warm", post(sidecar_warm))
         .route("/v1/vision/health", get(vision_health))
         .route("/v1/vision/detect", post(vision_detect))
+        .route("/v1/update/install", post(update_install))
+        .route("/v1/update/status", get(update_status))
         .route("/v1/gpu/release", post(gpu_release))
         .route("/v1/audio/transcriptions", post(whisper_proxy))
         .route("/ollama", any(ollama_proxy))

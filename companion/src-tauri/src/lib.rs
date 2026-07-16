@@ -857,12 +857,93 @@ async fn check_app_update(
     }))
 }
 
-#[tauri::command]
-async fn install_app_update(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, SharedState>,
+// ── Self-update core — shared by the GUI Update button and the REMOTE
+//    /v1/update/* proxy routes (so ClipAI's web UI can push the update
+//    without anyone at the GPU PC). Progress lives in a process-global so
+//    both the Tauri command and the proxy can report it. ──────────────────
+
+#[derive(Clone, Default)]
+pub(crate) struct UpdateStatus {
+    pub state: String,        // downloading | verifying | launching | failed
+    pub progress_pct: f64,    // download progress (0-100; -1 = size unknown)
+    pub downloaded_mb: f64,
+    pub total_mb: f64,
+    pub error: String,
+    pub started_ms: u64,
+}
+
+static UPDATE_STATUS: std::sync::Mutex<Option<UpdateStatus>> =
+    std::sync::Mutex::new(None);
+static UPDATE_RUNNING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn update_status_set(f: impl FnOnce(&mut UpdateStatus)) {
+    if let Ok(mut g) = UPDATE_STATUS.lock() {
+        let mut s = g.take().unwrap_or_default();
+        f(&mut s);
+        *g = Some(s);
+    }
+}
+
+pub(crate) fn update_status_json() -> serde_json::Value {
+    let snap = UPDATE_STATUS.lock().ok().and_then(|g| g.clone());
+    match snap {
+        None => serde_json::json!({"state": "idle", "running": false}),
+        Some(s) => serde_json::json!({
+            "state": s.state,
+            "running": UPDATE_RUNNING.load(std::sync::atomic::Ordering::Relaxed),
+            "progress_pct": s.progress_pct,
+            "downloaded_mb": s.downloaded_mb,
+            "total_mb": s.total_mb,
+            "error": s.error,
+            "started_ms": s.started_ms,
+            "app_version": env!("CARGO_PKG_VERSION"),
+            "app_build": env!("CLIPAI_BUILD_ID"),
+        }),
+    }
+}
+
+/// Download → verify → launch the installer. `silent` is the REMOTE path:
+/// the NSIS installer runs with /S and the app is relaunched afterwards, so
+/// the whole cycle needs nobody at the desktop (Windows only — a .dmg can't
+/// be installed unattended). Returns the installer path; the CALLER decides
+/// how to exit the app (GUI: AppHandle.exit; remote: process::exit after the
+/// HTTP response is flushed — on Windows the kill-on-close job object still
+/// reaps the managed Ollama/whisper children on a hard exit).
+pub(crate) async fn perform_self_update(
+    state: &SharedState, silent: bool,
 ) -> Result<String, String> {
-    let base = paired_base(&state.inner().clone())?;
+    if silent && UPDATE_PLATFORM != "windows" {
+        return Err("remote (unattended) update is Windows-only — a macOS .dmg \
+                    needs a user at the machine; use the Companion app's own \
+                    Update button".into());
+    }
+    if UPDATE_RUNNING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return Err("an update is already in progress".into());
+    }
+    let started = state::now_ms();
+    update_status_set(|s| {
+        *s = UpdateStatus {
+            state: "downloading".into(), progress_pct: 0.0,
+            downloaded_mb: 0.0, total_mb: 0.0, error: String::new(),
+            started_ms: started,
+        }
+    });
+    let res = perform_self_update_inner(state, silent).await;
+    match &res {
+        Ok(_) => update_status_set(|s| s.state = "launching".into()),
+        Err(e) => {
+            update_status_set(|s| { s.state = "failed".into(); s.error = e.clone(); });
+            UPDATE_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    res
+}
+
+async fn perform_self_update_inner(
+    state: &SharedState, silent: bool,
+) -> Result<String, String> {
+    let base = paired_base(state)?;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(600))
         .build()
@@ -875,8 +956,8 @@ async fn install_app_update(
     // back to the size-only gate (logged), rather than blocking the update.
     let expected_sha256 = fetch_installer_sha256(&client, &base).await;
     let url = format!("{base}/api/downloads/companion/{UPDATE_PLATFORM}");
-    log::info!("self-update: downloading installer from {url}");
-    let resp = client
+    log::info!("self-update: downloading installer from {url} (silent={silent})");
+    let mut resp = client
         .get(&url)
         .send()
         .await
@@ -903,10 +984,27 @@ async fn install_app_update(
         .map(|v| v.trim_matches(&['"', ' '][..]).to_string())
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| fallback.to_string());
-    let bytes = resp
-        .bytes()
+    // Stream the body so the progress bar (GUI + ClipAI's remote card) tracks
+    // the real download instead of jumping 0 → done.
+    let total = resp.content_length().unwrap_or(0);
+    let mut bytes: Vec<u8> = Vec::with_capacity(total as usize);
+    while let Some(chunk) = resp
+        .chunk()
         .await
-        .map_err(|e| format!("download interrupted: {e}"))?;
+        .map_err(|e| format!("download interrupted: {e}"))?
+    {
+        bytes.extend_from_slice(&chunk);
+        let done = bytes.len() as f64;
+        update_status_set(|s| {
+            s.downloaded_mb = done / (1024.0 * 1024.0);
+            s.total_mb = total as f64 / (1024.0 * 1024.0);
+            s.progress_pct = if total > 0 {
+                (done / total as f64 * 100.0).min(100.0)
+            } else {
+                -1.0
+            };
+        });
+    }
     if bytes.len() < 1_000_000 {
         // A real installer is tens of MB; a tiny body is an error page.
         return Err(format!(
@@ -914,6 +1012,7 @@ async fn install_app_update(
             bytes.len()
         ));
     }
+    update_status_set(|s| s.state = "verifying".into());
     // Integrity gate: the installer is about to be EXECUTED, so when the server
     // publishes a hash we refuse to run bytes that don't match it. This closes
     // the "corrupted download or on-path rewrite over the plaintext LAN hop
@@ -943,20 +1042,57 @@ async fn install_app_update(
         .await
         .map_err(|e| format!("could not save installer: {e}"))?;
     log::info!(
-        "self-update: launching installer {} ({} MB) and exiting so it can \
-         replace the app",
+        "self-update: launching installer {} ({} MB, silent={}) and exiting so \
+         it can replace the app",
         path.display(),
-        bytes.len() / (1024 * 1024)
+        bytes.len() / (1024 * 1024),
+        silent
     );
-    #[cfg(target_os = "macos")]
-    std::process::Command::new("open")
-        .arg(&path)
-        .spawn()
-        .map_err(|e| format!("could not open installer: {e}"))?;
-    #[cfg(not(target_os = "macos"))]
-    std::process::Command::new(&path)
-        .spawn()
-        .map_err(|e| format!("could not launch installer: {e}"))?;
+    if silent {
+        // Unattended (remote-triggered): wait for this app to exit, run the
+        // NSIS installer silently, then relaunch the (replaced) app so the
+        // Companion comes back online with nobody at the desktop.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            let exe = std::env::current_exe()
+                .map_err(|e| format!("could not resolve app path: {e}"))?;
+            let script = format!(
+                "timeout /t 3 /nobreak >nul & \"{}\" /S & start \"\" \"{}\"",
+                path.display(),
+                exe.display()
+            );
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            std::process::Command::new("cmd")
+                .args(["/C", &script])
+                .creation_flags(CREATE_NO_WINDOW)
+                .spawn()
+                .map_err(|e| format!("could not launch silent installer: {e}"))?;
+        }
+        #[cfg(not(windows))]
+        return Err("silent update is Windows-only".into());
+    } else {
+        #[cfg(target_os = "macos")]
+        std::process::Command::new("open")
+            .arg(&path)
+            .spawn()
+            .map_err(|e| format!("could not open installer: {e}"))?;
+        #[cfg(not(target_os = "macos"))]
+        std::process::Command::new(&path)
+            .spawn()
+            .map_err(|e| format!("could not launch installer: {e}"))?;
+    }
+    #[allow(unreachable_code)]
+    Ok(path.display().to_string())
+}
+
+#[tauri::command]
+async fn install_app_update(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, SharedState>,
+) -> Result<String, String> {
+    let shared = state.inner().clone();
+    let path = perform_self_update(&shared, false).await?;
     // Give the GUI a moment to render the "installer started" state, then
     // exit — the RunEvent::Exit handler stops Ollama/whisper children so the
     // installer can replace every file.
@@ -965,7 +1101,7 @@ async fn install_app_update(
         std::thread::sleep(std::time::Duration::from_millis(1500));
         handle.exit(0);
     });
-    Ok(path.display().to_string())
+    Ok(path)
 }
 
 #[tauri::command]

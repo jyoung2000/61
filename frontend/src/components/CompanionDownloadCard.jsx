@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { showToast } from './Toast';
 
 // GPU Companion — download card at the top of the Ollama section.
@@ -172,6 +172,7 @@ export default function CompanionDownloadCard({ isMobile = false }) {
       } else if (data.status === 'local') {
         // From-source setup: the meaningful check is served-vs-paired-Companion,
         // not GitHub. "Update available" is good news, not an error.
+        setRemote(data.companion || null);
         showToast(data.message,
           data.companion?.update_available ? 'success' : 'info');
       } else {
@@ -181,6 +182,88 @@ export default function CompanionDownloadCard({ isMobile = false }) {
       showToast('Update check failed', 'error');
     } finally {
       setRefreshing(false);
+    }
+  };
+
+  // ── Remote Companion update: push the installer from here, watch progress.
+  // The Companion downloads from THIS server, verifies, installs silently and
+  // relaunches — nobody needs to be at the GPU PC. Expect a short offline
+  // window ("restarting") while the installer swaps files.
+  const [remote, setRemote] = useState(null);       // companion info from refresh
+  const [push, setPush] = useState(null);           // {phase,pct,mb,totalMb,error,version}
+  const pushTimer = useRef(null);
+  const pushStarted = useRef(0);
+  useEffect(() => () => clearInterval(pushTimer.current), []);
+
+  // Quiet mount-time check so the "update available" banner appears without a
+  // click. Uses the side-effect-free status endpoint (NOT /refresh, which can
+  // kick off GitHub downloads).
+  useEffect(() => {
+    const t = setTimeout(async () => {
+      try {
+        const res = await fetch('/api/downloads/companion/push-update/status');
+        const st = await res.json();
+        if ((st.state === 'idle' || st.state === 'done')
+            && st.companion_version && st.up_to_date === false) {
+          setRemote({ update_available: true, version: st.companion_version, reachable: true });
+        }
+      } catch { /* banner is best-effort */ }
+    }, 1500);
+    return () => clearTimeout(t);
+  }, []);
+
+  const pollPush = async () => {
+    try {
+      const res = await fetch('/api/downloads/companion/push-update/status');
+      const st = await res.json();
+      const phase = st.state || 'restarting';
+      if (phase === 'done') {
+        clearInterval(pushTimer.current);
+        setPush({ phase: 'done', version: st.companion_version, build: st.companion_build });
+        setRemote((r) => (r ? { ...r, update_available: false } : r));
+        showToast(`Companion updated to v${st.companion_version}${st.companion_build ? ` (build ${st.companion_build})` : ''} ✓`, 'success');
+        return;
+      }
+      if (phase === 'failed') {
+        clearInterval(pushTimer.current);
+        setPush({ phase: 'failed', error: st.error || 'update failed on the Companion' });
+        return;
+      }
+      // Give the offline window a generous but finite budget (~6 min).
+      if (Date.now() - pushStarted.current > 6 * 60 * 1000) {
+        clearInterval(pushTimer.current);
+        setPush({
+          phase: 'failed',
+          error: "The Companion hasn't come back after the installer ran — check the GPU PC (the app may need a manual launch once).",
+        });
+        return;
+      }
+      setPush({
+        phase,
+        pct: st.progress_pct,
+        mb: st.downloaded_mb,
+        totalMb: st.total_mb,
+      });
+    } catch {
+      setPush({ phase: 'restarting' });
+    }
+  };
+
+  const startRemoteUpdate = async () => {
+    setPush({ phase: 'starting' });
+    try {
+      const res = await fetch('/api/downloads/companion/push-update', { method: 'POST' });
+      const data = await res.json();
+      if (data.status !== 'started') {
+        setPush({ phase: 'failed', error: data.message || 'could not start the update' });
+        showToast(data.message || 'Could not start the Companion update', data.status === 'busy' ? 'info' : 'error');
+        return;
+      }
+      pushStarted.current = Date.now();
+      setPush({ phase: 'downloading', pct: 0 });
+      pushTimer.current = setInterval(pollPush, 2500);
+    } catch (e) {
+      setPush({ phase: 'failed', error: String(e) });
     }
   };
 
@@ -304,6 +387,59 @@ export default function CompanionDownloadCard({ isMobile = false }) {
           {verifying ? 'Testing…' : 'Test GPU connection'}
         </button>
       </div>
+
+      {remote?.update_available && (!push || push.phase === 'failed') && (
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap',
+          padding: '8px 10px', marginBottom: 8, borderRadius: 8,
+          background: 'var(--success-dim)', border: '1px solid var(--success)',
+        }}>
+          <span style={{ fontSize: 11, color: 'var(--text-secondary)', flex: 1, minWidth: 180 }}>
+            The Companion on your GPU PC (v{remote.version || '?'}) is older than the
+            build this server hosts — it can be updated from here, no one needed at the PC.
+          </span>
+          <button type="button" onClick={startRemoteUpdate} style={btnStyle('primary')}
+            title="The Companion downloads this server's installer, verifies it, installs silently and relaunches itself">
+            ⬆ Update Companion now
+          </button>
+        </div>
+      )}
+      {push && push.phase !== 'done' && push.phase !== 'failed' && (
+        <div style={{ marginBottom: 8 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10.5, color: 'var(--text-muted)', marginBottom: 3 }}>
+            <span>
+              {push.phase === 'starting' && 'Contacting the Companion…'}
+              {push.phase === 'downloading' && `Companion downloading the installer${push.totalMb ? ` — ${(push.mb || 0).toFixed(0)} / ${push.totalMb.toFixed(0)} MB` : '…'}`}
+              {push.phase === 'verifying' && 'Verifying installer (sha256)…'}
+              {push.phase === 'launching' && 'Installer starting on the GPU PC…'}
+              {push.phase === 'restarting' && 'Installing + restarting the Companion… (it goes briefly offline — this is normal)'}
+              {!['starting', 'downloading', 'verifying', 'launching', 'restarting'].includes(push.phase) && 'Updating…'}
+            </span>
+            {push.phase === 'downloading' && push.pct >= 0 && <span>{Math.round(push.pct)}%</span>}
+          </div>
+          <div style={{ height: 6, borderRadius: 3, background: 'var(--bg-inset, var(--border))', overflow: 'hidden' }}>
+            <div style={{
+              height: '100%', borderRadius: 3, background: 'var(--accent-cyan)',
+              transition: 'width .4s ease',
+              width: push.phase === 'downloading' && push.pct >= 0 ? `${Math.max(3, push.pct)}%` : '100%',
+              // Indeterminate phases pulse instead of pretending to know a %.
+              animation: push.phase !== 'downloading' ? 'companionPulse 1.4s ease-in-out infinite' : 'none',
+              opacity: push.phase !== 'downloading' ? 0.75 : 1,
+            }} />
+          </div>
+          <style>{'@keyframes companionPulse { 0%,100% { opacity:.35 } 50% { opacity:.9 } }'}</style>
+        </div>
+      )}
+      {push?.phase === 'done' && (
+        <div style={{ fontSize: 11, color: 'var(--success)', marginBottom: 8 }}>
+          ✓ Companion updated to v{push.version}{push.build ? ` (build ${push.build})` : ''} and back online.
+        </div>
+      )}
+      {push?.phase === 'failed' && (
+        <div style={{ fontSize: 11, color: 'var(--accent-red, #e5484d)', marginBottom: 8, lineHeight: 1.4 }}>
+          Remote update didn't finish: {push.error}
+        </div>
+      )}
 
       {showTest && (
         <TestModal

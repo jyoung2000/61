@@ -469,3 +469,99 @@ async def companion_refresh():
                        "installer locally; this card then serves it "
                        "without GitHub.",
             "companion": companion_info}
+
+
+# ── Remote Companion update (push from this web UI, no one at the GPU PC) ───
+
+@router.post("/companion/push-update")
+async def companion_push_update():
+    """Tell the paired Companion to self-update NOW: it downloads the installer
+    this server hosts, sha256-verifies it, installs silently and relaunches.
+    Progress is polled via GET /companion/push-update/status."""
+    try:
+        from backend.services import ollama_registry as reg
+        comp = reg.companion_host()
+        if comp is None:
+            return {"status": "error",
+                    "message": "No paired GPU Companion — pair one first."}
+        base = reg.companion_base(comp)
+        headers = dict(reg.auth_headers(comp) or {})
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.post(f"{base}/v1/update/install", headers=headers)
+    except Exception as e:
+        return {"status": "error",
+                "message": f"Couldn't reach the Companion to start the update: {e}"}
+    if r.status_code == 404:
+        # Old build — the /v1/update routes don't exist yet. One manual hop.
+        return {"status": "unsupported",
+                "message": "The Companion app on the GPU PC is too old for "
+                           "remote updates (needs v0.2.5+). Do this ONE update "
+                           "at the PC — open the Companion app and click "
+                           "Update — and every update after that can be "
+                           "pushed from here."}
+    if r.status_code == 409:
+        detail = ""
+        try:
+            detail = (r.json() or {}).get("error", "")
+        except Exception:
+            pass
+        return {"status": "busy",
+                "message": detail or "The Companion GPU is mid-job — retry "
+                                     "when it finishes."}
+    if r.status_code != 200:
+        return {"status": "error",
+                "message": f"Companion answered HTTP {r.status_code}."}
+    return {"status": "started"}
+
+
+@router.get("/companion/push-update/status")
+async def companion_push_update_status():
+    """Poll the remote update. States the UI renders:
+    downloading (with %), verifying, launching, restarting (the app exited so
+    the installer can replace it — expected offline window), failed, done."""
+    local = _merged_view(None)
+    served_version = local.get("version", "")
+    served_build = local.get("build_id", "")
+    out = {"served_version": served_version, "served_build": served_build}
+    try:
+        from backend.services import ollama_registry as reg
+        comp = reg.companion_host()
+        if comp is None:
+            return {**out, "state": "no_companion"}
+        base = reg.companion_base(comp)
+        headers = dict(reg.auth_headers(comp) or {})
+        async with httpx.AsyncClient(timeout=4.0) as client:
+            r = await client.get(f"{base}/v1/update/status", headers=headers)
+            if r.status_code == 404:
+                return {**out, "state": "unsupported"}
+            if r.status_code != 200:
+                return {**out, "state": "restarting"}
+            st = r.json() or {}
+            # Companion is reachable — figure out whether it's ALREADY the
+            # served build (post-install relaunch = done).
+            ver = (st.get("app_version") or "").strip()
+            build = (st.get("app_build") or "").strip()
+            if not ver:
+                hr = await client.get(f"{base}/v1/health", headers=headers)
+                if hr.status_code == 200:
+                    hd = hr.json() or {}
+                    ver = (hd.get("version") or "").strip()
+                    build = (hd.get("build") or "").strip()
+            up_to_date = not _companion_update_available(
+                {"reachable": True, "version": ver, "build": build},
+                served_version, served_build)
+            state = st.get("state") or "idle"
+            if state in ("idle", "launching") and up_to_date and ver:
+                state = "done"
+            return {**out, "state": state,
+                    "progress_pct": st.get("progress_pct", 0.0),
+                    "downloaded_mb": st.get("downloaded_mb", 0.0),
+                    "total_mb": st.get("total_mb", 0.0),
+                    "error": st.get("error", ""),
+                    "companion_version": ver,
+                    "companion_build": build,
+                    "up_to_date": bool(up_to_date and ver)}
+    except Exception:
+        # Unreachable mid-update = the installer is swapping files. The UI
+        # keeps polling; reappearance with the served build = done.
+        return {**out, "state": "restarting"}

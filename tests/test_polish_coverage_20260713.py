@@ -139,7 +139,7 @@ def test_companion_version_bumped_and_synced():
                       open(os.path.join(REPO, "companion", "src-tauri", "Cargo.toml"),
                            encoding="utf-8").read(), re.M).group(1)
     from backend.services.companion_version import EXPECTED_COMPANION_VERSION
-    assert cargo == EXPECTED_COMPANION_VERSION == "0.2.4"
+    assert cargo == EXPECTED_COMPANION_VERSION == "0.2.5"
 
 
 # ── 3. Self-update hardening (adversarial-review CONFIRMED HIGH findings) ────
@@ -152,9 +152,11 @@ def test_installer_integrity_verified_before_execute():
                encoding="utf-8").read()
     # Expected hash is fetched from the manifest…
     assert "async fn fetch_installer_sha256" in lib
-    # …and the installer body is hashed + compared, refusing to run on mismatch.
-    i = lib.find("async fn install_app_update")
-    body = lib[i:i + 5000]
+    # …and the installer body is hashed + compared, refusing to run on
+    # mismatch. The core moved into perform_self_update_inner (shared by the
+    # GUI button and the remote /v1/update/install route) — verify THERE.
+    i = lib.find("async fn perform_self_update_inner")
+    body = lib[i:i + 8000]
     assert "expected_sha256" in body
     assert "Sha256::new()" in body
     assert "eq_ignore_ascii_case" in body
