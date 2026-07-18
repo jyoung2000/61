@@ -27,7 +27,9 @@ pub struct Config {
     /// Soft VRAM budget (GB) ClipAI may use on this GPU. Drives the
     /// whisper model tier and Ollama's OLLAMA_GPU_OVERHEAD reservation.
     pub vram_budget_gb: f32,
-    /// Ollama keep-alive for loaded models (Ollama duration syntax).
+    /// Ollama keep-alive for loaded models (Ollama duration syntax). Default
+    /// "30m" so models survive a long AI-quiet clip-export tail instead of
+    /// forcing a 10-60 s cold reload on the next LLM call.
     pub ollama_keep_alive: String,
     /// Minutes of inactivity before the whisper sidecar exits.
     pub sidecar_idle_min: u32,
@@ -40,9 +42,11 @@ pub struct Config {
     pub gpu_idle_free_min: u32,
     /// SECONDS after the last real request before the whole-GPU auto-free fires
     /// — the fast, primary knob (``gpu_idle_free_min`` is the coarser fallback).
-    /// Default 45: as soon as no job or test is in progress, the GPU is handed
-    /// back promptly instead of lingering for minutes. The in-flight and the
-    /// 45 s job-heartbeat guards still prevent any mid-job / mid-test eviction,
+    /// Default 300 (5 min): wide enough to ride out the pipeline's AI-quiet
+    /// clip-export tail (a single clip encode may take up to ~180 s with no
+    /// Ollama/Whisper traffic), so the next LLM calls (Auto-SEO, judge) don't
+    /// pay a 10-60 s cold model reload. The in-flight and the 300 s
+    /// job-heartbeat guards still prevent any mid-job / mid-test eviction,
     /// so this only fires when the Companion is genuinely idle. When > 0 it wins
     /// over ``gpu_idle_free_min``; set BOTH to 0 to disable the auto-free.
     pub gpu_idle_free_sec: u32,
@@ -149,10 +153,10 @@ impl Default for Config {
             token: generate_token(),
             port: PROXY_PORT_DEFAULT,
             vram_budget_gb: 0.0, // 0 = auto (total minus ~1 GB headroom)
-            ollama_keep_alive: "10m".into(),
+            ollama_keep_alive: "30m".into(),
             sidecar_idle_min: 15,
             gpu_idle_free_min: 3,
-            gpu_idle_free_sec: 45,
+            gpu_idle_free_sec: 300,
             paused: false,
             paired_clipai_url: String::new(),
             name: default_name(),
@@ -376,19 +380,19 @@ impl AppState {
             .ok()
             .map(|raw| {
                 // Was ``gpu_idle_free_sec`` actually written to disk, or is it
-                // about to be filled by the serde default (45)?
+                // about to be filled by the serde default (300)?
                 let had_free_sec = serde_json::from_str::<serde_json::Value>(&raw)
                     .ok()
                     .and_then(|v| v.get("gpu_idle_free_sec").cloned())
                     .is_some();
                 let mut cfg = serde_json::from_str::<Config>(&raw).unwrap_or_default();
-                // Migration: a config predating this field gets the 45 s default,
+                // Migration: a config predating this field gets the 300 s default,
                 // which would silently override an explicit ``gpu_idle_free_min``
                 // — re-enabling the auto-free for someone who set it to 0 ("off"),
                 // or overriding a custom minutes value. Preserve their intent:
                 // when the key was absent AND they'd changed the minutes knob away
                 // from its old default (3), let the minutes knob govern by zeroing
-                // the new one. Fresh / default-3 configs keep the new 45 s default.
+                // the new one. Fresh / default-3 configs keep the new 300 s default.
                 if !had_free_sec && cfg.gpu_idle_free_min != 3 {
                     cfg.gpu_idle_free_sec = 0;
                 }
@@ -658,11 +662,17 @@ impl AppState {
         job_id
     }
 
-    /// The reported job if a heartbeat arrived recently (< 45s) — else None so a
-    /// finished/abandoned job stops driving the bar.
+    /// The reported job if a heartbeat arrived recently (< 300s) — else None so
+    /// a finished/abandoned job stops driving the bar. The window is 300 s (not
+    /// the heartbeat cadence of ~1.5 s) because progress-quiet-but-active
+    /// stages are legitimate: a single clip-export encode may run up to ~180 s
+    /// with sparse heartbeats and no AI traffic, and it must still count as an
+    /// active job so the idle reaper doesn't evict the models mid-job. A dead
+    /// container's job therefore lingers up to 300 s before going stale —
+    /// X-ClipAI-Job-Ended clears it immediately in the normal case.
     pub fn reported_job_fresh(&self) -> Option<ReportedJob> {
         let r = self.reported_job.lock().unwrap().clone();
-        r.filter(|j| now_ms().saturating_sub(j.updated_ms) < 45_000)
+        r.filter(|j| now_ms().saturating_sub(j.updated_ms) < 300_000)
     }
 
     /// True when a real inference/transcription request (not a probe) has been
@@ -988,9 +998,10 @@ mod tests {
     }
 
     #[test]
-    fn default_idle_free_is_45s() {
-        // A fresh install (no config file) frees the GPU ~45 s after idle.
-        assert_eq!(test_state().config.lock().unwrap().gpu_idle_free_sec, 45);
+    fn default_idle_free_is_300s() {
+        // A fresh install (no config file) frees the GPU ~300 s after idle —
+        // wide enough to ride out an AI-quiet clip-export tail.
+        assert_eq!(test_state().config.lock().unwrap().gpu_idle_free_sec, 300);
     }
 
     fn load_with_json(raw: &str) -> Config {
@@ -1016,7 +1027,7 @@ mod tests {
     fn migration_preserves_explicit_disable() {
         // A pre-existing config that turned the auto-free OFF (min=0) and never
         // had the seconds field must STAY off after upgrade, not silently
-        // re-enable at the 45 s default.
+        // re-enable at the 300 s default.
         let cfg = load_with_json(r#"{"gpu_idle_free_min": 0}"#);
         assert_eq!(cfg.gpu_idle_free_min, 0);
         assert_eq!(cfg.gpu_idle_free_sec, 0, "disabled must survive upgrade");
@@ -1024,16 +1035,16 @@ mod tests {
 
     #[test]
     fn migration_preserves_custom_minutes() {
-        // A custom minutes value (e.g. 30) is preserved, not overridden by 45 s.
+        // A custom minutes value (e.g. 30) is preserved, not overridden by 300 s.
         let cfg = load_with_json(r#"{"gpu_idle_free_min": 30}"#);
         assert_eq!(cfg.gpu_idle_free_sec, 0);
     }
 
     #[test]
     fn migration_leaves_default_configs_on_the_fast_path() {
-        // An old config that kept the default minutes (3) upgrades to 45 s.
+        // An old config that kept the default minutes (3) upgrades to 300 s.
         let cfg = load_with_json(r#"{"gpu_idle_free_min": 3}"#);
-        assert_eq!(cfg.gpu_idle_free_sec, 45);
+        assert_eq!(cfg.gpu_idle_free_sec, 300);
         // And an explicit seconds value is always honored verbatim.
         let cfg2 = load_with_json(r#"{"gpu_idle_free_min": 0, "gpu_idle_free_sec": 20}"#);
         assert_eq!(cfg2.gpu_idle_free_sec, 20);

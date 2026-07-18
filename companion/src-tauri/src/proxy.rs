@@ -729,7 +729,7 @@ async fn progress_report(State(ctx): State<ProxyCtx>, headers: HeaderMap) -> Res
     }
     // A job-ended signal (X-ClipAI-Job-Ended) clears the active-job display at
     // once — ClipAI sends this when a job completes / fails / is cancelled or
-    // deleted, so the GUI never shows a phantom job for the 45s staleness window.
+    // deleted, so the GUI never shows a phantom job for the 300s staleness window.
     let ended = header_str(&headers, "x-clipai-job-ended");
     if matches!(ended.trim(), "1" | "true" | "yes") {
         ctx.state.clear_reported_job(&header_str(&headers, "x-clipai-job-id"));

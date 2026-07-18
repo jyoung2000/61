@@ -48,7 +48,7 @@ export interface CompanionStatus {
      *  (whisper sidecar stopped + Ollama models evicted). 0 = off. */
     gpu_idle_free_min: number;
     /** SECONDS of real-work idleness before the whole-GPU auto-free fires —
-     *  the fast, primary knob (default 45). When > 0 it wins over
+     *  the fast, primary knob (default 300). When > 0 it wins over
      *  gpu_idle_free_min; both 0 disables the auto-free. */
     gpu_idle_free_sec: number;
     paused: boolean;

@@ -550,6 +550,36 @@ class Settings(BaseSettings):
     # file) before deciding nobody is and self-extracting. Only relevant for
     # standalone engine use — inside the pipeline the marker appears ~instantly.
     PIPELINE_SHARED_AUDIO_GRACE_S: float = 10.0
+    # ── Speed audit: stage-overlap gates ─────────────────────────────────
+    # Run the translate+polish → summary LLM chain CONCURRENT with clip
+    # detection when the primary Ollama host is a remote GPU with ≥7 GB VRAM
+    # (Companion). Clip detection reads only the RAW perception transcript, so
+    # the overlap is pure scheduling — same calls, same inputs, joined before
+    # the clip-dependent followups. Small shared local cards always keep the
+    # serial order regardless of this flag.
+    PIPELINE_OVERLAP_TRANSLATION_CLIPS: bool = True
+    # Run local CUDA Whisper CONCURRENT with the face-detection loop when the
+    # local card has this much FREE VRAM (Whisper turbo ~1.5-2 GB + YOLO-World
+    # ~150 MB co-reside easily at 6 GB). Byte-identical: the same transcribe()
+    # call, started earlier, joined at the same point. 4 GB cards keep the
+    # proven sequential handoff. Remote (Companion) Whisper already overlaps.
+    WHISPER_LOCAL_CONCURRENT_WITH_FACES: bool = True
+    WHISPER_LOCAL_CONCURRENT_MIN_FREE_GB: float = 6.0
+    # Run the per-clip Auto-SEO LLM calls AFTER the COMPLETE save (background)
+    # instead of holding the job out of COMPLETE for minutes. The clips are
+    # final and target-language-captioned at COMPLETE; the SEO copy fills in
+    # via the existing background_task / clips_refreshed events. False =
+    # legacy inline order.
+    SEO_AFTER_COMPLETE: bool = True
+    # Hybrid word-timing reference (the second Whisper-EN pass whose TEXT is
+    # discarded): decode only windows around cues the readability enforcer
+    # could actually split, instead of the whole video (~8-10 min → ~1-2 min
+    # on a 24-min source). Cues outside the windows keep tier-B timing — the
+    # same fallback every remote/timeout run already ships — and it is only
+    # ever consumed when a cue splits. Long videos that used to skip the pass
+    # outright can now afford the windowed version (MORE tier-A than before).
+    # False = classic full-file reference pass.
+    HYBRID_WHISPER_REF_WINDOWED: bool = True
     # Concurrent per-clip SEO generations in the post-clip Auto-SEO stage.
     # Each clip's SEO is one independent LLM round-trip; serially the stage
     # cost N × provider latency. Cloud providers absorb a small fan-out
@@ -781,12 +811,16 @@ class Settings(BaseSettings):
     # so running them in parallel turns hundreds of serial ffmpeg seeks (minutes
     # on a long video) into a few concurrent waves (seconds).
     THUMBNAIL_EXTRACT_CONCURRENCY: int = 0
-    # Opt-in: skip re-encoding candidate clips entirely and just remux the bytes
+    # Skip re-encoding candidate clips entirely and just remux the bytes
     # (``-c copy``). Near-instant (the whole export phase drops from many minutes
-    # to seconds), but the cut snaps to the nearest keyframe, so a clip may begin
-    # a second or two before its intended moment. Great when you just need fast
-    # previews to review; leave off when you need frame-accurate starts.
-    CLIP_EXPORT_STREAM_COPY: bool = False
+    # to seconds) and bit-identical to the source — these MP4s are review
+    # artifacts only; the final user export always re-reads the original video,
+    # so nothing here touches deliverable pixels. The cut snaps to the nearest
+    # keyframe, so a preview may begin a second or two before its intended
+    # moment. Default ON (speed audit): the re-encode tail was the single
+    # longest phase of a default-config run. Set False for frame-accurate
+    # preview starts at the cost of one encode per candidate clip.
+    CLIP_EXPORT_STREAM_COPY: bool = True
     # When a clip is exported, also drop a human-readable ``.txt`` next to the
     # MP4 (and auto-download it in the UI) carrying the clip's viral score,
     # title, suggested caption, hashtags, recommended platform, per-platform
@@ -1072,16 +1106,19 @@ class Settings(BaseSettings):
     # so a slow-but-progressing CPU batch isn't killed and dropped to raw text.
     SUBTITLE_POLISH_TRANSLATION_SECONDS_PER_BATCH: int = 180
     # Task 6 — transcription polish parity. When a job translates, the heavy
-    # readability polish runs on the TARGET text after translation; by default
-    # the SOURCE transcript was left raw before translation. Cloud transcripts
-    # read cleaner partly because the source is effectively polished first, so
-    # apply a single light source-language cleanup (punctuation / casing /
-    # filler) BEFORE translation: the translator then works from clean input AND
-    # the shipped source transcript reads cleanly. One extra LLM pass per
-    # translate job (uses the local editorial model when offline); set False to
-    # restore the pure translate-then-polish behavior. The full readability
-    # reflow still runs on the translated text.
-    TRANSLATION_POLISH_SOURCE_FIRST: bool = True
+    # readability polish runs on the TARGET text after translation. Setting
+    # this True ALSO applies a light source-language cleanup (punctuation /
+    # casing / filler) BEFORE translation, so the translator works from clean
+    # input and the shipped source transcript reads cleanly — at the price of
+    # one extra full-transcript LLM pass ON THE CRITICAL PATH per translate
+    # job (measured 3-8 min on long videos). Default OFF (speed audit): the
+    # LLM translator handles unpunctuated colloquial input — that is its
+    # documented strength over NMT — and the MT post-edit still repairs the
+    # translated track against the original source lines, so the target-track
+    # quality does not depend on this pass. Only the cosmetics of the shipped
+    # SOURCE track change; set True to buy them back at the old cost. The
+    # full readability reflow still runs on the translated text either way.
+    TRANSLATION_POLISH_SOURCE_FIRST: bool = False
     # Polish the LLM-translated TARGET track too (mode=translation MTPE with
     # the cloud fallback). Historically skipped ("the LLM translation is
     # final"), which shipped the 4B translator's raw typos and word-salad
@@ -1369,9 +1406,13 @@ class Settings(BaseSettings):
     # read: only models whose weights fit under this go on the big card blind.
     # (When /v1/health answers, its live vram_budget_gb is used instead.)
     TRANSLATION_POLISH_UNKNOWN_VRAM_MAX_GB: float = 6.0
-    # Concurrency for the per-cue untranslated-leftover recovery (the Companion
-    # serves num_parallel slots; the old serial loop was a multi-minute tail).
-    TRANSLATION_LLM_CLEANUP_CONCURRENCY: int = 3
+    # Passive keep-alive sent with every Ollama TEXT completion. Ollama's
+    # server default is 5 min, which expires across the pipeline's longer
+    # stage gaps (e.g. translation → timing pass → post-edit) and forces a
+    # 30-60 s cold reload of the translation/editorial model mid-job. VRAM
+    # handoffs are unaffected — explicit evictions (keep_alive=0 /
+    # clear_vram) still win. "-1" = pin forever; "" = send nothing (legacy).
+    OLLAMA_TEXT_KEEP_ALIVE: str = "30m"
     # Cap stretched vocalizations ("Uuuuuuuu") at 3 glyphs on the translated track.
     SUBTITLE_VOCALIZATION_COLLAPSE: bool = True
     # Show the LLM translator a few surrounding SOURCE lines (reference only,
@@ -1387,6 +1428,14 @@ class Settings(BaseSettings):
     # where the batched JSON path fails on small local models). Cap the number of
     # such cues (0 disables the cleanup) and bound its wall-clock time so a
     # hopelessly-garbled transcript can't run for hours.
+    # How many batch-level completeness/recovery passes translate_via_llm runs
+    # INTERNALLY over cues still source-language or garbled. The pipeline's
+    # per-cue `_llm_cleanup_untranslated` (guaranteed on every pipeline path,
+    # and strictly more robust: plain-text per-cue + cloud escalation) retries
+    # the same stragglers anyway, so more than one internal pass mostly re-does
+    # work. Callers WITHOUT that downstream net (e.g. quality mode reached via
+    # the bilingual-SRT download) override this per call to keep the legacy 3.
+    TRANSLATION_INTERNAL_RECOVERY_PASSES: int = 1
     TRANSLATION_LLM_CLEANUP_MAX_CUES: int = 500
     TRANSLATION_LLM_CLEANUP_BUDGET_S: float = 1200.0
     # Front-load that cleanup with a BATCHED pre-pass: translate the unique

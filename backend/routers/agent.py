@@ -537,66 +537,84 @@ async def batch_export(job_id: str, req: BatchExportRequest):
     async def _do_batch():
         from backend.routers.clips import export_clip_endpoint
         try:
-            for clip in clips_to_export:
-                try:
-                    export_req = ExportRequest(
-                        start=clip.start_time,
-                        end=clip.end_time,
-                        clip_id=clip.id,
-                        clip_title=clip.title,
-                        aspect_ratio=req.aspect_ratio,
-                        subtitles_enabled=req.subtitles_enabled,
-                        subtitle_settings=req.subtitle_settings,
-                        export_quality=req.export_quality,
-                    )
-                    await export_clip_endpoint(job_id, export_req)
+            # Bounded parallel export: clips are independent ffmpeg jobs, so a
+            # small fan-out (capped at 3, and at CLIP_EXPORT_CONCURRENCY) cuts
+            # the batch wall-clock without stacking unbounded encodes. Per-clip
+            # failures stay isolated (one failure never kills the batch) and
+            # the response keeps the original clip order via _results.
+            _limit = min(int(getattr(settings, "CLIP_EXPORT_CONCURRENCY", 1) or 1), 3)
+            _sem = asyncio.Semaphore(max(1, _limit))
+            _results: list[Optional[dict]] = [None] * len(clips_to_export)
 
-                    # Wait for export to complete
-                    from backend.routers.clips import _active_export_tasks
-                    export_key = f"{job_id}_{clip.id}"
-                    task = _active_export_tasks.get(export_key)
-                    if task:
-                        await task
+            async def _export_one(pos: int, clip):
+                async with _sem:
+                    try:
+                        export_req = ExportRequest(
+                            start=clip.start_time,
+                            end=clip.end_time,
+                            clip_id=clip.id,
+                            clip_title=clip.title,
+                            aspect_ratio=req.aspect_ratio,
+                            subtitles_enabled=req.subtitles_enabled,
+                            subtitle_settings=req.subtitle_settings,
+                            export_quality=req.export_quality,
+                        )
+                        await export_clip_endpoint(job_id, export_req)
 
-                    # Check if export succeeded
-                    j = await database.load_job(job_id)
-                    exported = None
-                    if j:
-                        for exp in reversed(j.exported_clips):
-                            if exp.get("clip_id") == clip.id:
-                                exported = exp
-                                break
+                        # Wait for export to complete
+                        from backend.routers.clips import _active_export_tasks
+                        export_key = f"{job_id}_{clip.id}"
+                        task = _active_export_tasks.get(export_key)
+                        if task:
+                            await task
 
-                    clip_result = {
-                        "clip_id": clip.id,
-                        "title": clip.title,
-                        "viral_score": clip.viral_score,
-                        "status": "complete" if exported else "failed",
-                        "download_url": f"/api/files/{job_id}/clips/{exported['filename']}" if exported else None,
-                    }
+                        # Check if export succeeded
+                        j = await database.load_job(job_id)
+                        exported = None
+                        if j:
+                            for exp in reversed(j.exported_clips):
+                                if exp.get("clip_id") == clip.id:
+                                    exported = exp
+                                    break
 
-                    # Generate SEO if requested
-                    if req.generate_seo and exported:
-                        try:
-                            from backend.routers.clips import generate_seo_endpoint
-                            seo_result = await generate_seo_endpoint(job_id, clip.id)
-                            clip_result["seo"] = seo_result.get("seo") if isinstance(seo_result, dict) else None
-                        except Exception as seo_err:
-                            logger.warning("SEO generation failed for clip %s: %s", clip.id, seo_err)
+                        clip_result = {
+                            "clip_id": clip.id,
+                            "title": clip.title,
+                            "viral_score": clip.viral_score,
+                            "status": "complete" if exported else "failed",
+                            "download_url": f"/api/files/{job_id}/clips/{exported['filename']}" if exported else None,
+                        }
 
-                    _batch_status[batch_id]["clips"].append(clip_result)
-                    _batch_status[batch_id]["completed_clips"] += 1
-                    _batch_status[batch_id]["message"] = f"Exported {_batch_status[batch_id]['completed_clips']}/{len(clips_to_export)} clips"
+                        # Generate SEO if requested
+                        if req.generate_seo and exported:
+                            try:
+                                from backend.routers.clips import generate_seo_endpoint
+                                seo_result = await generate_seo_endpoint(job_id, clip.id)
+                                clip_result["seo"] = seo_result.get("seo") if isinstance(seo_result, dict) else None
+                            except Exception as seo_err:
+                                logger.warning("SEO generation failed for clip %s: %s", clip.id, seo_err)
 
-                except Exception as clip_err:
-                    logger.exception("Batch export failed for clip %s: %s", clip.id, clip_err)
-                    _batch_status[batch_id]["clips"].append({
-                        "clip_id": clip.id,
-                        "title": clip.title,
-                        "status": "failed",
-                        "error": str(clip_err),
-                    })
-                    _batch_status[batch_id]["failed_clips"] += 1
+                        _results[pos] = clip_result
+                        _batch_status[batch_id]["completed_clips"] += 1
+                        _batch_status[batch_id]["message"] = f"Exported {_batch_status[batch_id]['completed_clips']}/{len(clips_to_export)} clips"
+
+                    except Exception as clip_err:
+                        logger.exception("Batch export failed for clip %s: %s", clip.id, clip_err)
+                        _results[pos] = {
+                            "clip_id": clip.id,
+                            "title": clip.title,
+                            "status": "failed",
+                            "error": str(clip_err),
+                        }
+                        _batch_status[batch_id]["failed_clips"] += 1
+                    # Live-progress snapshot for pollers: finished clips only,
+                    # always in the original request order.
+                    _batch_status[batch_id]["clips"] = [r for r in _results if r is not None]
+
+            await asyncio.gather(*[
+                _export_one(i, clip) for i, clip in enumerate(clips_to_export)
+            ])
+            _batch_status[batch_id]["clips"] = [r for r in _results if r is not None]
 
             _batch_status[batch_id]["status"] = "complete"
             _batch_status[batch_id]["message"] = f"Batch complete: {_batch_status[batch_id]['completed_clips']} exported, {_batch_status[batch_id]['failed_clips']} failed"

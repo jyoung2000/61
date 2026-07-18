@@ -1617,6 +1617,14 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                 "repeat_penalty": 1.15,  # Penalize repetitive phrasing
             },
         }
+        # Keep the text model resident across the pipeline's stage gaps
+        # (summary → SEO → polish → translate): Ollama's server default
+        # keep_alive is 5 min, which expires between stages and forces a
+        # 30-60 s cold reload mid-job. Explicit evictions (keep_alive=0 /
+        # clear_vram) elsewhere still win; empty setting = send nothing.
+        _text_keep_alive = getattr(settings, "OLLAMA_TEXT_KEEP_ALIVE", "") or ""
+        if _text_keep_alive:
+            payload["keep_alive"] = _text_keep_alive
         # Qwen3 is the subtitle TRANSLATION / POLISH model. It repeats without a
         # presence penalty, and subtitle work wants determinism (faithful, stable
         # phrasing), so swap the diverse editorial sampling for Qwen3's tuned

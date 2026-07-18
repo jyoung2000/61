@@ -402,6 +402,24 @@ async def _free_editorial_vram_before_local_clips(job_id: str, orchestrator) -> 
     """
     if settings.resolve_ai_source("clip") != "local":
         return
+    # A remote high-VRAM Ollama host (Companion) holds the editorial LLM and
+    # the clip vision model side by side — and the post-clip Auto-SEO needs
+    # the editorial model again minutes from now, so unloading it here only
+    # buys a 60-150 s cold reload. The handoff below exists solely for the
+    # shared 4 GB local card.
+    # ≥7 GB matches the overlap gates in _run_analysis_inner — the same
+    # threshold that may still have translate/summary in flight on this host
+    # when the clip stage starts, so evicting here would be actively harmful.
+    try:
+        from backend.services import ollama_registry as _oreg
+        if _oreg.remote_primary_vram_gb() >= 7.0:
+            logger.info(
+                "[%s] Skipping pre-clip editorial unload — remote Ollama host "
+                "has VRAM headroom (editorial model stays resident for SEO)",
+                job_id)
+            return
+    except Exception:
+        pass
     try:
         if orchestrator is not None and hasattr(orchestrator, "unload_local_models"):
             await asyncio.wait_for(orchestrator.unload_local_models(), timeout=15)
@@ -432,9 +450,62 @@ async def _free_editorial_vram_before_local_clips(job_id: str, orchestrator) -> 
     await asyncio.sleep(1)
 
 
+def _hybrid_split_candidate_windows(translated_cues, total_s: float):
+    """Time windows around the translated cues that the readability enforcer
+    could actually SPLIT — the only cues whose tier-A (Whisper-EN) word timing
+    changes the rendered output. Cues comfortably under the CPS/duration/length
+    limits never split, so their word timing (tier B, source-pause projection)
+    is the same fallback every remote-Whisper/timeout run already ships.
+
+    Deliberately a SUPERSET (0.8× thresholds + alignment margin padding) so no
+    real split candidate is missed. Returns:
+      []    — no candidates: skip the reference pass entirely;
+      None  — candidates cover >60 % of the timeline: window buys nothing,
+              run the classic full pass;
+      list  — merged [(start_s, end_s), …] windows to decode.
+    """
+    try:
+        max_cps = float(getattr(settings, "SUBTITLE_MAX_CPS", 20.0))
+        max_dur_s = int(getattr(settings, "SUBTITLE_MAX_DURATION_MS", 9000)) / 1000.0
+        max_line = int(getattr(settings, "SUBTITLE_MAX_CHARS_PER_LINE", 42))
+        pad = float(getattr(settings, "HYBRID_ALIGN_MARGIN_S", 2.0)) + 1.0
+        spans = []
+        for c in translated_cues or []:
+            txt = (c.get("text") if isinstance(c, dict)
+                   else getattr(c, "text", "")) or ""
+            start = c.get("start") if isinstance(c, dict) else getattr(c, "start", None)
+            end = c.get("end") if isinstance(c, dict) else getattr(c, "end", None)
+            if start is None or end is None:
+                continue
+            start, end = float(start), float(end)
+            dur = max(0.01, end - start)
+            if (len(txt) / dur > 0.8 * max_cps
+                    or dur > 0.8 * max_dur_s
+                    or len(txt) > 1.6 * max_line):
+                spans.append((max(0.0, start - pad), end + pad))
+        if not spans:
+            return []
+        spans.sort()
+        merged = [list(spans[0])]
+        for a, b in spans[1:]:
+            if a <= merged[-1][1] + 0.5:
+                merged[-1][1] = max(merged[-1][1], b)
+            else:
+                merged.append([a, b])
+        if total_s > 0:
+            merged = [[a, min(b, total_s)] for a, b in merged if a < total_s]
+            coverage = sum(b - a for a, b in merged)
+            if coverage > 0.6 * total_s:
+                return None
+        return [(a, b) for a, b in merged]
+    except Exception:
+        return None  # any surprise → classic full pass (legacy behavior)
+
+
 def _whisper_native_translate_segments(video_path: str, source_lang: str,
                                        glossary: dict | None = None,
-                                       source_segments: list | None = None) -> list:
+                                       source_segments: list | None = None,
+                                       windows: list | None = None) -> list:
     """Run Whisper's native audio→English translate task (offline, no LLM).
 
     Returns a list of ``TranscriptSegment`` (English, with Whisper's own
@@ -469,7 +540,11 @@ def _whisper_native_translate_segments(video_path: str, source_lang: str,
     if not ai.try_load():
         logger.warning("Whisper native translate: engine failed to load (model=%s)", model_name)
         return []
-    raw = ai.whisper_translate(video_path, source_lang=source_lang, reuse_loaded=_was_cached)
+    # ``windows`` is passed only when set so engines (and test fakes) that
+    # predate the windowed-decode kwarg keep working on the full-file path.
+    _wt_kwargs = {"windows": windows} if windows else {}
+    raw = ai.whisper_translate(video_path, source_lang=source_lang,
+                               reuse_loaded=_was_cached, **_wt_kwargs)
     if not raw:
         return []
 
@@ -548,9 +623,18 @@ def _whisper_engine_cached() -> bool:
 
 async def _get_whisper_en_timing_reference(
     video_path: str, source_lang: str, source_segments: list, job_id: str,
+    translated_cues: list | None = None,
 ) -> list:
     """Run a Whisper-native English pass PURELY as a timing reference for the
     hybrid word-timing projection (its TEXT is never used — only ``.words``).
+
+    With ``translated_cues`` provided (and HYBRID_WHISPER_REF_WINDOWED on),
+    only the time windows around cues the readability enforcer could actually
+    split are decoded — typically 10-20 % of the audio instead of a full
+    second ASR pass over the whole video (the audit's single biggest
+    translation-path cost, ~8-10 min on a 24-min video). Cues outside the
+    windows keep tier-B timing, which is only ever consumed when a cue
+    splits — so the rendered output is unchanged for them.
 
     Gated on VRAM: only runs when the transcription engine is still cached (free
     reuse) or enough VRAM is free; otherwise returns ``[]`` so the caller
@@ -585,24 +669,49 @@ async def _get_whisper_en_timing_reference(
                 audio_s = max(audio_s, float(_e))
             except (TypeError, ValueError):
                 pass
+    # Windowed reference: decode only around split-candidate cues. [] means
+    # nothing can split — the whole pass would produce word timing no cue
+    # ever renders, so skip it outright. None means window coverage is so
+    # high the classic full pass is the better deal.
+    windows = None
+    if translated_cues and getattr(settings, "HYBRID_WHISPER_REF_WINDOWED", True):
+        windows = _hybrid_split_candidate_windows(translated_cues, audio_s)
+        if windows == []:
+            logger.info(
+                "[%s] Hybrid timing: no split-candidate cues — skipping the "
+                "Whisper-EN reference (tier-A timing would never render)",
+                job_id)
+            return []
+        if windows:
+            logger.info(
+                "[%s] Hybrid timing: windowed Whisper-EN reference — %d "
+                "window(s), %.0fs of %.0fs audio (%.0f%%)",
+                job_id, len(windows), sum(e - s for s, e in windows), audio_s,
+                100.0 * sum(e - s for s, e in windows) / max(1.0, audio_s))
+    # Estimate the decode cost from what will actually be decoded — the
+    # windowed subset when active, else the whole file. Long videos that
+    # used to skip (full pass would blow the timeout) can now afford the
+    # short windowed pass: MORE tier-A timing than before, not less.
+    decode_s = sum(e - s for s, e in windows) if windows else audio_s
     speedup = float(getattr(settings, "HYBRID_LOCAL_TRANSLATE_SPEEDUP", 2.5))
-    if audio_s > 0 and speedup > 0 and (audio_s / speedup) > timeout:
+    if decode_s > 0 and speedup > 0 and (decode_s / speedup) > timeout:
         logger.info(
             "[%s] Hybrid timing: skipping Whisper-EN reference — est. local "
             "runtime ~%.0fs for %.0fs of audio exceeds the %.0fs timeout "
             "(would time out and degrade to tier B anyway) — degrading now, "
-            "saving the wait", job_id, audio_s / speedup, audio_s, timeout)
+            "saving the wait", job_id, decode_s / speedup, decode_s, timeout)
         return []
     try:
         ref = await asyncio.wait_for(
             asyncio.to_thread(
                 _whisper_native_translate_segments, video_path, source_lang,
-                None, source_segments),
+                None, source_segments, windows),
             timeout=timeout,
         )
         logger.info(
-            "[%s] Hybrid timing: Whisper-EN reference ready (%d cue(s), reuse=%s)",
-            job_id, len(ref or []), cached)
+            "[%s] Hybrid timing: Whisper-EN reference ready (%d cue(s), reuse=%s%s)",
+            job_id, len(ref or []), cached,
+            f", windowed×{len(windows)}" if windows else "")
         return ref or []
     except asyncio.TimeoutError:
         logger.warning(
@@ -1087,6 +1196,14 @@ async def _batch_prefill_translations(orchestrator, unique_texts, source_lang,
     # Ollama simply queues the wave server-side (never slower than serial);
     # cloud providers cut the stage's wall-clock by the wave width.
     wave = max(1, int(getattr(settings, "TRANSLATION_LLM_CLEANUP_CONCURRENCY", 3)))
+    # A paired Companion advertising >wave parallel slots (Turbo profile)
+    # widens the wave — the same /v1/health signal the main translation
+    # fan-out uses. Local hosts keep the configured width.
+    try:
+        from backend.services.translator import _translation_batch_concurrency
+        wave = max(wave, await _translation_batch_concurrency())
+    except Exception:
+        pass
     for _w in range(0, len(batches), wave):
         if deadline is not None and _time.monotonic() > deadline:
             logger.info("[%s] Batched cleanup budget reached (%d done)", job_id, len(out))
@@ -1265,8 +1382,18 @@ async def _llm_cleanup_untranslated(segments, source_lang, target_lang,
             _cache[src_text] = t or ""
 
         if _todo:
-            _rec_sem = asyncio.Semaphore(
-                max(1, int(getattr(settings, "TRANSLATION_LLM_CLEANUP_CONCURRENCY", 3))))
+            _rec_conc = max(1, int(getattr(
+                settings, "TRANSLATION_LLM_CLEANUP_CONCURRENCY", 3)))
+            # Widen to the Companion's advertised num_parallel when higher
+            # (same signal as the main translation fan-out); local hosts
+            # keep the configured width.
+            try:
+                from backend.services.translator import (
+                    _translation_batch_concurrency)
+                _rec_conc = max(_rec_conc, await _translation_batch_concurrency())
+            except Exception:
+                pass
+            _rec_sem = asyncio.Semaphore(_rec_conc)
 
             async def _guarded_recover(s: str) -> None:
                 async with _rec_sem:
@@ -2601,10 +2728,15 @@ async def _set_translation_status(job_id: str, status: str, reason: Optional[str
         pass
 
 
-async def _run_post_clip_followups(job_id: str, orchestrator, pp_result: Optional[dict], clips):
+async def _run_post_clip_followups(job_id: str, orchestrator, pp_result: Optional[dict], clips,
+                                   run_seo: bool = True):
     """Clip-dependent finishers that run AFTER clip extraction: rebuild clip
     captions from the translated transcript (when translation succeeded) and
     seed per-clip Auto-SEO from the best-available transcript.
+
+    ``run_seo=False`` runs only the (cheap) caption refresh — the caller
+    defers the Auto-SEO LLM calls to after the COMPLETE save via
+    ``_auto_seo_followup`` so they stop blocking job completion.
 
     Split out of ``_background_post_processing`` so subtitle translation can run
     BEFORE clip extraction (and therefore never be skipped when the clip stage
@@ -2650,7 +2782,25 @@ async def _run_post_clip_followups(job_id: str, orchestrator, pp_result: Optiona
             logger.warning("[%s] Post-translation clip refresh failed: %s", job_id, _cr_err)
 
     # (b) Seed per-clip SEO from the final transcript (translated when
-    #     available, otherwise the polished source).
+    #     available, otherwise the polished source). Skipped when the caller
+    #     defers SEO to after the COMPLETE save (_auto_seo_followup runs it).
+    if run_seo:
+        final_clips = await _auto_seo_followup(
+            job_id, orchestrator, pp, seo_input_clips, final_clips)
+    # Hand the final (target-language caption/hook/title + SEO) list back so the
+    # caller can persist it directly — the DB round-trip can't be trusted to
+    # have these clips during post-processing.
+    return final_clips
+
+
+async def _auto_seo_followup(job_id: str, orchestrator, pp: dict,
+                             seo_input_clips, final_clips):
+    """The Auto-SEO half of the post-clip followups: per-clip, per-platform
+    LLM copy. Pure metadata on already-final clips — safe to run either
+    inline (legacy) or AFTER the COMPLETE save (default: the calls no longer
+    hold the job out of COMPLETE for minutes; the UI gets the copy via the
+    existing background_task/clips_refreshed events). Returns the final clip
+    list (SEO'd when it succeeded, the input list otherwise)."""
     seo_segments = pp.get("seo_transcript")
     if seo_segments is None:
         try:
@@ -2684,9 +2834,6 @@ async def _run_post_clip_followups(job_id: str, orchestrator, pp_result: Optiona
             "type": "background_task", "task": "auto_seo", "status": "failed",
             "message": f"Auto-SEO skipped: {str(_seo_err)[:80]}",
         })
-    # Hand the final (target-language caption/hook/title + SEO) list back so the
-    # caller can persist it directly — the DB round-trip can't be trusted to
-    # have these clips during post-processing.
     return final_clips
 
 
@@ -3413,7 +3560,7 @@ async def _background_post_processing(
                             getattr(job, "file_path", None), source_lang,
                             [s.model_dump() if hasattr(s, "model_dump") else dict(s)
                              for s in _trans_input] if _trans_input else None,
-                            job_id)
+                            job_id, translated_cues=_llm_cues)
                         _tiers = project_hybrid_timings(
                             _llm_cues, whisper_en_segments=_whisper_ref,
                             source_cues=list(_trans_input) if _trans_input else None,
@@ -4543,31 +4690,14 @@ async def _run_analysis_inner(job_id: str, resume: bool = False):
             job_id, tier.window_duration, tier.per_call_timeout_base, tier.summary_strategy,
             tier.vision_batch_concurrency, _remote_vram_gb,
         )
-        # Warm up models to detect capabilities and VRAM constraints,
-        # then immediately unload so Whisper gets exclusive GPU access.
-        # Models reload automatically when scene analysis starts.
-        # Timeout: skip warmup if it takes too long — models will load lazily.
-        try:
-            await _update_progress(job_id, JobStatus.EXTRACTING_FRAMES, 3, "Warming up local AI models...")
-            await asyncio.wait_for(_primary_provider.warmup(), timeout=60)
-            # Log GPU status after warmup for diagnostics
-            if hasattr(_primary_provider, 'log_gpu_status'):
-                await _primary_provider.log_gpu_status()
-        except asyncio.TimeoutError:
-            logger.warning("[%s] Ollama warmup timed out after 60s — skipping (models will load lazily)", job_id)
-        except Exception as e:
-            logger.warning("[%s] Ollama warmup failed (non-fatal): %s", job_id, e)
-
-        # ── Critical: free GPU for Whisper ──
-        # warmup() loaded Ollama models (qwen2.5:3b = 2.3GB) onto the GPU.
-        # On a 4GB GPU, this leaves only ~1.5GB for Whisper → silent OOM.
-        # Unload now — models reload when pipeline reaches scene analysis.
-        #
-        # ONLY when Ollama shares the LOCAL card AND Whisper runs locally.
-        # With a paired Companion primary, the warmed models sit on the
-        # Companion's GPU — unloading them frees nothing here and forces a
-        # cold reload at scene analysis. With remote Whisper, the local card
-        # doesn't need freeing at all.
+        # Warm up models to detect capabilities and VRAM constraints.
+        # LOCAL card: block, then immediately unload so Whisper gets
+        # exclusive GPU access (models reload at scene analysis).
+        # REMOTE (Companion) primary: the warmed models sit on another
+        # box's GPU and nothing here competes with them — run the warmup
+        # in the BACKGROUND so it never delays extraction (the blocking
+        # warmup+unload dance cost 30-77 s of critical path for zero
+        # local-VRAM benefit).
         _ollama_local = True
         _whisper_remote = False
         try:
@@ -4580,6 +4710,47 @@ async def _run_analysis_inner(job_id: str, resume: bool = False):
             _whisper_remote = _ra.remote_whisper_configured()
         except Exception:
             pass
+        if not _ollama_local:
+            async def _bg_warmup():
+                try:
+                    await asyncio.wait_for(_primary_provider.warmup(), timeout=60)
+                    if hasattr(_primary_provider, 'log_gpu_status'):
+                        await _primary_provider.log_gpu_status()
+                except Exception as _w_e:
+                    logger.info(
+                        "[%s] Background Ollama warmup skipped (models will "
+                        "load lazily): %s", job_id, _w_e)
+            try:
+                _warm_task = asyncio.get_running_loop().create_task(_bg_warmup())
+                _BACKGROUND_TASKS.add(_warm_task)
+                _warm_task.add_done_callback(_BACKGROUND_TASKS.discard)
+                logger.info(
+                    "[%s] Remote Ollama primary — model warmup runs in the "
+                    "background (not blocking extraction)", job_id)
+            except RuntimeError:
+                pass
+        else:
+            try:
+                await _update_progress(job_id, JobStatus.EXTRACTING_FRAMES, 3, "Warming up local AI models...")
+                await asyncio.wait_for(_primary_provider.warmup(), timeout=60)
+                # Log GPU status after warmup for diagnostics
+                if hasattr(_primary_provider, 'log_gpu_status'):
+                    await _primary_provider.log_gpu_status()
+            except asyncio.TimeoutError:
+                logger.warning("[%s] Ollama warmup timed out after 60s — skipping (models will load lazily)", job_id)
+            except Exception as e:
+                logger.warning("[%s] Ollama warmup failed (non-fatal): %s", job_id, e)
+
+        # ── Critical: free GPU for Whisper ──
+        # warmup() loaded Ollama models (qwen2.5:3b = 2.3GB) onto the GPU.
+        # On a 4GB GPU, this leaves only ~1.5GB for Whisper → silent OOM.
+        # Unload now — models reload when pipeline reaches scene analysis.
+        #
+        # ONLY when Ollama shares the LOCAL card AND Whisper runs locally.
+        # With a paired Companion primary, the warmed models sit on the
+        # Companion's GPU — unloading them frees nothing here and forces a
+        # cold reload at scene analysis. With remote Whisper, the local card
+        # doesn't need freeing at all.
         if _ollama_local and not _whisper_remote:
             try:
                 await _update_progress(job_id, JobStatus.EXTRACTING_FRAMES, 4, "Freeing GPU for transcription...")
@@ -6149,68 +6320,70 @@ async def _run_analysis_inner(job_id: str, resume: bool = False):
         job_id, _bg_target or "(none)", _bg_source or "auto", _will_translate,
     )
     _pp_result = None
-    try:
-        _pp_job = await database.load_job(job_id) or job
-        _pp_result = await _background_post_processing(
-            job_id, list(transcript), orchestrator, _pp_job,
-            polished_already=_polished_in_critical_path,
-        )
-    except Exception as _pp_err:
-        logger.error(
-            "[%s] translate+polish step raised (non-fatal — continuing): %s",
-            job_id, _pp_err, exc_info=True,
-        )
-    # Adopt the SOURCE transcript exactly as post-processing finalized it —
-    # polished on the no-translation / translation-failed paths — so the COMPLETE
-    # save persists a clean transcript, never raw (Task 2). The translated track
-    # is persisted separately as translated_transcript by post-processing.
-    if _pp_result and _pp_result.get("source_transcript") is not None:
-        transcript = _pp_result["source_transcript"]
-    # Fail loud when a PLANNED translation did not produce target output (Task 3).
-    if _will_translate:
-        if _pp_result is None:
-            # Crashed before it could translate OR run its source-language
-            # fallback — last-resort polish so we never ship raw, plus a status.
-            logger.error(
-                "[%s] translate+polish crashed before completing — polishing "
-                "source transcript as a last resort", job_id)
-            try:
-                _src_models, _ = await _polish_transcript_loop(
-                    job_id, list(transcript), orchestrator, _bg_source,
-                    model_override=_resolve_polish_model_override(orchestrator))
-                if _src_models:
-                    transcript = [
-                        m.model_dump() if hasattr(m, "model_dump") else dict(m)
-                        for m in _src_models
-                    ]
-            except Exception as _lp_err:
-                logger.warning("[%s] last-resort source polish failed: %s", job_id, _lp_err)
-            await _set_translation_status(
-                job_id, "translation_failed",
-                "translate+polish step crashed; kept source-language transcript")
-        elif not _pp_result.get("translated") and not _pp_result.get("failed_reason"):
-            await _set_translation_status(
-                job_id, "translation_failed",
-                "planned translation produced no target-language output")
-
-    # ── VLM summary (kept ai_orchestrator) — runs AFTER translation now ──
-    # Defensive, idempotent: free the Whisper engine before the VLM stage in
-    # case we deferred its release above to let a Whisper-native translate reuse
-    # it. No-ops when it was already released (the normal, non-reuse path).
-    await _release_whisper_vram(job_id)
-    cancel_check()
-    await _update_progress(
-        job_id, JobStatus.GENERATING_SUMMARY, 70, "Generating video summary...",
-    )
     summary = None
-    # Summarize the TRANSLATED (target-language) transcript when we produced one,
-    # so the summary comes out in the output language even on a weak local model.
-    # `transcript` was reset to the SOURCE track above (~line 3997), so feeding it
-    # to the summary made the offline summary come back in the source language
-    # (Japanese) — the cloud models happened to translate-on-the-fly and hid it.
+    # Refined by _translation_stage once translation lands: the TRANSLATED
+    # (target-language) transcript when one was produced, so the summary comes
+    # out in the output language even on a weak local model. Initialized to the
+    # source track so the post-clip fallback path always has something real.
     _summary_transcript = transcript
-    if _pp_result and _pp_result.get("translated") and _pp_result.get("target_transcript"):
-        _summary_transcript = _pp_result["target_transcript"]
+
+    async def _translation_stage():
+        """Translate + polish, then adopt the finalized source track and pick
+        the summary input. Extracted verbatim from the old inline block so it
+        can run either serially (small shared local GPU — today's proven
+        order) or as a task overlapped with clip detection (Companion rigs,
+        where the clip stage reads only the RAW perception transcript and the
+        two stages share no local VRAM)."""
+        nonlocal _pp_result, transcript, _summary_transcript
+        try:
+            _pp_job = await database.load_job(job_id) or job
+            _pp_result = await _background_post_processing(
+                job_id, list(transcript), orchestrator, _pp_job,
+                polished_already=_polished_in_critical_path,
+            )
+        except Exception as _pp_err:
+            logger.error(
+                "[%s] translate+polish step raised (non-fatal — continuing): %s",
+                job_id, _pp_err, exc_info=True,
+            )
+        # Adopt the SOURCE transcript exactly as post-processing finalized it —
+        # polished on the no-translation / translation-failed paths — so the COMPLETE
+        # save persists a clean transcript, never raw (Task 2). The translated track
+        # is persisted separately as translated_transcript by post-processing.
+        if _pp_result and _pp_result.get("source_transcript") is not None:
+            transcript = _pp_result["source_transcript"]
+        # Fail loud when a PLANNED translation did not produce target output (Task 3).
+        if _will_translate:
+            if _pp_result is None:
+                # Crashed before it could translate OR run its source-language
+                # fallback — last-resort polish so we never ship raw, plus a status.
+                logger.error(
+                    "[%s] translate+polish crashed before completing — polishing "
+                    "source transcript as a last resort", job_id)
+                try:
+                    _src_models, _ = await _polish_transcript_loop(
+                        job_id, list(transcript), orchestrator, _bg_source,
+                        model_override=_resolve_polish_model_override(orchestrator))
+                    if _src_models:
+                        transcript = [
+                            m.model_dump() if hasattr(m, "model_dump") else dict(m)
+                            for m in _src_models
+                        ]
+                except Exception as _lp_err:
+                    logger.warning("[%s] last-resort source polish failed: %s", job_id, _lp_err)
+                await _set_translation_status(
+                    job_id, "translation_failed",
+                    "translate+polish step crashed; kept source-language transcript")
+            elif not _pp_result.get("translated") and not _pp_result.get("failed_reason"):
+                await _set_translation_status(
+                    job_id, "translation_failed",
+                    "planned translation produced no target-language output")
+        _summary_transcript = transcript
+        if _pp_result and _pp_result.get("translated") and _pp_result.get("target_transcript"):
+            _summary_transcript = _pp_result["target_transcript"]
+        # Free the Whisper engine in case transcription deferred its release so
+        # a Whisper-native translate could reuse it. No-ops when already freed.
+        await _release_whisper_vram(job_id)
 
     async def _generate_summary_stage():
         _s = None
@@ -6244,20 +6417,57 @@ async def _run_analysis_inner(job_id: str, resume: bool = False):
             logger.debug("[%s] summary persist skipped: %s", job_id, _sum_err)
         return _s
 
-    # Cloud-editorial rigs: the summary (cloud text + throttled vision) and
-    # the clip stage don't share a local GPU, so run the summary CONCURRENT
-    # with clip detection and join it before Auto-SEO reads it. Local-
-    # editorial rigs keep today's strict ordering — the summary VLM and the
-    # clip judge must hand the one small card to each other, and overlapping
-    # them just makes Ollama thrash model loads.
+    # ── Scheduling: how much of the LLM chain overlaps clip detection ──
+    # Clip detection reads only the RAW perception transcript
+    # (transcript_segments=perception.transcript_segments below) — it has NO
+    # dependency on translation, polish, or the summary. Those outputs are
+    # first consumed by _run_post_clip_followups, which already joins
+    # _summary_task first. Three modes:
+    #
+    #  A. Companion rig (remote Ollama host ≥7 GB): run the WHOLE chain —
+    #     translate+polish → summary — as one task overlapped with clip
+    #     detection. The Companion holds the editorial/translation model and
+    #     the clip vision model side by side; nothing shares the local card.
+    #  B. Cloud editorial: translation stays serial (it may use the LOCAL
+    #     Whisper-native/NMT path and the local card), but the summary —
+    #     cloud text — overlaps clip detection as before.
+    #  C. Shared small local GPU: today's fully serial order — the summary
+    #     VLM and the clip judge must hand the one card to each other, and
+    #     overlapping them just makes Ollama thrash model loads.
     _summary_task = None
-    if not _editorial_is_local:
-        _summary_task = asyncio.create_task(_generate_summary_stage())
+    _summary_remote_vram = 0.0
+    try:
+        from backend.services import ollama_registry as _oreg
+        _summary_remote_vram = _oreg.remote_primary_vram_gb()
+    except Exception:
+        _summary_remote_vram = 0.0
+    _overlap_llm_chain = (
+        _summary_remote_vram >= 7.0
+        and bool(getattr(settings, "PIPELINE_OVERLAP_TRANSLATION_CLIPS", True)))
+    if _overlap_llm_chain:
+        async def _llm_chain():
+            await _translation_stage()
+            cancel_check()
+            return await _generate_summary_stage()
+        _summary_task = asyncio.create_task(_llm_chain())
         logger.info(
-            "[%s] Summary started concurrently with clip detection "
-            "(cloud editorial — no local-GPU handoff needed)", job_id)
+            "[%s] Translate+polish → summary chain started CONCURRENT with "
+            "clip detection (remote Ollama host with %.0f GB holds all "
+            "models; clips read the raw perception transcript)",
+            job_id, _summary_remote_vram)
     else:
-        summary = await _generate_summary_stage()
+        await _translation_stage()
+        cancel_check()
+        await _update_progress(
+            job_id, JobStatus.GENERATING_SUMMARY, 70, "Generating video summary...",
+        )
+        if not _editorial_is_local:
+            _summary_task = asyncio.create_task(_generate_summary_stage())
+            logger.info(
+                "[%s] Summary started concurrently with clip detection "
+                "(cloud editorial — no local-GPU handoff needed)", job_id)
+        else:
+            summary = await _generate_summary_stage()
 
 
     # ── Clip detection (reframer clipper) ──
@@ -6494,9 +6704,15 @@ async def _run_analysis_inner(job_id: str, resume: bool = False):
     # block or skip translation, which already ran above the clip stage. The
     # in-process ``clips`` is threaded as the fallback for the DB-round-trip-empty
     # case. Best-effort: a failure here never aborts the finalize.
+    # Auto-SEO deferral: the per-clip, per-platform SEO LLM calls are pure
+    # metadata on already-final clips — by default they now run AFTER the
+    # COMPLETE save (background) instead of holding the job out of COMPLETE
+    # for minutes. The cheap caption refresh stays inline so the Viral Clips
+    # cards are in the target language at COMPLETE.
+    _defer_seo = bool(getattr(settings, "SEO_AFTER_COMPLETE", True))
     try:
         _final_clips = await _run_post_clip_followups(
-            job_id, orchestrator, _pp_result, clips)
+            job_id, orchestrator, _pp_result, clips, run_seo=not _defer_seo)
         # Prefer the in-process result (target-language caption/hook/title + SEO)
         # — the DB round-trip reads back 0 clips during post-processing, and
         # falling back to it would ship the stale source-language list. Only use
@@ -6668,6 +6884,52 @@ async def _run_analysis_inner(job_id: str, resume: bool = False):
         "[%s] Pipeline complete in %.1fs — %d clips, %d scenes, %d transcript segments",
         job_id, _analysis_seconds, len(_clip_models), len(scenes), len(transcript),
     )
+
+    # ── Deferred Auto-SEO (after COMPLETE) ──
+    # Runs the per-clip SEO copy generation in the background and re-persists
+    # the clip list when done. The job is already COMPLETE with final clips
+    # and target-language captions; this only fills in SEO metadata. Guarded
+    # against the job being deleted mid-task.
+    if _defer_seo and _persisted and _clip_models:
+        async def _post_complete_seo():
+            try:
+                _seo_final = await _auto_seo_followup(
+                    job_id, orchestrator, _pp_result or {},
+                    list(_clip_models), list(_clip_models))
+                if not _seo_final:
+                    return
+                if await database.load_job(job_id) is None:
+                    return  # job deleted while SEO ran
+                from backend.models import ClipCandidate as _CM
+                _coerced = []
+                for _c in _seo_final:
+                    if isinstance(_c, _CM):
+                        _coerced.append(_c)
+                    elif isinstance(_c, dict):
+                        try:
+                            _coerced.append(_CM(**_c))
+                        except Exception:
+                            _coerced.append(_c)
+                    else:
+                        _coerced.append(_c)
+                await database.update_job_status(job_id, clips=_coerced)
+                await broadcast_ws(job_id, {
+                    "type": "clips_refreshed",
+                    "message": "Clip SEO copy ready",
+                })
+            except Exception as _ps_err:
+                logger.warning(
+                    "[%s] Post-COMPLETE Auto-SEO failed (non-fatal): %s",
+                    job_id, _ps_err)
+        try:
+            _seo_task = asyncio.get_running_loop().create_task(_post_complete_seo())
+            _BACKGROUND_TASKS.add(_seo_task)
+            _seo_task.add_done_callback(_BACKGROUND_TASKS.discard)
+            logger.info(
+                "[%s] Auto-SEO deferred to background — job is COMPLETE; "
+                "clip SEO copy will fill in shortly", job_id)
+        except RuntimeError:
+            pass
     # NOTE: translate + polish (``_background_post_processing``) ran on the
     # critical path BEFORE clip extraction (decoupled so a clip-stage failure
     # cannot bypass it), and the clip-dependent caption refresh + Auto-SEO ran

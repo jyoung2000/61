@@ -234,6 +234,23 @@ def companion_host() -> Optional[OllamaHost]:
                  and h.url.rstrip("/").endswith("/ollama")), None)
 
 
+def remote_primary_vram_gb() -> float:
+    """VRAM (GB) of the ACTIVE primary Ollama host when it is a REMOTE GPU
+    (Companion / LAN box). 0.0 when the primary is the server's own card or
+    its VRAM is unknown. Callers use this single signal to decide whether the
+    4 GB single-card serialization dances (summary-before-clips, editorial
+    unload before local clips, blocking warmup) still apply — a high-VRAM
+    remote host lifts them with no quality change."""
+    try:
+        ph = primary_host()
+        if ph is not None and not is_local_gpu_host(ph.url) \
+                and getattr(ph, "vram_total_mb", 0):
+            return float(ph.vram_total_mb) / 1024.0
+    except Exception:
+        pass
+    return 0.0
+
+
 def companion_base(host: OllamaHost) -> str:
     """A Companion's base URL (for ``/v1/audio/transcriptions``, ``/v1/health``)
     — its Ollama URL minus a trailing ``/ollama``."""

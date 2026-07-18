@@ -206,11 +206,31 @@ class Perceiver:
         # safe sequential ordering below (it shares the card with YOLO).
         _txn: dict = {"result": None, "error": None}
         _txn_thread = None
+        _txn_mode = "remote"
         try:
             from backend.services.reframer_audio import remote_whisper_configured
             _txn_remote = bool(remote_whisper_configured())
         except Exception:
             _txn_remote = False
+        # Local variant of the same overlap: a local card with real headroom
+        # (≥6 GB free — YOLO-World small is ~150 MB, Whisper turbo ~1.5-2 GB)
+        # can hold Whisper NEXT TO the detectors, so the faces→Whisper
+        # serialization that a 4 GB card genuinely needs is pure lost time
+        # there. Byte-identical for the same reason as the remote overlap:
+        # the SAME transcribe() call, started earlier, joined at the same
+        # point. Small cards (and CPU rigs) keep the proven sequential order.
+        _txn_local_concurrent = False
+        if not _txn_remote and bool(getattr(
+                settings, 'WHISPER_LOCAL_CONCURRENT_WITH_FACES', True)):
+            try:
+                import torch as _torch_cc
+                if _torch_cc.cuda.is_available():
+                    _free_b, _ = _torch_cc.cuda.mem_get_info()
+                    _txn_local_concurrent = (_free_b / 1_073_741_824) >= float(
+                        getattr(settings,
+                                'WHISPER_LOCAL_CONCURRENT_MIN_FREE_GB', 6.0))
+            except Exception:
+                _txn_local_concurrent = False
         if _txn_remote:
             import threading as _threading
 
@@ -246,6 +266,42 @@ class Perceiver:
                 'PERCEIVE',
                 'Remote Whisper transcription started CONCURRENTLY with face '
                 'detection (runs on the Companion GPU — no local VRAM contention)')
+            _emit_txn_event(on_progress, 'txn_started')
+        elif _txn_local_concurrent:
+            import threading as _threading
+            _txn_mode = "local-gpu"
+
+            def _run_local_txn(dur_ms=r.duration_ms):
+                try:
+                    _stem = self.transcribe_audio_path
+                    if callable(_stem):
+                        try:
+                            _stem = _stem()
+                        except Exception:
+                            _stem = None
+                    # Only proceed concurrently when the engine actually
+                    # landed on CUDA. A CPU-selected engine would compete
+                    # with the face loop for cores — defer it to the normal
+                    # sequential pass instead (same behavior as today).
+                    if (self.audio_intel.try_load()
+                            and str(self.audio_intel.device_used).startswith('cuda')):
+                        _txn["result"] = self.audio_intel.transcribe(
+                            self.path, dur_ms,
+                            language=self.source_language,
+                            on_progress=None,  # don't fight the face-loop's bar
+                            audio_path_override=_stem)
+                    else:
+                        _txn["result"] = {'_local_deferred': True}
+                except Exception as _e:  # noqa: BLE001 — reported, then retried
+                    _txn["error"] = _e
+
+            _txn_thread = _threading.Thread(
+                target=_run_local_txn, name="clipai-local-whisper", daemon=True)
+            _txn_thread.start()
+            log.log_stage(
+                'PERCEIVE',
+                'Local Whisper transcription started CONCURRENTLY with face '
+                'detection (local GPU has VRAM headroom for both)')
             _emit_txn_event(on_progress, 'txn_started')
 
         # ── Optimization #2: overlap speaker diarization with the visual pass ──
@@ -914,13 +970,15 @@ class Perceiver:
             # music/silence locally would only waste minutes to confirm it.
             _ok = (_txn["error"] is None and _res is not None
                    and not _res.get("_remote_failed")
+                   and not _res.get("_local_deferred")
                    and (bool(_res.get("segments"))
                         or bool(_res.get("no_speech_evidence"))))
             if _ok:
                 _apply_audio_result(_res)
                 _txn_done = True
                 log.log_stage('PERCEIVE',
-                              'Remote Whisper transcript ready (ran concurrently '
+                              f'{"Remote" if _txn_mode == "remote" else "Local"} '
+                              'Whisper transcript ready (ran concurrently '
                               'with face detection)')
                 _emit_txn_event(on_progress, _txn_done_hint(_res))
             else:

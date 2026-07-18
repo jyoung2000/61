@@ -565,7 +565,7 @@ pub async fn free_gpu(state: &Arc<AppState>, reason: &str) -> (bool, usize) {
 }
 
 /// Whole-GPU idle-free window in milliseconds from the two config knobs. The
-/// seconds knob is primary (fast, default 45 s); the minutes knob is the coarse
+/// seconds knob is primary (fast, default 300 s); the minutes knob is the coarse
 /// fallback used only when seconds is 0. Both 0 → 0 (auto-free disabled).
 pub(crate) fn effective_free_ms(free_sec: u32, free_min: u32) -> u64 {
     if free_sec > 0 {
@@ -583,7 +583,8 @@ pub(crate) fn effective_free_ms(free_sec: u32, free_min: u32) -> u64 {
 /// registry, "idle" never elapsed and the whisper sidecar sat on VRAM
 /// indefinitely. That is the "models linger on the GPU after the test" bug.
 ///
-///   * ``gpu_idle_free_sec`` (default 45, primary) / ``gpu_idle_free_min``
+///   * ``gpu_idle_free_sec`` (default 300, primary — wide enough to ride out
+///     an AI-quiet clip-export tail of up to ~180 s) / ``gpu_idle_free_min``
 ///     (coarse fallback, default 3): after that idle window with no
 ///     transcription/inference running or finishing, free the WHOLE GPU —
 ///     whisper sidecar stopped AND all resident Ollama models evicted. The
@@ -617,10 +618,13 @@ pub fn spawn_idle_reaper(state: Arc<AppState>) {
             // do NOT idle-free mid-job. The observed failure: the 3-min free
             // fired during the container's local extraction stage, evicting
             // the models (and the pre-warmed whisper sidecar) minutes before
-            // the pipeline needed them, forcing cold reloads mid-job. ClipAI
+            // the pipeline needed them, forcing cold reloads mid-job. The
+            // freshness window is 300 s so a progress-quiet-but-active stage
+            // (a single clip-export encode may run up to ~180 s with sparse
+            // heartbeats and zero AI traffic) still counts as fresh. ClipAI
             // still hands VRAM around explicitly (/v1/sidecar/release after
             // transcription), and the job-ended grace free + these reapers
-            // (heartbeats go stale 45 s after a dead container) remain the
+            // (heartbeats go stale 300 s after a dead container) remain the
             // cleanup for every other case.
             if state.reported_job_fresh().is_some() {
                 continue;
@@ -659,8 +663,8 @@ mod free_window_tests {
 
     #[test]
     fn seconds_knob_is_primary() {
-        // Default: 45 s free window (prompt free once no job/test is running).
-        assert_eq!(effective_free_ms(45, 3), 45_000);
+        // Default: 300 s free window (rides out an AI-quiet clip-export tail).
+        assert_eq!(effective_free_ms(300, 3), 300_000);
         assert_eq!(effective_free_ms(10, 3), 10_000);
     }
 

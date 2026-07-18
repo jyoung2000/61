@@ -646,6 +646,7 @@ async def translate_via_llm(
     job_id: str = "",
     status_callback=None,
     model_override: str | None = None,
+    recovery_passes: int | None = None,
 ) -> Optional[list[TranscriptSegment]]:
     """Translate the SOURCE transcript text-to-text with the editorial LLM,
     1:1 — every segment, same timing + speaker. The reliable, COMPLETE path:
@@ -982,7 +983,21 @@ async def translate_via_llm(
                 + list(load_custom_vocabulary_terms()) if w)
         except Exception:
             _gloss_terms = frozenset()
-        for _pass in range(3):
+        # Pass bound: the pipeline's downstream `_llm_cleanup_untranslated`
+        # (guaranteed to run on every pipeline path, per-cue plain-text + cloud
+        # escalation — strictly more robust than this batched retry) picks up
+        # the same stragglers anyway, so the pipeline default is ONE pass
+        # (TRANSLATION_INTERNAL_RECOVERY_PASSES). Callers without that
+        # downstream net pass an explicit ``recovery_passes`` to keep their
+        # legacy multi-pass behavior.
+        _passes = recovery_passes
+        if _passes is None:
+            try:
+                _passes = int(getattr(
+                    settings, "TRANSLATION_INTERNAL_RECOVERY_PASSES", 1))
+            except Exception:
+                _passes = 1
+        for _pass in range(max(0, _passes)):
             # Re-translate cues still in the source language OR garbled (word-salad
             # / romaji-leak) — one loop covers all failure classes.
             idxs = [i for i, s in enumerate(out_segs)
@@ -1752,7 +1767,12 @@ async def _translate_quality_mode(
     try:
         llm_out = await translate_via_llm(
             segments, source_language, target_language, client,
-            glossary=glossary, status_callback=status_callback)
+            glossary=glossary, status_callback=status_callback,
+            # Quality mode can be reached WITHOUT the pipeline's downstream
+            # `_llm_cleanup_untranslated` net (e.g. the on-demand bilingual-SRT
+            # download in routers/jobs.py), so keep its legacy 3 internal
+            # recovery passes here.
+            recovery_passes=3)
     except Exception as e:
         logger.warning("Translation quality mode: LLM call failed (%s) — falling "
                        "back to the NMT→MTPE chain", e)

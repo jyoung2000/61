@@ -751,7 +751,24 @@ class AIOrchestrator:
             job_id, len(chunks), chunk_seconds, is_ollama,
         )
 
-        sem = asyncio.Semaphore(1 if is_ollama else 3)
+        # Map-chunk concurrency ladder. Chunks are independent, disjoint
+        # transcript spans, so running them in parallel is quality-neutral.
+        # A local small card must stay serial (VRAM), but a high-VRAM remote
+        # Companion handles 2-3 in flight; cloud providers take 6.
+        if is_ollama:
+            _conc = 1
+            try:
+                from backend.services import ollama_registry
+                _vram_gb = ollama_registry.remote_primary_vram_gb()
+                if _vram_gb >= 10:
+                    _conc = 3
+                elif _vram_gb >= 7:
+                    _conc = 2
+            except Exception:
+                _conc = 1  # local/unknown card: keep the serial legacy behavior
+        else:
+            _conc = 6
+        sem = asyncio.Semaphore(_conc)
 
         async def _summarize_chunk(idx, start, end, segs, scns):
             async with sem:
@@ -810,7 +827,24 @@ class AIOrchestrator:
         # Reduce phase
         combined = "\n".join(mini_summaries)
         if is_ollama and len(combined) > 2500:
-            combined = combined[:2500]
+            # Even coverage instead of head-truncation: head-truncating at 2500
+            # chars silently dropped the back half of long videos from the
+            # reduce. Keep mini-summaries evenly strided across the WHOLE list
+            # (mirroring the map phase's even-stride cue sampling above) so the
+            # reduce still sees the video's end, while staying under the same
+            # 2500-char cap that the small local ctx requires. Chronological
+            # order of what's kept is preserved.
+            for _keep in range(len(mini_summaries) - 1, 0, -1):
+                _stride = len(mini_summaries) / _keep
+                _idxs = sorted({min(int(k * _stride), len(mini_summaries) - 1)
+                                for k in range(_keep)})
+                _cand = "\n".join(mini_summaries[i] for i in _idxs)
+                if len(_cand) <= 2500:
+                    combined = _cand
+                    break
+            else:
+                # Even a single mini-summary exceeds the cap — hard-truncate it.
+                combined = combined[:2500]
 
         reduce_prompt = (
             _lang_dir +

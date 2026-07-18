@@ -1,3 +1,84 @@
+# ClipAI — Speed audit Tier 1+2: overlap the LLM chain with clips, window the timing pass, un-block COMPLETE
+
+Implements the full speed audit (docs/perf-audit-46min-to-15-20.md): a 24-min
+video that took ~46 min should now land ~15-20 min on a Companion rig and
+~20-26 min local-only, with deliverables unchanged. Every overlap runs the
+same calls with the same inputs, just earlier; small shared local cards keep
+the proven serial order automatically. All gates are config-flippable.
+
+- **Candidate-clip stream copy ON by default** (`CLIP_EXPORT_STREAM_COPY=True`).
+  Candidate clips are review artifacts (final exports re-read the source); the
+  default-config re-encode tail (~45-135 s/clip × dozens) drops to seconds and
+  the previews become bit-identical to the source. Preview starts snap to the
+  previous keyframe; set False for frame-accurate starts.
+- **Translate+polish → summary chain runs CONCURRENT with clip detection** on a
+  remote ≥7 GB Ollama host (`PIPELINE_OVERLAP_TRANSLATION_CLIPS`). Clip
+  detection reads only the RAW perception transcript (verified false
+  dependency); the chain joins before the clip-dependent followups. The
+  summary∥clips gate now also recognizes a high-VRAM remote host when
+  editorial is "local", and the pre-clip editorial unload is skipped there
+  (it only existed for the shared 4 GB card and forced a 60-150 s cold reload
+  before Auto-SEO).
+- **Hybrid word-timing reference is windowed** (`HYBRID_WHISPER_REF_WINDOWED`).
+  The second Whisper-EN pass (text discarded, only `.words` kept) now decodes
+  only `clip_timestamps` windows around cues the readability enforcer could
+  actually split (~10-20 % of the audio) instead of the whole video — the
+  audit's single biggest translation-path cost (~8-10 min on a 24-min
+  source). Cues outside the windows keep tier-B timing, which only ever
+  renders when a cue splits. Long videos that used to skip the pass entirely
+  (full pass would blow the timeout) now afford the windowed one — more
+  tier-A timing than before, not less.
+- **Local Whisper overlaps the face loop on roomy local cards**
+  (`WHISPER_LOCAL_CONCURRENT_WITH_FACES`, ≥6 GB free): the same transcribe()
+  call the remote-Companion overlap already runs early, extended to local
+  CUDA engines. CPU-selected engines defer to the sequential pass (they'd
+  fight the face loop for cores). 4 GB cards keep the handoff order.
+- **Auto-SEO runs AFTER the COMPLETE save** (`SEO_AFTER_COMPLETE`): the
+  per-clip/per-platform LLM copy no longer holds the job out of COMPLETE for
+  minutes; clips are final and target-language-captioned at COMPLETE and the
+  SEO copy fills in via the existing background_task/clips_refreshed events,
+  re-persisted with a deleted-job guard.
+- **Pre-translation source polish default OFF**
+  (`TRANSLATION_POLISH_SOURCE_FIRST=False`): one full-transcript LLM pass
+  (3-8 min) whose only beneficiary is the cosmetics of the shipped SOURCE
+  track — the translator handles raw colloquial input (its documented
+  strength) and the MT post-edit still repairs the translated track against
+  the source lines. Set True to buy the old behavior back.
+- **Translation redundancy removed**: translate_via_llm's internal 3-pass
+  completeness loop drops to 1 pass on the pipeline path
+  (`TRANSLATION_INTERNAL_RECOVERY_PASSES`; the bilingual-SRT download path
+  keeps 3 — it has no downstream net), since `_llm_cleanup_untranslated` is
+  guaranteed to run and is strictly more robust. The cleanup's batched wave
+  and per-cue recovery widths now follow the Companion's advertised
+  `num_parallel` (same signal as the main translation fan-out); the duplicate
+  `TRANSLATION_LLM_CLEANUP_CONCURRENCY` config field is gone.
+- **No more mid-run model evictions**: Ollama TEXT calls now carry
+  `keep_alive` (`OLLAMA_TEXT_KEEP_ALIVE=30m`; explicit keep_alive=0 handoffs
+  untouched) — the 5-min server default was evicting the translation model
+  across longer stage gaps. Companion: managed keep_alive 10m→30m, idle
+  whole-GPU reaper + job-freshness window 45 s→300 s, so an AI-quiet clip
+  encode (up to 180 s) can no longer trigger a full eviction mid-job.
+- **Remote-host warmup no longer blocks the pipeline start**: the 60 s warmup
+  + 15 s unload + 2 s sleep dance runs in the background when the primary
+  Ollama host is remote (it only ever protected the local card's VRAM).
+- **Summary map-reduce**: chunk concurrency now follows the remote-VRAM
+  ladder the vision path already uses (2-3 on ≥7/≥10 GB hosts, 6 on cloud,
+  serial on the local card) — chunks are disjoint spans, outputs identical.
+  Bug fix: the reduce input was head-truncated at 2500 chars, silently
+  dropping the back half of long videos; it now stride-samples chunk
+  summaries evenly across the whole timeline under the same cap.
+- **Batch export parallelized** (user-facing): up to
+  min(CLIP_EXPORT_CONCURRENCY, 3) concurrent exports, per-clip error
+  isolation and result ordering preserved.
+- `.env.example` documents the previously-hidden speed knobs
+  (CLIP_EXPORT_STREAM_COPY/CONCURRENCY, REFRAMER_MAX_SAMPLES,
+  REFRAMER_MIN_SAMPLE_FPS, SUMMARY_MAX_CHUNKS, the new overlap gates).
+- Verified: full suite 2011 passed; the failure set is byte-identical to
+  main's (122 pre-existing environment failures, none introduced).
+  Companion: cargo check + 32 unit tests pass.
+
+---
+
 # ClipAI — Remote desktop GPU sharing: multi-Ollama failover, remote Whisper, GPU Companion
 
 Turns the 4 GB GTX 1650 bottleneck inside out: the AI stages (Whisper, VLM,

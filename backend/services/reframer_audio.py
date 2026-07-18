@@ -3335,7 +3335,8 @@ class AudioIntelligence:
                 pass
 
     def whisper_translate(self, video_path: str, source_lang: str = None,
-                          on_progress=None, reuse_loaded: bool = False) -> List[dict]:
+                          on_progress=None, reuse_loaded: bool = False,
+                          windows: Optional[List[tuple]] = None) -> List[dict]:
         """Direct audio→English translation via Whisper's native translate task.
 
         For non-English → English, this single-step pass (Whisper run with
@@ -3345,6 +3346,15 @@ class AudioIntelligence:
         result afterward). The pipeline calls this first for English targets
         and falls back to the offline NMT engines in
         ``backend/services/translator.py`` only when it returns ``[]``.
+
+        ``windows`` — optional ``[(start_s, end_s), …]``: decode ONLY those
+        ranges via ``clip_timestamps`` (the gap-fill mechanism). Used by the
+        hybrid word-timing reference, which needs EN word alignment only
+        around the cues that will actually be split — decoding 10-20 % of
+        the audio instead of all of it. LOCAL decode paths only; the remote
+        Companion translate ignores it (that path is fast and returns the
+        full file). Unsupported faster-whisper builds fall back to the full
+        file automatically.
 
         Returns a list of ``{start, end, text}`` dicts (English, with Whisper's
         own audio-aligned timing), or ``[]`` when the engine is unavailable.
@@ -3426,21 +3436,54 @@ class AudioIntelligence:
                 except Exception:
                     pass
 
+            # Windowed decode: flat [start, end, start, end, …] seconds list,
+            # same contract as the gap-fill pass. Dropped (full-file retry)
+            # when the installed faster-whisper doesn't accept it.
+            _clip_kwargs = {}
+            if windows:
+                _clip_ts: list = []
+                for _ws, _we in windows:
+                    _clip_ts.append(round(float(_ws), 3))
+                    _clip_ts.append(round(float(_we), 3))
+                _clip_kwargs = {"clip_timestamps": _clip_ts}
+                log.log_stage('TRANSLATE',
+                    f'Windowed translate: {len(windows)} window(s), '
+                    f'{sum(e - s for s, e in windows):.0f}s of audio')
+
             try:
                 from faster_whisper import BatchedInferencePipeline
                 batched = BatchedInferencePipeline(model=self.engine)
                 _decode = _decoding_kwargs(batched.transcribe)
-                segments_iter, info = batched.transcribe(
-                    audio_path, batch_size=self._batch_size,
-                    language=whisper_lang,
-                    task='translate',  # ← the key difference
-                    beam_size=_beam_size(), vad_filter=True,
-                    vad_parameters=_vad_parameters(),
-                    word_timestamps=True,
-                    no_speech_threshold=float(getattr(
-                        settings, "WHISPER_NO_SPEECH_THRESHOLD", 0.4)),
-                    **_decode,
-                )
+                try:
+                    segments_iter, info = batched.transcribe(
+                        audio_path, batch_size=self._batch_size,
+                        language=whisper_lang,
+                        task='translate',  # ← the key difference
+                        beam_size=_beam_size(), vad_filter=True,
+                        vad_parameters=_vad_parameters(),
+                        word_timestamps=True,
+                        no_speech_threshold=float(getattr(
+                            settings, "WHISPER_NO_SPEECH_THRESHOLD", 0.4)),
+                        **_clip_kwargs,
+                        **_decode,
+                    )
+                except TypeError:
+                    if not _clip_kwargs:
+                        raise
+                    log.log_stage('TRANSLATE',
+                        'clip_timestamps unsupported — full-file translate')
+                    _clip_kwargs = {}
+                    segments_iter, info = batched.transcribe(
+                        audio_path, batch_size=self._batch_size,
+                        language=whisper_lang,
+                        task='translate',
+                        beam_size=_beam_size(), vad_filter=True,
+                        vad_parameters=_vad_parameters(),
+                        word_timestamps=True,
+                        no_speech_threshold=float(getattr(
+                            settings, "WHISPER_NO_SPEECH_THRESHOLD", 0.4)),
+                        **_decode,
+                    )
             except Exception as e:
                 err_str = str(e)
                 if self.device_used.startswith('cuda') and (
@@ -3452,13 +3495,26 @@ class AudioIntelligence:
                         'CUDA out of memory — reloading Whisper on CPU')
                     self._reload_on_cpu()
                 # Fallback to sequential
-                segments_iter, info = self.engine.transcribe(
-                    audio_path, language=whisper_lang,
-                    task='translate',
-                    beam_size=_beam_size(), vad_filter=True,
-                    word_timestamps=True,
-                    **_decoding_kwargs(self.engine.transcribe),
-                )
+                try:
+                    segments_iter, info = self.engine.transcribe(
+                        audio_path, language=whisper_lang,
+                        task='translate',
+                        beam_size=_beam_size(), vad_filter=True,
+                        word_timestamps=True,
+                        **_clip_kwargs,
+                        **_decoding_kwargs(self.engine.transcribe),
+                    )
+                except TypeError:
+                    if not _clip_kwargs:
+                        raise
+                    _clip_kwargs = {}
+                    segments_iter, info = self.engine.transcribe(
+                        audio_path, language=whisper_lang,
+                        task='translate',
+                        beam_size=_beam_size(), vad_filter=True,
+                        word_timestamps=True,
+                        **_decoding_kwargs(self.engine.transcribe),
+                    )
 
             segments = []
             for seg in segments_iter:
