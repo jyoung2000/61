@@ -1215,7 +1215,7 @@ class AIOrchestrator:
             except Exception:
                 continue
 
-    async def text_completion(self, prompt: str, max_tokens: int = 4096, timeout: float = 60, job_id: str = "", skip_circuit_breaker: bool = False, model_override: str | None = None, local_only: bool = False) -> str:
+    async def text_completion(self, prompt: str, max_tokens: int = 4096, timeout: float = 60, job_id: str = "", skip_circuit_breaker: bool = False, model_override: str | None = None, local_only: bool = False, json_mode: bool = False, json_schema: dict | None = None) -> str:
         """Generic text completion using the configured provider chain.
 
         Used by transcript correction, translation, and other text-only tasks.
@@ -1314,9 +1314,22 @@ class AIOrchestrator:
                     except Exception:
                         pass
                 logger.info("text_completion attempting via %s model=%s (%d chars prompt)", pname, model_name, len(prompt))
+                # JSON constraints are an Ollama capability (grammar-level
+                # ``format``); other providers keep their plain call — the
+                # caller's parser still guards their output. NOTE: this
+                # forwarding is what makes ``json_mode=True`` callers work at
+                # all — the parameter used to not exist here, so those calls
+                # raised TypeError and silently fell into their except-blocks
+                # (the batched cleanup prefill never ran).
+                _tc_kw = {}
+                if pname == "ollama":
+                    if json_schema is not None:
+                        _tc_kw["json_schema"] = json_schema
+                    elif json_mode:
+                        _tc_kw["json_mode"] = True
                 t0 = time.monotonic()
                 result = await asyncio.wait_for(
-                    provider.text_complete(prompt, max_tokens=max_tokens, timeout=int(_call_timeout)),
+                    provider.text_complete(prompt, max_tokens=max_tokens, timeout=int(_call_timeout), **_tc_kw),
                     timeout=_call_timeout,
                 )
                 elapsed = time.monotonic() - t0

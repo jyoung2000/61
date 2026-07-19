@@ -1542,6 +1542,7 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
 
     async def _call_text(self, prompt: str, system: str = "", max_tokens: int = 4096,
                          timeout: float = 90.0, json_mode: bool = False,
+                         json_schema: dict | None = None,
                          generation_progress=None) -> str:
         """Text completion with streaming to prevent HTTP timeout death spiral.
 
@@ -1637,7 +1638,12 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                 payload["options"].update(_q3)
         except Exception:
             pass
-        if json_mode:
+        if json_schema is not None:
+            # Structured outputs: a full JSON Schema constrains shape, not just
+            # validity. Older Ollama servers reject a dict format with a 400 —
+            # the ladder loop below downgrades to plain "json" and retries.
+            payload["format"] = json_schema
+        elif json_mode:
             payload["format"] = "json"
 
         logger.debug(
@@ -1725,6 +1731,16 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                     # secondary error.
                     if response.status_code >= 400:
                         error_text = (await response.aread()).decode("utf-8", errors="replace")[:500]
+                        # An old Ollama that predates structured outputs
+                        # rejects a JSON-Schema ``format`` with a 400 —
+                        # downgrade to plain "json" and retry this rung.
+                        if (response.status_code == 400
+                                and isinstance(payload.get("format"), dict)):
+                            logger.info(
+                                "Ollama rejected JSON-Schema format (HTTP 400) — "
+                                "downgrading to format=json and retrying")
+                            payload["format"] = "json"
+                            continue
                         if response.status_code == 404:
                             logger.warning(
                                 "Ollama text model %r not found (HTTP 404). "
@@ -1898,13 +1914,20 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
             f"(model={text_model})")
 
     async def text_complete(self, prompt: str, max_tokens: int = 4096, timeout: int | None = None,
-                            json_mode: bool = False) -> str:
+                            json_mode: bool = False,
+                            json_schema: dict | None = None) -> str:
         # ``json_mode`` routes to Ollama's grammar-constrained ``format: "json"``
         # output. Small local models (qwen2.5:3b) routinely ignore a "return
         # ONLY JSON" instruction in free-form mode and emit prose, which made
         # the map-reduce summary REDUCE step fail ("No valid JSON found") and
         # fall back to a truncated overview. Constraining the grammar fixes that.
-        return await self._call_text(prompt, max_tokens=max_tokens, json_mode=json_mode)
+        # ``json_schema`` goes further: Ollama structured outputs (a full JSON
+        # Schema as ``format``) constrain the SHAPE — e.g. "an array of exactly
+        # N strings" for batch translation, where a 12B at batch 20 missed the
+        # strict count on ~1/3 of batches and paid a split-and-retry cascade
+        # each time. Grammar-level enforcement makes the miss rate ~0.
+        return await self._call_text(prompt, max_tokens=max_tokens,
+                                     json_mode=json_mode, json_schema=json_schema)
 
     async def analyze_frames(
         self, frames: list[FrameData], custom_prompt: Optional[str] = None,

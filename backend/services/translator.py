@@ -671,6 +671,7 @@ async def translate_via_llm(
     # (not per-batch) so names render consistently and coined nouns are
     # transliterated, not translated into ordinary words. Content-agnostic.
     _auto_terms = ""
+    _user_vocab: list = []
     try:
         from backend.services.glossary import (
             build_translation_glossary_block, load_custom_vocabulary_terms)
@@ -689,6 +690,36 @@ async def translate_via_llm(
                             len(_auto_terms), len(_user_vocab))
     except Exception as _g_e:
         logger.debug("auto-glossary skipped: %s", _g_e)
+
+    # Raw glossary TERM SET for the echo guard below: when the model is handed
+    # hallucinated/garbled source (music sections), it sometimes "translates"
+    # by echoing the glossary — a comma-joined dump of the pinned names shipped
+    # as a subtitle cue in a real run. Detect exactly that shape and keep the
+    # source line instead (the untranslated-cue cleanup then retries it).
+    _echo_terms: set = set()
+    try:
+        from backend.services.glossary import (
+            extract_recurring_terms, merge_glossary_terms)
+        _echo_terms = {
+            (t or "").strip().lower()
+            for t in merge_glossary_terms(
+                _user_vocab,
+                extract_recurring_terms(segments, source_language), cap=60)
+            if (t or "").strip()
+        }
+    except Exception:
+        _echo_terms = set()
+
+    def _is_glossary_echo(txt: str) -> bool:
+        if len(_echo_terms) < 3 or not txt:
+            return False
+        parts = [p.strip().lower() for p in re.split(r"[,、;/·•|]+", txt)
+                 if p.strip()]
+        if len(parts) < 4:
+            return False
+        hits = sum(1 for p in parts if p in _echo_terms)
+        return (hits / len(parts)) >= float(getattr(
+            settings, "TRANSLATION_GLOSSARY_ECHO_RATIO", 0.6))
 
     # Surrounding SOURCE lines shown to the model for continuity — reference
     # only, never re-translated or emitted. Kept short so local models at
@@ -753,9 +784,20 @@ async def translate_via_llm(
             _per_seg = float(getattr(settings, "TRANSLATION_LLM_SECONDS_PER_SEGMENT", 12.0))
             _floor = float(getattr(settings, "TRANSLATION_LLM_TIMEOUT_FLOOR", 180.0))
             _t0 = time.monotonic()
+            # Structured output: constrain the Ollama decode to EXACTLY a
+            # len(batch)-string JSON array. The 12B at batch 20 missed the
+            # strict count on ~1/3 of free-form batches (each miss = a full
+            # split-and-retry cascade re-paying the work); grammar-level
+            # enforcement makes the parse-miss rate ~0. Cloud providers
+            # ignore the schema (the orchestrator forwards it only to
+            # Ollama) and keep today's parse-guarded behavior.
+            _schema = None
+            if bool(getattr(settings, "TRANSLATION_STRUCTURED_OUTPUTS", True)):
+                _schema = {"type": "array", "items": {"type": "string"},
+                           "minItems": len(batch), "maxItems": len(batch)}
             resp = await orchestrator.text_completion(
                 prompt, timeout=max(_floor, len(batch) * _per_seg), job_id=job_id,
-                model_override=model_override)
+                model_override=model_override, json_schema=_schema)
         except Exception as e:
             logger.warning("LLM translate: call failed (%s)", e)
             return None
@@ -827,10 +869,36 @@ async def translate_via_llm(
     _is_large_model = bool(_eff_model) and (_parse_params_b(_eff_model) or 0) >= float(
         getattr(settings, "TRANSLATION_LARGE_MODEL_MIN_PARAMS_B", 10.0))
     if _is_large_model:
+        # Budget-aware slot upgrade: the single-slot pin exists because a 12B
+        # can't hold parallel KV caches in a MODEST budget — but the Companion
+        # advertises its real budget (/v1/health vram_budget_gb). When budget
+        # minus estimated weights leaves enough headroom for a second KV slot,
+        # run two batches in flight: Ollama's continuous batching then decodes
+        # both on the same weights (~1.5-1.8× throughput, identical outputs).
+        # The measured run: 9.5 GB budget, ~7.3 GB weights → 2.2 GB free.
+        try:
+            _max_par = int(getattr(settings, "TRANSLATION_LARGE_CONCURRENCY_MAX", 2) or 1)
+            if (_is_ollama and _max_par > 1 and _companion_parallel > 1
+                    and int(_plan.get("concurrency") or 1) <= 1):
+                from backend.services.local_models import estimate_model_weights_gb
+                _budget_gb = await _companion_vram_budget_gb()
+                _w_gb = estimate_model_weights_gb(_eff_model) or 0.0
+                _need = float(getattr(
+                    settings, "TRANSLATION_LARGE_PARALLEL_HEADROOM_GB", 2.0))
+                if _budget_gb > 0 and _w_gb > 0 and (_budget_gb - _w_gb) >= _need:
+                    _plan["concurrency"] = min(_max_par, _companion_parallel)
+                    logger.info(
+                        "LLM translate: Companion budget %.1f GB − weights %.1f GB "
+                        "≥ %.1f GB headroom → running %d parallel slots for %s",
+                        _budget_gb, _w_gb, _need, _plan["concurrency"], _eff_model)
+        except Exception as _bp_e:
+            logger.debug("LLM translate: parallel-slot budget check skipped (%s)", _bp_e)
         logger.info(
             "LLM translate: large model %s → batch %d, concurrency %d "
-            "(fewer/bigger batches, single slot)",
-            _eff_model, BATCH, int(_plan.get("concurrency") or 1))
+            "(fewer/bigger batches%s)",
+            _eff_model, BATCH, int(_plan.get("concurrency") or 1),
+            ", single slot" if int(_plan.get("concurrency") or 1) <= 1
+            else f", {_plan.get('concurrency')} budget-fitted slots")
         # Make the 12B FIT: evict every OTHER model from the (Companion) Ollama so
         # it reloads into the FULL VRAM budget on batch 0 instead of spilling
         # layers to the CPU beside a resident 3B editorial model (the measured
@@ -867,6 +935,13 @@ async def translate_via_llm(
             # glossary template) can NEVER ship — de-salad it deterministically
             # here, even when no LLM re-translate is reachable.
             txt = collapse_separator_salad(txt, _src_line)
+            # Comma-joined glossary dump (the model "translating" hallucinated
+            # music-section source by echoing the pinned names): keep the source
+            # line instead; the untranslated-cue cleanup retries it per-cue.
+            if _is_glossary_echo(txt):
+                logger.info("LLM translate: glossary-echo cue rejected (%r…) — "
+                            "keeping source for the cleanup pass", txt[:60])
+                txt = _src_line
             if glossary:
                 for k, v in glossary.items():
                     ks, vs = (k or "").strip(), (v or "").strip()

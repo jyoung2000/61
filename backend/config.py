@@ -1387,6 +1387,25 @@ class Settings(BaseSettings):
     # fine again — but 4096 is the safe default for an unmanaged Ollama.)
     TRANSLATION_LARGE_NUM_CTX: int = 4096
     TRANSLATION_LARGE_CONCURRENCY: int = 1       # one KV slot; don't fan out a 12B
+    # Budget-aware slot upgrade for the large translation model: when the
+    # Companion's advertised vram_budget_gb minus the model's estimated weights
+    # leaves at least HEADROOM_GB free, run up to CONCURRENCY_MAX batches in
+    # flight — Ollama's continuous batching decodes them on the same weights
+    # (~1.5-1.8× throughput, identical outputs). Measured baseline this fixes:
+    # gemma3:12b at concurrency 1 spent ~26 min translating a 24-min episode.
+    TRANSLATION_LARGE_CONCURRENCY_MAX: int = 2
+    TRANSLATION_LARGE_PARALLEL_HEADROOM_GB: float = 2.0
+    # Ollama structured outputs for batch translation: constrain the decode to
+    # a JSON array of EXACTLY the batch's line count (grammar-level). Kills the
+    # parse-miss → split-and-retry cascade (12 of 35 batches on the measured
+    # run). Old Ollama servers that reject a schema downgrade to format=json
+    # automatically. Applies to the Ollama path only.
+    TRANSLATION_STRUCTURED_OUTPUTS: bool = True
+    # Reject a "translation" that is really a comma-joined echo of the names
+    # glossary (the model's response to hallucinated music-section source):
+    # if ≥ this fraction of a cue's comma-separated parts are glossary terms,
+    # keep the source line and let the per-cue cleanup retry it.
+    TRANSLATION_GLOSSARY_ECHO_RATIO: float = 0.6
     # Make the large translation model FIT on the paired Companion GPU. On a
     # shared budget (the measured 4070: 9.5 GB, with a ~2 GB editorial 3B left
     # resident) a 12B q4 loads PARTIALLY on the CPU → 45-65 s/batch instead of
