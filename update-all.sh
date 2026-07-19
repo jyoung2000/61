@@ -8,10 +8,15 @@
 # multi-line pastes drop lines and corrupt inline here-scripts). Run it with:
 #
 #   cd /mnt/user/appdata/clipai
-#   git fetch origin claude/transcription-coverage-loss-87p7ho && \
-#     git reset --hard origin/claude/transcription-coverage-loss-87p7ho
 #   nohup bash update-all.sh > /mnt/user/appdata/clipai-update.log 2>&1 &
 #   tail -f /mnt/user/appdata/clipai-update.log
+#
+# The script fetches + hard-resets to DEFAULT_BRANCH below (override with
+# `bash update-all.sh <branch>` or CLIPAI_UPDATE_BRANCH=<branch>), so any
+# checkout done before invoking it is replaced — keep DEFAULT_BRANCH pointed
+# at the branch you actually want deployed. (This bit a real update: the
+# caller reset to the new work branch, then this script's stale default
+# quietly reset BACK to the old branch and rebuilt the old code.)
 #
 # The Companion cross-build (COMPANION_BUILD_FROM_SOURCE=1) needs outbound
 # internet (~1 GB MSVC SDK the first time) and can take 10-30 min; the build
@@ -23,7 +28,8 @@
 set -uo pipefail
 cd "$(dirname "$0")"
 
-BRANCH="${1:-claude/transcription-coverage-loss-87p7ho}"
+DEFAULT_BRANCH="claude/video-pipeline-performance-ywh81m"
+BRANCH="${1:-${CLIPAI_UPDATE_BRANCH:-$DEFAULT_BRANCH}}"
 START=$(date +%s)
 log(){ local t=$(( $(date +%s) - START )); printf '\n[all] %02d:%02d %s\n' $((t/60)) $((t%60)) "$*"; }
 
