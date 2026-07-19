@@ -1067,26 +1067,49 @@ async fn perform_self_update_inner(
                      (installer={path_str:?}, app={exe_str:?})"
                 ));
             }
+            // Relaunch must be RESILIENT — nobody is at the desk to restart a
+            // Companion that fails to come back. The image name lets the script
+            // confirm the app is actually RUNNING (not just that its .exe file
+            // exists) and keep retrying the launch until it is.
+            let exe_name = exe
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("ClipAI GPU Companion.exe")
+                .to_string();
             // Write a real .cmd file instead of an inline `cmd /C "…"` string:
             // the app's own path has spaces, and interpolating it into a
             // single command line is what let quoting break. A script file
             // sidesteps all shell-escaping of the interpolated paths.
-            //   * `ping -n 4 127.0.0.1` waits ~3 s WITHOUT a console — `timeout`
+            //   * `ping -n N 127.0.0.1` waits WITHOUT a console — `timeout`
             //     needs console input and silently errors under CREATE_NO_WINDOW,
             //     so the app could still hold files when the installer started.
-            //   * a post-install `ping` loop waits for the installer to drop the
-            //     new exe before relaunching, so a slow (>3 s) install no longer
-            //     races the `start` and 404s the path.
+            //   * after the installer runs, LOOP: launch the app, then poll
+            //     tasklist for its image; only stop once it is actually up.
+            //     If the installer failed and left the OLD exe in place, this
+            //     still brings the (old) Companion back online rather than
+            //     leaving it dead — a broken update must never take the app
+            //     offline until someone walks over to the desktop.
+            //   * a log next to the script records the outcome for diagnosis.
             let script_path = std::env::temp_dir().join("clipai-companion-update.cmd");
+            let log_path = std::env::temp_dir()
+                .join("clipai-companion-update.log");
+            let log_str = log_path.display().to_string();
             let script = format!(
                 "@echo off\r\n\
+                 echo [%date% %time%] update script start >\"{log_str}\"\r\n\
                  ping -n 4 127.0.0.1 >nul\r\n\
+                 echo [%date% %time%] running installer >>\"{log_str}\"\r\n\
                  \"{path_str}\" /S\r\n\
-                 for /l %%i in (1,1,30) do (\r\n\
-                 \x20 if exist \"{exe_str}\" ( start \"\" \"{exe_str}\" & goto done )\r\n\
-                 \x20 ping -n 2 127.0.0.1 >nul\r\n\
+                 echo [%date% %time%] installer exit=%errorlevel% >>\"{log_str}\"\r\n\
+                 ping -n 3 127.0.0.1 >nul\r\n\
+                 set _started=0\r\n\
+                 for /l %%i in (1,1,40) do (\r\n\
+                 \x20 tasklist /fi \"imagename eq {exe_name}\" 2>nul | find /i \"{exe_name}\" >nul && ( set _started=1 & goto up )\r\n\
+                 \x20 if exist \"{exe_str}\" start \"\" \"{exe_str}\"\r\n\
+                 \x20 ping -n 3 127.0.0.1 >nul\r\n\
                  )\r\n\
-                 :done\r\n\
+                 :up\r\n\
+                 echo [%date% %time%] app running=%_started% >>\"{log_str}\"\r\n\
                  del \"%~f0\"\r\n"
             );
             std::fs::write(&script_path, script)
@@ -1295,6 +1318,22 @@ pub fn run() {
         ))
         .setup(|app| {
             log::info!("setup: begin");
+            // Reboot backstop for unattended updates: register the app to run
+            // at login so that even if a self-update's relaunch fails, or the
+            // GPU box simply reboots, the Companion comes back online without
+            // anyone at the desk. Idempotent; best-effort (a locked-down
+            // machine may refuse the registration — never fatal).
+            {
+                use tauri_plugin_autostart::ManagerExt;
+                let al = app.autolaunch();
+                match al.is_enabled() {
+                    Ok(true) => log::info!("autostart: already enabled"),
+                    _ => match al.enable() {
+                        Ok(()) => log::info!("autostart: enabled (login relaunch backstop)"),
+                        Err(e) => log::warn!("autostart: could not enable ({e})"),
+                    },
+                }
+            }
             let config_dir = app
                 .path()
                 .app_config_dir()
