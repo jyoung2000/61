@@ -517,8 +517,8 @@ def _transcript_fingerprint(segments, speaker_timeline, language) -> str:
         for s in (segments or []):
             g = (lambda k: s.get(k) if isinstance(s, dict)
                  else getattr(s, k, None))
-            h.update(repr((round(float(g("start") or 0.0), 3),
-                           round(float(g("end") or 0.0), 3),
+            h.update(repr((round(float(g("start") or g("start_sec") or 0.0), 3),
+                           round(float(g("end") or g("end_sec") or 0.0), 3),
                            g("text") or "")).encode("utf-8", "replace"))
         h.update(repr(speaker_timeline).encode("utf-8", "replace"))
         h.update(str(language or "").lower().encode("utf-8", "replace"))
@@ -6025,6 +6025,20 @@ async def _run_analysis_inner(job_id: str, resume: bool = False):
             "[%s] EARLY overlap: transcript + diarization landed mid-face-loop "
             "(%d segments) — starting transcript chain + translation now",
             job_id, len(_segs))
+        # Free the Companion's whisper VRAM NOW: the transcription that
+        # published this payload is complete (the bridge micro-decodes run
+        # INSIDE transcribe(), before the gate fires) and the chain below is
+        # about to load the 12B LLM onto the SAME GPU. Without this the
+        # sidecar (~1.6-4 GB) stays resident for the rest of the face loop
+        # and can push the LLM into partial offload. Best-effort and
+        # idempotent: the post-join release still runs, an in-flight decode
+        # wins server-side (409), and the tier-A timing pass cold-restarts
+        # the sidecar when it needs it.
+        try:
+            from backend.services.reframer_audio import remote_whisper_release
+            asyncio.create_task(asyncio.to_thread(remote_whisper_release))
+        except Exception:
+            pass
         _res = await _transcript_chain(_segs, _tl, _lang, quiet=True)
         _pp_task = None
         try:

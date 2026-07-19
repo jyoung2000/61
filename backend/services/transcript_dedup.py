@@ -285,12 +285,17 @@ def _has_sentence_terminator(surface_words: list) -> bool:
     return False
 
 
-def _collapse_consecutive_phrase_repeats(words, norm, *, max_phrase=6, min_phrase=2):
+def _collapse_consecutive_phrase_repeats(words, norm, *, max_phrase=10, min_phrase=2):
     """Collapse any contiguous phrase (``min_phrase``..``max_phrase`` words) that
     repeats ≥2× back-to-back ANYWHERE in the line, keeping ONE copy. Returns
     ``(words, changed)``. Order-preserving; operates on the ORIGINAL surfaces,
-    compares on ``norm``. The repeated unit must be ≥2 words and must not end a
-    sentence (a cross-sentence restatement is left to editorial judgement)."""
+    compares on ``norm``. The repeated unit must be ≥2 words and must not END
+    a sentence — a sentence-aligned restatement ("Go home. Go home.") is
+    deliberate emphasis and is left to editorial judgement. A LONG unit
+    (≥5 words) whose only terminator sits strictly INSIDE it is collapsed
+    anyway: "…trying to escape? There's no way they trying to escape? There's
+    no way they could…" is the decoder's overlap stutter — no deliberate
+    restatement restarts mid-sentence."""
     n = len(words)
     changed = False
     i = 0
@@ -305,13 +310,17 @@ def _collapse_consecutive_phrase_repeats(words, norm, *, max_phrase=6, min_phras
             reps = 1
             while norm[i + reps * p: i + (reps + 1) * p] == unit:
                 reps += 1
-            if reps >= 2 and not _has_sentence_terminator(words[i:i + p]):
-                out_w.extend(words[i:i + p])   # keep ONE copy (original surfaces)
-                out_n.extend(norm[i:i + p])
-                i += reps * p
-                changed = True
-                collapsed = True
-                break
+            if reps >= 2:
+                unit_words = words[i:i + p]
+                _aligned = _has_sentence_terminator(unit_words[-1:])
+                _interior = _has_sentence_terminator(unit_words[:-1])
+                if not _aligned and (not _interior or p >= 5):
+                    out_w.extend(unit_words)  # keep ONE copy (original surfaces)
+                    out_n.extend(norm[i:i + p])
+                    i += reps * p
+                    changed = True
+                    collapsed = True
+                    break
         if not collapsed:
             out_w.append(words[i])
             out_n.append(norm[i])
@@ -676,13 +685,22 @@ _STOPWORDS = frozenset(
 
 def _content_words(s: str) -> set:
     """Content words normalized for matching: curly apostrophes unified with
-    straight ones and possessive 's stripped, so "satellite’s" ≡ "satellite's"
-    ≡ "satellite" (a real duplicate escaped on exactly that difference)."""
+    straight ones, possessive 's stripped, and plurals folded onto their
+    singular ("satellites" ≡ "satellite", "colonies" ≡ "colony") — so
+    "satellite’s" ≡ "satellite's" ≡ "satellites'" ≡ "satellite". Two real
+    duplicates escaped on exactly these differences ("The surveillance
+    satellites' vision is lacking" vs "The surveillance satellite's
+    observation is lacking" scored 0.5 < 0.7 unfolded). Matching-only — the
+    display text is never touched, so the crude stem can't leak."""
     out = set()
     for w in re.findall(r"[\w']+", (s or "").lower().replace("’", "'")):
         if w.endswith("'s"):
             w = w[:-2]
         w = w.strip("'")
+        if w.endswith("ies") and len(w) >= 5:
+            w = w[:-3] + "y"
+        elif w.endswith("s") and not w.endswith("ss") and len(w) >= 4:
+            w = w[:-1]
         if w and w not in _STOPWORDS and len(w) >= 2:
             out.add(w)
     return out
@@ -728,8 +746,15 @@ def drop_repeated_sentences(
                     # dramatic repeats — leave them to the intra-cue pass.
                     if pidx == cue_idx or not pcw:
                         continue
+                    # BOTH sentences must be substantial for the content-word
+                    # containment test: with a tiny earlier set the min-denom
+                    # makes full containment trivial — "Are we under attack?!"
+                    # (2 words) must not delete a later "We're under sudden
+                    # enemy attack!" (real dialogue, observed). The char-level
+                    # branch below still catches short verbatim repeats.
                     denom = min(len(cw), len(pcw))
-                    if denom and (len(cw & pcw) / denom) >= similarity:
+                    if (len(pcw) >= min_content_words
+                            and denom and (len(cw & pcw) / denom) >= similarity):
                         is_dup = True
                         break
                     if _text_similarity(sent, praw) >= 0.8:

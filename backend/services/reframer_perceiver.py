@@ -230,8 +230,7 @@ class Perceiver:
 
         def _maybe_fire_early():
             hook = getattr(self, 'early_transcript_hook', None)
-            if hook is None:
-                return
+            _run_ecapa = False
             with _early_lock:
                 if _early_state["fired"]:
                     return
@@ -242,9 +241,52 @@ class Perceiver:
                     return
                 segs = res.get("segments")
                 tl = _diar.get("timeline")
-                if not segs or not tl:
+                if (segs and not tl and _diar.get("done")
+                        and not _diar.get("ecapa_claimed")):
+                    # The concurrent diarizer finished EMPTY (typically:
+                    # pyannote can't load without HF_TOKEN) and the transcript
+                    # it was missing just arrived — claim the ECAPA fallback
+                    # so exactly one worker thread runs it, mid-face-loop.
+                    _diar["ecapa_claimed"] = True
+                    _run_ecapa = True
+                elif not segs or not tl:
                     return  # need BOTH; else the classic serial path runs
-                _early_state["fired"] = True
+                else:
+                    _early_state["fired"] = True
+            if _run_ecapa:
+                # The local-embedding diarizer normally runs AFTER the face
+                # loop (it needs the transcript, which classically only exists
+                # post-join). Running it HERE — the moment the concurrent
+                # transcription lands — moves its cost off the critical path
+                # AND lets the early-translation gate below publish on rigs
+                # with no HF_TOKEN, which otherwise never fire (observed: a
+                # 10.5-minute overlap window wasted while the timeline sat
+                # empty until 17 s after the face loop ended). The result is
+                # stored where the post-join code reads the concurrent
+                # timeline, so the final perception.speaker_timeline is the
+                # SAME object either way — the adoption fingerprint depends
+                # on that. On any failure the classic post-join ECAPA block
+                # still runs (timeline stays empty; nothing is lost).
+                try:
+                    from backend.services.local_diarizer import LocalEmbeddingDiarizer
+                    _led = LocalEmbeddingDiarizer()
+                    if _led.is_available():
+                        _tl_early = _led.diarize(self.path, segs, r.duration_ms)
+                        if _tl_early:
+                            _diar["timeline"] = _tl_early
+                            log.log_stage(
+                                'PERCEIVE',
+                                'Speaker diarization: local SpeechBrain ECAPA '
+                                '(audio-based, no HF token) — ran mid-face-'
+                                'loop, right after the concurrent transcript '
+                                'landed')
+                except Exception as _le_err:  # noqa: BLE001 — fallbacks remain
+                    log.log_stage('PERCEIVE',
+                                  f'early ECAPA diarization skipped: {_le_err}')
+                _maybe_fire_early()  # publish if the timeline just landed
+                return
+            if hook is None:
+                return
             try:
                 import copy as _early_copy
                 from backend.services.language_codes import normalize_lang_code
@@ -379,6 +421,10 @@ class Perceiver:
                         _diar["timeline"] = self.diarizer.diarize(self.path, dur_ms)
                 except Exception as _e:  # noqa: BLE001 — degrade to the fallback
                     _diar["error"] = _e
+                # Mark completion BEFORE the early check: an empty timeline is
+                # only actionable (ECAPA fallback, mid-loop) once it's KNOWN to
+                # be final rather than still-computing.
+                _diar["done"] = True
                 _maybe_fire_early()
 
             _diar_thread = _threading_d.Thread(

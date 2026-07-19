@@ -506,6 +506,15 @@ class Settings(BaseSettings):
     # slower decode for a few % more words — the Netflix-quality trade. Set
     # False to keep turbo on English. Ignored when WHISPER_REMOTE_MODEL is set.
     WHISPER_REMOTE_PREFER_ACCURACY: bool = True
+    # Model used for Whisper's native audio→English TRANSLATE pass when the
+    # active model can't run it: large-v3-turbo / distil-* / kotoba-* were
+    # distilled WITHOUT the translate task and silently transcribe instead
+    # (observed: 3495 CJK vs 16 Latin chars back from a turbo Companion —
+    # tier-A word timing got nothing). "medium" is the multitask workhorse:
+    # strong ja→en translate, ~1 GB quantized — fits beside a resident 12B
+    # LLM on the Companion GPU and loads on a 4 GB local card. Applies to
+    # both the remote (Companion) and local translate passes.
+    WHISPER_TRANSLATE_MODEL: str = "medium"
     # When True, AI runs ONLY on remote GPUs (a paired Companion): Ollama never
     # falls back to the local-GPU daemon (the weak on-server card), and a flaky
     # remote-Whisper health probe won't silently route transcription to it. If

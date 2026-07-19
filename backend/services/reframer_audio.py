@@ -693,6 +693,30 @@ def remote_whisper_pick_model(language: Optional[str]) -> str:
     return "large-v3"
 
 
+def _model_lacks_translate(name: str) -> bool:
+    """True for Whisper checkpoints distilled WITHOUT the translate task.
+
+    ``large-v3-turbo`` (and the distil-whisper / kotoba families) kept only
+    the transcription task — run with ``task=translate`` they silently
+    TRANSCRIBE, returning source-language text. Observed end-to-end: the
+    Companion's whisper.cpp server honored ``translate=true`` but the loaded
+    turbo model returned 3495 CJK chars vs 16 Latin — tier-A timing got zero
+    usable cues. Translate passes must swap these for a multitask checkpoint
+    (``WHISPER_TRANSLATE_MODEL``, default ``medium``).
+    """
+    n = (name or "").lower()
+    return ("turbo" in n) or ("distil" in n) or ("kotoba" in n)
+
+
+def whisper_translate_model() -> str:
+    """The multitask checkpoint used when a translate pass must swap models
+    (see ``_model_lacks_translate``). ``medium`` by default: strong ja→en
+    translate quality, small enough (~1 GB q5/int8) to sit beside a resident
+    12B LLM on the Companion GPU or load on a 4 GB local card."""
+    return str(getattr(settings, "WHISPER_TRANSLATE_MODEL", "medium")
+               or "medium").strip() or "medium"
+
+
 def remote_whisper_warm() -> None:
     """Ask the Companion to start its whisper sidecar NOW, in the background.
 
@@ -993,6 +1017,17 @@ class RemoteWhisperEngine:
         from backend.services.cloud_transcription import _vocab_prompt
 
         model = self.model or remote_whisper_pick_model(language)
+        if translate and _model_lacks_translate(model):
+            # turbo/distil checkpoints have no translate head — they'd return
+            # source-language text (see _model_lacks_translate). The Companion
+            # honors the per-request model header on any budget ("medium"
+            # passes its tier map unchanged), so swap for this one pass.
+            _tx_model = whisper_translate_model()
+            logger.info(
+                "Remote translate: %s cannot translate (distilled without the "
+                "task) — requesting %s for the audio→English pass",
+                model, _tx_model)
+            model = _tx_model
         data = {
             "model": model,
             "response_format": "verbose_json",
@@ -1013,7 +1048,12 @@ class RemoteWhisperEngine:
             data["translate"] = "true"
         if language and language not in ("auto", ""):
             data["language"] = language
-        prompt = _vocab_prompt(language or "en")
+        # The initial prompt conditions the decoder's OUTPUT tokens. A
+        # translate task outputs ENGLISH, so it gets the English "Glossary:"
+        # framing (biasing the Latin name spellings tier-A alignment needs) —
+        # the CJK-formatted prompt would prime source-script output on the
+        # very pass that must not produce it.
+        prompt = _vocab_prompt("en" if translate else (language or "en"))
         if prompt:
             data["prompt"] = prompt
 
@@ -3317,9 +3357,10 @@ class AudioIntelligence:
                 r'[぀-ヿ㐀-鿿豈-﫿]', _all_text))
             if _cjk > _latin:
                 log.log_stage('TRANSLATE',
-                    f'Remote host IGNORED the translate task (returned '
-                    f'source-script text: {_cjk} CJK vs {_latin} Latin chars) '
-                    '— update the Companion; falling back to the local engine')
+                    f'Remote translate returned source-script text '
+                    f'({_cjk} CJK vs {_latin} Latin chars) — the host either '
+                    'ignored the translate field (old sidecar) or ran a model '
+                    'with no translate head; falling back to the local engine')
                 return []
             # Tier-A projection needs word timestamps with real coverage. A
             # single word-bearing segment used to pass this gate ("any");
@@ -3416,9 +3457,37 @@ class AudioIntelligence:
             self.engine = None
             self.available = False
             self.device_used = 'unknown'
+            if _model_lacks_translate(getattr(self, 'model_name', '') or ''):
+                # About to load the local ladder anyway — make it a model that
+                # CAN translate (turbo/distil would silently transcribe).
+                _tx_model = whisper_translate_model()
+                log.log_stage('TRANSLATE',
+                    f'{self.model_name} cannot translate (distilled without '
+                    f'the task) — loading {_tx_model} for the audio→English pass')
+                self.model_name = _tx_model
             if not self.try_load(force_local=True):
                 log.log_stage('TRANSLATE',
                     'Local Whisper unavailable — cannot use native translate')
+                return []
+
+        if (self.engine is not None
+                and _model_lacks_translate(getattr(self, 'model_name', '') or '')):
+            # A LOCAL turbo/distil engine is resident (local-whisper rigs reach
+            # here without the remote branch above). Its translate output would
+            # be source-language text — reload with a multitask checkpoint.
+            # Costs one model load, buys a usable pass instead of silent garbage.
+            _tx_model = whisper_translate_model()
+            log.log_stage('TRANSLATE',
+                f'{self.model_name} cannot translate (distilled without the '
+                f'task) — swapping to {_tx_model} for the audio→English pass')
+            self.engine = None
+            self.available = False
+            self.device_used = 'unknown'
+            self.model_name = _tx_model
+            if not self.try_load(force_local=True):
+                log.log_stage('TRANSLATE',
+                    'Translate-capable Whisper unavailable — cannot use '
+                    'native translate')
                 return []
 
         if not self.engine:
@@ -3568,6 +3637,21 @@ class AudioIntelligence:
 
                 if on_progress and info.duration > 0:
                     on_progress(min(1.0, seg.end / info.duration))
+
+            # Same safety net as the remote path: if the engine TRANSCRIBED
+            # instead of translating (a distilled model that slipped past the
+            # family check, or a future checkpoint without the task), the
+            # output is source-script text that EN↔EN alignment can never
+            # match — reject it rather than feeding tier-A garbage downstream.
+            _all_text = " ".join(s.get('text') or '' for s in segments)
+            _latin = len(re.findall(r'[A-Za-z]', _all_text))
+            _cjk = len(re.findall(r'[぀-ヿ㐀-鿿豈-﫿]', _all_text))
+            if segments and _cjk > _latin:
+                log.log_stage('TRANSLATE',
+                    f'Whisper translate returned source-script text '
+                    f'({_cjk} CJK vs {_latin} Latin chars) — model '
+                    f'{self.model_name} did not translate; discarding the pass')
+                return []
 
             # Clamp drift to the real audio end (task='translate' loops on music
             # too) so the English cues never run past the video.

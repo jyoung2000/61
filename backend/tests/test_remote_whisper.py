@@ -254,6 +254,71 @@ def test_remote_failure_returns_none(monkeypatch, wav_file):
     assert out is None
 
 
+# ── Translate pass: model must actually HAVE the translate task ──────
+
+
+def test_model_lacks_translate_predicate():
+    # Distilled checkpoints kept only transcription — task=translate silently
+    # transcribes on them (observed: turbo returned 3495 CJK vs 16 Latin).
+    assert RA._model_lacks_translate("large-v3-turbo")
+    assert RA._model_lacks_translate("distil-large-v3")
+    assert RA._model_lacks_translate("kotoba-tech/kotoba-whisper-v2.0-faster")
+    # The multitask family translates fine.
+    assert not RA._model_lacks_translate("large-v3")
+    assert not RA._model_lacks_translate("medium")
+    assert not RA._model_lacks_translate("small")
+    assert not RA._model_lacks_translate("")
+
+
+def test_translate_swaps_turbo_for_multitask_model(monkeypatch, wav_file):
+    # translate=True on a turbo engine must request the multitask checkpoint
+    # (WHISPER_TRANSLATE_MODEL) instead — header AND form model switch so the
+    # Companion's ensure_running loads a model that can actually translate.
+    server = _FixtureServer()
+    server.start()
+    try:
+        monkeypatch.setattr(settings, "WHISPER_REMOTE_URL", server.url, raising=False)
+        out = RemoteWhisperEngine(model="large-v3-turbo").transcribe_wav(
+            wav_file, language="ja", translate=True)
+        assert out is not None
+        joined = "\n".join(server.requests).lower()
+        assert "x-clipai-whisper-model: medium" in joined
+        assert "x-clipai-whisper-model: large-v3-turbo" not in joined
+    finally:
+        server.stop()
+
+
+def test_translate_keeps_multitask_model(monkeypatch, wav_file):
+    # A model that CAN translate is left alone — no silent downgrade.
+    server = _FixtureServer()
+    server.start()
+    try:
+        monkeypatch.setattr(settings, "WHISPER_REMOTE_URL", server.url, raising=False)
+        out = RemoteWhisperEngine(model="large-v3").transcribe_wav(
+            wav_file, language="ja", translate=True)
+        assert out is not None
+        joined = "\n".join(server.requests).lower()
+        assert "x-clipai-whisper-model: large-v3" in joined
+    finally:
+        server.stop()
+
+
+def test_transcribe_never_swaps_model(monkeypatch, wav_file):
+    # The swap is translate-pass-only: plain transcription keeps the turbo
+    # pick (its transcription quality is the whole point of the family).
+    server = _FixtureServer()
+    server.start()
+    try:
+        monkeypatch.setattr(settings, "WHISPER_REMOTE_URL", server.url, raising=False)
+        out = RemoteWhisperEngine(model="large-v3-turbo").transcribe_wav(
+            wav_file, language="ja")
+        assert out is not None
+        joined = "\n".join(server.requests).lower()
+        assert "x-clipai-whisper-model: large-v3-turbo" in joined
+    finally:
+        server.stop()
+
+
 # ── Selection order in try_load ──────────────────────────────────────
 
 
