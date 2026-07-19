@@ -505,7 +505,8 @@ def _hybrid_split_candidate_windows(translated_cues, total_s: float):
 def _whisper_native_translate_segments(video_path: str, source_lang: str,
                                        glossary: dict | None = None,
                                        source_segments: list | None = None,
-                                       windows: list | None = None) -> list:
+                                       windows: list | None = None,
+                                       local_fallback: bool = True) -> list:
     """Run Whisper's native audio→English translate task (offline, no LLM).
 
     Returns a list of ``TranscriptSegment`` (English, with Whisper's own
@@ -540,9 +541,13 @@ def _whisper_native_translate_segments(video_path: str, source_lang: str,
     if not ai.try_load():
         logger.warning("Whisper native translate: engine failed to load (model=%s)", model_name)
         return []
-    # ``windows`` is passed only when set so engines (and test fakes) that
-    # predate the windowed-decode kwarg keep working on the full-file path.
-    _wt_kwargs = {"windows": windows} if windows else {}
+    # Non-default kwargs are passed only when set so engines (and test fakes)
+    # that predate them keep working on the classic full-file path.
+    _wt_kwargs = {}
+    if windows:
+        _wt_kwargs["windows"] = windows
+    if not local_fallback:
+        _wt_kwargs["local_fallback"] = False
     raw = ai.whisper_translate(video_path, source_lang=source_lang,
                                reuse_loaded=_was_cached, **_wt_kwargs)
     if not raw:
@@ -721,10 +726,15 @@ async def _get_whisper_en_timing_reference(
             "saving the wait", job_id, decode_s / speedup, decode_s, timeout)
         return []
     try:
+        # When the pass runs because the REMOTE host advertised translate,
+        # forbid the local fallback: this call bypassed the local VRAM gates
+        # on the promise of Companion compute, so a local retry is unbounded
+        # (the observed failure: NameError in the remote guard → local CPU
+        # full-file decode, 25.5 min, tier A still 0).
         ref = await asyncio.wait_for(
             asyncio.to_thread(
                 _whisper_native_translate_segments, video_path, source_lang,
-                None, source_segments, windows),
+                None, source_segments, windows, not _remote_translate),
             timeout=timeout,
         )
         logger.info(
@@ -831,6 +841,18 @@ def _llm_translation_model_is_large(orchestrator) -> bool:
     the post-edit) on any resolution error."""
     try:
         model = _resolve_translation_model_override(orchestrator) or ""
+        if not model:
+            # No DEDICATED override — translate_via_llm then uses the active
+            # editorial model itself, so size THAT. The resolver returns None
+            # when the override EQUALS the editorial model (e.g. editorial
+            # auto-selected gemma3:12b too), and gating on "" here made a
+            # 12B-translated track pay a redundant 793 s 12B post-edit.
+            try:
+                info = orchestrator.get_editorial_model_info() if orchestrator else {}
+                if (info.get("provider") or "").lower() in ("ollama", "openrouter"):
+                    model = (info.get("model") or "").strip()
+            except Exception:
+                model = ""
         if not model:
             return False
         from backend.services.local_models import _parse_params_b

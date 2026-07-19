@@ -7,6 +7,7 @@ transplant. The original Tkinter GUI is not part of this module.
 import cv2
 import numpy as np
 import json
+import re
 import subprocess
 import threading
 import os
@@ -3356,7 +3357,8 @@ class AudioIntelligence:
 
     def whisper_translate(self, video_path: str, source_lang: str = None,
                           on_progress=None, reuse_loaded: bool = False,
-                          windows: Optional[List[tuple]] = None) -> List[dict]:
+                          windows: Optional[List[tuple]] = None,
+                          local_fallback: bool = True) -> List[dict]:
         """Direct audio→English translation via Whisper's native translate task.
 
         For non-English → English, this single-step pass (Whisper run with
@@ -3391,6 +3393,17 @@ class AudioIntelligence:
                 remote_segs = self._remote_translate(video_path, source_lang, log)
                 if remote_segs:
                     return remote_segs
+                if not local_fallback:
+                    # Caller chose remote EXPLICITLY (e.g. the optional hybrid
+                    # word-timing reference, which bypassed the local VRAM
+                    # gates because it expected the Companion to do the work).
+                    # A local retry there is unbounded — the observed failure
+                    # decoded the whole file on CPU for 25.5 min to produce a
+                    # timing garnish. Degrade to tier B instead.
+                    log.log_stage('TRANSLATE',
+                        'Remote translate unusable and local fallback is '
+                        'disabled for this pass — skipping')
+                    return []
                 log.log_stage('TRANSLATE',
                     'Remote translate unusable — falling back to the local engine')
             else:
