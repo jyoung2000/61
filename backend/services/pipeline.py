@@ -3732,8 +3732,15 @@ async def _background_post_processing(
                     try:
                         from backend.services.glossary import extract_recurring_terms
                         from backend.services.transcript_dedup import drop_bare_glossary_runs
-                        _tl, _bg = drop_bare_glossary_runs(
-                            _tl, extract_recurring_terms(transcript, ""))
+                        # Terms must be in the LANGUAGE OF THE TRACK being
+                        # cleaned: source-mined terms are Japanese script and
+                        # can never match the English cues (the run-41 miss —
+                        # "Just Love. / Spaceport / Gundarium" all survived).
+                        # Mine the translated track itself and union with the
+                        # source terms so CJK-target tracks keep working.
+                        _bg_terms = (list(extract_recurring_terms(transcript, ""))
+                                     + list(extract_recurring_terms(_tl, "")))
+                        _tl, _bg = drop_bare_glossary_runs(_tl, _bg_terms)
                     except Exception as _bg_err:
                         logger.debug("[%s] bare-glossary-run drop skipped: %s",
                                      job_id, _bg_err)

@@ -675,8 +675,17 @@ _STOPWORDS = frozenset(
 
 
 def _content_words(s: str) -> set:
-    return {w for w in re.findall(r"[\w']+", (s or "").lower())
-            if w not in _STOPWORDS and len(w) >= 2}
+    """Content words normalized for matching: curly apostrophes unified with
+    straight ones and possessive 's stripped, so "satellite’s" ≡ "satellite's"
+    ≡ "satellite" (a real duplicate escaped on exactly that difference)."""
+    out = set()
+    for w in re.findall(r"[\w']+", (s or "").lower().replace("’", "'")):
+        if w.endswith("'s"):
+            w = w[:-2]
+        w = w.strip("'")
+        if w and w not in _STOPWORDS and len(w) >= 2:
+            out.add(w)
+    return out
 
 
 def drop_repeated_sentences(
@@ -763,9 +772,16 @@ def drop_bare_glossary_runs(
         return segments, 0
 
     def _is_bare(seg) -> bool:
-        txt = (_seg_get(seg, text_key, "") or "").strip()
+        txt = (_seg_get(seg, text_key, "") or "").strip().replace("’", "'")
         core = re.sub(r"[^\w\s']+", "", txt).strip().lower()
-        return bool(core) and len(core.split()) <= 3 and core in terms
+        if not core:
+            return False
+        words = core.split()
+        if len(words) > 3:
+            return False
+        # The whole cue is one glossary term, or every word of it is one
+        # (the miner splits "Just Love" into two single-word terms).
+        return core in terms or all(w in terms for w in words)
 
     flags = [_is_bare(s) for s in segments]
     drop: set = set()

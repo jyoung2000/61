@@ -3303,13 +3303,33 @@ class AudioIntelligence:
             if not result:
                 return []
             segs = result.get('segments') or []
-            # Tier-A projection needs word timestamps. If the host returned none,
-            # fall back to the local engine (which always produces them).
-            has_words = any(
-                (s.get('words') if isinstance(s, dict) else None) for s in segs)
-            if not has_words:
+            # An old sidecar that IGNORES the translate field returns a
+            # TRANSCRIPTION — source-language text that downstream EN↔EN
+            # alignment can never match (observed: 94 Japanese segments,
+            # tier A = 0 across the whole track, 2 wasted minutes). The
+            # translate task's output must be Latin-majority: reject
+            # anything else and fall back to the local engine.
+            _all_text = " ".join(
+                (s.get('text') or '') for s in segs if isinstance(s, dict))
+            _latin = len(re.findall(r'[A-Za-z]', _all_text))
+            _cjk = len(re.findall(
+                r'[぀-ヿ㐀-鿿豈-﫿]', _all_text))
+            if _cjk > _latin:
                 log.log_stage('TRANSLATE',
-                    'Remote translate returned no word timestamps — local '
+                    f'Remote host IGNORED the translate task (returned '
+                    f'source-script text: {_cjk} CJK vs {_latin} Latin chars) '
+                    '— update the Companion; falling back to the local engine')
+                return []
+            # Tier-A projection needs word timestamps with real coverage. A
+            # single word-bearing segment used to pass this gate ("any");
+            # require half the segments to carry words before trusting it.
+            _with_words = sum(
+                1 for s in segs
+                if isinstance(s, dict) and s.get('words'))
+            if not segs or _with_words < max(1, len(segs) // 2):
+                log.log_stage('TRANSLATE',
+                    f'Remote translate word coverage too sparse '
+                    f'({_with_words}/{len(segs)} segments) — local '
                     'fallback for tier-A timing')
                 return []
             out = []

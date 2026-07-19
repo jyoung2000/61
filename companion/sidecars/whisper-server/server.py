@@ -244,6 +244,12 @@ async def transcribe(
     prompt: str = Form(""),
     response_format: str = Form("verbose_json"),
     temperature: float = Form(0.0),
+    # Whisper's native audio→English translate task. ClipAI sends
+    # translate=true for the hybrid word-timing reference; whisper.cpp's
+    # server honors the same field on macOS. This server used to IGNORE it
+    # and hardcode task=transcribe — the container then aligned English
+    # tokens against a Japanese "translation" and got zero tier-A timings.
+    translate: Optional[str] = Form(None),
     # ── Optional decode-tuning fields (ClipAI parity) ──
     # All default to None so a client that never sends them (speaches /
     # whisper.cpp compatibility) gets the sidecar's historical behavior:
@@ -276,9 +282,12 @@ async def transcribe(
         audio_path = tmp.name
 
     try:
+        task = ("translate" if str(translate or "").strip().lower()
+                in ("1", "true", "yes", "on") else "transcribe")
         base_kwargs = {
             "vad_filter": True,
             "word_timestamps": True,
+            "task": task,
         }
         if language and language not in ("auto", ""):
             base_kwargs["language"] = language
@@ -370,7 +379,7 @@ async def transcribe(
             return JSONResponse({"text": full_text.getvalue().strip()})
         # verbose_json (default) — what ClipAI asks for.
         return JSONResponse({
-            "task": "transcribe",
+            "task": task,
             "language": getattr(info, "language", language or "en"),
             "duration": round(float(getattr(info, "duration", 0.0) or 0.0), 3),
             "text": full_text.getvalue().strip(),
