@@ -295,17 +295,51 @@ def _romaji_leak_reason(text, source_language="", glossary_terms=frozenset()):
     return None
 
 
+_CJK_CHAR_RE = re.compile(r"[぀-ヿ㐀-鿿豈-﫿]")
+
+
+def _cjk_remnant_reason(text):
+    """A few CJK characters stranded inside otherwise-Latin output — a real
+    run shipped "Gun曜日" in an English track. Only fires when Latin letters
+    dominate (≥3 Latin, CJK ≤ Latin), so a CJK-TARGET translation (where CJK
+    dominates) and a fully-untranslated cue (owned by ``_is_untranslated``)
+    are never touched."""
+    t = text or ""
+    cjk = len(_CJK_CHAR_RE.findall(t))
+    if not cjk:
+        return None
+    latin = len(re.findall(r"[A-Za-z]", t))
+    if latin >= 3 and cjk <= latin:
+        return "cjk-remnant"
+    return None
+
+
 def garble_reason(text, source_language="", glossary_terms=frozenset()):
     """Reason a TRANSLATED cue is garbled (word-salad or romaji-leak), else None.
     Still-CJK stays owned by ``_is_untranslated``; recovery selection ORs both."""
     if not bool(getattr(settings, "TRANSLATION_GARBLE_DETECT_ENABLED", True)):
         return None
     return (_word_salad_reason(text)
-            or _romaji_leak_reason(text, source_language, glossary_terms))
+            or _romaji_leak_reason(text, source_language, glossary_terms)
+            or _cjk_remnant_reason(text))
 
 
 def is_garbled_translation(text, source_language="", glossary_terms=frozenset()) -> bool:
     return garble_reason(text, source_language, glossary_terms) is not None
+
+
+def tidy_punctuation_artifacts(text: str) -> str:
+    """Deterministic cleanup of the small punctuation artifacts LLM
+    translation leaves behind: a stray leading CJK period ("。 And you?"),
+    spaced double terminators ("Mobile Suits? !"), and a dangling trailing
+    "?"/"." after a finished sentence ("See that it doesn't. ?"). Ellipses
+    ("...") are untouched — every rule requires whitespace between marks."""
+    s = text or ""
+    s = re.sub(r"^[\s。、・]+", "", s)     # leading 。 、 ・
+    s = re.sub(r"([?!])\s+([?!])", r"\1\2", s)          # "? !" → "?!"
+    s = re.sub(r"([.?!…])\s+[.?]$", r"\1", s)           # trailing ". ?"
+    s = re.sub(r"\s{2,}", " ", s)
+    return s.strip()
 
 
 def collapse_separator_salad(text, source: str = "") -> str:
@@ -982,6 +1016,7 @@ async def translate_via_llm(
                 logger.info("LLM translate: glossary-echo cue rejected (%r…) — "
                             "keeping source for the cleanup pass", txt[:60])
                 txt = _src_line
+            txt = tidy_punctuation_artifacts(txt)
             if glossary:
                 for k, v in glossary.items():
                     ks, vs = (k or "").strip(), (v or "").strip()

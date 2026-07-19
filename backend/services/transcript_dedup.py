@@ -650,3 +650,142 @@ def clamp_segments_to_duration(
             changed += 1
         out.append(seg)
     return out, changed
+
+
+# ── Sentence-level near-duplicate removal (translated track) ────────────
+# The overlap dedup above works on WHOLE cues at OVERLAPPING times. Two real
+# duplication patterns slip through it: (a) a re-decoded span landing at
+# SHIFTED (non-overlapping) times whose translation is a paraphrase of a
+# nearby cue ("Grown from Earth, humanity sought new hope…" 10 s before
+# "Seeking new hope for a better life…"), and (b) a duplicated SENTENCE
+# embedded inside a longer neighboring cue ("…trajectory? The surveillance
+# satellite's vision is lacking." repeating the previous cue verbatim).
+# This pass splits cues into sentences and drops any sentence that
+# near-repeats a sentence from a nearby EARLIER cue; a cue whose every
+# sentence is a repeat is dropped whole. Conservative by construction:
+# only sentences with enough content words are eligible, so legitimate
+# short repeats ("Fire! Fire!", a name called twice) are never touched.
+
+_SENT_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+")
+_STOPWORDS = frozenset(
+    "the a an and or but of to in on at for with is are was were be been it "
+    "its this that these those i you he she we they them his her their my "
+    "your our as by from not no so do does did have has had will would can "
+    "could there here".split())
+
+
+def _content_words(s: str) -> set:
+    return {w for w in re.findall(r"[\w']+", (s or "").lower())
+            if w not in _STOPWORDS and len(w) >= 2}
+
+
+def drop_repeated_sentences(
+    segments: list,
+    text_key: str = "text",
+    start_key: str = "start",
+    window_s: float = 25.0,
+    similarity: float = 0.70,
+    min_content_words: int = 4,
+) -> tuple[list, int]:
+    """Remove sentences that near-repeat a sentence from a nearby earlier cue.
+
+    A sentence is dropped when (a) it carries ≥ ``min_content_words`` content
+    words (long enough that a coincidental repeat is implausible), and (b) an
+    earlier sentence within ``window_s`` seconds has ≥ ``similarity``
+    content-word overlap (relative to the SMALLER set — catches paraphrases
+    that reorder or trim words) or ≥ 0.8 :func:`_text_similarity`. Cues left
+    empty are removed. Returns ``(segments, sentences_dropped)``."""
+    if not segments:
+        return segments, 0
+    kept_sents: list = []  # (start_s, cue_index, content_word_set, raw_sentence)
+    out: list = []
+    dropped = 0
+    for cue_idx, seg in enumerate(segments):
+        txt = (_seg_get(seg, text_key, "") or "").strip()
+        start = float(_seg_get(seg, start_key, 0) or 0)
+        if not txt:
+            out.append(seg)
+            continue
+        sents = [s for s in _SENT_SPLIT_RE.split(txt) if s.strip()]
+        keep: list = []
+        for sent in sents:
+            cw = _content_words(sent)
+            is_dup = False
+            if len(cw) >= min_content_words:
+                for (ps, pidx, pcw, praw) in reversed(kept_sents):
+                    if start - ps > window_s:
+                        break
+                    # Same-cue echoes ("Five? Five Gundams?") are deliberate
+                    # dramatic repeats — leave them to the intra-cue pass.
+                    if pidx == cue_idx or not pcw:
+                        continue
+                    denom = min(len(cw), len(pcw))
+                    if denom and (len(cw & pcw) / denom) >= similarity:
+                        is_dup = True
+                        break
+                    if _text_similarity(sent, praw) >= 0.8:
+                        is_dup = True
+                        break
+            if is_dup:
+                dropped += 1
+            else:
+                keep.append(sent)
+                kept_sents.append((start, cue_idx, cw, sent))
+        if not keep:
+            continue  # every sentence was a repeat — drop the cue
+        if len(keep) != len(sents):
+            _seg_set(seg, text_key, " ".join(keep))
+        out.append(seg)
+    if dropped:
+        return out, dropped
+    return segments, 0
+
+
+def drop_bare_glossary_runs(
+    segments: list,
+    glossary_terms,
+    text_key: str = "text",
+    start_key: str = "start",
+    min_run: int = 2,
+    max_gap_s: float = 30.0,
+) -> tuple[list, int]:
+    """Drop RUNS of consecutive cues that are each a bare glossary term.
+
+    The observed failure: over ED music, Whisper hallucinates romaji lyric
+    fragments and the translator maps each to the nearest pinned name —
+    shipping "Justlove." / "Space Port." / "Gundanium." as three consecutive
+    subtitles. A single bare name can be legitimate dialogue (someone called
+    by name), so only a RUN of ≥ ``min_run`` such cues (each within
+    ``max_gap_s`` of the previous) is treated as music-section noise and
+    removed. Returns ``(segments, dropped_count)``."""
+    terms = {str(t or "").strip().lower() for t in (glossary_terms or []) if t}
+    if not segments or len(terms) < 2:
+        return segments, 0
+
+    def _is_bare(seg) -> bool:
+        txt = (_seg_get(seg, text_key, "") or "").strip()
+        core = re.sub(r"[^\w\s']+", "", txt).strip().lower()
+        return bool(core) and len(core.split()) <= 3 and core in terms
+
+    flags = [_is_bare(s) for s in segments]
+    drop: set = set()
+    i = 0
+    while i < len(segments):
+        if not flags[i]:
+            i += 1
+            continue
+        j = i
+        run = [i]
+        while j + 1 < len(segments) and flags[j + 1]:
+            _gap = (float(_seg_get(segments[j + 1], start_key, 0) or 0)
+                    - float(_seg_get(segments[j], start_key, 0) or 0))
+            if _gap > max_gap_s:
+                break
+            run.append(j + 1)
+            j += 1
+        if len(run) >= min_run:
+            drop.update(run)
+        i = j + 1
+    if not drop:
+        return segments, 0
+    return [s for k, s in enumerate(segments) if k not in drop], len(drop)

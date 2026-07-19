@@ -644,10 +644,24 @@ async def _get_whisper_en_timing_reference(
         return []
     if not video_path:
         return []
+    # Companion path: when the paired remote Whisper advertises the translate
+    # task, the reference pass runs on THAT GPU (~40× realtime — the same rig
+    # transcribed a full 24-min episode in 34 s), needing neither local VRAM
+    # nor a cached local engine. The local gates below only protect the local
+    # decode path — a real run skipped here at "2.9 GB free < 3.0 floor" and
+    # shipped tier-B timing its Companion could have upgraded for ~40 s.
+    _remote_translate = False
+    try:
+        from backend.services.reframer_audio import (
+            remote_whisper_configured, remote_whisper_supports_translate)
+        _remote_translate = bool(
+            remote_whisper_configured() and remote_whisper_supports_translate())
+    except Exception:
+        _remote_translate = False
     cached = _whisper_engine_cached()
     free_gb = _gpu_free_vram_gb()
     floor = float(getattr(settings, "HYBRID_WHISPER_REF_MIN_FREE_GB", 3.0))
-    if not cached and free_gb < floor:
+    if not _remote_translate and not cached and free_gb < floor:
         logger.info(
             "[%s] Hybrid timing: skipping Whisper-EN reference (engine not cached, "
             "only %.1f GB free < %.1f GB floor) — degrading to tier B",
@@ -694,6 +708,11 @@ async def _get_whisper_en_timing_reference(
     # short windowed pass: MORE tier-A timing than before, not less.
     decode_s = sum(e - s for s, e in windows) if windows else audio_s
     speedup = float(getattr(settings, "HYBRID_LOCAL_TRANSLATE_SPEEDUP", 2.5))
+    if _remote_translate:
+        speedup = 0.0  # remote Companion decode — the local estimator is moot
+        logger.info(
+            "[%s] Hybrid timing: Whisper-EN reference will run on the remote "
+            "Companion (translate task advertised)", job_id)
     if decode_s > 0 and speedup > 0 and (decode_s / speedup) > timeout:
         logger.info(
             "[%s] Hybrid timing: skipping Whisper-EN reference — est. local "
@@ -3694,11 +3713,38 @@ async def _background_post_processing(
                     # would otherwise mask the high counts and leave 3× repeats.
                     _tl, _s = drop_scattered_duplicates(_tl)
                     _tl, _l = drop_repetition_loops(_tl)
+                # Sentence-level near-duplicate removal: the two patterns the
+                # whole-cue overlap pass can't see — a re-decoded span at
+                # SHIFTED times whose translation paraphrases a nearby cue,
+                # and a duplicated sentence embedded inside a longer
+                # neighboring cue (both shipped in a real run opening
+                # narration). Conservative: ≥5 content words per sentence.
+                _sd = 0
+                if bool(getattr(settings, "SUBTITLE_SENTENCE_DEDUP_ENABLED", True)):
+                    from backend.services.transcript_dedup import drop_repeated_sentences
+                    _tl, _sd = drop_repeated_sentences(_tl)
+                # Runs of consecutive bare glossary-term cues — music-section
+                # hallucinations the translator mapped onto pinned names
+                # ("Justlove." / "Space Port." / "Gundanium." over the ED).
+                # A single bare name can be real dialogue, so only runs go.
+                _bg = 0
+                if bool(getattr(settings, "TRANSLATION_BARE_GLOSSARY_RUN_DROP", True)):
+                    try:
+                        from backend.services.glossary import extract_recurring_terms
+                        from backend.services.transcript_dedup import drop_bare_glossary_runs
+                        _tl, _bg = drop_bare_glossary_runs(
+                            _tl, extract_recurring_terms(transcript, ""))
+                    except Exception as _bg_err:
+                        logger.debug("[%s] bare-glossary-run drop skipped: %s",
+                                     job_id, _bg_err)
                 translated = _tl
-                if _a or _o or _l or _s or _r or _ic:
+                if _a or _o or _l or _s or _r or _ic or _sd or _bg:
                     logger.info(
-                        "[%s] Translated transcript dedup: %d → %d (%d run, %d adj, %d overlap, %d loop, %d scattered, %d intra-cue)",
-                        job_id, _pre_dd, len(translated), _r, _a, _o, _l, _s, _ic)
+                        "[%s] Translated transcript dedup: %d → %d (%d run, %d adj, "
+                        "%d overlap, %d loop, %d scattered, %d intra-cue, "
+                        "%d sentence, %d bare-glossary)",
+                        job_id, _pre_dd, len(translated), _r, _a, _o, _l, _s, _ic,
+                        _sd, _bg)
             except Exception as _dd_err:
                 logger.warning("[%s] Translated dedup skipped (%s)", job_id, _dd_err)
 

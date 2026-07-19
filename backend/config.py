@@ -1126,6 +1126,17 @@ class Settings(BaseSettings):
     # once." 3 keeps a genuine double ("No, no.") but collapses a 3×+ loop
     # ("no no no" → "no no").
     SUBTITLE_INTRA_CUE_MIN_WORD_RUN: int = 3
+    # Sentence-level near-duplicate removal on the translated track: drops a
+    # sentence that near-repeats (content-word overlap ≥0.72) a sentence from
+    # a cue within the previous 25 s — the shifted-re-decode paraphrase and
+    # embedded-duplicate-sentence patterns the whole-cue overlap dedup can't
+    # see. ≥5 content words required, so short legitimate repeats
+    # ("Fire! Fire!") are never touched.
+    SUBTITLE_SENTENCE_DEDUP_ENABLED: bool = True
+    # Drop RUNS (≥2 consecutive) of cues that are each a bare glossary term —
+    # music-section hallucinations the translator mapped onto pinned names.
+    # A single bare name (someone called by name) is always kept.
+    TRANSLATION_BARE_GLOSSARY_RUN_DROP: bool = True
     # Per-batch time budget (seconds) for the polish loop when it runs on the
     # translation model. The translation model (qwen3:4b) is larger than the
     # editorial model and may run on CPU on a 4 GB card, so its batches are
