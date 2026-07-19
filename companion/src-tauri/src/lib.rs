@@ -970,20 +970,19 @@ async fn perform_self_update_inner(
             resp.status()
         ));
     }
-    // Filename from Content-Disposition, else a platform default.
-    let fallback = if UPDATE_PLATFORM == "mac" {
+    // On-disk name: a FIXED, safe filename per platform. The server's
+    // Content-Disposition ("ClipAI GPU Companion_0.2.6_x64-setup.exe") carries
+    // spaces AND an RFC-5987 ``filename*=utf-8''…`` part; the old
+    // ``split("filename=").nth(1)`` swallowed that tail, producing an on-disk
+    // path with embedded quotes/`;`/`%` that shattered the launch script's
+    // quoting and popped a "Windows cannot find '\\'" dialog while the app was
+    // already exiting. We don't need the server's name for anything — the file
+    // is a throwaway we execute once — so never trust it for the FS path.
+    let filename = if UPDATE_PLATFORM == "mac" {
         "ClipAI-GPU-Companion-update.dmg"
     } else {
         "ClipAI-GPU-Companion-update.exe"
     };
-    let filename = resp
-        .headers()
-        .get("content-disposition")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split("filename=").nth(1))
-        .map(|v| v.trim_matches(&['"', ' '][..]).to_string())
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| fallback.to_string());
     // Stream the body so the progress bar (GUI + ClipAI's remote card) tracks
     // the real download instead of jumping 0 → done.
     let total = resp.content_length().unwrap_or(0);
@@ -1057,15 +1056,52 @@ async fn perform_self_update_inner(
             use std::os::windows::process::CommandExt;
             let exe = std::env::current_exe()
                 .map_err(|e| format!("could not resolve app path: {e}"))?;
+            let exe_str = exe.display().to_string();
+            let path_str = path.display().to_string();
+            // Guard the exact failure that stranded a user: NEVER build a
+            // launch line around an empty/degenerate path (that is what
+            // produced `start "" ""` → the "cannot find '\\'" dialog).
+            if exe_str.trim().is_empty() || path_str.trim().is_empty() {
+                return Err(format!(
+                    "refusing to launch silent update — degenerate path \
+                     (installer={path_str:?}, app={exe_str:?})"
+                ));
+            }
+            // Write a real .cmd file instead of an inline `cmd /C "…"` string:
+            // the app's own path has spaces, and interpolating it into a
+            // single command line is what let quoting break. A script file
+            // sidesteps all shell-escaping of the interpolated paths.
+            //   * `ping -n 4 127.0.0.1` waits ~3 s WITHOUT a console — `timeout`
+            //     needs console input and silently errors under CREATE_NO_WINDOW,
+            //     so the app could still hold files when the installer started.
+            //   * a post-install `ping` loop waits for the installer to drop the
+            //     new exe before relaunching, so a slow (>3 s) install no longer
+            //     races the `start` and 404s the path.
+            let script_path = std::env::temp_dir().join("clipai-companion-update.cmd");
             let script = format!(
-                "timeout /t 3 /nobreak >nul & \"{}\" /S & start \"\" \"{}\"",
-                path.display(),
-                exe.display()
+                "@echo off\r\n\
+                 ping -n 4 127.0.0.1 >nul\r\n\
+                 \"{path_str}\" /S\r\n\
+                 for /l %%i in (1,1,30) do (\r\n\
+                 \x20 if exist \"{exe_str}\" ( start \"\" \"{exe_str}\" & goto done )\r\n\
+                 \x20 ping -n 2 127.0.0.1 >nul\r\n\
+                 )\r\n\
+                 :done\r\n\
+                 del \"%~f0\"\r\n"
+            );
+            std::fs::write(&script_path, script)
+                .map_err(|e| format!("could not write update script: {e}"))?;
+            log::info!(
+                "self-update: silent update script written to {} (installer={}, app={})",
+                script_path.display(), path_str, exe_str
             );
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            const DETACHED_PROCESS: u32 = 0x0000_0008;
             std::process::Command::new("cmd")
-                .args(["/C", &script])
-                .creation_flags(CREATE_NO_WINDOW)
+                // Pass the script path as a real argv entry (not concatenated
+                // into a command string) so its own spaces can't break parsing.
+                .args(["/C", &script_path.display().to_string()])
+                .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
                 .spawn()
                 .map_err(|e| format!("could not launch silent installer: {e}"))?;
         }
