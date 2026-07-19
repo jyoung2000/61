@@ -428,6 +428,19 @@ RUN mkdir -p /app/backend/models/insightface && \
                              providers=['CPUExecutionProvider']).prepare(ctx_id=-1, det_size=(320,320))" \
     || echo "WARN: buffalo_s pre-download failed — will download at runtime"
 
+# ── GPU onnxruntime for u2netp saliency ─────────────────────────────────
+# Swap the CPU wheel (pulled by requirements.txt) for onnxruntime-gpu so the
+# u2netp salient-object model runs on CUDA during the face loop — the
+# profiled anime run spent most of its per-sample overhead on these CPU
+# forwards (~0.4-0.5 s each; ~5-15 ms on the GPU). The GPU wheel bundles the
+# CPU EP too, so CPU-pinned callers (insightface/ArcFace above) behave
+# exactly as before. 1.19.x is the CUDA 12 / cuDNN 9 build matching this
+# base image. Fail-soft: if the GPU wheel can't install, restore the CPU
+# wheel so the build never breaks (u2netp then runs on CPU as before).
+RUN pip3 uninstall -y onnxruntime onnxruntime-gpu || true && \
+    (pip3 install --no-cache-dir "onnxruntime-gpu==1.19.2" || \
+     pip3 install --no-cache-dir "onnxruntime>=1.17.0")
+
 # Copy backend source
 COPY backend/ ./backend/
 # The SEO intelligence layer ships data files (banned tags, evergreen

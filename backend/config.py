@@ -720,6 +720,14 @@ class Settings(BaseSettings):
     # model file is present at REFRAMER_U2NET_MODEL_PATH.
     REFRAMER_U2NET_SALIENCY: bool = True
     REFRAMER_U2NET_MODEL_PATH: str = ""        # path to u2netp.onnx (blank ⇒ falls back to spectral)
+    # u2netp device: auto | cuda | cpu. ``auto`` uses onnxruntime's CUDA
+    # provider when the GPU wheel is installed (Dockerfile.gpu ships it) and
+    # free VRAM clears the floor — with remote Whisper/Ollama the local card
+    # is idle during the face loop, and the CPU forwards were the dominant
+    # per-sample cost on faceless (anime) content. Any CUDA failure falls
+    # back to the classic OpenCV CPU path mid-run with identical outputs.
+    REFRAMER_U2NET_DEVICE: str = "auto"
+    REFRAMER_U2NET_GPU_MIN_FREE_MB: int = 300
     # ── Sample-loop speed (profiled: 612s of a 926s perception stage was
     # per-sample "other" work, ~75-90% of it u2netp CPU forwards on faceless
     # anime samples) ──
