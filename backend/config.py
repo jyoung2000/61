@@ -1528,6 +1528,14 @@ class Settings(BaseSettings):
     # transliterated, not translated into ordinary words. Content-agnostic; works
     # in any source language. Set False to disable the auto glossary.
     TRANSLATION_AUTO_GLOSSARY: bool = True
+    # Canonical-name resolution: one title-anchored LLM call upgrades mis-heard
+    # auto-glossary romaji ("Ririna", "Zex") to the official English names
+    # ("Relena Darlian", "Zechs") before translation, so names render the way
+    # official subtitles would. Fail-soft; user custom vocabulary always wins.
+    TRANSLATION_CANONICAL_NAMES: bool = True
+    TRANSLATION_CANONICAL_NAMES_TIMEOUT: float = 45.0   # LLM call timeout (s)
+    TRANSLATION_CANONICAL_NAMES_MAX_TERMS: int = 40     # terms sent per call
+    TRANSLATION_CANONICAL_NAMES_MODEL: str = ""         # optional model override
     # Push the LLM translator toward natural, idiomatic English (dub/localization
     # phrasing) instead of a structurally-literal rendering — while preserving
     # the exact meaning. Set False to revert to the plain faithful style.

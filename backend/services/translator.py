@@ -672,6 +672,7 @@ async def translate_via_llm(
     # transliterated, not translated into ordinary words. Content-agnostic.
     _auto_terms = ""
     _user_vocab: list = []
+    _canon_map = None
     try:
         from backend.services.glossary import (
             build_translation_glossary_block, load_custom_vocabulary_terms)
@@ -681,9 +682,41 @@ async def translate_via_llm(
         # names — so an explicit custom vocabulary is honored even with auto off.
         # When auto is off, pass no segments so ONLY the user's names seed it.
         if _use_auto or _user_vocab:
+            # Canonical-name resolution: one title-anchored LLM call upgrades
+            # mis-heard auto-glossary romaji ("Ririna", "Zex", "Hero Yuu") to
+            # the official English names ("Relena Darlian", "Zechs",
+            # "Heero Yuy") BEFORE translation, so the whole episode renders
+            # names the way the official subtitles would. Fail-soft — no
+            # title, no LLM, or a bad answer just keeps the mined spellings.
+            # User custom-vocabulary terms are never rewritten.
+            if _use_auto and bool(getattr(settings, "TRANSLATION_CANONICAL_NAMES", True)):
+                try:
+                    import os as _os
+                    from backend.services.canonical_names import resolve_canonical_names
+                    from backend.services.glossary import extract_recurring_terms
+                    _title = ""
+                    if job_id:
+                        try:
+                            from backend import database as _db
+                            _j = await _db.load_job(job_id)
+                            _title = ((getattr(_j, "filename", "") or "").strip()
+                                      or _os.path.basename(
+                                          (getattr(_j, "file_path", "") or "").strip()))
+                        except Exception:
+                            _title = ""
+                    _canon_map = await resolve_canonical_names(
+                        extract_recurring_terms(segments, source_language),
+                        _title, orchestrator, job_id=job_id)
+                    if _canon_map:
+                        logger.info(
+                            "LLM translate: canonical names resolved from title %r — "
+                            "%d mapping(s): %s", _title, len(_canon_map),
+                            "; ".join(f"{k}→{v}" for k, v in list(_canon_map.items())[:8]))
+                except Exception as _cn_e:
+                    logger.debug("canonical-name resolution skipped: %s", _cn_e)
             _auto_terms = build_translation_glossary_block(
                 segments if _use_auto else [], source_language, tgt_name,
-                user_terms=_user_vocab)
+                user_terms=_user_vocab, canonical_map=_canon_map)
             if _auto_terms:
                 logger.info("LLM translate: attached names glossary (%d term chars, "
                             "%d user term(s)) for consistency",
@@ -706,6 +739,12 @@ async def translate_via_llm(
                 _user_vocab,
                 extract_recurring_terms(segments, source_language), cap=60)
             if (t or "").strip()
+        }
+        # The glossary block may now carry canonical spellings — an echo dump
+        # would contain those, not just the mined romaji.
+        _echo_terms |= {
+            (v or "").strip().lower() for v in (_canon_map or {}).values()
+            if (v or "").strip()
         }
     except Exception:
         _echo_terms = set()

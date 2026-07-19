@@ -1,0 +1,315 @@
+"""Canonical-name resolution for the auto translation glossary.
+
+The auto glossary (``backend/services/glossary.py``) mines recurring proper
+nouns straight out of the Whisper transcript, so it faithfully locks in
+Whisper's *mis-heard romaji* — a real Gundam Wing run shipped "Ririna / Leena
+Dorian" (official: Relena Darlian), "Zex/Zekus" (Zechs), "Hero Yuu" (Heero
+Yuy), "Katō" (Quatre) and so on, because the glossary told the translator to
+keep those wrong spellings "consistent".
+
+The video title ("MOBILE SUIT GUNDAM WING Episode 1") is available in job
+metadata, and even a small local model (gemma3:12b on the Companion) knows the
+series' canonical English names. This module makes ONE fail-soft LLM call that
+maps each mined term to its canonical official English romanization, producing
+a ``{detected: canonical}`` dict the glossary builder renders as
+``"Ririna → Relena Darlian"`` entries — so the translation LLM converges on
+the right spelling instead of the mis-heard one.
+
+Design constraints:
+  * ONE call per job (module-level cache keyed by job_id), ~45 s timeout,
+    ``skip_circuit_breaker=True`` so a failure never degrades the provider
+    chain for the actual translation.
+  * Fail-soft everywhere: any error → ``{}`` and the glossary ships as-is.
+  * Defensive parsing: only accept a JSON object; drop non-string values,
+    identity mappings, sentence-like values, invented keys (keys must come
+    from the input term list), profane values, and duplicate canonical values
+    whose sources are not obvious variants of each other (e.g. "Zex" and
+    "Zekus" may both → "Zechs", but "Shuttle" → "Zechs" is dropped).
+  * Non-name terms ("shuttle", "colony", "capsule") pass through unmapped
+    unless the LLM explicitly (and plausibly) maps them.
+
+Config knobs (all optional, read via ``getattr(settings, ..., default)``):
+  * ``TRANSLATION_CANONICAL_NAMES: bool = True`` — master switch.
+  * ``TRANSLATION_CANONICAL_NAMES_TIMEOUT: float = 45.0`` — LLM call timeout.
+  * ``TRANSLATION_CANONICAL_NAMES_MAX_TERMS: int = 40`` — cap on terms sent.
+  * ``TRANSLATION_CANONICAL_NAMES_MODEL: str = ""`` — optional
+    ``model_override`` for the orchestrator call.
+"""
+from __future__ import annotations
+
+import asyncio
+import difflib
+import json
+import logging
+import re
+
+logger = logging.getLogger("clipai.canonical_names")
+
+# ── Defaults (overridable via settings, see module docstring) ──
+_DEF_TIMEOUT = 45.0
+_DEF_MAX_TERMS = 40
+
+# Canonical values longer than this are "the model wrote a sentence", not a
+# name — official romanizations are 1-4 words ("Relena Darlian", "Mobile Suit
+# Gundam Wing" edge-cases included).
+_MAX_VALUE_WORDS = 4
+_MAX_VALUE_CHARS = 60
+
+# Deny-heuristic: never emit a canonical value containing profanity (a
+# hallucinating model must not be able to inject slurs into the translation
+# prompt as an "official name"). Word-boundary match, case-insensitive.
+_PROFANITY = {
+    "fuck", "fucking", "shit", "bitch", "cunt", "asshole", "bastard",
+    "dick", "cock", "pussy", "whore", "slut", "nigger", "faggot", "retard",
+}
+_PROFANITY_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(w) for w in sorted(_PROFANITY)) + r")\b",
+    re.IGNORECASE,
+)
+
+# ── Per-job in-module cache: repeat calls within a job are free. Failures are
+# cached too ({}) — this is a single-shot pre-translation step and retrying a
+# dead/slow provider mid-job would just stall the pipeline again. ──
+_CACHE: dict[str, dict[str, str]] = {}
+_CACHE_MAX = 64
+
+
+def clear_cache() -> None:
+    """Test hook / memory hygiene."""
+    _CACHE.clear()
+
+
+def _cache_put(key: str, value: dict[str, str]) -> None:
+    if len(_CACHE) >= _CACHE_MAX:
+        try:
+            _CACHE.pop(next(iter(_CACHE)))
+        except Exception:
+            _CACHE.clear()
+    _CACHE[key] = value
+
+
+def _settings():
+    try:
+        from backend.config import settings
+        return settings
+    except Exception:
+        return None
+
+
+def _clean_terms(auto_terms, max_terms: int) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in auto_terms or []:
+        term = str(raw or "").strip()
+        key = term.lower()
+        if not term or len(term) > 80 or key in seen:
+            continue
+        seen.add(key)
+        out.append(term)
+        if len(out) >= max_terms:
+            break
+    return out
+
+
+def _normalize(s: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+
+def _similar(a: str, b: str) -> bool:
+    """True when ``a`` and ``b`` are plausibly the same name mis-heard —
+    "Zex"/"Zechs", "Zekus"/"Zechs". Used only for the duplicate-value guard."""
+    na, nb = _normalize(a), _normalize(b)
+    if not na or not nb:
+        return False
+    if na == nb:
+        return True
+    if len(na) >= 3 and len(nb) >= 3 and (na.startswith(nb) or nb.startswith(na)):
+        return True
+    return difflib.SequenceMatcher(None, na, nb).ratio() >= 0.5
+
+
+def _parse_json_object(raw: str) -> dict | None:
+    """Best-effort extraction of a JSON object from an LLM response."""
+    if not raw or not isinstance(raw, str):
+        return None
+    data = None
+    try:
+        from backend.services.providers.base import extract_json
+        parsed = extract_json(raw)
+        if isinstance(parsed, dict):
+            data = parsed
+    except Exception:
+        data = None
+    if data is None:
+        try:
+            start, end = raw.index("{"), raw.rindex("}")
+            parsed = json.loads(raw[start:end + 1])
+            if isinstance(parsed, dict):
+                data = parsed
+        except Exception:
+            return None
+    if data is None:
+        return None
+    # Unwrap a single wrapper key ({"mappings": {...}}) when the top level
+    # carries no string values itself.
+    if data and not any(isinstance(v, str) for v in data.values()):
+        for v in data.values():
+            if isinstance(v, dict):
+                return v
+    return data
+
+
+def _sanitize_mapping(raw: dict, terms: list[str]) -> dict[str, str]:
+    """Reduce a raw LLM dict to safe ``{detected_term: canonical}`` entries.
+
+    Drops: keys not in ``terms`` (never invent names), non-string values,
+    identity mappings, sentence-like / over-long values, profane values, and
+    colliding canonical values whose sources are not obvious variants.
+    """
+    by_lower = {t.lower(): t for t in terms}
+    out: dict[str, str] = {}
+    for k, v in (raw or {}).items():
+        if not isinstance(k, str) or not isinstance(v, str):
+            continue
+        src = by_lower.get(k.strip().lower())
+        if not src:
+            continue  # invented / hallucinated key — not one of our terms
+        val = " ".join(v.strip().split())
+        if not val or len(val) > _MAX_VALUE_CHARS:
+            continue
+        if len(val.split()) > _MAX_VALUE_WORDS:
+            continue  # looks like a sentence/explanation, not a name
+        if val.lower() == src.lower():
+            continue  # identity mapping adds nothing
+        if _PROFANITY_RE.search(val):
+            continue
+        out[src] = val
+
+    # Duplicate-canonical guard: two sources may share a canonical value only
+    # when they are obvious variants (of the value or of each other).
+    groups: dict[str, list[str]] = {}
+    for src, val in out.items():
+        groups.setdefault(val.lower(), []).append(src)
+    for _val_key, srcs in groups.items():
+        if len(srcs) < 2:
+            continue
+        keep = [s for s in srcs if _similar(s, out[s])]
+        changed = True
+        while changed:
+            changed = False
+            for s in srcs:
+                if s not in keep and any(_similar(s, k) for k in keep):
+                    keep.append(s)
+                    changed = True
+        for s in srcs:
+            if s not in keep:
+                out.pop(s, None)
+    return out
+
+
+def _build_prompt(terms: list[str], video_title: str, series_hint: str) -> str:
+    title = (video_title or "").strip()
+    hint = (series_hint or "").strip()
+    context_bits = []
+    if title:
+        context_bits.append(f'This is a video titled "{title}".')
+    if hint:
+        context_bits.append(f"Series/context hint: {hint}.")
+    context = " ".join(context_bits)
+    terms_json = json.dumps(terms, ensure_ascii=False)
+    return (
+        f"{context}\n"
+        "The following terms were automatically detected in its speech "
+        "transcript. Some are names of characters, people, places, machines, "
+        "ships, or organizations from this work that the speech recognizer "
+        "romanized incorrectly; others are ordinary words.\n\n"
+        f"DETECTED TERMS: {terms_json}\n\n"
+        "For each detected term that you recognize as a name from this work, "
+        "map it to its canonical official English romanization (the spelling "
+        "used in the official English release).\n"
+        "Return ONLY a JSON object mapping detected term to canonical "
+        'spelling, e.g. {"Ririna": "Relena", "Zekus": "Zechs"}.\n'
+        "Rules:\n"
+        "- Keys MUST be terms copied exactly from DETECTED TERMS. NEVER "
+        "invent or add names that are not in the list.\n"
+        "- If you do not recognize a term, or it is an ordinary word (e.g. "
+        '"shuttle", "colony"), return it unchanged or omit it.\n'
+        "- Values must be short proper names (1-4 words), never sentences or "
+        "explanations.\n"
+    )
+
+
+async def resolve_canonical_names(
+    auto_terms: list[str],
+    video_title: str,
+    orchestrator,
+    job_id: str = "",
+    series_hint: str = "",
+) -> dict[str, str]:
+    """Map mined transcript terms to canonical official English names.
+
+    ONE LLM call via ``orchestrator.text_completion`` (json_mode when
+    supported, ``skip_circuit_breaker=True``, ~45 s timeout). Returns
+    ``{detected_term: canonical_name}`` for the terms the model recognized;
+    ``{}`` on any error, when disabled, or when there is nothing to anchor on
+    (no terms, or no title AND no series hint). Cached in-module per job so
+    repeat calls are free.
+    """
+    key = None
+    try:
+        s = _settings()
+        if s is not None and not bool(getattr(s, "TRANSLATION_CANONICAL_NAMES", True)):
+            return {}
+        max_terms = int(getattr(s, "TRANSLATION_CANONICAL_NAMES_MAX_TERMS", _DEF_MAX_TERMS) or _DEF_MAX_TERMS) if s else _DEF_MAX_TERMS
+        terms = _clean_terms(auto_terms, max_terms=max(1, max_terms))
+        if not terms or orchestrator is None:
+            return {}
+        title = (video_title or "").strip()
+        hint = (series_hint or "").strip()
+        if not title and not hint:
+            # Nothing identifies the work — the model would have to guess the
+            # series, which is exactly the invention we must not allow.
+            return {}
+
+        key = f"job:{job_id}" if job_id else (
+            "anon:" + title.lower() + "|" + "|".join(sorted(t.lower() for t in terms)))
+        cached = _CACHE.get(key)
+        if cached is not None:
+            return dict(cached)
+
+        timeout = float(getattr(s, "TRANSLATION_CANONICAL_NAMES_TIMEOUT", _DEF_TIMEOUT) or _DEF_TIMEOUT) if s else _DEF_TIMEOUT
+        model = str(getattr(s, "TRANSLATION_CANONICAL_NAMES_MODEL", "") or "").strip() if s else ""
+
+        prompt = _build_prompt(terms, title, hint)
+        kwargs: dict = {
+            "max_tokens": min(2048, 200 + 24 * len(terms)),
+            "timeout": timeout,
+            "job_id": job_id or "",
+            "skip_circuit_breaker": True,
+            "json_mode": True,
+        }
+        if model:
+            kwargs["model_override"] = model
+        try:
+            raw = await asyncio.wait_for(
+                orchestrator.text_completion(prompt, **kwargs), timeout + 15)
+        except TypeError:
+            # Orchestrator variant without json_mode/model_override kwargs —
+            # retry with the bare positional call (wait_for still bounds it).
+            raw = await asyncio.wait_for(
+                orchestrator.text_completion(prompt), timeout + 15)
+
+        data = _parse_json_object(raw or "")
+        result = _sanitize_mapping(data, terms) if data else {}
+        if result:
+            logger.info(
+                "[%s] canonical names resolved for %d/%d term(s): %s",
+                job_id or "-", len(result), len(terms),
+                "; ".join(f"{k}→{v}" for k, v in list(result.items())[:8]))
+        _cache_put(key, result)
+        return dict(result)
+    except Exception as e:
+        logger.debug("[%s] canonical name resolution skipped: %s", job_id or "-", e)
+        if key is not None:
+            _cache_put(key, {})
+        return {}

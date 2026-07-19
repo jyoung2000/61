@@ -1,0 +1,278 @@
+"""Canonical-name resolution for the auto translation glossary.
+
+The Gundam Wing E01 run shipped "Ririna / Leena Dorian", "Zex/Zekus", "Hero
+Yuu", "Katō" etc. because the auto glossary locked in Whisper's mis-heard
+romaji. ``resolve_canonical_names`` asks one LLM call (anchored on the video
+title) to map detected terms to official English names; these tests pin down
+its parse robustness, deny-heuristics, fail-softness, caching, and the
+glossary-block rendering with user-term precedence.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+
+import pytest
+
+from backend.services import canonical_names as CN
+from backend.services.canonical_names import resolve_canonical_names
+from backend.services.glossary import (
+    build_recurring_terms_block,
+    build_translation_glossary_block,
+)
+
+TITLE = "MOBILE SUIT GUNDAM WING Episode 1"
+TERMS = ["Ririna", "Zex", "Zekus", "Hero Yuu", "Katō", "Shuttle", "Colony"]
+
+
+class DummyOrch:
+    """Mock orchestrator recording calls; returns a canned response."""
+
+    def __init__(self, response="", exc=None):
+        self.response = response
+        self.exc = exc
+        self.calls = []
+
+    async def text_completion(self, prompt, **kwargs):
+        self.calls.append((prompt, kwargs))
+        if self.exc is not None:
+            raise self.exc
+        return self.response
+
+
+class NoJsonModeOrch:
+    """Orchestrator variant whose signature rejects json_mode (TypeError)."""
+
+    def __init__(self, response):
+        self.response = response
+        self.calls = 0
+
+    async def text_completion(self, prompt, max_tokens=4096, timeout=60,
+                              job_id="", skip_circuit_breaker=False,
+                              model_override=None):
+        self.calls += 1
+        return self.response
+
+
+@pytest.fixture(autouse=True)
+def _fresh_cache():
+    CN.clear_cache()
+    yield
+    CN.clear_cache()
+
+
+def _resolve(orch, terms=None, title=TITLE, job_id="", series_hint=""):
+    return asyncio.run(resolve_canonical_names(
+        terms if terms is not None else list(TERMS), title, orch,
+        job_id=job_id, series_hint=series_hint))
+
+
+# ── Happy path + parse robustness ──
+
+
+def test_happy_path_maps_names_and_leaves_common_nouns_alone():
+    resp = json.dumps({
+        "Ririna": "Relena", "Zex": "Zechs", "Zekus": "Zechs",
+        "Hero Yuu": "Heero Yuy", "Katō": "Quatre",
+        "Shuttle": "Shuttle", "Colony": "Colony",  # identities → dropped
+    })
+    orch = DummyOrch(resp)
+    out = _resolve(orch)
+    assert out == {"Ririna": "Relena", "Zex": "Zechs", "Zekus": "Zechs",
+                   "Hero Yuu": "Heero Yuy", "Katō": "Quatre"}
+    assert "Shuttle" not in out and "Colony" not in out
+    # ONE LLM call, json_mode requested, circuit breaker skipped.
+    assert len(orch.calls) == 1
+    kwargs = orch.calls[0][1]
+    assert kwargs.get("json_mode") is True
+    assert kwargs.get("skip_circuit_breaker") is True
+
+
+def test_parses_fenced_and_prose_wrapped_json():
+    resp = ("Sure! Here is the mapping:\n```json\n"
+            '{"Ririna": "Relena", "Colony": "Colony"}\n```\nHope that helps.')
+    out = _resolve(DummyOrch(resp))
+    assert out == {"Ririna": "Relena"}
+
+
+def test_keys_matched_case_insensitively_to_input_surface_form():
+    out = _resolve(DummyOrch('{"ririna": "Relena", "ZEX": "Zechs"}'))
+    assert out == {"Ririna": "Relena", "Zex": "Zechs"}
+
+
+def test_non_dict_and_garbage_responses_yield_empty():
+    assert _resolve(DummyOrch('["Relena", "Zechs"]')) == {}
+    CN.clear_cache()
+    assert _resolve(DummyOrch("no json here at all")) == {}
+    CN.clear_cache()
+    assert _resolve(DummyOrch("")) == {}
+
+
+def test_non_string_values_dropped():
+    resp = '{"Ririna": ["Relena"], "Zex": 5, "Katō": null, "Hero Yuu": "Heero Yuy"}'
+    assert _resolve(DummyOrch(resp)) == {"Hero Yuu": "Heero Yuy"}
+
+
+def test_sentence_like_values_dropped():
+    resp = json.dumps({
+        "Ririna": "This character is officially called Relena Darlian",
+        "Zex": "Zechs",
+    })
+    assert _resolve(DummyOrch(resp)) == {"Zex": "Zechs"}
+
+
+def test_invented_keys_dropped():
+    # "Wufei" is NOT in the detected terms — the model must not invent names.
+    resp = '{"Wufei": "Chang Wufei", "Ririna": "Relena"}'
+    assert _resolve(DummyOrch(resp)) == {"Ririna": "Relena"}
+
+
+def test_wrapper_object_unwrapped():
+    resp = '{"mappings": {"Ririna": "Relena"}}'
+    assert _resolve(DummyOrch(resp)) == {"Ririna": "Relena"}
+
+
+# ── Deny-heuristics ──
+
+
+def test_profane_values_dropped():
+    resp = '{"Ririna": "Relena", "Zex": "Fucking Zechs"}'
+    assert _resolve(DummyOrch(resp)) == {"Ririna": "Relena"}
+
+
+def test_duplicate_canonical_allowed_only_for_obvious_variants():
+    # Zex + Zekus are variants of "Zechs" → both kept; "Shuttle" mapping to
+    # the same value is not a variant → dropped.
+    resp = json.dumps({"Zex": "Zechs", "Zekus": "Zechs", "Shuttle": "Zechs"})
+    out = _resolve(DummyOrch(resp))
+    assert out == {"Zex": "Zechs", "Zekus": "Zechs"}
+
+
+# ── Fail-soft + gating ──
+
+
+def test_orchestrator_error_yields_empty():
+    assert _resolve(DummyOrch(exc=RuntimeError("provider down"))) == {}
+
+
+def test_orchestrator_timeout_yields_empty():
+    assert _resolve(DummyOrch(exc=asyncio.TimeoutError())) == {}
+
+
+def test_no_terms_or_no_title_makes_no_llm_call():
+    orch = DummyOrch('{"Ririna": "Relena"}')
+    assert _resolve(orch, terms=[]) == {}
+    assert _resolve(orch, title="") == {}
+    assert orch.calls == []
+
+
+def test_series_hint_alone_is_enough_anchor():
+    orch = DummyOrch('{"Ririna": "Relena"}')
+    out = _resolve(orch, title="", series_hint="Mobile Suit Gundam Wing")
+    assert out == {"Ririna": "Relena"}
+    assert "Gundam Wing" in orch.calls[0][0]
+
+
+def test_disabled_via_settings_returns_empty(monkeypatch):
+    # The TRANSLATION_CANONICAL_NAMES field lands in config.py via the wiring
+    # change; until then the pydantic Settings model rejects unknown fields,
+    # so stub the module's settings accessor to flip the gate.
+    class _S:
+        TRANSLATION_CANONICAL_NAMES = False
+
+    monkeypatch.setattr(CN, "_settings", lambda: _S())
+    orch = DummyOrch('{"Ririna": "Relena"}')
+    assert _resolve(orch) == {}
+    assert orch.calls == []
+
+
+def test_json_mode_typeerror_falls_back_to_bare_call():
+    orch = NoJsonModeOrch('{"Ririna": "Relena"}')
+    assert _resolve(orch) == {"Ririna": "Relena"}
+    # first attempt (with json_mode) raised TypeError before the coroutine
+    # ran, so only the bare retry actually executed.
+    assert orch.calls == 1
+
+
+# ── Caching ──
+
+
+def test_cache_per_job_id_makes_repeat_calls_free():
+    orch = DummyOrch('{"Ririna": "Relena"}')
+    first = _resolve(orch, job_id="job-42")
+    second = _resolve(orch, job_id="job-42")
+    assert first == second == {"Ririna": "Relena"}
+    assert len(orch.calls) == 1
+
+
+def test_prompt_contains_title_and_all_terms():
+    orch = DummyOrch("{}")
+    _resolve(orch)
+    prompt = orch.calls[0][0]
+    assert TITLE in prompt
+    for t in TERMS:
+        assert t in prompt
+
+
+# ── Glossary block rendering + merge precedence ──
+
+
+def test_block_renders_arrow_entries_and_canonical_rule():
+    block = build_recurring_terms_block(
+        ["Ririna", "Colony"], "English",
+        canonical_map={"Ririna": "Relena Darlian"})
+    assert "Ririna → Relena Darlian" in block
+    assert "Colony" in block
+    assert "canonical" in block  # instruction line present
+
+
+def test_block_without_map_is_unchanged_format():
+    block = build_recurring_terms_block(["Ririna", "Colony"], "English")
+    assert "→" not in block
+    assert "canonical" not in block
+    assert "Ririna, Colony" in block
+
+
+def test_user_terms_always_win_over_canonical_rewrites():
+    block = build_recurring_terms_block(
+        ["Relena Darlian", "Ririna"], "English",
+        canonical_map={"Relena Darlian": "Wrong Name",
+                       "Ririna": "Relena Darlian"},
+        protected_terms=["Relena Darlian"])
+    assert "Relena Darlian → Wrong Name" not in block
+    assert "Wrong Name" not in block
+    assert "Ririna → Relena Darlian" in block
+
+
+def test_identity_mapping_not_rendered_as_arrow():
+    block = build_recurring_terms_block(
+        ["Zechs"], "English", canonical_map={"Zechs": "zechs"})
+    assert "→" not in block
+
+
+def test_build_translation_glossary_block_end_to_end_precedence_and_cap():
+    segs = [{"text": "Ririna went to the shuttle"},
+            {"text": "Ririna spoke to Zex"},
+            {"text": "Zex saluted"}]
+    block = build_translation_glossary_block(
+        segs, "ja", "English", user_terms=["Heero Yuy"],
+        canonical_map={"Ririna": "Relena Darlian",
+                       "Heero Yuy": "Hero Yu",  # must NOT rewrite user term
+                       "Zex": "Zechs"})
+    assert "Heero Yuy" in block and "Hero Yu," not in block and "→ Hero Yu" not in block
+    assert "Ririna → Relena Darlian" in block
+    assert "Zex → Zechs" in block
+    # user term ranks first in the merged list
+    assert block.index("Heero Yuy") < block.index("Ririna")
+
+
+def test_cap_preserved_with_canonical_map():
+    segs = []
+    for i in range(60):
+        # each name appears twice so it qualifies as recurring
+        segs.append({"text": f"Name{i:02d} met Name{i:02d}"})
+    cmap = {f"Name{i:02d}": f"Canon{i:02d}" for i in range(60)}
+    block = build_translation_glossary_block(
+        segs, "en", "English", max_terms=10, user_terms=[], canonical_map=cmap)
+    listed = [e for e in block.splitlines()[1].split(", ") if e.strip()]
+    assert len(listed) == 10

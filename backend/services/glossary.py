@@ -85,23 +85,56 @@ def extract_recurring_terms(
     return [term for c, term in ranked if c >= min_count][:max_terms]
 
 
-def build_recurring_terms_block(terms: list, target_lang: str = "the target language") -> str:
+def build_recurring_terms_block(
+    terms: list, target_lang: str = "the target language",
+    canonical_map: Optional[dict] = None, protected_terms: Optional[list] = None,
+) -> str:
     """Prompt block that pins recurring proper nouns to one consistent rendering.
 
     Empty string when there's nothing recurring, so it adds nothing to the
     prompt for content without recurring names.
+
+    ``canonical_map`` (``{detected_term: canonical_name}``, e.g. from
+    ``backend.services.canonical_names.resolve_canonical_names``) upgrades a
+    mis-heard auto term to a ``"Ririna → Relena Darlian"`` entry — same comma
+    list, same slot, so the translation LLM converges on the canonical
+    spelling instead of Whisper's romaji. ``protected_terms`` (the user's
+    custom-vocabulary spellings) are NEVER rewritten: user terms always win
+    over canonical rewrites. Lookups are case-insensitive; identity mappings
+    are ignored.
     """
     terms = [str(t).strip() for t in (terms or []) if str(t).strip()]
     if not terms:
         return ""
+    cmap = {
+        str(k).strip().lower(): str(v).strip()
+        for k, v in (canonical_map or {}).items()
+        if str(k or "").strip() and str(v or "").strip()
+    }
+    protected = {str(t or "").strip().lower() for t in (protected_terms or [])}
+    entries: list[str] = []
+    mapped_any = False
+    for t in terms:
+        canon = cmap.get(t.lower())
+        if canon and t.lower() not in protected and canon.lower() != t.lower():
+            entries.append(f"{t} → {canon}")
+            mapped_any = True
+        else:
+            entries.append(t)
     # Join with ", " NOT " · ": a small model that fails a cue sometimes echoes
     # this very template back as its "translation", and a middot-joined list is
     # the exact word-salad garble we then have to detect + repair downstream.
     # A comma list carries the same meaning with no salad template to mimic.
-    joined = ", ".join(terms)
+    joined = ", ".join(entries)
+    canon_rule = (
+        "Entries written as \"detected → canonical\" mean the left-hand "
+        "spelling is a mis-transcription: ALWAYS write that name using the "
+        "canonical right-hand spelling, never the left-hand one.\n"
+    ) if mapped_any else ""
     return (
         "RECURRING NAMES & TERMS — keep these consistent:\n"
         f"  {joined}\n"
+        + canon_rule +
         "Each of these appears several times in this video. Translate each one "
         f"the SAME way every time. Treat them as proper nouns: transliterate names "
         f"and coined terms into {target_lang} rather than translating them into "
@@ -145,6 +178,7 @@ def merge_glossary_terms(user_terms, auto_terms, cap: int = 40) -> list[str]:
 def build_translation_glossary_block(
     segments, source_lang: str = "", target_lang: str = "the target language",
     max_terms: int = 40, user_terms: Optional[list] = None,
+    canonical_map: Optional[dict] = None,
 ) -> str:
     """Extract + format the recurring-terms glossary in one call (empty string
     when there is nothing to pin).
@@ -155,9 +189,19 @@ def build_translation_glossary_block(
     name that Whisper mis-heard, that appears only once, or that is katakana in
     the source (so the model would guess the romanization) is still pinned to
     the exact spelling the user typed. User terms rank first and the merged list
-    is capped at ``max_terms`` to keep the per-batch prompt bounded."""
+    is capped at ``max_terms`` to keep the per-batch prompt bounded.
+
+    ``canonical_map`` (``{detected_term: canonical}``, typically from
+    ``backend.services.canonical_names.resolve_canonical_names`` fed with the
+    video title) rewrites mis-heard AUTO terms as ``"detected → canonical"``
+    entries in the block. User terms are passed through as the protected set,
+    so a spelling the user typed is never overridden by the LLM's canonical
+    guess. The cap is unchanged: the map only re-renders entries already in
+    the merged, capped list — it never adds terms."""
     if user_terms is None:
         user_terms = load_custom_vocabulary_terms()
     auto = extract_recurring_terms(segments, source_lang, max_terms=max_terms)
     merged = merge_glossary_terms(user_terms, auto, cap=max_terms)
-    return build_recurring_terms_block(merged, target_lang)
+    return build_recurring_terms_block(
+        merged, target_lang, canonical_map=canonical_map,
+        protected_terms=user_terms)
