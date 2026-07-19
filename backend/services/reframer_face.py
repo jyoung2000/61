@@ -135,6 +135,11 @@ class FaceDetector:
         except Exception:
             self._yolo_stride = 2
         self._yolo_det_count = 0            # detect() calls since last YOLO run
+        # Consecutive detect() calls that ended with zero faces, within the
+        # current scene (reset on faces found and on clear_nonhuman_cache,
+        # which the perceiver calls at scene cuts). Gates the tiled YuNet
+        # pass on confirmed-empty runs (REFRAMER_TILED_EMPTY_SKIP).
+        self._empty_streak = 0
         self._cached_person_bboxes = []     # carried forward on skipped frames
         self._cached_nonhuman_raw = []
         # Full unsplit subject list (all classes) from the last real YOLO run —
@@ -680,6 +685,20 @@ class FaceDetector:
                         biggest_h = max(
                             (f.get('h', 0) for f in all_faces), default=0)
                         run_tiled = biggest_h < frame_h * min_frac
+                    # Empty-streak gate: after N consecutive confirmed-empty
+                    # samples in the SAME scene, the tiled pass has been
+                    # re-confirming "nothing there" at ~4x YuNet cost every
+                    # sample. Throttle it to an every-4th-sample sweep so a
+                    # genuinely tiny face entering mid-scene is still caught
+                    # within ~4 samples; any face hit or scene cut resets
+                    # the streak and restores the full cadence.
+                    if run_tiled and getattr(
+                            _settings, 'REFRAMER_TILED_EMPTY_SKIP', True):
+                        _after = int(getattr(
+                            _settings, 'REFRAMER_TILED_EMPTY_SKIP_AFTER', 3))
+                        _streak = getattr(self, '_empty_streak', 0)
+                        if _streak >= max(1, _after) and (_streak % 4) != 0:
+                            run_tiled = False
                 except Exception:
                     pass
                 if run_tiled:
@@ -733,9 +752,18 @@ class FaceDetector:
                     if (not _gated or person_bboxes
                             or self._yolo_model is None
                             or self._haar_fallback_count % 4 == 0):
-                        return self._detect_haar(frame_bgr)
+                        _haar_hits = self._detect_haar(frame_bgr)
+                        self._empty_streak = (
+                            0 if _haar_hits
+                            else getattr(self, '_empty_streak', 0) + 1)
+                        return _haar_hits
+                    self._empty_streak = getattr(self, '_empty_streak', 0) + 1
                     return []
-                return self._dedupe_faces(all_faces) if all_faces else []
+                if all_faces:
+                    self._empty_streak = 0
+                    return self._dedupe_faces(all_faces)
+                self._empty_streak = getattr(self, '_empty_streak', 0) + 1
+                return []
             elif self.tier == 'dnn':
                 faces = self._detect_dnn(frame_bgr, conf)
                 if not faces and self._yolo_model is not None:
@@ -833,6 +861,9 @@ class FaceDetector:
         self._cached_nonhuman_raw = []
         self._cached_subject_bboxes_all = []
         self._yolo_det_count = 0
+        # New scene — the tiled pass must run at full cadence again until
+        # this scene, too, is confirmed empty.
+        self._empty_streak = 0
 
     def _update_nonhuman_cache(self, nonhuman_bboxes):
         """Merge new YOLO detections into the spatial cache.

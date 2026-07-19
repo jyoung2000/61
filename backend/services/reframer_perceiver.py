@@ -527,8 +527,28 @@ class Perceiver:
         # 'where does each sample's time go' is answerable from the job log
         # (the 0.72 s/sample regression was invisible without it).
         import time as _time_mod
-        _tbuck = {'acquire': 0.0, 'detect': 0.0, 'loop': 0.0}
+        # Sub-buckets: 'lk' (inter-sample LK gap tracking), 'saliency'
+        # (spectral + u2netp + fusion + person bookkeeping on faceless
+        # samples), 'motion' (Farnebäck flow + hotspot EMA), 'book'
+        # (histogram scene-cut, temporal filter, track assignment,
+        # static-skip checks). Together they decompose the 'other' figure
+        # that previously hid 70% of the loop's wall time.
+        _tbuck = {'acquire': 0.0, 'detect': 0.0, 'loop': 0.0,
+                  'lk': 0.0, 'saliency': 0.0, 'motion': 0.0, 'book': 0.0,
+                  'static_skips': 0, 'u2net_reuse': 0}
         _loop_t0 = _time_mod.perf_counter()
+
+        # ── Static-scene skip state (REFRAMER_STATIC_SKIP) ──
+        # Anime/gameplay hold frames for seconds. When the current sample's
+        # downscaled gray is (near-)identical to the previous sample's, every
+        # expensive per-sample stage — detector union, u2netp saliency,
+        # optical flow — would recompute the same answer. Carry the previous
+        # sample's outputs forward instead. Outputs only change on frames
+        # that actually changed, so this is quality-neutral by construction.
+        _static_on = bool(getattr(settings, 'REFRAMER_STATIC_SKIP', True))
+        _static_diff = float(getattr(settings, 'REFRAMER_STATIC_SKIP_DIFF', 0.6))
+        self._carry_prev_raw = None       # raw_faces of the last full sample
+        self._carry_prev_tracked = None   # tracked faces of the last full sample
 
         for (i, time_ms, small_bgr, gray_small, gap_grays) in self._iter_samples(
                 cap, sample_times_ms, r, det_w, det_h, det_scale, seek_gap,
@@ -542,7 +562,32 @@ class Perceiver:
             # so the acquisition I/O overlaps detection instead of
             # alternating with it.
             if gap_grays:
+                _t_lk = _time_mod.perf_counter()
                 self._track_through_gap(gap_grays, r, det_w, det_h, det_scale)
+                _tbuck['lk'] += _time_mod.perf_counter() - _t_lk
+
+            # ── Static-scene skip (see _tbuck comment above) ──
+            # Mean abs diff of the two downscaled grays is ~0.1-0.4 on a held
+            # anime frame (codec noise only) and >2 on any real change; a
+            # scene cut is two orders of magnitude above the threshold, so a
+            # skipped sample can never swallow a cut. Requires a previous
+            # fully-processed sample to carry from.
+            if (_static_on and prev_gray_small is not None
+                    and self._carry_prev_tracked is not None):
+                _t_ss = _time_mod.perf_counter()
+                _mdiff = float(cv2.mean(
+                    cv2.absdiff(prev_gray_small, gray_small))[0])
+                if _mdiff < _static_diff:
+                    self._carry_static_sample(r, time_ms, recent_raw, _mdiff)
+                    self._last_gray_small = gray_small
+                    self._last_sample_ms = time_ms
+                    prev_gray_small = gray_small
+                    _tbuck['static_skips'] += 1
+                    _tbuck['book'] += _time_mod.perf_counter() - _t_ss
+                    if on_progress and i % 20 == 0:
+                        on_progress(i / total_samples)
+                    continue
+                _tbuck['book'] += _time_mod.perf_counter() - _t_ss
 
             # ── Face detection at low res ──
             _t_det = _time_mod.perf_counter()
@@ -550,6 +595,7 @@ class Perceiver:
                 gray_small, small_bgr, min_face, max_face, det_w, det_h, det_scale)
             _tbuck['detect'] += _time_mod.perf_counter() - _t_det
 
+            _t_book = _time_mod.perf_counter()
             # Temporal smoothing
             recent_raw.append(raw_faces)
             if len(recent_raw) > 4:
@@ -559,6 +605,10 @@ class Perceiver:
             # Track assignment
             tracked = self._assign_tracks(confirmed, time_ms)
             r.face_timeline[time_ms] = tracked
+
+            # State for the static-skip carry (next sample may be a hold).
+            self._carry_prev_raw = raw_faces
+            self._carry_prev_tracked = tracked
 
             # State for the inter-sample LK tracker (bridges the next gap).
             self._last_gray_small = gray_small
@@ -590,7 +640,12 @@ class Perceiver:
                     # Nonhuman subject positions from the previous scene
                     # don't apply after a cut — reset the spatial cache.
                     self.face_detector.clear_nonhuman_cache()
+                    # The cached u2netp saliency map belongs to the previous
+                    # scene — force a fresh compute on the next faceless sample.
+                    self._u2_cached_map = None
+                    self._u2_call_count = 0
             prev_hist = hist.copy()
+            _tbuck['book'] += _time_mod.perf_counter() - _t_book
 
             # ── Motion (dense optical flow + camera-motion compensation) ──
             # Farnebäck dense optical flow gives per-pixel motion vectors,
@@ -601,6 +656,7 @@ class Perceiver:
             # movement instead of drifting with the camera. Falls back to
             # the previous frame-diff method on any opencv failure so a
             # missing build flag never crashes the perceiver.
+            _t_mot = _time_mod.perf_counter()
             if prev_gray_small is not None:
                 try:
                     # Downsample to half det resolution before computing flow.
@@ -694,6 +750,7 @@ class Perceiver:
                     'cy': raw_cy,
                     'intensity': round(best_intensity, 4),
                 }
+            _tbuck['motion'] += _time_mod.perf_counter() - _t_mot
 
             # ── Non-face subject tracking (YOLO-World + saliency) ──
             # When no face is detected, reuse the subject boxes the face
@@ -706,6 +763,7 @@ class Perceiver:
             # the content that needs it most.
             has_faces = bool(tracked)
 
+            _t_sal = _time_mod.perf_counter()
             if not has_faces:
                 person_bboxes = list(getattr(
                     self.face_detector, '_cached_subject_bboxes_all', []) or [])
@@ -773,11 +831,35 @@ class Perceiver:
                         # apply. Falls back to spectral on any failure.
                         if getattr(settings, 'REFRAMER_U2NET_SALIENCY', False):
                             try:
-                                from backend.services.reframer_u2net import u2net_saliency
-                                _u2 = u2net_saliency(small_bgr, sal_size)
-                                if _u2 is not None:
-                                    sal_map = _u2
+                                # ── u2netp stride (REFRAMER_U2NET_STRIDE) ──
+                                # The CPU u2netp forward is by far the
+                                # heaviest per-sample cost on faceless
+                                # content. On runs of faceless samples reuse
+                                # the previous mask on every stride-th call —
+                                # the saliency-hotspot EMA (α=0.35) plus
+                                # planner smoothing absorb the half-sample
+                                # staleness. Cache is dropped on scene cuts,
+                                # so a mask never crosses a cut.
+                                _u2_stride = max(1, int(getattr(
+                                    settings, 'REFRAMER_U2NET_STRIDE', 2)))
+                                _u2_n = getattr(self, '_u2_call_count', 0)
+                                self._u2_call_count = _u2_n + 1
+                                _u2_cached = getattr(self, '_u2_cached_map', None)
+                                if (_u2_stride > 1 and _u2_cached is not None
+                                        and (_u2_n % _u2_stride) != 0):
+                                    sal_map = _u2_cached.copy()
                                     _used_u2net = True
+                                    _tbuck['u2net_reuse'] += 1
+                                else:
+                                    from backend.services.reframer_u2net import u2net_saliency
+                                    _u2 = u2net_saliency(small_bgr, sal_size)
+                                    if _u2 is not None:
+                                        # Cache a pristine copy — sal_map is
+                                        # mutated in place below (text
+                                        # suppression, speaker bump).
+                                        self._u2_cached_map = _u2.copy()
+                                        sal_map = _u2
+                                        _used_u2net = True
                             except Exception:
                                 pass
                         # ── Text/watermark saliency suppression ──
@@ -868,6 +950,7 @@ class Perceiver:
                             }
                     except Exception:
                         pass  # Saliency is optional — never crash the pipeline
+            _tbuck['saliency'] += _time_mod.perf_counter() - _t_sal
 
             prev_gray_small = gray_small  # cvtColor creates new array each iteration
 
@@ -886,11 +969,22 @@ class Perceiver:
         _tbuck['loop'] = _time_mod.perf_counter() - _loop_t0
         _n = max(1, len(r.face_timeline))
         _other = max(0.0, _tbuck['loop'] - _tbuck['acquire'] - _tbuck['detect'])
+        # 'untracked' = loop wall time not caught by any named bucket —
+        # queue waits, progress callbacks, python overhead. If it grows,
+        # something new needs its own bucket.
+        _untracked = max(0.0, _other - _tbuck['lk'] - _tbuck['saliency']
+                         - _tbuck['motion'] - _tbuck['book'])
         log.log_stage('PERCEIVE',
             f"  Sample-loop timing: {_tbuck['loop']:.0f}s total "
             f"({_tbuck['loop'] / _n:.2f}s/sample) — acquire "
             f"{_tbuck['acquire']:.0f}s, detect {_tbuck['detect']:.0f}s, "
-            f"other {_other:.0f}s")
+            f"other {_other:.0f}s "
+            f"(lk {_tbuck['lk']:.0f}s, saliency {_tbuck['saliency']:.0f}s, "
+            f"motion {_tbuck['motion']:.0f}s, "
+            f"bookkeeping {_tbuck['book']:.0f}s, "
+            f"untracked {_untracked:.0f}s); "
+            f"static-skip {int(_tbuck['static_skips'])} samples, "
+            f"u2netp reuse {int(_tbuck['u2net_reuse'])}")
 
         cap.release()
         if on_progress:
@@ -1120,6 +1214,73 @@ class Perceiver:
         r.detection_local_frames = int(getattr(fd, '_local_frames', 0) or 0) if fd else 0
 
         return r
+
+    def _carry_static_sample(self, r: PerceptionResult, time_ms: int,
+                             recent_raw: List[List[dict]],
+                             mdiff: float) -> None:
+        """Carry the previous sample's outputs onto an unchanged frame.
+
+        Called by the static-scene skip (REFRAMER_STATIC_SKIP) when the
+        current sample's downscaled gray differs from the previous sample's
+        by less than REFRAMER_STATIC_SKIP_DIFF mean-abs-diff (codec noise).
+        Re-running the detector union / u2netp / optical flow on a
+        byte-near-identical frame reproduces the previous answer at full
+        cost, so instead:
+
+          - face_timeline gets a copy of the previous tracked faces (track
+            last-seen refreshed so holds longer than the 5 s expiry don't
+            fragment tracks);
+          - the temporal-filter history is fed the previous raw detections;
+          - motion is recorded as the measured residual (≈0 — the frame
+            really didn't move) with the hotspot held at ~zero intensity;
+          - person/saliency hotspots are copied forward when present.
+
+        No scene-cut histogram is needed: an unchanged frame cannot be a
+        cut, and ``prev_hist`` stays valid for the next changed sample.
+        """
+        prev_ms = getattr(self, '_last_sample_ms', None)
+
+        tracked = [dict(f) for f in (self._carry_prev_tracked or [])]
+        r.face_timeline[time_ms] = tracked
+        carried_ids = {f.get('track_id') for f in tracked}
+        if carried_ids:
+            for tr in self._active_tracks:
+                if tr['id'] in carried_ids:
+                    tr['last_seen_ms'] = time_ms
+
+        recent_raw.append(list(self._carry_prev_raw or []))
+        if len(recent_raw) > 4:
+            recent_raw.pop(0)
+
+        # The frame genuinely didn't change → motion is the measured codec
+        # residual, and the held hotspot carries ~zero intensity so the
+        # planner's 0.01 intensity gate ignores it (same as a computed-flow
+        # result on identical frames).
+        r.motion_timeline[time_ms] = round(mdiff / 255.0 * 10.0, 6)
+        if getattr(self, '_prev_hotspot_cx', None) is not None:
+            r.motion_hotspot[time_ms] = {
+                'cx': self._prev_hotspot_cx,
+                'cy': self._prev_hotspot_cy,
+                'intensity': round(min(1.0, mdiff / 255.0), 4),
+            }
+
+        if prev_ms is None:
+            return
+        prev_persons = r.person_timeline.get(prev_ms)
+        if prev_persons:
+            persons = [dict(p) for p in prev_persons]
+            r.person_timeline[time_ms] = persons
+            pids = {p.get('track_id') for p in persons}
+            for tr in self._active_person_tracks:
+                if tr['id'] in pids:
+                    tr['last_seen_ms'] = time_ms
+        prev_sal = r.saliency_hotspot.get(prev_ms)
+        if prev_sal:
+            r.saliency_hotspot[time_ms] = dict(prev_sal)
+            _src = prev_sal.get('source')
+            if _src:
+                self._saliency_source_counts[_src] = \
+                    self._saliency_source_counts.get(_src, 0) + 1
 
     def _release_perception_models(self) -> None:
         """Drop face / YOLO weights from VRAM after detection is finished.
@@ -1611,11 +1772,49 @@ class Perceiver:
         if not cur:
             return
 
+        # Static-gap shortcut: an in-gap frame that is (near-)identical to
+        # the previous gray carries zero flow by definition — LK would
+        # return dx=dy≈0 after paying two pyramid builds per face. One
+        # cheap absdiff decides; the emitted entries are what LK would
+        # have produced (unchanged boxes). Shares the static-skip knobs.
+        _static_diff = None
+        if bool(getattr(settings, 'REFRAMER_STATIC_SKIP', True)):
+            _static_diff = float(getattr(settings,
+                                         'REFRAMER_STATIC_SKIP_DIFF', 0.6))
+
+        def _entry_for(fbox):
+            ncx = fbox['x'] + fbox['w'] / 2.0
+            ncy = fbox['y'] + fbox['h'] / 2.0
+            src = fbox['src']
+            entry = {k: v for k, v in src.items()
+                     if k not in ('x', 'y', 'w', 'h', 'cx', 'cy',
+                                  'confidence', 'tracked')}
+            entry.update({
+                'x': int(fbox['x'] / det_scale),
+                'y': int(fbox['y'] / det_scale),
+                'w': int(fbox['w'] / det_scale),
+                'h': int(fbox['h'] / det_scale),
+                'cx': int(ncx / det_scale),
+                'cy': int(ncy / det_scale),
+                'confidence': round(
+                    float(src.get('confidence', 0.5)) * 0.9, 3),
+                'tracked': True,
+            })
+            return entry
+
         for (t_ms, gray2) in gap_grays:
             if not cur:
                 break
             # Tracking is opportunistic — any failure just skips this frame.
             try:
+                if _static_diff is not None:
+                    _md = float(cv2.mean(cv2.absdiff(prev_gray, gray2))[0])
+                    if _md < _static_diff:
+                        entries = [_entry_for(fbox) for fbox in cur]
+                        prev_gray = gray2
+                        if entries and t_ms not in r.face_timeline:
+                            r.face_timeline[t_ms] = entries
+                        continue
                 moved = []
                 entries = []
                 for fbox in cur:
@@ -1645,22 +1844,7 @@ class Perceiver:
                     if not (0 <= ncx < det_w and 0 <= ncy < det_h):
                         continue  # walked out of frame
                     moved.append(fbox)
-                    src = fbox['src']
-                    entry = {k: v for k, v in src.items()
-                             if k not in ('x', 'y', 'w', 'h', 'cx', 'cy',
-                                          'confidence', 'tracked')}
-                    entry.update({
-                        'x': int(fbox['x'] / det_scale),
-                        'y': int(fbox['y'] / det_scale),
-                        'w': int(fbox['w'] / det_scale),
-                        'h': int(fbox['h'] / det_scale),
-                        'cx': int(ncx / det_scale),
-                        'cy': int(ncy / det_scale),
-                        'confidence': round(
-                            float(src.get('confidence', 0.5)) * 0.9, 3),
-                        'tracked': True,
-                    })
-                    entries.append(entry)
+                    entries.append(_entry_for(fbox))
                 cur = moved
                 prev_gray = gray2
                 if entries and t_ms not in r.face_timeline:

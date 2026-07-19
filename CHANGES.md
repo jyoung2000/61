@@ -1,3 +1,55 @@
+# ClipAI — Profiled-run fixes: kill the u2netp tax, grammar-lock translation, canonical names
+
+Driven by a real 24:27 anime run (640x360, GTX 1650 + 12 GB Companion) that
+took 44.5 min on the PREVIOUS build: reframer_analysis 926 s (its own
+instrumentation: acquire 36 s, detect 223 s, **other 612 s**), translation
+26.5 min (gemma3:12b, batch 20, single slot, **12 of 35 batches parse-missed**
+into split-and-retry cascades), everything else already fast (remote Whisper
+transcribed the full episode in 34 s; extraction 42 s; summary 6.5 s;
+clips 56 s).
+
+- **Face-loop "other" tax dissected and removed.** The 612 s was ~75-90 %
+  u2netp CPU saliency forwards on faceless anime samples. New: static-scene
+  skip (unchanged frames carry every per-sample output forward —
+  `REFRAMER_STATIC_SKIP`), u2netp mask stride-2 with carry-forward on
+  faceless runs (never crosses a scene cut, absorbed by the hotspot EMA +
+  planner smoothing), an LK static-gap shortcut, and a tiled-YuNet
+  empty-streak throttle (no-op below 960 px det width). The Sample-loop
+  timing line now breaks "other" into lk/saliency/motion/bookkeeping
+  sub-buckets plus skip/reuse counters, so the next run proves the split.
+  Expected on the profiled run: **~250-400 s off the 870 s loop**.
+- **Translation grammar-locked and budget-parallelized.**
+  `TRANSLATION_STRUCTURED_OUTPUTS` constrains the Ollama decode to a JSON
+  array of exactly the batch's line count (parse-miss → ~0; old servers
+  auto-downgrade to `format=json`). Large models get a second in-flight
+  batch when the Companion's advertised `vram_budget_gb` minus estimated
+  weights leaves ≥ `TRANSLATION_LARGE_PARALLEL_HEADROOM_GB` (Ollama
+  continuous batching: ~1.5-1.8× throughput, identical outputs; the
+  measured rig: 9.5 − 7.3 = 2.2 GB → 2 slots). Expected:
+  **26.5 min → ~8-12 min** at unchanged quality.
+- **Latent bug fixed:** `AIOrchestrator.text_completion` didn't accept
+  `json_mode`, so the batched untranslated-cue cleanup prefill (added to fix
+  the ~13-min recovery tail) had been raising TypeError into its
+  except-block and **silently never ran**. The parameter now exists and
+  forwards (with `json_schema`) to Ollama.
+- **Canonical names** (`services/canonical_names.py`): the auto glossary
+  mines Whisper's romaji and used to lock WRONG spellings in ("Ririna",
+  "Zex", "Hero Yuu", "Trott", "Katō"). One title-anchored LLM call now maps
+  mined terms to official romanizations (Relena Darlian, Zechs, Heero Yuy,
+  Trowa, Quatre) and the glossary renders "mined → canonical" so the whole
+  episode uses official-subtitle names. Defensive parse (no invented names,
+  identity/sentence/profane/collision values dropped), fail-soft, per-job
+  cached; user custom vocabulary always wins. 24 new tests.
+- **Glossary-echo guard:** the run shipped a comma-joined dump of the
+  glossary as a subtitle cue (the model "translating" hallucinated
+  music-section source). Cues that are ≥60 % glossary terms now revert to
+  the source line and flow into the per-cue cleanup.
+- Verified: translation/glossary/canonical suites green (42 + 46);
+  reframer sweep 102 passed with the failure set byte-identical to main's
+  (17 pre-existing scipy/env failures, none introduced).
+
+---
+
 # ClipAI — Speed audit Tier 1+2: overlap the LLM chain with clips, window the timing pass, un-block COMPLETE
 
 Implements the full speed audit (docs/perf-audit-46min-to-15-20.md): a 24-min

@@ -720,6 +720,25 @@ class Settings(BaseSettings):
     # model file is present at REFRAMER_U2NET_MODEL_PATH.
     REFRAMER_U2NET_SALIENCY: bool = True
     REFRAMER_U2NET_MODEL_PATH: str = ""        # path to u2netp.onnx (blank ⇒ falls back to spectral)
+    # ── Sample-loop speed (profiled: 612s of a 926s perception stage was
+    # per-sample "other" work, ~75-90% of it u2netp CPU forwards on faceless
+    # anime samples) ──
+    # Static-scene skip: when a sample's downscaled gray equals the previous
+    # sample's (mean abs diff below the threshold — codec noise only; a real
+    # change is >2 and a cut orders above), carry every per-sample output
+    # forward instead of recomputing detect/saliency/flow. Outputs change only
+    # on frames that changed.
+    REFRAMER_STATIC_SKIP: bool = True
+    REFRAMER_STATIC_SKIP_DIFF: float = 0.6
+    # Reuse the u2netp saliency mask every Nth faceless sample (1 = legacy
+    # every-sample). The α=0.35 hotspot EMA + planner smoothing absorb it;
+    # the cache never crosses a scene cut.
+    REFRAMER_U2NET_STRIDE: int = 2
+    # Throttle the 2x2 tiled YuNet sweep after N consecutive confirmed-empty
+    # samples within a scene (restored on any face hit or scene cut). No-op
+    # below 960px detection width (the tiled pass doesn't run there).
+    REFRAMER_TILED_EMPTY_SKIP: bool = True
+    REFRAMER_TILED_EMPTY_SKIP_AFTER: int = 3
     # L1-optimal camera path (Grundmann 2011) — decomposes the target path into
     # static holds + constant-velocity pans via an LP (scipy.optimize.linprog).
     # Replaces the reactive smoother output. Default ON.
