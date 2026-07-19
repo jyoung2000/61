@@ -706,7 +706,8 @@ async def translate_via_llm(
                             _title = ""
                     _canon_map = await resolve_canonical_names(
                         extract_recurring_terms(segments, source_language),
-                        _title, orchestrator, job_id=job_id)
+                        _title, orchestrator, job_id=job_id,
+                        model_override=model_override)
                     if _canon_map:
                         logger.info(
                             "LLM translate: canonical names resolved from title %r — "

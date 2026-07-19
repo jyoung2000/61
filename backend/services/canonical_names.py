@@ -207,14 +207,42 @@ def _sanitize_mapping(raw: dict, terms: list[str]) -> dict[str, str]:
     return out
 
 
+# Filenames that identify nothing ("videoplayback.mp4", "download (3).mkv",
+# "movie.mp4"…). A real production run passed exactly this — the model had no
+# series anchor and phonetically romanized every name (リリーナ→"Reirina"
+# instead of the official "Relena"). Treat these as NO title so the prompt
+# leans on the terms themselves to identify the work.
+_GENERIC_TITLE_RE = re.compile(
+    r"^(?:videoplayback|video|movie|film|clip|download|untitled|output|"
+    r"recording|export|final|sample|media|track|episode|ep)?"
+    r"[\s\-_\.\(\)\[\]#\d]*$",
+    re.IGNORECASE,
+)
+
+
+def _informative_title(video_title: str) -> str:
+    """The title stripped of its extension, or '' when it identifies nothing."""
+    t = (video_title or "").strip()
+    t = re.sub(r"\.(mp4|mkv|avi|mov|webm|m4v|ts|flv|wmv)$", "", t,
+               flags=re.IGNORECASE).strip()
+    if not t or _GENERIC_TITLE_RE.match(t):
+        return ""
+    return t
+
+
 def _build_prompt(terms: list[str], video_title: str, series_hint: str) -> str:
-    title = (video_title or "").strip()
+    title = _informative_title(video_title)
     hint = (series_hint or "").strip()
     context_bits = []
     if title:
         context_bits.append(f'This is a video titled "{title}".')
     if hint:
         context_bits.append(f"Series/context hint: {hint}.")
+    context_bits.append(
+        "First, silently identify which published work (anime, film, series, "
+        "or game) this transcript is from — use the title/hint if given, and "
+        "the distinctive detected terms below either way (recurring character "
+        "and mecha names usually identify a work unambiguously).")
     context = " ".join(context_bits)
     terms_json = json.dumps(terms, ensure_ascii=False)
     return (
@@ -230,6 +258,8 @@ def _build_prompt(terms: list[str], video_title: str, series_hint: str) -> str:
         "Return ONLY a JSON object mapping detected term to canonical "
         'spelling, e.g. {"Ririna": "Relena", "Zekus": "Zechs"}.\n'
         "Rules:\n"
+        "- Only map names when you have CONFIDENTLY identified the specific "
+        "work. If you cannot identify it, return {} — never guess.\n"
         "- Keys MUST be terms copied exactly from DETECTED TERMS. NEVER "
         "invent or add names that are not in the list.\n"
         "- If you do not recognize a term, or it is an ordinary word (e.g. "
@@ -245,6 +275,7 @@ async def resolve_canonical_names(
     orchestrator,
     job_id: str = "",
     series_hint: str = "",
+    model_override: str | None = None,
 ) -> dict[str, str]:
     """Map mined transcript terms to canonical official English names.
 
@@ -266,9 +297,13 @@ async def resolve_canonical_names(
             return {}
         title = (video_title or "").strip()
         hint = (series_hint or "").strip()
-        if not title and not hint:
-            # Nothing identifies the work — the model would have to guess the
-            # series, which is exactly the invention we must not allow.
+        # A generic filename ("videoplayback.mp4") anchors nothing, but the
+        # TERMS themselves usually identify the work — recurring character +
+        # mecha names are close to a fingerprint, and the prompt's
+        # confidence rule ("return {} unless you identified the work")
+        # carries the no-guessing guarantee. Only bail when there's neither
+        # an informative title nor enough distinctive terms to fingerprint.
+        if not _informative_title(title) and not hint and len(terms) < 4:
             return {}
 
         key = f"job:{job_id}" if job_id else (
@@ -278,7 +313,12 @@ async def resolve_canonical_names(
             return dict(cached)
 
         timeout = float(getattr(s, "TRANSLATION_CANONICAL_NAMES_TIMEOUT", _DEF_TIMEOUT) or _DEF_TIMEOUT) if s else _DEF_TIMEOUT
+        # Model priority: explicit config pin > the caller's translation model
+        # (the biggest model in the rig — a 12B recognizes a series where the
+        # small editorial default just romanizes phonetically) > chain default.
         model = str(getattr(s, "TRANSLATION_CANONICAL_NAMES_MODEL", "") or "").strip() if s else ""
+        if not model and model_override:
+            model = str(model_override).strip()
 
         prompt = _build_prompt(terms, title, hint)
         kwargs: dict = {

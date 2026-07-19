@@ -412,7 +412,7 @@ async def _free_editorial_vram_before_local_clips(job_id: str, orchestrator) -> 
     # when the clip stage starts, so evicting here would be actively harmful.
     try:
         from backend.services import ollama_registry as _oreg
-        if _oreg.remote_primary_vram_gb() >= 7.0:
+        if await _oreg.remote_primary_vram_gb_resolved() >= 7.0:
             logger.info(
                 "[%s] Skipping pre-clip editorial unload — remote Ollama host "
                 "has VRAM headroom (editorial model stays resident for SEO)",
@@ -6438,7 +6438,7 @@ async def _run_analysis_inner(job_id: str, resume: bool = False):
     _summary_remote_vram = 0.0
     try:
         from backend.services import ollama_registry as _oreg
-        _summary_remote_vram = _oreg.remote_primary_vram_gb()
+        _summary_remote_vram = await _oreg.remote_primary_vram_gb_resolved()
     except Exception:
         _summary_remote_vram = 0.0
     _overlap_llm_chain = (

@@ -159,11 +159,27 @@ def test_orchestrator_timeout_yields_empty():
     assert _resolve(DummyOrch(exc=asyncio.TimeoutError())) == {}
 
 
-def test_no_terms_or_no_title_makes_no_llm_call():
+def test_no_terms_or_too_few_anchorless_terms_makes_no_llm_call():
+    # No terms at all → nothing to map, no call, with or without a title.
     orch = DummyOrch('{"Ririna": "Relena"}')
     assert _resolve(orch, terms=[]) == {}
-    assert _resolve(orch, title="") == {}
+    # No title/hint AND too few terms to fingerprint the work → no call.
+    assert _resolve(orch, terms=["Ririna", "Oz"], title="") == {}
     assert orch.calls == []
+
+
+def test_anchorless_but_distinctive_terms_do_resolve():
+    # A generic filename anchors nothing, but >=4 distinctive terms are a
+    # fingerprint — the model is asked to identify the work itself (its
+    # confidence rule guards against guessing). Regression: a real run
+    # passed title "videoplayback.mp4" and every name stayed phonetic.
+    orch = DummyOrch('{"Ririna": "Relena"}')
+    out = _resolve(orch, title="videoplayback.mp4")
+    assert out == {"Ririna": "Relena"}
+    assert len(orch.calls) == 1
+    # The useless filename must NOT be presented as a title anchor.
+    assert "videoplayback" not in orch.calls[0][0]
+    assert "identify" in orch.calls[0][0].lower()
 
 
 def test_series_hint_alone_is_enough_anchor():

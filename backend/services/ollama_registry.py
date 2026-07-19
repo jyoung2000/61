@@ -251,6 +251,51 @@ def remote_primary_vram_gb() -> float:
     return 0.0
 
 
+# Cached Companion /v1/health VRAM read for the async fallback below:
+# (base_url, vram_gb, checked_at).
+_health_vram_cache: tuple = ("", 0.0, 0.0)
+
+
+async def remote_primary_vram_gb_resolved(ttl: float = 60.0) -> float:
+    """Async :func:`remote_primary_vram_gb` with a Companion-health fallback.
+
+    The sync helper only sees ``vram_total_mb`` from the OLLAMA_HOSTS entry —
+    an optional field almost nobody sets, so a real 12 GB Companion read as
+    0 and every VRAM-gated stage overlap silently stayed serial (observed in
+    production). When the entry carries nothing, ask the paired Companion's
+    ``/v1/health`` for its advertised budget instead (cached ~60 s,
+    fail-soft 0.0)."""
+    v = remote_primary_vram_gb()
+    if v > 0:
+        return v
+    try:
+        ph = primary_host()
+        if ph is None or is_local_gpu_host(ph.url):
+            return 0.0
+        base = companion_base(ph)
+        if not base:
+            return 0.0
+        global _health_vram_cache
+        cb, cv, ct = _health_vram_cache
+        if cb == base and (time.time() - ct) < ttl:
+            return cv
+        val = 0.0
+        try:
+            async with httpx.AsyncClient(timeout=3.0) as client:
+                resp = await client.get(join_url(base, "/v1/health"),
+                                        headers=auth_headers(ph))
+                if resp.status_code == 200:
+                    j = resp.json() or {}
+                    val = (float(j.get("vram_total_gb") or 0)
+                           or float(j.get("vram_budget_gb") or 0))
+        except Exception:
+            val = 0.0
+        _health_vram_cache = (base, val, time.time())
+        return val
+    except Exception:
+        return 0.0
+
+
 def companion_base(host: OllamaHost) -> str:
     """A Companion's base URL (for ``/v1/audio/transcriptions``, ``/v1/health``)
     — its Ollama URL minus a trailing ``/ollama``."""
