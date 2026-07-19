@@ -279,12 +279,25 @@ async def companion_download(platform: str):
     candidates = [p for p in (_local_asset(d, key) for d in (CACHE_DIR, BAKED_DIR)) if p]
     if candidates:
         path = max(candidates, key=lambda p: _installer_rank(os.path.basename(p), p))
-        filename = os.path.basename(path)
-        ext = os.path.splitext(filename)[1].lower()
+        ext = os.path.splitext(os.path.basename(path))[1].lower()
+        # Serve a CLEAN, token-safe ASCII download name. The real installer
+        # name ("ClipAI GPU Companion_0.2.6_x64-setup.exe") has spaces, which
+        # Starlette encodes as an RFC-5987 ``filename*=utf-8''…%20…`` header —
+        # fragile across HTTP clients (curl, browsers, the Companion updater).
+        # A token-safe name yields a plain ``filename="…"`` header everyone
+        # parses. NOTE: this is hygiene, NOT the fix for the ``\\`` self-update
+        # dialog — that was the Companion's inline ``cmd /C`` quoting (fixed in
+        # v0.2.7, which now writes a .cmd file). Newer clients ignore this
+        # header and save to a fixed name regardless.
+        _clean = {
+            ".exe": "ClipAI-GPU-Companion-Setup.exe",
+            ".msi": "ClipAI-GPU-Companion-Setup.msi",
+            ".dmg": "ClipAI-GPU-Companion.dmg",
+        }.get(ext, "ClipAI-GPU-Companion-Setup" + ext)
         return FileResponse(
             path,
             media_type=_CONTENT_TYPES.get(ext, "application/octet-stream"),
-            filename=filename,
+            filename=_clean,
         )
 
     github = await _github_latest_manifest()

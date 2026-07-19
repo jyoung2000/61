@@ -94,7 +94,12 @@ def test_download_streams_baked_file(dirs, no_github):
     resp = client.get("/api/downloads/companion/mac")
     assert resp.status_code == 200
     assert resp.content == b"installer mac 0.1.0"
-    assert "Companion_0.1.0.dmg" in resp.headers.get("content-disposition", "")
+    # The download name is served as a token-safe, space-free ASCII filename
+    # (a plain filename="…" header, not RFC-5987 filename*=), so the
+    # Companion updater and other HTTP clients parse it cleanly.
+    _cd = resp.headers.get("content-disposition", "")
+    assert 'filename="ClipAI-GPU-Companion.dmg"' in _cd
+    assert "filename*=" not in _cd
 
 
 def test_download_redirects_to_github_when_not_local(dirs, monkeypatch):
