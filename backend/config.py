@@ -558,6 +558,16 @@ class Settings(BaseSettings):
     # the clip-dependent followups. Small shared local cards always keep the
     # serial order regardless of this flag.
     PIPELINE_OVERLAP_TRANSLATION_CLIPS: bool = True
+    # Start the transcript chain + translation the moment the perceiver's
+    # concurrent Whisper + diarization results land — typically MINUTES
+    # before the face loop ends (the observed run had the transcript ready
+    # 10 minutes early while translation waited). Companion rigs only
+    # (remote Ollama ≥7 GB — early translation must not fight the face loop
+    # for the local card), never on resumed runs. The engine's final
+    # transcript is fingerprint-compared to the early snapshot; any
+    # divergence discards the early work and re-runs the classic serial
+    # chain, so output is byte-identical either way.
+    PIPELINE_EARLY_TRANSLATION: bool = True
     # Run local CUDA Whisper CONCURRENT with the face-detection loop when the
     # local card has this much FREE VRAM (Whisper turbo ~1.5-2 GB + YOLO-World
     # ~150 MB co-reside easily at 6 GB). Byte-identical: the same transcribe()

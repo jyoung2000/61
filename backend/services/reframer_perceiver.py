@@ -80,13 +80,20 @@ class Perceiver:
 
     def __init__(self, video_path: str, sample_fps: float = 5.0,
                  source_language: str = 'auto',
-                 transcribe_audio_path: Optional[str] = None):
+                 transcribe_audio_path: Optional[str] = None,
+                 early_transcript_hook=None):
         self.path = video_path
         self.sample_fps = sample_fps
         self.source_language = source_language
         # Optional pre-separated vocal stem to transcribe instead of the raw
         # video audio (vocal-separation stage). None → extract from video.
         self.transcribe_audio_path = transcribe_audio_path
+        # Early-translation overlap: called (from a worker thread, at most
+        # once) with (segments_copy, timeline_copy, normalized_language) the
+        # moment BOTH the concurrent transcription and the concurrent
+        # diarization have produced usable results — typically minutes before
+        # the face loop ends. None → no early publishing (classic behavior).
+        self.early_transcript_hook = early_transcript_hook
         self.cancelled = False
 
         # Tiered face detector: YOLO → DNN → Haar
@@ -207,6 +214,49 @@ class Perceiver:
         _txn: dict = {"result": None, "error": None}
         _txn_thread = None
         _txn_mode = "remote"
+        # Early-transcript publisher (early-translation overlap). Fired from
+        # whichever concurrent worker thread (transcription / diarization)
+        # finishes LAST, once both carry usable results. Replicates the join
+        # acceptance criteria exactly — a result the join would reject (remote
+        # failure marker, empty segments) never publishes, so the sequential
+        # fallback path keeps its classic timing. Deep-copies the payload so
+        # later in-place edits can't mutate what the pipeline already read
+        # (the adoption fingerprint would catch it anyway — this keeps the
+        # early chain deterministic).
+        _diar: dict = {"timeline": None, "error": None}
+        import threading as _early_threading
+        _early_state = {"fired": False}
+        _early_lock = _early_threading.Lock()
+
+        def _maybe_fire_early():
+            hook = getattr(self, 'early_transcript_hook', None)
+            if hook is None:
+                return
+            with _early_lock:
+                if _early_state["fired"]:
+                    return
+                res = _txn.get("result")
+                if _txn.get("error") is not None or not isinstance(res, dict):
+                    return
+                if res.get("_remote_failed") or res.get("_local_deferred"):
+                    return
+                segs = res.get("segments")
+                tl = _diar.get("timeline")
+                if not segs or not tl:
+                    return  # need BOTH; else the classic serial path runs
+                _early_state["fired"] = True
+            try:
+                import copy as _early_copy
+                from backend.services.language_codes import normalize_lang_code
+                hook(_early_copy.deepcopy(segs), _early_copy.deepcopy(tl),
+                     normalize_lang_code(res.get("language", "") or ""))
+                log.log_stage(
+                    'PERCEIVE',
+                    'EARLY transcript published to the pipeline '
+                    f'({len(segs)} segments) — translation can start while '
+                    'the face loop continues')
+            except Exception as _eh_err:  # noqa: BLE001 — publishing is optional
+                log.log_stage('PERCEIVE', f'early-transcript hook failed: {_eh_err}')
         try:
             from backend.services.reframer_audio import remote_whisper_configured
             _txn_remote = bool(remote_whisper_configured())
@@ -258,6 +308,7 @@ class Perceiver:
                         _txn["result"] = {'_remote_failed': True}
                 except Exception as _e:  # noqa: BLE001 — reported, then retried
                     _txn["error"] = _e
+                _maybe_fire_early()
 
             _txn_thread = _threading.Thread(
                 target=_run_remote_txn, name="clipai-remote-whisper", daemon=True)
@@ -294,6 +345,7 @@ class Perceiver:
                         _txn["result"] = {'_local_deferred': True}
                 except Exception as _e:  # noqa: BLE001 — reported, then retried
                     _txn["error"] = _e
+                _maybe_fire_early()
 
             _txn_thread = _threading.Thread(
                 target=_run_local_txn, name="clipai-local-whisper", daemon=True)
@@ -316,7 +368,7 @@ class Perceiver:
         # inside the face pass. Worst case we just join and wait — never
         # slower than the old order; the local-embedding fallback (needs the
         # transcript) still runs sequentially below.
-        _diar: dict = {"timeline": None, "error": None}
+        # (_diar was initialized above, beside the early-transcript publisher)
         _diar_thread = None
         if bool(getattr(settings, 'DIARIZE_CONCURRENT_WITH_FACES', True)):
             import threading as _threading_d
@@ -327,6 +379,7 @@ class Perceiver:
                         _diar["timeline"] = self.diarizer.diarize(self.path, dur_ms)
                 except Exception as _e:  # noqa: BLE001 — degrade to the fallback
                     _diar["error"] = _e
+                _maybe_fire_early()
 
             _diar_thread = _threading_d.Thread(
                 target=_run_diar, name="clipai-diarize", daemon=True)

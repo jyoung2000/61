@@ -502,6 +502,32 @@ def _hybrid_split_candidate_windows(translated_cues, total_s: float):
         return None  # any surprise → classic full pass (legacy behavior)
 
 
+def _transcript_fingerprint(segments, speaker_timeline, language) -> str:
+    """Stable identity of a (transcript, diarization, language) triple.
+
+    Used by the early-translation overlap: the chain that runs mid-face-loop
+    snapshots its inputs; at engine completion the main flow only ADOPTS the
+    early result when the engine's final fields hash identically — any
+    divergence (sequential Whisper fallback, post-join edits) discards the
+    early work and re-runs the proven serial path. Fail-soft: an unhashable
+    surprise returns a unique token so adoption can never false-match."""
+    import hashlib
+    try:
+        h = hashlib.sha256()
+        for s in (segments or []):
+            g = (lambda k: s.get(k) if isinstance(s, dict)
+                 else getattr(s, k, None))
+            h.update(repr((round(float(g("start") or 0.0), 3),
+                           round(float(g("end") or 0.0), 3),
+                           g("text") or "")).encode("utf-8", "replace"))
+        h.update(repr(speaker_timeline).encode("utf-8", "replace"))
+        h.update(str(language or "").lower().encode("utf-8", "replace"))
+        return h.hexdigest()
+    except Exception:
+        import uuid
+        return f"unfingerprintable-{uuid.uuid4()}"
+
+
 def _whisper_native_translate_segments(video_path: str, source_lang: str,
                                        glossary: dict | None = None,
                                        source_segments: list | None = None,
@@ -5526,13 +5552,539 @@ async def _run_analysis_inner(job_id: str, resume: bool = False):
     else:
         _engine_stem = _vocals_path
 
+
+    # ── Transcript chain (runs exactly ONCE per job) ─────────────────────
+    # to_fez → raw persist → speaker fusion → voiceprint → source-polish
+    # gates → resegment → readability → music mark → dedup → readability
+    # score. It consumes ONLY the transcript segments, the diarization
+    # timeline and the detected language — all of which the perceiver's
+    # concurrent Whisper+diarization threads finish MINUTES before the face
+    # loop ends (observed: transcript ready at 17:18, faces done 17:28). The
+    # early-overlap runner below executes this chain (and starts translation)
+    # the moment those land; the main flow adopts the result only when the
+    # engine's FINAL transcript fingerprint matches the early snapshot, else
+    # it discards the early work and re-runs the chain inline — today's
+    # proven serial order is always the fallback.
+    async def _transcript_chain(_tc_segments, _tc_timeline, _tc_language,
+                                quiet: bool = False) -> dict:
+        import types as _shim_types
+        perception = _shim_types.SimpleNamespace(
+            transcript_segments=_tc_segments,
+            speaker_timeline=_tc_timeline,
+            detected_language=_tc_language,
+        )
+        # The transcript conversion is cheap and has NO dependency on the repair
+        # or the plan — hoist it so the speaker-fusion + LLM polish chain below
+        # can start immediately, OVERLAPPED with the repair + bridge work.
+        transcript = await asyncio.to_thread(
+            to_fez_transcript,
+            perception.transcript_segments,
+            getattr(perception, "speaker_timeline", None),
+        )
+        # Snapshot the RAW (unpolished) transcript now — before the LLM polish /
+        # dedup / translation cleanup below rewrites ``transcript`` — so the UI
+        # can offer both the polished and the raw Whisper output for download.
+        if transcript:
+            try:
+                _raw_dicts = [
+                    t.model_dump() if hasattr(t, "model_dump") else dict(t)
+                    for t in transcript
+                ]
+                await database.update_job_status(job_id, raw_transcript=_raw_dicts)
+            except Exception as _rt_err:
+                logger.debug("[%s] could not save raw transcript: %s", job_id, _rt_err)
+
+        # Loud, visible signal when transcription came back empty. Without a
+        # transcript the pipeline silently skips subtitle translation AND produces
+        # an empty summary ("no transcript was available") — so surface it as a job
+        # warning + WS notice instead of letting the run look cleanly COMPLETE. The
+        # usual cause is a transcription/audio-extraction failure (see the [AUDIO]
+        # error in the logs), not a genuinely silent video.
+        if not transcript:
+            _record_pipeline_warning(
+                job_id,
+                "Transcription produced no segments — subtitle translation and the "
+                "text summary were skipped. Check the audio track / [AUDIO] log lines.")
+            logger.warning(
+                "[%s] No transcript segments after analysis — translation + summary "
+                "will be skipped (likely a transcription/audio-extraction failure).",
+                job_id)
+            try:
+                await broadcast_ws(job_id, {
+                    "type": "compute_warning",
+                    "message": ("No speech transcript was produced — translation and "
+                                "summary skipped. Check the source audio."),
+                })
+            except Exception:
+                pass
+
+        # Whisper's detected language — hoisted here so the critical-path polish
+        # block below can pass it to the polisher (CJK-specific rules). It was
+        # previously only assigned much later, which raised UnboundLocalError in
+        # the polish try/except and silently disabled the LLM polish pass.
+        # Normalize to ISO 639-1 ("japanese" → "ja"): the polisher's CJK rules,
+        # the translator router and the auto-translate check all key on ISO codes.
+        # (The perceiver normalizes too, but a checkpoint-restored perception from
+        # an older run can still carry whisper.cpp's full language name.)
+        from backend.services.language_codes import normalize_lang_code as _norm_lang
+        _detected_lang = _norm_lang(getattr(perception, "detected_language", "") or "")
+
+        # ── Will this job translate? (translate-then-polish decision) ──
+        # When a translation pass will follow, we deliberately SKIP the heavy
+        # source-language polish / resegmentation / readability reflow below and
+        # leave that work for AFTER translation, so the LLM polishes the TARGET
+        # language text (English) rather than the source (Japanese). Mirrors the
+        # target/source resolution in _background_post_processing, including the
+        # "auto-translate non-English → English when no explicit subtitle_language"
+        # default, so the two decisions never disagree.
+        _bg_target = (job.subtitle_language or "").strip().lower()
+        _bg_source = (job.language or "").strip().lower() or _detected_lang.strip().lower()
+        if not _bg_target and _bg_source and _bg_source not in ("en", "english"):
+            _bg_target = "en"
+        _will_translate = bool(_bg_target and _bg_target != _bg_source and transcript)
+        logger.info(
+            "[%s] Post-processing plan: source=%s target=%s → %s",
+            job_id, _bg_source or "auto", _bg_target or "(none)",
+            "translate-then-polish in target language" if _will_translate
+            else "polish in source language (no translation)",
+        )
+
+        # ── Speaker fusion (Task 2): overlap voting + mid-segment splits +
+        # word-level regrouping. Replaces to_fez_transcript's basic per-segment
+        # majority vote with a proper diarization→transcript merge, so speaker
+        # turns follow the diarization timeline instead of acoustic windows.
+        # The mouth-motion heuristic remains the documented fallback: an empty
+        # speaker_timeline leaves the transcript untouched.
+        _speaker_timeline = getattr(perception, "speaker_timeline", None)
+        if _speaker_timeline and transcript:
+            try:
+                from backend.services.speaker_fusion import assign_speakers_from_timeline
+                from backend.services.reframer_bridge import _speaker_label_map
+                _pre_fusion = len(transcript)
+                _label_map = _speaker_label_map(_speaker_timeline)
+                _fused = assign_speakers_from_timeline(
+                    transcript, _speaker_timeline, label_map=_label_map,
+                )
+                transcript = [
+                    f.model_dump() if hasattr(f, "model_dump") else dict(f)
+                    for f in _fused
+                ]
+                logger.info(
+                    "[%s] Speaker fusion: %d → %d segments (%d speakers)",
+                    job_id, _pre_fusion, len(transcript), len(_label_map),
+                )
+            except Exception as _fusion_err:
+                logger.warning(
+                    "[%s] Speaker fusion failed (%s) — keeping basic attribution",
+                    job_id, _fusion_err,
+                )
+
+        # ── Voiceprint matching (Task 3): auto-apply names learned in prior
+        # jobs. No-ops gracefully when the pyannote embedding backend / HF_TOKEN
+        # are absent — the per-job "Speaker N" labels simply stand.
+        if _speaker_timeline and transcript:
+            _vram_snapshot("pre_voiceprint", job_id)
+            try:
+                from backend.services.voiceprint_registry import apply_voiceprint_names
+                from backend.services.reframer_bridge import _speaker_label_map
+                transcript = apply_voiceprint_names(
+                    transcript, _speaker_timeline, video_path,
+                    label_map=_speaker_label_map(_speaker_timeline),
+                )
+            except Exception as _vp_err:
+                logger.warning(
+                    "[%s] Voiceprint matching skipped (%s)", job_id, _vp_err)
+
+        # ── Synchronous transcript polish (BEFORE readability) ──
+        # Without this, CJK content (Japanese narration, K-drama dialogue)
+        # arrives as 30s blocks with zero 。 — the readability splitter falls
+        # back to particle-boundary guesses. Running the LLM polisher first
+        # gives the splitter actual sentence punctuation to break on, which
+        # is the single biggest lever on transcript readability.
+        _polished_in_critical_path = False
+        if _will_translate:
+            # Translate-then-polish: the heavy readability reflow runs in the TARGET
+            # language after translation, so we don't spend an LLM pass punctuating
+            # Japanese we're about to replace with English. BUT (Task 6) apply a
+            # single light SOURCE cleanup (punctuation / casing / filler) first so
+            # the translator works from clean input AND the shipped source
+            # transcript reads cleanly — both benefit. Fail-soft + gated by
+            # TRANSLATION_POLISH_SOURCE_FIRST; the full reflow still runs on the
+            # translated text. When it applies, it COUNTS as the source polish
+            # (_polished_in_critical_path=True): re-running the full multi-pass
+            # loop on translation failure spent ~33 min changing <3% of cues.
+            if (settings.AI_TRANSCRIPT_CORRECTION
+                    and getattr(settings, "TRANSCRIPT_POLISHING_ENABLED", True)
+                    and getattr(settings, "TRANSLATION_POLISH_SOURCE_FIRST", True)
+                    and transcript):
+                try:
+                    cancel_check()
+                    from backend.services.transcript_polisher import (
+                        polish_source_before_translation,
+                    )
+                    _src_polished = await polish_source_before_translation(
+                        transcript, orchestrator,
+                        source_language=(_detected_lang or "").lower(), job_id=job_id,
+                    )
+                    if _src_polished and len(_src_polished) == len(transcript):
+                        transcript = [
+                            p.model_dump() if hasattr(p, "model_dump") else dict(p)
+                            for p in _src_polished
+                        ]
+                        _polished_in_critical_path = True
+                        logger.info(
+                            "[%s] Light source-language polish applied before translation "
+                            "(%d segments) — translator + shipped source both benefit",
+                            job_id, len(transcript))
+                except Exception as _sp_err:
+                    logger.warning(
+                        "[%s] Pre-translation source polish skipped (%s) — keeping raw "
+                        "source", job_id, _sp_err)
+            else:
+                logger.info(
+                    "[%s] Skipping source-language polish before translation "
+                    "(disabled) — heavy polish runs on the translated text", job_id)
+            logger.info(
+                "[%s] Skipping source-language resegment + reflow "
+                "(translation pending — heavy reflow runs on the translated text)",
+                job_id,
+            )
+        elif (
+            settings.AI_TRANSCRIPT_CORRECTION
+            and getattr(settings, "TRANSCRIPT_POLISHING_ENABLED", True)
+            and transcript
+        ):
+            try:
+                cancel_check()
+                if not quiet:
+                    await _update_progress(
+                        job_id, JobStatus.ANALYZING_SCENES, 60,
+                        "Polishing transcript (punctuation + proper-noun fixes)...",
+                    )
+                # Pass Whisper's detected language so the polisher applies
+                # CJK-specific rules (insert 。/、, smaller batches, no
+                # filler removal) when appropriate.
+                _correction_lang = (_detected_lang or "").lower()
+                _polished_models, _polish_report = await _polish_transcript_loop(
+                    job_id, transcript, orchestrator, _correction_lang,
+                    model_override=_resolve_polish_model_override(orchestrator),
+                )
+                if _polished_models:
+                    transcript = [
+                        p.model_dump() if hasattr(p, "model_dump") else dict(p)
+                        for p in _polished_models
+                    ]
+                    _polished_in_critical_path = True
+                    logger.info(
+                        "[%s] Critical-path polish complete: %d segments, readability %s",
+                        job_id, len(transcript),
+                        f"{_polish_report.get('score', 0):.1f}/100" if _polish_report else "(no score)",
+                    )
+            except Exception as _polish_err:
+                logger.warning(
+                    "[%s] Critical-path polish failed (%s) — falling back to raw transcript",
+                    job_id, _polish_err,
+                )
+
+        # ── Sentence-aware resegmentation (Task 4) ──
+        # Merge same-speaker neighbours then re-split at sentence boundaries
+        # (using word timestamps), so the now-polished transcript breaks by
+        # sentence rather than raw VAD window. Runs after speaker fusion +
+        # polish (which adds the punctuation this relies on) and before the
+        # readability pass, which enforces duration/CPS on the result. Skipped
+        # when a translation will follow — resegmentation happens on the
+        # translated English text instead (it relies on punctuation the
+        # post-translation polish adds).
+        if getattr(settings, "SENTENCE_SEGMENTATION_ENABLED", True) and transcript and not _will_translate:
+            try:
+                from backend.services.sentence_segmenter import resegment_by_sentence
+                _pre_resegment = len(transcript)
+                _reseg = resegment_by_sentence(transcript)
+                transcript = [
+                    t.model_dump() if hasattr(t, "model_dump") else dict(t)
+                    for t in _reseg
+                ]
+                logger.info(
+                    "[%s] Sentence resegmentation: %d → %d segments",
+                    job_id, _pre_resegment, len(transcript),
+                )
+            except Exception as _reseg_err:
+                logger.warning(
+                    "[%s] Sentence resegmentation failed (%s) — keeping segments",
+                    job_id, _reseg_err,
+                )
+
+        # ── Apply readability rules to the (now-polished) transcript ──
+        # Whisper emits one segment per VAD-detected speech window, which on
+        # dialogue-dense content (Japanese narration, podcasts) ends up as
+        # 30 s blocks of un-broken text — unreadable as subtitles. Run the
+        # Netflix/YouTube/TikTok-style enforcer here so the on-screen captions
+        # and the transcript panel are both segmented to readable chunks
+        # BEFORE translation runs. Translation later applies the enforcer
+        # again on its own output to handle character-density changes
+        # (CJK → English typically doubles segment length). Skipped when a
+        # translation will follow — the reflow runs on the translated English
+        # text (post-translation) instead, so we don't reflow source segments
+        # we're about to discard.
+        if getattr(settings, "SUBTITLE_CPS_ENFORCEMENT", True) and transcript and not _will_translate:
+            try:
+                from backend.services.subtitle_formatter import (
+                    enforce_readability, compute_readability_report,
+                )
+                from backend.models import TranscriptSegment
+                _ts_models = [
+                    t if isinstance(t, TranscriptSegment) else TranscriptSegment(**t)
+                    for t in transcript
+                ]
+                # Build the readability kwargs from config so the source-language
+                # (no-translate) path honors the same settings as the polish loop
+                # and the translation path. Without this it fell through to the
+                # function-signature defaults (notably max_duration_ms) and ignored
+                # SUBTITLE_MAX_DURATION_MS / SUBTITLE_MAX_CPS / SUBTITLE_MAX_CHARS_PER_LINE
+                # / SUBTITLE_MIN_DURATION_MS / SUBTITLE_SMART_LINE_BREAKS — a slow
+                # English cue between 4.5s and 9s got split that the configured 9s
+                # cap would have kept whole.
+                _src_enforce_kwargs = dict(
+                    max_cps=float(getattr(settings, "SUBTITLE_MAX_CPS", 20.0)),
+                    max_chars_per_line=int(getattr(settings, "SUBTITLE_MAX_CHARS_PER_LINE", 42)),
+                    min_duration_ms=int(getattr(settings, "SUBTITLE_MIN_DURATION_MS", 833)),
+                    max_duration_ms=int(getattr(settings, "SUBTITLE_MAX_DURATION_MS", 9000)),
+                    smart_line_breaks=bool(getattr(settings, "SUBTITLE_SMART_LINE_BREAKS", True)),
+                )
+                # Iterate the readability enforcer until the score plateaus.
+                # Single-pass leaves cascade artifacts (Pass 2 extends a short
+                # segment, Pass 4 caps it back below min_dur, score stays low).
+                _readable = _ts_models
+                _best_readable = list(_ts_models)
+                _best_score = -1.0
+                for _ in range(4):
+                    _readable = enforce_readability(list(_readable), **_src_enforce_kwargs)
+                    try:
+                        _sc = float(compute_readability_report(list(_readable)).get("score", 0) or 0)
+                    except Exception:
+                        _sc = 0.0
+                    if _sc > _best_score + 0.5:
+                        _best_score = _sc
+                        _best_readable = list(_readable)
+                    else:
+                        break
+                _readable = _best_readable
+                transcript = [
+                    t.model_dump() if hasattr(t, "model_dump") else dict(t)
+                    for t in _readable
+                ]
+                logger.info(
+                    "[%s] Raw transcript reflowed for readability: %d → %d segments",
+                    job_id, len(_ts_models), len(transcript),
+                )
+                # Once-per-job timing-provenance summary: how many cues are
+                # word-timed vs. char-proportional. Makes timing-quality regressions
+                # (e.g. polish wiping word timing) visible at a glance.
+                try:
+                    from backend.services.sentence_segmenter import timing_provenance_report
+                    _tp = timing_provenance_report(transcript)
+                    logger.info(
+                        "[%s] Cue timing provenance: %d/%d word-timed (%.1f%%), "
+                        "%d char-proportional",
+                        job_id, _tp["word_timed"], _tp["total"],
+                        _tp["pct_word_timed"], _tp["proportional"],
+                    )
+                except Exception:
+                    pass
+            except Exception as _re_err:
+                logger.warning(
+                    "[%s] Raw transcript readability pass failed (%s) — keeping Whisper output as-is",
+                    job_id, _re_err,
+                )
+
+        # ── Music suppression + marking (Task 4) ──
+        # In sustained music-only spans (OP/ED themes, insert songs), DROP Whisper's
+        # hallucinated lyrics/vocalisations and positively label the span with a
+        # "[♪ music ♪]" marker instead. Dialogue OVER music is classified `speech`
+        # (not `music`) by the spectral classifier, so real dialogue is untouched.
+        # Markers are language-neutral and pass through the translator verbatim.
+        # One classify pass feeds both suppression and marking. No-ops gracefully
+        # if audio/numpy is missing.
+        if getattr(settings, "SUBTITLE_MARK_MUSIC", True) and transcript:
+            try:
+                _audio_wav = os.path.join(job_dir, "audio.wav")
+                if os.path.isfile(_audio_wav):
+                    from backend.services.audio_analyzer import mark_and_suppress_music
+                    transcript, _n_suppressed, _n_markers = await mark_and_suppress_music(
+                        _audio_wav, transcript,
+                        min_seconds=float(getattr(settings, "SUBTITLE_MUSIC_MIN_SEC", 5.0)),
+                        suppress=bool(getattr(settings, "SUBTITLE_SUPPRESS_SPEECH_IN_MUSIC", True)),
+                        min_overlap_frac=float(getattr(settings, "SUBTITLE_MUSIC_SUPPRESS_OVERLAP", 0.6)),
+                        vocalizations_only=bool(getattr(settings, "SUBTITLE_MUSIC_SUPPRESS_VOCALIZATIONS_ONLY", True)),
+                    )
+                    if _n_suppressed or _n_markers:
+                        logger.info(
+                            "[%s] Music suppression+marking: dropped %d hallucinated "
+                            "speech cue(s) over music, inserted %d [♪ music ♪] cue(s)",
+                            job_id, _n_suppressed, _n_markers,
+                        )
+            except Exception as _mm_err:
+                logger.warning(
+                    "[%s] Music suppression/marking skipped (%s)", job_id, _mm_err)
+
+        # ── Final de-duplication pass ──
+        # The per-segment hallucination filters run inside the Whisper stage, but
+        # speaker fusion, sentence resegmentation and the readability reflow can
+        # all re-introduce duplicates downstream: back-to-back identical cues
+        # (observed as ``[11:25] …`` twice in a row) and scattered repetition-loop
+        # hallucinations (the garbled ``ドーリアンリ`` name repeated 8× across the
+        # episode). Run BOTH collapses one last time on the fully-assembled
+        # transcript — this is the version that gets persisted, translated and
+        # exported, so it's the one the user actually sees in the TXT/SRT/VTT.
+        if transcript:
+            try:
+                from backend.services.transcript_dedup import (
+                    collapse_adjacent_duplicates, drop_repetition_loops,
+                    collapse_overlapping_duplicates,
+                )
+                _pre_dedup = len(transcript)
+                transcript, _adj = collapse_adjacent_duplicates(transcript)
+                # Overlap + similarity collapse catches near-duplicate
+                # re-transcriptions that aren't strictly adjacent or identical
+                # (the gap-fill pass landing the same line a few hundred ms off
+                # the primary cue). TranscriptSegment dicts use start/end keys.
+                transcript, _ovl = collapse_overlapping_duplicates(transcript)
+                transcript, _loop = drop_repetition_loops(transcript)
+                if _adj or _ovl or _loop:
+                    logger.info(
+                        "[%s] Final transcript dedup: %d → %d segments "
+                        "(%d adjacent dup, %d overlapping near-dup, %d repetition-loop)",
+                        job_id, _pre_dedup, len(transcript), _adj, _ovl, _loop,
+                    )
+            except Exception as _dd_err:
+                logger.warning(
+                    "[%s] Final transcript dedup skipped (%s)", job_id, _dd_err)
+
+        # ── Transcript readability score ──
+        # Returns a Netflix-style A-F grade + per-axis sub-scores (CPS,
+        # line length, duration, gap). Persisted on the job so the Analysis
+        # page can display a readability card next to the reframe report.
+        transcript_readability = None
+        if transcript:
+            try:
+                from backend.services.subtitle_formatter import compute_readability_report
+                from backend.models import TranscriptSegment
+                _r_models = [
+                    t if isinstance(t, TranscriptSegment) else TranscriptSegment(**t)
+                    for t in transcript
+                ]
+                transcript_readability = compute_readability_report(_r_models)
+                logger.info(
+                    "[%s] Transcript readability: grade %s (%.1f/100) — CPS %.1f compliance, "
+                    "avg %.1f cps / peak %.1f cps over %d segments%s",
+                    job_id,
+                    transcript_readability.get("grade"),
+                    transcript_readability.get("score", 0),
+                    transcript_readability.get("cps_compliance_pct", 0),
+                    transcript_readability.get("avg_cps", 0),
+                    transcript_readability.get("max_cps_observed", 0),
+                    transcript_readability.get("total_segments", 0),
+                    " (CJK profile)" if transcript_readability.get("is_cjk") else "",
+                )
+            except Exception as _rd_err:
+                logger.warning(
+                    "[%s] Readability scoring failed: %s",
+                    job_id, _rd_err,
+                )
+
+
+        return {
+            "transcript": transcript,
+            "detected_lang": _detected_lang,
+            "bg_source": _bg_source,
+            "bg_target": _bg_target,
+            "will_translate": _will_translate,
+            "polished_in_critical_path": _polished_in_critical_path,
+            "readability": transcript_readability,
+        }
+
+    async def _early_chain_runner(_evt, _payload, _engine_fut):
+        """Wait for the perceiver's early transcript gate; when it fires
+        BEFORE the engine finishes, run the transcript chain quietly and
+        start translation immediately. Returns None when the engine won (no
+        early work), else {fingerprint, res, pp_task} for adoption."""
+        _evt_wait = asyncio.create_task(_evt.wait())
+        try:
+            await asyncio.wait({_evt_wait, _engine_fut},
+                               return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            if not _evt_wait.done():
+                _evt_wait.cancel()
+        if not _evt.is_set():
+            return None  # engine finished first — classic serial path
+        _segs = _payload.get("segments") or []
+        _tl = _payload.get("timeline")
+        _lang = _payload.get("language") or ""
+        _fp = _transcript_fingerprint(_segs, _tl, _lang)
+        logger.info(
+            "[%s] EARLY overlap: transcript + diarization landed mid-face-loop "
+            "(%d segments) — starting transcript chain + translation now",
+            job_id, len(_segs))
+        _res = await _transcript_chain(_segs, _tl, _lang, quiet=True)
+        _pp_task = None
+        try:
+            if _res and _res.get("transcript"):
+                _pp_job_e = await database.load_job(job_id) or job
+                _pp_task = asyncio.create_task(_background_post_processing(
+                    job_id, list(_res["transcript"]), orchestrator, _pp_job_e,
+                    polished_already=_res["polished_in_critical_path"]))
+                logger.info(
+                    "[%s] EARLY translation started (%s) — overlapped with the "
+                    "face loop", job_id,
+                    "translate+polish" if _res.get("will_translate")
+                    else "source polish only")
+        except Exception as _ep_err:
+            logger.warning("[%s] early translation start failed (%s) — the "
+                           "classic path will translate", job_id, _ep_err)
+            _pp_task = None
+        return {"fingerprint": _fp, "res": _res, "pp_task": _pp_task}
+
+    # Early-overlap gate: enabled on Companion rigs only (translation must
+    # not fight the face loop for the LOCAL card's VRAM), never on resumed
+    # runs (their transcript is checkpoint-restored, not gate-published).
+    _early_chain_task = None
+    _early_hook = None
+    if (not _resumed_from_checkpoint
+            and bool(getattr(settings, "PIPELINE_EARLY_TRANSLATION", True))):
+        try:
+            from backend.services import ollama_registry as _oreg_e
+            _early_ok = await _oreg_e.remote_primary_vram_gb_resolved() >= 7.0
+        except Exception:
+            _early_ok = False
+        if _early_ok:
+            _early_evt = asyncio.Event()
+            _early_payload: dict = {}
+            _early_loop = asyncio.get_running_loop()
+
+            def _early_hook(segments, timeline, language):  # perceiver thread
+                _early_payload["segments"] = segments
+                _early_payload["timeline"] = timeline
+                _early_payload["language"] = language
+                _early_loop.call_soon_threadsafe(_early_evt.set)
+
     if not _resumed_from_checkpoint:
         engine = ReframeEngine(video_path, sample_fps=_sample_fps,
                                aspect_ratio="9:16", trace_path=_trace_path,
                                source_language=_engine_source_lang,
-                               transcribe_audio_path=_engine_stem)
+                               transcribe_audio_path=_engine_stem,
+                               early_transcript_hook=_early_hook)
         async with _stage_timer(job_id, "reframer_analysis"):
-            reframer_plan = await asyncio.to_thread(engine.analyze, _engine_progress)
+            _engine_fut = asyncio.create_task(
+                asyncio.to_thread(engine.analyze, _engine_progress))
+            if _early_hook is not None:
+                _early_chain_task = asyncio.create_task(
+                    _early_chain_runner(_early_evt, _early_payload, _engine_fut))
+            try:
+                reframer_plan = await _engine_fut
+            except BaseException:
+                if _early_chain_task is not None:
+                    _early_chain_task.cancel()
+                raise
         perception = engine.perception
         _log_gpu_memory(job_id, "post-reframer")
         # Optimization #4: join the frame+audio extraction that ran concurrently
@@ -5710,27 +6262,6 @@ async def _run_analysis_inner(job_id: str, resume: bool = False):
         heartbeat_label="reframe repair",
     )
 
-    # The transcript conversion is cheap and has NO dependency on the repair
-    # or the plan — hoist it so the speaker-fusion + LLM polish chain below
-    # can start immediately, OVERLAPPED with the repair + bridge work.
-    transcript = await asyncio.to_thread(
-        to_fez_transcript,
-        perception.transcript_segments,
-        getattr(perception, "speaker_timeline", None),
-    )
-    # Snapshot the RAW (unpolished) transcript now — before the LLM polish /
-    # dedup / translation cleanup below rewrites ``transcript`` — so the UI
-    # can offer both the polished and the raw Whisper output for download.
-    if transcript:
-        try:
-            _raw_dicts = [
-                t.model_dump() if hasattr(t, "model_dump") else dict(t)
-                for t in transcript
-            ]
-            await database.update_job_status(job_id, raw_transcript=_raw_dicts)
-        except Exception as _rt_err:
-            logger.debug("[%s] could not save raw transcript: %s", job_id, _rt_err)
-
     # ── Repair + bridge as ONE background task, overlapped with the
     # transcript chain (speaker fusion → voiceprint → source polish) below.
     # Both sides are independent: repair mutates the PLAN + face timeline
@@ -5777,60 +6308,50 @@ async def _run_analysis_inner(job_id: str, resume: bool = False):
 
     _plan_prep_task = asyncio.create_task(_repair_and_bridge())
 
-    # Loud, visible signal when transcription came back empty. Without a
-    # transcript the pipeline silently skips subtitle translation AND produces
-    # an empty summary ("no transcript was available") — so surface it as a job
-    # warning + WS notice instead of letting the run look cleanly COMPLETE. The
-    # usual cause is a transcription/audio-extraction failure (see the [AUDIO]
-    # error in the logs), not a genuinely silent video.
-    if not transcript:
-        _record_pipeline_warning(
-            job_id,
-            "Transcription produced no segments — subtitle translation and the "
-            "text summary were skipped. Check the audio track / [AUDIO] log lines.")
-        logger.warning(
-            "[%s] No transcript segments after analysis — translation + summary "
-            "will be skipped (likely a transcription/audio-extraction failure).",
-            job_id)
+    # ── Transcript chain: adopt the early-overlap result or run inline ──
+    _pp_early_task = None
+    _chain_early = None
+    if _early_chain_task is not None:
         try:
-            await broadcast_ws(job_id, {
-                "type": "compute_warning",
-                "message": ("No speech transcript was produced — translation and "
-                            "summary skipped. Check the source audio."),
-            })
-        except Exception:
-            pass
-
-    # Whisper's detected language — hoisted here so the critical-path polish
-    # block below can pass it to the polisher (CJK-specific rules). It was
-    # previously only assigned much later, which raised UnboundLocalError in
-    # the polish try/except and silently disabled the LLM polish pass.
-    # Normalize to ISO 639-1 ("japanese" → "ja"): the polisher's CJK rules,
-    # the translator router and the auto-translate check all key on ISO codes.
-    # (The perceiver normalizes too, but a checkpoint-restored perception from
-    # an older run can still carry whisper.cpp's full language name.)
-    from backend.services.language_codes import normalize_lang_code as _norm_lang
-    _detected_lang = _norm_lang(getattr(perception, "detected_language", "") or "")
-
-    # ── Will this job translate? (translate-then-polish decision) ──
-    # When a translation pass will follow, we deliberately SKIP the heavy
-    # source-language polish / resegmentation / readability reflow below and
-    # leave that work for AFTER translation, so the LLM polishes the TARGET
-    # language text (English) rather than the source (Japanese). Mirrors the
-    # target/source resolution in _background_post_processing, including the
-    # "auto-translate non-English → English when no explicit subtitle_language"
-    # default, so the two decisions never disagree.
-    _bg_target = (job.subtitle_language or "").strip().lower()
-    _bg_source = (job.language or "").strip().lower() or _detected_lang.strip().lower()
-    if not _bg_target and _bg_source and _bg_source not in ("en", "english"):
-        _bg_target = "en"
-    _will_translate = bool(_bg_target and _bg_target != _bg_source and transcript)
-    logger.info(
-        "[%s] Post-processing plan: source=%s target=%s → %s",
-        job_id, _bg_source or "auto", _bg_target or "(none)",
-        "translate-then-polish in target language" if _will_translate
-        else "polish in source language (no translation)",
-    )
+            _chain_early = await _early_chain_task
+        except Exception as _ec_err:
+            logger.warning(
+                "[%s] Early transcript chain failed (%s) — running inline",
+                job_id, _ec_err)
+            _chain_early = None
+    from backend.services.language_codes import normalize_lang_code as _fp_norm
+    _fp_now = _transcript_fingerprint(
+        getattr(perception, "transcript_segments", None) or [],
+        getattr(perception, "speaker_timeline", None),
+        _fp_norm(getattr(perception, "detected_language", "") or ""))
+    if (_chain_early and _chain_early.get("res")
+            and _chain_early.get("fingerprint") == _fp_now):
+        _cr = _chain_early["res"]
+        _pp_early_task = _chain_early.get("pp_task")
+        logger.info(
+            "[%s] EARLY transcript chain ADOPTED (fingerprint match) — "
+            "translation has been running since mid-face-loop", job_id)
+    else:
+        if _chain_early:
+            logger.warning(
+                "[%s] EARLY transcript chain DISCARDED (fingerprint mismatch — "
+                "sequential Whisper fallback or post-join edits changed the "
+                "transcript); re-running the chain inline", job_id)
+            _pt = _chain_early.get("pp_task")
+            if _pt is not None and not _pt.done():
+                _pt.cancel()
+        _cr = await _transcript_chain(
+            getattr(perception, "transcript_segments", None) or [],
+            getattr(perception, "speaker_timeline", None),
+            getattr(perception, "detected_language", "") or "",
+            quiet=False)
+    transcript = _cr["transcript"]
+    _detected_lang = _cr["detected_lang"]
+    _bg_source = _cr["bg_source"]
+    _bg_target = _cr["bg_target"]
+    _will_translate = _cr["will_translate"]
+    _polished_in_critical_path = _cr["polished_in_critical_path"]
+    transcript_readability = _cr["readability"]
 
     # The bridge is done — say so. Without this the keepalive kept reading
     # "render plan conversion" (with an ever-growing clock) through speaker
@@ -5840,348 +6361,6 @@ async def _run_analysis_inner(job_id: str, resume: bool = False):
         "Fusing speakers + polishing the source transcript...",
         heartbeat_label="source transcript polish",
     )
-
-    # ── Speaker fusion (Task 2): overlap voting + mid-segment splits +
-    # word-level regrouping. Replaces to_fez_transcript's basic per-segment
-    # majority vote with a proper diarization→transcript merge, so speaker
-    # turns follow the diarization timeline instead of acoustic windows.
-    # The mouth-motion heuristic remains the documented fallback: an empty
-    # speaker_timeline leaves the transcript untouched.
-    _speaker_timeline = getattr(perception, "speaker_timeline", None)
-    if _speaker_timeline and transcript:
-        try:
-            from backend.services.speaker_fusion import assign_speakers_from_timeline
-            from backend.services.reframer_bridge import _speaker_label_map
-            _pre_fusion = len(transcript)
-            _label_map = _speaker_label_map(_speaker_timeline)
-            _fused = assign_speakers_from_timeline(
-                transcript, _speaker_timeline, label_map=_label_map,
-            )
-            transcript = [
-                f.model_dump() if hasattr(f, "model_dump") else dict(f)
-                for f in _fused
-            ]
-            logger.info(
-                "[%s] Speaker fusion: %d → %d segments (%d speakers)",
-                job_id, _pre_fusion, len(transcript), len(_label_map),
-            )
-        except Exception as _fusion_err:
-            logger.warning(
-                "[%s] Speaker fusion failed (%s) — keeping basic attribution",
-                job_id, _fusion_err,
-            )
-
-    # ── Voiceprint matching (Task 3): auto-apply names learned in prior
-    # jobs. No-ops gracefully when the pyannote embedding backend / HF_TOKEN
-    # are absent — the per-job "Speaker N" labels simply stand.
-    if _speaker_timeline and transcript:
-        _vram_snapshot("pre_voiceprint", job_id)
-        try:
-            from backend.services.voiceprint_registry import apply_voiceprint_names
-            from backend.services.reframer_bridge import _speaker_label_map
-            transcript = apply_voiceprint_names(
-                transcript, _speaker_timeline, video_path,
-                label_map=_speaker_label_map(_speaker_timeline),
-            )
-        except Exception as _vp_err:
-            logger.warning(
-                "[%s] Voiceprint matching skipped (%s)", job_id, _vp_err)
-
-    # ── Synchronous transcript polish (BEFORE readability) ──
-    # Without this, CJK content (Japanese narration, K-drama dialogue)
-    # arrives as 30s blocks with zero 。 — the readability splitter falls
-    # back to particle-boundary guesses. Running the LLM polisher first
-    # gives the splitter actual sentence punctuation to break on, which
-    # is the single biggest lever on transcript readability.
-    _polished_in_critical_path = False
-    if _will_translate:
-        # Translate-then-polish: the heavy readability reflow runs in the TARGET
-        # language after translation, so we don't spend an LLM pass punctuating
-        # Japanese we're about to replace with English. BUT (Task 6) apply a
-        # single light SOURCE cleanup (punctuation / casing / filler) first so
-        # the translator works from clean input AND the shipped source
-        # transcript reads cleanly — both benefit. Fail-soft + gated by
-        # TRANSLATION_POLISH_SOURCE_FIRST; the full reflow still runs on the
-        # translated text. When it applies, it COUNTS as the source polish
-        # (_polished_in_critical_path=True): re-running the full multi-pass
-        # loop on translation failure spent ~33 min changing <3% of cues.
-        if (settings.AI_TRANSCRIPT_CORRECTION
-                and getattr(settings, "TRANSCRIPT_POLISHING_ENABLED", True)
-                and getattr(settings, "TRANSLATION_POLISH_SOURCE_FIRST", True)
-                and transcript):
-            try:
-                cancel_check()
-                from backend.services.transcript_polisher import (
-                    polish_source_before_translation,
-                )
-                _src_polished = await polish_source_before_translation(
-                    transcript, orchestrator,
-                    source_language=(_detected_lang or "").lower(), job_id=job_id,
-                )
-                if _src_polished and len(_src_polished) == len(transcript):
-                    transcript = [
-                        p.model_dump() if hasattr(p, "model_dump") else dict(p)
-                        for p in _src_polished
-                    ]
-                    _polished_in_critical_path = True
-                    logger.info(
-                        "[%s] Light source-language polish applied before translation "
-                        "(%d segments) — translator + shipped source both benefit",
-                        job_id, len(transcript))
-            except Exception as _sp_err:
-                logger.warning(
-                    "[%s] Pre-translation source polish skipped (%s) — keeping raw "
-                    "source", job_id, _sp_err)
-        else:
-            logger.info(
-                "[%s] Skipping source-language polish before translation "
-                "(disabled) — heavy polish runs on the translated text", job_id)
-        logger.info(
-            "[%s] Skipping source-language resegment + reflow "
-            "(translation pending — heavy reflow runs on the translated text)",
-            job_id,
-        )
-    elif (
-        settings.AI_TRANSCRIPT_CORRECTION
-        and getattr(settings, "TRANSCRIPT_POLISHING_ENABLED", True)
-        and transcript
-    ):
-        try:
-            cancel_check()
-            await _update_progress(
-                job_id, JobStatus.ANALYZING_SCENES, 60,
-                "Polishing transcript (punctuation + proper-noun fixes)...",
-            )
-            # Pass Whisper's detected language so the polisher applies
-            # CJK-specific rules (insert 。/、, smaller batches, no
-            # filler removal) when appropriate.
-            _correction_lang = (_detected_lang or "").lower()
-            _polished_models, _polish_report = await _polish_transcript_loop(
-                job_id, transcript, orchestrator, _correction_lang,
-                model_override=_resolve_polish_model_override(orchestrator),
-            )
-            if _polished_models:
-                transcript = [
-                    p.model_dump() if hasattr(p, "model_dump") else dict(p)
-                    for p in _polished_models
-                ]
-                _polished_in_critical_path = True
-                logger.info(
-                    "[%s] Critical-path polish complete: %d segments, readability %s",
-                    job_id, len(transcript),
-                    f"{_polish_report.get('score', 0):.1f}/100" if _polish_report else "(no score)",
-                )
-        except Exception as _polish_err:
-            logger.warning(
-                "[%s] Critical-path polish failed (%s) — falling back to raw transcript",
-                job_id, _polish_err,
-            )
-
-    # ── Sentence-aware resegmentation (Task 4) ──
-    # Merge same-speaker neighbours then re-split at sentence boundaries
-    # (using word timestamps), so the now-polished transcript breaks by
-    # sentence rather than raw VAD window. Runs after speaker fusion +
-    # polish (which adds the punctuation this relies on) and before the
-    # readability pass, which enforces duration/CPS on the result. Skipped
-    # when a translation will follow — resegmentation happens on the
-    # translated English text instead (it relies on punctuation the
-    # post-translation polish adds).
-    if getattr(settings, "SENTENCE_SEGMENTATION_ENABLED", True) and transcript and not _will_translate:
-        try:
-            from backend.services.sentence_segmenter import resegment_by_sentence
-            _pre_resegment = len(transcript)
-            _reseg = resegment_by_sentence(transcript)
-            transcript = [
-                t.model_dump() if hasattr(t, "model_dump") else dict(t)
-                for t in _reseg
-            ]
-            logger.info(
-                "[%s] Sentence resegmentation: %d → %d segments",
-                job_id, _pre_resegment, len(transcript),
-            )
-        except Exception as _reseg_err:
-            logger.warning(
-                "[%s] Sentence resegmentation failed (%s) — keeping segments",
-                job_id, _reseg_err,
-            )
-
-    # ── Apply readability rules to the (now-polished) transcript ──
-    # Whisper emits one segment per VAD-detected speech window, which on
-    # dialogue-dense content (Japanese narration, podcasts) ends up as
-    # 30 s blocks of un-broken text — unreadable as subtitles. Run the
-    # Netflix/YouTube/TikTok-style enforcer here so the on-screen captions
-    # and the transcript panel are both segmented to readable chunks
-    # BEFORE translation runs. Translation later applies the enforcer
-    # again on its own output to handle character-density changes
-    # (CJK → English typically doubles segment length). Skipped when a
-    # translation will follow — the reflow runs on the translated English
-    # text (post-translation) instead, so we don't reflow source segments
-    # we're about to discard.
-    if getattr(settings, "SUBTITLE_CPS_ENFORCEMENT", True) and transcript and not _will_translate:
-        try:
-            from backend.services.subtitle_formatter import (
-                enforce_readability, compute_readability_report,
-            )
-            from backend.models import TranscriptSegment
-            _ts_models = [
-                t if isinstance(t, TranscriptSegment) else TranscriptSegment(**t)
-                for t in transcript
-            ]
-            # Build the readability kwargs from config so the source-language
-            # (no-translate) path honors the same settings as the polish loop
-            # and the translation path. Without this it fell through to the
-            # function-signature defaults (notably max_duration_ms) and ignored
-            # SUBTITLE_MAX_DURATION_MS / SUBTITLE_MAX_CPS / SUBTITLE_MAX_CHARS_PER_LINE
-            # / SUBTITLE_MIN_DURATION_MS / SUBTITLE_SMART_LINE_BREAKS — a slow
-            # English cue between 4.5s and 9s got split that the configured 9s
-            # cap would have kept whole.
-            _src_enforce_kwargs = dict(
-                max_cps=float(getattr(settings, "SUBTITLE_MAX_CPS", 20.0)),
-                max_chars_per_line=int(getattr(settings, "SUBTITLE_MAX_CHARS_PER_LINE", 42)),
-                min_duration_ms=int(getattr(settings, "SUBTITLE_MIN_DURATION_MS", 833)),
-                max_duration_ms=int(getattr(settings, "SUBTITLE_MAX_DURATION_MS", 9000)),
-                smart_line_breaks=bool(getattr(settings, "SUBTITLE_SMART_LINE_BREAKS", True)),
-            )
-            # Iterate the readability enforcer until the score plateaus.
-            # Single-pass leaves cascade artifacts (Pass 2 extends a short
-            # segment, Pass 4 caps it back below min_dur, score stays low).
-            _readable = _ts_models
-            _best_readable = list(_ts_models)
-            _best_score = -1.0
-            for _ in range(4):
-                _readable = enforce_readability(list(_readable), **_src_enforce_kwargs)
-                try:
-                    _sc = float(compute_readability_report(list(_readable)).get("score", 0) or 0)
-                except Exception:
-                    _sc = 0.0
-                if _sc > _best_score + 0.5:
-                    _best_score = _sc
-                    _best_readable = list(_readable)
-                else:
-                    break
-            _readable = _best_readable
-            transcript = [
-                t.model_dump() if hasattr(t, "model_dump") else dict(t)
-                for t in _readable
-            ]
-            logger.info(
-                "[%s] Raw transcript reflowed for readability: %d → %d segments",
-                job_id, len(_ts_models), len(transcript),
-            )
-            # Once-per-job timing-provenance summary: how many cues are
-            # word-timed vs. char-proportional. Makes timing-quality regressions
-            # (e.g. polish wiping word timing) visible at a glance.
-            try:
-                from backend.services.sentence_segmenter import timing_provenance_report
-                _tp = timing_provenance_report(transcript)
-                logger.info(
-                    "[%s] Cue timing provenance: %d/%d word-timed (%.1f%%), "
-                    "%d char-proportional",
-                    job_id, _tp["word_timed"], _tp["total"],
-                    _tp["pct_word_timed"], _tp["proportional"],
-                )
-            except Exception:
-                pass
-        except Exception as _re_err:
-            logger.warning(
-                "[%s] Raw transcript readability pass failed (%s) — keeping Whisper output as-is",
-                job_id, _re_err,
-            )
-
-    # ── Music suppression + marking (Task 4) ──
-    # In sustained music-only spans (OP/ED themes, insert songs), DROP Whisper's
-    # hallucinated lyrics/vocalisations and positively label the span with a
-    # "[♪ music ♪]" marker instead. Dialogue OVER music is classified `speech`
-    # (not `music`) by the spectral classifier, so real dialogue is untouched.
-    # Markers are language-neutral and pass through the translator verbatim.
-    # One classify pass feeds both suppression and marking. No-ops gracefully
-    # if audio/numpy is missing.
-    if getattr(settings, "SUBTITLE_MARK_MUSIC", True) and transcript:
-        try:
-            _audio_wav = os.path.join(job_dir, "audio.wav")
-            if os.path.isfile(_audio_wav):
-                from backend.services.audio_analyzer import mark_and_suppress_music
-                transcript, _n_suppressed, _n_markers = await mark_and_suppress_music(
-                    _audio_wav, transcript,
-                    min_seconds=float(getattr(settings, "SUBTITLE_MUSIC_MIN_SEC", 5.0)),
-                    suppress=bool(getattr(settings, "SUBTITLE_SUPPRESS_SPEECH_IN_MUSIC", True)),
-                    min_overlap_frac=float(getattr(settings, "SUBTITLE_MUSIC_SUPPRESS_OVERLAP", 0.6)),
-                    vocalizations_only=bool(getattr(settings, "SUBTITLE_MUSIC_SUPPRESS_VOCALIZATIONS_ONLY", True)),
-                )
-                if _n_suppressed or _n_markers:
-                    logger.info(
-                        "[%s] Music suppression+marking: dropped %d hallucinated "
-                        "speech cue(s) over music, inserted %d [♪ music ♪] cue(s)",
-                        job_id, _n_suppressed, _n_markers,
-                    )
-        except Exception as _mm_err:
-            logger.warning(
-                "[%s] Music suppression/marking skipped (%s)", job_id, _mm_err)
-
-    # ── Final de-duplication pass ──
-    # The per-segment hallucination filters run inside the Whisper stage, but
-    # speaker fusion, sentence resegmentation and the readability reflow can
-    # all re-introduce duplicates downstream: back-to-back identical cues
-    # (observed as ``[11:25] …`` twice in a row) and scattered repetition-loop
-    # hallucinations (the garbled ``ドーリアンリ`` name repeated 8× across the
-    # episode). Run BOTH collapses one last time on the fully-assembled
-    # transcript — this is the version that gets persisted, translated and
-    # exported, so it's the one the user actually sees in the TXT/SRT/VTT.
-    if transcript:
-        try:
-            from backend.services.transcript_dedup import (
-                collapse_adjacent_duplicates, drop_repetition_loops,
-                collapse_overlapping_duplicates,
-            )
-            _pre_dedup = len(transcript)
-            transcript, _adj = collapse_adjacent_duplicates(transcript)
-            # Overlap + similarity collapse catches near-duplicate
-            # re-transcriptions that aren't strictly adjacent or identical
-            # (the gap-fill pass landing the same line a few hundred ms off
-            # the primary cue). TranscriptSegment dicts use start/end keys.
-            transcript, _ovl = collapse_overlapping_duplicates(transcript)
-            transcript, _loop = drop_repetition_loops(transcript)
-            if _adj or _ovl or _loop:
-                logger.info(
-                    "[%s] Final transcript dedup: %d → %d segments "
-                    "(%d adjacent dup, %d overlapping near-dup, %d repetition-loop)",
-                    job_id, _pre_dedup, len(transcript), _adj, _ovl, _loop,
-                )
-        except Exception as _dd_err:
-            logger.warning(
-                "[%s] Final transcript dedup skipped (%s)", job_id, _dd_err)
-
-    # ── Transcript readability score ──
-    # Returns a Netflix-style A-F grade + per-axis sub-scores (CPS,
-    # line length, duration, gap). Persisted on the job so the Analysis
-    # page can display a readability card next to the reframe report.
-    transcript_readability = None
-    if transcript:
-        try:
-            from backend.services.subtitle_formatter import compute_readability_report
-            from backend.models import TranscriptSegment
-            _r_models = [
-                t if isinstance(t, TranscriptSegment) else TranscriptSegment(**t)
-                for t in transcript
-            ]
-            transcript_readability = compute_readability_report(_r_models)
-            logger.info(
-                "[%s] Transcript readability: grade %s (%.1f/100) — CPS %.1f compliance, "
-                "avg %.1f cps / peak %.1f cps over %d segments%s",
-                job_id,
-                transcript_readability.get("grade"),
-                transcript_readability.get("score", 0),
-                transcript_readability.get("cps_compliance_pct", 0),
-                transcript_readability.get("avg_cps", 0),
-                transcript_readability.get("max_cps_observed", 0),
-                transcript_readability.get("total_segments", 0),
-                " (CJK profile)" if transcript_readability.get("is_cjk") else "",
-            )
-        except Exception as _rd_err:
-            logger.warning(
-                "[%s] Readability scoring failed: %s",
-                job_id, _rd_err,
-            )
 
     # ── Join the overlapped repair + bridge task ──
     # Everything from here on reads render_plan / scenes / subject_track (and
@@ -6411,11 +6590,17 @@ async def _run_analysis_inner(job_id: str, resume: bool = False):
         two stages share no local VRAM)."""
         nonlocal _pp_result, transcript, _summary_transcript
         try:
-            _pp_job = await database.load_job(job_id) or job
-            _pp_result = await _background_post_processing(
-                job_id, list(transcript), orchestrator, _pp_job,
-                polished_already=_polished_in_critical_path,
-            )
+            if _pp_early_task is not None:
+                # Translation was pre-started by the early-overlap runner
+                # (mid-face-loop, on the fingerprint-verified chain output) —
+                # just collect it. Same call, same inputs, started earlier.
+                _pp_result = await _pp_early_task
+            else:
+                _pp_job = await database.load_job(job_id) or job
+                _pp_result = await _background_post_processing(
+                    job_id, list(transcript), orchestrator, _pp_job,
+                    polished_already=_polished_in_critical_path,
+                )
         except Exception as _pp_err:
             logger.error(
                 "[%s] translate+polish step raised (non-fatal — continuing): %s",
