@@ -861,23 +861,51 @@ class AIOrchestrator:
             "key_topics MUST contain 3-6 specific topics from the video."
         )
 
+        # Grammar-level schema so the model CANNOT omit a required field — a
+        # real run produced a rich, correct summary and lost ALL of it to a
+        # missing "content_category" (pydantic rejected the dict, the stage
+        # fell through two fallbacks, and the UI showed a template overview
+        # with face-diagnostic "topics").
+        _reduce_schema = {
+            "type": "object",
+            "required": ["overview", "key_topics", "tone",
+                         "estimated_audience", "content_category"],
+            "properties": {
+                "overview": {"type": "string"},
+                "key_topics": {"type": "array", "items": {"type": "string"},
+                               "minItems": 3, "maxItems": 6},
+                "tone": {"type": "string"},
+                "estimated_audience": {"type": "string"},
+                "content_category": {"type": "string"},
+            },
+        }
         for provider in chain:
             try:
-                # Local models (qwen2.5:3b) ignore a "return ONLY JSON" instruction
-                # in free-form mode and emit prose — the observed cause of the
-                # reduce failing ("No valid JSON found") and dropping to the
-                # truncated fallback. Ollama exposes a grammar-constrained JSON
-                # mode; request it so the 3B reduce actually returns parseable JSON.
                 _kw = {}
-                if getattr(provider, "provider_name", "") == "ollama":
-                    _kw["json_mode"] = True
+                if getattr(provider, "provider_name", "") in ("ollama", "openrouter"):
+                    _kw["json_schema"] = _reduce_schema
                 raw = await asyncio.wait_for(
                     provider.text_complete(reduce_prompt, max_tokens=1000 if is_ollama else 2000, **_kw),
                     timeout=120 if is_ollama else 90,
                 )
                 data = extract_json(raw)
                 if has_real_summary_content(data):
-                    return VideoSummary(**data), self._get_task_model(provider, "summary")
+                    # Coercion backstop: a summary with real content must
+                    # never be discarded over a missing enum-ish field —
+                    # fill the trivia with defaults and keep the content.
+                    try:
+                        return VideoSummary(**data), self._get_task_model(provider, "summary")
+                    except Exception:
+                        _merged = {
+                            "tone": "conversational",
+                            "estimated_audience": "general viewers",
+                            "content_category": "video content",
+                            "key_topics": [],
+                        }
+                        _merged.update({k: v for k, v in (data or {}).items()
+                                        if v not in (None, "")})
+                        return (VideoSummary(**_merged),
+                                self._get_task_model(provider, "summary"))
             except Exception as e:
                 logger.warning("[%s] Reduce summary via %s failed: %s", job_id, provider.provider_name, e)
                 continue
@@ -892,9 +920,23 @@ class AIOrchestrator:
         overview = " ".join(_clean[:8])
         if len(overview) > 900:
             overview = overview[:900].rsplit(" ", 1)[0] + "..."
+        # Mine content topics from the chunk summaries (recurring TitleCase
+        # terms) — an EMPTY key_topics list fails the pipeline's
+        # has_real_summary_content gate and drops this perfectly usable
+        # overview for the template fallback (whose "topics" are reframer
+        # diagnostics like "adaptive face — 2 face(s)").
+        _tc: dict = {}
+        for _ms in _clean:
+            for _tm in _re.findall(r"\b[A-Z][a-z]{2,}(?:\s[A-Z][a-z]{2,})?\b", _ms):
+                if _tm.split()[0].lower() in ("the", "this", "that", "there",
+                                              "then", "with", "from"):
+                    continue
+                _tc[_tm] = _tc.get(_tm, 0) + 1
+        _topics = [t for t, c in sorted(_tc.items(), key=lambda kv: (-kv[1], kv[0]))
+                   if c >= 2][:5]
         return VideoSummary(
             overview=overview or " ".join(mini_summaries[:6]),
-            key_topics=[],
+            key_topics=_topics,
             tone="conversational",
             estimated_audience="general viewers",
             content_category="video content",

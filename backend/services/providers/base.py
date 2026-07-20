@@ -304,6 +304,13 @@ def build_summary_from_transcript(
 
     # Extract key topics from high-importance scenes (skip synthetic descriptions)
     _synthetic_prefixes = ("Frame at ", "Video frame at ", "Continuation of video")
+    # Reframer strategy labels masquerade as scene descriptions ("adaptive
+    # face — 2 face(s)", "TACT speaker high conf — 3 face(s)") — a real run
+    # shipped exactly those as the UI's KEY TOPICS. They are diagnostics,
+    # never content.
+    _diagnostic_re = re.compile(
+        r"face\s*\(s\)|\btact\b|adaptive[\s_]face|speaker\s+high\s+conf|"
+        r"reframe|keyframe|saliency", re.IGNORECASE)
     topics = []
     seen_topic_words = set()
     for scene in sorted(scenes, key=lambda s: _scene_attr(s, "importance_score", 0) or 0, reverse=True):
@@ -313,6 +320,8 @@ def build_summary_from_transcript(
         if not desc or any(desc.startswith(p) for p in _synthetic_prefixes):
             continue
         if "unavailable" in desc.lower() or "analysis" in desc.lower():
+            continue
+        if _diagnostic_re.search(desc):
             continue
         # Use first sentence or first 60 chars as topic
         topic = desc.split(".")[0].strip()

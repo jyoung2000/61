@@ -41,7 +41,7 @@ def test_mining_finds_garbled_names_and_skips_common_words():
         "Return to the trees and try to contain it on Earth.",
         "The capsule fell. But there's nothing here.",
     ]
-    cands = {t for t, _ex in _mine_name_candidates(texts)}
+    cands = {t for t, _ex, _c in _mine_name_candidates(texts)}
     assert "Ail Reese" in cands
     assert "Gundarium" in cands
     assert "Trowat" in cands
@@ -55,14 +55,14 @@ def test_mining_requires_mid_sentence_for_single_words():
     # "Sex" mid-sentence (after a comma) is a candidate; a word that only
     # ever opens sentences is not.
     texts = ["Impressive work, Sex, unique…", "Perhaps we should go."]
-    cands = {t for t, _ in _mine_name_candidates(texts)}
+    cands = {t for t, _ex, _c in _mine_name_candidates(texts)}
     assert "Sex" in cands
     assert "Perhaps" not in cands
 
 
 def test_mining_skips_words_also_used_lowercase():
     texts = ["The Cut was deep.", "Please cut the rope."]
-    cands = {t for t, _ in _mine_name_candidates(texts)}
+    cands = {t for t, _ex, _c in _mine_name_candidates(texts)}
     assert "Cut" not in cands
 
 
@@ -416,3 +416,81 @@ def test_roster_call_uses_json_schema():
     assert "json_mode" not in (fake.kwargs or {})
     _CACHE.pop("job:test-schema", None)
     _CACHE.pop("roster:test-schema", None)
+
+
+# ── Run-47 overcorrection guards ─────────────────────────────────────
+
+
+def test_vetting_rejects_unrelated_substitutions():
+    # The run-47 rogue mappings: phonetically unrelated "corrections" that
+    # swapped in different characters/terms or broke correct ones.
+    cands = {"Hero Yuu", "Earth Sphere Alliance", "Operation Meteor",
+             "Gundarium", "Ail Reese", "Miina"}
+    pairs = [
+        {"wrong": "Hero Yuu", "right": "Trowa Barton"},          # wrong character
+        {"wrong": "Earth Sphere Alliance", "right": "Zeon"},     # wrong franchise
+        {"wrong": "Operation Meteor", "right": "Operation Endgame"},  # shared prefix, unrelated core
+        {"wrong": "Gundarium", "right": "Gundanium"},            # real mishearing
+        {"wrong": "Ail Reese", "right": "Aries"},                # real mishearing
+        {"wrong": "Miina", "right": "Marina"},                   # real mishearing
+    ]
+    out = _vet_roster_pairs(pairs, cands)
+    assert "Hero Yuu" not in out
+    assert "Earth Sphere Alliance" not in out
+    assert "Operation Meteor" not in out
+    assert out["Gundarium"] == "Gundanium"
+    assert out["Ail Reese"] == "Aries"
+    assert out["Miina"] == "Marina"
+
+
+def test_vetting_frequency_gate_and_cap():
+    cands = {f"Tok{i}" for i in range(12)} | {"Deathscythe"}
+    pairs = [{"wrong": f"Tok{i}", "right": f"Toc{i}"} for i in range(12)]
+    pairs.append({"wrong": "Deathscythe", "right": "Death Syche"})
+    out = _vet_roster_pairs(pairs, cands, frequent={"Deathscythe"})
+    # Frequent consistent terms are untouchable; fan-out capped at 8.
+    assert "Deathscythe" not in out
+    assert len(out) <= 8
+
+
+def test_resolver_never_asks_about_frequent_terms():
+    _CACHE["job:test-freq"] = {
+        "ガンダム": "Gundam", "ゼクス": "Zechs", "リリーナ": "Relena",
+    }
+    texts = ["The Operation Meteor plan begins now."] * 5 + [
+        "It can only be Gundarium alloy."]
+
+    class _Fake:
+        def __init__(self):
+            self.prompts = []
+
+        async def text_completion(self, prompt, **kwargs):
+            self.prompts.append(prompt)
+            return '[{"wrong": "Gundarium", "right": "Gundanium"}]'
+
+    fake = _Fake()
+    out = asyncio.run(resolve_roster_corrections(texts, fake, job_id="test-freq"))
+    assert out == {"Gundarium": "Gundanium"}
+    # "Operation Meteor" appears 5× — a consistent term, never offered.
+    assert "Operation Meteor" not in fake.prompts[0]
+    _CACHE.pop("job:test-freq", None)
+    _CACHE.pop("roster:test-freq", None)
+
+
+def test_reduce_summary_coercion_fills_missing_fields():
+    # Run 47: the reduce produced a rich summary but omitted
+    # content_category — pydantic rejected the whole dict and the UI got a
+    # template overview with face-diagnostic topics. The coercion backstop
+    # keeps the content.
+    from backend.models import VideoSummary
+
+    data = {"overview": "The video depicts the opening of a mecha conflict.",
+            "key_topics": ["Gundam", "Colony", "Alliance"],
+            "tone": "dramatic", "estimated_audience": "sci-fi fans"}
+    merged = {"tone": "conversational", "estimated_audience": "general viewers",
+              "content_category": "video content", "key_topics": []}
+    merged.update({k: v for k, v in data.items() if v not in (None, "")})
+    vs = VideoSummary(**merged)
+    assert vs.overview.startswith("The video depicts")
+    assert vs.content_category == "video content"
+    assert vs.key_topics == ["Gundam", "Colony", "Alliance"]

@@ -452,21 +452,54 @@ def _mine_name_candidates(texts: list, max_candidates: int = 60) -> list[tuple[s
                 for w in words:
                     _offer(w, line)
     ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
-    return [(tok, examples.get(tok, "")) for tok, _n in ranked[:max_candidates]]
+    return [(tok, examples.get(tok, ""), n) for tok, n in ranked[:max_candidates]]
 
 
-def _vet_roster_pairs(pairs, candidates: set) -> dict[str, str]:
+def _roster_phonetic_ok(wrong: str, right: str) -> tuple[bool, float]:
+    """A correction is only credible when the two forms SOUND alike — an ASR
+    mishearing, not a different name that fits the scene. A real run mapped
+    "Hero Yuu"→"Trowa Barton" (wrong character at Heero's introduction),
+    "Earth Sphere Alliance"→"Zeon" (different franchise) and
+    "Operation Meteor"→"Operation Endgame" (broke a correct term). Shared
+    leading/trailing words are stripped first so a common prefix
+    ("Operation …") can't carry an unrelated core past the ratio."""
+    ws, rs = wrong.split(), right.split()
+    while ws and rs and ws[0].lower() == rs[0].lower():
+        ws.pop(0)
+        rs.pop(0)
+    while ws and rs and ws[-1].lower() == rs[-1].lower():
+        ws.pop()
+        rs.pop()
+    a = _normalize(" ".join(ws)) or _normalize(wrong)
+    b = _normalize(" ".join(rs)) or _normalize(right)
+    if not a or not b:
+        return False, 0.0
+    ratio = difflib.SequenceMatcher(None, a, b).ratio()
+    ok = ratio >= 0.5 or (len(a) >= 4 and len(b) >= 4
+                          and (a.startswith(b) or b.startswith(a)))
+    return ok, ratio
+
+
+def _vet_roster_pairs(pairs, candidates: set,
+                      frequent: set | None = None,
+                      max_pairs: int = 8) -> dict[str, str]:
     """Keep only corrections that are safe to auto-apply: the wrong form must
     be one of OUR mined candidates verbatim, the right form must look like a
     name (letters/spaces/apostrophes, ≤40 chars, ≤4 words), differ from the
-    wrong form beyond case, and not be a safelisted ordinary word."""
-    out: dict[str, str] = {}
+    wrong form beyond case, not be a safelisted ordinary word, SOUND like the
+    wrong form (see ``_roster_phonetic_ok``), and not target a FREQUENT
+    consistent term (a spelling used 4+ times is the glossary working, not a
+    garble). Capped at the ``max_pairs`` phonetically-strongest pairs — a
+    model that "corrects" everything is hallucinating."""
+    scored: list[tuple[float, str, str]] = []
     for p in (pairs or []):
         if not isinstance(p, dict):
             continue
         wrong = str(p.get("wrong") or "").strip()
         right = str(p.get("right") or "").strip()
         if not wrong or not right or wrong not in candidates:
+            continue
+        if frequent and wrong in frequent:
             continue
         if len(right) > 40 or len(right.split()) > _MAX_VALUE_WORDS:
             continue
@@ -478,8 +511,12 @@ def _vet_roster_pairs(pairs, candidates: set) -> dict[str, str]:
             continue
         if _PROFANITY_RE.search(right):
             continue
-        out[wrong] = right
-    return out
+        ok, ratio = _roster_phonetic_ok(wrong, right)
+        if not ok:
+            continue
+        scored.append((ratio, wrong, right))
+    scored.sort(key=lambda t: -t[0])
+    return {w: r for _s, w, r in scored[:max_pairs]}
 
 
 def roster_corrections_for_job(job_id: str) -> dict[str, str]:
@@ -552,10 +589,14 @@ async def resolve_roster_corrections(
         candidates = _mine_name_candidates(texts)
         if not candidates:
             return {}
-        # Terms already canonical need no second look — but keep them in the
-        # prompt context; only ASK about the rest.
+        # Terms already canonical need no second look, and FREQUENT
+        # consistent spellings (4+ uses) are the glossary working — a real
+        # run "corrected" Operation Meteor and Deathscythe into hallucinated
+        # variants because they were offered at all. Only ASK about the rest.
         known = {v.lower() for v in series_map.values()}
-        ask = [(t, ex) for (t, ex) in candidates if t.lower() not in known]
+        frequent = {t for (t, _ex, c) in candidates if c >= 4}
+        ask = [(t, ex) for (t, ex, _c) in candidates
+               if t.lower() not in known and t not in frequent]
         if not ask:
             return {}
         evidence = "; ".join(f"{k} = {v}" for k, v in list(series_map.items())[:20])
@@ -568,8 +609,13 @@ async def resolve_roster_corrections(
             "These identify the series precisely.\n\n"
             "For each candidate token below, decide whether it is a GARBLED "
             "rendering of a character, mecha, faction, place or term from "
-            "this series. Return ONLY the corrections you are confident "
-            "about, as a JSON array of objects "
+            "this series. A correction is ONLY valid when the token is an "
+            "obvious mis-hearing that SOUNDS like the official name "
+            "('Gundarium' → 'Gundanium'). NEVER replace a name with a "
+            "DIFFERENT character or term that merely fits the scene, and "
+            "NEVER rewrite a term that is already a correct official "
+            "spelling — omit those. Return ONLY the corrections you are "
+            "confident about, as a JSON array of objects "
             '[{"wrong": "<token exactly as listed>", "right": "<official '
             'English spelling>"}]. Omit tokens that are already correct, '
             "are ordinary words, or that you are unsure about. Output only "
