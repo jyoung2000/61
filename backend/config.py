@@ -506,6 +506,17 @@ class Settings(BaseSettings):
     # slower decode for a few % more words — the Netflix-quality trade. Set
     # False to keep turbo on English. Ignored when WHISPER_REMOTE_MODEL is set.
     WHISPER_REMOTE_PREFER_ACCURACY: bool = True
+    # Second, fail-soft LLM pass after translation that fixes ASR-garbled
+    # proper nouns the mined glossary missed ("Ail Reese"→Aries,
+    # "Gundarium"→Gundanium, "Hero Yui"→Heero Yuy — all shipped on a real
+    # run). Requires the canonical-names mapping (series evidence); one call,
+    # deterministic word-boundary applies behind strict vetting.
+    TRANSLATION_ROSTER_CORRECTIONS: bool = True
+    TRANSLATION_ROSTER_TIMEOUT: float = 75.0
+    # Keep romanized honorifics (-san/-sama/-kun/-chan) in translated subs.
+    # Default False: render them the way professional subs do ("Miss Relena"),
+    # matching broadcast/YouTube style.
+    TRANSLATION_KEEP_HONORIFICS: bool = False
     # Model used for Whisper's native audio→English TRANSLATE pass when the
     # active model can't run it: large-v3-turbo / distil-* / kotoba-* were
     # distilled WITHOUT the translate task and silently transcribe instead

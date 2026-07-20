@@ -3232,6 +3232,8 @@ async def _background_post_processing(
                     drop_repetition_loops as _drl,
                     drop_scattered_duplicates as _dsd,
                     collapse_repeated_runs as _crr,
+                    drop_repeated_sentences as _drs_src,
+                    drop_misplaced_outro_stubs as _dos_src,
                 )
                 _pre_src_dd = len(_trans_input)
                 # Block-level first (on the raw sequence): drop a whole run of
@@ -3241,11 +3243,25 @@ async def _background_post_processing(
                 _trans_input, _so = _cod(_trans_input)
                 _trans_input, _ss = _dsd(_trans_input)
                 _trans_input, _sl = _drl(_trans_input)
-                if _sa or _so or _sl or _ss or _sr:
+                # Sentence-level near-dups MUST die on the source side: once
+                # each copy is translated independently, the wording diverges
+                # and the translated-side dedup can no longer match them
+                # (observed: the same surveillance-satellite line shipped
+                # twice as two different English sentences). CJK sentences
+                # compare by character similarity inside the dropper.
+                _trans_input, _sn = _drs_src(_trans_input)
+                # Whisper hallucinates outro formula words (次回 / 予告 /
+                # "Preview") over the mid-episode eyecatch sting — drop them
+                # before they get translated; the real end-of-episode preview
+                # is inside the protected tail and survives.
+                _trans_input, _sm = _dos_src(_trans_input)
+                if _sa or _so or _sl or _ss or _sr or _sn or _sm:
                     logger.info(
                         "[%s] Source dedup before translate: %d → %d cue(s) "
-                        "(%d run, %d adjacent, %d overlapping, %d repetition-loop, %d scattered)",
-                        job_id, _pre_src_dd, len(_trans_input), _sr, _sa, _so, _sl, _ss)
+                        "(%d run, %d adjacent, %d overlapping, %d repetition-loop, "
+                        "%d scattered, %d sentence, %d outro-stub)",
+                        job_id, _pre_src_dd, len(_trans_input), _sr, _sa, _so,
+                        _sl, _ss, _sn, _sm)
             except Exception as _sdd_err:
                 logger.warning("[%s] Pre-translate source dedup skipped (%s)",
                                job_id, _sdd_err)
@@ -3764,6 +3780,44 @@ async def _background_post_processing(
                     logger.warning("[%s] Post-translation readability enforcement failed (%s)",
                                    job_id, _rd_err)
 
+            # ── (c-roster) Fix ASR-garbled proper nouns on the final text ──
+            # The glossary anchors only MINED (recurring) terms; names that
+            # surface a few times in music-heavy scenes ship phonetically
+            # garbled ("Ail Reese" for Aries, "Gundarium", "Hero Yui",
+            # "Trowat", "Katru" — all observed). One extra fail-soft LLM call
+            # re-uses the per-job canonical mapping as series evidence, mines
+            # TitleCase candidates from the TRANSLATED text, and returns only
+            # confident corrections, applied with word-boundary replaces.
+            # Runs BEFORE the final dedup so corrections that unify spellings
+            # let the dedup see (and drop) true repeats.
+            if _will_translate and bool(getattr(
+                    settings, "TRANSLATION_ROSTER_CORRECTIONS", True)):
+                try:
+                    from backend.services.canonical_names import (
+                        apply_roster_corrections, resolve_roster_corrections)
+                    _rc_texts = [
+                        (t.get("text", "") if isinstance(t, dict)
+                         else getattr(t, "text", "")) or ""
+                        for t in translated
+                    ]
+                    _rc_map = await resolve_roster_corrections(
+                        _rc_texts, orchestrator, job_id=job_id,
+                        model_override=_resolve_polish_model_override(orchestrator))
+                    if _rc_map:
+                        _rc_new, _rc_n = apply_roster_corrections(_rc_texts, _rc_map)
+                        if _rc_n:
+                            for _seg, _new_text in zip(translated, _rc_new):
+                                if isinstance(_seg, dict):
+                                    _seg["text"] = _new_text
+                                else:
+                                    _seg.text = _new_text
+                            logger.info(
+                                "[%s] Roster corrections applied: %d replacement(s) "
+                                "across %d mapping(s)", job_id, _rc_n, len(_rc_map))
+                except Exception as _rc_err:
+                    logger.warning("[%s] Roster correction skipped (%s)",
+                                   job_id, _rc_err)
+
             # ── (d) Final dedup on the translated, polished transcript ──
             try:
                 from backend.services.transcript_dedup import (
@@ -3829,6 +3883,21 @@ async def _background_post_processing(
                 if bool(getattr(settings, "SUBTITLE_SENTENCE_DEDUP_ENABLED", True)):
                     from backend.services.transcript_dedup import drop_repeated_sentences
                     _tl, _sd = drop_repeated_sentences(_tl)
+                # Safety net for outro-formula hallucinations that survived (or
+                # were introduced by) translation — "Next time…" / "Preview."
+                # mid-episode; the real end-of-episode preview is in the
+                # protected tail. The source-side pass (a0-pre) catches these
+                # in Japanese; this catches the English renderings.
+                _os = 0
+                try:
+                    from backend.services.transcript_dedup import drop_misplaced_outro_stubs
+                    _tl, _os = drop_misplaced_outro_stubs(_tl)
+                    if _os:
+                        logger.info("[%s] Dropped %d misplaced outro-stub cue(s) "
+                                    "(mid-episode eyecatch hallucination)",
+                                    job_id, _os)
+                except Exception as _os_err:
+                    logger.debug("[%s] outro-stub drop skipped: %s", job_id, _os_err)
                 # Runs of consecutive bare glossary-term cues — music-section
                 # hallucinations the translator mapped onto pinned names
                 # ("Justlove." / "Space Port." / "Gundanium." over the ED).

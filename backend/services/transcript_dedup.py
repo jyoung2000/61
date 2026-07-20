@@ -675,7 +675,20 @@ def clamp_segments_to_duration(
 # only sentences with enough content words are eligible, so legitimate
 # short repeats ("Fire! Fire!", a name called twice) are never touched.
 
-_SENT_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+")
+# Sentence boundaries: Latin terminators need trailing whitespace ("3.5"
+# must not split); CJK terminators (。！？) end a sentence with NO space
+# after them, so they split zero-width — without this the whole rule
+# no-oped on Japanese cues (one "sentence" per cue, nothing comparable).
+_SENT_SPLIT_RE = re.compile(
+    r"(?<=[。！？])\s*"                       # CJK terminators: no space needed
+    r"|(?<=[.!?…])\s+"                       # Latin terminators need whitespace
+    r"|(?<=[.!?…])(?=[぀-ヿ㐀-鿿豈-﫿])"      # ASCII ?/! glued to CJK text
+)
+
+# A sentence is "CJK" for dedup purposes when it carries enough CJK glyphs
+# to be a real utterance (short interjections はい/何 are exempt — too many
+# legitimate repeats).
+_CJK_SENT_RE = re.compile(r"[぀-ヿ㐀-鿿豈-﫿]")
 _STOPWORDS = frozenset(
     "the a an and or but of to in on at for with is are was were be been it "
     "its this that these those i you he she we they them his her their my "
@@ -738,13 +751,32 @@ def drop_repeated_sentences(
         for sent in sents:
             cw = _content_words(sent)
             is_dup = False
-            if len(cw) >= min_content_words:
+            # CJK text has no word spaces, so a whole Japanese sentence mines
+            # as ONE "content word" and the ≥min_content_words gate silently
+            # exempted it — Whisper's re-decoded duplicates then sailed into
+            # translation, where the LLM rendered each copy differently and
+            # the translated-side dedup could no longer match them lexically
+            # (observed: the same "meteorite / wave course" line shipped
+            # twice with different wording). Substantial CJK sentences (≥6
+            # glyphs) compare by character similarity instead.
+            _is_cjk_sent = (len(cw) < min_content_words
+                            and len(_CJK_SENT_RE.findall(sent)) >= 6)
+            if len(cw) >= min_content_words or _is_cjk_sent:
                 for (ps, pidx, pcw, praw) in reversed(kept_sents):
                     if start - ps > window_s:
                         break
                     # Same-cue echoes ("Five? Five Gundams?") are deliberate
                     # dramatic repeats — leave them to the intra-cue pass.
                     if pidx == cue_idx or not pcw:
+                        continue
+                    if _is_cjk_sent:
+                        # Char-bigram similarity only (no word sets to
+                        # compare). 0.75: two independent decodes of the SAME
+                        # utterance land well above it; genuinely different
+                        # sentences share far fewer bigrams.
+                        if _text_similarity(sent, praw) >= 0.75:
+                            is_dup = True
+                            break
                         continue
                     # BOTH sentences must be substantial for the content-word
                     # containment test: with a tiny earlier set the min-denom
@@ -770,6 +802,61 @@ def drop_repeated_sentences(
         if len(keep) != len(sents):
             _seg_set(seg, text_key, " ".join(keep))
         out.append(seg)
+    if dropped:
+        return out, dropped
+    return segments, 0
+
+
+# Formulaic outro/eyecatch words. Whisper hallucinates these over mid-episode
+# music stings (the eyecatch): run 44 shipped "[6:15] Next time..." /
+# "[6:18] Preview." nine minutes into a 24-minute episode. Both scripts are
+# covered so the rule works on the SOURCE track (before translation) and on
+# the translated track alike.
+_OUTRO_STUB_RE = re.compile(
+    r"^[\s\W]*(次回予告|次回|予告|つづく|続く|"
+    r"to\s+be\s+continued|next\s+time|next\s+episode|preview)[\s\W]*$",
+    re.IGNORECASE)
+
+
+def drop_misplaced_outro_stubs(
+    segments: list,
+    text_key: str = "text",
+    start_key: str = "start",
+    end_key: str = "end",
+    tail_fraction: float = 0.15,
+) -> tuple[list, int]:
+    """Drop bare outro-formula cues ("Next time…", "Preview.", 次回, 予告,
+    つづく) that appear OUTSIDE the final ``tail_fraction`` of the timeline.
+
+    A real next-episode preview lives at the very end — those are kept. A
+    lone formula word mid-episode is the ASR hallucinating over the eyecatch
+    sting, and a human subber would never ship it. The timeline end is taken
+    from the last cue's end (no duration plumbing needed); with fewer than 3
+    cues nothing is dropped."""
+    segs = list(segments or [])
+    if len(segs) < 3:
+        return segments, 0
+    last_end = 0.0
+    for s in segs:
+        try:
+            last_end = max(last_end, float(_seg_get(s, end_key, 0) or 0))
+        except (TypeError, ValueError):
+            continue
+    if last_end <= 0:
+        return segments, 0
+    cutoff = last_end * (1.0 - tail_fraction)
+    out: list = []
+    dropped = 0
+    for s in segs:
+        txt = (_seg_get(s, text_key, "") or "").strip()
+        try:
+            start = float(_seg_get(s, start_key, 0) or 0)
+        except (TypeError, ValueError):
+            start = 0.0
+        if txt and start < cutoff and _OUTRO_STUB_RE.match(txt):
+            dropped += 1
+            continue
+        out.append(s)
     if dropped:
         return out, dropped
     return segments, 0

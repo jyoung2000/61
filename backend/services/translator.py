@@ -832,11 +832,30 @@ async def translate_via_llm(
             "Rules:\n"
             f"- Translate ALL lines, including song lyrics, narration and exclamations. "
             f"NEVER leave a line in {src_name}.\n"
-            "- Preserve honorifics (-san, -kun, -chan, -sama) and proper nouns "
-            "(names of people, places, organizations, products); transliterate "
-            "names rather than translating them into ordinary words.\n"
+            "- Preserve proper nouns (names of people, places, organizations, "
+            "products); transliterate names rather than translating them into "
+            "ordinary words.\n"
+            + (
+                "- Preserve honorifics (-san, -kun, -chan, -sama).\n"
+                if bool(getattr(settings, "TRANSLATION_KEEP_HONORIFICS", False))
+                else (
+                    f"- Render honorifics naturally in {tgt_name} the way "
+                    "professional subtitles do (e.g. 様 → Miss/Mr. + name, or "
+                    "just the name); NEVER output romanized suffixes such as "
+                    "-sama, -san, -kun or -chan.\n"
+                )
+            ) +
             "- Translate faithfully: never summarise, merge meaning, or invent "
             "words to fill a gap. If unsure, translate as literally as possible.\n"
+            "- The source lines are SPEECH-RECOGNITION output and can contain "
+            "mis-recognized homophones or garbled words. When the literal "
+            "reading is absurd for the scene, translate the contextually "
+            "plausible homophone instead (e.g. a battlefield 登校 'go to "
+            "school' is almost certainly 投降 'surrender').\n"
+            "- The source language may drop subjects: use the surrounding "
+            "lines to resolve WHO acts on WHOM, and never flip a negation or "
+            "an outcome — a line must not state the opposite of what its "
+            "context implies.\n"
             "- Write BROADCAST-quality subtitles (Netflix / professional YouTube): "
             "natural, fluent, idiomatic — never word-for-word or machine-literal.\n"
             "- NEVER repeat a phrase within a line and NEVER duplicate the previous "

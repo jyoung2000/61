@@ -353,3 +353,248 @@ async def resolve_canonical_names(
         if key is not None:
             _cache_put(key, {})
         return {}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Roster-based garble correction (translated track)
+# ═══════════════════════════════════════════════════════════════════════════
+# The canonical-names pass above fixes the terms the glossary MINED — but
+# mining needs recurrence, so names that appear a handful of times in
+# music-heavy scenes never get anchored. Whisper mis-hears them, the
+# translator spells them phonetically, and the shipped subs read
+# "Ail Reese" (Aries), "Gundarium" (Gundanium), "Hero Yui" (Heero Yuy),
+# "Trowat" (Trowa), "Katru" (Quatre) — all observed on a real run whose
+# glossary was otherwise correct.
+#
+# This second, fail-soft pass runs AFTER translation: mine name-like
+# TitleCase tokens from the TRANSLATED text, hand them (with the already-
+# resolved canonical mapping as series evidence) to the same model, and ask
+# ONLY for confident corrections. The apply step is deterministic
+# (word-boundary replaces) behind strict vetting, so a hallucinating model
+# can rewrite nothing outside the candidate list.
+
+# Words that are never garbled names no matter how they are capitalized.
+_ROSTER_SAFE_WORDS = frozenset("""
+the this that these those what where when why how who which i we you they he
+she it but and then now well yes no not just so oh ah huh hey mm even if do
+don is are was were will would can could should please speaker sir madam
+miss mister mrs ms dr father mother captain general colonel lieutenant major
+sergeant left right up down here there earth space okay ok
+""".split())
+
+# TitleCase run: 1-3 capitalized words (Latin incl. extended chars like ō),
+# optional possessive stripped by the miner.
+_TITLECASE_RUN_RE = re.compile(
+    r"\b([A-Z][a-zÀ-ſ]+"
+    r"(?:[-'’][A-Za-zÀ-ſ]+)*"
+    r"(?:\s+[A-Z][a-zÀ-ſ]+(?:[-'’][A-Za-zÀ-ſ]+)*){0,2})")
+
+_SENT_START_RE = re.compile(r"(?:^|[.!?…\"'“‘]\s*)$")
+
+
+def _strip_possessive(tok: str) -> str:
+    return re.sub(r"[’']s?$", "", tok)
+
+
+def _mine_name_candidates(texts: list, max_candidates: int = 60) -> list[tuple[str, str]]:
+    """Mine likely proper-noun tokens from translated cue texts.
+
+    Returns ``[(token, example_line), …]`` most-frequent-first. Single
+    TitleCase words count only when they appear MID-sentence at least once
+    (sentence-initial capitalization proves nothing); multi-word runs count
+    anywhere — and each constituent word is ALSO offered on its own, so
+    "Recorder Trowat" surfaces "Trowat" too. Tokens that also appear as an
+    ordinary lowercase word anywhere in the CASE-PRESERVED corpus are
+    skipped (real words, not names), as are safelisted structural words.
+    """
+    # Case preserved: a token trivially matches itself in a lowercased
+    # corpus, which silently disabled this filter's purpose.
+    corpus = " " + " ".join(str(t) for t in texts) + " "
+
+    def _lowercase_attested(word: str) -> bool:
+        return re.search(
+            r"(?<![A-Za-z])" + re.escape(word.lower()) + r"(?![A-Za-z])",
+            corpus) is not None
+
+    counts: dict[str, int] = {}
+    examples: dict[str, str] = {}
+
+    def _offer(tok: str, line: str) -> None:
+        tok = _strip_possessive(tok.strip())
+        if not tok or len(tok) < 3:
+            return
+        words = tok.split()
+        if all(w.lower() in _ROSTER_SAFE_WORDS for w in words):
+            return
+        if len(words) == 1 and _lowercase_attested(tok):
+            return
+        counts[tok] = counts.get(tok, 0) + 1
+        examples.setdefault(tok, line.strip()[:110])
+
+    for raw in texts:
+        line = str(raw or "")
+        for m in _TITLECASE_RUN_RE.finditer(line):
+            tok = _strip_possessive(m.group(1).strip())
+            if not tok:
+                continue
+            words = tok.split()
+            if len(words) == 1:
+                # Sentence-initial single words are ambiguous — skip this
+                # occurrence (a mid-sentence sighting elsewhere still counts).
+                if _SENT_START_RE.search(line[: m.start(1)]):
+                    continue
+                _offer(tok, line)
+            else:
+                _offer(tok, line)
+                # Constituents too — the phrase may be one real word plus one
+                # garbled name ("Recorder Trowat"), and the model corrects
+                # single tokens more reliably than mixed phrases.
+                for w in words:
+                    _offer(w, line)
+    ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    return [(tok, examples.get(tok, "")) for tok, _n in ranked[:max_candidates]]
+
+
+def _vet_roster_pairs(pairs, candidates: set) -> dict[str, str]:
+    """Keep only corrections that are safe to auto-apply: the wrong form must
+    be one of OUR mined candidates verbatim, the right form must look like a
+    name (letters/spaces/apostrophes, ≤40 chars, ≤4 words), differ from the
+    wrong form beyond case, and not be a safelisted ordinary word."""
+    out: dict[str, str] = {}
+    for p in (pairs or []):
+        if not isinstance(p, dict):
+            continue
+        wrong = str(p.get("wrong") or "").strip()
+        right = str(p.get("right") or "").strip()
+        if not wrong or not right or wrong not in candidates:
+            continue
+        if len(right) > 40 or len(right.split()) > _MAX_VALUE_WORDS:
+            continue
+        if not re.fullmatch(r"[A-Za-z][A-Za-z .'’-]*", right):
+            continue
+        if right.lower() == wrong.lower():
+            continue
+        if right.lower() in _ROSTER_SAFE_WORDS:
+            continue
+        if _PROFANITY_RE.search(right):
+            continue
+        out[wrong] = right
+    return out
+
+
+def apply_roster_corrections(texts: list, mapping: dict[str, str]) -> tuple[list, int]:
+    """Word-boundary replace each vetted wrong→right pair in each text.
+    Longest wrong-forms first so "Ail Reese" wins over a hypothetical "Ail".
+    Case-sensitive: only the exact mined surface is touched. Returns
+    ``(new_texts, replacements)``."""
+    if not mapping:
+        return list(texts), 0
+    ordered = sorted(mapping.items(), key=lambda kv: -len(kv[0]))
+    total = 0
+    out: list = []
+    for raw in texts:
+        line = str(raw or "")
+        for wrong, right in ordered:
+            line, n = re.subn(r"\b" + re.escape(wrong) + r"\b", right, line)
+            total += n
+        out.append(line)
+    return out, total
+
+
+def _parse_json_pairs(raw: str) -> list:
+    """First JSON array of objects in ``raw`` (code fences tolerated)."""
+    s = (raw or "").strip()
+    s = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", s)
+    start = s.find("[")
+    if start < 0:
+        return []
+    depth = 0
+    for i in range(start, len(s)):
+        if s[i] == "[":
+            depth += 1
+        elif s[i] == "]":
+            depth -= 1
+            if depth == 0:
+                try:
+                    data = json.loads(s[start:i + 1])
+                    return data if isinstance(data, list) else []
+                except Exception:
+                    return []
+    return []
+
+
+async def resolve_roster_corrections(
+    texts: list,
+    orchestrator,
+    job_id: str = "",
+    model_override: str | None = None,
+) -> dict[str, str]:
+    """ONE fail-soft LLM call mapping mined garbled tokens → canonical names.
+
+    Requires the per-job canonical mapping (already resolved during
+    translation, cached in this module) as series evidence — with no series
+    identified the pass is too risky and returns ``{}``. Fail-soft: any
+    error → ``{}`` and the transcript ships as-is."""
+    try:
+        s = _settings()
+        if s is not None and not bool(getattr(s, "TRANSLATION_ROSTER_CORRECTIONS", True)):
+            return {}
+        if orchestrator is None or not texts:
+            return {}
+        series_map = dict(_CACHE.get(f"job:{job_id}") or {}) if job_id else {}
+        if len(series_map) < 3:
+            return {}
+        candidates = _mine_name_candidates(texts)
+        if not candidates:
+            return {}
+        # Terms already canonical need no second look — but keep them in the
+        # prompt context; only ASK about the rest.
+        known = {v.lower() for v in series_map.values()}
+        ask = [(t, ex) for (t, ex) in candidates if t.lower() not in known]
+        if not ask:
+            return {}
+        evidence = "; ".join(f"{k} = {v}" for k, v in list(series_map.items())[:20])
+        cand_block = "\n".join(f'- "{t}"  (e.g. “{ex}”)' for t, ex in ask)
+        prompt = (
+            "You are repairing machine subtitles for one specific episode. "
+            "Speech recognition mis-heard some Japanese proper nouns and the "
+            "translator spelled them phonetically.\n"
+            f"Canonical terms already verified for this episode: {evidence}. "
+            "These identify the series precisely.\n\n"
+            "For each candidate token below, decide whether it is a GARBLED "
+            "rendering of a character, mecha, faction, place or term from "
+            "this series. Return ONLY the corrections you are confident "
+            "about, as a JSON array of objects "
+            '[{"wrong": "<token exactly as listed>", "right": "<official '
+            'English spelling>"}]. Omit tokens that are already correct, '
+            "are ordinary words, or that you are unsure about. Output only "
+            "the JSON array.\n\n"
+            f"Candidates:\n{cand_block}"
+        )
+        timeout = float(getattr(s, "TRANSLATION_ROSTER_TIMEOUT", 75.0) or 75.0) if s else 75.0
+        kwargs: dict = {
+            "max_tokens": min(2048, 200 + 24 * len(ask)),
+            "timeout": timeout,
+            "job_id": job_id or "",
+            "skip_circuit_breaker": True,
+            "json_mode": True,
+        }
+        if model_override:
+            kwargs["model_override"] = str(model_override).strip()
+        try:
+            raw = await asyncio.wait_for(
+                orchestrator.text_completion(prompt, **kwargs), timeout + 15)
+        except TypeError:
+            raw = await asyncio.wait_for(
+                orchestrator.text_completion(prompt), timeout + 15)
+        mapping = _vet_roster_pairs(
+            _parse_json_pairs(raw or ""), {t for t, _ in ask})
+        if mapping:
+            logger.info(
+                "[%s] roster corrections resolved for %d token(s): %s",
+                job_id or "-", len(mapping),
+                "; ".join(f"{k}→{v}" for k, v in list(mapping.items())[:10]))
+        return mapping
+    except Exception as e:
+        logger.debug("[%s] roster correction skipped: %s", job_id or "-", e)
+        return {}
