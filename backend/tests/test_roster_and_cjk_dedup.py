@@ -477,6 +477,73 @@ def test_resolver_never_asks_about_frequent_terms():
     _CACHE.pop("roster:test-freq", None)
 
 
+def test_roster_worth_asking_drops_noise_keeps_garbles():
+    # Run 48: 50 candidates were offered and the busy 12B corrected NONE —
+    # the real garbles were buried under ordinary-word noise. The filter must
+    # keep the garbles and drop the chaff so the model's attention lands.
+    from backend.services.canonical_names import _roster_worth_asking
+    known_words = {"mobile", "suit", "relena", "oz", "colony",
+                   "gundam", "shuttle", "miina", "zechs"}
+
+    # Real garbles worth asking about — kept.
+    for tok in ("Gundarium", "Katul", "Hero Yuu", "Deathbringer",
+                "From Nag Ranch", "Am Wufe", "Leo"):
+        assert _roster_worth_asking(tok, known_words), tok
+
+    # All-ordinary phrases and sentence-opening common words — dropped.
+    for tok in ("Especially", "Humanity", "Inform", "Combat Log",
+                "Colony Summit", "Civilian Shuttle", "Eastern", "Part",
+                "Alliance Headquarters"):
+        assert not _roster_worth_asking(tok, known_words), tok
+
+    # Phrases that merely CONTAIN an already-correct canonical word — dropped
+    # (the term is right; the phrase is just it in context).
+    for tok in ("Miss Relena", "Oz's Zechs", "New Mobile Report",
+                "Gundam Wing", "Especially Miina", "Zechs Merquise"):
+        assert not _roster_worth_asking(tok, known_words), tok
+
+
+def test_resolver_noise_filter_shrinks_ask_and_reharden_correct_terms():
+    # The noise filter also re-hardens the run-47 rogue path: a correct term
+    # made of ordinary words ("Operation Meteor") is never offered, so the
+    # model can't "correct" it into a hallucinated variant.
+    _CACHE["job:test-noise"] = {
+        "ガンダム": "Gundam", "ゼクス": "Zechs", "リリーナ": "Relena",
+        "コロニー": "Colony", "マリーナ": "Miina",
+    }
+    texts = [
+        "It can only be Gundarium alloy.",
+        "Especially Miina's flagship approaches.",   # noise: Especially, known Miina
+        "The Colony Summit was inconclusive.",       # noise: all ordinary/known
+        "Inform Zechs at once.",                     # noise: contains known Zechs
+        "Operation Meteor will proceed.",            # correct term, all-ordinary → not offered
+        "The Gundam called Deathbringer.",           # real garble (passes phonetic gate)
+    ]
+
+    class _Fake:
+        def __init__(self):
+            self.prompts = []
+
+        async def text_completion(self, prompt, **kwargs):
+            self.prompts.append(prompt)
+            return ('[{"wrong": "Gundarium", "right": "Gundanium"},'
+                    ' {"wrong": "Deathbringer", "right": "Deathscythe"}]')
+
+    fake = _Fake()
+    out = asyncio.run(resolve_roster_corrections(texts, fake, job_id="test-noise"))
+    assert out == {"Gundarium": "Gundanium", "Deathbringer": "Deathscythe"}
+    prompt = fake.prompts[0]
+    # Real garbles were offered…
+    assert "Gundarium" in prompt and "Deathbringer" in prompt
+    # …but the ordinary-word noise and correct-term phrases were withheld.
+    assert "Especially" not in prompt
+    assert "Colony Summit" not in prompt
+    assert "Operation Meteor" not in prompt
+    assert "Inform Zechs" not in prompt
+    _CACHE.pop("job:test-noise", None)
+    _CACHE.pop("roster:test-noise", None)
+
+
 def test_reduce_summary_coercion_fills_missing_fields():
     # Run 47: the reduce produced a rich summary but omitted
     # content_category — pydantic rejected the whole dict and the UI got a

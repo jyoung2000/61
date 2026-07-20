@@ -382,6 +382,32 @@ miss mister mrs ms dr father mother captain general colonel lieutenant major
 sergeant left right up down here there earth space okay ok
 """.split())
 
+# Ordinary English vocabulary that surfaces as TitleCase candidates — a word
+# opening a sentence, or a plain noun inside a "Colony Summit"-style phrase —
+# but is NEVER a garbled proper noun worth correcting. When EVERY word of a
+# candidate is structural (above) or common (here), the candidate is noise and
+# is withheld from the model, so the handful of real garbles (Gundarium,
+# Katul, Hero Yuu) aren't drowned in a 50-token list a busy local model just
+# skims and abandons. Deliberately generic — anything series-specific (a
+# character, mecha, faction, place) must NOT appear here, since a listed word
+# is never offered for correction. Worst case of a wrong entry is fail-safe:
+# the token is simply not corrected and ships as-is, never mis-corrected.
+_ROSTER_COMMON_WORDS = frozenset("""
+especially humanity human inform information report reports eastern western
+northern southern academy school federation republic empire kingdom nation
+alliance colony colonies headquarters base station port harbor summit council
+meeting conference civilian civilians combat battle war peace justice power
+control victory defeat mission operation weapon weapons target enemy enemies
+pilot pilots soldier soldiers officer commander force forces army navy fleet
+squadron division battalion troop troops unit units carrier ship shuttle
+capsule fighter machine gun radar surveillance data analysis evidence salvage
+search rescue attack defense assault backup reinforcement satellite meteor
+meteorite atmosphere spaceport airport spaceship area zone sector region part
+parts log logs wing area everyone everything something anything nothing
+someone anyone perhaps maybe suddenly finally probably already almost
+morning evening tonight today tomorrow yesterday minister government official
+""".split())
+
 # TitleCase run: 1-3 capitalized words (Latin incl. extended chars like ō),
 # optional possessive stripped by the miner.
 _TITLECASE_RUN_RE = re.compile(
@@ -453,6 +479,29 @@ def _mine_name_candidates(texts: list, max_candidates: int = 60) -> list[tuple[s
                     _offer(w, line)
     ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
     return [(tok, examples.get(tok, ""), n) for tok, n in ranked[:max_candidates]]
+
+
+def _roster_worth_asking(token: str, known_words: set) -> bool:
+    """True when ``token`` is worth showing the correction model.
+
+    Withholds two kinds of noise so the real garbles aren't buried:
+    (1) any candidate whose words are ALL structural/common English — a
+    sentence-opening ordinary word ("Especially", "Humanity") or a plain
+    descriptive phrase ("Colony Summit", "Combat Log") is never a mis-heard
+    name; (2) any candidate containing an already-correct canonical word
+    ("Miss Relena", "Oz's Zechs", "New Mobile Report") — the canonical term is
+    right, the phrase is just it in context. Single unusual tokens
+    ("Gundarium", "Katul", "Deathbringer") and mixed phrases that carry a
+    genuinely foreign word ("Hero Yuu", "Am Wufe") pass through."""
+    words = [_strip_possessive(w).lower() for w in str(token).split()]
+    words = [w for w in words if w]
+    if not words:
+        return False
+    if any(w in known_words for w in words):
+        return False
+    if all(w in _ROSTER_SAFE_WORDS or w in _ROSTER_COMMON_WORDS for w in words):
+        return False
+    return True
 
 
 def _roster_phonetic_ok(wrong: str, right: str) -> tuple[bool, float]:
@@ -594,11 +643,20 @@ async def resolve_roster_corrections(
         # run "corrected" Operation Meteor and Deathscythe into hallucinated
         # variants because they were offered at all. Only ASK about the rest.
         known = {v.lower() for v in series_map.values()}
+        # Word-level view of the canonical values so a multi-word candidate
+        # that merely CONTAINS a correct term ("Miss Relena", "Gundam Wing")
+        # is recognised as noise, not just exact-phrase matches.
+        known_words = {w for v in known for w in v.split()}
         frequent = {t for (t, _ex, c) in candidates if c >= 4}
         ask = [(t, ex) for (t, ex, _c) in candidates
-               if t.lower() not in known and t not in frequent]
+               if t.lower() not in known and t not in frequent
+               and _roster_worth_asking(t, known_words)]
         if not ask:
             return {}
+        logger.info(
+            "[%s] roster: %d candidate(s) mined, %d worth asking after "
+            "noise/known/frequency filtering",
+            job_id or "-", len(candidates), len(ask))
         evidence = "; ".join(f"{k} = {v}" for k, v in list(series_map.items())[:20])
         cand_block = "\n".join(f'- "{t}"  (e.g. “{ex}”)' for t, ex in ask)
         prompt = (
@@ -611,10 +669,13 @@ async def resolve_roster_corrections(
             "rendering of a character, mecha, faction, place or term from "
             "this series. A correction is ONLY valid when the token is an "
             "obvious mis-hearing that SOUNDS like the official name "
-            "('Gundarium' → 'Gundanium'). NEVER replace a name with a "
-            "DIFFERENT character or term that merely fits the scene, and "
-            "NEVER rewrite a term that is already a correct official "
-            "spelling — omit those. Return ONLY the corrections you are "
+            "('Gundarium' → 'Gundanium'). Most candidates are already correct "
+            "or ordinary words — return the FEW that are clearly garbled "
+            "character, mecha, faction or place names, and leave the rest. "
+            "NEVER replace a name with a DIFFERENT character or term that "
+            "merely fits the scene, and NEVER rewrite a term that is already "
+            "a correct official spelling — omit those. Return ONLY the "
+            "corrections you are "
             "confident about, as a JSON array of objects "
             '[{"wrong": "<token exactly as listed>", "right": "<official '
             'English spelling>"}]. Omit tokens that are already correct, '
