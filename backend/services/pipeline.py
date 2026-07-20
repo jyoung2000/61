@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 import time as _time
 from concurrent.futures import ThreadPoolExecutor
@@ -2904,6 +2905,106 @@ async def _auto_seo_followup(job_id: str, orchestrator, pp: dict,
     return final_clips
 
 
+async def _condense_over_cps_cues(
+    translated: list, orchestrator, job_id: str = "",
+    model_override: str | None = None,
+) -> tuple[list, int]:
+    """LLM-condense cues that remain unreadably fast AFTER the readability
+    enforcer converged.
+
+    The enforcer can split (needs word timings) and extend into idle time
+    (needs idle time) — but a long cue jammed against its neighbor with
+    neither ships at 30-100 chars/sec, a flash no viewer can read (run 44
+    measured 10 such cues, worst 102 cps). Professional subtitlers CONDENSE
+    that text to fit the window; this does the same with one batched,
+    fail-soft LLM call. Guards: only cues over SUBTITLE_CONDENSE_CPS
+    (default 28 — well past the 17-cps broadcast cap, so normal prose is
+    never touched); a returned line is used only when it actually shrank and
+    is non-empty; anything else keeps the original. Returns
+    ``(translated, cues_condensed)``."""
+    try:
+        threshold = float(getattr(settings, "SUBTITLE_CONDENSE_CPS", 28.0) or 28.0)
+        max_cps = float(getattr(settings, "SUBTITLE_MAX_CPS", 17.0) or 17.0)
+
+        def _get(seg, key, default=None):
+            if isinstance(seg, dict):
+                return seg.get(key, default)
+            return getattr(seg, key, default)
+
+        offenders: list = []  # (index, text, budget_chars)
+        for i, seg in enumerate(translated or []):
+            txt = str(_get(seg, "text", "") or "").strip()
+            if not txt or txt.startswith("["):
+                continue  # markers stay verbatim
+            try:
+                dur = float(_get(seg, "end", 0) or 0) - float(_get(seg, "start", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if dur <= 0:
+                continue
+            if len(txt) / dur > threshold:
+                budget = max(20, int(dur * max_cps))
+                if budget < len(txt):
+                    offenders.append((i, txt, budget))
+        if not offenders or orchestrator is None:
+            return translated, 0
+
+        numbered = "\n".join(
+            f"{n + 1}. (max {b} chars) {t}"
+            for n, (_i, t, b) in enumerate(offenders))
+        prompt = (
+            "These subtitle lines display too briefly for a viewer to read "
+            "them at their current length. Rewrite EACH line within its "
+            "character budget while preserving its meaning, tone and any "
+            "names — cut filler and redundancy, never the substance. "
+            f"Return ONLY a JSON array of exactly {len(offenders)} strings, "
+            "in order.\n\n"
+            f"Lines:\n{numbered}"
+        )
+        _schema = {"type": "array", "items": {"type": "string"},
+                   "minItems": len(offenders), "maxItems": len(offenders)}
+        kwargs: dict = {
+            "max_tokens": min(2048, 100 + 40 * len(offenders)),
+            "timeout": 60.0,
+            "job_id": job_id or "",
+            "skip_circuit_breaker": True,
+            "json_schema": _schema,
+        }
+        if model_override:
+            kwargs["model_override"] = str(model_override).strip()
+        try:
+            raw = await asyncio.wait_for(
+                orchestrator.text_completion(prompt, **kwargs), 75.0)
+        except TypeError:
+            raw = await asyncio.wait_for(
+                orchestrator.text_completion(prompt), 75.0)
+        try:
+            import json as _json
+            s = (raw or "").strip()
+            s = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", s)
+            arr = _json.loads(s[s.index("["):s.rindex("]") + 1])
+        except Exception:
+            return translated, 0
+        if not isinstance(arr, list) or len(arr) != len(offenders):
+            return translated, 0
+
+        changed = 0
+        for (i, orig, _budget), new in zip(offenders, arr):
+            new_txt = str(new or "").strip()
+            if not new_txt or len(new_txt) >= len(orig):
+                continue  # must actually shrink; else keep the original
+            seg = translated[i]
+            if isinstance(seg, dict):
+                seg["text"] = new_txt
+            else:
+                seg.text = new_txt
+            changed += 1
+        return translated, changed
+    except Exception as _cd_err:
+        logger.debug("[%s] over-cps condensation skipped: %s", job_id or "-", _cd_err)
+        return translated, 0
+
+
 async def _background_post_processing(
     job_id: str, transcript: list, orchestrator, job,
     polished_already: bool = False,
@@ -3779,6 +3880,25 @@ async def _background_post_processing(
                 except Exception as _rd_err:
                     logger.warning("[%s] Post-translation readability enforcement failed (%s)",
                                    job_id, _rd_err)
+
+            # ── (c-condense) LLM-condense residually unreadable cues ──
+            # The enforcer above converged, but cues with no word timings and
+            # no idle time to extend into can still ship at 30-100 chars/sec.
+            # A professional subtitler condenses that text to fit the window;
+            # one batched fail-soft LLM call does the same for the handful of
+            # residual offenders (run 44: 10 cues over 30 cps, worst 102).
+            if bool(getattr(settings, "SUBTITLE_CONDENSE_OVER_CPS", True)):
+                try:
+                    translated, _cd_n = await _condense_over_cps_cues(
+                        translated, orchestrator, job_id=job_id,
+                        model_override=_resolve_polish_model_override(orchestrator))
+                    if _cd_n:
+                        logger.info(
+                            "[%s] Condensed %d unreadably-fast cue(s) to fit "
+                            "their display windows", job_id, _cd_n)
+                except Exception as _cd_err:
+                    logger.warning("[%s] Over-cps condensation skipped (%s)",
+                                   job_id, _cd_err)
 
             # ── (c-roster) Fix ASR-garbled proper nouns on the final text ──
             # The glossary anchors only MINED (recurring) terms; names that

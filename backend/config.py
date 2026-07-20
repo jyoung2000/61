@@ -506,6 +506,12 @@ class Settings(BaseSettings):
     # slower decode for a few % more words — the Netflix-quality trade. Set
     # False to keep turbo on English. Ignored when WHISPER_REMOTE_MODEL is set.
     WHISPER_REMOTE_PREFER_ACCURACY: bool = True
+    # LLM-condense cues that remain unreadably fast after the readability
+    # enforcer converged (no word timings to split with, no idle time to
+    # extend into). Only cues over SUBTITLE_CONDENSE_CPS are touched — well
+    # past the 17-cps broadcast cap, so normal prose never is.
+    SUBTITLE_CONDENSE_OVER_CPS: bool = True
+    SUBTITLE_CONDENSE_CPS: float = 28.0
     # Second, fail-soft LLM pass after translation that fixes ASR-garbled
     # proper nouns the mined glossary missed ("Ail Reese"→Aries,
     # "Gundarium"→Gundanium, "Hero Yui"→Heero Yuy — all shipped on a real

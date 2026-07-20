@@ -212,3 +212,63 @@ def test_outro_stub_needs_enough_cues():
     segs = [{"text": "Preview.", "start": 1.0, "end": 2.0}]
     _out, dropped = drop_misplaced_outro_stubs(segs)
     assert dropped == 0
+
+
+# ── Over-CPS condensation ────────────────────────────────────────────
+
+
+def test_condense_targets_only_unreadable_cues():
+    from backend.services.pipeline import _condense_over_cps_cues
+
+    segs = [
+        {"text": "A short readable line.", "start": 0.0, "end": 3.0},
+        {"text": "This enormously long narration sentence describes the whole "
+                 "operation in exhausting detail nobody can read.",
+         "start": 5.0, "end": 6.0},          # ~109 chars in 1s → offender
+        {"text": "[♪ music ♪]", "start": 7.0, "end": 8.0},
+    ]
+
+    class _Fake:
+        def __init__(self):
+            self.prompts = []
+
+        async def text_completion(self, prompt, **kwargs):
+            self.prompts.append(prompt)
+            return '["The narration, condensed."]'
+
+    fake = _Fake()
+    out, n = asyncio.run(_condense_over_cps_cues(segs, fake, job_id="t"))
+    assert n == 1
+    assert out[1]["text"] == "The narration, condensed."
+    assert out[0]["text"] == "A short readable line."   # untouched
+    assert out[2]["text"] == "[♪ music ♪]"              # markers untouched
+    assert len(fake.prompts) == 1 and "max" in fake.prompts[0]
+
+
+def test_condense_keeps_original_when_llm_fails_to_shrink():
+    from backend.services.pipeline import _condense_over_cps_cues
+
+    long_line = ("Another enormously long narration sentence that describes "
+                 "the whole operation in exhausting, unreadable detail.")
+    segs = [{"text": long_line, "start": 0.0, "end": 1.0}]
+
+    class _Fake:
+        async def text_completion(self, prompt, **kwargs):
+            # Longer than the original AND an empty string — both rejected.
+            return '["' + long_line + ' and even more words on top"]'
+
+    out, n = asyncio.run(_condense_over_cps_cues(segs, _Fake(), job_id="t"))
+    assert n == 0
+    assert out[0]["text"] == long_line
+
+
+def test_condense_noop_without_offenders():
+    from backend.services.pipeline import _condense_over_cps_cues
+
+    class _Boom:
+        async def text_completion(self, *a, **k):
+            raise AssertionError("must not be called")
+
+    segs = [{"text": "Fine.", "start": 0.0, "end": 2.0}]
+    out, n = asyncio.run(_condense_over_cps_cues(segs, _Boom(), job_id="t"))
+    assert n == 0 and out[0]["text"] == "Fine."
