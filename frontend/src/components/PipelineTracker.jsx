@@ -47,8 +47,10 @@ export default function PipelineTracker({
   isComplete = false,
   isFailed = false,
   stages = null, // optional override from API
+  concurrentStageIds = [], // lanes running IN PARALLEL with currentStageId
 }) {
   const displayStages = stages || STAGE_ORDER.map((id) => ({ id }));
+  const isConcurrent = (id) => id !== currentStageId && concurrentStageIds.includes(id);
 
   // Compute total weight for bar sizing (approximate)
   const STAGE_WEIGHTS = {
@@ -61,6 +63,7 @@ export default function PipelineTracker({
     metadata: 'Metadata', extraction: 'Frames', face_detection: 'Faces',
     transcription: 'Whisper', diarization: 'Speakers', conversion: 'Convert',
     summary: 'Summary', translation: 'Translate', clips: 'Clips', saving: 'Save',
+    polishing: 'Polish', seo: 'SEO',
   };
 
   const currentIdx = displayStages.findIndex((s) => s.id === currentStageId);
@@ -102,13 +105,13 @@ export default function PipelineTracker({
           const weight = STAGE_WEIGHTS[stage.id] || 5;
           const widthPct = (weight / totalWeight) * 100;
           const isDone = stageTimes[stage.id] != null || (isComplete && idx < displayStages.length);
-          const isActive = stage.id === currentStageId && !isComplete;
+          const isActive = (stage.id === currentStageId || isConcurrent(stage.id)) && !isComplete;
           const color = STAGE_COLORS[stage.id] || '#6b7280';
 
           return (
             <div
               key={stage.id}
-              title={`${stage.label || STAGE_LABELS[stage.id] || stage.id}${stageTimes[stage.id] != null ? ` — ${fmtElapsed(stageTimes[stage.id])}` : ''}`}
+              title={`${stage.label || STAGE_LABELS[stage.id] || stage.id}${stageTimes[stage.id] != null ? ` — ${fmtElapsed(stageTimes[stage.id])}` : ''}${isConcurrent(stage.id) ? ' (running concurrently)' : ''}`}
               style={{
                 flex: `0 0 ${widthPct}%`,
                 background: isDone || isActive ? color : 'var(--border)',
@@ -154,6 +157,14 @@ export default function PipelineTracker({
               <span style={{ color: 'var(--text-muted)' }}>
                 {` · step ${currentIdx + 1}/${displayStages.length}`}
               </span>
+              {concurrentStageIds.filter((id) => id !== currentStageId).length > 0 && (
+                <span style={{ color: 'var(--text-muted)' }}>
+                  {' ∥ ' + concurrentStageIds
+                    .filter((id) => id !== currentStageId)
+                    .map((id) => STAGE_LABELS[id] || id)
+                    .join(' ∥ ')}
+                </span>
+              )}
             </>
           ) : null}
         </div>
@@ -163,7 +174,7 @@ export default function PipelineTracker({
           const weight = STAGE_WEIGHTS[stage.id] || 5;
           const widthPct = (weight / totalWeight) * 100;
           const isDone = stageTimes[stage.id] != null || isComplete;
-          const isActive = stage.id === currentStageId && !isComplete;
+          const isActive = (stage.id === currentStageId || isConcurrent(stage.id)) && !isComplete;
           const color = STAGE_COLORS[stage.id] || '#6b7280';
           const label = stage.label || STAGE_LABELS[stage.id] || stage.id;
           const elapsed = stageTimes[stage.id];

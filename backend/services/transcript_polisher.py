@@ -1576,10 +1576,15 @@ async def correct_transcript(
         _state["done"] += 1
         if result is None:
             _state["fail_streak"] += 1
-            if _state["fail_streak"] >= 5 and not _state["aborted"]:
+            # 3, not 5: with halve-and-retry each failed batch already
+            # represents up to three failed LLM calls, so three failed
+            # batches ≈ nine provider misses — that's an outage, not luck.
+            # A run polishing against a browned-out provider burned 25 min
+            # of wall clock before the old threshold mattered.
+            if _state["fail_streak"] >= 3 and not _state["aborted"]:
                 _state["aborted"] = True
                 logger.warning(
-                    "transcript polishing: 5 consecutive batch failures — "
+                    "transcript polishing: 3 consecutive batch failures — "
                     "aborting the remaining batches (drafts kept)")
         else:
             _state["fail_streak"] = 0

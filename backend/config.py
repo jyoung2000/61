@@ -182,6 +182,23 @@ class Settings(BaseSettings):
     # the cloud fallback. Warm calls keep the caller's tight timeout so a
     # genuinely stuck model still fails over quickly. 0 disables.
     OLLAMA_COLD_LOAD_TIMEOUT_EXTRA_S: float = 240.0
+    # Serialize big-TEXT vs VISION phases on a remote Ollama card whose budget
+    # can't hold both models resident (e.g. gemma3:12b ~8.3 GB + llava:7b
+    # ~5.5 GB on a 9.5 GB Companion budget). Without this, running clip
+    # vision concurrently with the translation loop CPU-spills the text model
+    # — a real run degraded every text call to 21s-3m26s for 21 minutes and
+    # shipped an untranslated transcript. Stage overlap is KEPT; only the GPU
+    # turns alternate. No effect when both models co-fit or no remote host.
+    OLLAMA_SERIALIZE_TEXT_VISION: bool = True
+    # After a translation pass that changed 0 segments (a provider outage
+    # symptom, not a language problem), probe the text provider once and — if
+    # it answers — retry the whole translate pass a single time. A run whose
+    # provider browned out for 21 minutes shipped Japanese subtitles even
+    # though the same model answered the very next (summary) call; this turns
+    # that into a delayed-but-translated run. No wait when the provider is
+    # still down: the probe fails fast and the source-language fallback ships
+    # exactly as before.
+    TRANSLATION_RETRY_AFTER_OUTAGE: bool = True
     # VRAM the CUDA context + baseline allocation hold and never free — subtract
     # from total VRAM to get the model's usable budget. ~1.2 GB matches a 4 GB
     # GTX 1650 (≈2.5 GB free after Whisper releases).

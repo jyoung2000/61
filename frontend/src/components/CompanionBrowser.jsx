@@ -1,4 +1,5 @@
 import React, { useEffect, useState, useCallback, useMemo } from 'react';
+import { LANGUAGES } from '../constants/languages';
 
 // Finder + Spotlight-inspired remote file browser for a paired GPU Companion's
 // shared folders. Browse (server-jailed to the shared roots), search/paste a
@@ -122,6 +123,23 @@ export default function CompanionBrowser({ kind = 'video', onClose, onImported }
   const [selectedPaths, setSelectedPaths] = useState(() => new Set());
   const [batchMsg, setBatchMsg] = useState('');
   const [view, setView] = useState('list'); // 'list' | 'grid'
+  // Source + target language for imported videos — same semantics as the
+  // Upload page pickers (empty source = auto-detect, empty target = keep the
+  // original language). Companion imports used to skip language selection
+  // entirely, so a Japanese video always fell back to the auto→English
+  // default with no way to choose. Sticky across sessions via localStorage.
+  const [sourceLang, setSourceLang] = useState(
+    () => { try { return localStorage.getItem('companionImportSourceLang') || ''; } catch { return ''; } });
+  const [targetLang, setTargetLang] = useState(
+    () => { try { return localStorage.getItem('companionImportTargetLang') || ''; } catch { return ''; } });
+  const pickSourceLang = (v) => {
+    setSourceLang(v);
+    try { localStorage.setItem('companionImportSourceLang', v); } catch { /* private mode */ }
+  };
+  const pickTargetLang = (v) => {
+    setTargetLang(v);
+    try { localStorage.setItem('companionImportTargetLang', v); } catch { /* private mode */ }
+  };
 
   useEffect(() => {
     (async () => {
@@ -225,7 +243,11 @@ export default function CompanionBrowser({ kind = 'video', onClose, onImported }
       try {
         const res = await fetch('/api/providers/companion-files/import', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ host_id: hostId, path: entry.path, kind, size: entry.size || 0 }),
+          body: JSON.stringify({
+            host_id: hostId, path: entry.path, kind, size: entry.size || 0,
+            source_language: kind === 'video' ? sourceLang : '',
+            target_language: kind === 'video' ? targetLang : '',
+          }),
         });
         const data = await res.json();
         if (!res.ok) { resolve({ error: data.detail || res.status }); return; }
@@ -512,6 +534,33 @@ export default function CompanionBrowser({ kind = 'video', onClose, onImported }
             )}
           </div>
         </div>
+
+        {/* Language pickers — same semantics as the Upload page. Imports from
+            the Companion used to start analysis with no language choice at
+            all, silently defaulting to auto-detect → English. */}
+        {kind === 'video' && (
+          <div style={{ flex: 'none', display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap', padding: '10px 16px', borderBottom: '1px solid var(--fb-border)' }}>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--fb-tm)', minWidth: 0 }}>
+              <span style={{ whiteSpace: 'nowrap' }}>Video language</span>
+              <select value={sourceLang} onChange={(ev) => pickSourceLang(ev.target.value)}
+                style={{ height: 30, borderRadius: 8, background: 'var(--fb-elev)', color: 'var(--fb-tp)', border: '1px solid var(--fb-border)', fontSize: 12, padding: '0 6px', maxWidth: 180 }}>
+                {LANGUAGES.map((l) => (
+                  <option key={l.code || 'auto'} value={l.code}>{l.label}</option>
+                ))}
+              </select>
+            </label>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--fb-tm)', minWidth: 0 }}>
+              <span style={{ whiteSpace: 'nowrap' }}>Translate subtitles to</span>
+              <select value={targetLang} onChange={(ev) => pickTargetLang(ev.target.value)}
+                style={{ height: 30, borderRadius: 8, background: 'var(--fb-elev)', color: 'var(--fb-tp)', border: '1px solid var(--fb-border)', fontSize: 12, padding: '0 6px', maxWidth: 180 }}>
+                <option value="">No translation (keep original)</option>
+                {LANGUAGES.filter((l) => l.code).map((l) => (
+                  <option key={l.code} value={l.code}>{l.label}</option>
+                ))}
+              </select>
+            </label>
+          </div>
+        )}
 
         {/* Breadcrumb + view toggle */}
         <div style={{ flex: 'none', display: 'flex', alignItems: 'center', gap: 10, padding: '9px 16px', borderBottom: '1px solid var(--fb-border)', minHeight: 46 }}>

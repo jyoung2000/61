@@ -457,6 +457,10 @@ export default function Analysis() {
   const wsRef = useRef(null);
   const [activityLog, setActivityLog] = useState([]);
   const [currentStageId, setCurrentStageId] = useState('');
+  // Concurrent-lane progress (translation ∥ clips; post-complete SEO):
+  // { translation: {message, pct, ts}, seo: {...} } — rendered as live chips
+  // under the pipeline tracker so a lane the main bar has passed stays visible.
+  const [activeLanes, setActiveLanes] = useState({});
   const currentStageIdRef = useRef(''); // stable ref for WS closures
   const [pipelineStartTime, setPipelineStartTime] = useState(null);
   const [stageTimes, setStageTimes] = useState({});
@@ -1236,6 +1240,31 @@ export default function Analysis() {
             // 'exporting' would cause isProcessing to toggle and the
             // analysis progress bar to blink in and out.
             const isExportStatus = msg.status === 'exporting' || msg.status === 'generating_seo';
+            // Concurrent-lane tick (translation while clips own the bar;
+            // post-complete SEO enrichment). Update the lane chip + log; a
+            // broadcast-only tick (no scalar progress) must NOT touch the job
+            // status/bar — that lane is deliberately behind the main bar.
+            const laneId = typeof msg.lane === 'string' ? msg.lane : '';
+            if (laneId) {
+              const lanePct = typeof msg.lane_pct === 'number' ? msg.lane_pct : null;
+              setActiveLanes((prev) => ({
+                ...prev,
+                [laneId]: {
+                  message: String(msg.message || ''),
+                  pct: lanePct,
+                  ts: Date.now(),
+                },
+              }));
+              // Live lane work — keep the stuck-timer quiet.
+              lastProgressRef.current = { ...lastProgressRef.current, time: Date.now() };
+              setStuckSeconds((prev) => (prev === 0 ? prev : 0));
+              if (typeof msg.progress !== 'number') {
+                pushLog('status', msg.message || '', {
+                  stage_id: msg.stage_id || laneId,
+                });
+                return;
+              }
+            }
             if (!isExportStatus) {
               setJob((prev) => {
                 if (!prev) return prev;
@@ -1314,6 +1343,12 @@ export default function Analysis() {
               sendNotification('Analysis Complete', {
                 body: msg.message || 'Your video analysis has finished.',
                 tag: `analysis-${jobId}`,
+              });
+              // Analysis lanes are done; the SEO lane may still be enriching
+              // clips post-complete, so leave it in place.
+              setActiveLanes((prev) => {
+                const { translation, polishing, ...rest } = prev;
+                return (translation || polishing) ? rest : prev;
               });
               fetchJob();
             }
@@ -1399,6 +1434,15 @@ export default function Analysis() {
               taskMsg,
               { stage_id: bgStageId },
             );
+            // A finished/failed background task retires its lane chip.
+            if (taskStatus === 'complete' || taskStatus === 'failed') {
+              setActiveLanes((prev) => {
+                if (!(bgStageId in prev)) return prev;
+                const next = { ...prev };
+                delete next[bgStageId];
+                return next;
+              });
+            }
             // Refresh job data when background task completes (e.g., polished transcript)
             if (taskStatus === 'complete') {
               // Pull the finished transcript over the lightweight endpoint right
@@ -3279,7 +3323,47 @@ export default function Analysis() {
               pipelineElapsed={pipelineElapsed}
               isComplete={job.status === 'complete'}
               isFailed={job.status === 'failed'}
+              concurrentStageIds={Object.keys(activeLanes)}
             />
+          )}
+          {/* Concurrent-lane chips: stages running IN PARALLEL with whatever
+              owns the main bar (translation ∥ clips; SEO enrichment after
+              "Analyzed in…" freezes). Without these, a lagging lane was
+              invisible for its entire runtime. */}
+          {Object.keys(activeLanes).length > 0 && (
+            <div style={{
+              display: 'flex', flexWrap: 'wrap', gap: 6, margin: '0 0 8px 0',
+            }}>
+              {Object.entries(activeLanes).map(([laneId, lane]) => (
+                <span key={laneId} style={{
+                  display: 'inline-flex', alignItems: 'center', gap: 6,
+                  padding: '3px 10px', borderRadius: 12,
+                  background: 'var(--bg-panel)', border: '1px solid var(--border)',
+                  fontSize: 11, fontFamily: 'var(--font-mono)',
+                  color: 'var(--text-secondary)', maxWidth: '100%',
+                }}>
+                  <span style={{
+                    width: 6, height: 6, borderRadius: '50%',
+                    background: laneId === 'translation' ? '#14b8a6'
+                      : laneId === 'seo' ? '#64748b' : '#ec4899',
+                    animation: 'lanePulse 1.4s ease-in-out infinite',
+                    flex: '0 0 auto',
+                  }} />
+                  <span style={{
+                    whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+                  }}>
+                    {lane.message || laneId}
+                    {lane.pct != null ? ` · ${lane.pct}%` : ''}
+                  </span>
+                </span>
+              ))}
+              <style>{`
+                @keyframes lanePulse {
+                  0%, 100% { opacity: 1; }
+                  50% { opacity: 0.35; }
+                }
+              `}</style>
+            </div>
           )}
           <ProcessingLog
             entries={activityLog}

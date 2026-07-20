@@ -177,6 +177,80 @@ def _probe_ollama_reachable(timeout: float = 1.5) -> bool:
     return False
 
 
+class _GpuClassLease:
+    """Serializes GPU model CLASSES (big text vs vision) on a remote card
+    that cannot hold both models resident at once.
+
+    When gemma3:12b (~8.3 GB) and llava:7b (~5.5 GB) share a 9.5 GB budget,
+    running the translation loop concurrently with clip vision analysis
+    CPU-spills the text model — a real run degraded every text call to
+    21s-3m26s for 21 minutes and shipped an untranslated transcript. The
+    lease keeps the OVERLAP (clips still run during translation) but hands
+    the GPU to one model class at a time: same-class calls run concurrently,
+    an opposing class waits for the current holders to drain plus a short
+    grace window (so back-to-back calls of one class don't ping-pong
+    multi-GB model loads)."""
+
+    def __init__(self, grace_s: float = 15.0):
+        self._grace = grace_s
+        self._cls: str | None = None
+        self._holders = 0
+        self._last_release = 0.0
+        self._cond: asyncio.Condition | None = None
+
+    def _condition(self) -> asyncio.Condition:
+        # Created lazily so the lease can be built before a loop exists.
+        if self._cond is None:
+            self._cond = asyncio.Condition()
+        return self._cond
+
+    async def acquire(self, cls: str) -> None:
+        cond = self._condition()
+        async with cond:
+            while True:
+                if self._holders == 0:
+                    if self._cls in (None, cls):
+                        break
+                    remaining = self._grace - (time.monotonic() - self._last_release)
+                    if remaining <= 0:
+                        break
+                    try:
+                        await asyncio.wait_for(cond.wait(), timeout=remaining)
+                    except asyncio.TimeoutError:
+                        pass
+                    continue
+                if self._cls == cls:
+                    break
+                await cond.wait()
+            self._cls = cls
+            self._holders += 1
+
+    async def release(self) -> None:
+        cond = self._condition()
+        async with cond:
+            self._holders = max(0, self._holders - 1)
+            self._last_release = time.monotonic()
+            cond.notify_all()
+
+
+def _est_model_gb(model_name: str) -> float:
+    """Rough resident-size estimate for an Ollama model from its name.
+
+    Weights ≈ params × 0.62 GB/B (q4_K_M-class quants) + ~1.2 GB runtime
+    overhead (KV cache, CUDA context). Checked against observation:
+    gemma3:12b-it-q4_K_M ≈ 8.3 GB actual vs 8.6 est; llava:7b ≈ 5-6 GB
+    actual vs 5.5 est. Only used for a coarse "do these two co-fit"
+    decision, so ±15% is fine. Returns 0 when no parameter count is
+    parseable (treated as unknown → assume it fits)."""
+    m = re.search(r"(\d+(?:\.\d+)?)\s*b", (model_name or "").lower())
+    if not m:
+        return 0.0
+    try:
+        return float(m.group(1)) * 0.62 + 1.2
+    except ValueError:
+        return 0.0
+
+
 class AIOrchestrator:
     """
     Tries providers in fallback chain order.
@@ -186,6 +260,13 @@ class AIOrchestrator:
     # Model downgrade fallback for consecutive Ollama failures
     _SMALLER_MODELS = ["qwen2.5:1.5b-instruct", "qwen2.5:0.5b-instruct", "tinyllama"]
     _FAILURE_THRESHOLD_FOR_DOWNGRADE = 3
+    # Class-level defaults so instances constructed without __init__ (test
+    # stubs) still work. The lease is deliberately CLASS-level: concurrent
+    # jobs share the one physical remote GPU, so their text/vision phases
+    # must take turns with each other too.
+    _gpu_lease_needed: bool | None = None
+    _last_ollama_defrag: float = 0.0
+    _gpu_class_lease = _GpuClassLease()
 
     def __init__(self, ws_broadcast=None, custom_prompts=None, cancel_check=None):
         self._circuit_breaker = _CircuitBreaker()
@@ -194,6 +275,11 @@ class AIOrchestrator:
         self._cancel_check = cancel_check  # callable that raises on cancel
         self._providers: dict[str, AIProvider] = {}
         self._consecutive_ollama_failures: int = 0
+        # Cooldown stamp for the CPU-spill defrag (evict-all + settle) so a
+        # burst of concurrent degraded calls triggers ONE defrag, not a storm.
+        # (The GPU class lease + the fit-check memo live on the CLASS: one
+        # physical remote GPU is shared by every orchestrator instance.)
+        self._last_ollama_defrag: float = 0.0
         self._current_model_override: str | None = None
         # Provider names that we know are unreachable for the lifetime
         # of this orchestrator (e.g. Ollama daemon not running, but
@@ -610,13 +696,31 @@ class AIOrchestrator:
                 except Exception as err:
                     logger.debug("Vision model override skipped: %s", err)
 
-                t0 = time.monotonic()
-                result = await provider.analyze_frames(
-                    frames, custom_prompt=frame_prompt,
-                    cancel_check=self._cancel_check,
-                    progress_callback=_provider_progress,
-                )
-                elapsed = time.monotonic() - t0
+                # On a budget-limited remote card, take the vision turn on the
+                # GPU for the whole frame batch — interleaving vision with the
+                # concurrent translation loop's text calls CPU-spills the big
+                # text model (the observed 21-minute brown-out). Same-class
+                # batches still run concurrently; only text-vs-vision switches
+                # serialize.
+                _vlease_held = False
+                if (provider.provider_name == "ollama"
+                        and await self._gpu_class_serialize_needed(provider)):
+                    logger.info(
+                        "Scene analysis waiting for its GPU turn (a text phase "
+                        "holds the remote card)")
+                    await self._gpu_class_lease.acquire("vision")
+                    _vlease_held = True
+                try:
+                    t0 = time.monotonic()
+                    result = await provider.analyze_frames(
+                        frames, custom_prompt=frame_prompt,
+                        cancel_check=self._cancel_check,
+                        progress_callback=_provider_progress,
+                    )
+                    elapsed = time.monotonic() - t0
+                finally:
+                    if _vlease_held:
+                        await self._gpu_class_lease.release()
                 logger.info("Scene analysis via %s completed in %.1fs (%d scenes)", provider.provider_name, elapsed, len(result))
                 # Log subject tracking distribution for debugging
                 if result:
@@ -1225,6 +1329,44 @@ class AIOrchestrator:
             return _partial_clips, "partial"
         raise AllProvidersFailedError("All providers failed for viral clip detection")
 
+    async def _gpu_class_serialize_needed(self, provider) -> bool:
+        """True when the remote card cannot hold the big text model and the
+        vision model resident together, so text and vision phases must take
+        turns on the GPU (see ``_GpuClassLease``). Memoized after first probe;
+        False (current behavior) whenever the budget or sizes are unknown."""
+        if self._gpu_lease_needed is not None:
+            return self._gpu_lease_needed
+        needed = False
+        try:
+            if not bool(getattr(settings, "OLLAMA_SERIALIZE_TEXT_VISION", True)):
+                self._gpu_lease_needed = False
+                return False
+            from backend.services import ollama_registry as _oreg
+            budget = float(await _oreg.remote_primary_vram_gb_resolved() or 0.0)
+            if budget <= 0:
+                # No remote budget known — local-only rigs already run the
+                # serial pipeline, so there is nothing to serialize.
+                self._gpu_lease_needed = False
+                return False
+            text_gb = max(
+                _est_model_gb(getattr(provider, "_editorial_model", "") or ""),
+                _est_model_gb(str(getattr(
+                    settings, "OLLAMA_TRANSLATION_MODEL", "") or "")),
+            )
+            vision_gb = _est_model_gb(getattr(provider, "_primary_model", "") or "")
+            if text_gb > 0 and vision_gb > 0:
+                needed = (text_gb + vision_gb) > budget * 0.95
+                if needed:
+                    logger.info(
+                        "GPU class lease ON: text ~%.1f GB + vision ~%.1f GB "
+                        "exceed the %.1f GB remote budget — text and vision "
+                        "phases take turns instead of CPU-spilling the text "
+                        "model", text_gb, vision_gb, budget)
+        except Exception:
+            needed = False
+        self._gpu_lease_needed = needed
+        return needed
+
     async def _maybe_downgrade_ollama_model(self, provider) -> None:
         """After consecutive Ollama failures, clear VRAM and try a smaller model."""
         self._consecutive_ollama_failures += 1
@@ -1236,24 +1378,34 @@ class AIOrchestrator:
             self._consecutive_ollama_failures,
         )
 
-        # Clear VRAM
+        # Clear VRAM — and let the CUDA release settle before anything
+        # reloads. The observed brown-out loop was exactly this path firing
+        # every ~90s: unload the timed-out model, a queued retry reloads it
+        # instantly into a half-released pool, it comes back CPU-spilled,
+        # and the next timeout re-arms the loop.
         if hasattr(provider, 'clear_vram'):
             await provider.clear_vram()
+            await asyncio.sleep(2.0)
 
-        # Try smaller models
-        import httpx as _httpx
+        # Try smaller models — through the provider's own client so the
+        # request carries the Companion proxy's auth. A raw unauthenticated
+        # client 401s here, which silently disabled the downgrade while the
+        # VRAM-clear side effect kept firing.
         for smaller_model in self._SMALLER_MODELS:
             try:
-                async with _httpx.AsyncClient(timeout=10) as client:
-                    resp = await client.post(
-                        f"{provider._host}/api/show",
-                        json={"model": smaller_model},
-                    )
-                    if resp.status_code == 200:
-                        logger.info("Downgrading to smaller model: %s", smaller_model)
-                        self._current_model_override = smaller_model
-                        self._consecutive_ollama_failures = 0
-                        return
+                resp = await provider._client.post(
+                    f"{provider._host}/api/show",
+                    json={"model": smaller_model},
+                    timeout=10.0,
+                )
+                if resp.status_code == 200:
+                    logger.info("Downgrading to smaller model: %s", smaller_model)
+                    self._current_model_override = smaller_model
+                    self._consecutive_ollama_failures = 0
+                    return
+                logger.info(
+                    "Downgrade probe for %s: HTTP %d — skipping",
+                    smaller_model, resp.status_code)
             except Exception:
                 continue
 
@@ -1326,6 +1478,14 @@ class AIOrchestrator:
                 original_model = provider._editorial_model
                 provider._editorial_model = _eff_override
             _call_timeout = timeout
+            # On a budget-limited remote card, take the text turn on the GPU
+            # before calling — a concurrent vision batch would CPU-spill this
+            # model otherwise. Waiting here does NOT count against the call's
+            # own timeout (that clock starts at the provider call below).
+            _lease_held = False
+            if pname == "ollama" and await self._gpu_class_serialize_needed(provider):
+                await self._gpu_class_lease.acquire("text")
+                _lease_held = True
             try:
                 # Evict a leftover model (e.g. the vision model) before the text
                 # call, but KEEP the text model resident so consecutive text
@@ -1341,9 +1501,58 @@ class AIOrchestrator:
                 # polish batches to the paid cloud fallback. When the target
                 # model is not resident, grant the configured cold-load
                 # allowance on top; warm calls keep the tight ceiling.
+                #
+                # A resident-but-CPU-SPILLED model (partial VRAM residency)
+                # gets the SAME allowance: it generates as slowly as a cold
+                # load, and a real brown-out showed the warm 90s ceiling
+                # killing calls the GPU host was completing at 21s-3m26s —
+                # 72 consecutive "timeouts" while translation shipped
+                # nothing. Worse, Ollama never rebalances a split model on
+                # its own, so once per cooldown window we also DEFRAG: evict
+                # everything (the squatting vision model AND the split
+                # target) so this call's generate reloads the target into a
+                # clean pool.
                 _cold_extra = float(getattr(
                     settings, "OLLAMA_COLD_LOAD_TIMEOUT_EXTRA_S", 240.0) or 0.0)
                 if (pname == "ollama" and _cold_extra > 0
+                        and hasattr(provider, "model_gpu_fraction")):
+                    try:
+                        _frac = await provider.model_gpu_fraction(model_name)
+                        if _frac is None:
+                            _call_timeout = timeout + _cold_extra
+                            logger.info(
+                                "text_completion: %s is not resident — cold "
+                                "load expected; extending timeout %.0fs → %.0fs",
+                                model_name, timeout, _call_timeout,
+                            )
+                        elif _frac < 0.9:
+                            _call_timeout = timeout + _cold_extra
+                            _now = time.monotonic()
+                            if (_now - self._last_ollama_defrag) >= 120.0:
+                                self._last_ollama_defrag = _now
+                                logger.warning(
+                                    "text_completion: %s is only %.0f%% on GPU "
+                                    "(CPU-spilled) — defragmenting: evicting all "
+                                    "models so it reloads into a clean pool; "
+                                    "timeout %.0fs → %.0fs",
+                                    model_name, _frac * 100, timeout, _call_timeout,
+                                )
+                                if hasattr(provider, "clear_vram"):
+                                    await provider.clear_vram()
+                                    # CUDA frees asynchronously; reloading into a
+                                    # half-released pool is how the 1.8GB/8.3GB
+                                    # split kept coming back.
+                                    await asyncio.sleep(2.0)
+                            else:
+                                logger.info(
+                                    "text_completion: %s is %.0f%% on GPU — "
+                                    "degraded but recently defragmented; "
+                                    "extending timeout %.0fs → %.0fs",
+                                    model_name, _frac * 100, timeout, _call_timeout,
+                                )
+                    except Exception:
+                        pass
+                elif (pname == "ollama" and _cold_extra > 0
                         and hasattr(provider, "is_model_loaded")):
                     try:
                         if not await provider.is_model_loaded(model_name):
@@ -1410,6 +1619,8 @@ class AIOrchestrator:
                 await self._notify_fallback(job_id, pname, str(e))
                 continue
             finally:
+                if _lease_held:
+                    await self._gpu_class_lease.release()
                 # Restore original model if we overrode it
                 if original_model is not None:
                     provider._editorial_model = original_model

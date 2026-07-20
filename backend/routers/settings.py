@@ -1006,6 +1006,12 @@ class CompanionImportRequest(BaseModel):
     path: str
     kind: str = "video"          # "video" | "media" | "font"
     size: int = 0                # known file size (from the listing) for % progress
+    # Same semantics as the Upload page: empty source = auto-detect, empty
+    # target = keep the original language. This import path used to hand-build
+    # the JobResult with NO language fields, so a Companion-imported video
+    # always ran auto-detect → default-English with no way to choose.
+    source_language: str = ""    # ISO 639-1 of the spoken audio
+    target_language: str = ""    # ISO 639-1 to translate subtitles into
 
 
 # In-memory progress for in-flight Companion video imports, keyed by a short
@@ -1294,6 +1300,13 @@ async def companion_file_import(req: CompanionImportRequest):
                     status=JobStatus.QUEUED, progress=0,
                     progress_message="Imported from Companion, waiting for analysis",
                     created_at=now, updated_at=now,
+                    # The user's picks from the import dialog — the pipeline
+                    # reads exactly these two fields (job.language drives
+                    # Whisper's language hint, job.subtitle_language the
+                    # translation target), so setting them here gives the
+                    # Companion path full upload-parity.
+                    language=(req.source_language or "").strip().lower(),
+                    subtitle_language=(req.target_language or "").strip().lower(),
                 )
                 await _db.save_job(job)
                 _import_progress[import_id].update({"status": "complete", "job_id": job_id})

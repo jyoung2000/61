@@ -536,6 +536,32 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
         except Exception:
             return True
 
+    async def model_gpu_fraction(self, model_name: str) -> Optional[float]:
+        """Fraction of a RESIDENT model held in GPU VRAM (1.0 = fully on GPU),
+        or ``None`` when the model is not resident / the probe fails.
+
+        Distinguishes the three states that must not share one timeout:
+        not resident (cold load ahead), fully resident (fast), and resident
+        but CPU-SPILLED (size_vram ≪ size). The third is the observed
+        brown-out mode: a 12B squeezed to ~20% VRAM by a co-loaded vision
+        model generates 10-40× slower than normal, every call blows a tight
+        warm-model ceiling, and — critically — Ollama never rebalances an
+        already-loaded split model on its own, so without intervention the
+        degradation persists long after the VRAM pressure is gone."""
+        try:
+            resp = await self._client.get(f"{self._host}/api/ps", timeout=5.0)
+            if resp.status_code != 200:
+                return None
+            for m in resp.json().get("models", []) or []:
+                if _ollama_names_match(m.get("name", ""), model_name):
+                    size = float(m.get("size", 0) or 0)
+                    if size <= 0:
+                        return None
+                    return max(0.0, min(1.0, float(m.get("size_vram", 0) or 0) / size))
+            return None
+        except Exception:
+            return None
+
     async def is_model_on_gpu(self, model_name: str) -> bool:
         """Check if a specific model is currently loaded on GPU."""
         try:

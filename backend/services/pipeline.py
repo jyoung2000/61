@@ -1924,10 +1924,16 @@ PIPELINE_STAGES = [
     {"id": "transcription",  "label": "Audio Transcription",  "status": "analyzing_scenes",   "start_pct": 42,  "end_pct": 56},
     {"id": "diarization",    "label": "Speaker Detection",    "status": "analyzing_scenes",   "start_pct": 56,  "end_pct": 58},
     {"id": "conversion",     "label": "Scene Conversion",     "status": "analyzing_scenes",   "start_pct": 60,  "end_pct": 62},
-    {"id": "summary",        "label": "Video Summary",        "status": "generating_summary", "start_pct": 62,  "end_pct": 76},
-    {"id": "translation",    "label": "Subtitle Translation", "status": "translating",        "start_pct": 76,  "end_pct": 80},
+    # Bands below match what the live code actually emits (translation ticks
+    # 63-69% via translation_progress_pct, the summary stage announces at 70)
+    # — the old sequential 62-76/76-80 declaration mislabeled every live
+    # translation event as "Video Summary" in the processing log.
+    {"id": "translation",    "label": "Subtitle Translation", "status": "translating",        "start_pct": 63,  "end_pct": 69},
+    {"id": "summary",        "label": "Video Summary",        "status": "generating_summary", "start_pct": 70,  "end_pct": 79},
     {"id": "clips",          "label": "Clip Detection",       "status": "detecting_clips",    "start_pct": 80,  "end_pct": 98},
     {"id": "saving",         "label": "Saving Results",       "status": "detecting_clips",    "start_pct": 98,  "end_pct": 100},
+    # Post-COMPLETE enrichment lane (deferred SEO) — narrated via lane events.
+    {"id": "seo",            "label": "SEO Enrichment",       "status": "complete",           "start_pct": 100, "end_pct": 100},
 ]
 
 
@@ -1956,6 +1962,12 @@ def _resolve_pipeline_stage(status: str, progress: int) -> dict:
 # UI stuck at 94 % "Asking the VLM…" / "Generating summary…" because the
 # persisted status kept reverting to detecting_clips.
 _finalizing_jobs: set = set()
+
+# Last scalar (main-bar) progress written per job. Lets a CONCURRENT-lane
+# update (translation ticking 63-69% while clips own 80-97%) detect that it
+# is behind the bar and become broadcast-only instead of walking the shared
+# scalar backward. Pruned when the job leaves the pipeline.
+_last_scalar_progress: dict = {}
 
 
 async def _persist_complete_job(job_id: str, fields: dict) -> bool:
@@ -2080,6 +2092,7 @@ async def _update_progress(
     job_id: str, status: str, progress: int, message: str,
     protect_terminal: bool = True,
     heartbeat_label: str = "",
+    lane: str = "",
 ):
     """Update job progress in DB and broadcast via WebSocket.
     If a cancel has been requested, raises CancelledError instead of
@@ -2091,7 +2104,17 @@ async def _update_progress(
     to ``detecting_clips`` and wipe the persisted clips / translated
     transcript. The one deliberate exception is the QUEUED reset at the
     top of ``run_analysis``, which re-runs a finished job and therefore
-    passes ``protect_terminal=False``."""
+    passes ``protect_terminal=False``.
+
+    ``lane`` marks a CONCURRENT-lane update (e.g. ``"translation"`` while the
+    clips lane owns the main bar). The pipeline runs translation ∥ clip
+    detection, and both used to write the ONE scalar progress — last writer
+    wins, so the clips lane's 80-97% swallowed every translation tick and the
+    UI showed a silent, frozen bar for the whole translate loop. A lane
+    update whose percent is BEHIND the scalar becomes broadcast-only (the
+    event still reaches the processing log and the lane chip, tagged with
+    ``lane``/``lane_pct``); it only writes the scalar when it is actually
+    ahead (i.e. it IS the critical path)."""
     if is_cancel_requested(job_id):
         raise CancelledError(f"Job {job_id} was cancelled by user")
     # Hard gate: once finalization starts, drop every non-terminal progress
@@ -2100,43 +2123,66 @@ async def _update_progress(
     _status_str = status.value if hasattr(status, "value") else str(status)
     if job_id in _finalizing_jobs and _status_str not in (
             "complete", "failed", "cancelled"):
-        return
-    await database.update_job_status(
-        job_id,
-        status=status,
-        progress=progress,
-        progress_message=message,
-        protect_terminal=protect_terminal,
-    )
+        # Post-complete lane work (deferred SEO) still narrates via its lane
+        # events; scalar writes stay dropped.
+        if not lane:
+            return
+    _scalar_write = True
+    if lane and progress < _last_scalar_progress.get(job_id, 0):
+        _scalar_write = False
+    if job_id in _finalizing_jobs and _status_str not in (
+            "complete", "failed", "cancelled"):
+        _scalar_write = False
+    if _scalar_write:
+        await database.update_job_status(
+            job_id,
+            status=status,
+            progress=progress,
+            progress_message=message,
+            protect_terminal=protect_terminal,
+        )
+        _last_scalar_progress[job_id] = max(
+            _last_scalar_progress.get(job_id, 0), int(progress or 0))
     # Publish overall % onto the request context so outbound Ollama/Whisper calls
-    # carry X-ClipAI-Progress — the Companion shows a live bar for the work it serves.
-    try:
-        from backend.services.request_context import set_progress
-        set_progress(progress)
-        # Heartbeat the Companion so its live bar tracks the container even during
-        # local-only stages (frame extraction/encode on the server GPU) when no
-        # AI request reaches it. Throttled + fire-and-forget; no-op if unpaired.
-        from backend.services import companion_progress
-        companion_progress.heartbeat(progress)
-    except Exception:
-        pass
+    # carry X-ClipAI-Progress — the Companion shows a live bar for the work it
+    # serves. Broadcast-only lane events skip this: a lagging lane's percent
+    # must not walk the Companion's bar backward.
+    if _scalar_write:
+        try:
+            from backend.services.request_context import set_progress
+            set_progress(progress)
+            # Heartbeat the Companion so its live bar tracks the container even during
+            # local-only stages (frame extraction/encode on the server GPU) when no
+            # AI request reaches it. Throttled + fire-and-forget; no-op if unpaired.
+            from backend.services import companion_progress
+            companion_progress.heartbeat(progress)
+        except Exception:
+            pass
     status_str = status.value if hasattr(status, 'value') else str(status)
     _stage = _resolve_pipeline_stage(status_str, progress)
     _stage_start = _stage.get("start_pct", 0)
     _stage_end = _stage.get("end_pct", 100)
     _stage_range = max(1, _stage_end - _stage_start)
     _stage_pct = int(min(100, max(0, (progress - _stage_start) / _stage_range * 100)))
-    await broadcast_ws(job_id, {
+    _evt = {
         "type": "status",
         "status": status,
-        "progress": progress,
         "message": message,
         "stage_id": _stage.get("id", ""),
         "stage_label": _stage.get("label", ""),
         "stage_pct": _stage_pct,
         "stage_start": _stage_start,
         "stage_end": _stage_end,
-    })
+    }
+    if _scalar_write:
+        _evt["progress"] = progress
+    if lane:
+        # Lane tag so the frontend renders a live chip beside the bar. No
+        # lane_pct here: this progress value is the band-scaled SCALAR
+        # (63-69% for translation), not the lane's own completion — the
+        # message text carries the real "(n/total)" counts.
+        _evt["lane"] = lane
+    await broadcast_ws(job_id, _evt)
     # Touch heartbeat so it knows we just emitted a real update.
     # Use human-friendly stage names for heartbeat messages.
     hb = _heartbeats.get(job_id)
@@ -2458,6 +2504,8 @@ async def _auto_generate_clip_seo(
         await broadcast_ws(job_id, {
             "type": "status",
             "message": f"Generating SEO for clips… (live trends: {_trend_source})",
+            "stage_id": "seo",
+            "lane": "seo",
         })
     except Exception:
         pass
@@ -2599,6 +2647,9 @@ async def _auto_generate_clip_seo(
                 await broadcast_ws(job_id, {
                     "type": "status",
                     "message": f"Generating SEO for clips… ({_done}/{_seo_total})",
+                    "stage_id": "seo",
+                    "lane": "seo",
+                    "lane_pct": int(_done / max(1, _seo_total) * 100),
                 })
             except Exception:
                 pass
@@ -2713,8 +2764,10 @@ async def _polish_transcript_loop(
     _loop_started = _time.monotonic()
     best_models = list(polished_models)
     best_report: Optional[dict] = None
+    _last_pass_s = 0.0
     for _pass in range(1, max_passes + 1):
         _pre_pass_texts = [(getattr(m, "text", "") or "") for m in polished_models]
+        _pass_started = _time.monotonic()
         try:
             polished_models = await asyncio.wait_for(
                 correct_transcript(
@@ -2780,11 +2833,25 @@ async def _polish_transcript_loop(
                 job_id, _pass, _changed, _n, _min_yield * 100)
             break
         _elapsed = _time.monotonic() - _loop_started
+        _last_pass_s = _time.monotonic() - _pass_started
         if _pass < max_passes and _loop_budget_s > 0 and _elapsed >= _loop_budget_s:
             logger.info(
                 "[%s] Polish loop wall budget reached (%.0fs ≥ %.0fs) after "
                 "pass %d — keeping best result so far",
                 job_id, _elapsed, _loop_budget_s, _pass)
+            break
+        # The budget check above only fires BETWEEN passes, so a pass that
+        # itself overran (e.g. grinding through provider timeouts) used to
+        # launch another just-as-slow pass anyway — a real run burned 1540s
+        # against a 900s budget that way. Project the next pass from the one
+        # that just finished and stop when it can't fit.
+        if (_pass < max_passes and _loop_budget_s > 0
+                and _elapsed + _last_pass_s > _loop_budget_s):
+            logger.info(
+                "[%s] Polish pass %d took %.0fs — a further pass would "
+                "overrun the %.0fs loop budget (%.0fs elapsed); keeping "
+                "best result so far",
+                job_id, _pass, _last_pass_s, _loop_budget_s, _elapsed)
             break
 
     return best_models, best_report
@@ -2907,6 +2974,7 @@ async def _auto_seo_followup(job_id: str, orchestrator, pp: dict,
             "type": "background_task", "task": "auto_seo", "status": "running",
             "message": "Generating SEO titles, captions, and tags for clips...",
         })
+        _seo_t0 = _time.monotonic()
         _g, _f, _seo_clips = await _auto_generate_clip_seo(
             job_id, list(seo_segments or []), orchestrator,
             fallback_clips=seo_input_clips,
@@ -2914,10 +2982,15 @@ async def _auto_seo_followup(job_id: str, orchestrator, pp: dict,
         )
         if _seo_clips:
             final_clips = _seo_clips
+        _seo_mins = (time.monotonic() - _seo_t0) / 60.0
+        # Duration in the completion line: SEO runs AFTER the "Analyzed in
+        # Xm Ys" banner freezes, so this is the only place the user learns
+        # the enrichment's cost.
         await broadcast_ws(job_id, {
             "type": "background_task", "task": "auto_seo", "status": "complete",
             "message": (f"SEO generated for {_g} clips"
-                        + (f" ({_f} failed)" if _f else "")),
+                        + (f" ({_f} failed)" if _f else "")
+                        + (f" in {_seo_mins:.0f}m" if _seo_mins >= 1.0 else "")),
         })
     except Exception as _seo_err:
         logger.warning("[%s] Auto-SEO seeding failed: %s", job_id, _seo_err, exc_info=True)
@@ -3476,7 +3549,8 @@ async def _background_post_processing(
                 try:
                     await _update_progress(
                         job_id, JobStatus.TRANSLATING, _pct, msg,
-                        heartbeat_label="subtitle translation")
+                        heartbeat_label="subtitle translation",
+                        lane="translation")
                 except Exception:
                     pass
                 await broadcast_ws(job_id, {
@@ -3506,19 +3580,22 @@ async def _background_post_processing(
                 whisper_timeout=max(1800, _trans_timeout),
                 nmt_timeout=_trans_timeout,
             )
-            _used_whisper_native = (_engine_used == "whisper")
-            _used_llm = (_engine_used == "llm")
-            if _used_whisper_native:
-                changed = len(translated)
-                logger.info("[%s] Whisper native translate: %d English cues "
-                            "(offline, single-step, no LLM)", job_id, len(translated))
-            else:
-                # Compare against the coerced model list (``_trans_input``) so the
-                # count works whether the caller handed us dicts or models.
-                changed = sum(
-                    1 for t, o in zip(translated, _trans_input)
+            def _count_changed(_tr, _eng):
+                if _eng == "whisper":
+                    return len(_tr)
+                # Compare against the coerced model list (``_trans_input``) so
+                # the count works whether the caller handed us dicts or models.
+                return sum(
+                    1 for t, o in zip(_tr, _trans_input)
                     if (getattr(t, "text", "") or "") != (getattr(o, "text", "") or "")
                 )
+
+            _used_whisper_native = (_engine_used == "whisper")
+            _used_llm = (_engine_used == "llm")
+            changed = _count_changed(translated, _engine_used)
+            if _used_whisper_native:
+                logger.info("[%s] Whisper native translate: %d English cues "
+                            "(offline, single-step, no LLM)", job_id, len(translated))
 
             logger.info("[%s] Translate DONE: %d/%d segments changed → %s",
                         job_id, changed, len(translated), target_lang)
@@ -3535,6 +3612,46 @@ async def _background_post_processing(
             # translation effectively failed, so bail to the no-translation
             # path (keeps the source transcript + runs SEO on it) rather than
             # persisting Japanese under ``translated_transcript``.
+            if changed == 0 and bool(getattr(
+                    settings, "TRANSLATION_RETRY_AFTER_OUTAGE", True)):
+                # One bounded retry when the provider answers again: a
+                # 21-minute provider brown-out during the LLM loop shipped a
+                # whole run source-language even though the same model
+                # answered the summary call SECONDS after the give-up. A
+                # cheap probe distinguishes "outage cleared" (retry
+                # translates normally) from "provider still down" (fail as
+                # before, no extra wait).
+                _probe_ok = False
+                try:
+                    _probe = await orchestrator.text_completion(
+                        "Reply with exactly: OK", max_tokens=8, timeout=45,
+                        job_id=job_id, skip_circuit_breaker=True)
+                    _probe_ok = bool((_probe or "").strip())
+                except Exception:
+                    _probe_ok = False
+                if _probe_ok:
+                    logger.warning(
+                        "[%s] Translation produced 0 changed segments but the "
+                        "text provider answers again — retrying the translate "
+                        "pass once (outage recovery)", job_id)
+                    await _nmt_status(
+                        "Provider recovered — retrying subtitle translation…")
+                    translated, _engine_used = await translate_subtitles(
+                        _trans_input, source_lang, target_lang,
+                        video_path=getattr(job, "file_path", None),
+                        glossary=glossary,
+                        orchestrator=orchestrator,
+                        status_callback=_nmt_status,
+                        job_id=job_id,
+                        whisper_timeout=max(1800, _trans_timeout),
+                        nmt_timeout=_trans_timeout,
+                    )
+                    _used_whisper_native = (_engine_used == "whisper")
+                    _used_llm = (_engine_used == "llm")
+                    changed = _count_changed(translated, _engine_used)
+                    logger.info(
+                        "[%s] Outage-recovery retry: %d/%d segments changed → %s",
+                        job_id, changed, len(translated), target_lang)
             if changed == 0:
                 raise RuntimeError(
                     "translation produced 0 changed segments — keeping source transcript")
@@ -3665,7 +3782,8 @@ async def _background_post_processing(
                         await _update_progress(
                             job_id, JobStatus.TRANSLATING, 68,
                             f"Polishing translated subtitles… ({int(pct)}%)",
-                            heartbeat_label="subtitle translation")
+                            heartbeat_label="subtitle translation",
+                            lane="translation")
                     except Exception:
                         pass
                 _pe_t0 = _time.monotonic()
@@ -4529,6 +4647,7 @@ async def run_analysis(job_id: str, resume: bool = False):
             _heartbeats.pop(job_id, None)
             _cancel_events.pop(job_id, None)
             _finalizing_jobs.discard(job_id)
+            _last_scalar_progress.pop(job_id, None)
             try:
                 from backend.services import companion_progress
                 # Tell the Companion the job has ended so its active-job display
@@ -6855,9 +6974,12 @@ async def _run_analysis_inner(job_id: str, resume: bool = False):
     if _detected_lang:
         from backend.services.compat_stubs import _last_detected_language
         _last_detected_language["lang"] = _detected_lang
+    # "Scene analysis complete", not "Analysis complete" — the job is barely
+    # halfway (translation, summary, clips all follow) and the old wording made
+    # the UI announce completion twice.
     await _update_progress(
         job_id, JobStatus.ANALYZING_SCENES, 62,
-        f"Analysis complete — {_n_scenes_val} scenes, {_n_segs} transcript segments{_lang_note}",
+        f"Scene analysis complete — {_n_scenes_val} scenes, {_n_segs} transcript segments{_lang_note}",
     )
 
     # ── Subtitle translation + target-language polish (right after transcription
@@ -7254,7 +7376,7 @@ async def _run_analysis_inner(job_id: str, resume: bool = False):
                     _pairs, _clip_agg = await asyncio.to_thread(
                         evaluate_per_clip, reframer_plan, perception, clips)
                     for _c, _rep in _pairs:
-                        _c.reframe_report = {
+                        _c_report = {
                             "grade": _rep.grade,
                             "grade_uncapped": _rep.grade_uncapped,
                             "overall_score": round(_rep.overall_score, 1),
@@ -7265,6 +7387,13 @@ async def _run_analysis_inner(job_id: str, resume: bool = False):
                                 1 for p in _rep.problems
                                 if p.get("severity") == "HIGH"),
                         }
+                        # Clips arrive as FezClip objects OR plain dicts (the
+                        # snapshot/resume path) — evaluate_per_clip reads via a
+                        # tolerant getter, so the write-back must match.
+                        if isinstance(_c, dict):
+                            _c["reframe_report"] = _c_report
+                        else:
+                            _c.reframe_report = _c_report
                     # VLM spot-check: a human-proxy framing judgment on ~12
                     # cropped frames sampled from the exported clips. Kept as
                     # a SEPARATE calibration signal (vlm_framing_pct), never
