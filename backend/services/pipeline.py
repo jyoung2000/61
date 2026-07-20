@@ -2971,6 +2971,10 @@ async def _condense_over_cps_cues(
                     offenders.append((i, txt, budget))
         if not offenders or orchestrator is None:
             return translated, 0
+        logger.info(
+            "[%s] %d cue(s) still over %.0f cps after readability enforcement "
+            "— condensing to fit their display windows",
+            job_id or "-", len(offenders), threshold)
 
         numbered = "\n".join(
             f"{n + 1}. (max {b} chars) {t}"
@@ -3372,8 +3376,13 @@ async def _background_post_processing(
                 # and the translated-side dedup can no longer match them
                 # (observed: the same surveillance-satellite line shipped
                 # twice as two different English sentences). CJK sentences
-                # compare by character similarity inside the dropper.
-                _trans_input, _sn = _drs_src(_trans_input)
+                # compare by character similarity inside the dropper. The
+                # window is WIDE here: Whisper's block re-decodes land 60-120s
+                # after the original (run 45 shipped the 5:45 capsule scene
+                # again at 7:24, 99 s later, with different cue boundaries
+                # that defeat the run-level collapse); sung cues are exempt
+                # inside the dropper so a repeating chorus survives.
+                _trans_input, _sn = _drs_src(_trans_input, window_s=120.0)
                 # Whisper hallucinates outro formula words (次回 / 予告 /
                 # "Preview") over the mid-episode eyecatch sting — drop them
                 # before they get translated; the real end-of-episode preview
@@ -4026,6 +4035,19 @@ async def _background_post_processing(
                 if bool(getattr(settings, "SUBTITLE_SENTENCE_DEDUP_ENABLED", True)):
                     from backend.services.transcript_dedup import drop_repeated_sentences
                     _tl, _sd = drop_repeated_sentences(_tl)
+                # Runs of parenthetical-only stage directions ("(Heavy
+                # breathing)" ×4 on run 45) collapse to the first cue —
+                # one direction reads fine, a run reads as filler.
+                try:
+                    from backend.services.transcript_dedup import (
+                        collapse_stage_direction_runs as _csd)
+                    _tl, _sg = _csd(_tl)
+                    if _sg:
+                        logger.info("[%s] Collapsed %d stage-direction "
+                                    "filler cue(s)", job_id, _sg)
+                except Exception as _sg_err:
+                    logger.debug("[%s] stage-direction collapse skipped: %s",
+                                 job_id, _sg_err)
                 # Safety net for outro-formula hallucinations that survived (or
                 # were introduced by) translation — "Next time…" / "Preview."
                 # mid-episode; the real end-of-episode preview is in the

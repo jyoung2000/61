@@ -334,3 +334,85 @@ def test_translation_plan_cloud_concurrency():
     # Ollama large model keeps the budget-gated single slot default.
     p = translation_plan("gemma3:12b", 100, is_ollama=True, companion_parallel=1)
     assert p["concurrency"] == 1
+
+
+# ── Run-45 follow-ups ────────────────────────────────────────────────
+
+
+def test_block_redecode_99s_later_drops_with_wide_window():
+    # Run 45 shipped the 5:45 capsule scene again at 7:24 (99 s later) with
+    # different cue boundaries — outside the default 25 s window. The
+    # source-side pass runs with window_s=120.
+    a = "カプセルが軌道を変更した。自殺行為のつもりか?"
+    segs = [
+        {"text": a, "start": 345.0, "no_speech_prob": 0.1},
+        {"text": "別の台詞がここに入ります、確認します。", "start": 380.0,
+         "no_speech_prob": 0.1},
+        {"text": a, "start": 444.0, "no_speech_prob": 0.1},
+    ]
+    out, dropped = drop_repeated_sentences(segs, window_s=120.0)
+    assert dropped >= 1
+    assert len(out) == 2
+
+
+def test_sung_cues_exempt_from_wide_window():
+    # The OP reprises its opening lines ~50 s later — high no_speech_prob
+    # marks them as sung; neither copy may be dropped.
+    lyric = "雨に打たれながら燃える想いを伝えたい今夜。"
+    segs = [
+        {"text": lyric, "start": 30.0, "no_speech_prob": 0.85},
+        {"text": lyric, "start": 80.0, "no_speech_prob": 0.85},
+    ]
+    out, dropped = drop_repeated_sentences(segs, window_s=120.0)
+    assert dropped == 0
+    assert len(out) == 2
+
+
+def test_stage_direction_runs_collapse():
+    from backend.services.transcript_dedup import collapse_stage_direction_runs
+
+    segs = [
+        {"text": "(Heavy breathing)", "start": 604.0, "end": 607.0},
+        {"text": "(Exhausted gasps)", "start": 611.0, "end": 614.0},
+        {"text": "(More heavy breathing)", "start": 619.0, "end": 622.0},
+        {"text": "I'm sorry for worrying you.", "start": 634.0, "end": 637.0},
+        {"text": "(A single direction elsewhere stays)", "start": 700.0,
+         "end": 703.0},
+        {"text": "[♪ music ♪]", "start": 710.0, "end": 715.0},
+    ]
+    out, dropped = collapse_stage_direction_runs(segs)
+    texts = [s["text"] for s in out]
+    assert dropped == 2
+    assert texts.count("(Heavy breathing)") == 1
+    assert "(Exhausted gasps)" not in texts
+    # The kept head stretched over the dropped run.
+    assert out[0]["end"] == 622.0
+    # Lone directions and bracket markers untouched.
+    assert "(A single direction elsewhere stays)" in texts
+    assert "[♪ music ♪]" in texts
+
+
+def test_roster_call_uses_json_schema():
+    _CACHE["job:test-schema"] = {
+        "ガンダム": "Gundam", "ゼクス": "Zechs", "リリーナ": "Relena",
+    }
+
+    class _Fake:
+        def __init__(self):
+            self.kwargs = None
+
+        async def text_completion(self, prompt, **kwargs):
+            self.kwargs = kwargs
+            return '[{"wrong": "Gundarium", "right": "Gundanium"}]'
+
+    fake = _Fake()
+    out = asyncio.run(resolve_roster_corrections(
+        ["It can only be Gundarium alloy."], fake, job_id="test-schema"))
+    assert out == {"Gundarium": "Gundanium"}
+    # Grammar-level array schema, not json_mode (format=json biases toward a
+    # bare object and run 45 silently produced zero corrections on that).
+    assert "json_schema" in (fake.kwargs or {})
+    assert fake.kwargs["json_schema"]["type"] == "array"
+    assert "json_mode" not in (fake.kwargs or {})
+    _CACHE.pop("job:test-schema", None)
+    _CACHE.pop("roster:test-schema", None)

@@ -577,12 +577,27 @@ async def resolve_roster_corrections(
             f"Candidates:\n{cand_block}"
         )
         timeout = float(getattr(s, "TRANSLATION_ROSTER_TIMEOUT", 75.0) or 75.0) if s else 75.0
+        # Grammar-level schema, not plain json_mode: format=json biases the
+        # model toward a bare OBJECT while this prompt needs an ARRAY of
+        # pairs — the run-45 pass silently produced zero corrections on
+        # exactly that mismatch. The schema forces the array shape on both
+        # Ollama and OpenRouter; providers without schema support fall back
+        # to the parser guard as before.
         kwargs: dict = {
             "max_tokens": min(2048, 200 + 24 * len(ask)),
             "timeout": timeout,
             "job_id": job_id or "",
             "skip_circuit_breaker": True,
-            "json_mode": True,
+            "json_schema": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["wrong", "right"],
+                    "properties": {"wrong": {"type": "string"},
+                                   "right": {"type": "string"}},
+                },
+                "maxItems": max(1, len(ask)),
+            },
         }
         if model_override:
             kwargs["model_override"] = str(model_override).strip()
@@ -594,6 +609,14 @@ async def resolve_roster_corrections(
                 orchestrator.text_completion(prompt), timeout + 15)
         mapping = _vet_roster_pairs(
             _parse_json_pairs(raw or ""), {t for t, _ in ask})
+        if not mapping:
+            # Visible at INFO: a silent no-op here shipped "Gundarium" after
+            # the infrastructure was in place — diagnosability matters more
+            # than log quiet.
+            logger.info(
+                "[%s] roster corrections: %d candidate(s) offered, none "
+                "confidently corrected (raw reply %d chars)",
+                job_id or "-", len(ask), len(raw or ""))
         if mapping:
             logger.info(
                 "[%s] roster corrections resolved for %d token(s): %s",

@@ -458,6 +458,49 @@ def _seg_set(seg, key, value):
         setattr(seg, key, value)
 
 
+# A cue that is ENTIRELY a parenthetical stage direction — "(Heavy
+# breathing)", "(Exhausted gasps)" — usually comes from the polish pass
+# narrating non-speech audio. One is fine; a run of them ("(Heavy
+# breathing)" / "(Exhausted gasps)" / "(More heavy breathing)" /
+# "(Continued labored breathing)", shipped consecutively on a real run)
+# reads as filler no human subber would keep.
+_STAGE_DIRECTION_RE = re.compile(r"^[\(（][^()（）]{2,60}[\)）]$")
+
+
+def collapse_stage_direction_runs(
+    segments: list,
+    text_key: str = "text",
+    end_key: str = "end",
+) -> tuple[list, int]:
+    """Collapse a run of ≥2 consecutive parenthetical-only cues to the FIRST,
+    stretching its end over the dropped ones. Bracketed markers ("[♪ music ♪]")
+    are untouched. Returns ``(segments, dropped)``."""
+    out: list = []
+    dropped = 0
+    run_head = None  # the kept first parenthetical cue of the current run
+    for seg in segments or []:
+        txt = (_seg_get(seg, text_key, "") or "").strip()
+        if _STAGE_DIRECTION_RE.match(txt):
+            if run_head is None:
+                run_head = seg
+                out.append(seg)
+            else:
+                try:
+                    prev_end = float(_seg_get(run_head, end_key, 0) or 0)
+                    this_end = float(_seg_get(seg, end_key, 0) or 0)
+                    if this_end > prev_end:
+                        _seg_set(run_head, end_key, _seg_get(seg, end_key))
+                except (TypeError, ValueError):
+                    pass
+                dropped += 1
+            continue
+        run_head = None
+        out.append(seg)
+    if dropped:
+        return out, dropped
+    return segments, 0
+
+
 def collapse_adjacent_duplicates(
     segments: list,
     text_key: str = "text",
@@ -726,6 +769,7 @@ def drop_repeated_sentences(
     window_s: float = 25.0,
     similarity: float = 0.70,
     min_content_words: int = 4,
+    skip_no_speech_above: float = 0.6,
 ) -> tuple[list, int]:
     """Remove sentences that near-repeat a sentence from a nearby earlier cue.
 
@@ -746,6 +790,19 @@ def drop_repeated_sentences(
         if not txt:
             out.append(seg)
             continue
+        # Sung/music cues are exempt in BOTH directions: a song legitimately
+        # repeats its chorus (the OP reprises its opening lines ~50 s later),
+        # so lyrics must neither be dropped as "duplicates" nor kill later
+        # dialogue that happens to share words. Cues without the field are
+        # treated as speech.
+        _nsp = _seg_get(seg, "no_speech_prob", None)
+        if _nsp is not None:
+            try:
+                if float(_nsp) > skip_no_speech_above:
+                    out.append(seg)
+                    continue
+            except (TypeError, ValueError):
+                pass
         sents = [s for s in _SENT_SPLIT_RE.split(txt) if s.strip()]
         keep: list = []
         for sent in sents:
