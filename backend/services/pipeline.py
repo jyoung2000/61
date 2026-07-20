@@ -3265,6 +3265,45 @@ async def _background_post_processing(
             except Exception as _src_seg_err:
                 logger.warning("[%s] Source resegmentation skipped (%s)",
                                job_id, _src_seg_err)
+        # ── (a-pre) Pre-fetch the Whisper-EN timing reference CONCURRENTLY ──
+        # The hybrid word-timing step (c-hybrid below) needs a Whisper-native
+        # English pass as its timing reference. On Companion rigs that pass
+        # runs remotely and decodes the FULL file regardless of windows — it
+        # depends only on the SOURCE segments, not on the translation — yet
+        # it classically ran AFTER the multi-minute LLM loop, adding its
+        # whole runtime to the job tail (observed: 78 s serial at 21:15 on a
+        # run whose LLM loop it could have hidden inside). Start it now: the
+        # sidecar decode borrows a slice of the Companion GPU from the
+        # translation batches for ~a minute and removes itself from the
+        # critical path entirely. Local-decode rigs keep the classic
+        # sequential windowed pass (windows need the translated cues).
+        # Fail-soft in every direction: the getter never raises (it returns
+        # [] → tier B, exactly like the classic remote call), and a pre-fetch
+        # no branch consumes (whisper-native/NMT engine won) is cancelled.
+        _ref_pretask = None
+        try:
+            from backend.services.reframer_audio import (
+                remote_whisper_configured as _rwc_pf,
+                remote_whisper_supports_translate as _rwst_pf)
+            if (getattr(settings, "HYBRID_WORD_TIMING_ENABLED", True)
+                    and getattr(settings, "TRANSLATION_PREFER_LLM", True)
+                    and str(target_lang or "").lower().startswith("en")
+                    and _trans_input
+                    and _rwc_pf() and _rwst_pf()):
+                _ref_pretask = asyncio.create_task(
+                    _get_whisper_en_timing_reference(
+                        getattr(job, "file_path", None), source_lang,
+                        [s.model_dump() if hasattr(s, "model_dump") else dict(s)
+                         for s in _trans_input],
+                        job_id, translated_cues=None))
+                logger.info(
+                    "[%s] Hybrid timing: Whisper-EN reference PRE-FETCH "
+                    "started on the Companion — decoding concurrently with "
+                    "the translation below", job_id)
+        except Exception as _pf_err:
+            logger.debug("[%s] timing-reference pre-fetch skipped: %s",
+                         job_id, _pf_err)
+            _ref_pretask = None
         try:
             # ── (a) Translate (LLM-first, then Whisper-native / offline NMT) ──
             logger.info("[%s] Translate START: %s → %s (%d segments)",
@@ -3623,11 +3662,23 @@ async def _background_post_processing(
                             else _TSh(**(t.model_dump() if hasattr(t, "model_dump") else t))
                             for t in translated
                         ]
-                        _whisper_ref = await _get_whisper_en_timing_reference(
-                            getattr(job, "file_path", None), source_lang,
-                            [s.model_dump() if hasattr(s, "model_dump") else dict(s)
-                             for s in _trans_input] if _trans_input else None,
-                            job_id, translated_cues=_llm_cues)
+                        if _ref_pretask is not None:
+                            # Started before the LLM loop — by now the decode
+                            # normally finished minutes ago; awaiting is a
+                            # no-op join, not a serial pass.
+                            _whisper_ref = await _ref_pretask
+                            _ref_pretask = None
+                            logger.info(
+                                "[%s] Hybrid timing: PRE-FETCHED Whisper-EN "
+                                "reference consumed (%d cue(s)) — its decode "
+                                "ran concurrently with translation", job_id,
+                                len(_whisper_ref or []))
+                        else:
+                            _whisper_ref = await _get_whisper_en_timing_reference(
+                                getattr(job, "file_path", None), source_lang,
+                                [s.model_dump() if hasattr(s, "model_dump") else dict(s)
+                                 for s in _trans_input] if _trans_input else None,
+                                job_id, translated_cues=_llm_cues)
                         _tiers = project_hybrid_timings(
                             _llm_cues, whisper_en_segments=_whisper_ref,
                             source_cues=list(_trans_input) if _trans_input else None,
@@ -3655,6 +3706,13 @@ async def _background_post_processing(
                                 job_id, _pre_seg, len(translated))
                 except Exception as _rs_err:
                     logger.warning("[%s] Translated resegmentation failed (%s)", job_id, _rs_err)
+
+            # A pre-fetched timing reference no branch consumed (whisper-native
+            # or NMT engine won, or the hybrid block errored before the join):
+            # cancel it so it can't outlive the job.
+            if _ref_pretask is not None:
+                _ref_pretask.cancel()
+                _ref_pretask = None
 
             # ── (c cont.) Re-enforce readability in the target language ──
             # Translation changes character length dramatically — a CJK →
