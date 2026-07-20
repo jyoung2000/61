@@ -272,3 +272,59 @@ def test_condense_noop_without_offenders():
     segs = [{"text": "Fine.", "start": 0.0, "end": 2.0}]
     out, n = asyncio.run(_condense_over_cps_cues(segs, _Boom(), job_id="t"))
     assert n == 0 and out[0]["text"] == "Fine."
+
+
+# ── Cloud-provider parity: response_format + translation concurrency ─
+
+
+def test_openrouter_response_format_mapping():
+    from backend.services.providers.openrouter_provider import _response_format_for
+
+    schema = {"type": "array", "items": {"type": "string"},
+              "minItems": 3, "maxItems": 3}
+    rf = _response_format_for(False, schema)
+    assert rf["type"] == "json_schema"
+    assert rf["json_schema"]["strict"] is True
+    assert rf["json_schema"]["schema"] == schema
+    assert _response_format_for(True, None) == {"type": "json_object"}
+    assert _response_format_for(False, None) is None
+
+
+def test_openrouter_rejection_detector():
+    from backend.services.providers.openrouter_provider import (
+        _is_response_format_rejection)
+
+    assert _is_response_format_rejection(
+        Exception("400: response_format is not supported for this model"))
+    assert _is_response_format_rejection(
+        Exception("Invalid schema in json_schema field"))
+    assert not _is_response_format_rejection(Exception("429 rate limited"))
+    assert not _is_response_format_rejection(Exception("500 server error"))
+
+
+def test_openrouter_text_complete_accepts_json_kwargs():
+    # The orchestrator forwards json_schema/json_mode to openrouter — the
+    # signature must accept them (a mismatch would silently fall through to
+    # the next provider via the generic except).
+    import inspect
+    from backend.services.providers.openrouter_provider import OpenRouterProvider
+
+    params = inspect.signature(OpenRouterProvider.text_complete).parameters
+    assert "json_mode" in params and "json_schema" in params
+
+
+def test_translation_plan_cloud_concurrency():
+    from backend.services.local_models import translation_plan
+
+    # Ollama keeps the Companion-derived parallelism.
+    p = translation_plan("qwen3:4b", 100, is_ollama=True, companion_parallel=1)
+    assert p["concurrency"] == 1
+    # Cloud small model: fans out to the configured cloud concurrency.
+    p = translation_plan("some/cloud-model", 100, is_ollama=False, companion_parallel=1)
+    assert p["concurrency"] >= 3
+    # Cloud LARGE model: no single-slot VRAM logic either.
+    p = translation_plan("llama-3.1-70b", 100, is_ollama=False, companion_parallel=1)
+    assert p["concurrency"] >= 3
+    # Ollama large model keeps the budget-gated single slot default.
+    p = translation_plan("gemma3:12b", 100, is_ollama=True, companion_parallel=1)
+    assert p["concurrency"] == 1

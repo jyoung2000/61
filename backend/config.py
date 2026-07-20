@@ -506,6 +506,11 @@ class Settings(BaseSettings):
     # slower decode for a few % more words — the Netflix-quality trade. Set
     # False to keep turbo on English. Ignored when WHISPER_REMOTE_MODEL is set.
     WHISPER_REMOTE_PREFER_ACCURACY: bool = True
+    # Client-side batch fan-out for subtitle translation when it runs on a
+    # CLOUD provider (OpenRouter etc.) — those have no VRAM/KV-slot limits,
+    # so the Companion-derived concurrency (1 without a Companion) starves
+    # them. The provider's own rate limiter still spaces submissions.
+    TRANSLATION_CLOUD_CONCURRENCY: int = 3
     # LLM-condense cues that remain unreadably fast after the readability
     # enforcer converged (no word timings to split with, no idle time to
     # extend into). Only cues over SUBTITLE_CONDENSE_CPS are touched — well

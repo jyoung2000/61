@@ -1314,15 +1314,20 @@ class AIOrchestrator:
                     except Exception:
                         pass
                 logger.info("text_completion attempting via %s model=%s (%d chars prompt)", pname, model_name, len(prompt))
-                # JSON constraints are an Ollama capability (grammar-level
-                # ``format``); other providers keep their plain call — the
-                # caller's parser still guards their output. NOTE: this
-                # forwarding is what makes ``json_mode=True`` callers work at
-                # all — the parameter used to not exist here, so those calls
-                # raised TypeError and silently fell into their except-blocks
-                # (the batched cleanup prefill never ran).
+                # JSON constraints: Ollama enforces them at the grammar level
+                # (``format``); OpenRouter maps them to OpenAI-style
+                # ``response_format`` (strict json_schema / json_object) with
+                # an internal downgrade for models that reject it. Other
+                # providers keep their plain call — the caller's parser still
+                # guards their output. Without this forwarding a cloud-routed
+                # translation batch loses the exact-count array enforcement
+                # and the parse-miss retry cascade returns. NOTE: this
+                # forwarding is also what makes ``json_mode=True`` callers
+                # work at all — the parameter used to not exist here, so those
+                # calls raised TypeError and silently fell into their
+                # except-blocks (the batched cleanup prefill never ran).
                 _tc_kw = {}
-                if pname == "ollama":
+                if pname in ("ollama", "openrouter"):
                     if json_schema is not None:
                         _tc_kw["json_schema"] = json_schema
                     elif json_mode:

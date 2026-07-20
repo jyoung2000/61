@@ -381,6 +381,37 @@ def select_primary_model_for_content(content_type, preset_default: str) -> str:
     return override or preset_default
 
 
+def _response_format_for(json_mode: bool, json_schema: dict | None) -> dict | None:
+    """OpenAI-style ``response_format`` for the requested JSON constraint.
+
+    ``json_schema`` wins (strict grammar-level enforcement on models that
+    support it); plain ``json_mode`` degrades to ``json_object``. ``None``
+    when no constraint was requested — the request stays byte-identical to
+    the pre-constraint behavior."""
+    if json_schema is not None:
+        return {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "response",
+                "strict": True,
+                "schema": json_schema,
+            },
+        }
+    if json_mode:
+        return {"type": "json_object"}
+    return None
+
+
+def _is_response_format_rejection(err: Exception) -> bool:
+    """True when the error smells like the MODEL rejecting ``response_format``
+    (unsupported parameter / invalid schema), so the caller retries without
+    the constraint instead of failing the whole call."""
+    s = str(err).lower()
+    if "response_format" in s or "json_schema" in s or "structured output" in s:
+        return True
+    return "400" in s and ("format" in s or "schema" in s)
+
+
 class _RateLimiter:
     """Token bucket rate limiter: max RPM with minimum interval between requests."""
 
@@ -756,12 +787,24 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
             except Exception:
                 pass
 
-    async def text_complete(self, prompt: str, max_tokens: int = 4096, timeout: int | None = None) -> str:
-        """Generic text completion using the text model with fallback chain."""
+    async def text_complete(self, prompt: str, max_tokens: int = 4096,
+                            timeout: int | None = None,
+                            json_mode: bool = False,
+                            json_schema: dict | None = None) -> str:
+        """Generic text completion using the text model with fallback chain.
+
+        ``json_schema`` / ``json_mode`` map to OpenAI-style ``response_format``
+        (strict schema / json_object). This is the cloud counterpart of the
+        Ollama grammar constraint: without it, a cloud-routed translation
+        batch loses the exact-count JSON array enforcement and the parse-miss
+        retry cascade returns (the measured ~1/3 failure rate the local path
+        eliminated). Models that reject response_format are retried without
+        it — the caller's parser still guards the output."""
         messages = [{"role": "user", "content": prompt}]
         return await self._call_with_fallback(
             self._editorial_model, self._text_fallbacks, messages,
             max_tokens=max_tokens, timeout=timeout,
+            response_format=_response_format_for(json_mode, json_schema),
         )
 
     @property
@@ -779,22 +822,22 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
 
     _API_TIMEOUT = 180  # 3 minutes per API call
 
-    async def _call(self, model: str, messages: list[dict], max_tokens: int = 4096, timeout: int | None = None) -> str:
+    async def _call(self, model: str, messages: list[dict], max_tokens: int = 4096,
+                    timeout: int | None = None,
+                    response_format: dict | None = None) -> str:
         await self._rate_limiter.acquire()
         call_timeout = timeout or self._API_TIMEOUT
         t0 = time.monotonic()
-        try:
+
+        async def _attempt(fmt: dict | None):
+            kwargs = dict(model=model, messages=messages,
+                          max_tokens=max_tokens, temperature=0.3)
+            if fmt is not None:
+                kwargs["response_format"] = fmt
             response = await asyncio.wait_for(
-                self.client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    max_tokens=max_tokens,
-                    temperature=0.3,
-                ),
+                self.client.chat.completions.create(**kwargs),
                 timeout=call_timeout,
             )
-            elapsed = time.monotonic() - t0
-            logger.info("OpenRouter call to %s completed in %.1fs", model, elapsed)
             if response.usage:
                 self._total_tokens += response.usage.total_tokens
                 OpenRouterProvider._session_tokens += response.usage.total_tokens
@@ -802,6 +845,26 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                 logger.warning("OpenRouter %s returned empty/null choices", model)
                 raise ProviderError(f"OpenRouter empty response ({model}): no choices returned")
             return response.choices[0].message.content or ""
+
+        try:
+            try:
+                result = await _attempt(response_format)
+            except (asyncio.TimeoutError, ProviderError):
+                raise
+            except Exception as e:
+                # Not every model behind OpenRouter accepts response_format —
+                # degrade to an unconstrained call (the caller's parser still
+                # guards the output) rather than failing the stage.
+                if response_format is not None and _is_response_format_rejection(e):
+                    logger.info(
+                        "OpenRouter %s rejected response_format (%s) — "
+                        "retrying without the JSON constraint", model, str(e)[:120])
+                    result = await _attempt(None)
+                else:
+                    raise
+            elapsed = time.monotonic() - t0
+            logger.info("OpenRouter call to %s completed in %.1fs", model, elapsed)
+            return result
         except asyncio.TimeoutError:
             logger.error("OpenRouter call to %s timed out after %ds", model, call_timeout)
             raise ProviderError(f"OpenRouter timeout ({model}): no response in {call_timeout}s")
@@ -821,21 +884,7 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                 )
                 await asyncio.sleep(wait_s)
                 try:
-                    response = await asyncio.wait_for(
-                        self.client.chat.completions.create(
-                            model=model,
-                            messages=messages,
-                            max_tokens=max_tokens,
-                            temperature=0.3,
-                        ),
-                        timeout=call_timeout,
-                    )
-                    if response.usage:
-                        self._total_tokens += response.usage.total_tokens
-                        OpenRouterProvider._session_tokens += response.usage.total_tokens
-                    if not response.choices:
-                        raise ProviderError(f"OpenRouter empty response after retry ({model})")
-                    return response.choices[0].message.content or ""
+                    return await _attempt(response_format)
                 except asyncio.TimeoutError:
                     raise ProviderError(f"OpenRouter timeout after retry ({model})")
                 except ProviderError:
@@ -849,7 +898,7 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
     async def _call_with_fallback(
         self, primary: str, fallbacks: list[str] | None, messages: list[dict],
         max_tokens: int = 4096, is_vision: bool = False, cancel_check=None,
-        timeout: int | None = None,
+        timeout: int | None = None, response_format: dict | None = None,
     ) -> str:
         """Try primary model, then each fallback in order.
 
@@ -901,7 +950,8 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                     model_max_tokens = max(max_tokens, 4096)
             try:
                 result = await self._call_cancellable(
-                    model, messages, model_max_tokens, cancel_check, timeout=model_timeout,
+                    model, messages, model_max_tokens, cancel_check,
+                    timeout=model_timeout, response_format=response_format,
                 )
                 # Notify frontend which model actually served the request
                 if i > 0:
@@ -942,11 +992,15 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
     async def _call_cancellable(
         self, model: str, messages: list[dict], max_tokens: int = 4096,
         cancel_check=None, timeout: int | None = None,
+        response_format: dict | None = None,
     ) -> str:
         """Wrap _call with cancellation polling so we can abort mid-API-call."""
         if not cancel_check:
-            return await self._call(model, messages, max_tokens, timeout=timeout)
-        task = asyncio.ensure_future(self._call(model, messages, max_tokens, timeout=timeout))
+            return await self._call(model, messages, max_tokens, timeout=timeout,
+                                    response_format=response_format)
+        task = asyncio.ensure_future(self._call(
+            model, messages, max_tokens, timeout=timeout,
+            response_format=response_format))
         try:
             while not task.done():
                 await asyncio.sleep(1.0)
