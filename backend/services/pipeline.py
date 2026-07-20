@@ -2549,6 +2549,29 @@ async def _auto_generate_clip_seo(
                     pass
                 capped = enforce_platform_caps(seo.model_dump(), platform,
                                                brief_hashtags=_brief_tags)
+                # Re-apply the job's roster corrections to the GENERATED copy:
+                # the SEO model reads the corrected transcript but can still
+                # re-garble a name it "knows" phonetically — a title shipping
+                # "Gundarium" after the subtitles were fixed to Gundanium is
+                # exactly the regression this closes. Deterministic
+                # word-boundary replaces; no-op when no roster ran.
+                try:
+                    from backend.services.canonical_names import (
+                        apply_roster_corrections as _arc,
+                        roster_corrections_for_job as _rcfj)
+                    _ros = _rcfj(job_id)
+                    if _ros:
+                        _fixed, _nf = _arc(
+                            [capped.get("title", ""), capped.get("description", ""),
+                             capped.get("platform_tips", "")], _ros)
+                        if _nf:
+                            capped["title"], capped["description"], \
+                                capped["platform_tips"] = _fixed
+                        _tags, _nt = _arc(list(capped.get("tags") or []), _ros)
+                        if _nt:
+                            capped["tags"] = _tags
+                except Exception:
+                    pass
                 seo_record = ClipSEO(**capped)
                 seo_by_plat = dict(clip_dict.get("seo_by_platform") or {})
                 seo_by_plat[platform] = seo_record.model_dump()
@@ -7023,13 +7046,31 @@ async def _run_analysis_inner(job_id: str, resume: bool = False):
             #    silently degrades to signal-only and ranks clips 1–100 by audio
             #    /visual heuristics, the symptom on the key-limited run).
             if _local_editorial_models:
+                _judge_models = list(_local_editorial_models)
+                # Companion-aware judge upgrade: hook/flow judging is an
+                # editorial-quality task, and this ladder was sized for the
+                # 4 GB LOCAL card (3B-class first so it stays resident). With
+                # a big-VRAM Companion serving Ollama, the strongest model on
+                # the rig — the same 12B that translates/polishes — judges
+                # far better, especially on the non-English SOURCE transcript
+                # the clip stage sees (translation still runs concurrently).
+                # The small model stays as the fallback.
+                if bool(getattr(settings, "CLIP_JUDGE_PREFER_LARGE", True)):
+                    try:
+                        from backend.services import ollama_registry as _oreg_j
+                        if await _oreg_j.remote_primary_vram_gb_resolved() >= 7.0:
+                            _big_judge = _resolve_polish_model_override(orchestrator)
+                            if _big_judge and _big_judge not in _judge_models:
+                                _judge_models = [_big_judge] + _judge_models
+                    except Exception:
+                        pass
                 if _editorial_is_local:
-                    clipper_config.judge_primary = f"ollama:{_local_editorial_models[0]}"
+                    clipper_config.judge_primary = f"ollama:{_judge_models[0]}"
                     clipper_config.judge_fallback = (
-                        f"ollama:{_local_editorial_models[1]}"
-                        if len(_local_editorial_models) > 1 else "")
+                        f"ollama:{_judge_models[1]}"
+                        if len(_judge_models) > 1 else "")
                 elif not (clipper_config.judge_fallback or "").startswith("ollama:"):
-                    clipper_config.judge_fallback = f"ollama:{_local_editorial_models[0]}"
+                    clipper_config.judge_fallback = f"ollama:{_judge_models[0]}"
                 logger.info(
                     "[%s] Clip judge → %s%s", job_id,
                     clipper_config.judge_primary or "(configured)",

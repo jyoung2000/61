@@ -506,6 +506,12 @@ class Settings(BaseSettings):
     # slower decode for a few % more words — the Netflix-quality trade. Set
     # False to keep turbo on English. Ignored when WHISPER_REMOTE_MODEL is set.
     WHISPER_REMOTE_PREFER_ACCURACY: bool = True
+    # Prefer the rig's strongest model (the translation/polish 12B on a
+    # big-VRAM Companion) as the clip editorial judge, demoting the 3B-class
+    # local ladder to fallback. The 3B-first ordering was sized for 4 GB
+    # local cards; hook/flow judging — often on a non-English source
+    # transcript — is exactly where the big model earns its keep.
+    CLIP_JUDGE_PREFER_LARGE: bool = True
     # Client-side batch fan-out for subtitle translation when it runs on a
     # CLOUD provider (OpenRouter etc.) — those have no VRAM/KV-slot limits,
     # so the Companion-derived concurrency (1 without a Companion) starves

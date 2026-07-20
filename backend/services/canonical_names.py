@@ -482,6 +482,11 @@ def _vet_roster_pairs(pairs, candidates: set) -> dict[str, str]:
     return out
 
 
+def roster_corrections_for_job(job_id: str) -> dict[str, str]:
+    """The roster mapping resolved for this job (empty when none ran)."""
+    return dict(_CACHE.get(f"roster:{job_id}") or {}) if job_id else {}
+
+
 def apply_roster_corrections(texts: list, mapping: dict[str, str]) -> tuple[list, int]:
     """Word-boundary replace each vetted wrong→right pair in each text.
     Longest wrong-forms first so "Ail Reese" wins over a hypothetical "Ail".
@@ -594,6 +599,12 @@ async def resolve_roster_corrections(
                 "[%s] roster corrections resolved for %d token(s): %s",
                 job_id or "-", len(mapping),
                 "; ".join(f"{k}→{v}" for k, v in list(mapping.items())[:10]))
+        # Stash per job: downstream copy generators (clip SEO titles /
+        # descriptions / tags, summaries) re-apply the same deterministic
+        # corrections so a model can't re-introduce the garbled spellings
+        # the transcript pass just fixed.
+        if job_id:
+            _cache_put(f"roster:{job_id}", dict(mapping))
         return mapping
     except Exception as e:
         logger.debug("[%s] roster correction skipped: %s", job_id or "-", e)

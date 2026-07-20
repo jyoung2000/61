@@ -138,7 +138,13 @@ def test_resolver_end_to_end_with_fake_llm():
     assert out == {"Gundarium": "Gundanium"}
     # The prompt carried the series evidence.
     assert "Zechs" in fake.prompts[0]
+    # The mapping is stashed per job so downstream copy generators (clip SEO
+    # titles/descriptions/tags) can re-apply the same corrections.
+    from backend.services.canonical_names import roster_corrections_for_job
+    assert roster_corrections_for_job("test-roster") == {"Gundarium": "Gundanium"}
+    assert roster_corrections_for_job("") == {}
     _CACHE.pop("job:test-roster", None)
+    _CACHE.pop("roster:test-roster", None)
 
 
 # ── CJK source-side sentence dedup ───────────────────────────────────
