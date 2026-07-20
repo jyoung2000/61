@@ -576,7 +576,11 @@ async def resolve_roster_corrections(
             "the JSON array.\n\n"
             f"Candidates:\n{cand_block}"
         )
-        timeout = float(getattr(s, "TRANSLATION_ROSTER_TIMEOUT", 75.0) or 75.0) if s else 75.0
+        # 150s default: the call lands right after translation + condensation
+        # on the SAME busy 12B — the original 75s ceiling timed out on a real
+        # run, cascaded through a dead cloud provider (402), and the names
+        # shipped garbled with a scary provider-fallback warning in the UI.
+        timeout = float(getattr(s, "TRANSLATION_ROSTER_TIMEOUT", 150.0) or 150.0) if s else 150.0
         # Grammar-level schema, not plain json_mode: format=json biases the
         # model toward a bare OBJECT while this prompt needs an ARRAY of
         # pairs — the run-45 pass silently produced zero corrections on
@@ -601,6 +605,16 @@ async def resolve_roster_corrections(
         }
         if model_override:
             kwargs["model_override"] = str(model_override).strip()
+        # When the editorial provider is local Ollama, keep this garnish call
+        # local: a timeout must degrade to "no corrections", not cascade
+        # through cloud fallbacks (observed: a 75s timeout marched into a
+        # 402-dead OpenRouter and surfaced a provider-fallback warning).
+        try:
+            _prov = (orchestrator.get_editorial_model_info() or {}).get("provider")
+            if str(_prov or "").lower() == "ollama":
+                kwargs["local_only"] = True
+        except Exception:
+            pass
         try:
             raw = await asyncio.wait_for(
                 orchestrator.text_completion(prompt, **kwargs), timeout + 15)

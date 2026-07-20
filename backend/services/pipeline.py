@@ -7080,12 +7080,48 @@ async def _run_analysis_inner(job_id: str, resume: bool = False):
                 if bool(getattr(settings, "CLIP_JUDGE_PREFER_LARGE", True)):
                     try:
                         from backend.services import ollama_registry as _oreg_j
-                        if await _oreg_j.remote_primary_vram_gb_resolved() >= 7.0:
+                        _judge_vram = await _oreg_j.remote_primary_vram_gb_resolved()
+                        if _judge_vram >= 7.0:
+                            # The polish resolver returns None when the
+                            # translation override EQUALS the editorial model
+                            # (the run-42 trap) — fall back to sizing the
+                            # active editorial model, then to the configured
+                            # translation model, so an auto-selected 12B is
+                            # still found.
                             _big_judge = _resolve_polish_model_override(orchestrator)
+                            if not _big_judge:
+                                try:
+                                    _ji = orchestrator.get_editorial_model_info() if orchestrator else {}
+                                    if (_ji.get("provider") or "").lower() == "ollama":
+                                        _big_judge = (_ji.get("model") or "").strip()
+                                except Exception:
+                                    _big_judge = None
+                            if not _big_judge:
+                                _big_judge = (getattr(
+                                    settings, "OLLAMA_TRANSLATION_MODEL", "") or "").strip() or None
+                            if _big_judge:
+                                from backend.services.local_models import _parse_params_b
+                                _jp = _parse_params_b(_big_judge)
+                                if _jp is None or _jp < float(getattr(
+                                        settings, "TRANSLATION_LARGE_MODEL_MIN_PARAMS_B", 10.0)):
+                                    logger.info(
+                                        "[%s] Clip judge upgrade skipped: candidate "
+                                        "'%s' is not a large model", job_id, _big_judge)
+                                    _big_judge = None
                             if _big_judge and _big_judge not in _judge_models:
                                 _judge_models = [_big_judge] + _judge_models
-                    except Exception:
-                        pass
+                                logger.info(
+                                    "[%s] Clip judge upgraded to the rig's large "
+                                    "model %s (Companion %.1f GB)",
+                                    job_id, _big_judge, _judge_vram)
+                            elif not _big_judge:
+                                logger.info(
+                                    "[%s] Clip judge upgrade skipped: no large "
+                                    "model resolved (Companion %.1f GB)",
+                                    job_id, _judge_vram)
+                    except Exception as _jg_err:
+                        logger.info("[%s] Clip judge upgrade skipped (%s)",
+                                    job_id, _jg_err)
                 if _editorial_is_local:
                     clipper_config.judge_primary = f"ollama:{_judge_models[0]}"
                     clipper_config.judge_fallback = (

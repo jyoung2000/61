@@ -769,7 +769,7 @@ def drop_repeated_sentences(
     window_s: float = 25.0,
     similarity: float = 0.70,
     min_content_words: int = 4,
-    skip_no_speech_above: float = 0.6,
+    skip_no_speech_above: float = 0.75,
 ) -> tuple[list, int]:
     """Remove sentences that near-repeat a sentence from a nearby earlier cue.
 
@@ -790,11 +790,14 @@ def drop_repeated_sentences(
         if not txt:
             out.append(seg)
             continue
-        # Sung/music cues are exempt in BOTH directions: a song legitimately
-        # repeats its chorus (the OP reprises its opening lines ~50 s later),
-        # so lyrics must neither be dropped as "duplicates" nor kill later
-        # dialogue that happens to share words. Cues without the field are
-        # treated as speech.
+        # CLEARLY-SUNG cues are exempt in BOTH directions: a song
+        # legitimately repeats its chorus (the OP reprises its opening lines
+        # ~50 s later), so lyrics must neither be dropped as "duplicates" nor
+        # kill later dialogue that shares words. The threshold sits HIGH
+        # (0.75): narration spoken over BGM reads ~0.5-0.7 and must stay
+        # deduplicable — run 46's next-episode preview shipped its lines
+        # three times because a lower cutoff exempted it. Cues without the
+        # field are treated as speech.
         _nsp = _seg_get(seg, "no_speech_prob", None)
         if _nsp is not None:
             try:

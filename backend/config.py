@@ -529,7 +529,7 @@ class Settings(BaseSettings):
     # run). Requires the canonical-names mapping (series evidence); one call,
     # deterministic word-boundary applies behind strict vetting.
     TRANSLATION_ROSTER_CORRECTIONS: bool = True
-    TRANSLATION_ROSTER_TIMEOUT: float = 75.0
+    TRANSLATION_ROSTER_TIMEOUT: float = 150.0
     # Keep romanized honorifics (-san/-sama/-kun/-chan) in translated subs.
     # Default False: render them the way professional subs do ("Miss Relena"),
     # matching broadcast/YouTube style.
