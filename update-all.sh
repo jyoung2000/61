@@ -51,11 +51,19 @@ done
 git reset --hard "origin/$BRANCH"     || { log "git reset FAILED"; exit 1; }
 export BUILD_SHA="$(git rev-parse --short HEAD)"
 export BUILD_SUBJECT="$(git log -1 --pretty=%s)"
-EXPECTED="$(grep -m1 '^version' companion/src-tauri/Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+# Monotonic Companion build number: the repo's commit count. The builder
+# stamps it into the version's PATCH slot (0.3.0 → 0.3.<count>), so every
+# deploy's Companion carries a strictly higher version than the last —
+# update prompts and logs stop showing five identical "v0.2.9" installs.
+BUILD_NUM="$(git rev-list --count HEAD 2>/dev/null || echo 0)"
+BASE_V="$(grep -m1 '^version' companion/src-tauri/Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+EXPECTED="${BASE_V%.*}.${BUILD_NUM}"
+[ "$BUILD_NUM" = "0" ] && EXPECTED="$BASE_V"
 log "commit $BUILD_SHA — building container + Companion v$EXPECTED (from source; needs internet)"
 
 ( while :; do sleep 60; log "…still building ($(( ($(date +%s)-START)/60 ))m elapsed)"; done ) & HB=$!
-if ! $DC build $NOCACHE --build-arg COMPANION_BUILD_FROM_SOURCE=1 app; then
+if ! $DC build $NOCACHE --build-arg COMPANION_BUILD_FROM_SOURCE=1 \
+    --build-arg COMPANION_BUILD_NUMBER="$BUILD_NUM" app; then
   kill "$HB" 2>/dev/null || true
   log "BUILD FAILED — error is above (the Companion cross-build needs outbound internet)"
   exit 1

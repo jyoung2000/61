@@ -267,6 +267,45 @@ export default function CompanionDownloadCard({ isMobile = false }) {
     }
   };
 
+  // Remote "Force end all jobs": cancel every active analysis job on this
+  // server AND make the paired Companion(s) drop everything — active-job
+  // display cleared, whisper sidecar killed even mid-decode, all Ollama
+  // models evicted. The remote sibling of the Companion GUI's local
+  // "Force end" button, for when a job wedges the GPU PC.
+  const [forceEnding, setForceEnding] = useState(false);
+  const [forceEndResult, setForceEndResult] = useState(null);
+  const forceEndAll = async () => {
+    if (!window.confirm(
+      'Force end ALL jobs?\n\nEvery running analysis on this server is '
+      + 'cancelled, and the GPU Companion stops all work and frees its VRAM '
+      + '(Whisper stopped, AI models unloaded). This cannot be undone.')) return;
+    setForceEnding(true);
+    setForceEndResult(null);
+    try {
+      const res = await fetch('/api/providers/companion/force-end-jobs', { method: 'POST' });
+      if (!res.ok) {
+        setForceEndResult({ error: `Server error (HTTP ${res.status})` });
+        showToast(`Force end failed (HTTP ${res.status})`, 'error');
+        return;
+      }
+      const data = await res.json();
+      setForceEndResult(data);
+      const nJobs = (data.jobs_cancelled || []).length;
+      const comps = data.companions || [];
+      const okComp = comps.filter((c) => c.ok).length;
+      const unloaded = comps.reduce((s, c) => s + (c.ollama_unloaded || 0), 0);
+      showToast(
+        `Force-ended ${nJobs} job(s)`
+        + (comps.length ? ` · ${okComp}/${comps.length} Companion(s) freed (${unloaded} model(s) unloaded)` : ''),
+        okComp === comps.length ? 'success' : 'error');
+    } catch (e) {
+      setForceEndResult({ error: String(e) });
+      showToast(`Force end failed: ${e}`, 'error');
+    } finally {
+      setForceEnding(false);
+    }
+  };
+
   // Round-trip proof that work actually runs on the paired Companion GPU —
   // not just that its token authenticates.
   const verifyOffload = async () => {
@@ -386,7 +425,40 @@ export default function CompanionDownloadCard({ isMobile = false }) {
           title="Run a real round-trip on the paired Companion — a 1-token generation on each model AND an actual test transcription — to confirm work truly runs on its GPU before you rely on it">
           {verifying ? 'Testing…' : 'Test GPU connection'}
         </button>
+        <button type="button" onClick={forceEndAll} disabled={forceEnding}
+          style={{
+            ...btnStyle('secondary'), opacity: forceEnding ? 0.5 : 1,
+            color: 'var(--danger, #ef4444)',
+            borderColor: 'var(--danger, #ef4444)',
+          }}
+          title="Cancel every running analysis on this server AND make the Companion drop all work: whisper stopped (even mid-transcription), all AI models unloaded, its active-job display cleared">
+          {forceEnding ? 'Ending…' : '⏹ Force end all jobs'}
+        </button>
       </div>
+
+      {forceEndResult && (
+        <div style={{
+          padding: '8px 10px', marginBottom: 8, borderRadius: 8, fontSize: 11,
+          background: forceEndResult.error ? 'var(--amber-dim)' : 'var(--success-dim)',
+          border: `1px solid ${forceEndResult.error ? 'var(--accent-amber)' : 'var(--success)'}`,
+          color: 'var(--text-secondary)',
+        }}>
+          {forceEndResult.error ? (
+            <>Force end failed: {forceEndResult.error}</>
+          ) : (
+            <>
+              Force-ended {(forceEndResult.jobs_cancelled || []).length} job(s).
+              {(forceEndResult.companions || []).map((c) => (
+                <span key={c.host_id} style={{ display: 'block', marginTop: 2 }}>
+                  {c.name}: {c.ok
+                    ? `freed ✓ (whisper ${c.whisper_stopped ? 'stopped' : 'was idle'}, ${c.ollama_unloaded} model(s) unloaded${c.ended_job ? `, ended "${c.ended_job}"` : ''})`
+                    : (c.error || 'unreachable')}
+                </span>
+              ))}
+            </>
+          )}
+        </div>
+      )}
 
       {remote?.update_available && (!push || push.phase === 'failed') && (
         <div style={{

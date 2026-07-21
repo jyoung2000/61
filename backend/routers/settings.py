@@ -1142,6 +1142,79 @@ async def companion_file_roots():
     return {"companions": out}
 
 
+@router.post("/providers/companion/force-end-jobs")
+async def companion_force_end_jobs():
+    """Force-end every active job and free every paired Companion's GPU.
+
+    The remote sibling of the Companion GUI's local "Force end" button,
+    driven by the Settings → GPU Companion card. Container-first ordering so
+    a cancelled pipeline can't immediately reload the models the Companion
+    just evicted:
+
+      1. Every non-terminal analysis job is marked CANCELLED and signalled
+         (same semantics as the per-job cancel endpoint's running path).
+      2. Every paired Companion gets ``POST /v1/jobs/force-end`` — it clears
+         its active-job display, kills the whisper sidecar even mid-decode,
+         and evicts all resident Ollama models.
+
+    Fail-soft per job and per Companion; the response reports exactly what
+    was ended where."""
+    from backend import database as _db
+    from backend.models import JobStatus as _JS
+    from backend.services import ollama_registry as _oreg
+    from backend.services.pipeline import request_cancel as _rc
+
+    _terminal = {_JS.COMPLETE, _JS.FAILED, _JS.CANCELLED}
+    cancelled = []
+    try:
+        jobs = await _db.list_jobs(light=True)
+    except Exception:
+        jobs = []
+    for j in jobs:
+        try:
+            if j.status in _terminal:
+                continue
+            await _db.update_job_status(
+                j.job_id, status=_JS.CANCELLED,
+                progress_message="Force-ended from GPU Companion settings")
+            _rc(j.job_id)
+            cancelled.append(j.job_id)
+        except Exception:
+            continue
+
+    companions = []
+    for h in _oreg.get_hosts():
+        if _oreg.is_local_gpu_host(h.url):
+            continue
+        base = _oreg.companion_base(h)
+        entry = {"host_id": h.id, "name": h.name or base, "ok": False,
+                 "ended_job": None, "whisper_stopped": False,
+                 "ollama_unloaded": 0, "error": ""}
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                r = await client.post(_oreg.join_url(base, "/v1/jobs/force-end"),
+                                      headers=_oreg.auth_headers(h))
+            if r.status_code == 200:
+                d = r.json() or {}
+                entry.update(ok=True, ended_job=d.get("ended_job"),
+                             whisper_stopped=bool(d.get("whisper_stopped")),
+                             ollama_unloaded=int(d.get("ollama_unloaded") or 0))
+            elif r.status_code == 404:
+                entry["error"] = ("this Companion predates remote force-end — "
+                                  "update it from this card first")
+            elif r.status_code in (401, 403):
+                entry["error"] = "auth rejected — check the host token"
+            else:
+                entry["error"] = f"HTTP {r.status_code}"
+        except Exception as e:
+            entry["error"] = f"{type(e).__name__}: {str(e)[:100]}"
+        companions.append(entry)
+    logger.info(
+        "Force-end all jobs: %d job(s) cancelled, %d companion(s) signalled",
+        len(cancelled), len(companions))
+    return {"jobs_cancelled": cancelled, "companions": companions}
+
+
 @router.get("/providers/companion-files/list")
 async def companion_file_list(host_id: str, path: str):
     """Proxy a directory listing from a Companion's shared folder (jailed on the

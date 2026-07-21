@@ -60,6 +60,12 @@ RUN set +e; \
 # built. Installing them lets the NSIS bundling step run to completion.
 FROM rust:1-bookworm AS companion-builder
 ARG COMPANION_BUILD_FROM_SOURCE=0
+# Monotonic build number (update-all.sh passes the repo's git commit count).
+# When >0, the PATCH component of the Companion version becomes this number
+# (0.3.0 → 0.3.<count>), so every from-source build carries a version STRICTLY
+# HIGHER than the previous deploy's — the observed alternative was five
+# self-updates in one day all announcing "v0.2.9". 0 keeps the repo version.
+ARG COMPANION_BUILD_NUMBER=0
 WORKDIR /build
 COPY companion/ ./companion/
 ENV XWIN_ACCEPT_LICENSE=1 XWIN_CACHE_DIR=/xwin-cache
@@ -89,6 +95,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     rustup target add x86_64-pc-windows-msvc; \
     command -v cargo-xwin >/dev/null 2>&1 || CARGO_INSTALL_ROOT=/opt/xwin-tools cargo install cargo-xwin --locked; \
     cd companion; \
+    python3 scripts/set_build_version.py "${COMPANION_BUILD_NUMBER:-0}"; \
     BUNDLE_DIR=src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis; \
     rm -f "$BUNDLE_DIR"/*-setup.exe 2>/dev/null || true; \
     npm install --no-audit --no-fund --prefer-offline \

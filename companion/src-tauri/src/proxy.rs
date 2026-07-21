@@ -719,6 +719,40 @@ async fn gpu_release(State(ctx): State<ProxyCtx>, req: Request<Body>) -> Respons
     .into_response()
 }
 
+/// /v1/jobs/force-end → remotely end EVERYTHING the Companion is doing for
+/// ClipAI: clear + suppress the active-job display, kill the whisper sidecar
+/// EVEN MID-DECODE (that decode belongs to the job being ended), shut the
+/// vision sidecar down and evict every resident Ollama model.
+///
+/// The remote sibling of the GUI "Force end" button (``end_active_job`` in
+/// lib.rs), driven by ClipAI's Settings → GPU Companion card. Unlike
+/// /v1/gpu/release this deliberately does NOT refuse while work is in
+/// flight — the container cancels its jobs before calling, so any in-flight
+/// request that errors back lands in an already-cancelled pipeline.
+async fn jobs_force_end(State(ctx): State<ProxyCtx>, req: Request<Body>) -> Response {
+    if !authorized(&ctx, req.headers()) {
+        return unauthorized();
+    }
+    let ended = ctx.state.force_end_job();
+    ctx.state.job_progress.store(0, Ordering::Relaxed);
+    // Whisper first, unconditionally: free_gpu skips it while a decode holds
+    // the slot, but a force-end exists precisely to stop that decode.
+    let whisper_was_running = ctx.state.sidecar.lock().await.is_some();
+    crate::sidecar::shutdown(&ctx.state, "ClipAI /v1/jobs/force-end").await;
+    let (_stopped, unloaded) =
+        crate::sidecar::free_gpu(&ctx.state, "ClipAI /v1/jobs/force-end").await;
+    log::info!(
+        "jobs_force_end: ended {} on ClipAI's request — whisper_stopped={whisper_was_running}, ollama_unloaded={unloaded}",
+        ended.as_deref().unwrap_or("(no active job)")
+    );
+    Json(serde_json::json!({
+        "ended_job": ended,
+        "whisper_stopped": whisper_was_running,
+        "ollama_unloaded": unloaded,
+    }))
+    .into_response()
+}
+
 /// /v1/progress → a lightweight job-progress heartbeat from ClipAI (same
 /// X-ClipAI-* headers the AI routes carry). During local-only pipeline stages
 /// (video decode/frame extraction on the SERVER GPU) no AI request reaches us,
@@ -1206,6 +1240,7 @@ fn build_router(ctx: ProxyCtx) -> Router {
         .route("/v1/update/install", post(update_install))
         .route("/v1/update/status", get(update_status))
         .route("/v1/gpu/release", post(gpu_release))
+        .route("/v1/jobs/force-end", post(jobs_force_end))
         .route("/v1/audio/transcriptions", post(whisper_proxy))
         .route("/ollama", any(ollama_proxy))
         .route("/ollama/", any(ollama_proxy))
