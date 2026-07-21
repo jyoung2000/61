@@ -213,8 +213,12 @@ class Settings(BaseSettings):
     # Lead-in/out seconds around each hole (Whisper needs context; the pad is
     # clipped back out of the recovered cues so existing ones never double).
     VOCAL_GAP_PAD_S: float = 2.0
-    # Bounds so a sparse transcript can't schedule half the episode.
-    VOCAL_GAP_MAX_SPANS: int = 8
+    # Bounds so a sparse transcript can't schedule half the episode. The
+    # first live run found 8 gaps totalling 165s — the span cap bit before
+    # the seconds budget did and squeezed out the smaller holes (exactly the
+    # press-conference-sized ones this exists for), so spans lead generously
+    # and the seconds budget stays the real limiter.
+    VOCAL_GAP_MAX_SPANS: int = 14
     VOCAL_GAP_MAX_TOTAL_S: float = 240.0
     # Demucs device for the short recovery slices. CPU by default: recovery
     # may overlap SEO's GPU work and the slices are small.

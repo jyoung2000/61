@@ -239,7 +239,11 @@ async def recover_gap_dialogue(
                       for a, b in gaps))
 
         os.makedirs(work_dir, exist_ok=True)
-        recovered: list[dict] = []
+        # Phase 1: slice + separate EVERY span first, phase 2: transcribe the
+        # stems back-to-back. Interleaved, each ASR call paid a cold whisper
+        # sidecar start — CPU Demucs takes ~a minute per span, so the
+        # Companion's 45s idle reaper stopped the sidecar between every one.
+        stems: list[tuple[tuple[float, float], str]] = []
         for i, gap in enumerate(gaps):
             raw = os.path.join(work_dir, f"gap{i}.wav")
             if not await asyncio.to_thread(_slice_wav, audio_path, raw, gap[0], gap[1]):
@@ -254,8 +258,11 @@ async def recover_gap_dialogue(
                 segment=int(getattr(settings, "VOCAL_SEPARATION_SEGMENT", 7)),
                 timeout=int(getattr(settings, "VOCAL_GAP_SPAN_TIMEOUT_S", 300)),
             )
-            if not vocals:
-                continue
+            if vocals:
+                stems.append((gap, vocals))
+
+        recovered: list[dict] = []
+        for gap, vocals in stems:
             segs = await asyncio.to_thread(_transcribe_stem, vocals, source_lang)
             for s in segs:
                 s["start"] = float(s.get("start", 0.0)) + gap[0]
