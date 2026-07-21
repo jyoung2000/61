@@ -309,7 +309,7 @@ export function mapSubtitleSettings(cs) {
     max_width: cs.subtitleMaxWidth ?? 90,
     offset_v: cs.subtitleOffsetV ?? 4,
     max_words: cs.subtitleMaxWords ?? 0,
-    active_word_enabled: cs.activeWordEnabled ?? false,
+    active_word_enabled: cs.activeWordEnabled ?? true,
     active_word_color: cs.activeWordColor || '#FFD700',
     active_word_outline_color: cs.activeWordOutlineColor || '#000000',
     active_word_bg_color: cs.activeWordBgColor || '#000000',

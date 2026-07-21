@@ -1345,7 +1345,10 @@ export function processKeyframes(scenes, clipStart, clipEnd, srcRatio = null, ta
       return [{ t: 0, x: staticX }];
     }
   }
-  return result;
+  // Human-camera shaping (same policy as the dense-track path) so the
+  // sparse pipeline's output also pans deliberately and cuts on big
+  // repositions instead of sweeping.
+  return humanizeKeyframes(result);
 }
 
 /**
@@ -1564,7 +1567,100 @@ export function buildKeyframesFromSubjectTrack(track, clipStart, clipEnd, srcRat
     out.push({ t: clipDur, x: out[out.length - 1].x, source: 'hold_fwd' });
   }
 
-  return out;
+  // Human-camera shaping: cuts for big repositions, deliberate settling
+  // pans for small ones, no bounce-chasing or stutter (shared policy —
+  // this same shaped track is shipped to the export).
+  return humanizeKeyframes(out);
+}
+
+/**
+ * Human-camera shaping of a keyframe track — the single policy shared by
+ * the preview interpolator AND the export renderer (the track itself is
+ * shipped to the backend, so shaping here fixes both sides identically).
+ *
+ * A human operator never sweeps 40% of the frame or chases every wobble:
+ *   1. Micro-moves under DEAD_BAND are absorbed into the hold (with
+ *      hysteresis — a slow drift still moves once it accumulates).
+ *   2. A→B→A bounces inside BOUNCE_WIN are held through (no chasing a
+ *      two-beat interjection).
+ *   3. Successive moves closer than MIN_MOVE_GAP coalesce — the camera
+ *      goes directly to the final framing instead of stuttering through
+ *      intermediates.
+ *   4. Jumps ≥ CUT_THRESHOLD become hard CUTS (snap) — an editor cuts to
+ *      a new framing, never whip-pans across the scene.
+ *   5. Remaining pans get a hold keyframe so the move lasts a deliberate,
+ *      distance-scaled 0.4-0.9s and SETTLES exactly on the trigger — no
+ *      more sweeping across a whole 10s gap.
+ *
+ * Idempotent: running it on its own output changes nothing.
+ */
+export function humanizeKeyframes(kfs) {
+  if (!Array.isArray(kfs) || kfs.length < 2) return kfs;
+  const DEAD_BAND = 4;      // sx units — below this, hold
+  const CUT_THRESHOLD = 22; // sx units — at/above this, cut
+  const MIN_MOVE_GAP = 0.9; // s — moves closer than this coalesce
+  const BOUNCE_WIN = 1.6;   // s — A→B→A inside this is suppressed
+  const isPairGap = (a, b) => (b.t - a.t) < 0.005;
+
+  let out = kfs.map((k) => ({ ...k })).sort((a, b) => a.t - b.t);
+
+  // 1. Dead-band with hysteresis (never drop snap keyframes or hold points).
+  const banded = [out[0]];
+  for (let i = 1; i < out.length; i++) {
+    const prev = banded[banded.length - 1];
+    const cur = out[i];
+    if (!cur.snap && !isPairGap(prev, cur)
+        && Math.abs(cur.x - prev.x) < DEAD_BAND && i < out.length - 1) {
+      continue;
+    }
+    banded.push(cur);
+  }
+
+  // 2. Bounce suppression.
+  let i = 1;
+  while (i < banded.length - 1) {
+    const a = banded[i - 1]; const b = banded[i]; const c = banded[i + 1];
+    if (!isPairGap(a, b) && !isPairGap(b, c) && !b.snap
+        && Math.abs(c.x - a.x) <= DEAD_BAND
+        && Math.abs(b.x - a.x) > DEAD_BAND
+        && (c.t - b.t) < BOUNCE_WIN) {
+      banded.splice(i, 1);
+    } else i++;
+  }
+
+  // 3. Coalesce rapid successive moves — go straight to the destination.
+  i = 1;
+  while (i < banded.length - 1) {
+    const a = banded[i - 1]; const b = banded[i]; const c = banded[i + 1];
+    if (!isPairGap(a, b) && !isPairGap(b, c) && !b.snap && !c.snap
+        && (c.t - b.t) < MIN_MOVE_GAP
+        && Math.abs(b.x - a.x) >= DEAD_BAND
+        && Math.abs(c.x - b.x) >= DEAD_BAND) {
+      banded.splice(i, 1);
+    } else i++;
+  }
+
+  // 4+5. Classify: big jump → cut; small move → hold-then-settle pan.
+  const shaped = [banded[0]];
+  for (let k = 1; k < banded.length; k++) {
+    const prev = shaped[shaped.length - 1];
+    const cur = banded[k];
+    const dx = Math.abs(cur.x - prev.x);
+    const span = cur.t - prev.t;
+    if (cur.snap || dx >= CUT_THRESHOLD) {
+      cur.snap = true;
+      shaped.push(cur);
+      continue;
+    }
+    if (dx >= DEAD_BAND) {
+      const panDur = Math.min(0.9, Math.max(0.4, 0.35 + dx * 0.012));
+      if (span > panDur + 0.05) {
+        shaped.push({ t: +(cur.t - panDur).toFixed(3), x: prev.x, source: 'hold' });
+      }
+    }
+    shaped.push(cur);
+  }
+  return shaped;
 }
 
 // Keep old smoothKeyframes export for backward compatibility (unused but safe)

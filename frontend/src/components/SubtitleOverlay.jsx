@@ -2,6 +2,7 @@ import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react'
 import { outlineTextShadow } from '../utils/textOutline';
 import { spokenWindow, isSpokenAt } from '../utils/subtitleTiming';
 import { DEFAULT_SPEAKER_PALETTE, computeSpeakerRates, getCurrentWordIndex } from '../utils/activeWordTiming';
+import { resolveActiveWordColor } from '../utils/subtitleColors';
 import useTimelineStore from '../stores/timelineStore';
 import { snapToGuides } from '../utils/goldenGrid';
 
@@ -738,8 +739,11 @@ export default function SubtitleOverlay({
     ? `${currentSubtitle.speaker}: ${resolvedSubtitleText}`
     : resolvedSubtitleText;
 
-  // Active word highlighting
-  const awColor = settings.activeWordColor || '#FFD700';
+  // Active word highlighting — swap the highlight when it would merge into
+  // this speaker's caption color (gold-on-amber made the active word
+  // invisible). Mirrored in the export's ASS generator.
+  const awColor = resolveActiveWordColor(
+    settings.activeWordColor || '#FFD700', color);
   const awOutlineColor = settings.activeWordOutlineColor || '#000000';
   const awBgColor = settings.activeWordBgColor || '#000000';
   const awBgOpacity = settings.activeWordBgOpacity ?? 0;

@@ -26,7 +26,11 @@ export const DEFAULT_CLIP_SETTINGS = {
   subtitleMaxWidth: 90,
   subtitleOffsetV: 4,
   subtitleMaxWords: 0,
-  activeWordEnabled: false,
+  // Karaoke-style active-word highlighting is ON by default — it's the
+  // social-native caption look. The highlight color is auto-swapped per
+  // speaker when it would clash with that speaker's caption color (see
+  // resolveActiveWordColor in utils/subtitleColors.js).
+  activeWordEnabled: true,
   activeWordColor: '#FFD700',
   activeWordOutlineColor: '#000000',
   activeWordBgColor: '#000000',

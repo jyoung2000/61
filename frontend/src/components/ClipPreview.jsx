@@ -4,6 +4,7 @@ import { BASE_OVERHEAD_S, ANTICIPATION_S, AUDIO_BUFFER_S, PUNCT_PAUSE, FAST_WORD
 import ReframeDebugOverlay from './ReframeDebugOverlay';
 import useTimelineStore from '../stores/timelineStore';
 import { outlineTextShadow } from '../utils/textOutline';
+import { resolveActiveWordColor } from '../utils/subtitleColors';
 import useResponsive from '../hooks/useResponsive';
 import { SPEED_OPTIONS as SHARED_SPEED_OPTIONS } from '../utils/defaultSettings';
 
@@ -1043,9 +1044,11 @@ export default function ClipPreview({
       ? `${currentSubtitle.speaker}: ${currentSubtitle.text}`
       : currentSubtitle.text;
 
-    // Active word highlight settings
+    // Active word highlight settings — swap the highlight when it would
+    // merge into this speaker's caption color (mirrored in ass_generator).
     const awEnabled = activeWordEnabled;
-    const awColor = subtitleSettings?.activeWordColor || '#FFD700';
+    const awColor = resolveActiveWordColor(
+      subtitleSettings?.activeWordColor || '#FFD700', color);
     const awOutlineColor = subtitleSettings?.activeWordOutlineColor || '#000000';
     const awBgColor = subtitleSettings?.activeWordBgColor || '#000000';
     const awBgOpacity = subtitleSettings?.activeWordBgOpacity ?? 0;

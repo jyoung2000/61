@@ -1056,7 +1056,8 @@ export default function ClipSEO() {
     // where the preview held still).
     if (aspectRatio && subjectKeyframes?.length > 0) {
       body.subject_keyframes = subjectKeyframes.map(
-        (kf) => ({ time: +(+kf.t).toFixed(3), x: kf.x }));
+        (kf) => ({ time: +(+kf.t).toFixed(3), x: kf.x,
+                   ...(kf.snap ? { snap: true } : {}) }));
     }
     encoding.startExport(jobId, parseInt(clipId), clip?.title || `Clip ${clipId}`, body);
     showToast(`Exporting "${clip?.title || `Clip ${clipId}`}"...`, 'info');

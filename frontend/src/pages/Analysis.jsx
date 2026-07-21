@@ -218,16 +218,21 @@ function buildExportSubjectKeyframes(editorSubjectKeyframes, cropSegments) {
   );
   const hasTrack = editorSubjectKeyframes?.length > 0;
 
+  const _mapKf = (kf) => ({
+    time: +kf.t.toFixed(3), x: kf.x,
+    ...(kf.snap ? { snap: true } : {}),
+  });
   if (hasTrack && overrides.length === 0) {
-    // Pure auto-reframe: ship the smooth, correctly-timed track.
-    return editorSubjectKeyframes.map((kf) => ({ time: +kf.t.toFixed(3), x: kf.x }));
+    // Pure auto-reframe: ship the smooth, correctly-timed track (snap flags
+    // included so the export cuts where the preview cuts).
+    return editorSubjectKeyframes.map(_mapKf);
   }
   if (hasTrack) {
     // Merge: smooth track everywhere except inside pinned windows, which
     // are flat-held at the user's value.
     const kfs = editorSubjectKeyframes
       .filter((kf) => !overrides.some((o) => kf.t >= o.startTime && kf.t < o.endTime))
-      .map((kf) => ({ time: +kf.t.toFixed(3), x: kf.x }));
+      .map(_mapKf);
     for (const o of overrides) {
       kfs.push({ time: +o.startTime.toFixed(3), x: o.cropX });
       kfs.push({ time: +Math.max(o.startTime, o.endTime - 0.001).toFixed(3), x: o.cropX });

@@ -9,6 +9,7 @@ ASS is used instead of SRT for FFmpeg subtitle burning because it supports:
 """
 
 import logging
+import re
 import subprocess
 
 from backend.models import TranscriptSegment
@@ -185,6 +186,58 @@ DEFAULT_SPEAKER_PALETTE = [
     "#FB7185", "#38BDF8", "#FBBF24", "#34D399", "#C084FC", "#F472B6",
     "#22D3EE", "#A3E635", "#FB923C", "#2DD4BF", "#818CF8", "#F87171",
 ]
+
+
+_AW_FALLBACK_COLORS = ["#FFD700", "#3DFF8C", "#FF5CF0", "#00E5FF", "#FFFFFF"]
+
+
+def _hex_to_hsl(hex_color: str):
+    """(h°, s, l) for #RRGGBB, or None. Mirrors utils/subtitleColors.js."""
+    m = re.fullmatch(r"#?([0-9a-fA-F]{6})", (hex_color or "").strip())
+    if not m:
+        return None
+    n = int(m.group(1), 16)
+    r, g, b = ((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255
+    mx, mn = max(r, g, b), min(r, g, b)
+    l = (mx + mn) / 2
+    d = mx - mn
+    if d == 0:
+        return (0.0, 0.0, l)
+    s = d / (1 - abs(2 * l - 1))
+    if mx == r:
+        h = 60 * (((g - b) / d) % 6)
+    elif mx == g:
+        h = 60 * ((b - r) / d + 2)
+    else:
+        h = 60 * ((r - g) / d + 4)
+    return (h % 360, s, l)
+
+
+def _colors_clash(a: str, b: str) -> bool:
+    ha, hb = _hex_to_hsl(a), _hex_to_hsl(b)
+    if not ha or not hb:
+        return False
+    hue_diff = min(abs(ha[0] - hb[0]), 360 - abs(ha[0] - hb[0]))
+    if ha[1] > 0.35 and hb[1] > 0.35 and hue_diff < 40:
+        return True
+    if ha[1] <= 0.2 and hb[1] <= 0.2 and abs(ha[2] - hb[2]) < 0.25:
+        return True
+    return False
+
+
+def _resolve_aw_color(preferred: str, speaker_color: str) -> str:
+    """The active-word highlight to use against ``speaker_color`` — the
+    preferred color unless it would visually merge into the speaker's
+    caption color (gold-on-amber made the highlight invisible), else the
+    first non-clashing fallback. MIRRORS utils/subtitleColors.js so the
+    preview and the burned-in export pick the identical color."""
+    pref = preferred or _AW_FALLBACK_COLORS[0]
+    if not speaker_color or not _colors_clash(pref, speaker_color):
+        return pref
+    for c in _AW_FALLBACK_COLORS:
+        if c.lower() != pref.lower() and not _colors_clash(c, speaker_color):
+            return c
+    return "#FFFFFF"
 
 
 def _hex_to_ass_color(hex_color: str) -> str:
@@ -826,6 +879,15 @@ def generate_ass(
     aw_bg_alpha = None
     if active_word_enabled:
         aw_color = _hex_to_ass_color(active_word_color)
+        # Per-speaker clash-free highlight: when the configured highlight
+        # would merge into a speaker's caption color (gold-on-amber), that
+        # speaker's cues use the first non-clashing fallback instead —
+        # identical logic to the preview (utils/subtitleColors.js).
+        aw_color_by_speaker = {
+            sp: _hex_to_ass_color(
+                _resolve_aw_color(active_word_color, speaker_color_map[sp]))
+            for sp in speakers_seen
+        }
         # Honor the user's per-spoken-word outline color when set —
         # falls back to the line outline color so existing exports
         # without an explicit override stay unchanged.
@@ -939,7 +1001,7 @@ def generate_ass(
                     # Background mode: Layer 0 = box, Layer 1 = colored text
                     base_text_events.append((clip_start, clip_end, style_name, f"{prefix}{safe_text}"))
                     nobord_prefix = "{" + aw_nobord_tag + "}" if aw_nobord_tag else ""
-                    aw_tags = f"\\c{aw_color}"
+                    aw_tags = f"\\c{aw_color_by_speaker.get(speaker, aw_color)}"
                     if aw_bg_color:
                         aw_tags += f"\\3c{aw_bg_color}\\3a{aw_bg_alpha}"
                     event_text = f"{nobord_prefix}{prefix}{{{aw_tags}}}{safe_text}"
@@ -951,7 +1013,7 @@ def generate_ass(
                     base_text_events.append((clip_start, clip_end, style_name, border_event_text))
                     # Layer 1: color layer with \bord0 (no duplicate borders)
                     nobord_prefix = "{" + aw_nobord_tag + "}" if aw_nobord_tag else ""
-                    aw_tags = f"\\c{aw_color}"
+                    aw_tags = f"\\c{aw_color_by_speaker.get(speaker, aw_color)}"
                     if aw_bg_color:
                         aw_tags += f"\\3c{aw_bg_color}\\3a{aw_bg_alpha}"
                     event_text = f"{nobord_prefix}{prefix}{{{aw_tags}}}{safe_text}"
@@ -1036,7 +1098,7 @@ def generate_ass(
                     # color + alpha for just this run so the active
                     # word renders with its own border on top of the
                     # uniform Layer-0 stroke.
-                    aw_extra = f"\\c{aw_color}"
+                    aw_extra = f"\\c{aw_color_by_speaker.get(speaker, aw_color)}"
                     if aw_bg_color:
                         aw_extra += f"\\3c{aw_bg_color}\\3a{aw_bg_alpha}"
                     elif aw_outline and aw_outline != style_outline_color:
@@ -1169,7 +1231,7 @@ def generate_ass(
                     # color + alpha for just this run so the active
                     # word renders with its own border on top of the
                     # uniform Layer-0 stroke.
-                    aw_extra = f"\\c{aw_color}"
+                    aw_extra = f"\\c{aw_color_by_speaker.get(speaker, aw_color)}"
                     if aw_bg_color:
                         aw_extra += f"\\3c{aw_bg_color}\\3a{aw_bg_alpha}"
                     elif aw_outline and aw_outline != style_outline_color:

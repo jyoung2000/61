@@ -101,23 +101,33 @@ def test_sparse_step_mode_still_steps():
 
 def test_snap_transitions_hold_then_settle_at_trigger():
     # A 10-unit move over 4s used to smoothstep-pan the whole gap (sway).
-    # Now: hold → one deliberate move that SETTLES exactly at the trigger.
+    # Now: hold → one deliberate pan that SETTLES exactly at the trigger.
     kfs = [(0.0, 40), (4.0, 50)]
     out = _insert_snap_transitions(kfs, jump_threshold=1)
     assert len(out) == 3
     hold_end, settle = out[1], out[2]
     assert hold_end[1] == 40 and settle == (4.0, 50)
     move = settle[0] - hold_end[0]
-    assert 0.15 <= move <= 0.45                  # distance-proportional
+    assert 0.4 <= move <= 0.9                    # deliberate, human-paced
 
 
 def test_snap_transitions_duration_scales_with_distance():
-    small = _insert_snap_transitions([(0.0, 48), (4.0, 52)], jump_threshold=1)
-    large = _insert_snap_transitions([(0.0, 20), (4.0, 80)], jump_threshold=1)
+    small = _insert_snap_transitions([(0.0, 47), (4.0, 53)], jump_threshold=1)
+    large = _insert_snap_transitions([(0.0, 41), (4.0, 59)], jump_threshold=1)
     small_move = small[-1][0] - small[1][0]
     large_move = large[-1][0] - large[1][0]
-    assert large_move > small_move               # big reposition = slower move
-    assert large_move <= 0.45 + 1e-9             # but always bounded
+    assert large_move > small_move               # bigger pan = slower move
+    assert large_move <= 0.9 + 1e-9              # but always bounded
+
+
+def test_big_jumps_become_editorial_cuts_not_sweeps():
+    # The user-reported case: 34 → 72 (38 units). A human editor CUTS to the
+    # new framing — a whip-pan across 38% of the frame loses the viewer.
+    out = _insert_snap_transitions([(0.0, 34), (6.0, 72)], jump_threshold=1)
+    assert len(out) == 3
+    hold_end, cut = out[1], out[2]
+    assert hold_end[1] == 34 and cut == (6.0, 72)
+    assert (cut[0] - hold_end[0]) <= 0.002       # instant cut, no sweep
 
 
 def test_snap_transitions_preserve_scene_cut_pairs():

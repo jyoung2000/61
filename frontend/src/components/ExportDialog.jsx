@@ -334,7 +334,8 @@ export default function ExportDialog({
       // preview held still).
       if (exportPayload.aspect_ratio && subjectKeyframes?.length > 0) {
         exportPayload.subject_keyframes = subjectKeyframes.map(
-          (kf) => ({ time: +(+kf.t).toFixed(3), x: kf.x }));
+          (kf) => ({ time: +(+kf.t).toFixed(3), x: kf.x,
+                     ...(kf.snap ? { snap: true } : {}) }));
       }
 
       // Diagnostic logging: full export payload for debugging overlay/settings issues

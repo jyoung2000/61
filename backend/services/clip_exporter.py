@@ -2518,25 +2518,25 @@ def _insert_snap_transitions(
     keyframes: list[tuple[float, int]],
     jump_threshold: int = 15,
     snap_duration: float = 0.15,
-    max_snap_duration: float = 0.45,
+    max_snap_duration: float = 0.9,
+    cut_threshold: int = 22,
 ) -> list[tuple[float, int]]:
-    """Convert long interpolations into hold-then-ease, the way a human
-    operator moves: hold the old framing, then make ONE deliberate move that
-    SETTLES exactly when the new keyframe takes effect (the camera lands as
-    the new line/subject starts, instead of drifting or teleporting mid-gap).
+    """Shape transitions the way a human operator moves the camera:
 
-    The move's duration scales with DISTANCE — a small correction is a quick
-    ~0.2s nudge, a full reposition takes ~0.4s — because a fixed 150ms for
-    every move (the old behavior) is precisely what read as robotic: tiny
-    hops and huge reframes all snapping at the same speed.
+    * A jump ≥ ``cut_threshold`` becomes a hard CUT (1ms pair) — an editor
+      cuts to a new framing; whip-panning 40% of the frame ("34→72 sweeps")
+      loses the viewer.
+    * A smaller move becomes hold-then-ease: hold the old framing, then ONE
+      deliberate, distance-scaled pan (0.4-0.9s) that SETTLES exactly when
+      the new keyframe takes effect.
 
-    Two keyframes at t=0,sx=30 and t=10,sx=70 (jump 40) become:
-        t=0.000, sx=30  (hold)
-        t=9.550, sx=30  (hold ends — move begins)
-        t=10.00, sx=70  (move settles exactly on the trigger)
+    Two keyframes at t=0,sx=44 and t=10,sx=56 (jump 12) become:
+        t=0.000, sx=44  (hold)
+        t=9.500, sx=44  (hold ends — pan begins)
+        t=10.00, sx=56  (pan settles exactly on the trigger)
 
     Scene-cut pairs (1ms apart from _handle_scene_cuts) are preserved as
-    hard cuts — a human editor cuts across a shot boundary, never pans.
+    hard cuts.
     """
     if len(keyframes) <= 1:
         return keyframes
@@ -2547,10 +2547,14 @@ def _insert_snap_transitions(
         t1, sx1 = keyframes[i]
         dt = t1 - t0
         jump = abs(sx1 - sx0)
-        dur = min(max_snap_duration, snap_duration + jump * 0.008)
 
-        if jump >= jump_threshold and dt > dur * 2:
-            result.append((t1 - dur, sx0))   # hold ends; ease covers [t1-dur, t1]
+        if jump >= cut_threshold and dt > 0.005:
+            # Editorial cut: reposition instantly at the trigger.
+            result.append((round(t1 - 0.001, 3), sx0))
+        else:
+            dur = min(max_snap_duration, max(0.4, 0.35 + jump * 0.012))
+            if jump >= jump_threshold and dt > dur * 1.5:
+                result.append((t1 - dur, sx0))  # hold ends; pan covers [t1-dur, t1]
         result.append(keyframes[i])
 
     return result
@@ -4543,6 +4547,7 @@ def _build_filter_chain(
     face_y_center: float = 50.0,
     face_width_pct: float = 0.0,
     use_step_interpolation: bool = False,
+    transitions_prebaked: bool = False,
     zoom_keyframes: list[tuple[float, float]] | None = None,
     speed: float = 1.0,
 ) -> tuple[str | None, bool, str]:
@@ -4712,19 +4717,19 @@ def _build_filter_chain(
                 unique_sx = set(kf[1] for kf in subject_keyframes)
                 if len(unique_sx) > 1:
                     # Dynamic crop: time-varying x offset
-                    if use_step_interpolation:
-                        # Step mode (frontend keyframes): instant snap, no transitions
+                    if use_step_interpolation or transitions_prebaked:
+                        # Step mode (legacy frontend keyframes): instant snaps.
+                        # Prebaked mode (humanized frontend track): holds, cut
+                        # pairs and settling pans are already IN the track —
+                        # render it eased, exactly as the preview interpolates.
                         _final_kf = subject_keyframes
                     else:
                         # Backend keyframes, humanized: (1) suppress A→B→A
                         # bounces (an operator doesn't chase a two-beat
-                        # interjection — the "jittery" tell), then (2) convert
-                        # EVERY remaining change into hold-then-ease
-                        # (threshold=1: smaller alternating moves used to pan
-                        # across whole gaps, the "swaying" tell), with the
-                        # move duration scaling by distance and an ease-out
-                        # curve — one deliberate move that settles as the new
-                        # subject starts, not a fixed robotic 150ms snap.
+                        # interjection — the "jittery" tell), then (2) shape
+                        # every remaining change: big jump = CUT, small move =
+                        # deliberate distance-scaled settling pan (a human
+                        # never whip-pans across the scene).
                         _kf_calm = (_suppress_ping_pong(subject_keyframes)
                                     if len(subject_keyframes) <= 40
                                     else subject_keyframes)
@@ -6831,13 +6836,32 @@ async def export_clip(
 
             # ── Frontend keyframe override: use preview player's exact keyframes ──
             _using_frontend_keyframes = False
+            _frontend_prebaked = False
             if frontend_subject_keyframes and aspect_ratio and not all_tracking_off:
                 _using_frontend_keyframes = True
-                keyframes = [
-                    (round(kf.get("time", 0), 3), int(round(kf.get("x", 50))))
-                    for kf in frontend_subject_keyframes
-                ]
-                keyframes.sort()
+                # A humanized track (see subjectTracking.humanizeKeyframes)
+                # carries ``snap`` flags: hard CUTS for big repositions, with
+                # hold points already inserted so pans settle deliberately.
+                # Expand each snap into a 1ms pair (hold → cut) and render the
+                # track EASED — the exact camera the preview shows. Legacy
+                # payloads (no snap fields anywhere) keep the old step render.
+                _frontend_prebaked = any(kf.get("snap") for kf in frontend_subject_keyframes)
+                if _frontend_prebaked:
+                    _sorted_kfs = sorted(frontend_subject_keyframes,
+                                         key=lambda k: k.get("time", 0))
+                    keyframes = []
+                    for kf in _sorted_kfs:
+                        _t = round(float(kf.get("time", 0)), 3)
+                        _x = int(round(kf.get("x", 50)))
+                        if kf.get("snap") and keyframes and _t - keyframes[-1][0] > 0.002:
+                            keyframes.append((round(_t - 0.001, 3), keyframes[-1][1]))
+                        keyframes.append((_t, _x))
+                else:
+                    keyframes = [
+                        (round(kf.get("time", 0), 3), int(round(kf.get("x", 50))))
+                        for kf in frontend_subject_keyframes
+                    ]
+                    keyframes.sort()
 
                 # Compute face Y from scene data for vertical positioning
                 # (matters for 1:1, 4:5 crops where vertical offset is needed)
@@ -7463,7 +7487,9 @@ async def export_clip(
                     clip_duration=end - start,
                     face_y_center=_avg_face_y,
                     face_width_pct=_avg_face_w,
-                    use_step_interpolation=_using_frontend_keyframes,
+                    use_step_interpolation=(_using_frontend_keyframes
+                                            and not _frontend_prebaked),
+                    transitions_prebaked=_frontend_prebaked,
                     zoom_keyframes=zoom_keyframes,
                     # Per-segment speed retimes each segment separately, so the
                     # single global scaling doesn't apply there (fades stay in
