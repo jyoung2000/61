@@ -789,9 +789,19 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
     else if (pps < 60) interval = 2;
     else if (pps > 120) interval = 0.5;
 
+    // Authoritative content extent = the clip/video duration. The timeline
+    // represents EXACTLY this span, so the ruler ends here and every lane /
+    // item is cut off cleanly at this boundary. Previously the extent padded
+    // out by maxItemEnd*1.05, so a stale or mis-scoped item end (e.g. a
+    // recovered full-video item on a 60s clip) drew colored bars far past the
+    // last number marker. ``duration`` is the clip length when scoped to a
+    // clip; fall back to the furthest item only when duration isn't known yet.
     const maxItemEnd = items.length > 0 ? Math.max(...items.map(it => it.end || 0)) : 0;
-    const maxTime = Math.max(duration || 0, maxItemEnd, 30) * 1.05;
-    for (let t = 0; t <= maxTime; t += interval) {
+    const contentExtentSec = (duration && duration > 0.1)
+      ? duration
+      : Math.max(maxItemEnd, 30);
+    const extentPx = contentLeft + contentExtentSec * pps - sx;
+    for (let t = 0; t <= contentExtentSec + 1e-6; t += interval) {
       const x = contentLeft + t * pps - sx;
       if (x < contentLeft - 10 || x > canvasW + 10) continue;
       ctx.fillText(formatTime(t), x, 18);
@@ -811,6 +821,11 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
       ctx.stroke();
     }
 
+    // Content-area width bounded by the clip extent, so lanes are cut off
+    // cleanly at the clip's end marker (never a full-width lane running past
+    // the last number marker).
+    const laneContentW = Math.max(0, Math.min(contentWidth, extentPx - contentLeft));
+
     // ── Track lanes (ALL tracks always visible in timeline) ──
     tracks.forEach((track, idx) => {
       const laneHsD = laneHsRef.current;
@@ -825,7 +840,7 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
       ctx.fillStyle = isDark
         ? (laneAlt ? 'rgba(255,255,255,0.035)' : 'rgba(255,255,255,0.02)')
         : (laneAlt ? 'rgba(0,0,0,0.03)' : 'rgba(0,0,0,0.015)');
-      ctx.fillRect(contentLeft, y, contentWidth, laneH);
+      ctx.fillRect(contentLeft, y, laneContentW, laneH);
 
       // Track label background — solid darker strip so headers read as
       // "side rail" instead of part of the timeline grid.
@@ -837,18 +852,18 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
       // the rect (would force a save/restore per track).
       ctx.strokeStyle = isDark ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.07)';
       ctx.lineWidth = 1;
-      ctx.strokeRect(contentLeft + 0.5, y + 0.5, contentWidth - 1, laneH - 1);
+      ctx.strokeRect(contentLeft + 0.5, y + 0.5, Math.max(0, laneContentW - 1), laneH - 1);
 
       // Muted overlay
       if (track.muted) {
         ctx.fillStyle = isDark ? 'rgba(255,59,48,0.07)' : 'rgba(255,59,48,0.05)';
-        ctx.fillRect(contentLeft, y, contentWidth, laneH);
+        ctx.fillRect(contentLeft, y, laneContentW, laneH);
       }
 
       // Hidden track overlay — dimmed with diagonal stripes pattern
       if (isHidden) {
         ctx.fillStyle = isDark ? 'rgba(0,0,0,0.35)' : 'rgba(128,128,128,0.15)';
-        ctx.fillRect(contentLeft, y, contentWidth, laneH);
+        ctx.fillRect(contentLeft, y, laneContentW, laneH);
         ctx.fillRect(0, y, LABEL_WIDTH - 1, laneH);
       }
 
@@ -893,13 +908,15 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
       const x2 = contentLeft + item.end * pps - sx;
       const w = x2 - x1;
 
-      // Clip rendering to track bounds — prevents visual bleed across the gap
+      // Clip rendering to track bounds AND to the clip content extent, so an
+      // item never paints past the clip's end marker (a mis-scoped / stale
+      // item end is cut off cleanly instead of bleeding to the panel edge).
       ctx.save();
       ctx.beginPath();
-      ctx.rect(0, y, canvasW, laneH);
+      ctx.rect(0, y, Math.max(0, Math.min(canvasW, extentPx)), laneH);
       ctx.clip();
 
-      if (x2 < contentLeft || x1 > canvasW) { ctx.restore(); return; }
+      if (x2 < contentLeft || x1 > canvasW || x1 >= extentPx) { ctx.restore(); return; }
 
       const color = TRACK_COLORS[item.type] || TRACK_COLORS.video;
       const isSelected = item.id === selectedItemId;
@@ -916,7 +933,12 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
         ? contentLeft + nextSiblingStart * pps - sx
         : canvasW;
       const availableW = Math.max(0, maxRightX - clipX);
-      const actualW = Math.min(w, canvasW - clipX);
+      // Right edge is the item's OWN end (x2), clamped to the canvas — NOT
+      // clipX + full-width. The old ``min(w, canvasW - clipX)`` measured w
+      // from the true (often off-screen-left) x1, so a long item that started
+      // before the viewport was drawn all the way to the panel edge, well
+      // past its real end — the "track element runs past the last marker" bug.
+      const actualW = Math.min(x2, canvasW) - clipX;
       const clipW = Math.min(Math.max(actualW, 4), availableW || actualW);
 
       // Flat fill — selection/hover state changes opacity, not shading.
@@ -1158,10 +1180,12 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
           const cy = laneTop(laneHsC, cropTrackIdx);
           const cropLaneH = laneHsC[cropTrackIdx] ?? TRACK_HEIGHT;
 
-          // Clip crop segment rendering to crop track bounds
+          // Clip crop segment rendering to crop track bounds AND the clip
+          // content extent, so a crop segment never paints past the clip's
+          // end marker.
           ctx.save();
           ctx.beginPath();
-          ctx.rect(0, cy, canvasW, cropLaneH);
+          ctx.rect(0, cy, Math.max(0, Math.min(canvasW, extentPx)), cropLaneH);
           ctx.clip();
 
           // Precompute next-segment start times so min-width clamping doesn't
@@ -1185,7 +1209,9 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
               ? contentLeft + nextStart * pps - sx
               : canvasW;
             const availableCW = Math.max(0, maxRightCX - clipCX);
-            const actualCW = Math.min(cw, canvasW - clipCX);
+            // Right edge = the segment's OWN end (cx2), not clipCX + full width
+            // (same off-screen-left overshoot fix as the main items).
+            const actualCW = Math.min(cx2, canvasW) - clipCX;
             const clipCW = Math.min(Math.max(actualCW, 4), availableCW || actualCW);
 
             // Color by cluster or manual override
