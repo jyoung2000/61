@@ -133,7 +133,10 @@ def test_resolver_end_to_end_with_fake_llm():
 
     fake = _Fake()
     out = asyncio.run(resolve_roster_corrections(
-        ["It can only be Gundarium alloy, Zechs."],
+        ["It can only be Gundarium alloy, Zechs.",
+         # Attestation: the consolidation target must already dominate the
+         # transcript (consistency rule) or the pair is vetoed.
+         "Gundanium armor is rare.", "Only Gundanium withstands this."],
         fake, job_id="test-roster"))
     assert out == {"Gundarium": "Gundanium"}
     # The prompt carried the series evidence.
@@ -407,7 +410,8 @@ def test_roster_call_uses_json_schema():
 
     fake = _Fake()
     out = asyncio.run(resolve_roster_corrections(
-        ["It can only be Gundarium alloy."], fake, job_id="test-schema"))
+        ["It can only be Gundarium alloy.", "Gundanium armor is rare.",
+         "Only Gundanium withstands this."], fake, job_id="test-schema"))
     assert out == {"Gundarium": "Gundanium"}
     # Grammar-level array schema, not json_mode (format=json biases toward a
     # bare object and run 45 silently produced zero corrections on that).
@@ -464,6 +468,32 @@ def test_vetting_rejects_common_word_and_near_typo_rights():
     assert out["Hero-kun"] == "Heero"
 
 
+def test_vetting_attestation_blocks_uncorrections():
+    # Run 52 (the first FAST-model run): the roster UN-corrected correct
+    # names into invented variants — Duo→Dewo, General Septem→General
+    # Septain, Katul→Kattul. All sound alike (they pass the phonetic gate by
+    # construction: the model invented homophones). The attestation rule
+    # kills them: a right the transcript never uses more than the wrong is
+    # invention, not consolidation.
+    corpus = ("This is Duo! Main motor destroyed. "
+              "General Septem is waiting. This is Katul reporting. "
+              "Hero-kun sits next to Relena. Nice to meet you, Heero. "
+              "Take the seat, Heero.")
+    cands = {"Duo", "General Septem", "Katul", "Hero-kun"}
+    pairs = [
+        {"wrong": "Duo", "right": "Dewo"},
+        {"wrong": "General Septem", "right": "General Septain"},
+        {"wrong": "Katul", "right": "Kattul"},
+        {"wrong": "Hero-kun", "right": "Heero"},   # real consolidation
+    ]
+    out = _vet_roster_pairs(pairs, cands, corpus=corpus)
+    assert "Duo" not in out
+    assert "General Septem" not in out
+    assert "Katul" not in out
+    # Consolidating toward the transcript's dominant spelling still works.
+    assert out == {"Hero-kun": "Heero"}
+
+
 def test_vetting_frequency_gate_and_cap():
     cands = {f"Tok{i}" for i in range(12)} | {"Deathscythe"}
     pairs = [{"wrong": f"Tok{i}", "right": f"Toc{i}"} for i in range(12)]
@@ -479,7 +509,8 @@ def test_resolver_never_asks_about_frequent_terms():
         "ガンダム": "Gundam", "ゼクス": "Zechs", "リリーナ": "Relena",
     }
     texts = ["The Operation Meteor plan begins now."] * 5 + [
-        "It can only be Gundarium alloy."]
+        "It can only be Gundarium alloy.",
+        "Gundanium armor is rare.", "Only Gundanium withstands this."]
 
     class _Fake:
         def __init__(self):
@@ -539,6 +570,10 @@ def test_resolver_noise_filter_shrinks_ask_and_reharden_correct_terms():
         "Inform Zechs at once.",                     # noise: contains known Zechs
         "Operation Meteor will proceed.",            # correct term, all-ordinary → not offered
         "The Gundam called Deathbringer.",           # real garble (passes phonetic gate)
+        # Attestation targets: the dominant spellings the consolidations
+        # move toward must already exist in the transcript.
+        "Gundanium armor is rare.", "Only Gundanium withstands this.",
+        "The Deathscythe rises.", "Deathscythe is unstoppable.",
     ]
 
     class _Fake:

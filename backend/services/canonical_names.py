@@ -561,7 +561,8 @@ def _word_is_near_typo(word: str) -> bool:
 
 def _vet_roster_pairs(pairs, candidates: set,
                       frequent: set | None = None,
-                      max_pairs: int = 8) -> dict[str, str]:
+                      max_pairs: int = 8,
+                      corpus: str | None = None) -> dict[str, str]:
     """Keep only corrections that are safe to auto-apply: the wrong form must
     be one of OUR mined candidates verbatim, the right form must look like a
     name (letters/spaces/apostrophes, ≤40 chars, ≤4 words), differ from the
@@ -572,7 +573,26 @@ def _vet_roster_pairs(pairs, candidates: set,
     like the wrong form (see ``_roster_phonetic_ok``), and not target a
     FREQUENT consistent term (a spelling used 4+ times is the glossary
     working, not a garble). Capped at the ``max_pairs`` phonetically-
-    strongest pairs — a model that "corrects" everything is hallucinating."""
+    strongest pairs — a model that "corrects" everything is hallucinating.
+
+    When ``corpus`` (the joined cue texts) is provided, the right form must
+    ALSO be attested in it strictly more often than the wrong form. This
+    makes the pass a CONSISTENCY tool — consolidate variant spellings toward
+    the form the transcript itself uses most — instead of a knowledge tool.
+    The first fast-model run proved the knowledge mode untrustworthy: it
+    "corrected" the CORRECT "Duo" into the invented "Dewo" and
+    "General Septem" into "General Septain", while consolidations like
+    "Hero-kun" → the transcript's own dominant "Heero" are exactly what it
+    gets right. Series knowledge belongs to the canonical glossary and the
+    user's custom vocabulary, which don't hallucinate."""
+    _corpus_l = (corpus or "").lower()
+
+    def _attested(term: str) -> int:
+        if not _corpus_l:
+            return 0
+        return len(re.findall(
+            r"(?<![a-z])" + re.escape(term.lower()) + r"(?![a-z])", _corpus_l))
+
     scored: list[tuple[float, str, str]] = []
     for p in (pairs or []):
         if not isinstance(p, dict):
@@ -600,6 +620,11 @@ def _vet_roster_pairs(pairs, candidates: set,
         if any(_word_is_near_typo(w) for w in _right_words):
             continue
         if _PROFANITY_RE.search(right):
+            continue
+        if corpus is not None and _attested(right) <= _attested(wrong):
+            # Consistency rule: consolidate toward the transcript's dominant
+            # spelling only. A right the transcript never (or more rarely)
+            # uses is the model inventing, not correcting.
             continue
         ok, ratio = _roster_phonetic_ok(wrong, right)
         if not ok:
@@ -715,7 +740,10 @@ async def resolve_roster_corrections(
             "character, mecha, faction or place names, and leave the rest. "
             "NEVER replace a name with a DIFFERENT character or term that "
             "merely fits the scene, and NEVER rewrite a term that is already "
-            "a correct official spelling — omit those. Return ONLY the "
+            "a correct official spelling — omit those. Prefer consolidating "
+            "a variant spelling toward the spelling that already appears in "
+            "other candidates' example lines — never invent a new spelling. "
+            "Return ONLY the "
             "corrections you are "
             "confident about, as a JSON array of objects "
             '[{"wrong": "<token exactly as listed>", "right": "<official '
@@ -770,7 +798,8 @@ async def resolve_roster_corrections(
             raw = await asyncio.wait_for(
                 orchestrator.text_completion(prompt), timeout + 15)
         mapping = _vet_roster_pairs(
-            _parse_json_pairs(raw or ""), {t for t, _ in ask})
+            _parse_json_pairs(raw or ""), {t for t, _ in ask},
+            corpus=" ".join(str(t) for t in texts))
         if not mapping:
             # Visible at INFO: a silent no-op here shipped "Gundarium" after
             # the infrastructure was in place — diagnosability matters more

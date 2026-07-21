@@ -331,10 +331,14 @@ def is_garbled_translation(text, source_language="", glossary_terms=frozenset())
 def tidy_punctuation_artifacts(text: str) -> str:
     """Deterministic cleanup of the small punctuation artifacts LLM
     translation leaves behind: a stray leading CJK period ("。 And you?"),
-    spaced double terminators ("Mobile Suits? !"), and a dangling trailing
-    "?"/"." after a finished sentence ("See that it doesn't. ?"). Ellipses
-    ("...") are untouched — every rule requires whitespace between marks."""
+    spaced double terminators ("Mobile Suits? !"), a dangling trailing
+    "?"/"." after a finished sentence ("See that it doesn't. ?"), and an
+    HTML-ish tag fragment the model hallucinated (a shipped cue read
+    "</Span> I know you ran all this way"). Ellipses ("...") are untouched —
+    every punctuation rule requires whitespace between marks."""
     s = text or ""
+    # Markup fragments are never legitimate subtitle text.
+    s = re.sub(r"</?[A-Za-z][A-Za-z0-9]{0,15}(?:\s[^<>]{0,60})?/?>", "", s)
     s = re.sub(r"^[\s。、・]+", "", s)     # leading 。 、 ・
     s = re.sub(r"([?!])\s+([?!])", r"\1\2", s)          # "? !" → "?!"
     s = re.sub(r"([.?!…])\s+[.?]$", r"\1", s)           # trailing ". ?"
