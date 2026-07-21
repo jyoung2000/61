@@ -38,14 +38,32 @@ def test_gap_finder_interior_holes_only():
 
 
 def test_gap_finder_ignores_small_holes_and_respects_caps():
-    segs = _track((0, 10, "a"), (14, 20, "b"),      # 4s hole — too small
-                  (60, 64, "c"), (200, 204, "d"),   # 136s hole
-                  (400, 404, "e"))                  # 196s hole
+    # 136s / 196s holes are non-speech SCENES — the default per-gap cap
+    # (max_span_s=45) skips both; only short buried-dialogue holes qualify.
+    segs = _track((0, 10, "a"), (14, 56, "b"),      # 4s hole — too small
+                  (60, 64, "c"),                    # 4s hole — too small
+                  (94, 98, "d"),                    # 30s hole — kept
+                  (200, 204, "e"),                  # 102s hole — too long
+                  (400, 404, "f"))                  # 196s hole — too long
     gaps = find_coverage_gaps(segs, min_gap_s=8.0, pad_s=0.0,
                               max_spans=8, max_total_s=150.0)
-    # Largest-first budget: the 196s hole exceeds 150s alone and is skipped;
-    # the 136s hole fits.
+    assert gaps == [(64.0, 94.0)]
+
+
+def test_gap_finder_per_span_cap_can_be_disabled():
+    # With the per-gap cap OFF, the old largest-first / total-budget behavior
+    # holds: the 196s hole exceeds 150s alone and is skipped; the 136s fits.
+    segs = _track((0, 10, "a"), (60, 64, "c"), (200, 204, "d"), (400, 404, "e"))
+    gaps = find_coverage_gaps(segs, min_gap_s=8.0, pad_s=0.0,
+                              max_spans=8, max_total_s=150.0, max_span_s=0)
     assert gaps == [(64.0, 200.0)]
+
+
+def test_gap_finder_skips_the_long_music_scene():
+    # The run-1 case: a single 179s hole (76:34-79:33) that cost 8 min of
+    # Demucs for zero recovery. It must not be scheduled by default.
+    segs = _track((0, 4594, "dialogue"), (4773, 9000, "more dialogue"))
+    assert find_coverage_gaps(segs, min_gap_s=8.0, pad_s=2.0) == []
 
 
 def test_gap_finder_needs_two_cues():

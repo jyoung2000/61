@@ -60,21 +60,28 @@ def find_coverage_gaps(
     pad_s: float = 2.0,
     max_spans: int = 8,
     max_total_s: float = 240.0,
+    max_span_s: float = 45.0,
 ) -> list[tuple[float, float]]:
-    """Uncovered timeline holes ≥ ``min_gap_s`` between the first and last cue.
+    """Uncovered timeline holes between the first and last cue, ``min_gap_s`` ≤
+    length ≤ ``max_span_s``.
 
     Interior only — silence before the first or after the last cue is
-    normally logos/credits, not buried dialogue. Spans are padded by
-    ``pad_s`` on each side (Whisper needs lead-in context), largest first,
-    capped at ``max_spans`` and ``max_total_s`` recovered seconds so a
-    pathological transcript can't schedule half the episode."""
+    normally logos/credits, not buried dialogue. A hole LONGER than
+    ``max_span_s`` is skipped: music-buried DIALOGUE arrives as short holes,
+    whereas a continuous 45s+ hole is a non-speech scene (music / action) —
+    Demucs-separating minutes of it costs many post-COMPLETE minutes and
+    recovers nothing. Spans are padded by ``pad_s`` on each side (Whisper
+    needs lead-in context), largest ELIGIBLE first, capped at ``max_spans``
+    and ``max_total_s`` recovered seconds so a pathological transcript can't
+    schedule half the episode."""
     spans = sorted(b for s in (segments or []) if (b := _seg_bounds(s)))
     if len(spans) < 2:
         return []
     gaps: list[tuple[float, float]] = []
     cover_end = spans[0][1]
     for a, b in spans[1:]:
-        if a - cover_end >= min_gap_s:
+        hole = a - cover_end
+        if hole >= min_gap_s and (max_span_s <= 0 or hole <= max_span_s):
             gaps.append((max(0.0, cover_end - pad_s), a + pad_s))
         cover_end = max(cover_end, b)
     gaps.sort(key=lambda g: g[0] - g[1])  # largest first
@@ -286,6 +293,7 @@ async def recover_gap_dialogue(
             pad_s=pad,
             max_spans=int(getattr(settings, "VOCAL_GAP_MAX_SPANS", 8)),
             max_total_s=float(getattr(settings, "VOCAL_GAP_MAX_TOTAL_S", 240.0)),
+            max_span_s=float(getattr(settings, "VOCAL_GAP_MAX_SPAN_S", 45.0)),
         )
         if not gaps:
             logger.info("[%s] gap recovery: no coverage gaps ≥ threshold", job_id)

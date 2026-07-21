@@ -1318,11 +1318,18 @@ export default function Analysis() {
               });
               setPipelineStartTime((pt) => pt || Date.now());
             }
-            pushLog(
-              msg.type === 'complete' ? 'success' : 'status',
-              msg.message || `Status: ${msg.status}`,
-              { progress: msg.progress, stage_id: incomingStage },
-            );
+            // A reconnect REPLAY (ws.py sends replay:true on connect) syncs
+            // state but must not add a second timestamped log line — logging a
+            // replayed "Analysis complete" at reconnect time is the "two
+            // different completion times" confusion. Update status below; skip
+            // the duplicate log entry.
+            if (!msg.replay) {
+              pushLog(
+                msg.type === 'complete' ? 'success' : 'status',
+                msg.message || `Status: ${msg.status}`,
+                { progress: msg.progress, stage_id: incomingStage },
+              );
+            }
             if (msg.type === 'complete') {
               // Freeze elapsed and record the final stage
               if (pipelineElapsedRef.current) {

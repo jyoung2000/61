@@ -220,6 +220,13 @@ class Settings(BaseSettings):
     # and the seconds budget stays the real limiter.
     VOCAL_GAP_MAX_SPANS: int = 14
     VOCAL_GAP_MAX_TOTAL_S: float = 240.0
+    # Skip any SINGLE hole longer than this. Music-buried DIALOGUE arrives as
+    # short holes (a line or two the VAD lost under the bed); a continuous
+    # 45s+ hole is a non-speech SCENE (music / action / ambience), and
+    # Demucs-separating minutes of it on CPU costs many post-COMPLETE minutes
+    # and reliably recovers nothing — the measured 179s-gap → 8-min-for-zero
+    # tail that kept the Companion busy long after "Analysis complete".
+    VOCAL_GAP_MAX_SPAN_S: float = 45.0
     # Demucs device for the short recovery slices. CPU by default: recovery
     # may overlap SEO's GPU work and the slices are small.
     VOCAL_GAP_DEVICE: str = "cpu"

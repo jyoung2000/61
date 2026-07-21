@@ -44,6 +44,12 @@ async def websocket_job_progress(websocket: WebSocket, job_id: str):
                 "status": status,
                 "progress": int(getattr(job, "progress", 0) or (100 if terminal else 0)),
                 "message": msg,
+                # This is a state REPLAY on (re)connect, not a fresh live
+                # transition. The client uses it to sync status/UI but must NOT
+                # log a second "Analysis complete" stamped at reconnect time —
+                # that's the "two different completion times" confusion (the
+                # real completion already logged live, minutes earlier).
+                "replay": True,
             })
     except Exception as e:  # best-effort — never block the connection
         logger.debug("ws connect status replay failed for %s: %s", job_id, e)
