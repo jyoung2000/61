@@ -4410,6 +4410,32 @@ async def _background_post_processing(
             try:
                 from backend.services.transcript_sanitize import (
                     sanitize_translated_transcript, merge_transcript_fragments)
+                # Always-on punctuation tidy at the persist boundary. tidy runs
+                # per-cue at translation time, but boundary artifacts can be
+                # introduced AFTER it — a cue that shipped ". And you?" (stray
+                # leading period from a cross-cue split) or an inline grunt
+                # ("Yes, Mmm...") reached persist untidied. Re-applying the same
+                # conservative, idempotent pass here catches them no matter what
+                # produced them (cleanup re-translate, fragment redistribution).
+                try:
+                    from backend.services.translator import tidy_punctuation_artifacts
+                    _tidy_n = 0
+                    for _seg in _translated_out:
+                        _t0 = (_seg.get("text") if isinstance(_seg, dict)
+                               else getattr(_seg, "text", "")) or ""
+                        _t1 = tidy_punctuation_artifacts(_t0)
+                        if _t1 != _t0:
+                            _tidy_n += 1
+                            if isinstance(_seg, dict):
+                                _seg["text"] = _t1
+                            else:
+                                _seg.text = _t1
+                    if _tidy_n:
+                        logger.info("[%s] Tidied %d translated cue(s) at persist "
+                                    "(leading-period / inline-grunt artifacts)",
+                                    job_id, _tidy_n)
+                except Exception:
+                    pass
                 _san, _san_changed = sanitize_translated_transcript(_translated_out, target_lang)
                 if _san_changed:
                     logger.info("[%s] Sanitized translated_transcript before persist: %d → %d",

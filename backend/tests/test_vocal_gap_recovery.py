@@ -11,9 +11,18 @@ import pytest
 from backend.services.vocal_gap_recovery import (
     _JUNK_RE,
     _clip_to_gap,
+    _concat_offsets,
     find_coverage_gaps,
     merge_recovered,
 )
+
+
+def test_concat_offsets_track_silence_separators():
+    # All spans separated into ONE Demucs pass: each clip's start offset inside
+    # the concatenation = sum of prior clip durations + one separator between.
+    assert _concat_offsets([20.0, 15.0, 32.0], 1.0) == [0.0, 21.0, 37.0]
+    assert _concat_offsets([10.0], 1.0) == [0.0]   # lone span → no separator
+    assert _concat_offsets([], 1.0) == []
 
 
 def _track(*spans):

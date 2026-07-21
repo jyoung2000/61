@@ -174,6 +174,64 @@ def _slice_wav(audio_path: str, out_path: str, start: float, end: float) -> bool
         return False
 
 
+def _wav_duration(path: str) -> float:
+    """Seconds of audio in a WAV (ffprobe); 0.0 on any failure."""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nk=1:nw=1", path],
+            capture_output=True, text=True, timeout=30)
+        return float((r.stdout or "0").strip() or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _make_silence(out_path: str, sec: float, sr: int = 16000) -> bool:
+    """A ``sec``-second 16 kHz mono PCM silence clip (the concat separator)."""
+    try:
+        rc = subprocess.run(
+            ["ffmpeg", "-y", "-f", "lavfi", "-t", f"{max(0.1, sec):.2f}",
+             "-i", f"anullsrc=r={sr}:cl=mono", "-c:a", "pcm_s16le", out_path],
+            capture_output=True, timeout=60).returncode
+        return rc == 0 and os.path.exists(out_path)
+    except Exception:
+        return False
+
+
+def _concat_wavs(inputs: list[str], sep_path: str, out_path: str,
+                 work_dir: str) -> bool:
+    """Concatenate ``inputs`` into ``out_path`` with ``sep_path`` between each.
+
+    All clips share params (16 kHz mono PCM), so the concat demuxer with
+    ``-c copy`` is exact and cheap. Returns False on any failure."""
+    try:
+        listfile = os.path.join(work_dir, "gaps_concat_list.txt")
+        lines = []
+        for i, p in enumerate(inputs):
+            if i:
+                lines.append(f"file '{sep_path}'")
+            lines.append(f"file '{p}'")
+        with open(listfile, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        rc = subprocess.run(
+            ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", listfile,
+             "-c", "copy", out_path],
+            capture_output=True, timeout=300).returncode
+        return rc == 0 and os.path.exists(out_path)
+    except Exception:
+        return False
+
+
+def _concat_offsets(durations: list[float], sep_s: float) -> list[float]:
+    """Start offset of each clip inside a silence-separated concatenation
+    (pure — unit tested). Clip i starts after all prior clips + separators."""
+    offs, cur = [], 0.0
+    for d in durations:
+        offs.append(cur)
+        cur += d + sep_s
+    return offs
+
+
 def _default_speaker(segments, at_s: float) -> str:
     """Nearest existing cue's speaker so recovered lines blend in."""
     best, best_d = "Speaker 1", float("inf")
@@ -239,31 +297,61 @@ async def recover_gap_dialogue(
                       for a, b in gaps))
 
         os.makedirs(work_dir, exist_ok=True)
-        # Phase 1: slice + separate EVERY span first, phase 2: transcribe the
-        # stems back-to-back. Interleaved, each ASR call paid a cold whisper
-        # sidecar start — CPU Demucs takes ~a minute per span, so the
-        # Companion's 45s idle reaper stopped the sidecar between every one.
-        stems: list[tuple[tuple[float, float], str]] = []
+        # ONE Demucs pass for ALL spans. On CPU the cost is dominated by
+        # subprocess start + model load (~25-35s), NOT the few seconds of audio
+        # per span — separating each span in its own subprocess paid that fixed
+        # cost once PER GAP (a measured 11-minute post-COMPLETE tail across 13
+        # gaps that recovered nothing). Instead: slice every span, concatenate
+        # them into ONE track with a short silence separator, separate that once,
+        # then slice the vocal stem back per span for ASR. Same audio processed,
+        # a single model load.
+        SEP_S = 1.0
+        raws: list[str] = []
+        planned: list[tuple[tuple[float, float], float]] = []  # (gap, duration)
         for i, gap in enumerate(gaps):
             raw = os.path.join(work_dir, f"gap{i}.wav")
             if not await asyncio.to_thread(_slice_wav, audio_path, raw, gap[0], gap[1]):
                 continue
-            # CPU on purpose: recovery may overlap SEO's GPU work, and the
-            # slices are short enough (≤ ~1 min) that CPU Demucs stays fast.
-            vocals = await asyncio.to_thread(
-                vocal_separator.separate_vocals, raw,
-                os.path.join(work_dir, f"gap{i}"),
-                model=str(getattr(settings, "VOCAL_SEPARATION_MODEL", "htdemucs")),
-                device=str(getattr(settings, "VOCAL_GAP_DEVICE", "cpu")),
-                segment=int(getattr(settings, "VOCAL_SEPARATION_SEGMENT", 7)),
-                timeout=int(getattr(settings, "VOCAL_GAP_SPAN_TIMEOUT_S", 300)),
-            )
-            if vocals:
-                stems.append((gap, vocals))
+            dur = await asyncio.to_thread(_wav_duration, raw)
+            if dur <= 0.2:
+                continue
+            raws.append(raw)
+            planned.append((gap, dur))
+        if not raws:
+            logger.info("[%s] gap recovery: no usable span audio", job_id)
+            return []
 
+        sep_wav = os.path.join(work_dir, "sep_silence.wav")
+        concat_wav = os.path.join(work_dir, "gaps_concat.wav")
+        if not (await asyncio.to_thread(_make_silence, sep_wav, SEP_S)
+                and await asyncio.to_thread(
+                    _concat_wavs, raws, sep_wav, concat_wav, work_dir)):
+            logger.info("[%s] gap recovery: span concatenation failed — skipping",
+                        job_id)
+            return []
+
+        total_s = sum(d for _, d in planned) + SEP_S * max(0, len(planned) - 1)
+        # CPU on purpose: recovery may overlap SEO's GPU work, and one pass over
+        # a couple of concatenated minutes stays comfortably bounded.
+        vocals = await asyncio.to_thread(
+            vocal_separator.separate_vocals, concat_wav,
+            os.path.join(work_dir, "sep"),
+            model=str(getattr(settings, "VOCAL_SEPARATION_MODEL", "htdemucs")),
+            device=str(getattr(settings, "VOCAL_GAP_DEVICE", "cpu")),
+            segment=int(getattr(settings, "VOCAL_SEPARATION_SEGMENT", 7)),
+            timeout=int(120 + total_s * 4),
+        )
+        if not vocals:
+            logger.info("[%s] gap recovery: separation unavailable", job_id)
+            return []
+
+        offsets = _concat_offsets([d for _, d in planned], SEP_S)
         recovered: list[dict] = []
-        for gap, vocals in stems:
-            segs = await asyncio.to_thread(_transcribe_stem, vocals, source_lang)
+        for (gap, dur), off in zip(planned, offsets):
+            stem = os.path.join(work_dir, f"stem_{int(gap[0])}.wav")
+            if not await asyncio.to_thread(_slice_wav, vocals, stem, off, off + dur):
+                continue
+            segs = await asyncio.to_thread(_transcribe_stem, stem, source_lang)
             for s in segs:
                 s["start"] = float(s.get("start", 0.0)) + gap[0]
                 s["end"] = float(s.get("end", 0.0)) + gap[0]

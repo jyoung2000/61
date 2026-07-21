@@ -34,14 +34,37 @@ def test_tidy_strips_inline_grunt():
         "That's it! Nnn... Hey, hurry up!") == "That's it! Hey, hurry up!"
 
 
+def test_tidy_strips_inline_m_grunt():
+    # Run-54 15:37 cue — an M-grunt ("Mmm...") inside a real cue. The whole-cue
+    # sanitize net can't reach it because it's embedded, so tidy must.
+    assert tidy_punctuation_artifacts(
+        "That's right! Yes, Mmm...") == "That's right! Yes,"
+
+
+def test_tidy_strips_leading_hmm_grunt():
+    assert tidy_punctuation_artifacts(
+        "Hmm. It's definitely the Colony's M-Plan.") == "It's definitely the Colony's M-Plan."
+
+
 def test_tidy_empties_a_whole_cue_grunt():
     # 15:26 standalone — emptied here, then dropped downstream.
-    assert tidy_punctuation_artifacts("Nn...") == ""
+    for g in ("Nn...", "Mmm...", "Nnn…"):
+        assert tidy_punctuation_artifacts(g) == "", g
 
 
-def test_tidy_leaves_real_words_with_n():
-    for w in ("Inn is closed.", "Ann arrived.", "Nine lives."):
-        assert tidy_punctuation_artifacts(w) == w
+def test_tidy_leaves_real_words_with_n_or_m():
+    # A 2+ m/n run + trailing dots is the grunt signature; none of these have it.
+    for w in ("Inn is closed.", "Ann arrived.", "Nine lives.", "Hymn book.",
+              "Damn it.", "Mom is home.", "Mommy...", "Communication..."):
+        assert tidy_punctuation_artifacts(w) == w, w
+
+
+def test_tidy_unwraps_snippet_placeholder():
+    # Run-54 18:49 cue — the model leaked "${1:Moreover}" verbatim.
+    assert tidy_punctuation_artifacts("${1:Moreover}") == "Moreover"
+    assert tidy_punctuation_artifacts("Wait. ${1:Moreover}, listen.") == "Wait. Moreover, listen."
+    # A bare "${5}" (no colon head) is left alone — too close to a price literal.
+    assert tidy_punctuation_artifacts("It costs ${5} dollars.") == "It costs ${5} dollars."
 
 
 def test_tidy_stray_leading_period_but_keeps_ellipsis():

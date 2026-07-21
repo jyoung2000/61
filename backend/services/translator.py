@@ -341,18 +341,26 @@ def tidy_punctuation_artifacts(text: str) -> str:
     s = text or ""
     # Markup fragments are never legitimate subtitle text.
     s = re.sub(r"</?[A-Za-z][A-Za-z0-9]{0,15}(?:\s[^<>]{0,60})?/?>", "", s)
+    # Editor snippet-placeholder syntax the model occasionally emits verbatim
+    # (a shipped cue read "${1:Moreover}"): unwrap "${N:text}" → "text". The
+    # "${digit:" head is never real subtitle text, so this is zero-false-
+    # positive (a bare "${N}" is left alone — too close to a "${5}" literal).
+    s = re.sub(r"\$\{\d+:([^{}]*)\}", r"\1", s)
     s = re.sub(r"^[\s。、・]+", "", s)     # leading 。 、 ・
     # A SINGLE stray leading period + space ("[.] And you?" → "And you?").
     # Requiring whitespace right after the dot excludes an ellipsis on its
     # own ("... word" has no space after the first dot, so no match).
     s = re.sub(r"^\s*\.\s+", "", s)
     # An embedded non-lexical grunt token ("That's it! Nnn... Hey" → "That's
-    # it! Hey"), and a whole-cue grunt ("Nn..." → "" → dropped downstream).
-    # Capital-N + word boundary + REQUIRED trailing dots keep it to the
-    # grunt — it can never eat "Inn", "Ann", "Nine" (no trailing-dot run).
-    # This is the always-on home (TRANSCRIPT_FILLER_REMOVAL defaults off, so
-    # the polisher's filler strip can't be relied on).
-    s = re.sub(r"\bNn+[.…]+\s*", "", s)
+    # it! Hey"; "Yes, Mmm..." → "Yes,") and a whole-cue grunt ("Nn..." → "" →
+    # dropped downstream). A word-boundary run of ≥2 grunt letters (m/n, an
+    # optional leading h for "Hmm...") + REQUIRED trailing dots keeps it to
+    # the grunt: the {2,} run + trailing-dot run means it can never eat a real
+    # word — "Inn", "Ann", "Nine", "Hymn", "Damn", "Mom", "Mommy" all lack a
+    # 2+ m/n run immediately followed by dots. This is the always-on home
+    # (TRANSCRIPT_FILLER_REMOVAL defaults off, so the polisher's filler strip
+    # can't be relied on).
+    s = re.sub(r"\b[Hh]?[MmNn]{2,}[.…]+\s*", "", s)
     s = re.sub(r"([?!])\s+([?!])", r"\1\2", s)          # "? !" → "?!"
     s = re.sub(r"([.?!…])\s+[.?]$", r"\1", s)           # trailing ". ?"
     s = re.sub(r"\s{2,}", " ", s)
