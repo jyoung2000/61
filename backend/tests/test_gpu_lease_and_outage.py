@@ -81,6 +81,55 @@ def test_est_model_gb_unknown_is_zero():
     assert _est_model_gb("") == 0.0
 
 
+# ── Remote VRAM sizing + the sticky num_gpu rung ─────────────────────
+
+
+def _bare_provider(host="http://192.168.8.12:11500/ollama"):
+    from backend.services.providers.ollama_provider import OllamaProvider
+    p = OllamaProvider.__new__(OllamaProvider)
+    p._host = host
+    p._force_cpu = False
+    p._force_cpu_model = None
+    p._available_vram_mb = 0
+    p._gpu_layers_good = {}
+    return p
+
+
+def test_large_model_on_remote_host_forces_gpu(monkeypatch):
+    # Run 51: milliseconds into warmup (advertisement not landed,
+    # _available_vram_mb still 0) the provider decided llava:7b "exceeds 4GB
+    # VRAM" — of the LOCAL card — and pinned the Companion's vision to CPU
+    # for the whole job. Remote hosts must be judged roomy.
+    from backend.services import ollama_registry as oreg
+    monkeypatch.setattr(oreg, "is_local_gpu_host", lambda url: False)
+    p = _bare_provider()
+    assert p._get_num_gpu("llava:7b") == 99
+
+
+def test_large_model_on_small_local_host_stays_cpu(monkeypatch):
+    from backend.services import ollama_registry as oreg
+    monkeypatch.setattr(oreg, "is_local_gpu_host", lambda url: True)
+    p = _bare_provider(host="http://127.0.0.1:11434")
+    p._available_vram_mb = 4096
+    assert p._get_num_gpu("llava:7b") == 0
+
+
+def test_reset_gpu_layers_memo_unpins_the_rung():
+    # The memo is a one-way ratchet: a first load under (since-cleared)
+    # whisper pressure pinned gemma at ~22% residency for an entire run,
+    # because every defrag reload reused the low remembered rung. The
+    # defrag path resets it so the clean pool is actually used.
+    p = _bare_provider()
+    p._gpu_layers_good["gemma3:12b-it-q4_K_M"] = 11
+    p.reset_gpu_layers_memo("gemma3:12b-it-q4_K_M")
+    assert p._gpu_layers_good == {}
+    # Other models' memos survive; matching is tag-exact (same semantics as
+    # every other name comparison in the provider).
+    p._gpu_layers_good = {"gemma3:12b-it-q4_K_M": 11, "qwen3:4b": 20}
+    p.reset_gpu_layers_memo("gemma3:12b-it-q4_K_M")
+    assert p._gpu_layers_good == {"qwen3:4b": 20}
+
+
 # ── Concurrent-lane progress semantics ───────────────────────────────
 
 

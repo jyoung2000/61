@@ -1607,6 +1607,17 @@ class AIOrchestrator:
                                         "timeout %.0fs → %.0fs",
                                         model_name, _frac * 100, timeout, _call_timeout,
                                     )
+                                    # Forget the sticky num_gpu rung too: a
+                                    # first load under (since-cleared) VRAM
+                                    # pressure pinned a run at 22% residency
+                                    # end-to-end because every reload reused
+                                    # the low remembered rung — the clean pool
+                                    # was never actually used.
+                                    if hasattr(provider, "reset_gpu_layers_memo"):
+                                        try:
+                                            provider.reset_gpu_layers_memo(model_name)
+                                        except Exception:
+                                            pass
                                     if hasattr(provider, "clear_vram"):
                                         await provider.clear_vram()
                                         # CUDA frees asynchronously; reloading into a

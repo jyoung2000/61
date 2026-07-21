@@ -751,7 +751,12 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                 except Exception:
                     pass
                 # Remote but VRAM still unknown: leave 0 (unknown) rather than
-                # letting the LOCAL card's probes below misrepresent it.
+                # letting the LOCAL card's probes below misrepresent it. And
+                # DON'T cache the failure — the advertisement often lands
+                # seconds later (the /v1/health probe can race Companion
+                # startup), and a permanently cached unknown kept every sizing
+                # decision blind for the whole process.
+                self._vram_checked = False
                 logger.info(
                     "Remote Ollama host — skipping local VRAM probes (remote card size unknown)")
                 return self._available_vram_mb
@@ -839,10 +844,24 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                         "gemma:7b", "deepseek:7b", "phi3:14b", "qwen2.5:7b"]
         for pattern in large_models:
             if pattern in model_lower:
-                if self._available_vram_mb >= 6000:
+                # A REMOTE host (paired Companion) is judged roomy even when
+                # the VRAM advertisement hasn't landed yet: a real run made
+                # this decision milliseconds into warmup with
+                # _available_vram_mb still unset and forced llava:7b onto the
+                # Companion's CPU for the whole job ("known to exceed 4GB
+                # VRAM" — of a card it wasn't running on).
+                _remote = False
+                try:
+                    from backend.services import ollama_registry as _oreg_g
+                    _remote = not _oreg_g.is_local_gpu_host(self._host)
+                except Exception:
+                    _remote = False
+                if _remote or self._available_vram_mb >= 6000:
                     logger.info(
-                        "Model %s fits the active GPU (%d MB VRAM) — forcing all "
-                        "layers on GPU (num_gpu=99)", model_name, self._available_vram_mb)
+                        "Model %s fits the active GPU (%s) — forcing all "
+                        "layers on GPU (num_gpu=99)", model_name,
+                        f"{self._available_vram_mb} MB VRAM"
+                        if self._available_vram_mb else "remote Companion")
                     return 99
                 logger.info("Model %s known to exceed 4GB VRAM — forcing num_gpu=0 (CPU)", model_name)
                 return 0
@@ -933,8 +952,22 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
             _remote = not _oreg2.is_local_gpu_host(self._host)
         except Exception:
             _remote = False
-        if _remote and self._available_vram_mb > 0:
-            _total_gb = self._available_vram_mb / 1024.0
+        if _remote:
+            _total_gb = (self._available_vram_mb / 1024.0
+                         if self._available_vram_mb > 0 else 0.0)
+            if _total_gb <= 0:
+                # The advertisement hasn't landed (or the probe failed) — use
+                # the registry's resolved remote budget rather than falling
+                # through to the LOCAL card's total. A real run sized gemma's
+                # ladder from the container's 4 GB GTX 1650 while the calls
+                # ran on the 12 GB Companion: the start rung landed at ~22%
+                # of layers and the sticky memo pinned it there end-to-end
+                # (batches at 45-320s instead of ~30s).
+                try:
+                    from backend.services import ollama_registry as _oreg3
+                    _total_gb = float(_oreg3.remote_primary_vram_gb() or 0.0)
+                except Exception:
+                    _total_gb = 0.0
         else:
             try:
                 _total_gb = _total_vram_gb()
@@ -958,6 +991,26 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
 
     def _remember_gpu_layers(self, model_name: str, n_gpu: int) -> None:
         self._gpu_layers_good[model_name] = int(n_gpu)
+
+    def reset_gpu_layers_memo(self, model_name: str) -> None:
+        """Forget the remembered ``num_gpu`` rung for ``model_name`` so its
+        next load starts from the ladder's TOP again.
+
+        The memo is a one-way ratchet by design (never re-OOM at 99 every
+        call) — but that pinned a real run at 22% GPU residency for its
+        entire duration: the model's FIRST load happened while the whisper
+        sidecar still held ~4 GB, OOM-laddered down to ~11 layers, and the
+        memo then capped every later load at that rung even after whisper
+        released and the orchestrator's defrag evicted everything. The
+        defrag calls this so its "reload into a clean pool" actually gets
+        to USE the clean pool; the OOM step-down remains the safety net if
+        the pressure is still there."""
+        for k in list(self._gpu_layers_good.keys()):
+            try:
+                if _ollama_names_match(k, model_name):
+                    self._gpu_layers_good.pop(k, None)
+            except Exception:
+                pass
 
     async def resolve_gpu_fitting_model(self, model_name: str) -> str:
         """Return ``model_name`` — or a smaller-quant build of the SAME weights

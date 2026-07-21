@@ -2996,7 +2996,7 @@ async def _auto_seo_followup(job_id: str, orchestrator, pp: dict,
         )
         if _seo_clips:
             final_clips = _seo_clips
-        _seo_mins = (time.monotonic() - _seo_t0) / 60.0
+        _seo_mins = (_time.monotonic() - _seo_t0) / 60.0
         # Duration in the completion line: SEO runs AFTER the "Analyzed in
         # Xm Ys" banner freezes, so this is the only place the user learns
         # the enrichment's cost.
