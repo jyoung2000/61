@@ -30,7 +30,11 @@ from backend.services.clip_seo_sidecar import (
     format_clip_seo_csv,
     sidecar_path_for,
 )
-from backend.services.pipeline import _fallback_seo_title
+from backend.services.pipeline import (
+    _fallback_seo_title,
+    _clip_visual_context,
+    _is_timestamp_title,
+)
 from backend.services.reframer_bridge import to_fez_clips
 
 
@@ -124,25 +128,57 @@ class _JobStub:
     filename = "MOBILE SUIT GUNDAM WING Episode 1.mp4"
 
 
-def test_fallback_seo_title_ladder():
+def test_timestamp_titles_are_flagged_generic():
+    assert _is_timestamp_title("3:20")
+    assert _is_timestamp_title("highlight at 10:05")
+    assert _is_timestamp_title("Clip @ 1:02-1:30")
+    assert not _is_timestamp_title("Zechs strikes first")
+    assert not _is_timestamp_title("The Gundam falls at dawn")
+
+
+def test_fallback_seo_title_is_descriptive_never_a_timestamp():
+    job = _JobStub()
     # Real clip title survives.
-    t = _fallback_seo_title({"title": "Zechs strikes first", "start_time": 65},
-                            "", _JobStub())
-    assert t == "Zechs strikes first"
-    # Placeholder title falls through to the summary head.
+    assert _fallback_seo_title(
+        {"title": "Zechs strikes first", "start_time": 65}, "", job) == "Zechs strikes first"
+    # No-speech clip → describe from the VLM's on-screen hook.
     t = _fallback_seo_title(
-        {"title": "(no speech in this segment)", "start_time": 65},
-        "A rebel pilot crash-lands on Earth. More things happen.", _JobStub())
-    assert t.startswith("A rebel pilot crash-lands on Earth")
-    assert "1:05" in t
-    # No summary → filename.
-    t = _fallback_seo_title({"title": "Clip 3", "start_time": 605}, "", _JobStub())
-    assert "MOBILE SUIT GUNDAM WING" in t and "10:05" in t
-    # Nothing at all → still a usable title.
+        {"title": "Clip 5", "start_time": 500,
+         "vlm_hook": "A Gundam pierces the Alliance line"}, "", job)
+    assert t == "A Gundam pierces the Alliance line"
+    # Only the editorial reason available → its first sentence.
+    t = _fallback_seo_title(
+        {"title": "(no speech in this segment)", "start_time": 500,
+         "vlm_reason": "Zechs corners the enemy fighter over Eurasia. Then more."},
+        "", job)
+    assert t == "Zechs corners the enemy fighter over Eurasia"
+    # Nothing clip-specific → the video's opening subject sentence (topical,
+    # still descriptive — NOT a timestamp).
+    t = _fallback_seo_title(
+        {"title": "Clip 3", "start_time": 605}, "Humanity fled to space colonies. War follows.", job)
+    assert t == "Humanity fled to space colonies"
+    # Absolutely nothing → the source title, never a bare timestamp.
     class _Empty:
         filename = ""
     t = _fallback_seo_title({"start_time": 0}, "", _Empty())
-    assert t == "Highlight at 0:00"
+    assert t == "Untitled clip"
+    # Every branch is timestamp-free.
+    for cd, summ in (({"start_time": 500, "vlm_hook": "A Gundam pierces the line"}, ""),
+                     ({"start_time": 605}, "Humanity fled to space."),
+                     ({"start_time": 0}, "")):
+        assert not _is_timestamp_title(_fallback_seo_title(cd, summ, job))
+
+
+def test_visual_context_grounds_no_speech_clips():
+    ctx = _clip_visual_context({
+        "vlm_hook": "A Gundam pierces the Alliance line",
+        "vlm_reason": "It transforms mid-dive and downs two Aries.",
+        "why_this_works": "Instant spectacle.",
+    })
+    assert "A Gundam pierces the Alliance line" in ctx
+    assert "downs two Aries" in ctx
+    # A placeholder-only clip yields no misleading context.
+    assert _clip_visual_context({"vlm_hook": "(no speech in this segment)"}) == ""
 
 
 # ── 5. CSV sidecar ───────────────────────────────────────────────────────

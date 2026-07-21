@@ -789,7 +789,13 @@ def build_platform_seo_prompt(platform: str, trend_brief: str = "",
         "strips them.\n\n"
         "Use the clip's transcript, video summary, and title to ground the copy in "
         "specific things that actually happen in this clip. No generic filler — "
-        "every sentence should reference a concrete moment, quote, or visual.\n\n"
+        "every sentence should reference a concrete moment, quote, or visual.\n"
+        "The TITLE must DESCRIBE this specific clip — a named subject, action, "
+        "line, or stakes a scroller can picture. It is NEVER a bare timestamp, "
+        "a clip number, 'Highlight', 'Untitled', 'no speech', a filename, or a "
+        "vague label like 'Amazing moment'. If the clip has no dialogue, title "
+        "it from what happens ON SCREEN (any '[VISUAL CONTEXT]' block below is "
+        "your source); never write about the absence of speech.\n\n"
         "Return ONLY valid JSON:\n"
         '{"title": "...", "description": "...", "tags": ["#tag1", "#tag2", ...], '
         '"platform_tips": "...", "primary_keyword": "...", '

@@ -2391,36 +2391,86 @@ async def _refresh_clips_with_translation(
     return changed, updated_clips
 
 
+def _seo_clean(s) -> str:
+    """A trimmed string with placeholder echoes removed (empty if useless)."""
+    s = (s or "").strip()
+    if not s:
+        return ""
+    low = s.lower()
+    if "no speech" in low or low.startswith("clip ") or low in {"highlight", "untitled clip"}:
+        return ""
+    return s
+
+
+def _is_timestamp_title(s) -> bool:
+    """True when a title is essentially just a time code ("3:20", "at 10:05",
+    "highlight at 1:02") — a timestamp is not a description."""
+    import re as _re
+    t = (s or "").strip().lower()
+    if not t:
+        return False
+    return bool(_re.fullmatch(
+        r"(?:(?:highlight|clip|moment|scene|part|at|@)[\s\-–—@:#]*)*"
+        r"\d{1,2}:\d{2}(?:\s*[-–—]\s*\d{1,2}:\d{2})?", t))
+
+
+def _first_sentence(text: str, min_len: int = 12) -> str:
+    """The first substantial sentence/line of ``text`` (for a title/caption)."""
+    for part in (text or "").replace("\n", ". ").split(". "):
+        part = part.strip().strip("-–—•").strip()
+        if len(part) >= min_len:
+            return part
+    t = (text or "").strip()
+    return t if len(t) >= min_len else ""
+
+
+def _clip_visual_context(clip_dict: dict) -> str:
+    """The best CLIP-SPECIFIC descriptive material for a clip, drawn from the
+    vision/editorial pass that flagged it — used to ground SEO copy on what
+    actually happens in THIS clip (not the whole video), and as the source
+    for a descriptive title when there is no dialogue.
+
+    Order reflects descriptiveness: the VLM hook + reason describe the on-
+    screen moment; the judge title + why-it-works add the editorial angle."""
+    parts = []
+    for key, label in (("vlm_hook", "On-screen hook"),
+                       ("vlm_reason", "Why it stands out"),
+                       ("judge_title", "Editorial angle"),
+                       ("why_this_works", "Engagement")):
+        v = _seo_clean(clip_dict.get(key))
+        if v:
+            parts.append(f"{label}: {v}")
+    return "\n".join(parts)
+
+
 def _fallback_seo_title(clip_dict: dict, video_summary: str, job) -> str:
-    """Deterministic, always-usable SEO title for a clip whose LLM SEO failed
-    or came back empty / as a "no speech" echo.
+    """Deterministic, DESCRIPTIVE SEO title for a clip whose LLM SEO failed or
+    came back empty / as a "no speech" echo.
 
-    Ladder: the clip's own (real) title → the video's first summary sentence
-    → the source filename — always suffixed with the clip's timestamp so
-    multiple fallback titles stay distinct."""
-    def _clean(s: str) -> str:
-        s = (s or "").strip()
-        return "" if "no speech" in s.lower() else s
-
-    start_s = float(clip_dict.get("start_time", 0.0) or 0.0)
-    m, s = divmod(int(start_s), 60)
-    stamp = f"{m}:{s:02d}"
-
-    t = _clean(clip_dict.get("title"))
-    if t and not t.lower().startswith("clip "):
-        return t[:80]
-    summary_head = ""
-    for cand in (video_summary or "").replace("\n", " ").split(". "):
-        cand = cand.strip()
-        if len(cand) >= 12:
-            summary_head = cand
-            break
-    if summary_head:
-        return f"{summary_head[:64]} — highlight at {stamp}"
+    Ladder — clip-specific first, always a real phrase, NEVER a bare
+    "highlight at 3:20": the clip's own title → its VLM hook (the on-screen
+    moment) → its hook line / caption → the first sentence of the VLM reason
+    or why-it-works → the video's opening subject sentence. Titles carry no
+    timestamp — a timestamp isn't a description."""
+    # 1. A real, non-generic clip title the pipeline already derived.
+    for key in ("title", "vlm_hook", "hook_text", "suggested_caption"):
+        v = _seo_clean(clip_dict.get(key))
+        if v:
+            return _first_sentence(v, min_len=6)[:80] or v[:80]
+    # 2. First substantial sentence of the editorial reasoning (describes
+    #    the moment even with no dialogue).
+    for key in ("vlm_reason", "why_this_works", "viral_score_reasoning"):
+        s = _first_sentence(_seo_clean(clip_dict.get(key)))
+        if s:
+            return s[:80]
+    # 3. Topical: the video's opening subject sentence (still describes the
+    #    content, unlike a bare timestamp).
+    s = _first_sentence(video_summary)
+    if s:
+        return s[:80]
+    # 4. Last resort — the source title, still no timestamp noise.
     base = os.path.splitext(str(getattr(job, "filename", "") or ""))[0].strip()
-    if base:
-        return f"{base[:64]} — highlight at {stamp}"
-    return f"Highlight at {stamp}"
+    return (base[:80] if base else "Untitled clip")
 
 
 async def _auto_generate_clip_seo(
@@ -2593,20 +2643,31 @@ async def _auto_generate_clip_seo(
 
         start_s = float(clip_dict.get("start_time", 0.0) or 0.0)
         end_s = float(clip_dict.get("end_time", start_s) or start_s)
-        clip_transcript = _slice(start_s, end_s)
-        if not clip_transcript:
-            # Never feed the "(no speech…)" placeholder (or a title derived
-            # from it) into the SEO prompt — the model echoes it back and the
-            # clip card ships titled "No speech in this segment". A no-speech
-            # window is a MUSIC/ACTION moment: say so and steer the model to
-            # write from the video summary instead.
-            _cap = (clip_dict.get("suggested_caption") or clip_dict.get("title") or "")
-            if "no speech" in _cap.lower():
-                _cap = ""
-            clip_transcript = _cap or (
-                "(This clip is a music/action moment with no dialogue — write "
-                "the SEO from the video summary and the visual energy of the "
-                "scene. Do NOT mention the absence of speech.)")
+        _speech = _slice(start_s, end_s)
+        _visual = _clip_visual_context(clip_dict)
+        if _speech:
+            # There IS dialogue: lead with it, but still append the clip's
+            # visual/editorial context so the title can reference what's
+            # on screen, not only what's said.
+            clip_transcript = _speech
+            if _visual:
+                clip_transcript += "\n\n[VISUAL CONTEXT for this clip]\n" + _visual
+        elif _visual:
+            # No dialogue but the vision/editorial pass described the moment —
+            # write the SEO FROM that, so the title describes the actual clip.
+            clip_transcript = (
+                "[This clip has no spoken dialogue — it's a visual / action / "
+                "music moment. Base the title, caption and hook on what happens "
+                "ON SCREEN, described below. Do NOT mention the absence of "
+                "speech.]\n" + _visual)
+        else:
+            # No dialogue and no per-clip description — fall back to the video
+            # summary, still steering away from a generic "no speech" title.
+            clip_transcript = (
+                "[This clip has no spoken dialogue. Write a specific, "
+                "descriptive title and caption from the video's subject below; "
+                "do NOT mention the absence of speech or use a timestamp as a "
+                "title.]\n" + (video_summary[:600] if video_summary else ""))
 
         if platform not in prompt_cache:
             # Inject ONLY this platform's section of the structured brief —
@@ -2688,12 +2749,11 @@ async def _auto_generate_clip_seo(
                             capped["tags"] = _tags
                 except Exception:
                     pass
-                # Guard: a generated title must be real copy. An empty title
-                # or a "no speech" echo (the model parroting the placeholder)
-                # is replaced with a deterministic fallback so every clip
-                # ships with a usable SEO title.
-                _gen_title = (capped.get("title") or "").strip()
-                if not _gen_title or "no speech" in _gen_title.lower():
+                # Guard: a generated title must be real, DESCRIPTIVE copy.
+                # Empty, a "no speech" echo, a bare "Clip N" / "Highlight", or
+                # a title that's just a timestamp is replaced with the
+                # descriptive deterministic fallback.
+                if not _seo_clean(capped.get("title")) or _is_timestamp_title(capped.get("title")):
                     capped["title"] = _fallback_seo_title(
                         clip_dict, video_summary, job)
                 seo_record = ClipSEO(**capped)
@@ -2733,15 +2793,14 @@ async def _auto_generate_clip_seo(
     if work:
         await asyncio.gather(*(_gen_one(cd, p, t) for cd, p, t in work))
 
-    # ── Guarantee sweep: EVERY clip ends with a usable SEO title ──
+    # ── Guarantee sweep: EVERY clip ends with a DESCRIPTIVE SEO title ──
     # A failed LLM call (timeout, provider outage) leaves seo_title empty and
     # the clip card renders as a bare transcript snippet — or worse, a stale
-    # "(no speech…)" placeholder survives in title/caption. Fill the gaps
-    # deterministically; never overwrite real generated/user copy.
+    # "(no speech…)" placeholder or a bare timestamp survives. Fill/upgrade the
+    # gaps deterministically; never overwrite real, descriptive copy.
     _swept = 0
     for clip_dict in updated_clips:
-        _st = (clip_dict.get("seo_title") or "").strip()
-        if not _st or "no speech" in _st.lower():
+        if not _seo_clean(clip_dict.get("seo_title")) or _is_timestamp_title(clip_dict.get("seo_title")):
             clip_dict["seo_title"] = _fallback_seo_title(
                 clip_dict, video_summary, job)
             _swept += 1

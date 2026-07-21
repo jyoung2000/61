@@ -741,8 +741,19 @@ def to_fez_clips(clipper_candidates: list, editorial_results: list = None) -> li
         if "no speech" in transcript_slice.lower():
             transcript_slice = ""
         _clean_slice = strip_cue_timestamps(transcript_slice)
-        title = judge_title or vlm_hook[:80] or (
-            " ".join(_clean_slice.split()[:8]) or f"Clip {idx}")
+        # Descriptive-title ladder: editorial title → the VLM's on-screen hook
+        # → the first spoken words → the VLM's reason (describes the moment for
+        # a no-dialogue clip) → a plain "Clip N" only when we truly know nothing.
+        _reason_head = ""
+        for _cand in (vlm_reason or "").replace("\n", ". ").split(". "):
+            _cand = _cand.strip()
+            if len(_cand) >= 12:
+                _reason_head = _cand
+                break
+        title = (judge_title or vlm_hook[:80]
+                 or " ".join(_clean_slice.split()[:8])
+                 or _reason_head[:80]
+                 or f"Clip {idx}")
         hook_text = vlm_hook or (_clean_slice[:120] if _clean_slice else title)
         reasoning = vlm_reason or (
             f"Selected by signal analysis (score {composite:.2f}).")
