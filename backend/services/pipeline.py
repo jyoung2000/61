@@ -2391,6 +2391,38 @@ async def _refresh_clips_with_translation(
     return changed, updated_clips
 
 
+def _fallback_seo_title(clip_dict: dict, video_summary: str, job) -> str:
+    """Deterministic, always-usable SEO title for a clip whose LLM SEO failed
+    or came back empty / as a "no speech" echo.
+
+    Ladder: the clip's own (real) title → the video's first summary sentence
+    → the source filename — always suffixed with the clip's timestamp so
+    multiple fallback titles stay distinct."""
+    def _clean(s: str) -> str:
+        s = (s or "").strip()
+        return "" if "no speech" in s.lower() else s
+
+    start_s = float(clip_dict.get("start_time", 0.0) or 0.0)
+    m, s = divmod(int(start_s), 60)
+    stamp = f"{m}:{s:02d}"
+
+    t = _clean(clip_dict.get("title"))
+    if t and not t.lower().startswith("clip "):
+        return t[:80]
+    summary_head = ""
+    for cand in (video_summary or "").replace("\n", " ").split(". "):
+        cand = cand.strip()
+        if len(cand) >= 12:
+            summary_head = cand
+            break
+    if summary_head:
+        return f"{summary_head[:64]} — highlight at {stamp}"
+    base = os.path.splitext(str(getattr(job, "filename", "") or ""))[0].strip()
+    if base:
+        return f"{base[:64]} — highlight at {stamp}"
+    return f"Highlight at {stamp}"
+
+
 async def _auto_generate_clip_seo(
     job_id: str, transcript: list, orchestrator,
     fallback_clips: Optional[list] = None,
@@ -2563,7 +2595,18 @@ async def _auto_generate_clip_seo(
         end_s = float(clip_dict.get("end_time", start_s) or start_s)
         clip_transcript = _slice(start_s, end_s)
         if not clip_transcript:
-            clip_transcript = clip_dict.get("suggested_caption") or clip_dict.get("title", "")
+            # Never feed the "(no speech…)" placeholder (or a title derived
+            # from it) into the SEO prompt — the model echoes it back and the
+            # clip card ships titled "No speech in this segment". A no-speech
+            # window is a MUSIC/ACTION moment: say so and steer the model to
+            # write from the video summary instead.
+            _cap = (clip_dict.get("suggested_caption") or clip_dict.get("title") or "")
+            if "no speech" in _cap.lower():
+                _cap = ""
+            clip_transcript = _cap or (
+                "(This clip is a music/action moment with no dialogue — write "
+                "the SEO from the video summary and the visual energy of the "
+                "scene. Do NOT mention the absence of speech.)")
 
         if platform not in prompt_cache:
             # Inject ONLY this platform's section of the structured brief —
@@ -2645,6 +2688,14 @@ async def _auto_generate_clip_seo(
                             capped["tags"] = _tags
                 except Exception:
                     pass
+                # Guard: a generated title must be real copy. An empty title
+                # or a "no speech" echo (the model parroting the placeholder)
+                # is replaced with a deterministic fallback so every clip
+                # ships with a usable SEO title.
+                _gen_title = (capped.get("title") or "").strip()
+                if not _gen_title or "no speech" in _gen_title.lower():
+                    capped["title"] = _fallback_seo_title(
+                        clip_dict, video_summary, job)
                 seo_record = ClipSEO(**capped)
                 seo_by_plat = dict(clip_dict.get("seo_by_platform") or {})
                 seo_by_plat[platform] = seo_record.model_dump()
@@ -2681,6 +2732,29 @@ async def _auto_generate_clip_seo(
 
     if work:
         await asyncio.gather(*(_gen_one(cd, p, t) for cd, p, t in work))
+
+    # ── Guarantee sweep: EVERY clip ends with a usable SEO title ──
+    # A failed LLM call (timeout, provider outage) leaves seo_title empty and
+    # the clip card renders as a bare transcript snippet — or worse, a stale
+    # "(no speech…)" placeholder survives in title/caption. Fill the gaps
+    # deterministically; never overwrite real generated/user copy.
+    _swept = 0
+    for clip_dict in updated_clips:
+        _st = (clip_dict.get("seo_title") or "").strip()
+        if not _st or "no speech" in _st.lower():
+            clip_dict["seo_title"] = _fallback_seo_title(
+                clip_dict, video_summary, job)
+            _swept += 1
+        for _fld in ("title", "suggested_caption", "hook_text"):
+            _v = (clip_dict.get(_fld) or "").strip()
+            if not _v or "no speech" in _v.lower():
+                clip_dict[_fld] = (clip_dict["seo_title"] if _fld == "title"
+                                   else clip_dict.get("seo_title") or _v or "")
+                _swept += 1
+    if _swept:
+        logger.info("[%s] Auto-SEO sweep: filled %d empty/placeholder "
+                    "title/caption field(s) deterministically", job_id, _swept)
+        await database.update_job_status(job_id, clips=updated_clips)
 
     if generated > 0 or failed > 0:
         await database.update_job_status(job_id, clips=updated_clips)

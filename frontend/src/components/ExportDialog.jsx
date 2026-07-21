@@ -43,6 +43,10 @@ export default function ExportDialog({
   sourceWidth = 1920,
   sourceHeight = 1080,
   subjectX = 50,
+  // The editor preview's subject-tracking keyframes ([{t, x}]) — shipped
+  // with server exports so the render follows the exact camera path the
+  // preview showed (no server-side re-derivation).
+  subjectKeyframes = null,
   // Platform safe-zone preview: called with a profile name (or null) so
   // the parent viewport can shade the regions platform UI will cover.
   onSafeZonePreview,
@@ -324,6 +328,15 @@ export default function ExportDialog({
         exportPayload.layout_mode = 'auto';
       }
 
+      // Preview-export parity: ship the EXACT keyframes the editor preview
+      // interpolates (hold-until-next) so the server renders the same camera
+      // path instead of re-deriving its own (which panned/swayed where the
+      // preview held still).
+      if (exportPayload.aspect_ratio && subjectKeyframes?.length > 0) {
+        exportPayload.subject_keyframes = subjectKeyframes.map(
+          (kf) => ({ time: +(+kf.t).toFixed(3), x: kf.x }));
+      }
+
       // Diagnostic logging: full export payload for debugging overlay/settings issues
       console.log('[ExportDialog] Export payload:', JSON.stringify({
         clip_id: exportPayload.clip_id,
@@ -428,7 +441,7 @@ export default function ExportDialog({
     startTime, endTime, aspectRatio, onServerExport, onClose, subtitleQA,
     jobId, clipId, clipTitle, timelineMediaLibrary, transcript, exportFPS,
     scenes, sourceWidth, sourceHeight, subjectX, needsServerForPitch,
-    aspectOverride, effectiveAspect,
+    aspectOverride, effectiveAspect, subjectKeyframes,
   ]);
 
   const handleCancel = useCallback(() => {

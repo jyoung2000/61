@@ -3068,6 +3068,9 @@ export default function Analysis() {
               onTranscriptUpdated={fetchJob}
               isProcessing={isProcessing}
               onSubjectKeyframes={setEditorSubjectKeyframes}
+              clipOverlaySources={(job.clips || [])
+                .filter((c) => c && c.id != null)
+                .map((c) => ({ clipId: c.id, start: c.start_time || 0 }))}
               subtitleOverlay={
                 <SubtitleOverlay
                   currentTime={videoCurrentTime}
@@ -5196,7 +5199,7 @@ export default function Analysis() {
                         </a>
                         {ec.clip_id != null && (
                           <a
-                            href={`/api/jobs/${jobId}/clips/${ec.clip_id}/seo.txt`}
+                            href={`/api/jobs/${jobId}/clips/${ec.clip_id}/seo.csv`}
                             download
                             title="Download SEO info (viral score, title, caption, tags, platform)"
                             style={{
@@ -5210,7 +5213,7 @@ export default function Analysis() {
                               whiteSpace: 'nowrap',
                             }}
                           >
-                            SEO .txt
+                            SEO .csv
                           </a>
                         )}
                       </div>

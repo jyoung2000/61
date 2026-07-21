@@ -859,7 +859,7 @@ export default function Logs() {
                       </a>
                       {ec.clip_id != null && (
                         <a
-                          href={`/api/jobs/${ec.jobId}/clips/${ec.clip_id}/seo.txt`}
+                          href={`/api/jobs/${ec.jobId}/clips/${ec.clip_id}/seo.csv`}
                           download
                           title="Download SEO info (viral score, title, caption, tags, platform)"
                           style={{
@@ -874,7 +874,7 @@ export default function Logs() {
                             whiteSpace: 'nowrap',
                           }}
                         >
-                          SEO .txt
+                          SEO .csv
                         </a>
                       )}
                       {qualityMenuOpen === i && (

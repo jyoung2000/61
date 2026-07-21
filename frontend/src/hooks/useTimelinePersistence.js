@@ -148,6 +148,55 @@ async function reconcileMediaLibrary(jobId) {
   }
 }
 
+/**
+ * Load the visual overlay items (text / shape / self-contained image) from
+ * each clip's saved editor state, remapped to ABSOLUTE video time.
+ *
+ * Used by the full-video editor so edits made while previewing a clip stay
+ * visible in that clip's section of the full timeline. ``sources`` is
+ * ``[{clipId, start}]`` (start = the clip's absolute start in the video).
+ * Items come back with a stable ``clipmerge-`` id (dedupe-able), a
+ * ``fromClipId`` tag, and ``__absStart``/``__absEnd`` absolute times the
+ * caller converts into its own timeline base. Best-effort: [] on any error.
+ */
+export async function loadClipOverlayItems(jobId, sources) {
+  if (!jobId || !sources?.length) return [];
+  const out = [];
+  try {
+    const db = await getDB();
+    for (const src of sources) {
+      if (src?.clipId == null) continue;
+      let rec;
+      try {
+        rec = await db.get(STORE_NAME, `${jobId}_${src.clipId}`);
+      } catch {
+        continue;
+      }
+      const items = rec?.state?.items;
+      if (!Array.isArray(items)) continue;
+      for (const it of items) {
+        if (!it || (it.type !== 'text' && it.type !== 'shape' && it.type !== 'image')) continue;
+        // A mediaRef-only image needs the clip's media library to resolve —
+        // skip it here rather than show a broken placeholder.
+        if (it.type === 'image' && !it.src) continue;
+        const absStart = (Number(src.start) || 0) + (Number(it.start) || 0);
+        const absEnd = (Number(src.start) || 0) + (Number(it.end) || 0);
+        if (!(absEnd > absStart)) continue;
+        out.push({
+          ...it,
+          id: `clipmerge-${src.clipId}-${it.id}`,
+          fromClipId: src.clipId,
+          __absStart: absStart,
+          __absEnd: absEnd,
+        });
+      }
+    }
+  } catch {
+    return [];
+  }
+  return out;
+}
+
 export default function useTimelinePersistence(jobId, clipId) {
   const exportState = useTimelineStore((s) => s.exportState);
   const importState = useTimelineStore((s) => s.importState);

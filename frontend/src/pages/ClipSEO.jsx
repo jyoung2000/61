@@ -1050,9 +1050,17 @@ export default function ClipSEO() {
     if (overlays.warnings.length > 0) {
       for (const w of overlays.warnings) console.warn(`[Export] ${w}`);
     }
+    // Preview-export parity: ship the EXACT keyframes the preview player
+    // interpolates (hold-until-next), so the backend renders the same
+    // camera path instead of re-deriving its own (which panned/swayed
+    // where the preview held still).
+    if (aspectRatio && subjectKeyframes?.length > 0) {
+      body.subject_keyframes = subjectKeyframes.map(
+        (kf) => ({ time: +(+kf.t).toFixed(3), x: kf.x }));
+    }
     encoding.startExport(jobId, parseInt(clipId), clip?.title || `Clip ${clipId}`, body);
     showToast(`Exporting "${clip?.title || `Clip ${clipId}`}"...`, 'info');
-  }, [jobId, clipId, clip, startTime, endTime, clipSettings, encoding, editorTrim, editorVolume, editorSpeed, editorSegments, timelineItems, timelineMediaLibrary]);
+  }, [jobId, clipId, clip, startTime, endTime, clipSettings, encoding, editorTrim, editorVolume, editorSpeed, editorSegments, timelineItems, timelineMediaLibrary, aspectRatio, subjectKeyframes]);
 
   const handleApplySettings = useCallback((applied) => {
     setClipSettings(applied);
@@ -1340,7 +1348,7 @@ export default function ClipSEO() {
                   }}>
                     Download
                   </a>
-                  <a href={`/api/jobs/${jobId}/clips/${clipId}/seo.txt`} download
+                  <a href={`/api/jobs/${jobId}/clips/${clipId}/seo.csv`} download
                     title="Download SEO info (viral score, title, caption, tags, platform)"
                     style={{
                       padding: '6px 12px', fontSize: 11, fontWeight: 600,
@@ -1348,7 +1356,7 @@ export default function ClipSEO() {
                       border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)',
                       textDecoration: 'none', whiteSpace: 'nowrap',
                     }}>
-                    SEO .txt
+                    SEO .csv
                   </a>
                 </>
               )}
@@ -1759,7 +1767,7 @@ export default function ClipSEO() {
                       Download Again
                     </a>
                     <a
-                      href={`/api/jobs/${jobId}/clips/${clipId}/seo.txt`}
+                      href={`/api/jobs/${jobId}/clips/${clipId}/seo.csv`}
                       download
                       title="Download SEO info (viral score, title, caption, tags, platform)"
                       style={{
@@ -1770,7 +1778,7 @@ export default function ClipSEO() {
                         display: 'flex', alignItems: 'center',
                       }}
                     >
-                      SEO .txt
+                      SEO .csv
                     </a>
                   </>
                 )}

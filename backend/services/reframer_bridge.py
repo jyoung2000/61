@@ -735,6 +735,11 @@ def to_fez_clips(clipper_candidates: list, editorial_results: list = None) -> li
         # ``transcript_slice`` carries inline ``[m:ss]`` cue markers; strip them
         # from the social-facing hook/caption/title (shown on cards and used as
         # on-screen overlays) — "[0:00]" is just noise there.
+        # The prompt-side placeholder "(no speech in this segment)" must NEVER
+        # become a user-facing title/caption — clips over music/action windows
+        # were shipping cards literally titled "no speech in this segment".
+        if "no speech" in transcript_slice.lower():
+            transcript_slice = ""
         _clean_slice = strip_cue_timestamps(transcript_slice)
         title = judge_title or vlm_hook[:80] or (
             " ".join(_clean_slice.split()[:8]) or f"Clip {idx}")

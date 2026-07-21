@@ -3548,30 +3548,42 @@ def _build_crop_x_expr(
 
     # FFmpeg nested if() expressions have a depth limit (~100-200 depending
     # on build).  If we still have too many offsets, downsample to stay safe.
+    # Evenly-spaced index selection (always including first + last) — the old
+    # integer-step walk (step = (n-2)//78) rounded to step=1 for any count
+    # under ~158, silently keeping ALL knots and shipping 100+-deep nested
+    # expressions on dense tracks.
     MAX_EXPR_DEPTH = 80
     if len(offsets) > MAX_EXPR_DEPTH:
-        # Keep first, last, and evenly spaced keyframes
-        step = max(1, (len(offsets) - 2) // (MAX_EXPR_DEPTH - 2))
-        sampled = [offsets[0]]
-        for i in range(step, len(offsets) - 1, step):
-            sampled.append(offsets[i])
-        sampled.append(offsets[-1])
+        idxs = sorted({
+            round(i * (len(offsets) - 1) / (MAX_EXPR_DEPTH - 1))
+            for i in range(MAX_EXPR_DEPTH)
+        })
+        sampled = [offsets[i] for i in idxs]
         logger.warning(
             "[SubjectTracking] _build_crop_x_expr: downsampled %d → %d offsets (FFmpeg expression depth limit)",
             len(offsets), len(sampled),
         )
         offsets = sampled
 
-    # Force step mode for high keyframe counts — smoothstep triples nesting
-    # depth (hold + transition + hold per segment) which can exceed limits
-    if not step_mode and len(offsets) > 40:
-        step_mode = True
+    # Dense keyframe sets (a sampled camera track — the frontend's dense
+    # subject track or a cached RenderPlan motion_path) interpolate LINEARLY
+    # between knots. The old code forced STEP here, which — after the
+    # depth-limit downsampling above — turned a smooth camera move into
+    # ~0.5s stair-jumps (visible lurching side to side in the export that
+    # the preview, riding the dense track, never showed). Linear has the
+    # same expression depth as step and converges to the dense track.
+    # Smoothstep on a dense track is also wrong (it triples nesting depth
+    # and S-curves every half-second hop), so both modes collapse to linear.
+    linear_mode = len(offsets) > 40
+    if linear_mode:
         logger.info(
-            "[SubjectTracking] _build_crop_x_expr: forcing step mode (%d offsets — smoothstep would exceed nesting limit)",
+            "[SubjectTracking] _build_crop_x_expr: dense set (%d offsets) — using "
+            "piecewise-linear interpolation (matches the preview's dense track)",
             len(offsets),
         )
 
-    interp_label = "step" if step_mode else "smoothstep"
+    interp_label = ("linear" if linear_mode
+                    else ("step" if step_mode else "smoothstep"))
     logger.info(
         "[SubjectTracking] _build_crop_x_expr: dynamic (%s) — %d keyframes, offsets=%s (src_w=%d, crop_w=%d, max_offset=%d)",
         interp_label, len(offsets),
@@ -3583,7 +3595,19 @@ def _build_crop_x_expr(
     # Final fallback: last offset
     expr = str(offsets[-1][1])
 
-    if step_mode:
+    if linear_mode:
+        # Piecewise-linear ramp between knots — same nesting depth as step.
+        for i in range(len(offsets) - 2, -1, -1):
+            t0, off0 = offsets[i]
+            t1, off1 = offsets[i + 1]
+            dt = t1 - t0
+            if dt <= 0 or off0 == off1:
+                segment = str(off0)
+            else:
+                segment = (f"{off0}+{off1 - off0}"
+                           f"*clip((t-{t0:.3f})/{dt:.3f}\\,0\\,1)")
+            expr = f"if(lt(t\\,{t1:.3f})\\,{segment}\\,{expr})"
+    elif step_mode:
         # Step function: hold each offset until the next keyframe (matches
         # frontend interpolateSubjectX() exactly — instant snap, no easing)
         for i in range(len(offsets) - 2, -1, -1):
@@ -3819,6 +3843,47 @@ async def _probe_audio_sample_rate(video_path: str) -> int | None:
         return None
 
 
+async def _probe_video_fps(video_path: str) -> float | None:
+    """Average video frame rate of ``video_path`` (ffprobe); None on failure."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=avg_frame_rate",
+            "-of", "default=nk=1:nw=1", video_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out, _ = await proc.communicate()
+        raw = out.decode().strip().splitlines()[0]
+        if "/" in raw:
+            num, den = raw.split("/", 1)
+            fps = float(num) / float(den) if float(den) else 0.0
+        else:
+            fps = float(raw)
+        return fps if fps > 0 else None
+    except (OSError, ValueError, IndexError, ZeroDivisionError):
+        return None
+
+
+def _active_word_output_rate(src_fps: float | None) -> str | None:
+    """Output ``-r`` for active-word (karaoke) exports, or None for no force.
+
+    The old behavior forced ``-r 30`` unconditionally, which resampled a
+    23.976fps source with an uneven 4:5 pull-down — every 4th frame doubled —
+    a visible STUTTER on motion. Karaoke color flips only render at frame
+    boundaries, so some rate raise is still wanted on cinematic sources;
+    an exact 2× of the source keeps the cadence uniform (every frame shown
+    exactly twice — no judder) while doubling the subtitle update rate.
+    Sources already ≥30fps need no help; unknown fps forces nothing.
+    """
+    if not src_fps:
+        return None
+    if src_fps >= 29.5:
+        return None
+    doubled = min(60.0, src_fps * 2.0)
+    return f"{doubled:.3f}"
+
+
 def _speed_audio_chain(spd: float, preserve_pitch: bool, sample_rate: int | None) -> str:
     """Pick the audio retiming filter for a speed change.
 
@@ -3880,7 +3945,13 @@ def _build_speed_timeline(
     pos = 0.0
 
     for seg in sorted_segs:
-        seg_start = max(0.0, seg["start"] - clip_start)
+        # Clamp to the already-covered position as well as the clip bounds.
+        # Editor segments can OVERLAP by a little (drag/split float drift or a
+        # user dragging a boundary past its neighbor); without the ``pos``
+        # clamp the overlapping region was emitted in BOTH timeline entries,
+        # so the export re-played it — the "exported clip loops a moment"
+        # bug. Clamping keeps every source frame in exactly one entry.
+        seg_start = max(pos, max(0.0, seg["start"] - clip_start))
         seg_end = min(clip_dur, seg["end"] - clip_start)
         if seg_end <= seg_start:
             continue
@@ -4601,9 +4672,16 @@ def _build_filter_chain(
                         # Step mode (frontend keyframes): instant snap, no transitions
                         _final_kf = subject_keyframes
                     else:
-                        # Smoothstep mode (backend keyframes): insert snap transitions
-                        # for large jumps so they don't produce slow pans
-                        _final_kf = _insert_snap_transitions(subject_keyframes)
+                        # Backend keyframes: convert EVERY position change into
+                        # hold-then-snap (threshold=1). The old threshold of 15
+                        # only caught big jumps — smaller alternating moves
+                        # (A-B dialogue a dozen sx-units apart) still panned
+                        # across the whole inter-keyframe gap, which read as
+                        # the exported clip SWAYING side to side. The preview
+                        # player holds-until-next for every change, so holding
+                        # + a 150ms glide is the parity behavior.
+                        _final_kf = _insert_snap_transitions(
+                            subject_keyframes, jump_threshold=1)
                     x_expr = _build_crop_x_expr(
                         _final_kf, max_x_offset, src_w, crop_w,
                         step_mode=use_step_interpolation,
@@ -7615,7 +7693,7 @@ async def export_clip(
                     "-threads", str(app_settings.FFMPEG_THREADS),
                 ]
                 if _has_audio:
-                    cmd += ["-c:a", "aac"]
+                    cmd += ["-c:a", "aac", "-b:a", "192k"]
                 cmd += ["-avoid_negative_ts", "make_zero"]
                 if app_settings.FFMPEG_FASTSTART:
                     cmd += ["-movflags", "+faststart"]
@@ -7867,17 +7945,20 @@ async def export_clip(
                             cmd += ["-vf", vf]
                 if af:
                     cmd += ["-af", af]
-                # When active word highlighting is enabled, ensure at least
-                # 30fps output so subtitle color transitions appear smooth.
-                # Low-fps source videos (e.g. 24fps) show visible lag because
-                # subtitle updates only render at video frame boundaries.
+                # Active-word (karaoke) exports raise the frame rate so color
+                # flips don't lag — but ONLY by an exact 2× of the source.
+                # The old unconditional "-r 30" resampled 23.976fps sources
+                # with an uneven pull-down (every 4th frame doubled) — a
+                # visible stutter on motion.
                 _aw_enabled = subtitle_settings.get("active_word_enabled", False) if subtitle_settings else False
                 if _aw_enabled and subtitles_enabled:
-                    cmd += ["-r", "30"]
+                    _aw_rate = _active_word_output_rate(await _probe_video_fps(video_path))
+                    if _aw_rate:
+                        cmd += ["-r", _aw_rate]
                 cmd += [
                     *_gpu_encode_args(qp, export_quality),
                     "-threads", str(app_settings.FFMPEG_THREADS),
-                    "-c:a", "aac",
+                    "-c:a", "aac", "-b:a", "192k",
                     "-avoid_negative_ts", "make_zero",
                 ]
                 if app_settings.FFMPEG_FASTSTART:
@@ -8197,7 +8278,7 @@ async def export_clip(
                 cmd += [
                     *_gpu_encode_args(fb_qp, export_quality),
                     "-threads", str(app_settings.FFMPEG_THREADS),
-                    "-c:a", "aac",
+                    "-c:a", "aac", "-b:a", "192k",
                     "-avoid_negative_ts", "make_zero",
                 ]
                 if app_settings.FFMPEG_FASTSTART:
@@ -8232,10 +8313,11 @@ async def export_clip(
 
         logger.info(f"Exported clip {clip_id} to {output_path}")
 
-        # Drop a human-readable SEO sidecar (.txt) next to the MP4 so the
-        # user gets the clip's viral score, title, caption, hashtags,
-        # recommended platform, per-platform SEO and captions to paste into
-        # a social upload. Best-effort — never fail the export over it.
+        # Drop a CSV SEO sidecar next to the MP4 so the user gets the clip's
+        # viral score, title, caption, hashtags, recommended platform,
+        # per-platform SEO and captions (headers + one row — spreadsheet
+        # ready) to paste into a social upload. Best-effort — never fail
+        # the export over it.
         if app_settings.CLIP_EXPORT_SEO_SIDECAR:
             try:
                 from backend.services.clip_seo_sidecar import write_clip_seo_sidecar

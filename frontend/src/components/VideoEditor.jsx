@@ -329,6 +329,11 @@ export default function VideoEditor({
   // so page-level actions live inline in the editor chrome instead of a
   // separate header row above it.
   headerExtras = null,
+  // Full-video mode only: [{clipId, start}] for every detected clip, so
+  // overlay edits saved while previewing a clip are merged back onto the
+  // full timeline at their absolute position (clip edits stay visible in
+  // that section of the full video).
+  clipOverlaySources = null,
 }) {
   const { isMobile, isTablet, isTouch } = useResponsive();
   // No-hover / coarse-pointer surfaces: gate autoplay + touch affordances off
@@ -505,6 +510,49 @@ export default function VideoEditor({
     multiTrackInitialized.current = true;
     lastInitClipEnd.current = effectiveEnd;
   }, [src, clipStart, clipEnd, initFromClip, recovered, timelineStoreItems.length, transcript, addItem, addSubtitlesFromTranscript, rebuildSubtitlesFromTranscript, subtitlesUserEdited]);
+
+  // ── Full-video mode: surface per-clip overlay edits on this timeline ──
+  // Edits made while a clip was scoped (text / shapes / images) are saved
+  // per clip in IndexedDB. Merge them here at their ABSOLUTE position so the
+  // full-video timeline shows every clip's edits in its section. Dedupe by
+  // the stable ``clipmerge-`` id — a store re-init wipes them, and the
+  // items.length dependency re-runs this merge afterwards.
+  useEffect(() => {
+    if (!clipOverlaySources?.length || !jobId) return;
+    if (clipId != null) return; // only when the editor is full-video scoped
+    let cancelled = false;
+    (async () => {
+      try {
+        const { loadClipOverlayItems } = await import('../hooks/useTimelinePersistence');
+        const merged = await loadClipOverlayItems(jobId, clipOverlaySources);
+        if (cancelled || !merged.length) return;
+        const st = useTimelineStore.getState();
+        if (!st.items.some((it) => it.type === 'video')) return; // not initialized yet
+        const existing = new Set(st.items.map((it) => it.id));
+        const dur = clipEnd > clipStart ? clipEnd - clipStart : 0;
+        let added = 0;
+        for (const it of merged) {
+          if (existing.has(it.id)) continue;
+          const relStart = it.__absStart - clipStart;
+          const relEnd = it.__absEnd - clipStart;
+          if (relEnd <= 0 || (dur > 0 && relStart >= dur)) continue;
+          const { __absStart, __absEnd, ...rest } = it;
+          addItem({
+            ...rest,
+            start: Math.max(0, relStart),
+            end: dur > 0 ? Math.min(dur, relEnd) : relEnd,
+          });
+          added++;
+        }
+        if (added) {
+          console.log(`[VideoEditor] Merged ${added} clip overlay edit(s) onto the full-video timeline`);
+        }
+      } catch (e) {
+        console.warn('[VideoEditor] clip overlay merge skipped:', e);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [clipOverlaySources, jobId, clipId, clipStart, clipEnd, addItem, timelineStoreItems.length]);
 
   // ── Keep the subtitle track in sync with the current transcript ──
   // Runs INDEPENDENTLY of the init effect above, whose branching (needsInit /
@@ -3359,6 +3407,17 @@ export default function VideoEditor({
               {headerExtras}
             </span>
           )}
+          {onClose && clipId != null && (
+            <Tooltip label="Back to the full-video timeline (clip edits are kept)">
+              <button
+                className="ve-topbar__toggle"
+                onClick={(e) => { e.stopPropagation(); onClose(); }}
+                aria-label="Return to full video"
+              >
+                ⤺ Full video
+              </button>
+            </Tooltip>
+          )}
           <Tooltip label="Export">
             <button
               className="ve-topbar__export"
@@ -4689,6 +4748,7 @@ export default function VideoEditor({
           sourceWidth={sourceWidth}
           sourceHeight={sourceHeight}
           subjectX={subjectX}
+          subjectKeyframes={subjectKeyframes}
           onServerExport={handleServerExport}
           onSafeZonePreview={setSafeZonePlatform}
         />

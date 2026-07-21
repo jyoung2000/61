@@ -281,14 +281,15 @@ export function EncodingProvider({ children }) {
                 document.body.removeChild(a);
               });
 
-            // Companion SEO sidecar (.txt): viral score, title, caption,
-            // hashtags, recommended platform, per-platform SEO + captions.
-            // Same blob-download approach as the clip; staggered slightly so
-            // the browser treats it as a separate download rather than
-            // collapsing the two clicks into one.
+            // Companion SEO sidecar (.csv, headers + one row): viral score,
+            // title, caption, hashtags, recommended platform, per-platform
+            // SEO + captions. Same blob-download approach as the clip;
+            // staggered slightly so the browser treats it as a separate
+            // download rather than collapsing the two clicks into one.
             const seoUrl = rewriteForFetch(msg.seo_url);
             if (seoUrl) {
-              const seoName = `[${qualityTag}] ${safeName}.txt`;
+              const seoExt = (seoUrl.split('.').pop() || 'csv').split('?')[0];
+              const seoName = `[${qualityTag}] ${safeName}.${seoExt === 'txt' ? 'txt' : 'csv'}`;
               setTimeout(() => {
                 fetch(seoUrl)
                   .then((res) => {
