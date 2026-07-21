@@ -697,10 +697,23 @@ impl AppState {
         let mut last_done: u64 = 0;
         let feed = self.activity.lock().unwrap();
         for e in feed.iter() {
+            // Read-only lookups must not hold the GPU hostage: ClipAI's host
+            // registry refreshes /api/show for EVERY model every few minutes,
+            // and its Settings/diagnostics pages poll /v1/logs and the shared-
+            // folder listings — with any of those counting as "work", a 45s
+            // idle-free window fired 9 minutes late on a real rig (and never,
+            // with a browser tab open). Real work = generation, transcription,
+            // vision, pulls, and file DOWNLOADS (/v1/files/read) only.
             let probe = e.kind == "health"
                 || e.path.ends_with("/api/tags")
                 || e.path.ends_with("/api/ps")
-                || e.path.ends_with("/api/version");
+                || e.path.ends_with("/api/version")
+                || e.path.ends_with("/api/show")
+                || e.path.ends_with("/v1/logs")
+                || e.path.ends_with("/v1/update/status")
+                || e.path.ends_with("/v1/files/roots")
+                || e.path.ends_with("/v1/files/list")
+                || e.path.ends_with("/v1/files/thumb");
             if probe {
                 continue;
             }
@@ -1060,6 +1073,14 @@ mod tests {
         st.end_activity(a, 200);
         let b = st.begin_activity("ollama", "/api/tags", "", "", "");
         st.end_activity(b, 200);
+        // The registry's periodic /api/show refresh and the UI's log/file
+        // listings starved a 45s idle-free window for 9+ minutes on a real
+        // rig — all read-only lookups must leave the idle clock untouched.
+        for p in ["/api/show", "/v1/logs", "/v1/update/status",
+                  "/v1/files/roots", "/v1/files/list", "/v1/files/thumb"] {
+            let c = st.begin_activity("ollama", p, "", "", "");
+            st.end_activity(c, 200);
+        }
         let (inflight, last_real) = st.real_work_snapshot();
         assert!(!inflight);
         assert_eq!(last_real, 0, "probes must leave the idle clock untouched");

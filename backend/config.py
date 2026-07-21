@@ -199,6 +199,27 @@ class Settings(BaseSettings):
     # still down: the probe fails fast and the source-language fallback ships
     # exactly as before.
     TRANSLATION_RETRY_AFTER_OUTAGE: bool = True
+    # ── Targeted vocal-separation gap recovery ──
+    # After a job COMPLETES, find uncovered timeline holes in the transcript
+    # (music-buried dialogue Whisper's VAD skipped — e.g. a press-conference
+    # scene under crowd noise), Demucs-separate ONLY those spans on the CPU,
+    # re-transcribe the vocal stems, translate and merge the recovered cues
+    # additively. Runs like the deferred SEO: the analysis time the user sees
+    # is untouched, and the transcript refreshes in place a minute or two
+    # later. Fail-soft: no gaps / no demucs / ASR failure → nothing changes.
+    VOCAL_GAP_RECOVERY_ENABLED: bool = True
+    # A hole must be at least this long to schedule a recovery span.
+    VOCAL_GAP_MIN_S: float = 8.0
+    # Lead-in/out seconds around each hole (Whisper needs context; the pad is
+    # clipped back out of the recovered cues so existing ones never double).
+    VOCAL_GAP_PAD_S: float = 2.0
+    # Bounds so a sparse transcript can't schedule half the episode.
+    VOCAL_GAP_MAX_SPANS: int = 8
+    VOCAL_GAP_MAX_TOTAL_S: float = 240.0
+    # Demucs device for the short recovery slices. CPU by default: recovery
+    # may overlap SEO's GPU work and the slices are small.
+    VOCAL_GAP_DEVICE: str = "cpu"
+    VOCAL_GAP_SPAN_TIMEOUT_S: int = 300
     # VRAM the CUDA context + baseline allocation hold and never free — subtract
     # from total VRAM to get the model's usable budget. ~1.2 GB matches a 4 GB
     # GTX 1650 (≈2.5 GB free after Whisper releases).

@@ -2871,6 +2871,86 @@ async def _polish_transcript_loop(
     return best_models, best_report
 
 
+async def _post_complete_gap_recovery(job_id: str, orchestrator) -> None:
+    """Fill music-buried transcript holes AFTER the job completes.
+
+    Slices only the uncovered spans, Demucs-separates them (CPU), re-ASRs the
+    vocal stems, translates any recovered lines, and merges them ADDITIVELY
+    into both tracks — existing cues are never touched. Runs in the deferred
+    post-COMPLETE task (after SEO), so the reported analysis time is
+    unchanged; the UI transcript refreshes in place when it lands."""
+    from backend.services.vocal_gap_recovery import (
+        merge_recovered, recover_gap_dialogue)
+
+    if not bool(getattr(settings, "VOCAL_GAP_RECOVERY_ENABLED", True)):
+        return
+    job = await database.load_job(job_id)
+    if job is None:
+        return
+    _src = [s.model_dump() if hasattr(s, "model_dump") else dict(s)
+            for s in (getattr(job, "transcript", None) or [])]
+    if len(_src) < 4:
+        return
+    _audio = os.path.join(database._job_dir(job_id), "audio.wav")
+    source_lang = (getattr(job, "language", "") or "").strip().lower()
+    recovered = await recover_gap_dialogue(
+        job_id, _audio, _src, source_lang,
+        os.path.join(database._job_dir(job_id), "gap_recovery"))
+    if not recovered:
+        return
+
+    _merged_src, _added = merge_recovered(_src, recovered)
+    if not _added:
+        return
+    updates: dict = {"transcript": _merged_src}
+
+    # Translate the recovered lines when the job ships a translated track —
+    # per-cue plain-text calls (the most robust local-model shape), with the
+    # job's roster consolidations re-applied for name consistency.
+    _tt = [s.model_dump() if hasattr(s, "model_dump") else dict(s)
+           for s in (getattr(job, "translated_transcript", None) or [])]
+    if _tt and orchestrator is not None:
+        from backend.services.canonical_names import (
+            apply_roster_corrections, roster_corrections_for_job)
+        from backend.services.translator import SUPPORTED_LANGUAGES
+        _tgt = (getattr(job, "subtitle_language", "") or "en").strip().lower() or "en"
+        _tgt_name = SUPPORTED_LANGUAGES.get(_tgt, "English")
+        translated_new: list[dict] = []
+        for r in recovered:
+            try:
+                _out = await orchestrator.text_completion(
+                    f"Translate this subtitle line to {_tgt_name}. "
+                    f"Reply with ONLY the translation, no quotes.\n\n{r['text']}",
+                    max_tokens=200, timeout=60, job_id=job_id,
+                    skip_circuit_breaker=True)
+                _out = (_out or "").strip().strip('"')
+                if _out:
+                    translated_new.append({**r, "text": _out})
+            except Exception:
+                continue
+        if translated_new:
+            _map = roster_corrections_for_job(job_id)
+            if _map:
+                _texts, _n = apply_roster_corrections(
+                    [t["text"] for t in translated_new], _map)
+                for t, txt in zip(translated_new, _texts):
+                    t["text"] = txt
+            _merged_tt, _added_tt = merge_recovered(_tt, translated_new)
+            if _added_tt:
+                updates["translated_transcript"] = _merged_tt
+
+    await database.update_job_status(job_id, **updates)
+    logger.info(
+        "[%s] Gap recovery merged %d recovered cue(s) into the transcript",
+        job_id, _added)
+    await broadcast_ws(job_id, {
+        "type": "background_task", "task": "vocal_recovery",
+        "status": "complete",
+        "message": (f"Recovered {_added} line(s) from music-buried scenes"
+                    " (vocal separation)"),
+    })
+
+
 async def _set_translation_status(job_id: str, status: str, reason: Optional[str] = None):
     """Persist a visible, job-level translation outcome + broadcast it (Task 3).
 
@@ -7684,6 +7764,25 @@ async def _run_analysis_inner(job_id: str, resume: bool = False):
                 logger.warning(
                     "[%s] Post-COMPLETE Auto-SEO failed (non-fatal): %s",
                     job_id, _ps_err)
+            finally:
+                # Vocal-separation gap recovery AFTER SEO (both post-COMPLETE,
+                # serialized so their GPU work never overlaps): fill music-
+                # buried transcript holes additively, then refresh the UI.
+                try:
+                    await _post_complete_gap_recovery(job_id, orchestrator)
+                except Exception as _gr_err:
+                    logger.warning(
+                        "[%s] Post-COMPLETE gap recovery failed (non-fatal): %s",
+                        job_id, _gr_err)
+                # This was the job's LAST Companion work — tell it the job is
+                # truly over so its 20s-grace free unloads the models now,
+                # instead of them sitting resident until the idle reaper
+                # eventually wins against UI/registry polling.
+                try:
+                    from backend.services import companion_progress as _cp
+                    _cp.job_ended(job_id)
+                except Exception:
+                    pass
         try:
             _seo_task = asyncio.get_running_loop().create_task(_post_complete_seo())
             _BACKGROUND_TASKS.add(_seo_task)
@@ -7691,6 +7790,29 @@ async def _run_analysis_inner(job_id: str, resume: bool = False):
             logger.info(
                 "[%s] Auto-SEO deferred to background — job is COMPLETE; "
                 "clip SEO copy will fill in shortly", job_id)
+        except RuntimeError:
+            pass
+    elif _persisted:
+        # No deferred-SEO task (inline SEO, or a job with no clips) — the gap
+        # recovery + final Companion job-ended signal still need a home.
+        async def _post_complete_recovery_only():
+            try:
+                await _post_complete_gap_recovery(job_id, orchestrator)
+            except Exception as _gr_err:
+                logger.warning(
+                    "[%s] Post-COMPLETE gap recovery failed (non-fatal): %s",
+                    job_id, _gr_err)
+            finally:
+                try:
+                    from backend.services import companion_progress as _cp
+                    _cp.job_ended(job_id)
+                except Exception:
+                    pass
+        try:
+            _gr_task = asyncio.get_running_loop().create_task(
+                _post_complete_recovery_only())
+            _BACKGROUND_TASKS.add(_gr_task)
+            _gr_task.add_done_callback(_BACKGROUND_TASKS.discard)
         except RuntimeError:
             pass
     # NOTE: translate + polish (``_background_post_processing``) ran on the

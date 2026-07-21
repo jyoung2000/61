@@ -1,0 +1,309 @@
+"""Targeted vocal-separation gap recovery — fill music-buried dropouts.
+
+Dialogue under loud BGM/SFX comes back from Whisper as *no_speech*, so whole
+scenes drop out of the transcript (confirmed: the Gundam Wing ep-1 press
+conference — a reporter barrage over crowd noise — shipped as a 25-second
+hole in every run). Full-track separation before ASR would fix it but delays
+transcription start and kills the early-translation overlap, so it stays off.
+
+This module is the surgical version:
+
+  1. Find COVERAGE GAPS in the finished transcript (uncovered timeline holes
+     between the first and last cue, bounded in count and total seconds).
+  2. Slice ONLY those spans out of the already-extracted job audio.
+  3. Demucs each slice on the CPU (a few tens of seconds of audio — never
+     touches either GPU while it may still be busy).
+  4. Re-transcribe the isolated vocal stems (remote Companion whisper when
+     paired, else the local engine path the caller provides).
+  5. Return recovered cues clipped to their gap so they can be merged
+     ADDITIVELY — existing cues are never modified or replaced.
+
+Runs post-COMPLETE (like the deferred SEO) so the analysis time the user
+sees is untouched; the transcript refreshes in place when recovery lands.
+Fail-soft everywhere: no Demucs, no gaps, ASR failure, or garbage output
+just means "no recovered cues"."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import re
+import subprocess
+from difflib import SequenceMatcher
+from typing import Optional
+
+logger = logging.getLogger("clipai.vocal_gap_recovery")
+
+
+def _seg_bounds(seg) -> Optional[tuple[float, float]]:
+    if isinstance(seg, dict):
+        a, b = seg.get("start"), seg.get("end")
+    else:
+        a, b = getattr(seg, "start", None), getattr(seg, "end", None)
+    try:
+        a, b = float(a), float(b)
+    except (TypeError, ValueError):
+        return None
+    return (a, b) if b > a else None
+
+
+def _seg_text(seg) -> str:
+    t = seg.get("text") if isinstance(seg, dict) else getattr(seg, "text", "")
+    return (t or "").strip()
+
+
+def find_coverage_gaps(
+    segments,
+    *,
+    min_gap_s: float = 8.0,
+    pad_s: float = 2.0,
+    max_spans: int = 8,
+    max_total_s: float = 240.0,
+) -> list[tuple[float, float]]:
+    """Uncovered timeline holes ≥ ``min_gap_s`` between the first and last cue.
+
+    Interior only — silence before the first or after the last cue is
+    normally logos/credits, not buried dialogue. Spans are padded by
+    ``pad_s`` on each side (Whisper needs lead-in context), largest first,
+    capped at ``max_spans`` and ``max_total_s`` recovered seconds so a
+    pathological transcript can't schedule half the episode."""
+    spans = sorted(b for s in (segments or []) if (b := _seg_bounds(s)))
+    if len(spans) < 2:
+        return []
+    gaps: list[tuple[float, float]] = []
+    cover_end = spans[0][1]
+    for a, b in spans[1:]:
+        if a - cover_end >= min_gap_s:
+            gaps.append((max(0.0, cover_end - pad_s), a + pad_s))
+        cover_end = max(cover_end, b)
+    gaps.sort(key=lambda g: g[0] - g[1])  # largest first
+    picked: list[tuple[float, float]] = []
+    total = 0.0
+    for g in gaps[: max(0, max_spans)]:
+        if total + (g[1] - g[0]) > max_total_s:
+            continue
+        picked.append(g)
+        total += g[1] - g[0]
+    picked.sort()
+    return picked
+
+
+def _clip_to_gap(seg: dict, gap: tuple[float, float], pad_s: float) -> Optional[dict]:
+    """Keep a recovered cue only where it lands INSIDE the (unpadded) gap —
+    the padded lead-in/out overlaps existing cues and would double them."""
+    b = _seg_bounds(seg)
+    if b is None:
+        return None
+    lo, hi = gap[0] + pad_s, gap[1] - pad_s
+    if b[1] <= lo or b[0] >= hi:
+        return None
+    out = dict(seg)
+    out["start"], out["end"] = max(b[0], lo), min(b[1], hi)
+    return out if out["end"] - out["start"] >= 0.3 else None
+
+
+def _similar(a: str, b: str) -> float:
+    a, b = (a or "").lower().strip(), (b or "").lower().strip()
+    if not a or not b:
+        return 0.0
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def merge_recovered(existing: list, recovered: list[dict]) -> tuple[list, int]:
+    """Insert recovered cues into ``existing`` (returned sorted by start).
+
+    Additive only: existing cues are untouched. A recovered cue is dropped
+    when it text-matches (≥0.7) a temporal neighbor — Whisper re-hearing the
+    padded boundary — or another recovered cue already accepted."""
+    out = list(existing or [])
+    added = 0
+    accepted: list[dict] = []
+    for r in sorted(recovered or [], key=lambda s: s.get("start", 0.0)):
+        rt = _seg_text(r)
+        if not rt:
+            continue
+        rb = _seg_bounds(r)
+        if rb is None:
+            continue
+        dup = False
+        for e in out:
+            eb = _seg_bounds(e)
+            if eb is None or abs(eb[0] - rb[0]) > 20.0:
+                continue
+            if _similar(rt, _seg_text(e)) >= 0.7:
+                dup = True
+                break
+        if not dup:
+            for a in accepted:
+                if _similar(rt, _seg_text(a)) >= 0.8:
+                    dup = True
+                    break
+        if dup:
+            continue
+        accepted.append(r)
+        added += 1
+    out.extend(accepted)
+
+    def _key(s):
+        b = _seg_bounds(s)
+        return b[0] if b else 0.0
+
+    out.sort(key=_key)
+    return out, added
+
+
+# Whisper hallucination staples that show up on near-silent vocal stems.
+_JUNK_RE = re.compile(
+    r"^(?:thank you(?: for watching)?|thanks for watching|please subscribe"
+    r"|ご視聴ありがとうございました|お疲れ様でした)[.!\s]*$",
+    re.IGNORECASE,
+)
+
+
+def _slice_wav(audio_path: str, out_path: str, start: float, end: float) -> bool:
+    try:
+        rc = subprocess.run(
+            ["ffmpeg", "-y", "-ss", f"{start:.2f}", "-to", f"{end:.2f}",
+             "-i", audio_path, "-ac", "1", "-ar", "16000",
+             "-c:a", "pcm_s16le", out_path],
+            capture_output=True, timeout=120,
+        ).returncode
+        return rc == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 1024
+    except Exception:
+        return False
+
+
+def _default_speaker(segments, at_s: float) -> str:
+    """Nearest existing cue's speaker so recovered lines blend in."""
+    best, best_d = "Speaker 1", float("inf")
+    for s in segments or []:
+        b = _seg_bounds(s)
+        if b is None:
+            continue
+        d = min(abs(b[0] - at_s), abs(b[1] - at_s))
+        if d < best_d:
+            spk = (s.get("speaker") if isinstance(s, dict)
+                   else getattr(s, "speaker", None)) or "Speaker 1"
+            best, best_d = spk, d
+    return best
+
+
+async def recover_gap_dialogue(
+    job_id: str,
+    audio_path: str,
+    segments: list,
+    source_lang: str,
+    work_dir: str,
+) -> list[dict]:
+    """Run the full recovery for one job; returns recovered SOURCE-language
+    cues (possibly empty). Never raises."""
+    try:
+        from backend.config import settings
+        from backend.services import vocal_separator
+
+        if not bool(getattr(settings, "VOCAL_GAP_RECOVERY_ENABLED", True)):
+            return []
+        if not audio_path or not os.path.exists(audio_path):
+            logger.info("[%s] gap recovery: job audio missing — skipping", job_id)
+            return []
+        if not vocal_separator.is_available():
+            logger.info("[%s] gap recovery: demucs not installed — skipping", job_id)
+            return []
+
+        # Music markers ("[♪ music ♪]") are NOT coverage — they are the exact
+        # spans where buried dialogue lives. Compute holes against speech
+        # cues only.
+        try:
+            from backend.services.audio_analyzer import is_subtitle_marker
+            _speech = [s for s in (segments or [])
+                       if not is_subtitle_marker(_seg_text(s))]
+        except Exception:
+            _speech = list(segments or [])
+
+        pad = float(getattr(settings, "VOCAL_GAP_PAD_S", 2.0))
+        gaps = find_coverage_gaps(
+            _speech,
+            min_gap_s=float(getattr(settings, "VOCAL_GAP_MIN_S", 8.0)),
+            pad_s=pad,
+            max_spans=int(getattr(settings, "VOCAL_GAP_MAX_SPANS", 8)),
+            max_total_s=float(getattr(settings, "VOCAL_GAP_MAX_TOTAL_S", 240.0)),
+        )
+        if not gaps:
+            logger.info("[%s] gap recovery: no coverage gaps ≥ threshold", job_id)
+            return []
+        logger.info(
+            "[%s] gap recovery: %d gap(s), %.0fs total — %s", job_id, len(gaps),
+            sum(b - a for a, b in gaps),
+            ", ".join(f"{int(a) // 60}:{int(a) % 60:02d}-{int(b) // 60}:{int(b) % 60:02d}"
+                      for a, b in gaps))
+
+        os.makedirs(work_dir, exist_ok=True)
+        recovered: list[dict] = []
+        for i, gap in enumerate(gaps):
+            raw = os.path.join(work_dir, f"gap{i}.wav")
+            if not await asyncio.to_thread(_slice_wav, audio_path, raw, gap[0], gap[1]):
+                continue
+            # CPU on purpose: recovery may overlap SEO's GPU work, and the
+            # slices are short enough (≤ ~1 min) that CPU Demucs stays fast.
+            vocals = await asyncio.to_thread(
+                vocal_separator.separate_vocals, raw,
+                os.path.join(work_dir, f"gap{i}"),
+                model=str(getattr(settings, "VOCAL_SEPARATION_MODEL", "htdemucs")),
+                device=str(getattr(settings, "VOCAL_GAP_DEVICE", "cpu")),
+                segment=int(getattr(settings, "VOCAL_SEPARATION_SEGMENT", 7)),
+                timeout=int(getattr(settings, "VOCAL_GAP_SPAN_TIMEOUT_S", 300)),
+            )
+            if not vocals:
+                continue
+            segs = await asyncio.to_thread(_transcribe_stem, vocals, source_lang)
+            for s in segs:
+                s["start"] = float(s.get("start", 0.0)) + gap[0]
+                s["end"] = float(s.get("end", 0.0)) + gap[0]
+                s = _clip_to_gap(s, gap, pad)
+                if s is None:
+                    continue
+                txt = _seg_text(s)
+                if not txt or _JUNK_RE.match(txt):
+                    continue
+                if float(s.get("no_speech_prob", 0.0) or 0.0) > 0.85:
+                    continue
+                s["speaker"] = _default_speaker(segments, s["start"])
+                s["text"] = txt
+                recovered.append(s)
+        if recovered:
+            logger.info(
+                "[%s] gap recovery: %d cue(s) recovered from buried audio",
+                job_id, len(recovered))
+        else:
+            logger.info("[%s] gap recovery: separation found no new dialogue", job_id)
+        return recovered
+    except Exception as e:
+        logger.warning("[%s] gap recovery skipped (%s)", job_id, e)
+        return []
+
+
+def _transcribe_stem(wav_path: str, source_lang: str) -> list[dict]:
+    """ASR one vocal stem → list of {start,end,text,no_speech_prob} dicts.
+    Remote Companion whisper when configured; [] on any failure."""
+    try:
+        from backend.services.reframer_audio import (
+            RemoteWhisperEngine, remote_whisper_configured)
+        if not remote_whisper_configured():
+            return []
+        res = RemoteWhisperEngine().transcribe_wav(
+            wav_path, language=(source_lang or None))
+        segs = (res or {}).get("segments") or []
+        out = []
+        for s in segs:
+            d = dict(s) if isinstance(s, dict) else {
+                "start": getattr(s, "start", 0.0),
+                "end": getattr(s, "end", 0.0),
+                "text": getattr(s, "text", ""),
+                "no_speech_prob": getattr(s, "no_speech_prob", 0.0),
+            }
+            out.append(d)
+        return out
+    except Exception as e:
+        logger.info("gap recovery ASR failed (%s)", e)
+        return []
