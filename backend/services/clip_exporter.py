@@ -2518,15 +2518,25 @@ def _insert_snap_transitions(
     keyframes: list[tuple[float, int]],
     jump_threshold: int = 15,
     snap_duration: float = 0.15,
+    max_snap_duration: float = 0.45,
 ) -> list[tuple[float, int]]:
-    """Insert synthetic keyframes to convert long interpolations into hold-then-snap.
+    """Convert long interpolations into hold-then-ease, the way a human
+    operator moves: hold the old framing, then make ONE deliberate move that
+    SETTLES exactly when the new keyframe takes effect (the camera lands as
+    the new line/subject starts, instead of drifting or teleporting mid-gap).
 
-    Without this, two keyframes at t=0,sx=30 and t=10,sx=70 produce a
-    10-second slow pan. With this, they become:
+    The move's duration scales with DISTANCE — a small correction is a quick
+    ~0.2s nudge, a full reposition takes ~0.4s — because a fixed 150ms for
+    every move (the old behavior) is precisely what read as robotic: tiny
+    hops and huge reframes all snapping at the same speed.
+
+    Two keyframes at t=0,sx=30 and t=10,sx=70 (jump 40) become:
         t=0.000, sx=30  (hold)
-        t=4.925, sx=30  (hold ends)
-        t=5.075, sx=70  (snap complete - 150ms transition)
-        t=10.00, sx=70  (hold)
+        t=9.550, sx=30  (hold ends — move begins)
+        t=10.00, sx=70  (move settles exactly on the trigger)
+
+    Scene-cut pairs (1ms apart from _handle_scene_cuts) are preserved as
+    hard cuts — a human editor cuts across a shot boundary, never pans.
     """
     if len(keyframes) <= 1:
         return keyframes
@@ -2537,15 +2547,43 @@ def _insert_snap_transitions(
         t1, sx1 = keyframes[i]
         dt = t1 - t0
         jump = abs(sx1 - sx0)
+        dur = min(max_snap_duration, snap_duration + jump * 0.008)
 
-        if jump >= jump_threshold and dt > snap_duration * 4:
-            mid_t = (t0 + t1) / 2
-            half_snap = snap_duration / 2
-            result.append((mid_t - half_snap, sx0))
-            result.append((mid_t + half_snap, sx1))
+        if jump >= jump_threshold and dt > dur * 2:
+            result.append((t1 - dur, sx0))   # hold ends; ease covers [t1-dur, t1]
         result.append(keyframes[i])
 
     return result
+
+
+def _suppress_ping_pong(
+    keyframes: list[tuple[float, int]],
+    window_s: float = 1.6,
+    tolerance: int = 4,
+) -> list[tuple[float, int]]:
+    """Remove A→B→A camera bounces: when the path leaves a position and
+    returns to (within ``tolerance`` of) it in under ``window_s``, hold
+    through instead. A human operator doesn't chase a two-beat interjection
+    — the darting back-and-forth is the single biggest "jittery" tell in
+    dialogue scenes. Scene-cut pairs (1ms apart) are never treated as
+    bounces (their return leg is a real cut)."""
+    if len(keyframes) < 3:
+        return keyframes
+    out = list(keyframes)
+    i = 1
+    while i < len(out) - 1:
+        t_prev, x_prev = out[i - 1]
+        t_cur, x_cur = out[i]
+        t_next, x_next = out[i + 1]
+        is_cut_pair = (t_cur - t_prev) < 0.005 or (t_next - t_cur) < 0.005
+        if (not is_cut_pair
+                and abs(x_next - x_prev) <= tolerance      # returns to start
+                and abs(x_cur - x_prev) > tolerance        # after a real move
+                and (t_next - t_cur) < window_s):          # briefly
+            out.pop(i)   # drop the bounce — the hold carries through
+        else:
+            i += 1
+    return out
 
 
 def _compute_face_y_offset(
@@ -3615,7 +3653,12 @@ def _build_crop_x_expr(
             off0 = offsets[i][1]
             expr = f"if(lt(t\\,{t1:.3f})\\,{off0}\\,{expr})"
     else:
-        # Smoothstep: piecewise cubic Hermite interpolation between keyframes
+        # Ease-out cubic (1-(1-p)^3 = 3p-3p²+p³) between keyframes — the same
+        # curve the preview player uses for reframe transitions ("fast start,
+        # smooth deceleration — mimics a human camera operator snapping to
+        # the subject then settling gently"). The old symmetric smoothstep
+        # accelerated INTO the move, which read as mechanical; ease-out
+        # commits immediately and lands softly, like a human correction.
         for i in range(len(offsets) - 2, -1, -1):
             t0, off0 = offsets[i]
             t1, off1 = offsets[i + 1]
@@ -3624,8 +3667,9 @@ def _build_crop_x_expr(
                 segment = str(off0)
             else:
                 d_off = off1 - off0
-                p_expr = f"(t-{t0:.3f})/{dt:.3f}"
-                segment = f"{off0}+{d_off}*st(0\\,{p_expr})*ld(0)*(3-2*ld(0))"
+                p_expr = f"clip((t-{t0:.3f})/{dt:.3f}\\,0\\,1)"
+                segment = (f"{off0}+{d_off}*st(0\\,{p_expr})"
+                           f"*(3-3*ld(0)+ld(0)*ld(0))")
             expr = f"if(lt(t\\,{t1:.3f})\\,{segment}\\,{expr})"
 
     # Clamp to valid range
@@ -4672,16 +4716,20 @@ def _build_filter_chain(
                         # Step mode (frontend keyframes): instant snap, no transitions
                         _final_kf = subject_keyframes
                     else:
-                        # Backend keyframes: convert EVERY position change into
-                        # hold-then-snap (threshold=1). The old threshold of 15
-                        # only caught big jumps — smaller alternating moves
-                        # (A-B dialogue a dozen sx-units apart) still panned
-                        # across the whole inter-keyframe gap, which read as
-                        # the exported clip SWAYING side to side. The preview
-                        # player holds-until-next for every change, so holding
-                        # + a 150ms glide is the parity behavior.
+                        # Backend keyframes, humanized: (1) suppress A→B→A
+                        # bounces (an operator doesn't chase a two-beat
+                        # interjection — the "jittery" tell), then (2) convert
+                        # EVERY remaining change into hold-then-ease
+                        # (threshold=1: smaller alternating moves used to pan
+                        # across whole gaps, the "swaying" tell), with the
+                        # move duration scaling by distance and an ease-out
+                        # curve — one deliberate move that settles as the new
+                        # subject starts, not a fixed robotic 150ms snap.
+                        _kf_calm = (_suppress_ping_pong(subject_keyframes)
+                                    if len(subject_keyframes) <= 40
+                                    else subject_keyframes)
                         _final_kf = _insert_snap_transitions(
-                            subject_keyframes, jump_threshold=1)
+                            _kf_calm, jump_threshold=1)
                     x_expr = _build_crop_x_expr(
                         _final_kf, max_x_offset, src_w, crop_w,
                         step_mode=use_step_interpolation,

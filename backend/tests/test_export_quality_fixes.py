@@ -99,15 +99,55 @@ def test_sparse_step_mode_still_steps():
     assert "st(0" not in expr
 
 
-def test_snap_transitions_threshold_one_converts_small_moves():
+def test_snap_transitions_hold_then_settle_at_trigger():
     # A 10-unit move over 4s used to smoothstep-pan the whole gap (sway).
-    # With threshold=1 it becomes hold → 150ms snap → hold.
+    # Now: hold → one deliberate move that SETTLES exactly at the trigger.
     kfs = [(0.0, 40), (4.0, 50)]
     out = _insert_snap_transitions(kfs, jump_threshold=1)
-    assert len(out) == 4
-    hold_end, snap_end = out[1], out[2]
-    assert hold_end[1] == 40 and snap_end[1] == 50
-    assert (snap_end[0] - hold_end[0]) <= 0.2   # the fast glide
+    assert len(out) == 3
+    hold_end, settle = out[1], out[2]
+    assert hold_end[1] == 40 and settle == (4.0, 50)
+    move = settle[0] - hold_end[0]
+    assert 0.15 <= move <= 0.45                  # distance-proportional
+
+
+def test_snap_transitions_duration_scales_with_distance():
+    small = _insert_snap_transitions([(0.0, 48), (4.0, 52)], jump_threshold=1)
+    large = _insert_snap_transitions([(0.0, 20), (4.0, 80)], jump_threshold=1)
+    small_move = small[-1][0] - small[1][0]
+    large_move = large[-1][0] - large[1][0]
+    assert large_move > small_move               # big reposition = slower move
+    assert large_move <= 0.45 + 1e-9             # but always bounded
+
+
+def test_snap_transitions_preserve_scene_cut_pairs():
+    # 1ms scene-cut pairs are hard cuts — never stretched into eases.
+    kfs = [(0.0, 30), (5.0, 30), (5.001, 70), (9.0, 70)]
+    out = _insert_snap_transitions(kfs, jump_threshold=1)
+    assert (5.001, 70) in out                    # the cut edge survives intact
+
+
+def test_ping_pong_bounce_is_suppressed():
+    from backend.services.clip_exporter import _suppress_ping_pong
+    # A→B→A within 1.2s: the bounce (B) is dropped; the hold carries through.
+    kfs = [(0.0, 40), (5.0, 60), (6.2, 41), (12.0, 41)]
+    out = _suppress_ping_pong(kfs)
+    assert (5.0, 60) not in out
+    # A real move that STAYS is untouched.
+    kfs2 = [(0.0, 40), (5.0, 60), (11.0, 60)]
+    assert _suppress_ping_pong(kfs2) == kfs2
+    # Scene-cut pairs are never treated as bounces.
+    kfs3 = [(0.0, 40), (5.0, 40), (5.001, 60), (5.8, 40)]
+    assert (5.001, 60) in _suppress_ping_pong(kfs3)
+
+
+def test_crop_expr_uses_ease_out_curve():
+    # Sparse smoothstep mode now emits the ease-out cubic (3-3p+p²) form the
+    # preview player uses, not the symmetric smoothstep (3-2p).
+    expr = _build_crop_x_expr([(0.0, 30), (5.0, 70), (10.0, 30)],
+                              max_offset=800, src_w=1920, crop_w=606)
+    assert "(3-3*ld(0)+ld(0)*ld(0))" in expr
+    assert "(3-2*" not in expr
 
 
 # ── 4. SEO title guarantees ──────────────────────────────────────────────

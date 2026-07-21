@@ -191,6 +191,93 @@ def merge_transcript_fragments(segments, target_lang: str = "en"):
         return _as_rows(segments), False
 
 
+# ── Run-on cue split (YouTube-style one-thought-per-cue) ────────────────────
+# Official subs put ONE sentence/thought per cue; Whisper+1:1 translation can
+# cram 3-4 sentences into an 11-second cue ("The capsule has altered its
+# course. Does it have suicidal tendencies? If it burns out… I suppose that's
+# about right."), which reads far worse than the reference. Split such cues at
+# sentence boundaries, allocating time by character share.
+_RUNON_MAX_CHARS = 84          # a cue longer than ~2 subtitle lines is a run-on
+_RUNON_MIN_PIECE_S = 1.0       # never create a cue shorter than this
+_RUNON_MAX_PIECES = 3          # a cue never explodes into confetti
+_SENT_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+(?=[\"'‘“(\[]?[A-Z0-9])")
+
+
+def split_run_on_cues(segments, target_lang: str = "en"):
+    """Split multi-sentence run-on cues into one-thought-per-cue pieces.
+
+    Returns ``(rows, changed)`` (plain dicts). A cue is split only when ALL
+    hold: non-CJK target (sentence detection is Latin-oriented), not a
+    ``[marker]``, longer than ``_RUNON_MAX_CHARS``, at least 2 sentences, and
+    long enough on screen that every piece keeps ≥ ``_RUNON_MIN_PIECE_S``.
+    Time is allocated proportionally to each piece's character share; word
+    timestamps (when present) are partitioned into their piece's window.
+    Fail-soft: returns the input unchanged on any error."""
+    try:
+        tgt = (target_lang or "").strip().lower().split("-")[0]
+        rows = _as_rows(segments)
+        if tgt in _CJK_TARGETS or not rows:
+            return rows, False
+        out = []
+        changed = False
+        for seg in rows:
+            text = (seg.get("text") or "").strip()
+            start = float(seg.get("start") or 0.0)
+            end = float(seg.get("end") or start)
+            dur = end - start
+            if (len(text) <= _RUNON_MAX_CHARS or _is_marker(text)
+                    or dur < 2 * _RUNON_MIN_PIECE_S):
+                out.append(seg)
+                continue
+            sentences = [s.strip() for s in _SENT_SPLIT_RE.split(text) if s.strip()]
+            if len(sentences) < 2:
+                out.append(seg)
+                continue
+            # Group sentences into ≤ _RUNON_MAX_PIECES pieces, keeping each
+            # piece under the char budget where possible (greedy fill).
+            n_pieces = min(_RUNON_MAX_PIECES, len(sentences),
+                           max(2, int(dur // _RUNON_MIN_PIECE_S)))
+            budget = max(_RUNON_MAX_CHARS, len(text) // n_pieces + 1)
+            pieces: list[str] = []
+            cur = ""
+            for s in sentences:
+                if cur and (len(cur) + 1 + len(s) > budget) and len(pieces) < n_pieces - 1:
+                    pieces.append(cur)
+                    cur = s
+                else:
+                    cur = (cur + " " + s).strip()
+            if cur:
+                pieces.append(cur)
+            if len(pieces) < 2:
+                out.append(seg)
+                continue
+            # Proportional time allocation by character share.
+            total_chars = sum(len(p) for p in pieces) or 1
+            words = list(seg.get("words") or [])
+            t = start
+            for k, p in enumerate(pieces):
+                share = len(p) / total_chars
+                p_end = end if k == len(pieces) - 1 else min(end, t + dur * share)
+                if p_end - t < _RUNON_MIN_PIECE_S and k < len(pieces) - 1:
+                    p_end = min(end, t + _RUNON_MIN_PIECE_S)
+                piece_row = dict(seg)
+                piece_row["text"] = p
+                piece_row["start"], piece_row["end"] = round(t, 3), round(p_end, 3)
+                if words:
+                    piece_row["words"] = [
+                        w for w in words
+                        if (w.get("start") or 0) < p_end and (w.get("end") or 0) > t
+                    ] or None
+                else:
+                    piece_row["words"] = None
+                out.append(piece_row)
+                t = p_end
+            changed = True
+        return out, changed
+    except Exception:
+        return _as_rows(segments), False
+
+
 def sanitize_translated_transcript(segments, target_lang: str = "en"):
     """Return ``(cleaned_rows, changed)``.
 

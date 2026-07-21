@@ -4582,6 +4582,19 @@ async def _background_post_processing(
                     logger.info("[%s] Merged translated_transcript fragments: %d → %d cue(s)",
                                 job_id, len(_translated_out), len(_merged))
                     _translated_out = _merged
+                # The complement pass: split multi-sentence RUN-ON cues at
+                # sentence boundaries (YouTube-style one-thought-per-cue).
+                # Disjoint from the merge above (merge only touches cues with
+                # NO sentence-final punctuation; split only cues with ≥2
+                # complete sentences), so they never fight.
+                if bool(getattr(settings, "TRANSCRIPT_SPLIT_RUNON_CUES", True)):
+                    from backend.services.transcript_sanitize import split_run_on_cues
+                    _split, _split_changed = split_run_on_cues(_translated_out, target_lang)
+                    if _split_changed:
+                        logger.info("[%s] Split run-on translated cues: %d → %d cue(s) "
+                                    "(one thought per cue)",
+                                    job_id, len(_translated_out), len(_split))
+                        _translated_out = _split
             except Exception:
                 pass
             logger.info(

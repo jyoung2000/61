@@ -230,6 +230,10 @@ class Settings(BaseSettings):
     # Demucs device for the short recovery slices. CPU by default: recovery
     # may overlap SEO's GPU work and the slices are small.
     VOCAL_GAP_DEVICE: str = "cpu"
+    # Split multi-sentence run-on cues at sentence boundaries on persist
+    # (YouTube-style one-thought-per-cue — the single largest readability gap
+    # vs official subs). Deterministic, fail-soft, CJK targets untouched.
+    TRANSCRIPT_SPLIT_RUNON_CUES: bool = True
     VOCAL_GAP_SPAN_TIMEOUT_S: int = 300
     # VRAM the CUDA context + baseline allocation hold and never free — subtract
     # from total VRAM to get the model's usable budget. ~1.2 GB matches a 4 GB

@@ -1,0 +1,102 @@
+"""YouTube-style one-thought-per-cue segmentation: split_run_on_cues.
+
+Official subs put one sentence/thought per cue; Whisper + 1:1 translation can
+cram 3-4 sentences into an 11-second cue. The splitter breaks those at
+sentence boundaries with proportional time allocation — and must NEVER touch
+short cues, markers, CJK targets, or cues too brief to split readably.
+"""
+
+from backend.services.transcript_sanitize import (
+    merge_transcript_fragments,
+    split_run_on_cues,
+)
+
+
+def _cue(start, end, text, **kw):
+    return {"start": float(start), "end": float(end), "text": text,
+            "speaker": kw.get("speaker", "Speaker 1"),
+            "words": kw.get("words")}
+
+
+def test_splits_the_run54_capsule_runon():
+    # The real shipped cue: 4 sentences over ~11s.
+    segs = [_cue(355.0, 366.0,
+                 "The capsule has altered its course. Does it have suicidal "
+                 "tendencies? If it burns out, even secrets can be protected. "
+                 "I suppose that's about right.")]
+    out, changed = split_run_on_cues(segs, "en")
+    assert changed and 2 <= len(out) <= 3
+    # Chronological, gap-free, same overall window.
+    assert out[0]["start"] == 355.0 and out[-1]["end"] == 366.0
+    for a, b in zip(out, out[1:]):
+        assert abs(a["end"] - b["start"]) < 1e-6
+        assert a["end"] > a["start"]
+    # Every piece keeps the speaker and ends at a sentence boundary.
+    joined = " ".join(p["text"] for p in out)
+    assert joined == segs[0]["text"]
+    for p in out:
+        assert p["speaker"] == "Speaker 1"
+        assert p["text"].rstrip()[-1] in ".!?…"
+
+
+def test_time_allocation_is_proportional():
+    segs = [_cue(0.0, 10.0, "A" * 100 + ". " + "Second sentence here to split off.")]
+    out, changed = split_run_on_cues(segs, "en")
+    assert changed and len(out) == 2
+    # The long first sentence gets the lion's share of the window.
+    assert (out[0]["end"] - out[0]["start"]) > (out[1]["end"] - out[1]["start"])
+
+
+def test_never_touches_short_cues_markers_or_cjk():
+    short = [_cue(0, 3, "Two thoughts. Both short.")]
+    out, changed = split_run_on_cues(short, "en")
+    assert not changed and out[0]["text"] == "Two thoughts. Both short."
+
+    marker = [_cue(0, 30, "[♪ music ♪]" + " " * 90)]
+    _, changed = split_run_on_cues(marker, "en")
+    assert not changed
+
+    cjk = [_cue(0, 12, "これは長い文です。" * 12)]
+    _, changed = split_run_on_cues(cjk, "ja")
+    assert not changed
+
+    brief = [_cue(0.0, 1.5, "One. " * 30)]  # too brief for ≥1s pieces
+    _, changed = split_run_on_cues(brief, "en")
+    assert not changed
+
+
+def test_words_are_partitioned_into_their_piece():
+    words = ([{"start": 0.2 + i * 0.4, "end": 0.5 + i * 0.4, "word": f"w{i}"}
+              for i in range(20)])
+    text = ("This is the first long sentence of the run-on cue we split. "
+            "And here is the second sentence that lands in piece two.")
+    segs = [_cue(0.0, 8.0, text, words=words)]
+    out, changed = split_run_on_cues(segs, "en")
+    assert changed and len(out) == 2
+    w0, w1 = out[0]["words"] or [], out[1]["words"] or []
+    assert w0 and w1
+    assert max(w["end"] for w in w0) <= out[0]["end"] + 0.5
+    assert min(w["start"] for w in w1) >= out[1]["start"] - 0.5
+
+
+def test_split_and_merge_are_disjoint():
+    # merge only touches cues WITHOUT sentence-final punctuation; split only
+    # cues WITH ≥2 sentences — running both must be stable (no fighting).
+    segs = [
+        _cue(0.0, 2.0, "It's just the"),          # fragment → merge folds it
+        _cue(2.2, 4.0, "number 21."),
+        _cue(10.0, 21.0,
+             "The capsule has altered its course. Does it have suicidal "
+             "tendencies? If it burns out, even secrets can be protected. "
+             "I suppose that's about right."),     # run-on → split breaks it
+    ]
+    merged, m_changed = merge_transcript_fragments(segs, "en")
+    split, s_changed = split_run_on_cues(merged, "en")
+    assert m_changed and s_changed
+    # The merged fragment stays merged; the run-on got split.
+    texts = [c["text"] for c in split]
+    assert "It's just the number 21." in texts
+    assert not any(len(t) > 200 for t in texts)
+    # Idempotent: a second pass changes nothing further.
+    again, changed2 = split_run_on_cues(split, "en")
+    assert not changed2
