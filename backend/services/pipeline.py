@@ -1341,13 +1341,24 @@ async def _llm_cleanup_untranslated(segments, source_lang, target_lang,
         # is a zero-false-positive structural check, so it's safe to add to the
         # universal recovery net across every translation path.
         try:
-            from backend.services.translator import _word_salad_reason as _wsr
+            from backend.services.translator import (
+                _word_salad_reason as _wsr,
+                _cjk_remnant_reason as _cjkr,
+            )
         except Exception:
             _wsr = lambda _t: None
+            _cjkr = lambda _t: None
+        # _is_untranslated owns fully-CJK / romaji cues (cjk_ratio > 0.30);
+        # _wsr owns the "·"-joined glossary-echo salad. But a Latin-DOMINANT
+        # cue with a few stranded CJK glyphs ("From Nagランチポイント AX, we're
+        # confirming…") slips past both — cjk_ratio is only ~0.13, so it
+        # shipped raw katakana in the English track every run. _cjkr is the
+        # net built for exactly this (≥3 Latin AND CJK ≤ Latin), and it's
+        # zero-false-positive on real English (it requires actual CJK chars).
         leftover_idx = [i for i, s in enumerate(segments)
                         if _is_untranslated(_txt(s), source_lang)
                         or (getattr(settings, "TRANSLATION_GARBLE_DETECT_ENABLED", True)
-                            and _wsr(_txt(s)))]
+                            and (_wsr(_txt(s)) or _cjkr(_txt(s))))]
         if not leftover_idx:
             return segments
 
