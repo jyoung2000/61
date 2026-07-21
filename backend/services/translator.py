@@ -334,12 +334,25 @@ def tidy_punctuation_artifacts(text: str) -> str:
     spaced double terminators ("Mobile Suits? !"), a dangling trailing
     "?"/"." after a finished sentence ("See that it doesn't. ?"), and an
     HTML-ish tag fragment the model hallucinated (a shipped cue read
-    "</Span> I know you ran all this way"). Ellipses ("...") are untouched —
-    every punctuation rule requires whitespace between marks."""
+    "</Span> I know you ran all this way"), and a stray leading ASCII period
+    left when the sentence head was dropped (a shipped cue read ". And
+    you?"). Ellipses ("...") are untouched — every punctuation rule requires
+    whitespace between marks."""
     s = text or ""
     # Markup fragments are never legitimate subtitle text.
     s = re.sub(r"</?[A-Za-z][A-Za-z0-9]{0,15}(?:\s[^<>]{0,60})?/?>", "", s)
     s = re.sub(r"^[\s。、・]+", "", s)     # leading 。 、 ・
+    # A SINGLE stray leading period + space ("[.] And you?" → "And you?").
+    # Requiring whitespace right after the dot excludes an ellipsis on its
+    # own ("... word" has no space after the first dot, so no match).
+    s = re.sub(r"^\s*\.\s+", "", s)
+    # An embedded non-lexical grunt token ("That's it! Nnn... Hey" → "That's
+    # it! Hey"), and a whole-cue grunt ("Nn..." → "" → dropped downstream).
+    # Capital-N + word boundary + REQUIRED trailing dots keep it to the
+    # grunt — it can never eat "Inn", "Ann", "Nine" (no trailing-dot run).
+    # This is the always-on home (TRANSCRIPT_FILLER_REMOVAL defaults off, so
+    # the polisher's filler strip can't be relied on).
+    s = re.sub(r"\bNn+[.…]+\s*", "", s)
     s = re.sub(r"([?!])\s+([?!])", r"\1\2", s)          # "? !" → "?!"
     s = re.sub(r"([.?!…])\s+[.?]$", r"\1", s)           # trailing ". ?"
     s = re.sub(r"\s{2,}", " ", s)

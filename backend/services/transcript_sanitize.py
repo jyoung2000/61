@@ -33,7 +33,14 @@ caused. Space-joining is wrong for CJK, so CJK targets are returned untouched.
 """
 from __future__ import annotations
 
+import re
+
 _CJK_TARGETS = {"ja", "ko", "zh", "zh-cn", "zh-tw", "yue"}
+# A whole cue that is only a repeated grunt letter + trailing dots ("Nn...",
+# "Nnn...", "Mmm") is non-lexical mumble filler Whisper emits and the 1:1
+# translation carries through — YouTube omits these. ≥2 of the same letter so
+# a legitimate lone "n" survives and no real word can match.
+_GRUNT_CUE_RE = re.compile(r"(?:n{2,}|m{2,})[.…!?\s]*$", re.IGNORECASE)
 # Duplicate-cue policy. A SUBSTANTIAL line (a real sentence/phrase) should appear
 # once: a verbatim repeat far apart is almost always Whisper repetition /
 # hallucination on non-speech audio (music, moans, silence), faithfully carried
@@ -219,6 +226,12 @@ def sanitize_translated_transcript(segments, target_lang: str = "en"):
         for seg in rows:
             text = (_get(seg, "text", "") or "").strip()
             if not text:
+                continue
+            # Standalone non-lexical grunt cue ("Nn...", "Mmm") — always-on
+            # drop (the polisher's filler strip is off by default). The
+            # ``fullmatch`` keeps it to a WHOLE-cue grunt, never a real cue
+            # that merely ends in "…mm".
+            if not _is_marker(text) and _GRUNT_CUE_RE.fullmatch(text):
                 continue
             if drop_source_script and not _is_marker(text) and _cjk_ratio(text) > 0.30:
                 continue  # source-language relapse — not part of a translation

@@ -83,4 +83,11 @@ def is_boilerplate_hallucination(text: str) -> bool:
     # Amara.org community", …) — always phantoms, whatever the vendor.
     if _ATTRIBUTION_RE.search(key) or _CREDIT_VENDOR_RE.search(key):
         return True
+    # A whole cue that is only a repeated grunt letter ("Nn...", "Nnn...",
+    # "Mmm") is non-lexical filler Whisper emits on a mumble — YouTube omits
+    # these. ≥2 of the SAME letter so a legitimate lone "n" survives; a real
+    # word always carries a second distinct letter, so this can't match
+    # "no"/"now"/"nice". (_STRIP_CHARS already removed the trailing dots.)
+    if re.fullmatch(r"n{2,}|m{2,}", key):
+        return True
     return False
