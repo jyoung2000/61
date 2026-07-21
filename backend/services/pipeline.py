@@ -779,6 +779,20 @@ async def _get_whisper_en_timing_reference(
             "[%s] Hybrid timing: Whisper-EN reference failed (%s) — degrading to "
             "tier B", job_id, e)
         return []
+    finally:
+        # This decode RE-WARMED the Companion sidecar seconds after the
+        # LLM-phase release, and nothing released it again — whisper's ~3-4 GB
+        # sat resident through the entire translate loop and CPU-spilled the
+        # 12B to 22% residency (batches at 45-320s instead of ~30s). The
+        # reference is the LAST whisper work of the job; hand the VRAM back
+        # the moment the decode ends, whatever the outcome. Fire-and-forget:
+        # a 409 (some other decode is live) or an old Companion just no-ops.
+        if _remote_translate:
+            try:
+                from backend.services.reframer_audio import remote_whisper_release
+                await asyncio.to_thread(remote_whisper_release)
+            except Exception:
+                pass
 
 
 def _timeline_coverage_s(segments) -> float:

@@ -443,6 +443,27 @@ def test_vetting_rejects_unrelated_substitutions():
     assert out["Miina"] == "Marina"
 
 
+def test_vetting_rejects_common_word_and_near_typo_rights():
+    # Run-50 corruptions from a degraded model, both of which PASS the
+    # phonetic gate: the ending-song title "Justlove" rewritten into the
+    # ordinary word "Justice" (corrupting every lyric line it appeared in),
+    # and the CORRECT name "General Septem" "corrected" into the typo
+    # "Gneral Septem" ('gneral' is one transposition from 'general').
+    cands = {"Justlove", "General Septem", "Gundarium", "Hero-kun"}
+    pairs = [
+        {"wrong": "Justlove", "right": "Justice"},
+        {"wrong": "General Septem", "right": "Gneral Septem"},
+        {"wrong": "Gundarium", "right": "Gundanium"},
+        {"wrong": "Hero-kun", "right": "Heero"},
+    ]
+    out = _vet_roster_pairs(pairs, cands)
+    assert "Justlove" not in out
+    assert "General Septem" not in out
+    # Real mis-hearings still correct.
+    assert out["Gundarium"] == "Gundanium"
+    assert out["Hero-kun"] == "Heero"
+
+
 def test_vetting_frequency_gate_and_cap():
     cands = {f"Tok{i}" for i in range(12)} | {"Deathscythe"}
     pairs = [{"wrong": f"Tok{i}", "right": f"Toc{i}"} for i in range(12)]

@@ -529,17 +529,50 @@ def _roster_phonetic_ok(wrong: str, right: str) -> tuple[bool, float]:
     return ok, ratio
 
 
+def _word_is_near_typo(word: str) -> bool:
+    """True when ``word`` is NOT a structural/common English word but sits
+    within edit distance 1 of one — the signature of a model typo, not a
+    proper noun. A real run "corrected" the CORRECT name "General Septem"
+    into "Gneral Septem": 'gneral' is one transposition from 'general', and
+    no real character name lives that close to an ordinary word."""
+    w = word.lower()
+    if not w or w in _ROSTER_SAFE_WORDS or w in _ROSTER_COMMON_WORDS:
+        return False
+    for vocab in (_ROSTER_SAFE_WORDS, _ROSTER_COMMON_WORDS):
+        for known in vocab:
+            if abs(len(known) - len(w)) > 1 or len(known) < 4:
+                continue
+            # Cheap edit-distance ≤1 check (incl. adjacent transposition).
+            if len(known) == len(w):
+                diffs = [i for i in range(len(w)) if w[i] != known[i]]
+                if len(diffs) == 1:
+                    return True
+                if (len(diffs) == 2 and diffs[1] == diffs[0] + 1
+                        and w[diffs[0]] == known[diffs[1]]
+                        and w[diffs[1]] == known[diffs[0]]):
+                    return True
+            else:
+                longer, shorter = (w, known) if len(w) > len(known) else (known, w)
+                for i in range(len(longer)):
+                    if longer[:i] + longer[i + 1:] == shorter:
+                        return True
+    return False
+
+
 def _vet_roster_pairs(pairs, candidates: set,
                       frequent: set | None = None,
                       max_pairs: int = 8) -> dict[str, str]:
     """Keep only corrections that are safe to auto-apply: the wrong form must
     be one of OUR mined candidates verbatim, the right form must look like a
     name (letters/spaces/apostrophes, ≤40 chars, ≤4 words), differ from the
-    wrong form beyond case, not be a safelisted ordinary word, SOUND like the
-    wrong form (see ``_roster_phonetic_ok``), and not target a FREQUENT
-    consistent term (a spelling used 4+ times is the glossary working, not a
-    garble). Capped at the ``max_pairs`` phonetically-strongest pairs — a
-    model that "corrects" everything is hallucinating."""
+    wrong form beyond case, not be a safelisted/common ordinary word (a real
+    run rewrote the song title "Justlove" into "Justice", corrupting every
+    lyric line), not contain a near-typo of an ordinary word (the same run
+    "corrected" the correct "General Septem" into "Gneral Septem"), SOUND
+    like the wrong form (see ``_roster_phonetic_ok``), and not target a
+    FREQUENT consistent term (a spelling used 4+ times is the glossary
+    working, not a garble). Capped at the ``max_pairs`` phonetically-
+    strongest pairs — a model that "corrects" everything is hallucinating."""
     scored: list[tuple[float, str, str]] = []
     for p in (pairs or []):
         if not isinstance(p, dict):
@@ -556,7 +589,15 @@ def _vet_roster_pairs(pairs, candidates: set,
             continue
         if right.lower() == wrong.lower():
             continue
-        if right.lower() in _ROSTER_SAFE_WORDS:
+        _right_words = [w for w in re.split(r"[ .'’-]+", right) if w]
+        # A "correction" whose entire right side is ordinary English is a
+        # rewrite, not a name fix — names get REPLACED by dictionary words
+        # only when the model hallucinates (Justlove → Justice).
+        if _right_words and all(
+                w.lower() in _ROSTER_SAFE_WORDS or w.lower() in _ROSTER_COMMON_WORDS
+                for w in _right_words):
+            continue
+        if any(_word_is_near_typo(w) for w in _right_words):
             continue
         if _PROFANITY_RE.search(right):
             continue

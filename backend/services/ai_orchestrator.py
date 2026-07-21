@@ -266,6 +266,12 @@ class AIOrchestrator:
     # must take turns with each other too.
     _gpu_lease_needed: bool | None = None
     _last_ollama_defrag: float = 0.0
+    # Residency observed when the last defrag fired, and the futility window:
+    # when a defrag doesn't improve residency the pressure is EXTERNAL
+    # (whisper sidecar / desktop apps), and further evict+reload cycles only
+    # add churn — suspend them and ride on extended timeouts instead.
+    _frac_at_last_defrag: float = -1.0
+    _defrag_futile_until: float = 0.0
     _gpu_class_lease = _GpuClassLease()
 
     def __init__(self, ws_broadcast=None, custom_prompts=None, cancel_check=None):
@@ -850,6 +856,28 @@ class AIOrchestrator:
         chunk_timeout = 90 if is_ollama else 60
         max_chunk_tokens = 300 if is_ollama else 500
 
+        # Companion-aware model upgrade (mirror of the clip-judge upgrade): on
+        # a rig whose remote card holds the big translation model, run the
+        # summary on IT rather than the small editorial default. A real run's
+        # overview and key topics went sparse because all five map chunks and
+        # the reduce ran on qwen2.5:3b in 14 seconds flat, while gemma3:12b
+        # sat configured for translation on the same GPU.
+        _big_override = None
+        if is_ollama:
+            try:
+                from backend.services import ollama_registry as _oreg_s
+                if await _oreg_s.remote_primary_vram_gb_resolved() >= 7.0:
+                    _cand = str(getattr(
+                        settings, "OLLAMA_TRANSLATION_MODEL", "") or "").strip()
+                    _cur = str(getattr(chain[0], "_editorial_model", "") or "")
+                    if _cand and _est_model_gb(_cand) > _est_model_gb(_cur):
+                        _big_override = _cand
+                        logger.info(
+                            "[%s] Summary upgraded to the rig's large model %s "
+                            "(Companion GPU)", job_id, _cand)
+            except Exception:
+                _big_override = None
+
         logger.info(
             "[%s] Map-reduce summary: %d chunks (%.0fs each), ollama=%s",
             job_id, len(chunks), chunk_seconds, is_ollama,
@@ -907,6 +935,7 @@ class AIOrchestrator:
                         prompt, max_tokens=max_chunk_tokens,
                         timeout=chunk_timeout,
                         job_id=job_id, skip_circuit_breaker=True,
+                        model_override=_big_override,
                     )
                     # Broadcast chunk progress so the user sees activity
                     if self._ws_broadcast and job_id:
@@ -988,10 +1017,22 @@ class AIOrchestrator:
                 _kw = {}
                 if getattr(provider, "provider_name", "") in ("ollama", "openrouter"):
                     _kw["json_schema"] = _reduce_schema
-                raw = await asyncio.wait_for(
-                    provider.text_complete(reduce_prompt, max_tokens=1000 if is_ollama else 2000, **_kw),
-                    timeout=120 if is_ollama else 90,
-                )
+                # Reduce on the upgraded model too — the reduce writes the
+                # overview/topics the user actually reads.
+                _orig_em = None
+                if (_big_override
+                        and getattr(provider, "provider_name", "") == "ollama"
+                        and hasattr(provider, "_editorial_model")):
+                    _orig_em = provider._editorial_model
+                    provider._editorial_model = _big_override
+                try:
+                    raw = await asyncio.wait_for(
+                        provider.text_complete(reduce_prompt, max_tokens=1000 if is_ollama else 2000, **_kw),
+                        timeout=(240 if _big_override else 120) if is_ollama else 90,
+                    )
+                finally:
+                    if _orig_em is not None:
+                        provider._editorial_model = _orig_em
                 data = extract_json(raw)
                 if has_real_summary_content(data):
                     # Coercion backstop: a summary with real content must
@@ -1528,21 +1569,50 @@ class AIOrchestrator:
                         elif _frac < 0.9:
                             _call_timeout = timeout + _cold_extra
                             _now = time.monotonic()
-                            if (_now - self._last_ollama_defrag) >= 120.0:
-                                self._last_ollama_defrag = _now
-                                logger.warning(
-                                    "text_completion: %s is only %.0f%% on GPU "
-                                    "(CPU-spilled) — defragmenting: evicting all "
-                                    "models so it reloads into a clean pool; "
-                                    "timeout %.0fs → %.0fs",
+                            if _now < self._defrag_futile_until:
+                                # A prior defrag didn't win the VRAM back — the
+                                # pressure is external. Keep the extended
+                                # timeout, skip the churn.
+                                logger.info(
+                                    "text_completion: %s is %.0f%% on GPU — "
+                                    "external VRAM pressure (defrag suspended); "
+                                    "extending timeout %.0fs → %.0fs",
                                     model_name, _frac * 100, timeout, _call_timeout,
                                 )
-                                if hasattr(provider, "clear_vram"):
-                                    await provider.clear_vram()
-                                    # CUDA frees asynchronously; reloading into a
-                                    # half-released pool is how the 1.8GB/8.3GB
-                                    # split kept coming back.
-                                    await asyncio.sleep(2.0)
+                            elif (_now - self._last_ollama_defrag) >= 120.0:
+                                if (self._last_ollama_defrag > 0
+                                        and _frac <= self._frac_at_last_defrag + 0.15):
+                                    # The last defrag changed nothing (a real
+                                    # run sat at exactly 22% across a dozen
+                                    # cycles — the squatter was the whisper
+                                    # sidecar, outside Ollama's reach). Each
+                                    # futile cycle costs an unload + multi-GB
+                                    # reload; stop paying it.
+                                    self._defrag_futile_until = _now + 900.0
+                                    logger.warning(
+                                        "text_completion: %s still %.0f%% on GPU "
+                                        "after a defrag — VRAM pressure is "
+                                        "external (another process holds the "
+                                        "GPU); suspending defrags for 15 min, "
+                                        "keeping extended timeouts",
+                                        model_name, _frac * 100,
+                                    )
+                                else:
+                                    self._last_ollama_defrag = _now
+                                    self._frac_at_last_defrag = _frac
+                                    logger.warning(
+                                        "text_completion: %s is only %.0f%% on GPU "
+                                        "(CPU-spilled) — defragmenting: evicting all "
+                                        "models so it reloads into a clean pool; "
+                                        "timeout %.0fs → %.0fs",
+                                        model_name, _frac * 100, timeout, _call_timeout,
+                                    )
+                                    if hasattr(provider, "clear_vram"):
+                                        await provider.clear_vram()
+                                        # CUDA frees asynchronously; reloading into a
+                                        # half-released pool is how the 1.8GB/8.3GB
+                                        # split kept coming back.
+                                        await asyncio.sleep(2.0)
                             else:
                                 logger.info(
                                     "text_completion: %s is %.0f%% on GPU — "
