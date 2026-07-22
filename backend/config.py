@@ -606,6 +606,14 @@ class Settings(BaseSettings):
     # past the 17-cps broadcast cap, so normal prose never is.
     SUBTITLE_CONDENSE_OVER_CPS: bool = True
     SUBTITLE_CONDENSE_CPS: float = 28.0
+    # Cap how far the readability pass may extend an over-fast cue PAST its own
+    # end into the following silence. The extension makes a cue readable, but
+    # with a long gap after it a cue could otherwise linger several seconds into
+    # the quiet — reading as "the subtitle stays up too long" vs YouTube's tight
+    # holds. Capping the linger keeps the hold reasonable; a cue that still needs
+    # more time to hit CPS is split into tighter pieces instead (more
+    # YouTube-like). Seconds past the cue's own end; 0 disables the cap.
+    SUBTITLE_MAX_LINGER_S: float = 2.5
     # Second, fail-soft LLM pass after translation that fixes ASR-garbled
     # proper nouns the mined glossary missed ("Ail Reese"→Aries,
     # "Gundarium"→Gundanium, "Hero Yui"→Heero Yuy — all shipped on a real

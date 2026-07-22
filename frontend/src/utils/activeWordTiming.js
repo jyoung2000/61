@@ -88,31 +88,51 @@ export function getCurrentWordIndex(segment, relativeTime, speakerRates) {
   const anticipation = ANTICIPATION_S * rateScale;
 
   if (segment.words && segment.words.length === words.length) {
+    const n = segment.words.length;
+    const segStart = segment.start;
+    const segEnd = Math.max(segStart + 0.001, segment.end);
+    const cueSpan = segEnd - segStart;
     const w0 = segment.words[0];
-    const wLast = segment.words[segment.words.length - 1];
-    const cueDur = Math.max(0.001, segment.end - segment.start);
-    // Do the word timestamps use a PER-CUE 0-based clock (first word ≈ 0, whole
-    // span ≈ the cue duration) rather than the cue's own coordinate? ONLY then
-    // rebase onto a within-cue clock. A first word that begins a little BEFORE
-    // segment.start is NOT a different clock — it's the normal case: Whisper's
-    // first word routinely starts a few hundredths before the cue's (rounded /
-    // overlap-resolved) start, and an overlap-pushed cue start sits later than
-    // its own audio. The old ``w0.start < segment.start - 0.01`` test fired on
-    // exactly those cues and double-subtracted segment.start, shoving the
-    // highlight into the middle of the line ("doesn't start at the beginning").
-    const perCueClock = w0.start < segment.start - 1.0 && wLast.end <= cueDur + 1.0;
-    const baseT = perCueClock ? (relativeTime - segment.start) : relativeTime;
-    const adjusted = baseT + anticipation - AUDIO_BUFFER_S;
-    // Before the first word's audio but with the cue already on screen, light
-    // the FIRST word — karaoke should begin at the start of the line, not sit
-    // dark through the lead-in and then jump in mid-sentence.
-    if (adjusted < w0.start) {
-      return relativeTime >= segment.start - 0.05 ? 0 : -1;
+    const wLast = segment.words[n - 1];
+    // Per-cue 0-based clock? (first word begins WELL before the cue's own start
+    // AND the whole span fits the cue duration) → shift word times into the
+    // cue's coordinate. A first word that begins a hair before segment.start is
+    // the normal Whisper case, NOT a different clock — don't rebase for it.
+    const perCueClock =
+      Number.isFinite(w0.start) && w0.start < segStart - 1.0 &&
+      Number.isFinite(wLast.end) && wLast.end <= cueSpan + 1.0;
+    const toCue = (t) => (perCueClock ? t + segStart : t);
+    // Build STRICTLY-INCREASING end boundaries that cover the whole cue, each
+    // word guaranteed a ≥ minGap slice. Raw Whisper-EN projected word times can
+    // be out of order / overlapping after alignment + interpolation; a naive
+    // "first end > t" scan then SKIPS a word whose end is smaller than an
+    // earlier word's, and lets an early word with a late end grab the highlight
+    // mid-line. Clamping to a feasible monotonic schedule fixes both: word 0
+    // begins at the cue start, the last word holds to the cue end, and no word
+    // is skipped even when its raw timing is degenerate.
+    const minGap = Math.min(0.05, cueSpan / n);
+    const ends = new Array(n);
+    let cur = segStart;
+    for (let i = 0; i < n; i++) {
+      const tail = n - 1 - i;
+      const raw = segment.words[i] && Number.isFinite(segment.words[i].end)
+        ? toCue(segment.words[i].end) : cur + minGap;
+      let e = Math.min(raw, segEnd - tail * minGap); // leave room for the rest
+      e = Math.max(e, cur + minGap);                 // this word gets a real slice
+      ends[i] = Math.min(segEnd, e);
+      cur = ends[i];
     }
-    for (let i = 0; i < segment.words.length; i++) {
-      if (adjusted < segment.words[i].end) return i;
+    ends[n - 1] = segEnd; // the last word holds to the cue's own end
+    const adjusted = relativeTime + anticipation - AUDIO_BUFFER_S;
+    // On screen but before the first word's audio → light word 0 (karaoke starts
+    // at the beginning of the line, never dark-then-jump-in-mid-sentence).
+    if (adjusted < segStart) {
+      return relativeTime >= segStart - 0.05 ? 0 : -1;
     }
-    return segment.words.length - 1;
+    for (let i = 0; i < n; i++) {
+      if (adjusted < ends[i]) return i;
+    }
+    return n - 1;
   }
 
   // Proportional timing fallback for segments without word data
@@ -120,7 +140,9 @@ export function getCurrentWordIndex(segment, relativeTime, speakerRates) {
   if (totalChars === 0) return -1;
   const segDuration = segment.end - segment.start;
   const elapsed = (relativeTime - segment.start) + anticipation - AUDIO_BUFFER_S;
-  if (elapsed < 0) return -1;
+  // On screen but before the lead-in elapses → light word 0 (mirror the
+  // word-timestamp branch; never sit dark then jump in mid-sentence).
+  if (elapsed < 0) return relativeTime >= segment.start - 0.05 ? 0 : -1;
 
   const punctPauses = words.map((w) => {
     const last = w[w.length - 1];

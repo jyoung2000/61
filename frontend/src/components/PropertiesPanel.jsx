@@ -388,6 +388,14 @@ function SubtitleProperties({ item, update, settings, onSettingsChange, customFo
             {s.showSpeakerLabels ? 'On' : 'Off'}
           </button>
         </div>
+        {/* Active-word highlight colour, inline with the speaker colours so the
+            karaoke colour can be picked against them here too (mirrors the
+            desktop Speaker Colors row; both edit settings.activeWordColor). */}
+        {s.activeWordEnabled && (
+          <div className="ve-properties__row">
+            <ColorField label="Active Word" value={s.activeWordColor || '#FFD700'} onChange={(v) => set('activeWordColor', v)} />
+          </div>
+        )}
       </div>
     </>
   );

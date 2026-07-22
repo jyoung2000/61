@@ -163,6 +163,31 @@ describe('shared active-word timing (RenderEngine ↔ SubtitleOverlay)', () => {
     expect(getCurrentWordIndex(seg, 11.0, rates)).toBe(1);
   });
 
+  it('never skips a word when the projected timings are out of order', () => {
+    // Tier-A Whisper-EN projection can leave a word whose end is SMALLER than an
+    // earlier word's (word index 2 here ends at 11.5, before word 1's 12.0). The
+    // old "first end > t" scan never reached it → the highlight skipped it. The
+    // monotonic feasible-floor schedule guarantees every word gets a slice.
+    const seg = {
+      subtitleText: 'a b c d', start: 10, end: 13, speaker: 'S1',
+      words: [
+        { start: 10.0, end: 11.0 },
+        { start: 11.0, end: 12.0 },
+        { start: 11.1, end: 11.5 },   // out of order
+        { start: 12.05, end: 13.0 },
+      ],
+    };
+    const rates = { S1: 3.0 };
+    const seen = new Set();
+    let prev = -1, monotonic = true;
+    for (let t = 10.0; t < 13.0; t += 0.02) {
+      const i = getCurrentWordIndex(seg, t, rates);
+      if (i >= 0) { seen.add(i); if (i < prev) monotonic = false; prev = i; }
+    }
+    expect([...seen].sort((a, b) => a - b)).toEqual([0, 1, 2, 3]); // none skipped
+    expect(monotonic).toBe(true);                                  // never jumps back
+  });
+
   it('computeSpeakerRates aggregates words/sec per speaker', () => {
     const rates = computeSpeakerRates([
       { text: 'a b c', start: 0, end: 1, speaker: 'A' },   // 3 wps

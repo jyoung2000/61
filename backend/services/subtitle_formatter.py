@@ -1010,6 +1010,16 @@ def enforce_readability(
                                if _i + 1 < _n else seg.end + _target_dur)
                 _new_end = max(seg.end, min(seg.start + min(_target_dur, max_dur_s),
                                             _next_start - min_gap_s))
+                # Cap the linger past the cue's own end so a long following
+                # silence can't hold the subtitle up for seconds (YouTube keeps
+                # holds tight). A cue that still exceeds CPS after the cap is
+                # split into tighter pieces below instead of lingering.
+                try:
+                    _max_linger = float(getattr(_es, "SUBTITLE_MAX_LINGER_S", 2.5) or 0.0)
+                except Exception:
+                    _max_linger = 2.5
+                if _max_linger > 0:
+                    _new_end = min(_new_end, seg.end + _max_linger)
                 if _new_end > seg.end:
                     seg = TranscriptSegment(
                         start=seg.start, end=_new_end, text=seg.text,
