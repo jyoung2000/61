@@ -232,6 +232,126 @@ const WHISPER_FALLBACK_MODELS = [
   { id: 'distil-large-v3', hint: 'distilled large-v3, 6× faster (~756M)' },
 ];
 
+// Remote VRAM control for the paired GPU Companion: flip auto-allocate + drag
+// the manual budget from ClipAI. Self-contained (own state/effects) so it never
+// perturbs the big Settings component's hook order. Renders nothing when no
+// Companion is paired/reachable.
+function CompanionVramCard({ showToast }) {
+  const [cfg, setCfg] = useState(null);     // null = loading
+  const [saving, setSaving] = useState(false);
+  const [draftBudget, setDraftBudget] = useState(null);
+
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const res = await fetch('/api/providers/companion/vram');
+        const data = res.ok ? await res.json() : null;
+        if (alive) setCfg(data && data.ok ? data : { ok: false });
+      } catch { if (alive) setCfg({ ok: false }); }
+    })();
+    return () => { alive = false; };
+  }, []);
+
+  const post = async (payload, okMsg) => {
+    setSaving(true);
+    try {
+      const res = await fetch('/api/providers/companion/vram', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = res.ok ? await res.json() : null;
+      if (data && data.ok) {
+        showToast(okMsg, 'success');
+        setCfg((prev) => ({ ...prev, ...data }));
+        setDraftBudget(null);
+      } else {
+        showToast((data && data.error) || 'Failed to update VRAM', 'error');
+      }
+    } catch {
+      showToast('Failed to reach the Companion', 'error');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (!cfg || cfg.ok === false) return null;  // loading or no companion → hide
+
+  const totalGb = (cfg.vram_total_mb || 0) / 1024;
+  const auto = !!cfg.vram_auto;
+  const writable = cfg.writable !== false;
+  const eff = cfg.effective_budget_gb;
+  const maxGb = Math.max(1, Math.round(totalGb) || 24);
+  const manual = draftBudget != null
+    ? draftBudget
+    : Number(cfg.vram_budget_manual_gb) > 0
+      ? Number(cfg.vram_budget_manual_gb)
+      : Math.max(1, Math.round(totalGb) - 1);
+
+  return (
+    <div style={{
+      background: 'var(--bg-panel)', border: '1px solid var(--border)',
+      borderRadius: 'var(--radius-md)', padding: '12px 16px', marginTop: 12,
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+        <span style={{ fontSize: 13, fontWeight: 600, flex: 1 }}>Companion GPU memory</span>
+        {totalGb > 0 && (
+          <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+            {totalGb.toFixed(0)} GB card · using ~{eff != null ? Number(eff).toFixed(1) : '?'} GB
+          </span>
+        )}
+      </div>
+      {!writable && (
+        <div style={{ fontSize: 11, color: 'var(--warning, #d97706)', marginBottom: 8 }}>
+          {cfg.note || 'Update the GPU Companion app to change VRAM remotely.'}
+        </div>
+      )}
+      <label style={{
+        display: 'flex', alignItems: 'flex-start', gap: 10,
+        cursor: writable ? 'pointer' : 'default', opacity: writable ? 1 : 0.6,
+      }}>
+        <input
+          type="checkbox"
+          checked={auto}
+          disabled={!writable || saving}
+          onChange={(e) => post(
+            { vram_auto: e.target.checked },
+            e.target.checked ? 'Auto-allocate VRAM on' : 'Auto-allocate VRAM off')}
+          style={{ marginTop: 2, accentColor: 'var(--accent)' }}
+        />
+        <span>
+          <span style={{ fontSize: 13, fontWeight: 600 }}>Auto-allocate VRAM</span>
+          <span style={{ display: 'block', fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.5, marginTop: 3 }}>
+            Track free VRAM so the card is shared with games / other apps. Turn off to
+            pin a fixed budget below.
+          </span>
+        </span>
+      </label>
+      {!auto && (
+        <div style={{ marginTop: 10, opacity: writable ? 1 : 0.6 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, color: 'var(--text-secondary)', marginBottom: 4 }}>
+            <span>Manual budget</span><span>{manual.toFixed(1)} GB</span>
+          </div>
+          <input
+            type="range"
+            min={1} max={maxGb} step={0.5}
+            value={manual}
+            disabled={!writable || saving}
+            onChange={(e) => setDraftBudget(parseFloat(e.target.value))}
+            onMouseUp={(e) => post({ vram_budget_gb: parseFloat(e.target.value) }, `VRAM budget set to ${parseFloat(e.target.value).toFixed(1)} GB`)}
+            onTouchEnd={(e) => post({ vram_budget_gb: parseFloat(e.target.value) }, `VRAM budget set to ${parseFloat(e.target.value).toFixed(1)} GB`)}
+            style={{ width: '100%', accentColor: 'var(--accent)' }}
+          />
+          <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 4, lineHeight: 1.5 }}>
+            Raise this to fit a bigger model (a 14B needs ~9 GB). Leave ~1 GB for the desktop.
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function Settings() {
   const { isMobile } = useResponsive();
   const [searchParams] = useSearchParams();
@@ -1167,6 +1287,18 @@ export default function Settings() {
         setPulling(false);
         return;
       }
+      // The model is too big for the Companion's GPU — surface it clearly
+      // instead of leaving the picker stuck on "pulling…" forever.
+      if (data.status === 'wont_fit') {
+        showToast(data.message || "That model won't fit on the Companion GPU.", 'error');
+        setPullStatus('');
+        setPulling(false);
+        return;
+      }
+      // Fits the card but exceeds the current budget — pull proceeds, but warn.
+      if (Array.isArray(data.warnings) && data.warnings.length) {
+        showToast(data.warnings.join(' '), 'warning');
+      }
       showToast(data.message || 'Re-syncing models…', data.status === 'already_running' ? 'info' : 'success');
       setPullStatus('');
       // Drive the per-target (container + Companion) progress panel.
@@ -1850,6 +1982,9 @@ export default function Settings() {
                 </label>
               </div>
             )}
+
+            {/* Remote VRAM control: auto-allocate + manual budget on the Companion */}
+            {statuses._active?.companion && <CompanionVramCard showToast={showToast} />}
 
             {/* Cloud fallback for subtitle polish — none / auto / pinned model */}
             <PolishFallbackCard isMobile={isMobile} />

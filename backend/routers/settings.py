@@ -2093,6 +2093,144 @@ class PullOllamaRequest(BaseModel):
     models: Optional[list[str]] = None
 
 
+# ── Companion VRAM: remote read/set + model-fit pre-check ────────────────────
+# The paired Companion exposes GET/POST /v1/config/vram (v0.5.0+). ClipAI proxies
+# it so the user can flip auto-allocate + drag the budget from ClipAI's own UI,
+# and uses the card total to tell the user up front when a chosen model can't fit
+# — instead of leaving the model picker stuck on "pulling…" forever.
+
+def _estimate_model_vram_gb(tag: str, size_gb: float | None = None,
+                            param_b: float | None = None,
+                            quant: str | None = None) -> float:
+    """Rough VRAM (GB) a model needs to load GPU-resident. On-disk size is the
+    best proxy for the weights; add ~0.8 GB runtime/KV overhead. With no size,
+    estimate from parameter count × a per-billion factor by quant. Returns 0.0
+    when nothing is known (caller then skips the fit gate). Mirrors the
+    frontend ``estimateModelVramGb`` so UI and API agree."""
+    try:
+        if size_gb and float(size_gb) > 0:
+            return round(float(size_gb) + 0.8, 1)
+        b = float(param_b) if param_b else 0.0
+        if b <= 0:
+            m = re.search(r"(\d+(?:\.\d+)?)\s*b\b", (tag or "").lower())
+            b = float(m.group(1)) if m else 0.0
+        if b <= 0:
+            return 0.0
+        q = (quant or "").lower()
+        if "q2" in q or "q3" in q:
+            per = 0.45
+        elif "q5" in q:
+            per = 0.75
+        elif "q6" in q:
+            per = 0.9
+        elif "q8" in q or "int8" in q:
+            per = 1.1
+        elif "f16" in q or "fp16" in q or "bf16" in q or "f32" in q:
+            per = 2.1
+        else:  # q4 / k-quants / unknown → assume a 4-bit quant
+            per = 0.62
+        return round(b * per + 0.8, 1)
+    except Exception:
+        return 0.0
+
+
+async def _companion_vram_snapshot() -> dict:
+    """(effective_budget_gb, total_gb, gpu label, host) for the paired Companion
+    from its /v1/health, or zeros when none is reachable."""
+    from backend.services import ollama_registry as oreg
+    h = oreg.companion_host()
+    if h is None:
+        return {"host": None, "budget_gb": 0.0, "total_gb": 0.0, "gpu": ""}
+    base = oreg.companion_base(h)
+    try:
+        async with httpx.AsyncClient(timeout=6.0) as c:
+            r = await c.get(oreg.join_url(base, "/v1/health"), headers=oreg.auth_headers(h))
+            if r.status_code == 200:
+                j = r.json()
+                return {
+                    "host": h,
+                    "budget_gb": round(float(j.get("vram_budget_gb") or 0.0), 1),
+                    "total_gb": round(float(j.get("vram_total_mb") or 0.0) / 1024.0, 1),
+                    "gpu": j.get("gpu_name") or getattr(h, "name", "") or "the Companion GPU",
+                }
+    except Exception as e:
+        logger.debug("companion vram snapshot failed: %s", e)
+    return {"host": h, "budget_gb": 0.0, "total_gb": 0.0,
+            "gpu": getattr(h, "name", "") or "the Companion GPU"}
+
+
+class CompanionVramRequest(BaseModel):
+    vram_auto: bool | None = None
+    vram_budget_gb: float | None = None
+    vram_buffer_gb: float | None = None
+
+
+@router.get("/providers/companion/vram")
+async def get_companion_vram():
+    """Current VRAM controls on the paired Companion (auto toggle + manual
+    budget + buffer + card total), for ClipAI's slider. Falls back to /v1/health
+    for an older Companion that lacks the dedicated config route."""
+    from backend.services import ollama_registry as oreg
+    h = oreg.companion_host()
+    if h is None:
+        return {"ok": False, "error": "No GPU Companion is paired."}
+    base = oreg.companion_base(h)
+    try:
+        async with httpx.AsyncClient(timeout=6.0) as c:
+            r = await c.get(oreg.join_url(base, "/v1/config/vram"), headers=oreg.auth_headers(h))
+            if r.status_code == 200:
+                return {"ok": True, "companion": getattr(h, "name", ""), "writable": True, **r.json()}
+            if r.status_code == 404:
+                rh = await c.get(oreg.join_url(base, "/v1/health"), headers=oreg.auth_headers(h))
+                if rh.status_code == 200:
+                    j = rh.json()
+                    return {
+                        "ok": True, "companion": getattr(h, "name", ""), "writable": False,
+                        "vram_auto": j.get("vram_auto"),
+                        "vram_budget_manual_gb": j.get("vram_budget_manual_gb"),
+                        "vram_buffer_gb": j.get("vram_buffer_gb"),
+                        "vram_total_mb": j.get("vram_total_mb"),
+                        "vram_free_mb": j.get("vram_free_mb"),
+                        "effective_budget_gb": j.get("vram_budget_gb"),
+                        "note": "Update the GPU Companion app to change VRAM remotely.",
+                    }
+            return {"ok": False, "error": f"Companion returned HTTP {r.status_code}."}
+    except Exception as e:
+        return {"ok": False, "error": f"Couldn't reach the Companion: {e}"}
+
+
+@router.post("/providers/companion/vram")
+async def set_companion_vram(req: CompanionVramRequest):
+    """Remotely set the Companion's auto-allocate + VRAM budget. Returns the
+    fresh effective budget so the UI can immediately re-check model fit."""
+    from backend.services import ollama_registry as oreg
+    h = oreg.companion_host()
+    if h is None:
+        return {"ok": False, "error": "No GPU Companion is paired."}
+    payload: dict = {}
+    if req.vram_auto is not None:
+        payload["vram_auto"] = bool(req.vram_auto)
+    if req.vram_budget_gb is not None:
+        payload["vram_budget_gb"] = max(0.0, float(req.vram_budget_gb))
+    if req.vram_buffer_gb is not None:
+        payload["vram_buffer_gb"] = max(0.0, float(req.vram_buffer_gb))
+    if not payload:
+        return {"ok": False, "error": "Nothing to change."}
+    base = oreg.companion_base(h)
+    try:
+        async with httpx.AsyncClient(timeout=25.0) as c:
+            r = await c.post(oreg.join_url(base, "/v1/config/vram"),
+                             headers=oreg.auth_headers(h), json=payload)
+            if r.status_code == 200:
+                return {"ok": True, "companion": getattr(h, "name", ""), **r.json()}
+            if r.status_code == 404:
+                return {"ok": False, "error": "This GPU Companion is too old to set "
+                        "VRAM remotely — update the Companion app."}
+            return {"ok": False, "error": f"Companion returned HTTP {r.status_code}."}
+    except Exception as e:
+        return {"ok": False, "error": f"Couldn't reach the Companion: {e}"}
+
+
 @router.post("/providers/ollama/pull")
 async def pull_ollama_models(req: PullOllamaRequest | None = None):
     """Kick off a background pull of one or more Ollama models.
@@ -2125,11 +2263,46 @@ async def pull_ollama_models(req: PullOllamaRequest | None = None):
     if not models:
         return {"status": "error", "message": "No models to pull."}
 
+    # Fit pre-check against the paired Companion's GPU. A model bigger than the
+    # whole card would download but never load onto the GPU — which is what
+    # leaves the picker stuck on "pulling…". Refuse it up front with a clear
+    # message. A model that fits the card but exceeds the CURRENT budget still
+    # pulls (downloading needs no VRAM) but we warn the user to raise the budget
+    # (or enable auto-allocate) so it loads on the GPU instead of spilling to CPU.
+    snap = await _companion_vram_snapshot()
+    total_gb, budget_gb, gpu = snap["total_gb"], snap["budget_gb"], snap["gpu"]
+    warnings: list[str] = []
+    for m in models:
+        need = _estimate_model_vram_gb(m)
+        if need <= 0 or total_gb <= 0:
+            continue
+        if need > total_gb + 0.5:
+            return {
+                "status": "wont_fit",
+                "model": m,
+                "need_gb": need,
+                "total_gb": total_gb,
+                "budget_gb": budget_gb,
+                "gpu": gpu,
+                "message": (f"{m} needs about {need:.0f} GB of VRAM, but {gpu} only "
+                            f"has {total_gb:.0f} GB — it can't run on this GPU. "
+                            f"Pick a smaller model."),
+            }
+        if budget_gb > 0 and need > budget_gb + 0.5:
+            warnings.append(
+                f"{m} needs about {need:.0f} GB, but the Companion VRAM budget is "
+                f"{budget_gb:.0f} GB. Raise the budget (or turn on auto-allocate) so "
+                f"it loads on the GPU instead of spilling to CPU.")
+
     _pull_ollama_models_background(models)
+    msg = "Pulling " + ", ".join(models) + " in the background."
+    if warnings:
+        msg += " " + " ".join(warnings)
     return {
         "status": "started",
         "models": models,
-        "message": "Pulling " + ", ".join(models) + " in the background.",
+        "warnings": warnings,
+        "message": msg,
     }
 
 

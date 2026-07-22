@@ -1201,6 +1201,11 @@ async fn health(
         "vram_free_mb": gpu.vram_free_mb,
         "unified_memory": gpu.unified_memory,
         "vram_budget_gb": ctx.state.effective_budget_gb(),
+        // Raw VRAM controls so ClipAI can render + drive the auto-allocate toggle
+        // and the manual budget slider remotely (POST /v1/config/vram writes them).
+        "vram_auto": config.vram_auto,
+        "vram_budget_manual_gb": config.vram_budget_gb,
+        "vram_buffer_gb": config.vram_buffer_gb,
         "speed_profile": config.speed_profile,
         "num_parallel": num_parallel,
         "max_loaded_models": max_loaded,
@@ -1225,6 +1230,113 @@ async fn health(
     (StatusCode::OK, axum::Json(body)).into_response()
 }
 
+/// Shared JSON body for the VRAM config read + write paths.
+fn vram_config_json(ctx: &ProxyCtx) -> serde_json::Value {
+    let gpu = ctx.state.gpu.lock().unwrap().clone();
+    let cfg = ctx.state.config_snapshot();
+    serde_json::json!({
+        "vram_auto": cfg.vram_auto,
+        "vram_budget_manual_gb": cfg.vram_budget_gb,
+        "vram_buffer_gb": cfg.vram_buffer_gb,
+        "vram_total_mb": gpu.vram_total_mb,
+        "vram_free_mb": gpu.vram_free_mb,
+        "effective_budget_gb": ctx.state.effective_budget_gb(),
+    })
+}
+
+/// GET /v1/config/vram → the current VRAM controls + card total, so ClipAI can
+/// seed its auto-allocate toggle + budget slider to what the Companion is
+/// actually running (the same values `/v1/health` now carries, standalone).
+async fn vram_config_get(State(ctx): State<ProxyCtx>, headers: HeaderMap) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+    let activity = ctx.state.begin_activity("config", "/v1/config/vram", "", "", "");
+    let body = vram_config_json(&ctx);
+    ctx.state.end_activity(activity, 200);
+    (StatusCode::OK, axum::Json(body)).into_response()
+}
+
+/// POST /v1/config/vram → set the VRAM budget + auto-allocate REMOTELY (the
+/// desktop slider, mirrored over the LAN). Body may carry any of
+/// {vram_auto, vram_budget_gb, vram_buffer_gb}; each is applied with the same
+/// clamps + Ollama/sidecar restart as the local GUI's `set_config`, then the
+/// fresh effective budget is returned so ClipAI can immediately re-check whether
+/// the requested model now fits (and say so instead of hanging on "pulling").
+async fn set_vram_config(State(ctx): State<ProxyCtx>, req: Request<Body>) -> Response {
+    if !authorized(&ctx, req.headers()) {
+        return unauthorized();
+    }
+    let activity = ctx.state.begin_activity("config", "/v1/config/vram", "", "", "");
+    let bytes = match axum::body::to_bytes(req.into_body(), 64 * 1024).await {
+        Ok(b) => b,
+        Err(e) => {
+            ctx.state.end_activity(activity, 400);
+            return (StatusCode::BAD_REQUEST, format!("bad body: {e}")).into_response();
+        }
+    };
+    let patch: serde_json::Value = if bytes.is_empty() {
+        serde_json::json!({})
+    } else {
+        match serde_json::from_slice(&bytes) {
+            Ok(v) => v,
+            Err(e) => {
+                ctx.state.end_activity(activity, 400);
+                return (StatusCode::BAD_REQUEST, format!("bad json: {e}")).into_response();
+            }
+        }
+    };
+    let mut ollama_restart = false;
+    let mut sidecar_restart = false;
+    {
+        let mut cfg = ctx.state.config.lock().unwrap();
+        if let Some(v) = patch.get("vram_auto").and_then(|x| x.as_bool()) {
+            if v != cfg.vram_auto {
+                cfg.vram_auto = v;
+                ollama_restart = true;
+                sidecar_restart = true;
+            }
+        }
+        if let Some(v) = patch.get("vram_budget_gb").and_then(|x| x.as_f64()) {
+            let v = (v as f32).max(0.0);
+            if (v - cfg.vram_budget_gb).abs() > 0.01 {
+                cfg.vram_budget_gb = v;
+                ollama_restart = true;
+                sidecar_restart = true;
+            }
+        }
+        if let Some(v) = patch.get("vram_buffer_gb").and_then(|x| x.as_f64()) {
+            let v = (v as f32).clamp(0.0, 64.0);
+            if (v - cfg.vram_buffer_gb).abs() > 0.01 {
+                cfg.vram_buffer_gb = v;
+                if cfg.vram_auto {
+                    ollama_restart = true;
+                    sidecar_restart = true;
+                }
+            }
+        }
+    }
+    // Force the auto-VRAM loop to re-apply immediately (mirrors set_config).
+    ctx.state
+        .last_auto_baseline_mb
+        .store(u64::MAX, Ordering::Relaxed);
+    ctx.state.last_auto_apply_ms.store(0, Ordering::Relaxed);
+    ctx.state.save();
+    if ollama_restart {
+        let _ = crate::ollama::restart(&ctx.state).await;
+    }
+    if sidecar_restart {
+        crate::sidecar::shutdown(&ctx.state, "VRAM settings changed remotely").await;
+    }
+    let mut body = vram_config_json(&ctx);
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("ok".into(), serde_json::json!(true));
+        obj.insert("ollama_restarted".into(), serde_json::json!(ollama_restart));
+    }
+    ctx.state.end_activity(activity, 200);
+    (StatusCode::OK, axum::Json(body)).into_response()
+}
+
 fn build_router(ctx: ProxyCtx) -> Router {
     Router::new()
         .route("/v1/health", get(health))
@@ -1240,6 +1352,7 @@ fn build_router(ctx: ProxyCtx) -> Router {
         .route("/v1/update/install", post(update_install))
         .route("/v1/update/status", get(update_status))
         .route("/v1/gpu/release", post(gpu_release))
+        .route("/v1/config/vram", get(vram_config_get).post(set_vram_config))
         .route("/v1/jobs/force-end", post(jobs_force_end))
         .route("/v1/audio/transcriptions", post(whisper_proxy))
         .route("/ollama", any(ollama_proxy))
