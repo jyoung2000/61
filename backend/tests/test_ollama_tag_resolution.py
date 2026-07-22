@@ -56,3 +56,29 @@ def test_model_present_tolerates_instruct_suffix():
     assert R.model_present(installed, "qwen2.5:14b-instruct") is True
     assert R.model_present(installed, "qwen2.5:14b") is True
     assert R.model_present(installed, "qwen2.5:32b-instruct") is False
+
+
+# ── the friendly display-name id the model picker can store (hyphens, no colon)
+
+def test_model_size_key_parses_friendly_display_name():
+    # "Qwen2.5-14B-Instruct" (and with an ollama/ prefix) → same key as the tag.
+    assert R._model_size_key("Qwen2.5-14B-Instruct") == ("qwen2.5", "14b")
+    assert R._model_size_key("ollama/Qwen2.5-14B-Instruct") == ("qwen2.5", "14b")
+
+
+def test_size_token_not_misread_from_base_name():
+    # A base ending in "<n>b" must not be read as the size — the ":8b" wins.
+    assert R._model_size_key("granite3b:8b") == ("granite3b", "8b")
+
+
+def test_resolve_friendly_display_name_to_installed_tag():
+    installed = ["qwen2.5:14b", "llava:7b"]
+    assert R.resolve_installed_tag(installed, "ollama/Qwen2.5-14B-Instruct") == "qwen2.5:14b"
+    assert R.resolve_installed_tag(installed, "Qwen2.5-14B-Instruct") == "qwen2.5:14b"
+    assert R.model_present(installed, "ollama/Qwen2.5-14B-Instruct") is True
+
+
+def test_resolve_friendly_name_routes_in_host():
+    status = R.HostStatus(host_id="x", online=True, models=["qwen2.5:14b"])
+    model, subbed = R.resolve_model_for_host(status, "ollama/Qwen2.5-14B-Instruct", "text")
+    assert (model, subbed) == ("qwen2.5:14b", True)

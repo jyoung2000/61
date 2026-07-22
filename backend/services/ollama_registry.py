@@ -102,11 +102,16 @@ def _model_size_key(tag: str):
     ``None`` when there's no ``<n>b`` size token to anchor on, so two unrelated
     bare names are never treated as equal (and a 7b never matches a 14b)."""
     t = str(tag or "").split("/")[-1].strip().lower()
-    if ":" not in t:
-        return None
-    base, rest = t.split(":", 1)
-    m = re.match(r"(\d+(?:\.\d+)?b)\b", rest)
+    # Size token ``<n>b``, required to follow a separator or the string start so
+    # a base like "granite3b" is never misread as the size. Handles BOTH the
+    # real Ollama tag form ("qwen2.5:14b-instruct-q4_K_M") AND the friendly
+    # display form the model picker can store as an id ("Qwen2.5-14B-Instruct",
+    # hyphenated, no colon) — both key to ("qwen2.5", "14b").
+    m = re.search(r"(?:^|[:\-_ ])(\d+(?:\.\d+)?b)\b", t)
     if not m:
+        return None
+    base = t[:m.start(1)].rstrip(":-_. ")
+    if not base:
         return None
     return (base, m.group(1))
 

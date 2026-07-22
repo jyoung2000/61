@@ -1990,9 +1990,28 @@ def _pull_ollama_models_background(models: list[str] | None = None):
         import json as _json
         headers = ollama_registry.auth_headers(host)
         label = hs["gpu_name"] or hs["name"]
+        # What's already installed on this host, so a model whose equivalent is
+        # present (e.g. a friendly "Qwen2.5-14B-Instruct" id whose real tag
+        # qwen2.5:14b is pulled) is skipped instead of failing an /api/pull for a
+        # non-registry tag.
+        installed_here: list = []
+        try:
+            _tr = _httpx.get(ollama_registry.join_url(host.url, "/api/tags"),
+                             headers=headers, timeout=10)
+            if _tr.status_code == 200:
+                installed_here = [m.get("name", "") for m in (_tr.json() or {}).get("models", [])]
+        except Exception:
+            installed_here = []
         for model in models:
             hs["current"] = model
             hs["progress"][model] = 0.0
+            inst_tag = ollama_registry.resolve_installed_tag(installed_here, model)
+            if inst_tag:
+                hs["progress"][model] = 100.0
+                hs["done"].append(model)
+                logger.info("Pull %s → %s: already installed as %s (skipped)",
+                            model, label, inst_tag)
+                continue
             try:
                 logger.info("Pull %s → %s ...", model, label)
                 with _httpx.stream(
