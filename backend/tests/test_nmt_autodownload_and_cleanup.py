@@ -23,7 +23,7 @@ import pytest
 
 # ── A stub ``backend.config`` so nmt_translator's lazy ``from backend.config
 #    import settings`` works without pydantic-settings installed. ───────────
-def _install_config_stub(**overrides):
+def _install_config_stub(monkeypatch, **overrides):
     mod = types.ModuleType("backend.config")
     defaults = dict(
         NMT_NLLB_MODEL="facebook/nllb-200-distilled-600M",
@@ -34,13 +34,16 @@ def _install_config_stub(**overrides):
     )
     defaults.update(overrides)
     mod.settings = types.SimpleNamespace(**defaults)
-    sys.modules["backend.config"] = mod
+    # setitem (not a bare assignment) so the REAL backend.config is restored on
+    # teardown — otherwise this partial stub leaks into every later test's
+    # ``from backend.config import settings`` (it lacks most real settings).
+    monkeypatch.setitem(sys.modules, "backend.config", mod)
     return mod
 
 
 @pytest.fixture()
 def N(monkeypatch, tmp_path):
-    _install_config_stub()
+    _install_config_stub(monkeypatch)
     from backend.services import nmt_translator as N
     # Pin the models dir to a temp dir for the whole test.
     monkeypatch.setattr(N, "_models_dir", lambda: str(tmp_path))

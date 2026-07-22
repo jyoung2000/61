@@ -4590,6 +4590,19 @@ async def _background_post_processing(
                     logger.info("[%s] Sanitized translated_transcript before persist: %d → %d",
                                 job_id, len(_translated_out), len(_san))
                     _translated_out = _san
+                # Collapse a sung opening/ending THEME (mis-transcribed as
+                # duplicated, garbled dialogue) into a single "[♪ … theme ♪]"
+                # marker — the way official subs do — keyed on chorus repetition
+                # so it never eats spoken lines and a next-episode preview is kept.
+                try:
+                    from backend.services.transcript_sanitize import collapse_song_choruses
+                    _thm, _thm_changed = collapse_song_choruses(_translated_out, target_lang)
+                    if _thm_changed:
+                        logger.info("[%s] Collapsed sung theme chorus to marker: %d → %d cue(s)",
+                                    job_id, len(_translated_out), len(_thm))
+                        _translated_out = _thm
+                except Exception:
+                    pass
                 # Fold Whisper's mid-sentence fragment splits ("It's just the" /
                 # "number 21.") back into whole utterances so the translate panel
                 # + SRT read as sentences, not 2-4-word slivers. Idempotent.

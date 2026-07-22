@@ -247,6 +247,16 @@ class Settings(BaseSettings):
     TRANSCRIPT_RUNON_MAX_CHARS: int = 50      # a cue past ~one 42-char line is a run-on
     TRANSCRIPT_RUNON_MAX_PIECES: int = 6      # cap pieces per cue (min-duration guards the floor)
     TRANSCRIPT_RUNON_CLAUSE_SPLIT: bool = True  # break long single sentences at clause boundaries
+    # Collapse sung opening/ending THEME choruses (mis-transcribed as garbled,
+    # duplicated dialogue) into a single "[♪ Opening/Ending theme ♪]" marker,
+    # the way official subs do — instead of shipping the lyrics as dialogue.
+    # Keyed on chorus REPETITION inside the head/tail windows (real dialogue
+    # doesn't repeat whole sentences), so it never eats spoken lines; a
+    # next-episode preview narrated over the ending theme is preserved.
+    TRANSCRIPT_MARK_THEME_SONGS: bool = True
+    TRANSCRIPT_THEME_HEAD_S: float = 150.0    # opening-theme search window (from first cue)
+    TRANSCRIPT_THEME_TAIL_S: float = 210.0    # ending-theme search window (to last cue)
+    TRANSCRIPT_THEME_MIN_REPEATS: int = 2     # distinct repeated chorus lines to call it a song
     # Stop the export-time readability merge from welding two ALREADY-COMPLETE
     # sentences back into a run-on (it re-runs inside the SRT/VTT/ASS
     # generators and otherwise undoes the finer cadence above). False =

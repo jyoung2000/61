@@ -386,6 +386,141 @@ def split_run_on_cues(segments, target_lang: str = "en"):
         return _as_rows(segments), False
 
 
+_THEME_OPEN_LABEL = "[♪ Opening theme ♪]"
+_THEME_END_LABEL = "[♪ Ending theme ♪]"
+_PREVIEW_RE = re.compile(
+    r"\b(next (?:episode|time)|next,?\s+on|to be continued|preview|deathscythe)\b", re.I)
+_CHORUS_MIN_CHARS = 12
+_LYRIC_MAX_CHARS = 48
+_THEME_MIN_SPAN_S = 12.0
+
+
+def _song_norm(text: str) -> str:
+    t = re.sub(r"[^\w\s]", " ", (text or "").lower())
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _sent_split(text: str) -> list:
+    return [p.strip() for p in re.split(r"(?<=[.!?…])\s+", (text or "").strip()) if p.strip()]
+
+
+def _proper_noun_count(text: str) -> int:
+    """Capitalized, mid-sentence tokens — a preview/dialogue signal (a sung
+    lyric line rarely names characters). Sentence-initial caps don't count."""
+    n, sent_start = 0, True
+    for tok in (text or "").split():
+        w = tok.strip(".,!?;:\"'()[]…—–“”’")
+        if not sent_start and len(w) > 1 and w[:1].isupper() and not w.isupper():
+            n += 1
+        sent_start = bool(tok) and tok[-1] in ".!?…"
+    return n
+
+
+def collapse_song_choruses(segments, target_lang: str = "en"):
+    """Collapse a sung OPENING/ENDING theme — mis-transcribed as duplicated,
+    garbled dialogue — into a single ``[♪ … theme ♪]`` marker, the way official
+    subtitles do.
+
+    The signal is chorus REPETITION inside the head/tail windows: a normalized
+    sentence that recurs ≥2× is a chorus line (spoken dialogue does not repeat
+    whole sentences within a couple of minutes). The collapsed run is anchored
+    to the actual chorus cues, so it can never eat surrounding dialogue, and a
+    next-episode preview narrated over the ending theme (flagged by preview
+    keywords or ≥2 proper nouns) is preserved. Returns ``(rows, changed)``;
+    CJK targets, short transcripts, and non-repeating windows are passed
+    through unchanged. Fail-soft."""
+    try:
+        tgt = (target_lang or "").strip().lower().split("-")[0]
+        rows = _as_rows(segments)
+        if tgt in _CJK_TARGETS or len(rows) < 6:
+            return rows, False
+        try:
+            from backend.config import settings as _s
+            if not getattr(_s, "TRANSCRIPT_MARK_THEME_SONGS", True):
+                return rows, False
+            head_s = float(getattr(_s, "TRANSCRIPT_THEME_HEAD_S", 150.0))
+            tail_s = float(getattr(_s, "TRANSCRIPT_THEME_TAIL_S", 210.0))
+            min_rep = int(getattr(_s, "TRANSCRIPT_THEME_MIN_REPEATS", 2))
+        except Exception:
+            head_s, tail_s, min_rep = 150.0, 210.0, 2
+
+        def _st(r):
+            return float(r.get("start") or 0.0)
+
+        def _en(r):
+            return float(r.get("end") or _st(r))
+
+        first_t = _st(rows[0])
+        last_t = max(_en(r) for r in rows)
+        windows = [(first_t, first_t + head_s, _THEME_OPEN_LABEL),
+                   (last_t - tail_s, last_t, _THEME_END_LABEL)]
+
+        def _is_preview(txt):
+            return bool(_PREVIEW_RE.search(txt)) or _proper_noun_count(txt) >= 2
+
+        drop = set()
+        marker_at = {}
+        for w0, w1, label in windows:
+            idxs = [i for i, r in enumerate(rows)
+                    if (r.get("text") or "").strip()
+                    and not _is_marker((r.get("text") or "").strip())
+                    and w0 - 0.01 <= _st(r) <= w1 + 0.01]
+            if len(idxs) < 4:
+                continue
+            counts = {}
+            for i in idxs:
+                for s in _sent_split(rows[i].get("text") or ""):
+                    ns = _song_norm(s)
+                    if len(ns) >= _CHORUS_MIN_CHARS:
+                        counts[ns] = counts.get(ns, 0) + 1
+            chorus = {ns for ns, c in counts.items() if c >= 2}
+            if len(chorus) < min_rep:
+                continue   # no repeated chorus → not a song window; leave alone
+            chorus_idxs = [i for i in idxs
+                           if not _is_preview((rows[i].get("text") or "").strip())
+                           and any(_song_norm(s) in chorus
+                                   for s in _sent_split(rows[i].get("text") or ""))]
+            if len(chorus_idxs) < 3:
+                continue
+            lo, hi = min(chorus_idxs), max(chorus_idxs)
+            run = []
+            for i in idxs:
+                if not (lo <= i <= hi):
+                    continue
+                txt = (rows[i].get("text") or "").strip()
+                if _is_preview(txt):
+                    continue   # preserve preview/dialogue interleaved in the run
+                is_chorus = any(_song_norm(s) in chorus for s in _sent_split(txt))
+                lyric_like = _proper_noun_count(txt) == 0 and len(txt) <= _LYRIC_MAX_CHARS
+                if is_chorus or lyric_like:
+                    run.append(i)
+            if len(run) < 3:
+                continue
+            m_start = min(_st(rows[i]) for i in run)
+            m_end = max(_en(rows[i]) for i in run)
+            if m_end - m_start < _THEME_MIN_SPAN_S:
+                continue
+            drop.update(run)
+            marker_at[lo] = (m_start, m_end, label)
+
+        if not drop:
+            return rows, False
+        out = []
+        for i, r in enumerate(rows):
+            if i in marker_at:
+                s, e, lab = marker_at[i]
+                base = dict(r)
+                base.update({"text": lab, "start": round(s, 3), "end": round(e, 3),
+                             "words": None})
+                out.append(base)
+            if i in drop:
+                continue
+            out.append(dict(r))
+        return out, True
+    except Exception:
+        return _as_rows(segments), False
+
+
 def sanitize_translated_transcript(segments, target_lang: str = "en"):
     """Return ``(cleaned_rows, changed)``.
 
