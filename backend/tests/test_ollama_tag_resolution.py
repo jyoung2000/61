@@ -82,3 +82,14 @@ def test_resolve_friendly_name_routes_in_host():
     status = R.HostStatus(host_id="x", online=True, models=["qwen2.5:14b"])
     model, subbed = R.resolve_model_for_host(status, "ollama/Qwen2.5-14B-Instruct", "text")
     assert (model, subbed) == ("qwen2.5:14b", True)
+
+
+def test_canonical_pull_tag_rebuilds_friendly_name():
+    # A friendly display id → a real registry tag a bare host can actually pull.
+    assert R.canonical_pull_tag("ollama/Qwen2.5-14B-Instruct") == "qwen2.5:14b"
+    assert R.canonical_pull_tag("Qwen2.5-14B-Instruct") == "qwen2.5:14b"
+    # A real tag is kept as-is (just the ollama/ prefix stripped).
+    assert R.canonical_pull_tag("ollama/qwen2.5:14b") == "qwen2.5:14b"
+    assert R.canonical_pull_tag("qwen2.5:14b-instruct-q4_K_M") == "qwen2.5:14b-instruct-q4_K_M"
+    # Nothing to rebuild → unchanged.
+    assert R.canonical_pull_tag("mystery") == "mystery"

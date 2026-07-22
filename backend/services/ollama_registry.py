@@ -144,6 +144,23 @@ def resolve_installed_tag(installed: list, requested: str):
     return None
 
 
+def canonical_pull_tag(requested: str) -> str:
+    """A valid Ollama ``/api/pull`` tag for a requested model id.
+
+    Strips an ``ollama/`` prefix and, when the id is a friendly DISPLAY name
+    with no real ``base:size`` tag ("Qwen2.5-14B-Instruct"), rebuilds
+    ``base:size`` ("qwen2.5:14b") so a host that doesn't have it yet (e.g. the
+    container's own Ollama) pulls a real registry tag instead of 404-ing on the
+    display name. An id that already carries a ``:`` tag is kept as-is."""
+    t = str(requested or "").split("/")[-1].strip()
+    if not t or ":" in t:
+        return t
+    key = _model_size_key(t)
+    if key is not None:
+        return f"{key[0]}:{key[1]}"
+    return t
+
+
 def model_present(installed: list, requested: str) -> bool:
     """True if ``requested`` matches an installed Ollama tag, tolerating an
     implicit ``:latest``, an ``ollama/`` prefix, and the ``-instruct``/quant

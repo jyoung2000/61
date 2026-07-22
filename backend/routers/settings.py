@@ -2012,11 +2012,15 @@ def _pull_ollama_models_background(models: list[str] | None = None):
                 logger.info("Pull %s → %s: already installed as %s (skipped)",
                             model, label, inst_tag)
                 continue
+            # Not installed here — pull a REAL registry tag. A friendly display
+            # id ("Qwen2.5-14B-Instruct") is rebuilt to "qwen2.5:14b" so the
+            # pull hits a real tag instead of 404-ing on the display name.
+            pull_tag = ollama_registry.canonical_pull_tag(model)
             try:
-                logger.info("Pull %s → %s ...", model, label)
+                logger.info("Pull %s (as %s) → %s ...", model, pull_tag, label)
                 with _httpx.stream(
                     "POST", ollama_registry.join_url(host.url, "/api/pull"),
-                    json={"name": model, "stream": True},
+                    json={"name": pull_tag, "stream": True},
                     headers=headers,
                     timeout=_httpx.Timeout(connect=10, read=1800, write=10, pool=10),
                 ) as resp:
