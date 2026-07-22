@@ -197,27 +197,82 @@ def merge_transcript_fragments(segments, target_lang: str = "en"):
 # course. Does it have suicidal tendencies? If it burns out… I suppose that's
 # about right."), which reads far worse than the reference. Split such cues at
 # sentence boundaries, allocating time by character share.
-_RUNON_MAX_CHARS = 84          # a cue longer than ~2 subtitle lines is a run-on
+_RUNON_MAX_CHARS = 50          # a cue past ~one 42-char line is a run-on (fallback)
 _RUNON_MIN_PIECE_S = 1.0       # never create a cue shorter than this
-_RUNON_MAX_PIECES = 3          # a cue never explodes into confetti
+_RUNON_MAX_PIECES = 6          # a cue never explodes into confetti (fallback)
+_RUNON_MIN_PIECE_CHARS = 16    # never orphan a sub-readable fragment onto its own cue
 _SENT_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+(?=[\"'‘“(\[]?[A-Z0-9])")
+# Strong intra-sentence clause boundaries — split AFTER the punctuation, at the
+# following whitespace, so tokens are never cut in half (the word-partition
+# invariant stays exact). Deliberately NOT conjunction WORDS ("and"/"that"/…):
+# a punctuation-only rule keeps 1:1 word partitions intact and avoids
+# over-fragmenting mid-phrase.
+_CLAUSE_SPLIT_RE = re.compile(r"(?<=[,;:—–])\s+")
+
+
+def _clause_units(sentence: str) -> list[str]:
+    """Break one sentence into clause units at strong punctuation boundaries.
+    Concatenates (with single spaces) back to the input, so token counts are
+    preserved. Returns ``[sentence]`` when there is no clause boundary."""
+    parts = [p.strip() for p in _CLAUSE_SPLIT_RE.split(sentence) if p.strip()]
+    return parts or [sentence]
+
+
+def _pack_units(units: list[str], budget: int, min_chars: int) -> list[str]:
+    """Greedily pack clause units into ≤ ``budget``-char pieces, never closing a
+    piece while it is still shorter than ``min_chars`` (so a 7-char clause like
+    "M Plan," is absorbed into its neighbour instead of orphaned onto its own
+    cue). A single over-budget unit becomes its own piece."""
+    pieces: list[str] = []
+    cur = ""
+    for u in units:
+        if cur and len(cur) >= min_chars and (len(cur) + 1 + len(u) > budget):
+            pieces.append(cur)
+            cur = u
+        else:
+            cur = (cur + " " + u).strip()
+    if cur:
+        if pieces and len(cur) < min_chars:
+            pieces[-1] = (pieces[-1] + " " + cur).strip()
+        else:
+            pieces.append(cur)
+    return pieces
 
 
 def split_run_on_cues(segments, target_lang: str = "en"):
-    """Split multi-sentence run-on cues into one-thought-per-cue pieces.
+    """Split run-on cues into YouTube-style one-thought-per-cue pieces.
 
-    Returns ``(rows, changed)`` (plain dicts). A cue is split only when ALL
-    hold: non-CJK target (sentence detection is Latin-oriented), not a
-    ``[marker]``, longer than ``_RUNON_MAX_CHARS``, at least 2 sentences, and
-    long enough on screen that every piece keeps ≥ ``_RUNON_MIN_PIECE_S``.
-    Time is allocated proportionally to each piece's character share; word
-    timestamps (when present) are partitioned into their piece's window.
+    Returns ``(rows, changed)`` (plain dicts). A cue is split when it is a
+    non-CJK, non-``[marker]`` cue at least ``2 × _RUNON_MIN_PIECE_S`` long AND
+    it either runs past one subtitle line (``TRANSCRIPT_RUNON_MAX_CHARS``) or
+    carries ≥ 2 finished sentences. Splitting rules:
+
+      * **One sentence per piece** — two finished thoughts are never welded into
+        one cue (this is also what keeps a second pass a no-op: each emitted
+        piece is a single ≤-line sentence and re-fires nothing).
+      * **Clause splitting** — a single sentence longer than one line is broken
+        at strong clause punctuation (``, ; : — –``), packed back up to the
+        line budget. Only done when the cue's words are 1:1 with its text (tier
+        A/B) so each piece can carry exact word timings; word-less (tier C)
+        cues stay sentence-only, timed char-proportionally.
+      * **Timing** — piece boundaries land on the real word start when word
+        timings are present (no char-proportional drift at clause cuts),
+        otherwise by character share. Word timestamps are partitioned into
+        their piece by token count. Every piece keeps ≥ ``_RUNON_MIN_PIECE_S``.
+
     Fail-soft: returns the input unchanged on any error."""
     try:
         tgt = (target_lang or "").strip().lower().split("-")[0]
         rows = _as_rows(segments)
         if tgt in _CJK_TARGETS or not rows:
             return rows, False
+        try:
+            from backend.config import settings as _s
+            max_chars = int(getattr(_s, "TRANSCRIPT_RUNON_MAX_CHARS", _RUNON_MAX_CHARS))
+            max_pieces = int(getattr(_s, "TRANSCRIPT_RUNON_MAX_PIECES", _RUNON_MAX_PIECES))
+            clause_split = bool(getattr(_s, "TRANSCRIPT_RUNON_CLAUSE_SPLIT", True))
+        except Exception:
+            max_chars, max_pieces, clause_split = _RUNON_MAX_CHARS, _RUNON_MAX_PIECES, True
         out = []
         changed = False
         for seg in rows:
@@ -225,50 +280,77 @@ def split_run_on_cues(segments, target_lang: str = "en"):
             start = float(seg.get("start") or 0.0)
             end = float(seg.get("end") or start)
             dur = end - start
-            if (len(text) <= _RUNON_MAX_CHARS or _is_marker(text)
-                    or dur < 2 * _RUNON_MIN_PIECE_S):
+            if _is_marker(text) or dur < 2 * _RUNON_MIN_PIECE_S or not text:
                 out.append(seg)
                 continue
             sentences = [s.strip() for s in _SENT_SPLIT_RE.split(text) if s.strip()]
-            if len(sentences) < 2:
+            # A run-on is a cue that spills past one line OR carries ≥2 finished
+            # thoughts (official subs give each its own cue regardless of length).
+            if not sentences or not (len(text) > max_chars or len(sentences) >= 2):
                 out.append(seg)
                 continue
-            # Group sentences into ≤ _RUNON_MAX_PIECES pieces, keeping each
-            # piece under the char budget where possible (greedy fill).
-            n_pieces = min(_RUNON_MAX_PIECES, len(sentences),
-                           max(2, int(dur // _RUNON_MIN_PIECE_S)))
-            budget = max(_RUNON_MAX_CHARS, len(text) // n_pieces + 1)
+
+            words = list(seg.get("words") or [])
+            token_partition = bool(words) and len(text.split()) == len(words)
+
+            # Build pieces: one sentence per piece; a long single sentence is
+            # clause-split (only when word-timed, to avoid scrambling tier-C
+            # karaoke). Never weld two sentences together.
             pieces: list[str] = []
-            cur = ""
             for s in sentences:
-                if cur and (len(cur) + 1 + len(s) > budget) and len(pieces) < n_pieces - 1:
-                    pieces.append(cur)
-                    cur = s
+                if clause_split and token_partition and len(s) > max_chars:
+                    units = _clause_units(s)
                 else:
-                    cur = (cur + " " + s).strip()
-            if cur:
-                pieces.append(cur)
+                    units = [s]
+                pieces.extend(_pack_units(units, max_chars, _RUNON_MIN_PIECE_CHARS))
             if len(pieces) < 2:
                 out.append(seg)
                 continue
-            # Proportional time allocation by character share.
-            total_chars = sum(len(p) for p in pieces) or 1
-            words = list(seg.get("words") or [])
-            # Partition words by TOKEN COUNT (not time overlap): each piece
-            # takes the next len(piece.split()) words in order, so counts stay
-            # EXACT and no straddling word is duplicated into two pieces. Only
-            # valid when the word list is 1:1 with the text tokens; otherwise
-            # leave pieces word-less (the char-proportional highlighter fills
-            # them) rather than corrupt the alignment.
+
+            # Cap pieces by the confetti limit AND the min-duration floor.
+            cap = max(2, min(max_pieces, int(dur // _RUNON_MIN_PIECE_S)))
+            while len(pieces) > cap:
+                j = min(range(len(pieces) - 1),
+                        key=lambda i: len(pieces[i]) + len(pieces[i + 1]))
+                pieces[j] = (pieces[j] + " " + pieces[j + 1]).strip()
+                del pieces[j + 1]
+
             piece_tokens = [len(p.split()) for p in pieces]
-            token_partition = words and sum(piece_tokens) == len(words)
+            token_partition = bool(words) and sum(piece_tokens) == len(words)
+
+            # Word-timed contiguous boundaries when 1:1 words exist: each cut
+            # lands on the real start of the next piece's first word.
+            bounds = None
+            if token_partition:
+                cand = [start]
+                cum = 0
+                ok = True
+                for k in range(len(pieces) - 1):
+                    cum += piece_tokens[k]
+                    w = words[cum]
+                    ws = w.get("start") if isinstance(w, dict) else getattr(w, "start", None)
+                    if ws is None:
+                        ok = False
+                        break
+                    cand.append(min(end, max(cand[-1], float(ws))))
+                if ok:
+                    cand.append(end)
+                    bounds = cand
+
+            total_chars = sum(len(p) for p in pieces) or 1
             w_off = 0
             t = start
             for k, p in enumerate(pieces):
-                share = len(p) / total_chars
-                p_end = end if k == len(pieces) - 1 else min(end, t + dur * share)
-                if p_end - t < _RUNON_MIN_PIECE_S and k < len(pieces) - 1:
+                if bounds is not None:
+                    p_end = bounds[k + 1]
+                else:
+                    share = len(p) / total_chars
+                    p_end = end if k == len(pieces) - 1 else min(end, t + dur * share)
+                if k == len(pieces) - 1:
+                    p_end = end
+                elif p_end - t < _RUNON_MIN_PIECE_S:
                     p_end = min(end, t + _RUNON_MIN_PIECE_S)
+                p_end = max(p_end, t)
                 piece_row = dict(seg)
                 piece_row["text"] = p
                 piece_row["start"], piece_row["end"] = round(t, 3), round(p_end, 3)

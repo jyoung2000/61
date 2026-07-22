@@ -459,6 +459,12 @@ const useTimelineStore = create(
       // ── Crop segments (subject tracking keyframes as editable segments) ──
       cropSegments: [],          // [{id, startTime, endTime, cropX, clusterId, isManualOverride, label}]
       selectedCropSegmentId: null,
+      // Dense, SmoothDamp-smoothed subject track [{t, x, snap?}] (clip-relative
+      // seconds, x in 0–100). This is the AUTHORITATIVE camera motion (crop
+      // segments only quantize it to one value each); the timeline reads it to
+      // paint the crop track's smooth-pan gradient so the user sees the same
+      // human-operator easing the export renders.
+      subjectKeyframes: [],
 
       // ── Playback state (not tracked by undo) ──
       playhead: 0,
@@ -585,6 +591,12 @@ const useTimelineStore = create(
         sceneCuts: Array.isArray(cuts)
           ? cuts.map((t) => Number(t)).filter((t) => Number.isFinite(t)).sort((a, b) => a - b)
           : [],
+      }),
+      // Replace the dense smoothed subject track the timeline samples for the
+      // crop-track gradient. Pass [] to clear. Kept as-is (already sorted by t
+      // from subjectTracking); we only guard the array shape.
+      setSubjectKeyframes: (kf) => set({
+        subjectKeyframes: Array.isArray(kf) ? kf : [],
       }),
       // Update one or both endpoints of the loop range. Pass ``null``
       // for either to clear that endpoint. Auto-enables loop when both
@@ -1228,6 +1240,8 @@ const useTimelineStore = create(
           clipStart,
           clipEnd,
           cropSegments: [],
+          subjectKeyframes: [],   // stale-track guard: a new clip must not be
+                                  // coloured by the previous clip's pan track
           selectedCropSegmentId: null,
           playhead: 0,
           duration,
@@ -1405,6 +1419,9 @@ const useTimelineStore = create(
           trimEndOffset: 0,
           subtitleSettings: {},
           _originalSubtitles: [],
+          cropSegments: [],
+          selectedCropSegmentId: null,
+          subjectKeyframes: [],
         });
       },
 

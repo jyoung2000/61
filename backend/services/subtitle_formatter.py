@@ -731,6 +731,16 @@ def _merge_for_readability(
     parts are genuinely far apart stays split. Order-preserving."""
     if not segments or max_gap_s <= 0:
         return segments
+    # One-thought-per-cue: by default never weld two ALREADY-COMPLETE sentences.
+    # This merge re-runs inside the SRT/VTT/ASS generators, so without this it
+    # silently re-glues the run-ons split_run_on_cues just broke at persist.
+    # Merging to COMPLETE an unfinished fragment (the anti-choppiness purpose)
+    # is unaffected. Config-reversible.
+    try:
+        from backend.config import settings as _mfs
+        merge_complete = bool(getattr(_mfs, "SUBTITLE_MERGE_COMPLETE_SENTENCES", False))
+    except Exception:
+        merge_complete = False
     char_budget = max(int(max_chars_per_line), int(max_chars_per_line) * max(1, int(max_lines)))
     out: list[TranscriptSegment] = []
     for seg in segments:
@@ -742,6 +752,11 @@ def _merge_for_readability(
         prev_txt = (prev.text or "").strip()
         gap = seg.start - prev.end
         same_speaker = (prev.speaker or "") == (seg.speaker or "")
+        # Never glue two finished thoughts into one cue (one-thought-per-cue).
+        # Only an UNFINISHED previous cue earns a merge, to complete it.
+        if not merge_complete and _ends_sentence(prev_txt):
+            out.append(seg)
+            continue
         # A finished sentence starts a fresh cue (one-sentence-per-cue is ideal);
         # an UNFINISHED one earns a wider bridge to complete the thought.
         eff_gap = max_gap_s if _ends_sentence(prev_txt) else max(max_gap_s, sentence_gap_s)

@@ -1324,6 +1324,7 @@ export default function VideoEditor({
         isManualOverride: false,
         label: 'Center',
       }]);
+      store.setSubjectKeyframes?.([]);
       return;
     }
     const clusters = detectPositionClusters(subjectKeyframes);
@@ -1361,6 +1362,9 @@ export default function VideoEditor({
       }
     }
     store.setCropSegments(segments);
+    // Publish the dense smoothed track so the timeline can paint the crop
+    // track's smooth-pan gradient from the same curve the preview/export ride.
+    store.setSubjectKeyframes?.(subjectKeyframes);
   }, [subjectKeyframes, isCrop, clipStart, clipEnd, renderPlan, speakerNames, sceneCuts, subjectTrack]);
 
   const hasDynamicSubject = useMemo(

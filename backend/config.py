@@ -234,6 +234,26 @@ class Settings(BaseSettings):
     # (YouTube-style one-thought-per-cue — the single largest readability gap
     # vs official subs). Deterministic, fail-soft, CJK targets untouched.
     TRANSCRIPT_SPLIT_RUNON_CUES: bool = True
+    # One-thought-per-cue tuning for split_run_on_cues. Official subs put each
+    # finished thought on its own short cue; our cues were coarser because the
+    # splitter only fired on ≥2 sentences AND >84 chars, at sentence-final
+    # punctuation only. These knobs let it (a) split any ≥2-sentence cue
+    # regardless of length, (b) treat a cue over ~one line as a run-on, and
+    # (c) break a long single-sentence clause-run ("M Plan, as long as …, we
+    # have no choice but to decelerate.") at strong clause boundaries — but the
+    # clause split only runs on cues whose words are 1:1 with the text (tier
+    # A/B), so word/karaoke timing stays exact; word-less (tier C) cues stay
+    # sentence-only. Latin-only; CJK targets are untouched as before.
+    TRANSCRIPT_RUNON_MAX_CHARS: int = 50      # a cue past ~one 42-char line is a run-on
+    TRANSCRIPT_RUNON_MAX_PIECES: int = 6      # cap pieces per cue (min-duration guards the floor)
+    TRANSCRIPT_RUNON_CLAUSE_SPLIT: bool = True  # break long single sentences at clause boundaries
+    # Stop the export-time readability merge from welding two ALREADY-COMPLETE
+    # sentences back into a run-on (it re-runs inside the SRT/VTT/ASS
+    # generators and otherwise undoes the finer cadence above). False =
+    # one-thought-per-cue: only merge to COMPLETE an unfinished fragment, never
+    # to glue two finished thoughts. True restores the legacy weld-anything
+    # behavior. The unfinished-fragment merge (anti-choppiness) is unaffected.
+    SUBTITLE_MERGE_COMPLETE_SENTENCES: bool = False
     VOCAL_GAP_SPAN_TIMEOUT_S: int = 300
     # VRAM the CUDA context + baseline allocation hold and never free — subtract
     # from total VRAM to get the model's usable budget. ~1.2 GB matches a 4 GB

@@ -10,6 +10,7 @@ import {
 import ContextMenu from './ContextMenu';
 import Tooltip from './Tooltip';
 import useResponsive from '../hooks/useResponsive';
+import { getCropXForTime } from '../utils/subjectTracking';
 
 // ── Constants ────────────────────────────────────────────────────────────────
 // Track sizing modeled after Premiere Pro / DaVinci Resolve / VEED — a clear
@@ -103,6 +104,45 @@ const CROP_CLUSTER_COLORS = [
   '#EC4899', // pink — speaker 3
   '#8B5CF6', // purple — manual override / unknown
 ];
+
+// ── Crop-track smooth-pan gradient ───────────────────────────────────────────
+// Each crop element is filled with a horizontal gradient sampled from the
+// SmoothDamp subject track, so a human-like pan (the crop X gliding across the
+// shot) reads as a smooth colour transition and a held shot stays flat. The
+// element keeps its cluster HUE (speaker identity is preserved); only the
+// LIGHTNESS rides the crop position — centred so a centred crop (50%) is the
+// base colour, a left pan darkens and a right pan lightens. That way the user
+// literally sees the human-operator easing the export renders.
+const CROP_GRADIENT_LIGHT_AMP = 0.22; // max ± lightness shift edge-to-edge
+
+function _cropHexToHsl(hex) {
+  const h = (hex || '#888888').replace('#', '');
+  const s = h.length === 3 ? h.split('').map((c) => c + c).join('') : h;
+  const n = parseInt(s, 16);
+  let r = ((n >> 16) & 255) / 255;
+  let g = ((n >> 8) & 255) / 255;
+  let b = (n & 255) / 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b);
+  let hh = 0, ss = 0; const l = (max + min) / 2;
+  if (max !== min) {
+    const d = max - min;
+    ss = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+    if (max === r) hh = (g - b) / d + (g < b ? 6 : 0);
+    else if (max === g) hh = (b - r) / d + 2;
+    else hh = (r - g) / d + 4;
+    hh /= 6;
+  }
+  return { h: hh, s: ss, l };
+}
+
+// Map a crop X (0–100) to a display colour derived from ``baseHex``: keep the
+// hue/saturation, ride lightness with the pan position (centred at 50%).
+function cropColorAt(baseHex, cropX, alpha = 1) {
+  const hsl = _cropHexToHsl(baseHex);
+  const t = (Math.max(0, Math.min(100, Number.isFinite(cropX) ? cropX : 50)) - 50) / 50; // -1..1
+  const l = Math.max(0.12, Math.min(0.9, hsl.l + t * CROP_GRADIENT_LIGHT_AMP));
+  return `hsla(${Math.round(hsl.h * 360)}, ${Math.round(hsl.s * 100)}%, ${Math.round(l * 100)}%, ${alpha})`;
+}
 
 function formatTime(s) {
   if (!s || isNaN(s) || s < 0) return '0:00';
@@ -583,6 +623,7 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
   const tracks = useTimelineStore((s) => s.tracks);
   const items = useTimelineStore((s) => s.items);
   const cropSegments = useTimelineStore((s) => s.cropSegments);
+  const subjectKeyframes = useTimelineStore((s) => s.subjectKeyframes);
 
   // ── Mobile compact lanes (3.1) ──
   // Phones render slim lanes; tapping a track header expands one lane
@@ -1224,10 +1265,27 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
             const sBodyH = cropLaneH - 8;
             const sRr = 4;
 
-            // Flat fill — same treatment as the main segments so the crop
-            // track reads as part of the same visual system.
-            const sAlpha = isSelCrop ? 'E0' : (isHoverCrop ? 'B0' : '80');
-            ctx.fillStyle = baseColor + sAlpha;
+            // Smooth-pan gradient — sample the SmoothDamp subject track across
+            // the visible body so a human pan reads as a colour transition and
+            // a held shot stays flat. A manually-pinned segment (or a missing
+            // track) falls back to a flat fill at its own value.
+            const fillAlpha = isSelCrop ? 0.9 : (isHoverCrop ? 0.72 : 0.55);
+            const hasTrack = Array.isArray(subjectKeyframes) && subjectKeyframes.length > 1;
+            if (!hasTrack || seg.isManualOverride) {
+              ctx.fillStyle = cropColorAt(baseColor, seg.cropX, fillAlpha);
+            } else {
+              // Map gradient stops through the pixel→time inverse so the colour
+              // stays aligned even when the segment is partly scrolled off.
+              const grad = ctx.createLinearGradient(clipCX, 0, clipCX + clipCW, 0);
+              const STOPS = 12;
+              for (let gi = 0; gi <= STOPS; gi++) {
+                const frac = gi / STOPS;
+                const tt = (clipCX + frac * clipCW - contentLeft + sx) / pps;
+                const cxPct = getCropXForTime(tt, cropSegments, subjectKeyframes);
+                grad.addColorStop(frac, cropColorAt(baseColor, cxPct, fillAlpha));
+              }
+              ctx.fillStyle = grad;
+            }
 
             if (isSelCrop) {
               ctx.save();
@@ -1300,7 +1358,17 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
               ctx.textAlign = 'left';
               ctx.shadowColor = 'rgba(0,0,0,0.45)';
               ctx.shadowBlur = 2;
-              const lbl = seg.label || `${Math.round(seg.cropX)}%`;
+              // Label the actual pan the gradient shows: "35→71%" for a glide,
+              // "50%" for a hold. The segment's own cropX is a single
+              // mid-transition value, so read the smoothed track at the
+              // segment's ends instead (unless the user pinned it).
+              let lbl = seg.label || `${Math.round(seg.cropX)}%`;
+              const hasTrackLbl = Array.isArray(subjectKeyframes) && subjectKeyframes.length > 1;
+              if (hasTrackLbl && !seg.isManualOverride) {
+                const a = Math.round(getCropXForTime(seg.startTime, cropSegments, subjectKeyframes));
+                const b = Math.round(getCropXForTime(Math.max(seg.startTime, seg.endTime - 0.001), cropSegments, subjectKeyframes));
+                lbl = Math.abs(a - b) >= 2 ? `${a}→${b}%` : `${a}%`;
+              }
               ctx.fillText(lbl, Math.max(cx1 + 8, contentLeft + 6), cy + cropLaneH / 2 + 4, cw - 16);
               ctx.shadowColor = 'transparent';
               ctx.shadowBlur = 0;
@@ -1497,7 +1565,7 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
         ctx.lineWidth = 1;
       }
     }
-  }, [tracks, items, duration, zoom, scrollX, selectedItemId, selectedItemIds, hoverTime, pps, compact, activeTool, segments, cropSegments, selectedCropSegmentId, snapLine]);
+  }, [tracks, items, duration, zoom, scrollX, selectedItemId, selectedItemIds, hoverTime, pps, compact, activeTool, segments, cropSegments, subjectKeyframes, selectedCropSegmentId, snapLine]);
   // ``playhead`` is intentionally absent: every play tick was both
   // recreating ``draw`` (causing the ``[draw]`` effect below to re-fire)
   // AND running the rAF loop. Two redraw mechanisms stacked.

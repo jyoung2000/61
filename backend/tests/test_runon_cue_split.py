@@ -19,13 +19,14 @@ def _cue(start, end, text, **kw):
 
 
 def test_splits_the_run54_capsule_runon():
-    # The real shipped cue: 4 sentences over ~11s.
+    # The real shipped cue: 4 sentences over ~11s. One-thought-per-cue now
+    # gives each finished sentence its own cue (YouTube cadence) → 4 pieces.
     segs = [_cue(355.0, 366.0,
                  "The capsule has altered its course. Does it have suicidal "
                  "tendencies? If it burns out, even secrets can be protected. "
                  "I suppose that's about right.")]
     out, changed = split_run_on_cues(segs, "en")
-    assert changed and 2 <= len(out) <= 3
+    assert changed and 3 <= len(out) <= 4
     # Chronological, gap-free, same overall window.
     assert out[0]["start"] == 355.0 and out[-1]["end"] == 366.0
     for a, b in zip(out, out[1:]):
@@ -48,9 +49,10 @@ def test_time_allocation_is_proportional():
 
 
 def test_never_touches_short_cues_markers_or_cjk():
-    short = [_cue(0, 3, "Two thoughts. Both short.")]
+    # A single short thought (one sentence, under one line) stays whole.
+    short = [_cue(0, 3, "Just one short thought here.")]
     out, changed = split_run_on_cues(short, "en")
-    assert not changed and out[0]["text"] == "Two thoughts. Both short."
+    assert not changed and out[0]["text"] == "Just one short thought here."
 
     marker = [_cue(0, 30, "[♪ music ♪]" + " " * 90)]
     _, changed = split_run_on_cues(marker, "en")
@@ -63,6 +65,46 @@ def test_never_touches_short_cues_markers_or_cjk():
     brief = [_cue(0.0, 1.5, "One. " * 30)]  # too brief for ≥1s pieces
     _, changed = split_run_on_cues(brief, "en")
     assert not changed
+
+
+def test_short_two_sentence_cue_now_splits_one_thought_per_cue():
+    # Two finished thoughts on one ≥2s cue → each gets its own cue (the
+    # YouTube-cadence behavior; old contract kept them welded).
+    segs = [_cue(0.0, 3.0, "Two thoughts. Both short.")]
+    out, changed = split_run_on_cues(segs, "en")
+    assert changed and len(out) == 2
+    assert out[0]["text"] == "Two thoughts." and out[1]["text"] == "Both short."
+    assert out[0]["start"] == 0.0 and out[-1]["end"] == 3.0
+    for p in out:
+        assert p["end"] - p["start"] >= 1.0 - 1e-9  # min-piece floor honored
+
+
+def test_long_single_sentence_splits_at_clauses_when_word_timed():
+    # A long single clause-run sentence with NO sentence-final punctuation still
+    # splits — at strong clause boundaries — when the cue carries 1:1 words.
+    text = ("M Plan, as long as there's a civilian shuttle in front of us, "
+            "we have no choice but to decelerate.")
+    toks = text.split()
+    words = [{"start": i * 6.0 / len(toks), "end": (i + 1) * 6.0 / len(toks),
+              "word": toks[i]} for i in range(len(toks))]
+    segs = [_cue(0.0, 6.0, text, words=words)]
+    out, changed = split_run_on_cues(segs, "en")
+    assert changed and len(out) >= 2
+    # Text round-trips and word partition stays exact (no dropped/duplicated).
+    assert " ".join(p["text"] for p in out) == text
+    assert sum(len(p["words"] or []) for p in out) == len(words)
+    for p in out:
+        assert p["end"] > p["start"]
+
+
+def test_long_single_sentence_kept_whole_when_word_less():
+    # Same long sentence but WITHOUT 1:1 words (tier C): clause splitting is
+    # suppressed to avoid scrambling char-proportional timing, so it stays whole.
+    text = ("M Plan, as long as there's a civilian shuttle in front of us, "
+            "we have no choice but to decelerate.")
+    segs = [_cue(0.0, 6.0, text)]  # no words
+    out, changed = split_run_on_cues(segs, "en")
+    assert not changed and len(out) == 1
 
 
 def test_words_are_partitioned_into_their_piece():
