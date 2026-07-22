@@ -2516,27 +2516,28 @@ def _speaker_aware_keyframes(
 
 def _insert_snap_transitions(
     keyframes: list[tuple[float, int]],
-    jump_threshold: int = 15,
-    snap_duration: float = 0.15,
-    max_snap_duration: float = 0.9,
-    cut_threshold: int = 22,
+    jump_threshold: int = 4,
+    snap_duration: float = 0.4,
+    max_snap_duration: float = 1.3,
 ) -> list[tuple[float, int]]:
-    """Shape transitions the way a human operator moves the camera:
+    """Shape transitions the way a human operator moves the camera: every
+    move is a SMOOTH, gentle pan — never a cut, never a whip. The bigger the
+    move, the LONGER the pan (a full reposition eases over ~1.3s), so the
+    camera glides deliberately across the frame instead of snapping.
 
-    * A jump ≥ ``cut_threshold`` becomes a hard CUT (1ms pair) — an editor
-      cuts to a new framing; whip-panning 40% of the frame ("34→72 sweeps")
-      loses the viewer.
-    * A smaller move becomes hold-then-ease: hold the old framing, then ONE
-      deliberate, distance-scaled pan (0.4-0.9s) that SETTLES exactly when
-      the new keyframe takes effect.
+    Each move becomes hold-then-ease: hold the old framing, then one pan
+    whose duration scales with distance, settling exactly when the new
+    keyframe takes effect.
 
-    Two keyframes at t=0,sx=44 and t=10,sx=56 (jump 12) become:
-        t=0.000, sx=44  (hold)
-        t=9.500, sx=44  (hold ends — pan begins)
-        t=10.00, sx=56  (pan settles exactly on the trigger)
+        t=0.000, sx=35  (hold)
+        t=8.700, sx=35  (hold ends — pan begins, dur scales with the 36-unit move)
+        t=10.00, sx=71  (pan settles gently on the trigger)
 
-    Scene-cut pairs (1ms apart from _handle_scene_cuts) are preserved as
-    hard cuts.
+    (Used for backend-derived tracks — full-video / server exports. Clip
+    exports ship the frontend's SmoothDamp track and replay it directly.)
+    Only pre-existing 1ms scene-cut pairs (from _handle_scene_cuts /
+    _inject_shot_boundary_cuts) stay as hard cuts — those are real shot
+    boundaries where reframing must jump.
     """
     if len(keyframes) <= 1:
         return keyframes
@@ -2548,13 +2549,14 @@ def _insert_snap_transitions(
         dt = t1 - t0
         jump = abs(sx1 - sx0)
 
-        if jump >= cut_threshold and dt > 0.005:
-            # Editorial cut: reposition instantly at the trigger.
-            result.append((round(t1 - 0.001, 3), sx0))
-        else:
-            dur = min(max_snap_duration, max(0.4, 0.35 + jump * 0.012))
-            if jump >= jump_threshold and dt > dur * 1.5:
-                result.append((t1 - dur, sx0))  # hold ends; pan covers [t1-dur, t1]
+        # A pre-existing 1ms pair is a real shot-boundary cut — pass through.
+        if dt <= 0.02:
+            result.append(keyframes[i])
+            continue
+        # Distance-scaled gentle pan (bigger move → slower glide, capped).
+        dur = min(max_snap_duration, max(snap_duration, 0.3 + jump * 0.025))
+        if jump >= jump_threshold and dt > dur * 1.3:
+            result.append((round(t1 - dur, 3), sx0))  # hold ends; pan over [t1-dur, t1]
         result.append(keyframes[i])
 
     return result
@@ -3504,6 +3506,7 @@ def _build_crop_x_expr(
     src_w: int = 0,
     crop_w: int = 0,
     step_mode: bool = False,
+    force_linear: bool = False,
 ) -> str:
     """Build an FFmpeg expression for time-varying horizontal crop offset.
 
@@ -3616,12 +3619,15 @@ def _build_crop_x_expr(
     # same expression depth as step and converges to the dense track.
     # Smoothstep on a dense track is also wrong (it triples nesting depth
     # and S-curves every half-second hop), so both modes collapse to linear.
-    linear_mode = len(offsets) > 40
+    # Prebaked SmoothDamp tracks (force_linear) and any dense set are linked
+    # LINEARLY — the samples already encode the eased curve, so smoothstep
+    # per-segment would double-ease and pulse the glide.
+    linear_mode = force_linear or len(offsets) > 40
     if linear_mode:
         logger.info(
-            "[SubjectTracking] _build_crop_x_expr: dense set (%d offsets) — using "
-            "piecewise-linear interpolation (matches the preview's dense track)",
-            len(offsets),
+            "[SubjectTracking] _build_crop_x_expr: %s — using piecewise-linear "
+            "interpolation (matches the preview's dense track)",
+            "prebaked track" if force_linear else f"dense set ({len(offsets)} offsets)",
         )
 
     interp_label = ("linear" if linear_mode
@@ -4738,6 +4744,7 @@ def _build_filter_chain(
                     x_expr = _build_crop_x_expr(
                         _final_kf, max_x_offset, src_w, crop_w,
                         step_mode=use_step_interpolation,
+                        force_linear=transitions_prebaked,
                     )
                     filters.append(f"crop={crop_w}:{crop_h}:{x_expr}:{y_offset}")
                     logger.info(
@@ -6839,29 +6846,24 @@ async def export_clip(
             _frontend_prebaked = False
             if frontend_subject_keyframes and aspect_ratio and not all_tracking_off:
                 _using_frontend_keyframes = True
-                # A humanized track (see subjectTracking.humanizeKeyframes)
-                # carries ``snap`` flags: hard CUTS for big repositions, with
-                # hold points already inserted so pans settle deliberately.
-                # Expand each snap into a 1ms pair (hold → cut) and render the
-                # track EASED — the exact camera the preview shows. Legacy
-                # payloads (no snap fields anywhere) keep the old step render.
-                _frontend_prebaked = any(kf.get("snap") for kf in frontend_subject_keyframes)
-                if _frontend_prebaked:
-                    _sorted_kfs = sorted(frontend_subject_keyframes,
-                                         key=lambda k: k.get("time", 0))
-                    keyframes = []
-                    for kf in _sorted_kfs:
-                        _t = round(float(kf.get("time", 0)), 3)
-                        _x = int(round(kf.get("x", 50)))
-                        if kf.get("snap") and keyframes and _t - keyframes[-1][0] > 0.002:
-                            keyframes.append((round(_t - 0.001, 3), keyframes[-1][1]))
-                        keyframes.append((_t, _x))
-                else:
-                    keyframes = [
-                        (round(kf.get("time", 0), 3), int(round(kf.get("x", 50))))
-                        for kf in frontend_subject_keyframes
-                    ]
-                    keyframes.sort()
+                # The frontend ships the FINAL humanized camera path (see
+                # subjectTracking.humanizeKeyframes — a dense, ~10 Hz,
+                # speed-capped SmoothDamp follow). It is already the exact
+                # motion the preview shows, so the export must REPLAY it
+                # continuously (no re-deriving transitions, no stepping). Any
+                # ``snap`` marks a true shot-boundary cut → expand to a 1ms
+                # pair so it renders instant; everything else interpolates
+                # smoothly between the dense samples.
+                _frontend_prebaked = True
+                _sorted_kfs = sorted(frontend_subject_keyframes,
+                                     key=lambda k: k.get("time", 0))
+                keyframes = []
+                for kf in _sorted_kfs:
+                    _t = round(float(kf.get("time", 0)), 3)
+                    _x = int(round(kf.get("x", 50)))
+                    if kf.get("snap") and keyframes and _t - keyframes[-1][0] > 0.002:
+                        keyframes.append((round(_t - 0.001, 3), keyframes[-1][1]))
+                    keyframes.append((_t, _x))
 
                 # Compute face Y from scene data for vertical positioning
                 # (matters for 1:1, 4:5 crops where vertical offset is needed)

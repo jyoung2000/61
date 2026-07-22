@@ -120,14 +120,23 @@ def test_snap_transitions_duration_scales_with_distance():
     assert large_move <= 0.9 + 1e-9              # but always bounded
 
 
-def test_big_jumps_become_editorial_cuts_not_sweeps():
-    # The user-reported case: 34 → 72 (38 units). A human editor CUTS to the
-    # new framing — a whip-pan across 38% of the frame loses the viewer.
-    out = _insert_snap_transitions([(0.0, 34), (6.0, 72)], jump_threshold=1)
+def test_big_moves_are_smooth_pans_not_cuts():
+    # The user-reported 35 → 71 case: a human operator pans SMOOTHLY across a
+    # big reposition (never an instant cut, never a whip). The bigger the
+    # move, the longer/gentler the glide — bounded so it still settles.
+    out = _insert_snap_transitions([(0.0, 35), (6.0, 71)], jump_threshold=1)
     assert len(out) == 3
-    hold_end, cut = out[1], out[2]
-    assert hold_end[1] == 34 and cut == (6.0, 72)
-    assert (cut[0] - hold_end[0]) <= 0.002       # instant cut, no sweep
+    hold_end, settle = out[1], out[2]
+    assert hold_end[1] == 35 and settle == (6.0, 71)
+    pan = settle[0] - hold_end[0]
+    assert 0.9 <= pan <= 1.3                      # a slow, deliberate glide — not a cut
+
+
+def test_scene_cut_pairs_stay_hard_cuts():
+    # Real shot boundaries (1ms pairs) must NOT be softened into pans.
+    out = _insert_snap_transitions([(0.0, 30), (5.0, 30), (5.001, 70), (9.0, 70)],
+                                   jump_threshold=1)
+    assert (5.001, 70) in out
 
 
 def test_snap_transitions_preserve_scene_cut_pairs():

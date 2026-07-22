@@ -1447,9 +1447,13 @@ export function interpolateSubjectX(keyframes, t) {
   // the right keyframe.
   if (right.snap) return left.x;
 
+  // LINEAR interpolation between samples. The track is already a smoothed
+  // (SmoothDamp) camera path, so the samples ARE the eased curve — connect
+  // them straight. Smoothstep per-segment would re-ease every 0.1s sample,
+  // zeroing velocity at each boundary and making the glide pulse. (The
+  // export's _build_crop_x_expr force-links the same track linearly.)
   const u = Math.max(0, Math.min(1, (t - left.t) / span));
-  const e = u * u * (3 - 2 * u); // smoothstep (cubic Hermite)
-  return left.x + (right.x - left.x) * e;
+  return left.x + (right.x - left.x) * u;
 }
 
 /**
@@ -1567,100 +1571,109 @@ export function buildKeyframesFromSubjectTrack(track, clipStart, clipEnd, srcRat
     out.push({ t: clipDur, x: out[out.length - 1].x, source: 'hold_fwd' });
   }
 
-  // Human-camera shaping: cuts for big repositions, deliberate settling
-  // pans for small ones, no bounce-chasing or stutter (shared policy —
-  // this same shaped track is shipped to the export).
+  // Human-camera shaping: a critically-damped, speed-capped follow so every
+  // move is a smooth gentle pan (never a whip or a robotic cut). Same shaped
+  // track is shipped to the export, so preview and MP4 move identically.
   return humanizeKeyframes(out);
 }
 
 /**
- * Human-camera shaping of a keyframe track — the single policy shared by
- * the preview interpolator AND the export renderer (the track itself is
- * shipped to the backend, so shaping here fixes both sides identically).
+ * SmoothDamp — critically-damped follow (Game Programming Gems 4 / Unity's
+ * Mathf.SmoothDamp). Eases ``current`` toward ``target`` with a spring-like
+ * settle AND a hard maximum speed, so the camera can NEVER whip across the
+ * frame: a large move simply takes proportionally longer, exactly like a
+ * human operator easing the pan handle of a tripod. Returns [pos, vel].
+ */
+function smoothDamp(current, target, vel, smoothTime, maxSpeed, dt) {
+  smoothTime = Math.max(0.0001, smoothTime);
+  const omega = 2 / smoothTime;
+  const x = omega * dt;
+  const exp = 1 / (1 + x + 0.48 * x * x + 0.235 * x * x * x);
+  const originalTo = target;
+  let change = current - target;
+  const maxChange = maxSpeed * smoothTime;
+  change = Math.max(-maxChange, Math.min(maxChange, change));
+  const to = current - change;
+  const temp = (vel + omega * change) * dt;
+  let newVel = (vel - omega * temp) * exp;
+  let out = to + (change + temp) * exp;
+  // Prevent overshoot past the (unclamped) target.
+  if ((originalTo - current > 0) === (out > originalTo)) {
+    out = originalTo;
+    newVel = (out - originalTo) / dt;
+  }
+  return [out, newVel];
+}
+
+/**
+ * Human-camera shaping — the single policy shared by the preview
+ * interpolator AND the export renderer (this shaped track is shipped to the
+ * backend, so both sides move identically).
  *
- * A human operator never sweeps 40% of the frame or chases every wobble:
- *   1. Micro-moves under DEAD_BAND are absorbed into the hold (with
- *      hysteresis — a slow drift still moves once it accumulates).
- *   2. A→B→A bounces inside BOUNCE_WIN are held through (no chasing a
- *      two-beat interjection).
- *   3. Successive moves closer than MIN_MOVE_GAP coalesce — the camera
- *      goes directly to the final framing instead of stuttering through
- *      intermediates.
- *   4. Jumps ≥ CUT_THRESHOLD become hard CUTS (snap) — an editor cuts to
- *      a new framing, never whip-pans across the scene.
- *   5. Remaining pans get a hold keyframe so the move lasts a deliberate,
- *      distance-scaled 0.4-0.9s and SETTLES exactly on the trigger — no
- *      more sweeping across a whole 10s gap.
+ * The camera is a critically-damped mass that FOLLOWS the subject: it
+ * accelerates smoothly, is speed-capped so it can never sweep/whip across
+ * the frame, and settles gently — never an instant cut, never a robotic
+ * snap. Rapid A↔B dialogue swings are naturally damped into a gentle drift
+ * (the follow can't keep up with a two-beat flip, so it barely moves — the
+ * ping-pong disappears for free); slow deliberate moves are followed fully.
  *
- * Idempotent: running it on its own output changes nothing.
+ * The ONLY hard cut is a real shot boundary — an injected 1ms-apart ``snap``
+ * pair (from injectShotBoundaryCuts) — where the camera teleports to reframe
+ * the new shot. A large MID-scene subject jump is a smooth capped pan, NOT a
+ * cut (cutting there is the "jarring/robotic" artifact the operator avoids).
+ *
+ * Output is a dense (~10 Hz), continuous position track. Idempotent enough:
+ * re-running on an already-smooth track barely changes it.
  */
 export function humanizeKeyframes(kfs) {
   if (!Array.isArray(kfs) || kfs.length < 2) return kfs;
-  const DEAD_BAND = 4;      // sx units — below this, hold
-  const CUT_THRESHOLD = 22; // sx units — at/above this, cut
-  const MIN_MOVE_GAP = 0.9; // s — moves closer than this coalesce
-  const BOUNCE_WIN = 1.6;   // s — A→B→A inside this is suppressed
-  const isPairGap = (a, b) => (b.t - a.t) < 0.005;
+  const SMOOTH_TIME = 0.55;   // s — deliberate operator settle time
+  const MAX_SPEED = 42;       // %/s — hard velocity cap (no whip is possible)
+  const DT = 0.1;             // s — trajectory sampling step (~10 Hz)
+  const DEAD_BAND = 3.5;      // %  — ignore sub-perceptual target wobble
+  const CUT_PAIR_GAP = 0.02;  // s  — a snap this close to its neighbor = real cut
 
-  let out = kfs.map((k) => ({ ...k })).sort((a, b) => a.t - b.t);
+  const src = kfs.map((k) => ({ ...k })).sort((a, b) => a.t - b.t);
+  const t0 = src[0].t;
+  const tEnd = src[src.length - 1].t;
+  if (tEnd - t0 <= DT) return src;
 
-  // 1. Dead-band with hysteresis (never drop snap keyframes or hold points).
-  const banded = [out[0]];
-  for (let i = 1; i < out.length; i++) {
-    const prev = banded[banded.length - 1];
-    const cur = out[i];
-    if (!cur.snap && !isPairGap(prev, cur)
-        && Math.abs(cur.x - prev.x) < DEAD_BAND && i < out.length - 1) {
-      continue;
+  // Real shot-boundary cuts: a snap keyframe within CUT_PAIR_GAP of the
+  // previous one (the 1ms pair injectShotBoundaryCuts emits). A lone snap
+  // on a normally-spaced sample is just a big subject jump → pan, don't cut.
+  const isRealCut = (i) =>
+    i > 0 && src[i].snap && (src[i].t - src[i - 1].t) < CUT_PAIR_GAP;
+
+  const out = [];
+  let pos = src[0].x;
+  let vel = 0;
+  let held = src[0].x;   // dead-banded target
+  let idx = 0;
+  for (let t = t0; t <= tEnd + 1e-6; t += DT) {
+    // Advance the active target keyframe; teleport across any real cut we pass.
+    while (idx + 1 < src.length && src[idx + 1].t <= t + 1e-6) {
+      idx++;
+      if (isRealCut(idx)) { pos = src[idx].x; vel = 0; held = src[idx].x; }
     }
-    banded.push(cur);
+    const tgt = src[idx].x;
+    if (Math.abs(tgt - held) >= DEAD_BAND) held = tgt;
+    const [np, nv] = smoothDamp(pos, held, vel, SMOOTH_TIME, MAX_SPEED, DT);
+    pos = np; vel = nv;
+    out.push({ t: +t.toFixed(3), x: Math.round(pos * 10) / 10 });
+  }
+  if (Math.abs(out[out.length - 1].t - tEnd) > 1e-3) {
+    out.push({ t: +tEnd.toFixed(3), x: Math.round(pos * 10) / 10 });
   }
 
-  // 2. Bounce suppression.
-  let i = 1;
-  while (i < banded.length - 1) {
-    const a = banded[i - 1]; const b = banded[i]; const c = banded[i + 1];
-    if (!isPairGap(a, b) && !isPairGap(b, c) && !b.snap
-        && Math.abs(c.x - a.x) <= DEAD_BAND
-        && Math.abs(b.x - a.x) > DEAD_BAND
-        && (c.t - b.t) < BOUNCE_WIN) {
-      banded.splice(i, 1);
-    } else i++;
+  // Shrink the payload: keep a sample only when it has drifted ≥0.4% from the
+  // last kept one (holds collapse; moving sections keep their curve). Always
+  // keep both endpoints so the boundaries stay pinned.
+  const dedup = [out[0]];
+  for (let i = 1; i < out.length - 1; i++) {
+    if (Math.abs(out[i].x - dedup[dedup.length - 1].x) >= 0.4) dedup.push(out[i]);
   }
-
-  // 3. Coalesce rapid successive moves — go straight to the destination.
-  i = 1;
-  while (i < banded.length - 1) {
-    const a = banded[i - 1]; const b = banded[i]; const c = banded[i + 1];
-    if (!isPairGap(a, b) && !isPairGap(b, c) && !b.snap && !c.snap
-        && (c.t - b.t) < MIN_MOVE_GAP
-        && Math.abs(b.x - a.x) >= DEAD_BAND
-        && Math.abs(c.x - b.x) >= DEAD_BAND) {
-      banded.splice(i, 1);
-    } else i++;
-  }
-
-  // 4+5. Classify: big jump → cut; small move → hold-then-settle pan.
-  const shaped = [banded[0]];
-  for (let k = 1; k < banded.length; k++) {
-    const prev = shaped[shaped.length - 1];
-    const cur = banded[k];
-    const dx = Math.abs(cur.x - prev.x);
-    const span = cur.t - prev.t;
-    if (cur.snap || dx >= CUT_THRESHOLD) {
-      cur.snap = true;
-      shaped.push(cur);
-      continue;
-    }
-    if (dx >= DEAD_BAND) {
-      const panDur = Math.min(0.9, Math.max(0.4, 0.35 + dx * 0.012));
-      if (span > panDur + 0.05) {
-        shaped.push({ t: +(cur.t - panDur).toFixed(3), x: prev.x, source: 'hold' });
-      }
-    }
-    shaped.push(cur);
-  }
-  return shaped;
+  dedup.push(out[out.length - 1]);
+  return dedup;
 }
 
 // Keep old smoothKeyframes export for backward compatibility (unused but safe)
