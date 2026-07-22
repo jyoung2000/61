@@ -4407,6 +4407,47 @@ export default function VideoEditor({
               </label>
             );
           })}
+          {/* Active-word highlight color — lives in the same row so the operator
+              can pick a karaoke color that doesn't clash with the speaker colors.
+              Matches the swatch in ClipSettingsPanel; both edit settings.activeWordColor. */}
+          {(settings?.activeWordEnabled ?? true) && (
+            <label
+              title="Active-word highlight color — the color the currently-spoken word turns"
+              style={{
+                display: 'inline-flex', alignItems: 'center', gap: 6,
+                cursor: 'pointer',
+                padding: '4px 8px',
+                borderRadius: 6,
+                background: 'var(--ve-track-bg, rgba(0,0,0,0.04))',
+                border: '1px dashed var(--ve-chrome-border)',
+                transition: 'all 0.15s ease',
+              }}
+            >
+              <input
+                type="color"
+                value={settings?.activeWordColor || '#FFD700'}
+                onChange={(e) => {
+                  e.stopPropagation();
+                  if (onSettingsChange) {
+                    onSettingsChange({ ...settings, activeWordColor: e.target.value });
+                  }
+                }}
+                onClick={(e) => e.stopPropagation()}
+                style={{
+                  width: 24, height: 24, padding: 0,
+                  border: '2px solid var(--border, #ddd)',
+                  borderRadius: 6, cursor: 'pointer', background: 'none',
+                }}
+                aria-label="Active word highlight color"
+              />
+              <span style={{
+                color: 'var(--ve-text)', fontSize: 12, fontWeight: 500,
+                maxWidth: 120, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+              }}>
+                Active Word
+              </span>
+            </label>
+          )}
         </div>
       )}
 
