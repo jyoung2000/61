@@ -40,6 +40,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -94,9 +95,54 @@ class OllamaHost:
                 "is_companion": self.is_companion}
 
 
+def _model_size_key(tag: str):
+    """``(base, size)`` for an Ollama tag, IGNORING the ``-instruct`` marker and
+    the quant suffix — so ``qwen2.5:14b``, ``qwen2.5:14b-instruct`` and
+    ``qwen2.5:14b-instruct-q4_K_M`` all key to ``("qwen2.5", "14b")``. Returns
+    ``None`` when there's no ``<n>b`` size token to anchor on, so two unrelated
+    bare names are never treated as equal (and a 7b never matches a 14b)."""
+    t = str(tag or "").split("/")[-1].strip().lower()
+    if ":" not in t:
+        return None
+    base, rest = t.split(":", 1)
+    m = re.match(r"(\d+(?:\.\d+)?b)\b", rest)
+    if not m:
+        return None
+    return (base, m.group(1))
+
+
+def resolve_installed_tag(installed: list, requested: str):
+    """The installed Ollama tag to actually CALL for ``requested``, or ``None``.
+
+    Ollama's ``/api/generate`` needs the exact installed tag, so a configured
+    ``qwen2.5:14b-instruct`` must route to an installed ``qwen2.5:14b`` (same
+    model, different spelling) instead of 404-ing. A trivial match (exact /
+    ``:latest`` / ``ollama/`` prefix) keeps the REQUESTED spelling; only a
+    genuine ``-instruct``/quant difference returns the installed spelling."""
+    if not requested:
+        return None
+    try:
+        from backend.services.local_models import _ollama_names_match as _m
+    except Exception:
+        def _m(a, b):
+            a2, b2 = str(a).split("/")[-1].lower(), str(b).split("/")[-1].lower()
+            return a2 == b2 or a2.split(":")[0] == b2.split(":")[0]
+    for inst in installed or []:
+        if _m(inst, requested):
+            return requested
+    rk = _model_size_key(requested)
+    if rk is None:
+        return None
+    for inst in installed or []:
+        if _model_size_key(inst) == rk:
+            return inst
+    return None
+
+
 def model_present(installed: list, requested: str) -> bool:
     """True if ``requested`` matches an installed Ollama tag, tolerating an
-    implicit ``:latest`` and an ``ollama/`` prefix on either side."""
+    implicit ``:latest``, an ``ollama/`` prefix, and the ``-instruct``/quant
+    suffix (so an installed ``qwen2.5:14b`` satisfies ``qwen2.5:14b-instruct``)."""
     if not requested:
         return False
     req = str(requested).split("/")[-1]
@@ -105,7 +151,7 @@ def model_present(installed: list, requested: str) -> bool:
         mm = str(m).split("/")[-1]
         if mm in wanted or (":" not in req and mm.split(":")[0] == req):
             return True
-    return False
+    return resolve_installed_tag(installed, requested) is not None
 
 
 @dataclass
@@ -508,14 +554,25 @@ def resolve_model_for_host(status: HostStatus, requested: str,
     requested model is returned unchanged so the normal 404 → provider
     fallback path is preserved.
     """
-    if not status.models or _host_has_model(status, requested):
+    if not status.models:
         return requested, False
+    # An installed equivalent (incl. an -instruct/quant spelling of the same
+    # model) wins — routing to the INSTALLED tag so /api/generate doesn't 404 on
+    # a configured "qwen2.5:14b-instruct" when "qwen2.5:14b" is what's pulled.
+    hit = resolve_installed_tag(status.models, requested)
+    if hit is not None:
+        if hit != requested:
+            logger.info(
+                "Ollama tag resolution: routing %r to installed %r (same model)",
+                requested, hit)
+        return hit, (hit != requested)
     for candidate in MODEL_LADDER.get(kind, []):
-        if _host_has_model(status, candidate):
+        cand = resolve_installed_tag(status.models, candidate)
+        if cand is not None:
             logger.warning(
                 "Ollama model substitution: host lacks %r — using %r "
-                "(best installed %s-ladder model)", requested, candidate, kind)
-            return candidate, True
+                "(best installed %s-ladder model)", requested, cand, kind)
+            return cand, True
     return requested, False
 
 

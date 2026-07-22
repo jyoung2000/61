@@ -4341,6 +4341,14 @@ async def companion_verify():
 
     gen_url = _oreg.join_url(comp.url, "/api/generate")
     headers = _oreg.auth_headers(comp)
+    # What's actually installed on the Companion, so a configured
+    # "qwen2.5:14b-instruct" resolves to an installed "qwen2.5:14b" (same model)
+    # instead of a false "model not installed".
+    try:
+        _status = await _oreg.probe(comp)
+        installed = list(_status.models or [])
+    except Exception:
+        installed = []
     results = []
     # Short connect so an unreachable Companion fails fast; long read so a cold
     # model still has time to load and answer the 1-token sentinel.
@@ -4348,14 +4356,17 @@ async def companion_verify():
     async with _httpx.AsyncClient(timeout=_timeout) as client:
         for _m in want:
             item = {"model": _m, "ok": False, "detail": ""}
+            call_model = _oreg.resolve_installed_tag(installed, _m) or _m
             try:
                 r = await client.post(gen_url, headers=headers, json={
-                    "model": _m, "prompt": "ping", "stream": False,
+                    "model": call_model, "prompt": "ping", "stream": False,
                     "options": {"num_predict": 1},
                 })
                 if r.status_code == 200:
                     item["ok"] = True
-                    item["detail"] = "generated on the Companion GPU"
+                    item["detail"] = ("generated on the Companion GPU"
+                                      if call_model == _m
+                                      else f"generated on the Companion GPU (installed as {call_model})")
                 elif r.status_code in (401, 403):
                     item["detail"] = "auth rejected — check the host access token"
                 elif r.status_code == 404:
