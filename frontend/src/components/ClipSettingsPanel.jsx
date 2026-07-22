@@ -1160,25 +1160,30 @@ export default function ClipSettingsPanel({ speakers, speakerNames, videoResolut
                       </div>
                       {settings.activeWordEnabled && (
                         <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                          {/* Word Color */}
-                          <div>
-                            <div style={{ fontSize: 13, color: 'var(--text-primary)', marginBottom: 6 }}>Word Color</div>
-                            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                              <input
-                                type="color"
-                                value={settings.activeWordColor}
-                                onChange={(e) => update('activeWordColor', e.target.value)}
-                                style={{
-                                  width: 28, height: 28,
-                                  border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)',
-                                  padding: 1, cursor: 'pointer', background: 'var(--bg-elevated)',
-                                }}
-                              />
-                              <span style={{ fontSize: 11, fontFamily: 'var(--font-mono)', color: 'var(--text-secondary)' }}>
-                                {String(settings.activeWordColor || '')}
-                              </span>
+                          {/* Word Color — shown here only when there are no
+                              speakers to compare against; otherwise the swatch
+                              moves up into the Speaker Colors row so the user
+                              picks a highlight color that doesn't clash. */}
+                          {(!speakers || speakers.length === 0) && (
+                            <div>
+                              <div style={{ fontSize: 13, color: 'var(--text-primary)', marginBottom: 6 }}>Word Color</div>
+                              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                                <input
+                                  type="color"
+                                  value={settings.activeWordColor}
+                                  onChange={(e) => update('activeWordColor', e.target.value)}
+                                  style={{
+                                    width: 28, height: 28,
+                                    border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)',
+                                    padding: 1, cursor: 'pointer', background: 'var(--bg-elevated)',
+                                  }}
+                                />
+                                <span style={{ fontSize: 11, fontFamily: 'var(--font-mono)', color: 'var(--text-secondary)' }}>
+                                  {String(settings.activeWordColor || '')}
+                                </span>
+                              </div>
                             </div>
-                          </div>
+                          )}
                           {/* Word Stroke Color */}
                           <div>
                             <div style={{ fontSize: 13, color: 'var(--text-primary)', marginBottom: 6 }}>Word Stroke Color</div>
@@ -1265,7 +1270,28 @@ export default function ClipSettingsPanel({ speakers, speakerNames, videoResolut
                     {speakers && speakers.length > 0 && (
                       <div>
                         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: (settings.useSpeakerColors ?? true) ? 8 : 0 }}>
-                          <div style={{ fontSize: 13, color: 'var(--text-primary)' }}>Speaker Colors</div>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+                            <div style={{ fontSize: 13, color: 'var(--text-primary)' }}>Speaker Colors</div>
+                            {settings.activeWordEnabled && (
+                              <div
+                                title="Active-word highlight color — pick one that doesn't clash with the speaker colors"
+                                style={{ display: 'flex', alignItems: 'center', gap: 6 }}
+                              >
+                                <span style={{ fontSize: 11, color: 'var(--text-secondary)' }}>Active&nbsp;Word</span>
+                                <input
+                                  type="color"
+                                  value={settings.activeWordColor}
+                                  onChange={(e) => update('activeWordColor', e.target.value)}
+                                  aria-label="Active word highlight color"
+                                  style={{
+                                    width: 24, height: 24,
+                                    border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)',
+                                    padding: 1, cursor: 'pointer', background: 'var(--bg-elevated)',
+                                  }}
+                                />
+                              </div>
+                            )}
+                          </div>
                           <div
                             onClick={() => update('useSpeakerColors', !(settings.useSpeakerColors ?? true))}
                             style={{

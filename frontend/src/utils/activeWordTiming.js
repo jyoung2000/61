@@ -118,17 +118,33 @@ export function getCurrentWordIndex(segment, relativeTime, speakerRates) {
   const charTime = Math.max(segDuration - totalPause, segDuration * 0.45);
   const pauseScale = (segDuration - charTime) / Math.max(totalPause, 0.01);
 
-  let t = 0;
-  for (let i = 0; i < words.length; i++) {
-    const charDur = charTime * (words[i].length / totalChars);
+  // First pass: raw per-word durations with natural-speech rhythm.
+  const rawDurations = words.map((w, i) => {
+    const charDur = charTime * (w.length / totalChars);
     const pause = (BASE_OVERHEAD_S * rateScale + punctPauses[i]) * pauseScale;
     let wordDur = charDur + pause;
-    const stripped = words[i].toLowerCase().replace(/[.,!?;:—–]+$/, '');
+    const stripped = w.toLowerCase().replace(/[.,!?;:—–]+$/, '');
     if (FAST_WORDS.has(stripped)) wordDur *= 0.75;
     if (i === 0) wordDur *= 1.15;
     else if (i === words.length - 1) wordDur *= 1.10;
-    if (elapsed < t + wordDur) return i;
-    t += wordDur;
+    return wordDur;
+  });
+  // Normalize so the durations sum EXACTLY to segDuration — matches the
+  // export fallback (ass_generator.py), which scales raw_durations by
+  // duration/total_raw. Without this the fast-word (×0.75) and first/last
+  // (×1.15/×1.10) adjustments push the frontend total off the segment
+  // length, so the previewed highlight drifts from the exported one on
+  // word-less cues. Normalizing keeps the two in lock-step.
+  const totalRaw = rawDurations.reduce((a, b) => a + b, 0);
+  if (totalRaw > 0) {
+    const norm = segDuration / totalRaw;
+    for (let i = 0; i < rawDurations.length; i++) rawDurations[i] *= norm;
+  }
+
+  let t = 0;
+  for (let i = 0; i < words.length; i++) {
+    if (elapsed < t + rawDurations[i]) return i;
+    t += rawDurations[i];
   }
   return words.length - 1;
 }

@@ -1018,9 +1018,15 @@ def generate_ass(
                         aw_tags += f"\\3c{aw_bg_color}\\3a{aw_bg_alpha}"
                     event_text = f"{nobord_prefix}{prefix}{{{aw_tags}}}{safe_text}"
                     pending_word_events.append((clip_start, clip_end, style_name + aw_style_suffix, event_text))
-            elif seg_word_ts and len(seg_word_ts) > 0 and len(words) > 0 and _align_word_timestamps(seg_word_ts, words, clip_start, clip_end) is not None:
-                # Real per-word timestamps from Whisper (possibly aligned
-                # after minor user edits to subtitle text).
+            elif (seg_word_ts and len(seg_word_ts) == len(words) and len(words) > 0
+                  and _align_word_timestamps(seg_word_ts, words, clip_start, clip_end) is not None):
+                # Real per-word timestamps — used ONLY on EXACT count equality,
+                # matching the preview's gate (getCurrentWordIndex requires
+                # words.length === tokens.length). The old |diff|≤3 positional
+                # resample entered this branch when the preview would have
+                # fallen to the proportional even-split, so the two disagreed
+                # on which timing model highlighted the cue. Now they always
+                # agree: exact → real per-word times; else → char-proportional.
                 seg_word_ts = _align_word_timestamps(seg_word_ts, words, clip_start, clip_end)
                 # Match the preview's per-speaker rate-scaled anticipation
                 # so the highlight crossfade lands at the same audio
@@ -1040,9 +1046,13 @@ def generate_ass(
                 # so we don't ship a different lead/lag in export.
                 _ANTICIPATION_LOCAL = 0.10
                 _AUDIO_BUFFER_LOCAL = 0.12
-                _WORD_ANTICIPATION_S = max(
-                    0.0, _ANTICIPATION_LOCAL * rate_scale - _AUDIO_BUFFER_LOCAL,
-                )
+                # SIGNED net offset — matches the preview's
+                # ``baseT + anticipation - AUDIO_BUFFER_S`` exactly (no max(0,…)
+                # clamp). For fast speakers (rate_scale < 1.2) this net goes
+                # NEGATIVE, so the preview held the highlight ~0.06s later than
+                # the clamped export did; using the raw signed value keeps the
+                # exported highlight in lock-step with the preview.
+                _WORD_ANTICIPATION_S = _ANTICIPATION_LOCAL * rate_scale - _AUDIO_BUFFER_LOCAL
                 base_color = _hex_to_ass_color(speaker_color_map[speaker])
 
                 # Background mode: ONE Layer 0 event per segment = one

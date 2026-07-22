@@ -69,6 +69,14 @@ def _cue_has_words(cue) -> bool:
     return bool(_cue_attr(cue, "words", None))
 
 
+def _is_marker(text: str) -> bool:
+    """A bracketed non-speech caption (``[♪ music ♪]``, ``[applause]``). These
+    must never receive per-word timing — karaoke-highlighting a music glyph or
+    stage direction is wrong — so both fill tiers skip them."""
+    t = (text or "").strip()
+    return t.startswith("[") and t.endswith("]")
+
+
 def _set_words(cue, words: list):
     """Attach ``words`` to a cue (mutating it). Pydantic doesn't validate on
     assignment, so build the proper type rather than leaving dicts behind."""
@@ -221,48 +229,60 @@ def project_word_timings(
     return llm_cues, n_projected
 
 
+def distribute_cue_window(tokens: list[str], start: float, end: float) -> list[dict]:
+    """Char-weight distribution of a cue's [start,end] window across its
+    DISPLAYED tokens — the deterministic, translation-correct highlight model.
+
+    Each token gets a share of the window proportional to its length (longer
+    words read longer), so the highlight always advances left-to-right inside
+    the cue's own audio-aligned span. This is what the export fallback and the
+    frontend fallback compute too, so the three stay in lock-step. Returns
+    ``{word,start,end}`` dicts 1:1 with ``tokens``."""
+    n = len(tokens)
+    if n == 0:
+        return []
+    dur = max(0.0, end - start)
+    total = sum(max(1, len(t)) for t in tokens)
+    out, cur = [], start
+    for i, t in enumerate(tokens):
+        share = (max(1, len(t)) / total) if total else (1.0 / n)
+        w_end = end if i == n - 1 else min(end, cur + dur * share)
+        out.append({"word": t, "start": round(cur, 3), "end": round(w_end, 3)})
+        cur = w_end
+    return out
+
+
 def attach_source_pause_timings(
     llm_cues: list,
     source_cues: list,
     *,
     min_tokens: int = 2,
 ) -> tuple[list, int]:
-    """Tier B: give still-word-less LLM cues a timing skeleton from the 1:1
-    SOURCE cue's word timestamps.
+    """Tier B: give still-word-less LLM cues a highlight skeleton by
+    CHAR-WEIGHT-distributing the cue's own audio-aligned [start,end] window
+    across its DISPLAYED English tokens.
 
-    The LLM cues are 1:1 with the source sentences (translate_via_llm preserves
-    order + count). Map each English token onto the source word timeline by
-    position so the source's inter-word *pauses* fall between the right English
-    tokens — the split times then come from real audio silence even though the
-    English per-word text is approximate. Only fills cues that don't already have
-    words. Returns ``(llm_cues, n_attached)``."""
-    if not source_cues or len(source_cues) != len(llm_cues):
-        return llm_cues, 0
+    (The old Tier B mapped each English token onto the JAPANESE source word at
+    the same POSITION — but Japanese is SOV with a different word count/order,
+    so the real audio pauses landed under the wrong English words and the
+    highlight drifted off the spoken word. Distributing the cue window across
+    the English tokens keeps the highlight advancing correctly inside the
+    cue's real span, and matches the export + preview fallback exactly.)
+    ``source_cues`` is kept in the signature for call-site compatibility but
+    no longer used. Only fills cues that don't already have words."""
+    _ = source_cues  # retained for API stability; no longer consulted
     n_attached = 0
-    for cue, src in zip(llm_cues, source_cues):
-        if _cue_has_words(cue):
+    for cue in (llm_cues or []):
+        if _cue_has_words(cue) or _is_marker(_cue_text(cue)):
             continue
         en_tokens = _tokenize(_cue_text(cue))
         if len(en_tokens) < min_tokens:
             continue
-        src_words = [
-            (float(_word_attr(w, "start")), float(_word_attr(w, "end")))
-            for w in (_cue_attr(src, "words", None) or [])
-            if _word_attr(w, "start", None) is not None
-            and _word_attr(w, "end", None) is not None
-        ]
-        if len(src_words) < 2:
+        start = _cue_attr(cue, "start", None)
+        end = _cue_attr(cue, "end", None)
+        if start is None or end is None or float(end) <= float(start):
             continue
-        start = float(_cue_attr(cue, "start", src_words[0][0]) or src_words[0][0])
-        end = float(_cue_attr(cue, "end", src_words[-1][1]) or src_words[-1][1])
-        n, m = len(en_tokens), len(src_words)
-        times: list[Optional[tuple[float, float]]] = []
-        for i in range(n):
-            frac = (i / (n - 1)) if n > 1 else 0.0
-            j = min(m - 1, max(0, round(frac * (m - 1))))
-            times.append((src_words[j][0], src_words[j][1]))
-        words = _interpolate_and_clamp(en_tokens, times, start, end)
-        _set_words(cue, words)
+        _set_words(cue, distribute_cue_window(en_tokens, float(start), float(end)))
         n_attached += 1
     return llm_cues, n_attached
 
@@ -275,15 +295,32 @@ def project_hybrid_timings(
     margin_s: float = 2.0,
     min_anchor_ratio: float = 0.30,
 ) -> dict:
-    """Run the A→B ladder over ``llm_cues`` (mutating them) and report which tier
-    each cue ended on. Tier C cues are simply left word-less. Returns a summary
-    dict ``{"tier_a", "tier_b", "tier_c", "total"}`` for one-line logging."""
+    """Run the A→B→C ladder over ``llm_cues`` (mutating them) and report which
+    tier each cue ended on. Tier A projects real Whisper-EN audio times; Tier B
+    and Tier C both char-weight-distribute the cue's own [start,end] window
+    across its English tokens (B for multi-token cues, C for whatever remains —
+    e.g. single-token cues), so no dialogue cue ships word-less. Bracketed
+    non-speech markers are never filled. Returns a summary dict
+    ``{"tier_a", "tier_b", "tier_c", "total"}`` for one-line logging."""
     total = len(llm_cues or [])
     whisper_words = flatten_whisper_words(whisper_en_segments)
     _, n_a = project_word_timings(
         llm_cues, whisper_words, margin_s=margin_s, min_anchor_ratio=min_anchor_ratio)
-    n_b = 0
-    if source_cues is not None:
-        _, n_b = attach_source_pause_timings(llm_cues, source_cues)
-    n_c = sum(1 for c in (llm_cues or []) if not _cue_has_words(c))
+    _, n_b = attach_source_pause_timings(llm_cues, source_cues)
+    # Tier C: fill ANY remaining word-less cue (single-token, or an edge the
+    # tiers above skipped) by char-weight-distributing its window — so NO
+    # translated cue ships word-less and highlighting always has a real,
+    # cue-aligned skeleton (word-less cues were the systematically mis-aligned
+    # case: preview/export both fell back to a pure synthetic estimate).
+    n_c = 0
+    for cue in (llm_cues or []):
+        if _cue_has_words(cue) or _is_marker(_cue_text(cue)):
+            continue
+        toks = _tokenize(_cue_text(cue))
+        s = _cue_attr(cue, "start", None)
+        e = _cue_attr(cue, "end", None)
+        if not toks or s is None or e is None or float(e) <= float(s):
+            continue
+        _set_words(cue, distribute_cue_window(toks, float(s), float(e)))
+        n_c += 1
     return {"tier_a": n_a, "tier_b": n_b, "tier_c": n_c, "total": total}

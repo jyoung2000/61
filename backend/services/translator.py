@@ -2163,7 +2163,14 @@ def _apply_batch_translations(
                 confidence=orig.confidence,
             ))
         else:
-            result.append(orig)
+            # Empty translation — keep the source segment, but DROP its
+            # source-language word timestamps: the displayed text is still the
+            # source script here, and shipping its words would highlight
+            # source words (correct only for this rare untranslated cue). The
+            # per-cue cleanup re-translates it; a word-less cue highlights via
+            # the char-proportional estimate until then.
+            result.append(orig.model_copy(update={"words": None})
+                          if hasattr(orig, "model_copy") else orig)
     return result
 
 

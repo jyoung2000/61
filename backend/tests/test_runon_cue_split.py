@@ -66,17 +66,38 @@ def test_never_touches_short_cues_markers_or_cjk():
 
 
 def test_words_are_partitioned_into_their_piece():
-    words = ([{"start": 0.2 + i * 0.4, "end": 0.5 + i * 0.4, "word": f"w{i}"}
-              for i in range(20)])
+    # Words are 1:1 with the text tokens — the real case, whether they come
+    # straight off Whisper or 1:1 from the aligner. Each piece takes its own
+    # slice IN ORDER (by token count), so no straddling word is duplicated
+    # across the boundary the way the old time-overlap filter did.
     text = ("This is the first long sentence of the run-on cue we split. "
             "And here is the second sentence that lands in piece two.")
+    toks = text.split()
+    words = [{"start": i * 8.0 / len(toks), "end": (i + 1) * 8.0 / len(toks),
+              "word": toks[i]} for i in range(len(toks))]
     segs = [_cue(0.0, 8.0, text, words=words)]
     out, changed = split_run_on_cues(segs, "en")
     assert changed and len(out) == 2
     w0, w1 = out[0]["words"] or [], out[1]["words"] or []
-    assert w0 and w1
-    assert max(w["end"] for w in w0) <= out[0]["end"] + 0.5
-    assert min(w["start"] for w in w1) >= out[1]["start"] - 0.5
+    # Exact, in-order partition: each piece's words == its own tokens.
+    assert [w["word"] for w in w0] == out[0]["text"].split()
+    assert [w["word"] for w in w1] == out[1]["text"].split()
+    # Concatenation reproduces the input with nothing duplicated or dropped.
+    assert [w["word"] for w in w0] + [w["word"] for w in w1] == toks
+
+
+def test_mismatched_word_count_leaves_pieces_wordless():
+    # When the word list is NOT 1:1 with the text tokens the partition is
+    # ambiguous, so pieces ship word-less (the char-proportional highlighter
+    # fills them) rather than duplicate a straddling word into two cues.
+    text = ("This is the first long sentence of the run-on cue we split. "
+            "And here is the second sentence that lands in piece two.")
+    words = [{"start": 0.2 + i * 0.4, "end": 0.5 + i * 0.4, "word": f"w{i}"}
+             for i in range(20)]  # 20 words vs 23 tokens
+    segs = [_cue(0.0, 8.0, text, words=words)]
+    out, changed = split_run_on_cues(segs, "en")
+    assert changed and len(out) == 2
+    assert not out[0]["words"] and not out[1]["words"]
 
 
 def test_split_and_merge_are_disjoint():

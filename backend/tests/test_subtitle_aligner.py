@@ -1,7 +1,10 @@
 """Hybrid word-timing projection (subtitle_aligner) + word-timed splitting.
 
-Tier A = Whisper-EN projection, Tier B = source-pause projection, Tier C = keep
-whole. The LLM text is always authoritative — Whisper-EN supplies timing only.
+Tier A = Whisper-EN audio projection (real per-word times). Tier B and Tier C
+both char-weight-distribute the cue's OWN [start,end] window across its English
+tokens (B for multi-token cues, C for the single-token remainder) so no dialogue
+cue ships word-less; bracketed non-speech markers are never filled. The LLM text
+is always authoritative — Whisper-EN supplies timing only.
 """
 
 from backend.models import TranscriptSegment, WordTimestamp
@@ -78,56 +81,67 @@ def test_no_whisper_words_is_noop():
     assert n == 0 and not cues[0].words
 
 
-# ── Tier B: source-pause projection ──
+# ── Tier B: cue-window char-weight distribution ──
 
-def test_tier_b_uses_source_word_pauses():
-    # Source JA cue with a pause; English cue is 1:1 and word-less.
-    src = [_cue(20.0, 24.0, "ジャ", words=_w([
-        (20.0, 20.5, "破壊"), (20.5, 21.0, "する"),
-        (22.5, 23.0, "それ"), (23.0, 24.0, "から"),
-    ]))]
+def test_tier_b_distributes_cue_window_over_english():
+    # English cue is word-less; Tier B distributes the cue's OWN [20,24] window
+    # across the English tokens (source words are NO LONGER consulted — mapping
+    # English onto Japanese SOV positions put the highlight on the wrong word).
     llm = [_cue(20.0, 24.0, "I will destroy it and then go")]
-    cues, n = attach_source_pause_timings(llm, src)
+    cues, n = attach_source_pause_timings(llm, None)
     assert n == 1
     assert cues[0].text == "I will destroy it and then go"  # English intact
     ws = cues[0].words
     assert ws and len(ws) == len("I will destroy it and then go".split())
     for i in range(len(ws) - 1):
         assert ws[i].end <= ws[i + 1].start + 1e-9
-    # Times stay within the cue span.
+    # Times stay within the cue span and span it fully.
     assert ws[0].start >= 20.0 - 1e-9 and ws[-1].end <= 24.0 + 1e-9
+    assert abs(ws[0].start - 20.0) < 1e-6 and abs(ws[-1].end - 24.0) < 1e-6
 
 
-def test_tier_b_skips_when_source_has_no_words():
-    src = [_cue(20.0, 24.0, "ジャ", words=None)]
+def test_tier_b_is_source_independent():
+    # No source words at all no longer blocks Tier B — it fills from the cue's
+    # own window (the old positional projection skipped this case).
     llm = [_cue(20.0, 24.0, "English here without source timing")]
-    cues, n = attach_source_pause_timings(llm, src)
+    cues, n = attach_source_pause_timings(llm, [_cue(20.0, 24.0, "ジャ", words=None)])
+    assert n == 1
+    assert cues[0].words and len(cues[0].words) == 5
+
+
+def test_tier_b_skips_when_window_invalid():
+    # Zero-width window → nothing to distribute → left word-less.
+    llm = [_cue(20.0, 20.0, "zero width window here")]
+    cues, n = attach_source_pause_timings(llm, None)
+    assert n == 0 and not cues[0].words
+
+
+def test_tier_b_skips_bracket_markers():
+    # A [♪ music ♪] marker must never get karaoke word timing.
+    llm = [_cue(20.0, 24.0, "[♪ music ♪]")]
+    cues, n = attach_source_pause_timings(llm, None)
     assert n == 0 and not cues[0].words
 
 
 # ── A→B→C ladder + idempotency ──
 
 def test_ladder_a_then_b_then_c():
-    # cue0 → tier A (whisper match); cue1 → tier B (source pauses, no whisper);
-    # cue2 → tier C (neither).
+    # cue0 → tier A (whisper match); cue1 → tier B (multi-token, no whisper
+    # match); cue2 → tier C (single token: tier B's min_tokens=2 skips it, tier
+    # C fills the remainder). source_cues is None — Tier B is source-independent.
     llm = [
         _cue(10.0, 14.0, "I will destroy everything and then I will leave"),
         _cue(20.0, 24.0, "I will destroy it and then go"),
-        _cue(30.0, 33.0, "untranslatable unique tokens here"),
-    ]
-    src = [
-        _cue(10.0, 14.0, "x", words=None),
-        _cue(20.0, 24.0, "ジャ", words=_w([(20.0, 20.5, "破壊"), (20.5, 21.0, "する"),
-                                            (22.5, 23.0, "それ"), (23.0, 24.0, "から")])),
-        _cue(30.0, 33.0, "y", words=None),
+        _cue(30.0, 33.0, "Untranslatable"),
     ]
     tiers = project_hybrid_timings(
-        llm, whisper_en_segments=_whisper_ref(), source_cues=src, min_anchor_ratio=0.3)
+        llm, whisper_en_segments=_whisper_ref(), source_cues=None, min_anchor_ratio=0.3)
     assert tiers["tier_a"] == 1
     assert tiers["tier_b"] == 1
     assert tiers["tier_c"] == 1
     assert tiers["total"] == 3
-    assert llm[0].words and llm[1].words and not llm[2].words
+    # Every dialogue cue now carries a timing skeleton (no word-less shipping).
+    assert llm[0].words and llm[1].words and llm[2].words
 
 
 def test_idempotent_does_not_reproject():
@@ -175,6 +189,7 @@ def test_marker_preserved_and_not_projected():
     ]
     project_hybrid_timings(llm, whisper_en_segments=_whisper_ref(), source_cues=None)
     assert llm[0].text == "[♪ music ♪]"
+    assert not llm[0].words  # marker never gets per-word (karaoke) timing
     out = enforce_readability(llm, allow_split=True, word_timed_split_only=True)
     assert any(s.text == "[♪ music ♪]" for s in out)
 

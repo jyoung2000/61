@@ -254,6 +254,15 @@ def split_run_on_cues(segments, target_lang: str = "en"):
             # Proportional time allocation by character share.
             total_chars = sum(len(p) for p in pieces) or 1
             words = list(seg.get("words") or [])
+            # Partition words by TOKEN COUNT (not time overlap): each piece
+            # takes the next len(piece.split()) words in order, so counts stay
+            # EXACT and no straddling word is duplicated into two pieces. Only
+            # valid when the word list is 1:1 with the text tokens; otherwise
+            # leave pieces word-less (the char-proportional highlighter fills
+            # them) rather than corrupt the alignment.
+            piece_tokens = [len(p.split()) for p in pieces]
+            token_partition = words and sum(piece_tokens) == len(words)
+            w_off = 0
             t = start
             for k, p in enumerate(pieces):
                 share = len(p) / total_chars
@@ -263,11 +272,9 @@ def split_run_on_cues(segments, target_lang: str = "en"):
                 piece_row = dict(seg)
                 piece_row["text"] = p
                 piece_row["start"], piece_row["end"] = round(t, 3), round(p_end, 3)
-                if words:
-                    piece_row["words"] = [
-                        w for w in words
-                        if (w.get("start") or 0) < p_end and (w.get("end") or 0) > t
-                    ] or None
+                if token_partition:
+                    piece_row["words"] = words[w_off:w_off + piece_tokens[k]] or None
+                    w_off += piece_tokens[k]
                 else:
                     piece_row["words"] = None
                 out.append(piece_row)
