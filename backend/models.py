@@ -272,6 +272,12 @@ class JobResult(BaseModel):
     # the UI can offer both the polished and the raw transcript for download.
     raw_transcript: list[TranscriptSegment] = []
     translated_transcript: list[TranscriptSegment] = []  # Translated subtitle segments
+    # Translated transcript BEFORE the AI post-edit (MT post-editing / polish)
+    # rewrites it — i.e. the raw machine-translation draft. Captured so the UI's
+    # "raw" transcript download can offer the unpolished TRANSLATED text (more
+    # useful than the source-language Whisper output on a translated job). Empty
+    # when no translation ran; the download then falls back to ``raw_transcript``.
+    translated_raw_transcript: list[TranscriptSegment] = []
     # Visible outcome of a *planned* subtitle translation. Surfaced so a job
     # that planned a translation (subtitle_language != source) but couldn't
     # produce target-language output never silently presents as a clean

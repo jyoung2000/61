@@ -3928,6 +3928,22 @@ async def _background_post_processing(
                     logger.warning(
                         "[%s] Whisper pre-polish resegmentation failed (%s)", job_id, _prs_err)
 
+            # Snapshot the TRANSLATED-but-unpolished draft now — this is the raw
+            # machine translation before the AI post-edit below rewrites it, so
+            # the UI can offer it as the "raw" transcript download (more useful
+            # than the source-language Whisper output on a translated job).
+            try:
+                _tr_raw_dicts = [
+                    t.model_dump() if hasattr(t, "model_dump") else dict(t)
+                    for t in (translated or [])
+                ]
+                if _tr_raw_dicts:
+                    await database.update_job_status(
+                        job_id, translated_raw_transcript=_tr_raw_dicts)
+            except Exception as _trr_err:
+                logger.debug(
+                    "[%s] could not save translated-raw transcript: %s", job_id, _trr_err)
+
             # ── (b) AI post-edit on the TRANSLATED text (MT post-editing) ──
             # Offline NMT produced the base translation; the editorial LLM now
             # POLISHES that rough draft toward natural, professional subtitles —

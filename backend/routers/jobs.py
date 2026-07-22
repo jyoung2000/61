@@ -249,10 +249,11 @@ async def get_transcripts(job_id: str, user: User = Depends(get_current_user)):
     # consumes it, so we ONLY include it once the job is terminal — running polls
     # stay small, and the status->complete re-fetch delivers it exactly once.
     _terminal = getattr(job, "status", None) in (JobStatus.COMPLETE, JobStatus.FAILED)
-    _src_rows, _tt_rows, _raw_rows = await asyncio.to_thread(
+    _src_rows, _tt_rows, _raw_rows, _traw_rows = await asyncio.to_thread(
         lambda: (_dump(getattr(job, "transcript", [])),
                  _dump(_tt),
-                 _dump(getattr(job, "raw_transcript", [])) if _terminal else []))
+                 _dump(getattr(job, "raw_transcript", [])) if _terminal else [],
+                 _dump(getattr(job, "translated_raw_transcript", [])) if _terminal else []))
 
     return {
         "job_id": job_id,
@@ -263,6 +264,9 @@ async def get_transcripts(job_id: str, user: User = Depends(get_current_user)):
         "transcript": _src_rows,
         "translated_transcript": _tt_rows,
         "raw_transcript": _raw_rows,
+        # Translated-but-unpolished draft (raw machine translation, before the AI
+        # post-edit) — powers the "raw" transcript download on translated jobs.
+        "translated_raw_transcript": _traw_rows,
         # The video summary rides this lightweight poll too. It is persisted
         # mid-pipeline but otherwise only reaches the UI via the full (often
         # multi-MB) GET /jobs/{id} — the very request too large/slow to land over

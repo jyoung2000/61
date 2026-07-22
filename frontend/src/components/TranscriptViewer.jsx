@@ -126,7 +126,7 @@ function _transcriptBaseName(videoName) {
   return safe || 'transcript';
 }
 
-export default function TranscriptViewer({ transcript, rawTranscript = [], onSeek, jobId, onSpeakerRenamed, onTranscriptUpdated, onSpeakerColorChanged, onSpeakerAdded, speakerColors, timeRange, currentTime, maxHeight, hasTranslation = false, showingOriginal = false, onToggleOriginal = null, videoName = '' }) {
+export default function TranscriptViewer({ transcript, rawTranscript = [], translatedRawTranscript = [], onSeek, jobId, onSpeakerRenamed, onTranscriptUpdated, onSpeakerColorChanged, onSpeakerAdded, speakerColors, timeRange, currentTime, maxHeight, hasTranslation = false, showingOriginal = false, onToggleOriginal = null, videoName = '' }) {
   const { isMobile } = useResponsive();
   // Which track this viewer is editing. The displayed (translated) subtitles
   // and the source transcript have DIFFERENT segmentation, so every edit must
@@ -1064,27 +1064,35 @@ export default function TranscriptViewer({ transcript, rawTranscript = [], onSee
         >
           .srt
         </button>
-        {/* Raw (unpolished) Whisper transcript — the direct ASR output, before
-            the LLM polish/dedup/translation cleanup. Offered alongside the
-            polished download when the pipeline captured it. */}
-        {Array.isArray(rawTranscript) && rawTranscript.length > 0 && (
-          <button
-            onClick={() => download(
-              toTXT(rawTranscript),
-              _exportName('txt').replace(/\.txt$/i, '') + '_raw.txt')}
-            title="Download the raw, unpolished transcript (direct Whisper output, before AI polish/translation)"
-            style={{
-              padding: '8px 12px',
-              background: 'var(--bg-elevated)',
-              color: 'var(--text-muted)',
-              border: '1px dashed var(--border)',
-              borderRadius: 'var(--radius-sm)',
-              fontSize: 12,
-            }}
-          >
-            .txt (raw)
-          </button>
-        )}
+        {/* Raw (unpolished) transcript download. On a TRANSLATED job this is the
+            raw machine-translation draft BEFORE the AI post-edit (what the user
+            asked for — more useful than the source-language ASR); on a
+            non-translated job it falls back to the direct Whisper output. */}
+        {(() => {
+          const hasTransRaw = Array.isArray(translatedRawTranscript) && translatedRawTranscript.length > 0;
+          const rawSegs = hasTransRaw ? translatedRawTranscript : rawTranscript;
+          if (!Array.isArray(rawSegs) || rawSegs.length === 0) return null;
+          return (
+            <button
+              onClick={() => download(
+                toTXT(rawSegs),
+                _exportName('txt').replace(/\.txt$/i, '') + '_raw.txt')}
+              title={hasTransRaw
+                ? 'Download the translated transcript BEFORE the AI polish (raw machine-translation draft)'
+                : 'Download the raw, unpolished transcript (direct Whisper output, before AI polish)'}
+              style={{
+                padding: '8px 12px',
+                background: 'var(--bg-elevated)',
+                color: 'var(--text-muted)',
+                border: '1px dashed var(--border)',
+                borderRadius: 'var(--radius-sm)',
+                fontSize: 12,
+              }}
+            >
+              .txt (raw)
+            </button>
+          );
+        })()}
         <button
           onClick={copyAll}
           style={{
