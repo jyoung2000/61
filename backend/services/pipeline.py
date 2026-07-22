@@ -4603,6 +4603,22 @@ async def _background_post_processing(
                         _translated_out = _thm
                 except Exception:
                     pass
+                # Repair the over-splits the plain merge can't reach — a
+                # bare-punctuation cue ("."), a dangling title abbreviation
+                # ("Mr." alone, name on the next cue), and an ellipsis-split word
+                # ("Am Wu…" / "…Fey.") — each of which reads badly AND hands the
+                # karaoke highlight a junk target. Runs first so the merge/split
+                # below see whole tokens. Idempotent, fail-soft.
+                try:
+                    from backend.services.transcript_sanitize import repair_fragment_cues
+                    _rep, _rep_changed = repair_fragment_cues(_translated_out, target_lang)
+                    if _rep_changed:
+                        logger.info("[%s] Repaired fragment cues (bare-punct / "
+                                    "abbrev / ellipsis-bridge): %d → %d cue(s)",
+                                    job_id, len(_translated_out), len(_rep))
+                        _translated_out = _rep
+                except Exception:
+                    pass
                 # Fold Whisper's mid-sentence fragment splits ("It's just the" /
                 # "number 21.") back into whole utterances so the translate panel
                 # + SRT read as sentences, not 2-4-word slivers. Idempotent.

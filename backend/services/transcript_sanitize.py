@@ -191,6 +191,146 @@ def merge_transcript_fragments(segments, target_lang: str = "en"):
         return _as_rows(segments), False
 
 
+# ── Fragment repair the plain merge can't reach ──────────────────────────────
+# ``merge_transcript_fragments`` only folds cues that DON'T end in sentence-final
+# punctuation, so three common over-splits slip past it and land on their own
+# cue — hurting readability AND giving the karaoke highlight a junk target:
+#   1. a bare-punctuation cue (".", "…", "?") — nothing to read, nothing to speak;
+#   2. a title abbreviation left dangling ("Mr." / "Lt." on its own, then the
+#      name on the next cue) — ``_ends_complete`` sees the "." and calls it done;
+#   3. an ellipsis BRIDGE where one word is split across two cues by a dramatic
+#      pause ("Am Wu…" then "…Fey."), both halves reading as complete.
+# This pass repairs exactly those, repartitioning ``words`` so the merged cue's
+# per-word timing stays aligned. Same caps / same-speaker / gap discipline as the
+# plain merge; strict fixed point; fail-soft.
+_ABBREV_TRAILING = {
+    "mr.", "mrs.", "ms.", "dr.", "lt.", "sgt.", "capt.", "cpt.", "col.", "gen.",
+    "sr.", "jr.", "st.", "vs.", "mt.", "prof.", "rev.", "gov.", "sen.", "rep.",
+    "cmdr.", "adm.", "maj.", "pvt.", "cpl.",
+}
+_ELLIPSIS_TAIL_RE = re.compile(r"(?:\.\.\.|…)\s*$")
+_ELLIPSIS_HEAD_RE = re.compile(r"^\s*(?:\.\.\.|…)")
+
+
+def _is_bare_punct(text: str) -> bool:
+    """A non-empty cue with no letter/number/CJK char — pure punctuation/symbols
+    (a lone ".", "…", "?", "-"). Markers are never bare punctuation."""
+    t = (text or "").strip()
+    if not t or _is_marker(t):
+        return False
+    return re.search(r"[^\W_]", t, re.UNICODE) is None
+
+
+def _ends_with_abbrev(text: str) -> bool:
+    t = (text or "").rstrip()
+    while t and t[-1] in _TRAILING_CLOSERS:
+        t = t[:-1].rstrip()
+    last = t.split()[-1].lower() if t.split() else ""
+    return last in _ABBREV_TRAILING
+
+
+def _ellipsis_bridge(a: str, b: str) -> bool:
+    return bool(_ELLIPSIS_TAIL_RE.search(a or "")) and bool(_ELLIPSIS_HEAD_RE.search(b or ""))
+
+
+def repair_fragment_cues(segments, target_lang: str = "en"):
+    """Repair the three over-splits the plain fragment merge leaves behind
+    (bare-punctuation cue, dangling title abbreviation, ellipsis word-bridge).
+
+    Returns ``(rows, changed)`` (plain dicts). CJK targets pass through (space
+    joins are wrong there). Fail-soft: returns the input on any error."""
+    try:
+        tgt = (target_lang or "").strip().lower().split("-")[0]
+        rows = _as_rows(segments)
+        if tgt in _CJK_TARGETS or len(rows) < 2:
+            return rows, False
+
+        out: list = []
+        i = 0
+        n = len(rows)
+        while i < n:
+            base = rows[i]
+            raw = (base.get("text") or "")
+            norm = " ".join(raw.split())
+
+            # (1) Bare-punctuation cue → drop it, folding its on-screen time into
+            # the previous cue so the timeline stays gap-free (or the next, if it
+            # leads the track).
+            if _is_bare_punct(norm):
+                this_end = float(base.get("end") or base.get("start") or 0.0)
+                if out:
+                    prev = out[-1]
+                    prev["end"] = max(float(prev.get("end") or 0.0), this_end)
+                    i += 1
+                    continue
+                if i + 1 < n:
+                    nxt = rows[i + 1]
+                    nxt = dict(nxt)
+                    nxt["start"] = min(float(nxt.get("start") or 0.0),
+                                       float(base.get("start") or 0.0))
+                    rows[i + 1] = nxt
+                    i += 1
+                    continue
+                # lone bare-punct cue with no neighbor — nothing to fold into
+                out.append(dict(base))
+                i += 1
+                continue
+
+            # (2)/(3) Absorb the next cue while the running text dangles on a title
+            # abbreviation OR bridges an ellipsis-split word — same speaker, small
+            # gap, within the readable length/duration caps.
+            start = float(base.get("start") or 0.0)
+            end = float(base.get("end") or start)
+            spk = base.get("speaker")
+            words = list(base.get("words") or [])
+            j = i + 1
+            absorbed = False
+            while j < n and not _is_marker(norm):
+                nxt = rows[j]
+                nxt_text = " ".join((nxt.get("text") or "").split())
+                if not nxt_text or _is_marker(nxt_text) or _is_bare_punct(nxt_text):
+                    break
+                if nxt.get("speaker") != spk:
+                    break
+                bridge = _ellipsis_bridge(norm, nxt_text)
+                if not (_ends_with_abbrev(norm) or bridge):
+                    break
+                ns = float(nxt.get("start") or 0.0)
+                ne = float(nxt.get("end") or ns)
+                if ns - end > _FRAG_GAP_MAX_S:
+                    break
+                if bridge:
+                    # Collapse the doubled ellipsis at the seam into one.
+                    left = _ELLIPSIS_TAIL_RE.sub("…", norm)
+                    right = _ELLIPSIS_HEAD_RE.sub("", nxt_text).lstrip()
+                    cand = left + right
+                else:
+                    cand = norm + " " + nxt_text
+                if len(cand) > _FRAG_LEN_MAX:
+                    break
+                if ne - start > _FRAG_DUR_MAX_S:
+                    break
+                norm, end, j, absorbed = cand, ne, j + 1, True
+                words += list(nxt.get("words") or [])
+
+            if absorbed:
+                merged = dict(base)
+                merged["text"], merged["start"], merged["end"] = norm, start, end
+                # Rebuilt cue may no longer be 1:1 with the concatenated word list
+                # (the ellipsis seam drops a token's text but not its timing); keep
+                # ``words`` only when the count still matches so the karaoke branch
+                # stays valid, else let the proportional fallback re-fill.
+                merged["words"] = words if (words and len(words) == len(norm.split())) else None
+                out.append(merged)
+                i = j
+            else:
+                out.append(dict(base))
+                i += 1
+        return out, (len(out) != len(rows))
+    except Exception:
+        return _as_rows(segments), False
+
+
 # ── Run-on cue split (YouTube-style one-thought-per-cue) ────────────────────
 # Official subs put ONE sentence/thought per cue; Whisper+1:1 translation can
 # cram 3-4 sentences into an 11-second cue ("The capsule has altered its

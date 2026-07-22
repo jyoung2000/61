@@ -344,8 +344,14 @@ def tidy_punctuation_artifacts(text: str) -> str:
     # Editor snippet-placeholder syntax the model occasionally emits verbatim
     # (a shipped cue read "${1:Moreover}"): unwrap "${N:text}" → "text". The
     # "${digit:" head is never real subtitle text, so this is zero-false-
-    # positive (a bare "${N}" is left alone — too close to a "${5}" literal).
+    # positive.
     s = re.sub(r"\$\{\d+:([^{}]*)\}", r"\1", s)
+    # A LETTER-led "${Name}" placeholder is a leaked template variable, not
+    # subtitle text (a shipped cue read "${Zechs} Six?"). Unwrap it to the bare
+    # name. Restricting the head to a letter leaves a numeric "${5}" (a price /
+    # variable literal) untouched, so this stays zero-false-positive on real
+    # text while repairing the glossary/template leak.
+    s = re.sub(r"\$\{([A-Za-z][^{}]*)\}", r"\1", s)
     s = re.sub(r"^[\s。、・]+", "", s)     # leading 。 、 ・
     # A SINGLE stray leading period + space ("[.] And you?" → "And you?").
     # Requiring whitespace right after the dot excludes an ellipsis on its
