@@ -307,11 +307,19 @@ def split_run_on_cues(segments, target_lang: str = "en"):
                 out.append(seg)
                 continue
 
-            # Cap pieces by the confetti limit AND the min-duration floor.
-            cap = max(2, min(max_pieces, int(dur // _RUNON_MIN_PIECE_S)))
-            while len(pieces) > cap:
-                j = min(range(len(pieces) - 1),
-                        key=lambda i: len(pieces[i]) + len(pieces[i + 1]))
+            # Confetti cap: rein in clause-fragment explosion, but NEVER weld two
+            # COMPLETE sentences — welding whole thoughts would (a) re-manufacture
+            # a run-on and (b) re-split on the next pass (the welded piece carries
+            # ≥2 sentence marks), breaking idempotency. So only merge a piece whose
+            # LEFT is an unfinished clause fragment; when every piece is already a
+            # whole sentence we stop and let each keep its own cue (one thought per
+            # cue, regardless of count). The min-duration floor is handled below in
+            # time allocation, so it no longer forces a sentence weld here.
+            while len(pieces) > max_pieces:
+                cand = [i for i in range(len(pieces) - 1) if not _ends_complete(pieces[i])]
+                if not cand:
+                    break
+                j = min(cand, key=lambda i: len(pieces[i]) + len(pieces[i + 1]))
                 pieces[j] = (pieces[j] + " " + pieces[j + 1]).strip()
                 del pieces[j + 1]
 
@@ -329,7 +337,7 @@ def split_run_on_cues(segments, target_lang: str = "en"):
                     cum += piece_tokens[k]
                     w = words[cum]
                     ws = w.get("start") if isinstance(w, dict) else getattr(w, "start", None)
-                    if ws is None:
+                    if ws is None or ws != ws:   # `ws != ws` rejects NaN
                         ok = False
                         break
                     cand.append(min(end, max(cand[-1], float(ws))))
@@ -338,19 +346,30 @@ def split_run_on_cues(segments, target_lang: str = "en"):
                     bounds = cand
 
             total_chars = sum(len(p) for p in pieces) or 1
+            n = len(pieces)
+            # Feasible per-piece floor: honor _RUNON_MIN_PIECE_S when the cue is
+            # long enough to give every piece that much, else fall back to an
+            # equal share (dur / n) so a dense multi-thought cue still yields
+            # short-but-nonzero cues instead of a zero-length one. n·floor ≤ dur
+            # by construction, so every window below is non-empty.
+            floor = min(_RUNON_MIN_PIECE_S, dur / n) if n else 0.0
             w_off = 0
             t = start
             for k, p in enumerate(pieces):
-                if bounds is not None:
-                    p_end = bounds[k + 1]
-                else:
-                    share = len(p) / total_chars
-                    p_end = end if k == len(pieces) - 1 else min(end, t + dur * share)
-                if k == len(pieces) - 1:
+                tail = n - 1 - k
+                if k == n - 1:
                     p_end = end
-                elif p_end - t < _RUNON_MIN_PIECE_S:
-                    p_end = min(end, t + _RUNON_MIN_PIECE_S)
-                p_end = max(p_end, t)
+                else:
+                    if bounds is not None:
+                        p_end = bounds[k + 1]
+                    else:
+                        p_end = t + dur * (len(p) / total_chars)
+                    # Reserve the floor for every remaining piece, then honor
+                    # this piece's own floor — so no cue is starved and the last
+                    # piece (fixed to ``end``) still clears the floor.
+                    p_end = min(p_end, end - tail * floor)
+                    p_end = max(p_end, t + floor)
+                p_end = min(end, max(p_end, t))
                 piece_row = dict(seg)
                 piece_row["text"] = p
                 piece_row["start"], piece_row["end"] = round(t, 3), round(p_end, 3)

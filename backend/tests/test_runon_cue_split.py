@@ -128,6 +128,39 @@ def test_words_are_partitioned_into_their_piece():
     assert [w["word"] for w in w0] + [w["word"] for w in w1] == toks
 
 
+def test_dense_multisentence_cue_is_idempotent_and_never_zero_length():
+    # Many short sentences over a long cue: each finished thought keeps its own
+    # cue and the confetti cap must NOT weld two whole sentences (that would
+    # re-split on a second pass). No emitted cue may be zero-length.
+    text = ("First short thought here now. Second brief idea over here. "
+            "Third little notion appears. Fourth quick concept lands. "
+            "Fifth swift remark follows. Sixth fast point arrives. "
+            "Seventh final statement ends.")
+    segs = [_cue(0.0, 20.0, text)]
+    out1, ch1 = split_run_on_cues(segs, "en")
+    assert ch1 and len(out1) >= 6
+    assert all(p["end"] > p["start"] for p in out1)          # no zero-length
+    # Idempotent: a second pass changes nothing (no welded run-on to re-split).
+    out2, ch2 = split_run_on_cues(out1, "en")
+    assert not ch2
+    assert [p["text"] for p in out1] == [p["text"] for p in out2]
+
+
+def test_word_timed_tail_never_starves_last_cue():
+    # Word starts clustered near the tail must not march the boundary to `end`
+    # and collapse the last cue to zero length; every piece keeps a real span.
+    text = "Alpha bravo charlie. Delta echo foxtrot. Golf hotel india. Juliet kilo lima."
+    toks = text.split()
+    # starts bunched at the very end of the 3s window
+    starts = [0.0, 0.05, 0.1, 2.90, 2.92, 2.94, 2.96, 2.97, 2.98, 2.985, 2.99, 2.995][:len(toks)]
+    words = [{"start": starts[i], "end": starts[i], "word": toks[i]} for i in range(len(toks))]
+    out, changed = split_run_on_cues([_cue(0.0, 3.0, text, words=words)], "en")
+    assert changed
+    for p in out:
+        assert p["end"] > p["start"]                          # strictly positive span
+    assert out[-1]["end"] == 3.0 and out[0]["start"] == 0.0
+
+
 def test_mismatched_word_count_leaves_pieces_wordless():
     # When the word list is NOT 1:1 with the text tokens the partition is
     # ambiguous, so pieces ship word-less (the char-proportional highlighter

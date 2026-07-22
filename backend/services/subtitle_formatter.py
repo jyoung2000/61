@@ -698,12 +698,21 @@ def _is_bracket_marker(text: str) -> bool:
     return t.startswith("[") and t.endswith("]")
 
 
-def _ends_sentence(text: str) -> bool:
+def _ends_sentence(text: str, treat_ellipsis_as_end: bool = True) -> bool:
     """True when ``text`` reads as a finished sentence (ends in terminal
     punctuation, ignoring trailing quotes/brackets). Used to decide whether a
-    cue is mid-thought and should pull in its continuation."""
+    cue is mid-thought and should pull in its continuation.
+
+    ``treat_ellipsis_as_end`` (default True, legacy behaviour): when False, a
+    trailing ellipsis (``…`` / ``...``) counts as an UNFINISHED, trailing-off
+    thought — the exact case the completing-merge exists to fix — so it is not
+    treated as a finished sentence."""
     s = (text or "").rstrip().rstrip('"”’\')]')
-    return bool(s) and s[-1] in ".?!…。！？"
+    if not s:
+        return False
+    if s.endswith("…") or s.endswith("..."):
+        return treat_ellipsis_as_end
+    return s[-1] in ".?!。！？"
 
 
 def _merge_for_readability(
@@ -753,13 +762,16 @@ def _merge_for_readability(
         gap = seg.start - prev.end
         same_speaker = (prev.speaker or "") == (seg.speaker or "")
         # Never glue two finished thoughts into one cue (one-thought-per-cue).
-        # Only an UNFINISHED previous cue earns a merge, to complete it.
-        if not merge_complete and _ends_sentence(prev_txt):
+        # Only an UNFINISHED previous cue earns a merge, to complete it — a
+        # trailing ellipsis counts as unfinished (a trailing-off thought).
+        if not merge_complete and _ends_sentence(prev_txt, treat_ellipsis_as_end=False):
             out.append(seg)
             continue
         # A finished sentence starts a fresh cue (one-sentence-per-cue is ideal);
-        # an UNFINISHED one earns a wider bridge to complete the thought.
-        eff_gap = max_gap_s if _ends_sentence(prev_txt) else max(max_gap_s, sentence_gap_s)
+        # an UNFINISHED one (incl. a trailing ellipsis) earns a wider bridge to
+        # complete the thought.
+        eff_gap = (max_gap_s if _ends_sentence(prev_txt, treat_ellipsis_as_end=False)
+                   else max(max_gap_s, sentence_gap_s))
         # Hard ceiling: never bridge a genuinely large pause, even mid-sentence.
         # On single-speaker content (diarization labels everything "Speaker 1")
         # the sentence-merge bridge would otherwise glue cues across a real
