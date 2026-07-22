@@ -611,6 +611,14 @@ def generate_ass(
     if effective_max_words > 0:
         clip_segments = split_segments_by_max_words(clip_segments, effective_max_words)
 
+    # Snapshot BEFORE the overlap-clamp below: the frontend computeSpeakerRates
+    # runs over the un-clamped subtitle items, so computing per-speaker wps over
+    # the clamped segments here would give a different rate_scale (hence a
+    # slightly different anticipation lead) than the preview whenever a speaker
+    # has overlapping cues. Keeping the un-clamped durations keeps the two in
+    # lock-step. (max_words splitting is rate-neutral, so it may stay applied.)
+    _rate_segments = list(clip_segments)
+
     # --- Eliminate inter-segment temporal overlap ---
     # Transcript segments (especially from Whisper) often have overlapping
     # timestamps.  When two ASS Dialogue events overlap in time, libass
@@ -642,7 +650,7 @@ def generate_ass(
     speaker_rates: dict[str, float] = {}
     if active_word_enabled:
         _sp_stats: dict[str, dict] = {}
-        for seg in clip_segments:
+        for seg in _rate_segments:
             cs, ce, tx, sp = seg[0], seg[1], seg[2], seg[3]
             wc = len(tx.split())
             dur = ce - cs
@@ -1070,14 +1078,25 @@ def generate_ass(
 
                 for word_idx in range(len(words)):
                     w_start, w_end, _ = seg_word_ts[word_idx]
-                    w_start = max(w_start - _WORD_ANTICIPATION_S, clip_start)
-                    # Light the FIRST word from the moment the cue appears, not
-                    # only once its audio begins — otherwise the line sits dark
-                    # through any lead-in silence and the highlight looks like it
-                    # starts mid-sentence. Matches the preview (getCurrentWordIndex
-                    # returns word 0 while the cue is on screen before w0.start).
+                    # Preview parity through inter-word silences: advance the
+                    # highlight to word i at the END of word i-1, not at word i's
+                    # own audio start. getCurrentWordIndex returns the first word
+                    # whose end is still ahead of the (anticipation-adjusted) play
+                    # time, so during a gap it lights the UPCOMING word. The server
+                    # used to start word i at w[i].start-net and let the 0.5s
+                    # gap-fill stretch word i-1 across the pause — so the burned-in
+                    # export held the PREVIOUS word while the preview had already
+                    # advanced. Anchoring to w[i-1].end keeps them on the same word.
+                    # (Contiguous words: w[i-1].end == w[i].start → identical.)
                     if word_idx == 0:
+                        # Light the FIRST word from the moment the cue appears, not
+                        # only once its audio begins — otherwise the line sits dark
+                        # through any lead-in silence and the highlight looks like
+                        # it starts mid-sentence (matches getCurrentWordIndex, which
+                        # returns word 0 while the cue is on screen before w0.start).
                         w_start = clip_start
+                    else:
+                        w_start = max(seg_word_ts[word_idx - 1][1] - _WORD_ANTICIPATION_S, clip_start)
                     w_end = max(w_end - _WORD_ANTICIPATION_S, w_start + 0.01)
                     if word_idx == len(words) - 1:
                         # Last word: use natural end + 0.3s grace, allow up to
@@ -1213,17 +1232,27 @@ def generate_ass(
                 # This shifts word boundaries so the highlight at any given
                 # playback time matches the preview.
                 _net_offset = anticipation - _AUDIO_BUFFER_S
-                current_time = clip_start + _net_offset
+                _cum = 0.0
                 for word_idx in range(len(words)):
                     word_dur = raw_durations[word_idx]
-                    word_end = current_time + word_dur
+                    # Preview-parity window for word i. getCurrentWordIndex lights
+                    # word i when (t - start) + net ∈ [cum_before, cum_after);
+                    # solving for t gives [start + cum_before - net,
+                    # start + cum_after - net). Apply the net offset EXACTLY ONCE.
+                    # The old code seeded current_time at clip_start + net and then
+                    # subtracted ``anticipation`` AGAIN for shifted_start, double-
+                    # counting the lead and shifting every visible transition by
+                    # anticipation - 2*AUDIO_BUFFER ≈ 0.14s early vs the preview.
+                    _cum_before = _cum
+                    _cum += word_dur
+                    shifted_start = max(clip_start, clip_start + _cum_before - _net_offset)
+                    word_end = clip_start + _cum - _net_offset
                     if word_idx == len(words) - 1:
-                        word_end = min(current_time + word_dur + 0.3, clip_end)
-                    if word_end - current_time < 0.01:
-                        current_time = word_end
+                        word_end = min(word_end + 0.3, clip_end)
+                    else:
+                        word_end = min(word_end, clip_end)
+                    if word_end - shifted_start < 0.01:
                         continue
-
-                    shifted_start = max(clip_start, current_time - anticipation)
 
                     # Layer 0: Border layer — uniform color, continuous outline
                     # Skipped for background mode (single per-segment event above).
@@ -1267,7 +1296,6 @@ def generate_ass(
                         parts.append(f"{reset_tag} {after}")
                     color_event_text = nobord_prefix + prefix + "".join(parts)
                     pending_word_events.append((shifted_start, word_end, style_name + aw_style_suffix, color_event_text))
-                    current_time = word_end
         else:
             # Standard: single event with plain text + explicit outline override
             if show_speaker_labels and speaker:
