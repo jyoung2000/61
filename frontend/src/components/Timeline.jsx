@@ -108,40 +108,22 @@ const CROP_CLUSTER_COLORS = [
 // ── Crop-track smooth-pan gradient ───────────────────────────────────────────
 // Each crop element is filled with a horizontal gradient sampled from the
 // SmoothDamp subject track, so a human-like pan (the crop X gliding across the
-// shot) reads as a smooth colour transition and a held shot stays flat. The
-// element keeps its cluster HUE (speaker identity is preserved); only the
-// LIGHTNESS rides the crop position — centred so a centred crop (50%) is the
-// base colour, a left pan darkens and a right pan lightens. That way the user
-// literally sees the human-operator easing the export renders.
-const CROP_GRADIENT_LIGHT_AMP = 0.22; // max ± lightness shift edge-to-edge
+// shot) reads as a smooth colour transition and a held shot stays a flat band.
+// The colour is the crop POSITION itself, mapped across a full hue spectrum: a
+// left-biased crop is warm (red/orange), a centred crop is green, a
+// right-biased crop is cool (blue/violet). That way the user literally sees the
+// human-operator's framing sweep — and a glide from 20%→80% reads as a rainbow
+// wipe rather than the old single-hue light/dark shimmer ("only blue & green").
+const CROP_HUE_SPAN = 280; // 0° red (left) → 280° violet-blue (right); no wrap back to red
 
-function _cropHexToHsl(hex) {
-  const h = (hex || '#888888').replace('#', '');
-  const s = h.length === 3 ? h.split('').map((c) => c + c).join('') : h;
-  const n = parseInt(s, 16);
-  let r = ((n >> 16) & 255) / 255;
-  let g = ((n >> 8) & 255) / 255;
-  let b = (n & 255) / 255;
-  const max = Math.max(r, g, b), min = Math.min(r, g, b);
-  let hh = 0, ss = 0; const l = (max + min) / 2;
-  if (max !== min) {
-    const d = max - min;
-    ss = l > 0.5 ? d / (2 - max - min) : d / (max + min);
-    if (max === r) hh = (g - b) / d + (g < b ? 6 : 0);
-    else if (max === g) hh = (b - r) / d + 2;
-    else hh = (r - g) / d + 4;
-    hh /= 6;
-  }
-  return { h: hh, s: ss, l };
-}
-
-// Map a crop X (0–100) to a display colour derived from ``baseHex``: keep the
-// hue/saturation, ride lightness with the pan position (centred at 50%).
+// Map a crop X (0–100 %) to a full-spectrum hue. ``baseHex`` is retained in the
+// signature for callers but no longer tints the fill — the position drives the
+// colour so the whole pan range is legible at a glance. Vivid saturation + mid
+// lightness keep every hue readable on the dark timeline.
 function cropColorAt(baseHex, cropX, alpha = 1) {
-  const hsl = _cropHexToHsl(baseHex);
-  const t = (Math.max(0, Math.min(100, Number.isFinite(cropX) ? cropX : 50)) - 50) / 50; // -1..1
-  const l = Math.max(0.12, Math.min(0.9, hsl.l + t * CROP_GRADIENT_LIGHT_AMP));
-  return `hsla(${Math.round(hsl.h * 360)}, ${Math.round(hsl.s * 100)}%, ${Math.round(l * 100)}%, ${alpha})`;
+  const x = Math.max(0, Math.min(100, Number.isFinite(cropX) ? cropX : 50)) / 100; // 0..1
+  const hue = Math.round(x * CROP_HUE_SPAN);
+  return `hsla(${hue}, 82%, 54%, ${alpha})`;
 }
 
 function formatTime(s) {
