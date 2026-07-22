@@ -136,6 +136,33 @@ describe('shared active-word timing (RenderEngine ↔ SubtitleOverlay)', () => {
     expect(getCurrentWordIndex(seg, 101.5, {})).toBe(1);
   });
 
+  it('lights the first word when the cue start is later than its first word', () => {
+    // The overlap-resolved / rounded window start (2.0) sits a hair AFTER the
+    // first word's audio (1.95) — Whisper word boundaries rarely align with the
+    // cue start. The old `w0.start < start - 0.01` test misfired here and
+    // rebased by `t - start`, shoving the highlight into the middle of the line.
+    const seg = {
+      subtitleText: 'I will go', start: 2.0, end: 5.0, speaker: 'S1',
+      words: [ { start: 1.95, end: 2.30 }, { start: 2.30, end: 3.6 }, { start: 3.6, end: 5.0 } ],
+    };
+    const rates = { S1: 3.0 };
+    expect(getCurrentWordIndex(seg, 2.0, rates)).toBe(0);  // at cue start → first word
+    expect(getCurrentWordIndex(seg, 3.0, rates)).toBe(1);
+  });
+
+  it('lights the first word during a lead-in silence before its audio', () => {
+    // Cue is on screen from 10.0 but the first word's audio starts at 10.4 — the
+    // line must not sit dark through the lead-in and then jump in mid-sentence.
+    const seg = {
+      subtitleText: 'hello there friend', start: 10.0, end: 13.0, speaker: 'S1',
+      words: [ { start: 10.4, end: 10.9 }, { start: 10.9, end: 11.6 }, { start: 11.6, end: 12.6 } ],
+    };
+    const rates = { S1: 3.0 };
+    expect(getCurrentWordIndex(seg, 10.0, rates)).toBe(0);  // lead-in → first word lit
+    expect(getCurrentWordIndex(seg, 10.2, rates)).toBe(0);
+    expect(getCurrentWordIndex(seg, 11.0, rates)).toBe(1);
+  });
+
   it('computeSpeakerRates aggregates words/sec per speaker', () => {
     const rates = computeSpeakerRates([
       { text: 'a b c', start: 0, end: 1, speaker: 'A' },   // 3 wps

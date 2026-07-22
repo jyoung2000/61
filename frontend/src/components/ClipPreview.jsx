@@ -170,7 +170,12 @@ function getCurrentWordIndex(segment, relativeTime, speakerRates) {
   if (segment.words && segment.words.length === words.length) {
     const anticipation = 0.10; // 100ms lead for perceptual sync
     const adjusted = relativeTime + anticipation - _AUDIO_BUFFER_S;
-    if (adjusted < segment.words[0].start) return -1;
+    // Before the first word's audio but with the cue on screen, light the FIRST
+    // word so karaoke begins at the start of the line (not dark through a
+    // lead-in silence, then jumping in mid-sentence).
+    if (adjusted < segment.words[0].start) {
+      return relativeTime >= segment.start - 0.05 ? 0 : -1;
+    }
     for (let i = 0; i < segment.words.length; i++) {
       if (adjusted < segment.words[i].end) return i;
     }

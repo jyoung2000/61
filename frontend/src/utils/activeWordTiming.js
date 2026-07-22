@@ -89,12 +89,26 @@ export function getCurrentWordIndex(segment, relativeTime, speakerRates) {
 
   if (segment.words && segment.words.length === words.length) {
     const w0 = segment.words[0];
-    const wordsAreClipRelative = w0.start < segment.start - 0.01;
-    const baseT = wordsAreClipRelative
-      ? (relativeTime - segment.start)
-      : relativeTime;
+    const wLast = segment.words[segment.words.length - 1];
+    const cueDur = Math.max(0.001, segment.end - segment.start);
+    // Do the word timestamps use a PER-CUE 0-based clock (first word ≈ 0, whole
+    // span ≈ the cue duration) rather than the cue's own coordinate? ONLY then
+    // rebase onto a within-cue clock. A first word that begins a little BEFORE
+    // segment.start is NOT a different clock — it's the normal case: Whisper's
+    // first word routinely starts a few hundredths before the cue's (rounded /
+    // overlap-resolved) start, and an overlap-pushed cue start sits later than
+    // its own audio. The old ``w0.start < segment.start - 0.01`` test fired on
+    // exactly those cues and double-subtracted segment.start, shoving the
+    // highlight into the middle of the line ("doesn't start at the beginning").
+    const perCueClock = w0.start < segment.start - 1.0 && wLast.end <= cueDur + 1.0;
+    const baseT = perCueClock ? (relativeTime - segment.start) : relativeTime;
     const adjusted = baseT + anticipation - AUDIO_BUFFER_S;
-    if (adjusted < w0.start) return -1;
+    // Before the first word's audio but with the cue already on screen, light
+    // the FIRST word — karaoke should begin at the start of the line, not sit
+    // dark through the lead-in and then jump in mid-sentence.
+    if (adjusted < w0.start) {
+      return relativeTime >= segment.start - 0.05 ? 0 : -1;
+    }
     for (let i = 0; i < segment.words.length; i++) {
       if (adjusted < segment.words[i].end) return i;
     }

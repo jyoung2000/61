@@ -1071,6 +1071,13 @@ def generate_ass(
                 for word_idx in range(len(words)):
                     w_start, w_end, _ = seg_word_ts[word_idx]
                     w_start = max(w_start - _WORD_ANTICIPATION_S, clip_start)
+                    # Light the FIRST word from the moment the cue appears, not
+                    # only once its audio begins — otherwise the line sits dark
+                    # through any lead-in silence and the highlight looks like it
+                    # starts mid-sentence. Matches the preview (getCurrentWordIndex
+                    # returns word 0 while the cue is on screen before w0.start).
+                    if word_idx == 0:
+                        w_start = clip_start
                     w_end = max(w_end - _WORD_ANTICIPATION_S, w_start + 0.01)
                     if word_idx == len(words) - 1:
                         # Last word: use natural end + 0.3s grace, allow up to
