@@ -641,6 +641,90 @@ def _gpu_free_vram_gb() -> float:
     return 0.0
 
 
+def _adaptive_reframer_sample_cap(base_cap: int, job_id: str = "") -> int:
+    """Scale the face/motion sample cap to the LOCAL GPU that does the per-frame
+    work.
+
+    The perceiver's cost scales with the sample count, and the vision offload
+    moves ONLY the strided YOLO-World call — YuNet faces, u2net saliency, and
+    Farneback motion run locally on EVERY sampled frame regardless. So the local
+    card is the per-frame floor and the right governor: a capable card affords
+    more samples (finer reframing) at comparable wall time; a weak card stays at
+    the baseline, because inflating its sample count would only pile on the local
+    YuNet/saliency/motion work the offload can't remove (slower, not better).
+
+    Governor is LOCAL TOTAL VRAM (stable; free VRAM misreads while Whisper/Ollama
+    are resident), with a name override for weak mobile chips. A modest offload
+    boost applies only ABOVE the weak tier — it buys coverage, never speed, so a
+    weak card is never pushed past its own floor. Degrades to ``base_cap`` when
+    torch / nvidia-smi are unavailable."""
+    base = max(300, int(base_cap))
+    try:
+        total_mb = 0
+        try:
+            from backend.services.vram_ledger import _query_vram
+            _v = _query_vram()
+            if _v is not None:
+                total_mb = int(_v[1])
+        except Exception:
+            total_mb = 0
+        name = ""
+        try:
+            import torch
+            if torch.cuda.is_available():
+                name = torch.cuda.get_device_name(0) or ""
+                if total_mb <= 0:
+                    total_mb = int(torch.cuda.mem_get_info()[1] / (1024 * 1024))
+        except Exception:
+            pass
+        gb = (total_mb / 1024.0) if total_mb > 0 else 0.0
+
+        # LOCAL capability tier (per-frame floor lives here).
+        if gb <= 0.0:
+            mult = 1.0                 # unknown / CPU → conservative baseline
+        elif gb < 5.0:
+            mult = 1.0                 # ≤4 GB (GTX 1650) → WEAK baseline
+        elif gb < 7.0:
+            mult = 1.5                 # ~6 GB (2060/3050)
+        elif gb < 11.0:
+            mult = 2.2                 # 8-10 GB (3070/4060 Ti)
+        else:
+            mult = 3.0                 # ≥12 GB (4070/3090-class local)
+        # Belt-and-suspenders: force WEAK for known weak chips even if VRAM
+        # misreads (some mobile parts over-report).
+        if any(w in name for w in ("GTX 1650", "GTX 1050", "GTX 1630",
+                                   "MX", "P400", "T400", "T600")):
+            mult = min(mult, 1.0)
+
+        cap = base * mult
+
+        # Offload headroom: YOLO leaves the local card, freeing a little per-frame
+        # budget — a modest boost, and ONLY above the weak tier (a weak card's
+        # local floor is untouched by offload, so more samples there just cost
+        # more). Config-proxy check (offload POSSIBLE); the perceiver's own
+        # detector makes the authoritative live decision.
+        offload_possible = False
+        try:
+            if bool(getattr(settings, "REMOTE_VISION_ENABLED", True)):
+                from backend.services.reframer_audio import _remote_whisper_base
+                offload_possible = bool(_remote_whisper_base())
+        except Exception:
+            offload_possible = False
+        if offload_possible and mult > 1.0:
+            cap *= 1.25
+
+        ceiling = int(getattr(settings, "REFRAMER_SAMPLE_CAP_CEILING", 4200))
+        cap = max(300, int(round(min(cap, float(ceiling)))))
+        if job_id:
+            logger.info(
+                "[%s] Adaptive reframer cap: %d samples (local GPU=%s, %.1f GB, "
+                "mult=%.2f, offload_possible=%s, base=%d)",
+                job_id, cap, name or "unknown", gb, mult, offload_possible, base)
+        return cap
+    except Exception:
+        return base
+
+
 def _whisper_engine_cached() -> bool:
     """True when the reframer's Whisper engine is still loaded (so a Whisper-
     native translate can REUSE it with no second load). The analyze stage keeps
@@ -6109,7 +6193,10 @@ async def _run_analysis_inner(job_id: str, resume: bool = False):
     # up (fewer samples) without touching code. Defaults lowered from
     # 3600/5.0/2.0 to 1800/5.0/1.2 — roughly halving the face-detection time
     # on long videos with negligible reframing-accuracy loss.
-    _max_samples = max(300, int(getattr(settings, "REFRAMER_MAX_SAMPLES", 1800)))
+    _max_samples = _adaptive_reframer_sample_cap(
+        base_cap=max(300, int(getattr(settings, "REFRAMER_MAX_SAMPLES", 1200))),
+        job_id=job_id,
+    )
     _fps_ceiling = float(getattr(settings, "REFRAMER_SAMPLE_FPS", 5.0))
     _fps_floor = float(getattr(settings, "REFRAMER_MIN_SAMPLE_FPS", 1.2))
     # Cap-respecting sample rate — see resolve_sample_fps. The comfort floor

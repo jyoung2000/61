@@ -760,7 +760,15 @@ class Settings(BaseSettings):
     # sparse-sampling threshold that would force the YOLO stride back to 1
     # (fewer samples than ~1000 on a 24-min video is a net LOSS: per-sample
     # open-vocab detection outweighs the sample savings).
-    REFRAMER_MAX_SAMPLES: int = 1200       # total face/motion samples cap
+    REFRAMER_MAX_SAMPLES: int = 1200       # total face/motion samples cap (WEAK-card baseline)
+    # The cap above is the weak-card (GTX 1650, ~4 GB) baseline; a capable LOCAL
+    # GPU is scaled up from it by _adaptive_reframer_sample_cap (finer reframing
+    # at comparable wall time). The vision offload moves only YOLO — YuNet +
+    # u2net saliency + Farneback motion stay LOCAL every frame — so the LOCAL
+    # card is the per-frame floor and the governor; a weak card is NOT inflated
+    # (more samples there only adds local work the offload can't remove). This
+    # ceiling clamps the scaled cap on the strongest cards.
+    REFRAMER_SAMPLE_CAP_CEILING: int = 4200
     REFRAMER_SAMPLE_FPS: float = 5.0       # ceiling fps (short videos)
     REFRAMER_MIN_SAMPLE_FPS: float = 1.2   # floor fps (MEDIUM videos — applied
                                            # only while it stays within the cap)
