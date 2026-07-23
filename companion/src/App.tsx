@@ -7,7 +7,7 @@ import {
   CompanionStatus, getStatus, setConfig, regenerateToken,
   installOllama, startOllama, pullModel, pairClipai,
   listModels, deleteModel, InstalledModel,
-  downloadWhisper, refreshSidecar, exportLogs, testClipai, ClipaiTest, freeVram, endActiveJob,
+  downloadWhisper, refreshSidecar, downloadVision, refreshVision, exportLogs, testClipai, ClipaiTest, freeVram, endActiveJob,
   checkAppUpdate, installAppUpdate, AppUpdateCheck,
 } from './api';
 
@@ -395,6 +395,7 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
   const [confirmDel, setConfirmDel] = useState('');
   const [deleting, setDeleting] = useState('');
   const [whisperDl, setWhisperDl] = useState<{ active: boolean; percent: number; message: string } | null>(null);
+  const [visionDl, setVisionDl] = useState<{ active: boolean; percent: number; message: string } | null>(null);
   const [syncing, setSyncing] = useState(false);
   const [syncMsg, setSyncMsg] = useState('');
   const [modelQuery, setModelQuery] = useState('');
@@ -412,11 +413,16 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
       setWhisperDl({ active: stage !== 'done' && stage !== 'error', percent, message });
       if (stage === 'done' || stage === 'error') setTimeout(() => setWhisperDl(null), 4000);
     });
+    const uV = listen<{ stage: string; percent: number; message: string }>('vision-progress', (e) => {
+      const { stage, percent, message } = e.payload;
+      setVisionDl({ active: stage !== 'done' && stage !== 'error', percent, message });
+      if (stage === 'done' || stage === 'error') setTimeout(() => setVisionDl(null), 4000);
+    });
     const uP = listen<{ model: string; status: string; percent: number }>('pull-progress', (e) => {
       const { model, status: st, percent } = e.payload;
       setSyncMsg(`${model}: ${st}${percent >= 0 ? ` ${Math.round(percent)}%` : ''}`);
     });
-    return () => { uW.then((f) => f()); uP.then((f) => f()); };
+    return () => { uW.then((f) => f()); uV.then((f) => f()); uP.then((f) => f()); };
   }, []);
 
   const loadModels = useCallback(() => {
@@ -448,6 +454,23 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
 
   const doRefreshWhisper = async () => {
     try { await refreshSidecar(); } catch {}
+    refresh();
+  };
+
+  const doDownloadVision = async () => {
+    setVisionDl({ active: true, percent: -1, message: 'Starting…' });
+    try {
+      await downloadVision();
+      await refreshVision();
+      refresh();
+    } catch (e) {
+      setVisionDl({ active: false, percent: 0, message: `Failed: ${e}` });
+      setTimeout(() => setVisionDl(null), 6000);
+    }
+  };
+
+  const doRefreshVision = async () => {
+    try { await refreshVision(); } catch {}
     refresh();
   };
 
@@ -1211,6 +1234,52 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
           {status.sidecar_available && status.whisper_build === 'gpu' && (
             <div className="small muted" style={{ margin: '0 0 8px 17px' }}>
               ⚡ Whisper GPU build installed — transcription runs on the {status.gpu.gpu_name || 'GPU'}.
+            </div>
+          )}
+          <div className="row small" style={{ marginBottom: 6 }}>
+            {/* Green once installed/ready (idle is healthy — it starts on
+                demand); gray when it isn't installed. */}
+            <span className="dot" style={{
+              background: (status.vision_running || status.vision_available)
+                ? 'var(--success)' : 'var(--muted)',
+            }} />
+            Vision (face-detection) offload {status.vision_running ? 'running'
+              : status.vision_available ? 'ready (starts on demand)'
+              : 'not installed (optional) — ClipAI’s face-detection runs on the ClipAI server’s GPU instead'}
+          </div>
+          {!status.vision_available && (
+            <div style={{ margin: '0 0 8px 17px' }}>
+              <div className="small muted" style={{ marginBottom: 6 }}>
+                Install this so ClipAI can run its heaviest analysis stage — face/subject
+                detection — on the {status.gpu.gpu_name || 'GPU'} instead of the small server
+                card. It’s a large CUDA download; needed only once.
+              </div>
+              <div className="row" style={{ marginBottom: visionDl ? 6 : 0 }}>
+                <button className="secondary" onClick={doDownloadVision}
+                  disabled={!!visionDl?.active}
+                  title="Download the YOLO-World face-detection sidecar so this GPU runs ClipAI's FACES stage">
+                  {visionDl?.active ? 'Downloading…' : 'Download Vision offload'}
+                </button>
+                <button className="secondary" onClick={doRefreshVision} disabled={!!visionDl?.active}
+                  title="Re-check whether the vision sidecar is installed">
+                  ↻ Refresh
+                </button>
+              </div>
+              {visionDl && (
+                <div>
+                  <div className="small muted" style={{ marginBottom: 3 }}>{visionDl.message}</div>
+                  <div className={`meter${visionDl.percent < 0 ? ' indeterminate' : ''}`}>
+                    <div style={visionDl.percent < 0 ? undefined
+                      : { width: `${Math.max(2, Math.min(100, visionDl.percent))}%` }} />
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+          {status.vision_available && (
+            <div className="small muted" style={{ margin: '0 0 8px 17px' }}>
+              ⚡ Vision offload installed — ClipAI’s face detection runs on the {status.gpu.gpu_name || 'GPU'}
+              {' '}(needs a non-eco speed profile and ≥5 GB VRAM budget).
             </div>
           )}
           <div className="small muted" style={{ margin: '8px 0 4px' }}>

@@ -151,6 +151,7 @@ async fn get_status(
         whisper_model
     };
     let sidecar_running = state.sidecar.lock().await.is_some();
+    let vision_running = state.vision_sidecar.lock().await.is_some();
     // VRAM ClipAI is actively holding: resident Ollama models (/api/ps) plus a
     // rough whisper-model footprint while transcribing (whisper.cpp VRAM isn't
     // in /api/ps). Lets the GUI color ClipAI's use vs unrelated apps (games).
@@ -173,6 +174,9 @@ async fn get_status(
     let rd = app.path().resource_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let dd = app.path().app_data_dir().unwrap_or_else(|_| rd.clone());
     let whisper_build = sidecar::build_kind(&rd, &dd);
+    // Vision (face-detection) offload: whether the sidecar binary is present
+    // (bundled or downloaded) so ClipAI can push YOLO-World onto this GPU.
+    let vision_available = vision::available(&rd, &dd);
     let (speed_parallel, speed_loaded) = state.resolve_speed_settings();
     let activity: Vec<state::ActivityEntry> =
         state.activity.lock().unwrap().iter().cloned().collect();
@@ -250,6 +254,8 @@ async fn get_status(
         "sidecar_available": state.sidecar_available.load(Ordering::Relaxed),
         "sidecar_running": sidecar_running,
         "whisper_build": whisper_build,
+        "vision_available": vision_available,
+        "vision_running": vision_running,
         "busy": state.whisper_busy.load(Ordering::Relaxed),
         "current_job": current_job,
         "job_progress": job_progress,
@@ -477,6 +483,33 @@ async fn download_whisper(
         .sidecar_available
         .store(sidecar::available(&rd, &dd), Ordering::Relaxed);
     Ok(msg)
+}
+
+/// Re-probe whether the vision sidecar binary is present (bundled or
+/// downloaded) — the "Refresh" button after a Download. Returns availability.
+#[tauri::command]
+fn refresh_vision(app: tauri::AppHandle) -> bool {
+    let rd = app.path().resource_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let dd = app.path().app_data_dir().unwrap_or_else(|_| rd.clone());
+    vision::available(&rd, &dd)
+}
+
+/// Download the vision sidecar (YOLO-World face-detection offload) into app
+/// data (Windows), so ClipAI can run its FACES stage on THIS GPU instead of
+/// the server's small card. Progress arrives via `vision-progress` events.
+#[tauri::command]
+async fn download_vision(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, SharedState>,
+) -> Result<String, String> {
+    let dd = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("no app data dir: {e}"))?;
+    // A live vision-server.exe holds a file lock on Windows; stop it first so
+    // the re-download can overwrite it. It restarts lazily on the next frame.
+    vision::shutdown(&state, "vision download requested").await;
+    vision::download_vision(&app, &dd).await
 }
 
 /// Format a ms-epoch as local time, or "-" for 0/unset.
@@ -1557,6 +1590,8 @@ pub fn run() {
             delete_model,
             refresh_sidecar,
             download_whisper,
+            refresh_vision,
+            download_vision,
             export_logs,
             test_clipai,
             free_vram,

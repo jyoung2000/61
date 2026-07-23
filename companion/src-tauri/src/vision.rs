@@ -40,6 +40,173 @@ pub fn available(resource_dir: &PathBuf, data_dir: &PathBuf) -> bool {
     resolve_binary(resource_dir, data_dir).is_some()
 }
 
+/// Where a runtime-downloaded vision sidecar lands (mirrors the whisper
+/// `whisper-bin` layout). `resolve_binary` checks this dir first, so a
+/// downloaded build wins over any bundled one.
+pub fn downloaded_vision_dir(data_dir: &PathBuf) -> PathBuf {
+    data_dir.join("vision-bin")
+}
+
+// The ClipAI repo whose companion release carries the vision-server asset.
+// The installers + this asset are published by companion-release.yml on the
+// same repo, so the download target is stable (mirrors the whisper.cpp
+// download hard-coding its upstream repo).
+#[cfg(target_os = "windows")]
+const VISION_ASSET: &str = "vision-server-x64.zip";
+#[cfg(target_os = "windows")]
+const RELEASE_REPO: &str = "jyoung2000/61";
+
+/// Download the vision sidecar (`vision-server-x64.zip`) from the latest
+/// companion release and extract it into `app-data/vision-bin`. Windows-only:
+/// the asset is a PyInstaller CUDA build. Progress is emitted on the
+/// `vision-progress` event, mirroring the whisper download.
+#[cfg(target_os = "windows")]
+pub async fn download_vision(
+    app: &tauri::AppHandle,
+    data_dir: &PathBuf,
+) -> Result<String, String> {
+    use crate::state::quiet_command;
+    use futures_util::StreamExt;
+    use tauri::Emitter;
+    use tokio::io::AsyncWriteExt;
+
+    let emit = |stage: &str, percent: f64, message: &str| {
+        let _ = app.emit(
+            "vision-progress",
+            serde_json::json!({"stage": stage, "percent": percent, "message": message}),
+        );
+    };
+    emit("resolving", -1.0, "Finding the latest vision sidecar…");
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3600))
+        .user_agent("clipai-companion")
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    // Find the newest release that actually carries the vision asset — the
+    // companion asset set trails the installers on a fresh release, so scan a
+    // page of releases rather than assuming /latest has it.
+    let rels: serde_json::Value = client
+        .get(format!(
+            "https://api.github.com/repos/{RELEASE_REPO}/releases?per_page=20"
+        ))
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|e| format!("release lookup failed: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("release parse failed: {e}"))?;
+
+    let mut url = String::new();
+    let mut tag = String::new();
+    if let Some(list) = rels.as_array() {
+        'find: for rel in list {
+            let this_tag = rel.get("tag_name").and_then(|t| t.as_str()).unwrap_or("");
+            for a in rel.get("assets").and_then(|a| a.as_array()).into_iter().flatten() {
+                if a.get("name").and_then(|n| n.as_str()) == Some(VISION_ASSET) {
+                    url = a
+                        .get("browser_download_url")
+                        .and_then(|u| u.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    tag = this_tag.to_string();
+                    break 'find;
+                }
+            }
+        }
+    }
+    if url.is_empty() {
+        return Err(format!(
+            "no {VISION_ASSET} in the recent {RELEASE_REPO} releases yet — \
+             the companion build that publishes it may still be running"
+        ));
+    }
+    log::info!("selected vision asset '{VISION_ASSET}' from {tag}");
+
+    let dl_dir = downloaded_vision_dir(data_dir);
+    let _ = std::fs::create_dir_all(&dl_dir);
+    let zip_path = dl_dir.join("_download.zip");
+
+    emit("downloading", 0.0, &format!("Downloading vision sidecar {tag}…"));
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("download failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("download failed: HTTP {}", resp.status()));
+    }
+    let total = resp.content_length().unwrap_or(0);
+    let mut file = tokio::fs::File::create(&zip_path).await.map_err(|e| e.to_string())?;
+    let mut downloaded: u64 = 0;
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("download interrupted: {e}"))?;
+        file.write_all(&chunk).await.map_err(|e| e.to_string())?;
+        downloaded += chunk.len() as u64;
+        if total > 0 {
+            emit("downloading", downloaded as f64 / total as f64 * 100.0, "Downloading…");
+        }
+    }
+    file.flush().await.map_err(|e| e.to_string())?;
+    drop(file);
+
+    emit("extracting", -1.0, "Extracting…");
+    let status = quiet_command("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!(
+                "Expand-Archive -Force -LiteralPath '{}' -DestinationPath '{}'",
+                zip_path.display(),
+                dl_dir.display()
+            ),
+        ])
+        .status()
+        .await
+        .map_err(|e| format!("extraction failed to start: {e}"))?;
+    let _ = std::fs::remove_file(&zip_path);
+    if !status.success() {
+        return Err("extraction failed (Expand-Archive)".into());
+    }
+
+    // The zip may nest the exe one folder deep (dist/vision-server/*). If the
+    // top-level exe is missing but a single subdir holds it, flatten it up so
+    // resolve_binary finds vision-bin/vision-server.exe.
+    if !dl_dir.join("vision-server.exe").is_file() {
+        if let Ok(entries) = std::fs::read_dir(&dl_dir) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.is_dir() && p.join("vision-server.exe").is_file() {
+                    for inner in std::fs::read_dir(&p).into_iter().flatten().flatten() {
+                        let dest = dl_dir.join(inner.file_name());
+                        let _ = std::fs::rename(inner.path(), dest);
+                    }
+                    let _ = std::fs::remove_dir_all(&p);
+                    break;
+                }
+            }
+        }
+    }
+
+    if dl_dir.join("vision-server.exe").is_file() {
+        emit("done", 100.0, "Vision sidecar installed");
+        Ok(format!("vision sidecar {tag} installed"))
+    } else {
+        Err("vision-server.exe not found after extraction".into())
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub async fn download_vision(
+    _app: &tauri::AppHandle,
+    _data_dir: &PathBuf,
+) -> Result<String, String> {
+    Err("Runtime vision-sidecar download is Windows-only.".into())
+}
+
 pub async fn healthy() -> bool {
     reqwest::Client::new()
         .get(format!("{}/health", vision_url()))

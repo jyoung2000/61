@@ -135,6 +135,27 @@ jobs:
           New-Item -ItemType Directory -Force ..\..\src-tauri\sidecar | Out-Null
           Copy-Item -Recurse -Force dist\whisper-server\* ..\..\src-tauri\sidecar\
 
+      # ── Windows: build the YOLO-World vision sidecar (PyInstaller) ────
+      # Face-detection offload. NOT bundled into the installer (torch + CUDA
+      # would bloat it by GBs); instead zipped and attached to the release as
+      # vision-server-x64.zip, which the Companion downloads on demand
+      # (Settings → GPU Companion → Download Vision offload). Fail-soft: a
+      # build failure just means the offload asset is missing this release.
+      - name: Build vision sidecar (Windows)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        working-directory: companion/sidecars/vision-server
+        continue-on-error: true
+        run: |
+          python -m pip install --upgrade pip
+          # CUDA torch FIRST so YOLO-World runs on the GPU (PyPI's default
+          # torch wheel is CPU-only — that would defeat the whole offload).
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+          pip install -r requirements.txt
+          pyinstaller vision-server.spec
+          Compress-Archive -Force -Path dist\vision-server\* `
+            -DestinationPath ..\..\vision-server-x64.zip
+
       # ── macOS: build whisper.cpp server (Metal) ──────────────────────
       - name: Build whisper.cpp server (macOS)
         if: matrix.platform == 'macos-latest'
@@ -200,6 +221,25 @@ jobs:
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
+
+      # Attach the vision-offload sidecar to the release the tauri-action just
+      # created/updated. Separate from the installers so the base download
+      # stays small; the Companion fetches this only when the user opts in.
+      - name: Upload vision sidecar asset (Windows)
+        if: matrix.platform == 'windows-latest'
+        shell: bash
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          if [ -f companion/vision-server-x64.zip ]; then
+            gh release upload "$TAG" companion/vision-server-x64.zip \
+              --repo "${{ github.repository }}" --clobber
+            echo "attached vision-server-x64.zip to $TAG"
+          else
+            echo "no vision-server-x64.zip built — offload asset skipped this release"
+          fi
 
   manifest:
     name: Publish manifest.json

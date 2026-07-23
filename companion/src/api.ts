@@ -84,6 +84,10 @@ export interface CompanionStatus {
   sidecar_running: boolean;
   /** Which whisper build is installed: "gpu" (CUDA), "cpu", "bundled", "none". */
   whisper_build: 'gpu' | 'cpu' | 'bundled' | 'none';
+  /** Vision (face-detection) offload sidecar present (bundled or downloaded). */
+  vision_available: boolean;
+  /** Vision sidecar process currently running. */
+  vision_running: boolean;
   busy: boolean;
   current_job: ActivityEntry | null;
   job_progress: number | null;
@@ -113,6 +117,8 @@ export const listModels = () => invoke<InstalledModel[]>('list_models');
 export const deleteModel = (model: string) => invoke('delete_model', { model });
 export const downloadWhisper = () => invoke<string>('download_whisper');
 export const refreshSidecar = () => invoke<boolean>('refresh_sidecar');
+export const downloadVision = () => invoke<string>('download_vision');
+export const refreshVision = () => invoke<boolean>('refresh_vision');
 /** Write a full diagnostics report to Downloads and reveal it; returns the path. */
 export const exportLogs = () => invoke<string>('export_logs');
 export interface ClipaiTest {

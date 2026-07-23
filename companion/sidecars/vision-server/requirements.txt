@@ -1,5 +1,15 @@
-fastapi
-uvicorn
-ultralytics>=8.2
+# Windows/NVIDIA vision sidecar — Python 3.11, CUDA 12.x.
+#
+# YOLO-World runs on torch; to get GPU inference the CUDA torch wheel must
+# be installed FIRST from the PyTorch CUDA index, e.g.:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# (the companion-release CI does exactly this before installing this file).
+# Installing this file on its own pulls the CPU torch wheel from PyPI, which
+# still works but runs YOLO on the CPU — no faster than the ClipAI server.
+fastapi==0.111.0
+uvicorn==0.30.0
+ultralytics>=8.2,<8.4
 opencv-python-headless
 numpy
+# PyInstaller is a build-time dependency (see vision-server.spec).
+pyinstaller==6.11.1
