@@ -88,3 +88,66 @@ def test_disabled_via_config(monkeypatch):
     monkeypatch.setattr(settings, "TRANSCRIPT_MARK_THEME_SONGS", False)
     out, changed = collapse_song_choruses(_ending_theme_transcript(), "en")
     assert not changed
+
+
+def test_through_composed_opening_theme_collapses_without_a_repeated_chorus():
+    """The Gundam Wing cold-open OP has all-distinct verse lines (no chorus to
+    key on) and shipped as 'Speaker 1' dialogue. The repetition-independent
+    theme-run branch must collapse it: a long, single-speaker, proper-noun-free
+    run in the head window — while the narration that follows (proper nouns /
+    different speaker) survives."""
+    op = [
+        _cue(30, 36, "The rain won't fall, so I can't cool this fever"),
+        _cue(36, 48, "I want to convey my feelings in the air tonight"),
+        _cue(48, 51, "Your trembling fingertips wander,"),
+        _cue(51, 54, "seeking something"),
+        _cue(54, 57, "Turn sorrow into love"),
+        _cue(57, 62, "that changes its strength"),
+        _cue(62, 70, "Believe in myself I wish to protect"),
+        _cue(70, 78, "Because I won't turn away from it in my life"),
+    ]
+    for c in op:
+        c["speaker"] = "Speaker 1"
+    rest = [
+        {**_cue(80, 90, "Raised on Earth, a person sought hope in space colonies"), "speaker": "Speaker 1"},   # proper noun ends run
+        {**_cue(110, 118, "The Earth Sphere Unified Nation overwhelmed each colony."), "speaker": "Speaker 2"},
+    ]
+    rest += [{**_cue(300 + i * 6, 304 + i * 6, f"Dialogue line {i}."),
+              "speaker": "Speaker 1" if i % 2 else "Speaker 2"}   # turn-taking
+             for i in range(180)]
+    rows = op + rest
+    out, changed = collapse_song_choruses(rows, "en")
+    assert changed
+    texts = [r["text"] for r in out]
+    assert any(_is_marker(t) and "theme" in t.lower() for t in texts)
+    # None of the OP lyric lines survive as dialogue…
+    assert not any("trembling fingertips" in t for t in texts)
+    # …but the narration + dialogue do.
+    assert any("Earth Sphere Unified Nation" in t for t in texts)
+    assert any("Raised on Earth" in t for t in texts)
+
+
+def test_ordinary_dialogue_scene_is_not_collapsed():
+    """A normal opening dialogue scene must NOT be mistaken for a theme: it
+    turn-takes between speakers (breaking any single-speaker run) and names
+    people/places (proper nouns), so it never forms a long theme-run."""
+    lines = [
+        ("Speaker 2", "What's wrong, Lily?"),
+        ("Speaker 1", "Do you dislike returning to Earth so much?"),
+        ("Speaker 1", "Yes, very much."),
+        ("Speaker 2", "I've been too busy with work lately."),
+        ("Speaker 1", "Father, next time we go into space,"),
+        ("Speaker 1", "please take more time."),
+        ("Speaker 2", "Lord Darlian, our shuttle will enter the atmosphere."),
+        ("Speaker 1", "What is that over there?"),
+        ("Speaker 2", "Auto-lock engaged."),
+        ("Speaker 1", "Earth's attack mobile suit."),
+    ]
+    rows = [{**_cue(30 + i * 6, 34 + i * 6, txt), "speaker": spk}
+            for i, (spk, txt) in enumerate(lines)]
+    rows += [{**_cue(300 + i * 6, 304 + i * 6, f"Later line {i}."),
+              "speaker": "Speaker 1" if i % 2 else "Speaker 2"}   # turn-taking
+             for i in range(180)]
+    out, changed = collapse_song_choruses(rows, "en")
+    assert not changed
+    assert not any(_is_marker(r["text"]) for r in out)

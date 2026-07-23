@@ -533,6 +533,15 @@ _PREVIEW_RE = re.compile(
 _CHORUS_MIN_CHARS = 12
 _LYRIC_MAX_CHARS = 48
 _THEME_MIN_SPAN_S = 12.0
+# Through-composed OP/ED themes (verses all distinct → no repeated chorus) are
+# caught by a repetition-INDEPENDENT signal instead: a long, contiguous,
+# single-speaker, proper-noun-free run in the head/tail window. Real dialogue
+# turn-takes and names people/places within a few lines, so these thresholds
+# (deliberately higher than the chorus path's) keep it off narration/monologue.
+# NOTE: no per-cue length cap here — translated lyric lines are often long full
+# sentences; the length cap made this a no-op on real themes.
+_THEME_RUN_MIN_CUES = 6
+_THEME_RUN_MIN_SPAN_S = 25.0
 
 
 def _song_norm(text: str) -> str:
@@ -554,6 +563,37 @@ def _proper_noun_count(text: str) -> int:
             n += 1
         sent_start = bool(tok) and tok[-1] in ".!?…"
     return n
+
+
+def _longest_theme_run(rows, idxs, is_preview):
+    """Longest run of consecutive (within ``idxs``) cues that read as a sung
+    theme: same speaker (when the cue is labelled), zero proper nouns, and not a
+    next-episode preview. A speaker change, a proper noun, or a preview cue ends
+    the run — so real dialogue (which turn-takes and names people/places) can
+    never be absorbed. No per-cue length cap: translated lyric lines are often
+    long full sentences. Returns the row indices of the best run."""
+    best: list = []
+    cur: list = []
+    cur_spk = None
+    for i in idxs:
+        txt = (rows[i].get("text") or "").strip()
+        spk = rows[i].get("speaker")
+        theme_like = bool(txt) and not is_preview(txt) and _proper_noun_count(txt) == 0
+        same_spk = cur_spk is None or spk in (None, "") or spk == cur_spk
+        if theme_like and (not cur or same_spk):
+            if not cur:
+                cur_spk = spk
+            cur.append(i)
+        else:
+            if len(cur) > len(best):
+                best = list(cur)
+            if theme_like:
+                cur, cur_spk = [i], spk
+            else:
+                cur, cur_spk = [], None
+    if len(cur) > len(best):
+        best = list(cur)
+    return best
 
 
 def collapse_song_choruses(segments, target_lang: str = "en"):
@@ -615,7 +655,21 @@ def collapse_song_choruses(segments, target_lang: str = "en"):
                         counts[ns] = counts.get(ns, 0) + 1
             chorus = {ns for ns, c in counts.items() if c >= 2}
             if len(chorus) < min_rep:
-                continue   # no repeated chorus → not a song window; leave alone
+                # No repeated chorus, but a THROUGH-COMPOSED theme (an OP with
+                # all-distinct verse lines, or an ED with only a short hook) is a
+                # long single-speaker, proper-noun-free run. Collapse that run to
+                # the theme marker; any speaker change / proper noun / preview
+                # ends it, so dialogue is preserved. This catches the sung
+                # cold-open that shipped as "Speaker 1" dialogue — which the
+                # audio classifier misses because the vocals read as speech.
+                trun = _longest_theme_run(rows, idxs, _is_preview)
+                if len(trun) >= _THEME_RUN_MIN_CUES:
+                    tm_start = min(_st(rows[i]) for i in trun)
+                    tm_end = max(_en(rows[i]) for i in trun)
+                    if tm_end - tm_start >= _THEME_RUN_MIN_SPAN_S:
+                        drop.update(trun)
+                        marker_at[min(trun)] = (tm_start, tm_end, label)
+                continue   # window handled (or genuinely not a song)
             chorus_idxs = [i for i in idxs
                            if not _is_preview((rows[i].get("text") or "").strip())
                            and any(_song_norm(s) in chorus
