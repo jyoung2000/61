@@ -751,7 +751,11 @@ class Settings(BaseSettings):
     # sampled. These cap the total samples on long videos. Lowering
     # REFRAMER_MAX_SAMPLES (or REFRAMER_MIN_SAMPLE_FPS) directly speeds up
     # the dominant analysis stage at a small reframing-accuracy cost.
-    REFRAMER_MAX_SAMPLES: int = 1500       # total face/motion samples cap
+    # 1200 keeps a 24.5-min video at ~1.22s spacing — safely inside the 1.5s
+    # sparse-sampling threshold that would force the YOLO stride back to 1
+    # (fewer samples than ~1000 on a 24-min video is a net LOSS: per-sample
+    # open-vocab detection outweighs the sample savings).
+    REFRAMER_MAX_SAMPLES: int = 1200       # total face/motion samples cap
     REFRAMER_SAMPLE_FPS: float = 5.0       # ceiling fps (short videos)
     REFRAMER_MIN_SAMPLE_FPS: float = 1.2   # floor fps (MEDIUM videos — applied
                                            # only while it stays within the cap)

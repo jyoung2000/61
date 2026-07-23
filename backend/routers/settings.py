@@ -298,6 +298,20 @@ def _restore_user_settings():
             {k: data[k] for k in model_keys_in_file},
         )
 
+        # Stale-default migration: values persisted when they WERE the shipped
+        # default are a snapshot, not a user choice — restoring them pins the
+        # old default forever and silently defeats a tuned new default. The
+        # observed case: REFRAMER_MAX_SAMPLES=1800 (the old default) persisted
+        # on every save, so the 1200-sample speedup never took effect. Any
+        # persisted value matching a RETIRED default adopts the new default.
+        _RETIRED_DEFAULTS = {"REFRAMER_MAX_SAMPLES": (1800, 1500)}
+        for _k, _olds in _RETIRED_DEFAULTS.items():
+            if _k in data and data.get(_k) in _olds:
+                logger.info(
+                    "Migrating %s: persisted %s was a prior shipped default — "
+                    "adopting the current default %s", _k, data[_k], getattr(settings, _k, None))
+                data.pop(_k)
+
         for key, val in data.items():
             if key not in _PERSISTABLE_KEYS:
                 continue

@@ -78,3 +78,45 @@ def test_blank_reference_is_noop():
     clip = [{"start": 0, "end": 5, "text": "x", "speaker": "A"}]
     out, changed = conform_to_reference(clip, "", mode="adopt")
     assert changed is False and out == clip
+
+
+# ── Timestamp-less references (DownloadYoutubeSubtitles.com plain text) ─────
+
+def test_parse_reference_lines_blocks():
+    from backend.services.reference_transcript import parse_reference_lines
+    txt = "\n\n".join(f"Caption line number {i},\nwrapped for display" for i in range(10))
+    lines = parse_reference_lines(txt)
+    assert len(lines) == 10
+    assert lines[0] == "Caption line number 0, wrapped for display"
+    # A timestamped text is NOT for this parser.
+    assert parse_reference_lines("\n".join(f"[0:{30+i}] hi {i}" for i in range(10))) == []
+
+
+def test_timestampless_adopt_rewords_matched_cues_only():
+    ref = "\n\n".join([
+        "I told you.", "I'm a true soldier.", "All areas functioning.",
+        "Commencing operations in seven minutes.", "A civilian shuttle...",
+        "Mr. Darlian.", "The shuttle will soon enter the atmosphere.",
+        "Please fasten your seat belt and remain seated.",
+        "What's the matter Relena?", "Aren't you glad to be coming home to Earth?",
+    ])
+    clip = [
+        {"start": 240, "end": 243, "speaker": "S2", "text": "Didn't I say I'm a soldier?"},
+        {"start": 250, "end": 254, "speaker": "S1", "text": "All systems normal."},
+        {"start": 255, "end": 259, "speaker": "S1", "text": "We'll avoid the operation in seven minutes."},
+        {"start": 262, "end": 265, "speaker": "S1", "text": "A civilian shuttle."},
+        {"start": 268, "end": 272, "speaker": "S1", "text": "This shuttle will now enter Earth's atmosphere."},
+        {"start": 274, "end": 278, "speaker": "S1", "text": "Please fasten your seatbelt and remain seated, thank you."},
+        {"start": 280, "end": 283, "speaker": "S2", "text": "What's wrong, Lily?"},
+        {"start": 283, "end": 287, "speaker": "S2", "text": "Do you hate going back to Earth so much?"},
+        {"start": 289, "end": 291, "speaker": "S1", "text": "Yes, very much."},
+        {"start": 292, "end": 295, "speaker": "S2", "text": "Sorry about that."},
+    ]
+    out, changed = conform_to_reference(clip, ref, mode="adopt")
+    assert changed
+    texts = [r["text"] for r in out]
+    # Strong matches adopt YouTube's exact wording (timing/speaker kept)…
+    assert "The shuttle will soon enter the atmosphere." in texts
+    assert out[4]["start"] == 268 and out[4]["speaker"] == "S1"
+    # …and a cue with no good match keeps ClipAI's own text.
+    assert "Yes, very much." in texts

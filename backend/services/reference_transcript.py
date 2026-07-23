@@ -99,6 +99,76 @@ def parse_reference(text: str) -> list:
     return cues
 
 
+def parse_reference_lines(text: str) -> list:
+    """Timestamp-LESS reference (e.g. DownloadYoutubeSubtitles.com plain text):
+    one caption per non-empty line/paragraph, no times. Returns ``[str, …]``
+    (or [] when the text actually carries timestamps — use parse_reference)."""
+    if not text or not text.strip():
+        return []
+    raw = text.replace("\r\n", "\n").replace("\r", "\n")
+    if "-->" in raw or any(_LINE_TS.match(ln) and _LINE_TS.match(ln).group(0).strip()
+                           for ln in raw.split("\n") if ln.strip()):
+        return []
+    # Captions arrive as blank-line-separated blocks whose inner newlines are
+    # display line-wraps — join within a block, split on blank lines.
+    blocks = [b.strip() for b in re.split(r"\n\s*\n", raw)]
+    lines = [" ".join(b.split()) for b in blocks if b.strip()]
+    lines = [_SPEAKER_PREFIX.sub("", ln).strip() for ln in lines]
+    return [ln for ln in lines if ln] if len(lines) >= _MIN_REFERENCE_CUES else []
+
+
+def _norm_tokens(s: str) -> set:
+    return set(re.sub(r"[^\w\s]", " ", (s or "").lower()).split())
+
+
+def _sim(a: str, b: str) -> float:
+    """Token-overlap similarity — cheap, order-free, robust to rephrasing."""
+    ta, tb = _norm_tokens(a), _norm_tokens(b)
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / max(1, min(len(ta), len(tb)))
+
+
+def align_lines_to_cues(clip_rows: list, ref_lines: list) -> dict:
+    """Monotone alignment ClipAI cue index → reference line index.
+
+    Order-preserving DP (both tracks tell the same story in the same order);
+    a cue may skip lines and vice versa; only pairs above a similarity floor
+    are adopted. O(cues × lines) — fine at a few hundred each."""
+    n, m = len(clip_rows), len(ref_lines)
+    if not n or not m:
+        return {}
+    FLOOR = 0.34
+    # dp[i][j] = best score aligning first i cues with first j lines.
+    NEG = float("-inf")
+    dp = [[0.0] * (m + 1) for _ in range(n + 1)]
+    bt = [[0] * (m + 1) for _ in range(n + 1)]  # 1=match, 2=skip cue, 3=skip line
+    for i in range(1, n + 1):
+        txt_i = clip_rows[i - 1].get("text") or ""
+        for j in range(1, m + 1):
+            s = _sim(txt_i, ref_lines[j - 1])
+            match = dp[i - 1][j - 1] + (s if s >= FLOOR else -0.05)
+            skip_c = dp[i - 1][j]
+            skip_l = dp[i][j - 1]
+            best = max(match, skip_c, skip_l)
+            dp[i][j] = best
+            bt[i][j] = 1 if best == match else (2 if best == skip_c else 3)
+    # Backtrack; keep only genuinely-similar pairs.
+    out: dict = {}
+    i, j = n, m
+    while i > 0 and j > 0:
+        step = bt[i][j]
+        if step == 1:
+            if _sim(clip_rows[i - 1].get("text") or "", ref_lines[j - 1]) >= FLOOR:
+                out[i - 1] = j - 1
+            i, j = i - 1, j - 1
+        elif step == 2:
+            i -= 1
+        else:
+            j -= 1
+    return out
+
+
 def _overlap(a0, a1, b0, b1) -> float:
     return max(0.0, min(a1, b1) - max(a0, b0))
 
@@ -126,7 +196,31 @@ def conform_to_reference(segments, reference_text: str, mode: str = "adopt"):
                 (r.model_dump(mode="json") if hasattr(r, "model_dump") else dict(r))
                 for r in (segments or [])]
         ref = parse_reference(reference_text or "")
-        if len(ref) < _MIN_REFERENCE_CUES or not rows:
+        if len(ref) < _MIN_REFERENCE_CUES:
+            # Timestamp-less reference (plain caption lines): adopt the
+            # reference WORDING onto ClipAI's own cue timing via monotone
+            # fuzzy alignment. Timing/segmentation stay ClipAI's (there are
+            # no reference times to take); unmatched cues keep their text.
+            lines = parse_reference_lines(reference_text or "")
+            if lines and rows:
+                amap = align_lines_to_cues(rows, lines)
+                # Trust the alignment only when a real fraction of cues found a
+                # confident partner — a handful of coincidental matches must not
+                # rewrite a transcript the reference doesn't actually cover.
+                if len(amap) >= max(5, len(rows) // 5):
+                    out = []
+                    changed = False
+                    for i, r in enumerate(rows):
+                        nr = dict(r)
+                        j = amap.get(i)
+                        if j is not None and lines[j] != (nr.get("text") or ""):
+                            nr["text"] = lines[j]
+                            nr["words"] = []
+                            changed = True
+                        out.append(nr)
+                    return out, changed
+            return rows, False
+        if not rows:
             return rows, False
 
         if (mode or "adopt").strip().lower() == "timing":
