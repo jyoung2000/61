@@ -140,9 +140,11 @@ def align_lines_to_cues(clip_rows: list, ref_lines: list) -> dict:
         return {}
     FLOOR = 0.34
     # dp[i][j] = best score aligning first i cues with first j lines.
-    NEG = float("-inf")
     dp = [[0.0] * (m + 1) for _ in range(n + 1)]
-    bt = [[0] * (m + 1) for _ in range(n + 1)]  # 1=match, 2=skip cue, 3=skip line
+    # 1=match(1:1), 2=skip cue, 3=skip line, 4=match cue↔TWO lines (a split —
+    # YouTube segments the same speech more finely than ClipAI, so adopting
+    # its PAIR of lines onto one ClipAI cue reproduces YouTube's pacing).
+    bt = [[0] * (m + 1) for _ in range(n + 1)]
     for i in range(1, n + 1):
         txt_i = clip_rows[i - 1].get("text") or ""
         for j in range(1, m + 1):
@@ -150,18 +152,35 @@ def align_lines_to_cues(clip_rows: list, ref_lines: list) -> dict:
             match = dp[i - 1][j - 1] + (s if s >= FLOOR else -0.05)
             skip_c = dp[i - 1][j]
             skip_l = dp[i][j - 1]
-            best = max(match, skip_c, skip_l)
+            best, step = match, 1
+            if skip_c > best:
+                best, step = skip_c, 2
+            if skip_l > best:
+                best, step = skip_l, 3
+            if j >= 2:
+                s2 = _sim(txt_i, ref_lines[j - 2] + " " + ref_lines[j - 1])
+                # Small bonus: when a cue covers two reference lines, the pair
+                # match beats two lone half-matches.
+                pair = dp[i - 1][j - 2] + (s2 * 1.15 if s2 >= FLOOR else -0.1)
+                if pair > best:
+                    best, step = pair, 4
             dp[i][j] = best
-            bt[i][j] = 1 if best == match else (2 if best == skip_c else 3)
-    # Backtrack; keep only genuinely-similar pairs.
+            bt[i][j] = step
+    # Backtrack; keep only genuinely-similar pairs. Values are an int (1:1)
+    # or a (j1, j2) tuple (this cue spans two reference lines → split it).
     out: dict = {}
     i, j = n, m
     while i > 0 and j > 0:
         step = bt[i][j]
+        txt_i = clip_rows[i - 1].get("text") or ""
         if step == 1:
-            if _sim(clip_rows[i - 1].get("text") or "", ref_lines[j - 1]) >= FLOOR:
+            if _sim(txt_i, ref_lines[j - 1]) >= FLOOR:
                 out[i - 1] = j - 1
             i, j = i - 1, j - 1
+        elif step == 4:
+            if _sim(txt_i, ref_lines[j - 2] + " " + ref_lines[j - 1]) >= FLOOR:
+                out[i - 1] = (j - 2, j - 1)
+            i, j = i - 1, j - 2
         elif step == 2:
             i -= 1
         else:
@@ -213,6 +232,20 @@ def conform_to_reference(segments, reference_text: str, mode: str = "adopt"):
                     for i, r in enumerate(rows):
                         nr = dict(r)
                         j = amap.get(i)
+                        if isinstance(j, tuple):
+                            # This cue spans TWO reference lines — split it so
+                            # the pacing matches YouTube's finer segmentation.
+                            # Time divides by each line's share of characters.
+                            a, b = lines[j[0]], lines[j[1]]
+                            s = float(nr.get("start") or 0.0)
+                            e = float(nr.get("end") or s)
+                            frac = len(a) / max(1, len(a) + len(b))
+                            cut = round(s + (e - s) * frac, 3)
+                            first = {**nr, "text": a, "end": cut, "words": []}
+                            second = {**nr, "text": b, "start": cut, "words": []}
+                            out.extend([first, second])
+                            changed = True
+                            continue
                         if j is not None and lines[j] != (nr.get("text") or ""):
                             nr["text"] = lines[j]
                             nr["words"] = []

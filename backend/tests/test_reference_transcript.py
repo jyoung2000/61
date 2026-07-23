@@ -115,8 +115,41 @@ def test_timestampless_adopt_rewords_matched_cues_only():
     out, changed = conform_to_reference(clip, ref, mode="adopt")
     assert changed
     texts = [r["text"] for r in out]
-    # Strong matches adopt YouTube's exact wording (timing/speaker kept)…
+    # Strong matches adopt YouTube's exact wording (speaker kept; indices may
+    # shift because a cue spanning two reference lines splits in two).
     assert "The shuttle will soon enter the atmosphere." in texts
-    assert out[4]["start"] == 268 and out[4]["speaker"] == "S1"
+    shuttle = next(r for r in out if r["text"] == "The shuttle will soon enter the atmosphere.")
+    assert shuttle["speaker"] == "S1"
     # …and a cue with no good match keeps ClipAI's own text.
     assert "Yes, very much." in texts
+
+
+def test_timestampless_pair_match_splits_cue_for_youtube_pacing():
+    """A ClipAI cue that covers TWO reference lines splits into two cues at a
+    char-proportional cut, reproducing YouTube's finer pacing."""
+    ref = "\n\n".join([
+        "I told you.", "I'm a true soldier.", "All areas functioning.",
+        "Commencing operations in seven minutes.", "A civilian shuttle...",
+        "Mr. Darlian.", "The shuttle will soon enter the atmosphere.",
+        "Please fasten your seat belt and remain seated.",
+    ])
+    clip = [
+        {"start": 240, "end": 244, "speaker": "S2", "text": "I told you, I'm a true soldier."},
+        {"start": 250, "end": 254, "speaker": "S1", "text": "All areas functioning."},
+        {"start": 255, "end": 259, "speaker": "S1", "text": "Commencing operations in seven minutes."},
+        {"start": 262, "end": 265, "speaker": "S1", "text": "A civilian shuttle..."},
+        {"start": 266, "end": 267, "speaker": "S1", "text": "Mr. Darlian."},
+        {"start": 268, "end": 272, "speaker": "S1", "text": "The shuttle will soon enter the atmosphere."},
+        {"start": 274, "end": 278, "speaker": "S1", "text": "Please fasten your seat belt and remain seated."},
+    ]
+    out, changed = conform_to_reference(clip, ref, mode="adopt")
+    assert changed
+    texts = [r["text"] for r in out]
+    # The double-line cue split into YouTube's two cues…
+    assert "I told you." in texts and "I'm a true soldier." in texts
+    a = next(r for r in out if r["text"] == "I told you.")
+    b = next(r for r in out if r["text"] == "I'm a true soldier.")
+    # …contiguous in time, inside the original span, same speaker.
+    assert a["end"] == b["start"]
+    assert a["start"] == 240 and b["end"] == 244
+    assert a["speaker"] == b["speaker"] == "S2"
