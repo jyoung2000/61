@@ -485,11 +485,28 @@ async fn whisper_proxy(State(ctx): State<ProxyCtx>, req: Request<Body>) -> Respo
             .into_response();
     };
     ctx.state.whisper_busy.store(true, Ordering::Relaxed);
-    // The vision offload and Whisper both want THIS GPU. A Whisper decode wins:
-    // stop the vision sidecar so transcription isn't starved (it relaunches
-    // lazily on the next face request). Without this, a resident vision sidecar
-    // + a concurrent decode made the Companion unresponsive for the whole job.
-    crate::vision::shutdown(&ctx.state, "whisper decode starting").await;
+    // The vision offload and Whisper both want THIS GPU. On a small, contended
+    // card a resident vision sidecar + a concurrent decode starved transcription
+    // and made the Companion unresponsive — so a decode used to kill vision
+    // outright. But on a big card (a 4070's 12 GB) YOLO (~2 GB) + Whisper (~2 GB)
+    // coexist with room to spare, and killing vision there just forces faces back
+    // onto ClipAI's small SERVER GPU (the 1h+ face loop the offload exists to
+    // avoid). So decide by LIVE free VRAM: keep vision running when the GPU still
+    // has headroom for the decode, stop it only when memory is tight.
+    const KEEP_VISION_MIN_FREE_MB: u64 = 1536;
+    let free_mb = crate::gpu::snapshot().vram_free_mb;
+    if free_mb >= KEEP_VISION_MIN_FREE_MB {
+        log::info!(
+            "vision offload kept running alongside whisper decode \
+             ({free_mb} MB free >= {KEEP_VISION_MIN_FREE_MB} MB headroom)"
+        );
+    } else {
+        crate::vision::shutdown(
+            &ctx.state,
+            "whisper decode starting (low VRAM, no room for both)",
+        )
+        .await;
+    }
 
     let activity = ctx.state.begin_activity(
         "whisper",
