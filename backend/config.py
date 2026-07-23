@@ -751,7 +751,7 @@ class Settings(BaseSettings):
     # sampled. These cap the total samples on long videos. Lowering
     # REFRAMER_MAX_SAMPLES (or REFRAMER_MIN_SAMPLE_FPS) directly speeds up
     # the dominant analysis stage at a small reframing-accuracy cost.
-    REFRAMER_MAX_SAMPLES: int = 1800       # total face/motion samples cap
+    REFRAMER_MAX_SAMPLES: int = 1500       # total face/motion samples cap
     REFRAMER_SAMPLE_FPS: float = 5.0       # ceiling fps (short videos)
     REFRAMER_MIN_SAMPLE_FPS: float = 1.2   # floor fps (MEDIUM videos — applied
                                            # only while it stays within the cap)
@@ -765,8 +765,13 @@ class Settings(BaseSettings):
     # behind the 17-min face stage) runs every Nth sampled frame, carrying its
     # subject bboxes forward in between. YuNet faces + motion still run EVERY
     # frame, so framing density is unchanged; subjects don't teleport in one
-    # ~0.8s sample. 2 ≈ halves the YOLO cost; 1 restores every-frame detection.
-    REFRAMER_YOLO_STRIDE: int = 2
+    # ~0.8s sample. 3 ≈ cuts the YOLO cost to a third; 1 restores every-frame
+    # detection. Raised 2→3 for weak local cards (GTX 1650, ~3.7 GB): the
+    # sub-second sample spacing means a subject carried ~2.4 s never teleports,
+    # while YuNet faces + motion keep running EVERY frame so framing density is
+    # unchanged. The heavy open-vocab pass is the dominant per-run cost, so this
+    # is the single biggest local speed lever short of the Companion offload.
+    REFRAMER_YOLO_STRIDE: int = 3
     # ── Reframe debug bundle ─────────────────────────────────────────────────
     # Write a machine-readable reframe_debug.json next to the JSONL trace at the
     # end of ReframeEngine.analyze(): per-scene measured signals + derived params
