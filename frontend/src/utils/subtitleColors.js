@@ -49,17 +49,17 @@ export function colorsClash(a, b) {
 }
 
 /**
- * The highlight color to use for a word spoken by a speaker whose caption
- * color is `speakerColor`. Returns `preferred` unless it clashes; then the
- * first non-clashing fallback.
+ * The active-word highlight color. ONE color for EVERY speaker — the configured
+ * value, applied uniformly.
+ *
+ * (It used to fall through to a non-clashing fallback per speaker so the
+ * highlight never vanished against a same-hue speaker color — but that made
+ * different speakers show different highlight colors, which reads as
+ * inconsistent. The operator picks a contrasting color via the Active Word
+ * swatch instead. ``speakerColor`` is kept in the signature for call-site
+ * compatibility and is no longer consulted.)
  */
 export function resolveActiveWordColor(preferred, speakerColor) {
-  const pref = preferred || FALLBACKS[0];
-  if (!speakerColor || !colorsClash(pref, speakerColor)) return pref;
-  for (const c of FALLBACKS) {
-    if (c.toLowerCase() !== pref.toLowerCase() && !colorsClash(c, speakerColor)) {
-      return c;
-    }
-  }
-  return '#FFFFFF';
+  void speakerColor;
+  return preferred || FALLBACKS[0];
 }

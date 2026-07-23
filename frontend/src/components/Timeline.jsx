@@ -1247,27 +1247,27 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
             const sBodyH = cropLaneH - 8;
             const sRr = 4;
 
-            // Smooth-pan gradient — sample the SmoothDamp subject track across
-            // the visible body so a human pan reads as a colour transition and
-            // a held shot stays flat. A manually-pinned segment (or a missing
-            // track) falls back to a flat fill at its own value.
+            // ONE solid colour per crop element, keyed to a SINGLE representative
+            // crop %: a held shot is exactly seg.cropX; a panning shot is
+            // summarised by the AVERAGE smoothed crop across the element (one
+            // value, not the pan range). The element reads as a single flat band
+            // whose hue tells you the framing at a glance.
             const fillAlpha = isSelCrop ? 0.9 : (isHoverCrop ? 0.72 : 0.55);
             const hasTrack = Array.isArray(subjectKeyframes) && subjectKeyframes.length > 1;
-            if (!hasTrack || seg.isManualOverride) {
-              ctx.fillStyle = cropColorAt(baseColor, seg.cropX, fillAlpha);
-            } else {
-              // Map gradient stops through the pixel→time inverse so the colour
-              // stays aligned even when the segment is partly scrolled off.
-              const grad = ctx.createLinearGradient(clipCX, 0, clipCX + clipCW, 0);
-              const STOPS = 12;
-              for (let gi = 0; gi <= STOPS; gi++) {
-                const frac = gi / STOPS;
-                const tt = (clipCX + frac * clipCW - contentLeft + sx) / pps;
-                const cxPct = getCropXForTime(tt, cropSegments, subjectKeyframes);
-                grad.addColorStop(frac, cropColorAt(baseColor, cxPct, fillAlpha));
+            let repCropX = Number.isFinite(seg.cropX) ? seg.cropX : 50;
+            if (hasTrack && !seg.isManualOverride
+                && Number.isFinite(seg.startTime) && Number.isFinite(seg.endTime)
+                && seg.endTime > seg.startTime) {
+              let sum = 0, cnt = 0;
+              const N = 8;
+              for (let k = 0; k <= N; k++) {
+                const tt = seg.startTime + (seg.endTime - seg.startTime) * (k / N);
+                const v = getCropXForTime(tt, cropSegments, subjectKeyframes);
+                if (Number.isFinite(v)) { sum += v; cnt++; }
               }
-              ctx.fillStyle = grad;
+              if (cnt) repCropX = sum / cnt;
             }
+            ctx.fillStyle = cropColorAt(baseColor, repCropX, fillAlpha);
 
             if (isSelCrop) {
               ctx.save();
@@ -1340,17 +1340,9 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
               ctx.textAlign = 'left';
               ctx.shadowColor = 'rgba(0,0,0,0.45)';
               ctx.shadowBlur = 2;
-              // Label the actual pan the gradient shows: "35→71%" for a glide,
-              // "50%" for a hold. The segment's own cropX is a single
-              // mid-transition value, so read the smoothed track at the
-              // segment's ends instead (unless the user pinned it).
-              let lbl = seg.label || `${Math.round(seg.cropX)}%`;
-              const hasTrackLbl = Array.isArray(subjectKeyframes) && subjectKeyframes.length > 1;
-              if (hasTrackLbl && !seg.isManualOverride) {
-                const a = Math.round(getCropXForTime(seg.startTime, cropSegments, subjectKeyframes));
-                const b = Math.round(getCropXForTime(Math.max(seg.startTime, seg.endTime - 0.001), cropSegments, subjectKeyframes));
-                lbl = Math.abs(a - b) >= 2 ? `${a}→${b}%` : `${a}%`;
-              }
+              // ONE number: the element's single representative crop % (the same
+              // value that picks its solid colour above).
+              const lbl = seg.label || `${Math.round(repCropX)}%`;
               ctx.fillText(lbl, Math.max(cx1 + 8, contentLeft + 6), cy + cropLaneH / 2 + 4, cw - 16);
               ctx.shadowColor = 'transparent';
               ctx.shadowBlur = 0;

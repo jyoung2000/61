@@ -226,18 +226,16 @@ def _colors_clash(a: str, b: str) -> bool:
 
 
 def _resolve_aw_color(preferred: str, speaker_color: str) -> str:
-    """The active-word highlight to use against ``speaker_color`` — the
-    preferred color unless it would visually merge into the speaker's
-    caption color (gold-on-amber made the highlight invisible), else the
-    first non-clashing fallback. MIRRORS utils/subtitleColors.js so the
-    preview and the burned-in export pick the identical color."""
-    pref = preferred or _AW_FALLBACK_COLORS[0]
-    if not speaker_color or not _colors_clash(pref, speaker_color):
-        return pref
-    for c in _AW_FALLBACK_COLORS:
-        if c.lower() != pref.lower() and not _colors_clash(c, speaker_color):
-            return c
-    return "#FFFFFF"
+    """The active-word highlight color — ONE color for EVERY speaker (the
+    configured value, applied uniformly). MIRRORS utils/subtitleColors.js.
+
+    (It used to fall through to a non-clashing fallback per speaker so the
+    highlight never merged into a same-hue speaker color, but that made
+    different speakers show different highlight colors — inconsistent. The
+    operator picks a contrasting color instead. ``speaker_color`` is kept for
+    call-site compatibility and no longer consulted.)"""
+    _ = speaker_color
+    return preferred or _AW_FALLBACK_COLORS[0]
 
 
 def _hex_to_ass_color(hex_color: str) -> str:
