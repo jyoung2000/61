@@ -118,12 +118,14 @@ const CROP_HUE_SPAN = 280; // 0° red (left) → 280° violet-blue (right); no w
 
 // Map a crop X (0–100 %) to a full-spectrum hue. ``baseHex`` is retained in the
 // signature for callers but no longer tints the fill — the position drives the
-// colour so the whole pan range is legible at a glance. Vivid saturation + mid
-// lightness keep every hue readable on the dark timeline.
+// colour so the whole pan range is legible at a glance. Deliberately DARK
+// (low lightness): the element carries the white crop-% number, and a bright
+// fill washed the text out. Keeping the same hues but toning the lightness way
+// down gives every colour enough contrast for the label to stay readable.
 function cropColorAt(baseHex, cropX, alpha = 1) {
   const x = Math.max(0, Math.min(100, Number.isFinite(cropX) ? cropX : 50)) / 100; // 0..1
   const hue = Math.round(x * CROP_HUE_SPAN);
-  return `hsla(${hue}, 82%, 54%, ${alpha})`;
+  return `hsla(${hue}, 60%, 38%, ${alpha})`;
 }
 
 function formatTime(s) {
