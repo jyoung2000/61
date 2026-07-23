@@ -1734,6 +1734,17 @@ class Settings(BaseSettings):
     # name-repair passes stay disabled and garbles like "Sex Unique" (Zechs)
     # ship as-is. Blank = fall back to auto-identifying the work from the terms.
     TRANSLATION_SERIES_HINT: str = ""
+    # Optional REFERENCE transcript (e.g. YouTube's official captions) to match.
+    # When set, the subtitle track is conformed to it — the surest way to match
+    # a known-good source's words, timing AND segmentation. Accepts SRT, VTT, or
+    # plain timestamped lines ("0:30 text" / "[0:30] text"). ClipAI's speaker
+    # diarization is preserved (mapped onto the reference cues by time overlap).
+    # Blank = ClipAI's own transcript ships (today's behaviour).
+    TRANSLATION_REFERENCE_SUBTITLES: str = ""
+    # "adopt" = take the reference's words + timing + cue segmentation wholesale
+    # (full match). "timing" = keep ClipAI's words but snap cue start/end onto
+    # the reference boundaries (fixes linger/early without trusting its wording).
+    TRANSLATION_REFERENCE_MODE: str = "adopt"
     # Push the LLM translator toward natural, idiomatic English (dub/localization
     # phrasing) instead of a structurally-literal rendering — while preserving
     # the exact meaning. Set False to revert to the plain faithful style.

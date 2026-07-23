@@ -107,6 +107,8 @@ _PERSISTABLE_KEYS = [
     # Operator series/show hint — anchors canonical-name + roster correction so
     # mis-heard character/mecha names come out as the official spellings.
     "TRANSLATION_SERIES_HINT",
+    # Reference transcript (YouTube captions) + conform mode.
+    "TRANSLATION_REFERENCE_SUBTITLES", "TRANSLATION_REFERENCE_MODE",
     # Audio event detection toggles.
     "AUDIO_EVENT_DETECTION", "AUDIO_EVENTS_IN_SUBTITLES",
     "AUDIO_MUSIC_DETECTION",
@@ -3852,6 +3854,10 @@ class SaveTranscriptionSettingsRequest(BaseModel):
     # Operator hint naming the show/film (e.g. "Mobile Suit Gundam Wing") so
     # mis-heard character/mecha names resolve to their official spellings.
     series_hint: Optional[str] = None
+    # Reference transcript (YouTube captions) to conform the subtitle track to,
+    # and how (adopt = words+timing+segmentation; timing = snap timing only).
+    reference_subtitles: Optional[str] = None
+    reference_mode: Optional[str] = None
 
 
 @router.get("/transcription/settings")
@@ -3873,6 +3879,8 @@ async def get_transcription_settings():
         "sentence_segmentation_enabled": bool(getattr(
             settings, "SENTENCE_SEGMENTATION_ENABLED", True)),
         "series_hint": str(getattr(settings, "TRANSLATION_SERIES_HINT", "") or ""),
+        "reference_subtitles": str(getattr(settings, "TRANSLATION_REFERENCE_SUBTITLES", "") or ""),
+        "reference_mode": str(getattr(settings, "TRANSLATION_REFERENCE_MODE", "adopt") or "adopt"),
     }
 
 
@@ -3929,6 +3937,14 @@ async def save_transcription_settings(req: SaveTranscriptionSettingsRequest):
     if req.series_hint is not None:
         settings.TRANSLATION_SERIES_HINT = str(req.series_hint).strip()[:200]
 
+    if req.reference_subtitles is not None:
+        # Bounded but roomy — a 25-min episode's captions are ~30-60 KB.
+        settings.TRANSLATION_REFERENCE_SUBTITLES = str(req.reference_subtitles)[:400_000]
+
+    if req.reference_mode is not None:
+        _rm = str(req.reference_mode).strip().lower()
+        settings.TRANSLATION_REFERENCE_MODE = _rm if _rm in ("adopt", "timing") else "adopt"
+
     _invalidate_status_cache()
     _persist_user_settings()
     return {
@@ -3947,6 +3963,8 @@ async def save_transcription_settings(req: SaveTranscriptionSettingsRequest):
         "sentence_segmentation_enabled": bool(getattr(
             settings, "SENTENCE_SEGMENTATION_ENABLED", True)),
         "series_hint": str(getattr(settings, "TRANSLATION_SERIES_HINT", "") or ""),
+        "reference_subtitles": str(getattr(settings, "TRANSLATION_REFERENCE_SUBTITLES", "") or ""),
+        "reference_mode": str(getattr(settings, "TRANSLATION_REFERENCE_MODE", "adopt") or "adopt"),
     }
 
 

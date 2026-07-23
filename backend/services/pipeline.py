@@ -4642,6 +4642,27 @@ async def _background_post_processing(
                         _translated_out = _split
             except Exception:
                 pass
+
+            # ── Conform to an operator reference transcript (e.g. YouTube's
+            # captions) — the surest way to match a known-good source's words,
+            # timing and segmentation. Opt-in (blank = no-op), fail-soft. Runs
+            # LAST so it overrides ClipAI's own segmentation with the reference.
+            _ref_txt = str(getattr(settings, "TRANSLATION_REFERENCE_SUBTITLES", "") or "").strip()
+            if _ref_txt:
+                try:
+                    from backend.services.reference_transcript import conform_to_reference
+                    _ref_mode = str(getattr(settings, "TRANSLATION_REFERENCE_MODE", "adopt") or "adopt")
+                    _conf, _conf_changed = conform_to_reference(
+                        _translated_out, _ref_txt, mode=_ref_mode)
+                    if _conf_changed:
+                        logger.info(
+                            "[%s] Conformed translated_transcript to reference "
+                            "(mode=%s): %d → %d cue(s)",
+                            job_id, _ref_mode, len(_translated_out), len(_conf))
+                        _translated_out = _conf
+                except Exception as _ref_e:
+                    logger.warning("[%s] Reference conform skipped (%s)", job_id, _ref_e)
+
             logger.info(
                 "[%s] Persisting translated_transcript (%d segments)",
                 job_id, len(_translated_out),
