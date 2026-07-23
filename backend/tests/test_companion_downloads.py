@@ -485,3 +485,16 @@ def test_vision_install_status_passthrough(paired_reg, monkeypatch):
     assert out["stage"] == "torch"
     assert out["active"] is True
     assert out["percent"] == 20.0
+
+
+def test_vision_uninstall_no_companion(monkeypatch):
+    from backend.services import ollama_registry as reg
+    monkeypatch.setattr(reg, "companion_host", lambda: None)
+    with pytest.raises(Exception):  # HTTPException 400 — no paired Companion
+        asyncio.run(D.companion_vision_uninstall())
+
+
+def test_vision_uninstall_ok(paired_reg, monkeypatch):
+    _fake_httpx(monkeypatch, {"/v1/vision/uninstall": _FakeResp(200, "removed")})
+    out = asyncio.run(D.companion_vision_uninstall())
+    assert out["removed"] is True

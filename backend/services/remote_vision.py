@@ -85,6 +85,19 @@ class RemoteVisionDetector:
         base = self._base()
         if not base:
             return False
+        # Faces + Whisper run concurrently, and the vision sidecar shares the
+        # Companion GPU with remote Whisper. Offloading faces there starves the
+        # transcription (observed: an 18-min Whisper hang + an unresponsive
+        # Companion). When Whisper is remote on this same host, keep faces LOCAL
+        # unless the operator explicitly opts into sharing the GPU.
+        if not bool(getattr(settings, "REMOTE_VISION_ALLOW_WITH_REMOTE_WHISPER", False)):
+            if not self._disabled:
+                self._disabled = True
+                logger.info(
+                    "Vision offload stays LOCAL: the sidecar shares the Companion "
+                    "GPU with remote Whisper (faces + transcription run at once). "
+                    "Set REMOTE_VISION_ALLOW_WITH_REMOTE_WHISPER=1 to override.")
+            return False
         now = time.monotonic()
         if now - self._healthy_at < 60.0:
             return self._healthy

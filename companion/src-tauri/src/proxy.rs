@@ -485,6 +485,11 @@ async fn whisper_proxy(State(ctx): State<ProxyCtx>, req: Request<Body>) -> Respo
             .into_response();
     };
     ctx.state.whisper_busy.store(true, Ordering::Relaxed);
+    // The vision offload and Whisper both want THIS GPU. A Whisper decode wins:
+    // stop the vision sidecar so transcription isn't starved (it relaunches
+    // lazily on the next face request). Without this, a resident vision sidecar
+    // + a concurrent decode made the Companion unresponsive for the whole job.
+    crate::vision::shutdown(&ctx.state, "whisper decode starting").await;
 
     let activity = ctx.state.begin_activity(
         "whisper",
@@ -747,6 +752,19 @@ async fn vision_install(State(ctx): State<ProxyCtx>, req: Request<Body>) -> Resp
         crate::vision::install_from_source(st, rd, dd, model_url, parsed.token).await;
     });
     (StatusCode::ACCEPTED, "vision install started").into_response()
+}
+
+/// POST /v1/vision/uninstall → stop + remove the from-source vision offload,
+/// reverting to faces-local. Lets ClipAI (or the GUI) undo a bad install
+/// remotely when the offload is hurting the pipeline.
+async fn vision_uninstall(State(ctx): State<ProxyCtx>, req: Request<Body>) -> Response {
+    if !authorized(&ctx, req.headers()) {
+        return unauthorized();
+    }
+    match crate::vision::uninstall(&ctx.state, &ctx.data_dir).await {
+        Ok(()) => (StatusCode::OK, "vision offload removed").into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
 }
 
 /// GET /v1/vision/install/status → live install progress + whether the sidecar
@@ -1428,6 +1446,7 @@ fn build_router(ctx: ProxyCtx) -> Router {
         .route("/v1/vision/detect", post(vision_detect))
         .route("/v1/vision/install", post(vision_install))
         .route("/v1/vision/install/status", get(vision_install_status))
+        .route("/v1/vision/uninstall", post(vision_uninstall))
         .route("/v1/update/install", post(update_install))
         .route("/v1/update/status", get(update_status))
         .route("/v1/gpu/release", post(gpu_release))

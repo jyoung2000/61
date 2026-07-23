@@ -1210,6 +1210,14 @@ class Settings(BaseSettings):
     REMOTE_VISION_ENABLED: bool = True
     REMOTE_VISION_TIMEOUT_S: float = 10.0
     REMOTE_VISION_BREAKER_FAILS: int = 5
+    # Face detection and Whisper run CONCURRENTLY in the pipeline. The vision
+    # sidecar lives on the SAME Companion as remote Whisper, so offloading faces
+    # there makes the two fight over one GPU — observed: an 18-min Whisper hang
+    # and an unresponsive Companion while faces "offloaded". When Whisper is
+    # remote on that same host, keep face detection LOCAL by default (the fast,
+    # collision-free arrangement). Set True only if the Companion GPU has ample
+    # headroom to run both at once. No effect when Whisper is local.
+    REMOTE_VISION_ALLOW_WITH_REMOTE_WHISPER: bool = False
     # Pull the pipeline's Ollama models onto the Companion in the background
     # when they're missing there (throttled; failures never touch the job).
     COMPANION_AUTOPULL_MODELS: bool = True

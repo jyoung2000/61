@@ -696,6 +696,32 @@ async def companion_vision_install():
     return {"started": True}
 
 
+@router.post("/companion/vision-uninstall")
+async def companion_vision_uninstall():
+    """Remove the vision offload on the paired Companion — stop the sidecar and
+    delete its files so face detection returns to the fast faces-local path."""
+    from backend.services import ollama_registry as reg
+    comp = reg.companion_host()
+    if comp is None:
+        raise HTTPException(status_code=400, detail="No GPU Companion is paired")
+    base = reg.companion_base(comp)
+    headers = dict(reg.auth_headers(comp) or {})
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.post(f"{base}/v1/vision/uninstall", headers=headers)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Companion unreachable: {e}")
+    if r.status_code == 404:
+        raise HTTPException(
+            status_code=400,
+            detail="This Companion build can't remove the vision offload "
+                   "remotely — update the Companion app.")
+    if r.status_code != 200:
+        raise HTTPException(status_code=502,
+                            detail=f"Companion returned {r.status_code}: {r.text[:200]}")
+    return {"removed": True}
+
+
 @router.get("/companion/vision-install/status")
 async def companion_vision_install_status():
     """Live progress of the remote vision-offload install on the Companion."""

@@ -369,6 +369,13 @@ pub async fn install_from_source(
     model_url: Option<String>,
     model_token: Option<String>,
 ) {
+    // Never run the heavy install (torch download is ~2.5 GB and pegs the box)
+    // while this GPU is transcribing — that starved Whisper for a whole job and
+    // made the Companion unresponsive. Make the user run it when idle.
+    if state.whisper_busy.load(std::sync::atomic::Ordering::Relaxed) {
+        set_error(&state, "A transcription is running on this GPU — wait for the current job to finish, then install.");
+        return;
+    }
     {
         let mut g = match state.vision_install.lock() {
             Ok(g) => g,
@@ -474,6 +481,24 @@ async fn install_inner(
         }
     }
     ensure_running(state, resource_dir.clone(), data_dir.clone()).await?;
+    Ok(())
+}
+
+/// Remove the from-source vision offload: stop the sidecar and delete the
+/// venv + server + weight so `available()` goes false and ClipAI stops trying
+/// to offload — a clean revert to the pre-install (faces-local) behaviour.
+/// Does NOT touch a packaged/downloaded binary (there's nothing to clean up
+/// there); a user who wants the offload back just installs again.
+pub async fn uninstall(state: &AppState, data_dir: &PathBuf) -> Result<(), String> {
+    shutdown(state, "vision offload removed").await;
+    let work = source_dir(data_dir);
+    if work.exists() {
+        std::fs::remove_dir_all(&work)
+            .map_err(|e| format!("could not remove {}: {e}", work.display()))?;
+    }
+    if let Ok(mut g) = state.vision_install.lock() {
+        *g = InstallProgress::default();
+    }
     Ok(())
 }
 

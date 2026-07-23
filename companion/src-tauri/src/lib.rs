@@ -537,6 +537,21 @@ async fn install_vision(
     Ok(())
 }
 
+/// Remove the vision offload: stop the sidecar and delete its venv/model so
+/// ClipAI stops offloading face detection to this GPU — a clean revert to the
+/// faster faces-local arrangement. Mirrors the remote /v1/vision/uninstall.
+#[tauri::command]
+async fn uninstall_vision(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, SharedState>,
+) -> Result<(), String> {
+    let dd = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("no app data dir: {e}"))?;
+    vision::uninstall(&state, &dd).await
+}
+
 /// Format a ms-epoch as local time, or "-" for 0/unset.
 fn fmt_ms(ms: u64) -> String {
     if ms == 0 {
@@ -1617,6 +1632,7 @@ pub fn run() {
             download_whisper,
             refresh_vision,
             install_vision,
+            uninstall_vision,
             export_logs,
             test_clipai,
             free_vram,

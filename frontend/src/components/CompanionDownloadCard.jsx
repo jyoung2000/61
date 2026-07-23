@@ -382,6 +382,29 @@ export default function CompanionDownloadCard({ isMobile = false }) {
     }
   };
 
+  const [removingVision, setRemovingVision] = useState(false);
+  const removeVisionInstall = async () => {
+    if (!window.confirm(
+      'Remove the vision offload from the Companion?\n\nFace detection returns '
+      + 'to running on the ClipAI server GPU. You can reinstall any time.')) return;
+    setRemovingVision(true);
+    clearInterval(visionTimer.current);
+    try {
+      const res = await fetch('/api/downloads/companion/vision-uninstall', { method: 'POST' });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        showToast(data.detail || `Could not remove (HTTP ${res.status})`, 'error');
+        return;
+      }
+      setVision(null);
+      showToast('Vision offload removed — face detection runs on the server again', 'success');
+    } catch (e) {
+      showToast(`Could not remove: ${e}`, 'error');
+    } finally {
+      setRemovingVision(false);
+    }
+  };
+
   // Round-trip proof that work actually runs on the paired Companion GPU —
   // not just that its token authenticates.
   const verifyOffload = async () => {
@@ -643,8 +666,17 @@ export default function CompanionDownloadCard({ isMobile = false }) {
           </div>
         )}
         {vision?.phase === 'running' && (
-          <div style={{ fontSize: 11, color: 'var(--success)', marginTop: 6 }}>
-            ⚡ Running on the Companion GPU (needs a non-eco speed profile and ≥5 GB VRAM budget).
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', marginTop: 6 }}>
+            <span style={{ fontSize: 11, color: 'var(--success)', flex: 1, minWidth: 180 }}>
+              ⚡ Installed on the Companion GPU. Note: if Whisper also runs on that
+              same Companion, ClipAI keeps face detection local so the two don't
+              compete — set REMOTE_VISION_ALLOW_WITH_REMOTE_WHISPER=1 to override.
+            </span>
+            <button type="button" onClick={removeVisionInstall} disabled={removingVision}
+              style={btnStyle('secondary')}
+              title="Stop and delete the vision offload; face detection returns to the server GPU">
+              {removingVision ? 'Removing…' : '✕ Remove'}
+            </button>
           </div>
         )}
         {vision?.phase === 'failed' && (

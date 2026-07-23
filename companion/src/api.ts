@@ -130,6 +130,8 @@ export const refreshSidecar = () => invoke<boolean>('refresh_sidecar');
  *  Runs in the background; watch `vision_install` from getStatus(). */
 export const installVision = () => invoke<void>('install_vision');
 export const refreshVision = () => invoke<boolean>('refresh_vision');
+/** Remove the vision offload (stop + delete) — reverts to faces-local. */
+export const uninstallVision = () => invoke<void>('uninstall_vision');
 /** Write a full diagnostics report to Downloads and reveal it; returns the path. */
 export const exportLogs = () => invoke<string>('export_logs');
 export interface ClipaiTest {

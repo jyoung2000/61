@@ -7,7 +7,7 @@ import {
   CompanionStatus, getStatus, setConfig, regenerateToken,
   installOllama, startOllama, pullModel, pairClipai,
   listModels, deleteModel, InstalledModel,
-  downloadWhisper, refreshSidecar, installVision, refreshVision, exportLogs, testClipai, ClipaiTest, freeVram, endActiveJob,
+  downloadWhisper, refreshSidecar, installVision, refreshVision, uninstallVision, exportLogs, testClipai, ClipaiTest, freeVram, endActiveJob,
   checkAppUpdate, installAppUpdate, AppUpdateCheck,
 } from './api';
 
@@ -460,6 +460,12 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
 
   const doRefreshVision = async () => {
     try { await refreshVision(); } catch {}
+    refresh();
+  };
+
+  const doUninstallVision = async () => {
+    if (!window.confirm('Remove the vision offload? Face detection returns to the ClipAI server GPU. You can reinstall any time.')) return;
+    try { await uninstallVision(); } catch { /* ignore */ }
     refresh();
   };
 
@@ -1282,9 +1288,15 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
                 )}
 
                 {ready && (
-                  <div className="small muted" style={{ margin: '0 0 8px 17px' }}>
-                    ⚡ Vision offload installed — ClipAI’s face detection runs on the {status.gpu.gpu_name || 'GPU'}
-                    {' '}(needs a non-eco speed profile and ≥5 GB VRAM budget).
+                  <div style={{ margin: '0 0 8px 17px' }}>
+                    <div className="small muted" style={{ marginBottom: 4 }}>
+                      ⚡ Vision offload installed. Note: while this GPU also runs Whisper for a job,
+                      ClipAI keeps face detection local so the two don’t compete.
+                    </div>
+                    <button className="secondary" onClick={doUninstallVision}
+                      title="Stop and delete the vision offload; face detection returns to the ClipAI server GPU">
+                      ✕ Remove vision offload
+                    </button>
                   </div>
                 )}
 
