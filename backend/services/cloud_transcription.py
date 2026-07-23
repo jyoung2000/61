@@ -56,7 +56,16 @@ def _vocab_prompt(language: str) -> Optional[str]:
             build_initial_prompt, load_vocabulary)
         if not bool(getattr(settings, "CUSTOM_VOCABULARY_ENABLED", True)):
             return None
-        terms = load_vocabulary()
+        terms = list(load_vocabulary())
+        # Series-hint roster biases mis-heard names at the source (same as the
+        # local Whisper path).
+        try:
+            from backend.services.canonical_names import series_roster_terms
+            for t in series_roster_terms():
+                if t not in terms:
+                    terms.append(t)
+        except Exception:
+            pass
         if not terms:
             return None
         return build_initial_prompt(terms, language=language or "en") or None

@@ -292,3 +292,62 @@ def test_cap_preserved_with_canonical_map():
         segs, "en", "English", max_terms=10, user_terms=[], canonical_map=cmap)
     listed = [e for e in block.splitlines()[1].split(", ") if e.strip()]
     assert len(listed) == 10
+
+
+# ── Series-hint → ASR bias roster (source-side name fix) ──────────────────
+
+class _RosterOrch:
+    def __init__(self, payload):
+        self.payload = payload
+        self.calls = 0
+
+    async def text_completion(self, prompt, **kwargs):
+        self.calls += 1
+        return self.payload
+
+
+def test_expand_series_hint_caches_and_feeds_asr_roster():
+    CN._ROSTER_CACHE.clear()
+    orch = _RosterOrch('["Heero Yuy", "Relena Darlian", "Zechs Merquise", "OZ"]')
+    from backend.config import settings
+    settings.TRANSLATION_SERIES_HINT = "Mobile Suit Gundam Wing"
+    settings.CUSTOM_VOCABULARY_ENABLED = True
+    out = asyncio.run(CN.expand_series_hint_to_names(
+        "Mobile Suit Gundam Wing", orch, job_id="t"))
+    assert "Zechs Merquise" in out and "Heero Yuy" in out
+    # series_roster_terms() reads the cache for the configured hint.
+    assert "Zechs Merquise" in CN.series_roster_terms()
+    # Cached — a second expand makes no new LLM call.
+    asyncio.run(CN.expand_series_hint_to_names("Mobile Suit Gundam Wing", orch, job_id="t"))
+    assert orch.calls == 1
+    settings.TRANSLATION_SERIES_HINT = ""
+    assert CN.series_roster_terms() == []
+    CN._ROSTER_CACHE.clear()
+
+
+def test_expand_series_hint_failsoft_on_bad_reply():
+    CN._ROSTER_CACHE.clear()
+    orch = _RosterOrch("I don't know this show, sorry.")
+    out = asyncio.run(CN.expand_series_hint_to_names("Some Obscure Show", orch, job_id="t"))
+    assert out == []
+    CN._ROSTER_CACHE.clear()
+
+
+def test_vocab_bias_kwargs_includes_series_roster(monkeypatch):
+    # The local Whisper bias site must merge the series roster with the glossary.
+    CN._ROSTER_CACHE.clear()
+    from backend.config import settings
+    settings.TRANSLATION_SERIES_HINT = "Mobile Suit Gundam Wing"
+    settings.CUSTOM_VOCABULARY_ENABLED = True
+    CN._ROSTER_CACHE["mobile suit gundam wing"] = ["Zechs Merquise", "Heero Yuy"]
+    import backend.services.custom_vocabulary as CV
+    monkeypatch.setattr(CV, "load_vocabulary", lambda: ["MyOwnTerm"])
+    from backend.services.reframer_audio import _vocab_bias_kwargs
+
+    def _cb(*a, hotwords=None, **k):
+        pass
+    out = _vocab_bias_kwargs(_cb, "ja")
+    blob = " ".join(str(v) for v in out.values())
+    assert "Zechs Merquise" in blob and "MyOwnTerm" in blob
+    settings.TRANSLATION_SERIES_HINT = ""
+    CN._ROSTER_CACHE.clear()

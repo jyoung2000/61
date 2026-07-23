@@ -5120,6 +5120,29 @@ async def _run_analysis_inner(job_id: str, resume: bool = False):
         cancel_check=cancel_check,
     )
 
+    # Expand the operator's series hint into a proper-noun roster and bias the
+    # ASR with it, so mis-heard character/mecha names (e.g. "Sex Unique" for
+    # Zechs) come out correct + consistent AT THE SOURCE. Fire it in the
+    # background now — transcription doesn't start until after frame extraction
+    # (~2 min in), so the one-shot LLM call is done long before Whisper reads
+    # the cache. Fail-soft: no hint or any error ⇒ no roster ⇒ today's behavior.
+    _series_hint_cfg = str(getattr(settings, "TRANSLATION_SERIES_HINT", "") or "").strip()
+    if _series_hint_cfg and bool(getattr(settings, "CUSTOM_VOCABULARY_ENABLED", True)):
+        try:
+            from backend.services.canonical_names import expand_series_hint_to_names as _expand_roster
+
+            async def _bg_series_roster():
+                try:
+                    await _expand_roster(
+                        _series_hint_cfg, orchestrator, job_id=job_id,
+                        model_override=_resolve_translation_model_override(orchestrator))
+                except Exception as _e:
+                    logger.debug("[%s] series roster expansion skipped: %s", job_id, _e)
+
+            asyncio.get_running_loop().create_task(_bg_series_roster())
+        except Exception as _e:
+            logger.debug("[%s] series roster task not started: %s", job_id, _e)
+
     # ── Local editorial model (Offline primary + cloud key-limit fallback) ──
     # Point the Ollama provider at the best installed model that fits the GPU.
     # In Offline Mode it's the PRIMARY editorial AI; in cloud mode it's the

@@ -356,6 +356,122 @@ async def resolve_canonical_names(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  Series-hint → ASR bias roster (source-side name fix)
+# ═══════════════════════════════════════════════════════════════════════════
+# The name-repair passes above and below are ALL downstream of Whisper and gated
+# on recurrence/consistency — so mis-hearings that romanize DIFFERENTLY every
+# time (Zechs → Zecks/Zexes/"Sex Unique") slip through every one of them. The
+# only place to break that is the source: expand the operator's series hint into
+# the work's real proper nouns ONCE and bias the ASR with them, so Whisper emits
+# the names correctly + identically in the first place (hotwords only nudge the
+# decoder — they cannot fabricate a subtitle). Then the downstream chain
+# converges for free. Fail-soft: any error → [] and transcription is unchanged.
+
+# Roster cache keyed by the normalized hint (a series roster is stable across
+# every episode, so this is reused for a whole show).
+_ROSTER_CACHE: dict[str, list[str]] = {}
+
+
+def series_roster_terms() -> list[str]:
+    """The ASR-bias roster for the currently configured series hint, or [].
+
+    Synchronous + side-effect-free: reads the cache populated by
+    ``expand_series_hint_to_names`` (called once at job start). Returns [] when
+    no hint is set or the expansion hasn't run/succeeded — i.e. today's exact
+    behaviour."""
+    try:
+        s = _settings()
+        hint = str(getattr(s, "TRANSLATION_SERIES_HINT", "") or "").strip() if s else ""
+        if not hint:
+            return []
+        return list(_ROSTER_CACHE.get(hint.lower(), []))
+    except Exception:
+        return []
+
+
+async def expand_series_hint_to_names(
+    series_hint: str, orchestrator, job_id: str = "",
+    model_override: str | None = None,
+) -> list[str]:
+    """Expand a series hint into ≤~30 canonical proper nouns for ASR biasing.
+
+    ONE fail-soft, per-hint-cached LLM call (``skip_circuit_breaker=True``).
+    A KNOWLEDGE call — safe here BECAUSE the output only biases the decoder
+    (hotwords can't invent a subtitle), unlike the deterministic replacers
+    where knowledge mode is banned. Returns [] on any error/empty/disabled."""
+    hint = str(series_hint or "").strip()
+    if not hint:
+        return []
+    ckey = hint.lower()
+    if ckey in _ROSTER_CACHE:
+        return list(_ROSTER_CACHE[ckey])
+    try:
+        s = _settings()
+        if orchestrator is None:
+            return []
+        if s is not None and not bool(getattr(s, "CUSTOM_VOCABULARY_ENABLED", True)):
+            return []
+        timeout = float(getattr(s, "TRANSLATION_CANONICAL_NAMES_TIMEOUT", _DEF_TIMEOUT) or _DEF_TIMEOUT) if s else _DEF_TIMEOUT
+        model = str(getattr(s, "TRANSLATION_CANONICAL_NAMES_MODEL", "") or "").strip() if s else ""
+        if not model and model_override:
+            model = str(model_override).strip()
+        prompt = (
+            f'List the principal proper nouns from "{hint}" — main character '
+            "names, mecha/vehicle/ship names, organizations/factions, and place "
+            "names — using their official English spellings.\n"
+            "Return ONLY a JSON array of short strings (1-3 words each), at most "
+            '30 entries, e.g. ["Heero Yuy", "Relena Darlian", "Zechs Merquise", '
+            '"Gundam", "OZ"]. No commentary. If you do not confidently know the '
+            "work, return []."
+        )
+        kwargs: dict = {
+            "max_tokens": 700, "timeout": timeout, "job_id": job_id or "",
+            "skip_circuit_breaker": True, "json_mode": True,
+        }
+        if model:
+            kwargs["model_override"] = model
+        try:
+            raw = await asyncio.wait_for(
+                orchestrator.text_completion(prompt, **kwargs), timeout + 15)
+        except TypeError:
+            raw = await asyncio.wait_for(
+                orchestrator.text_completion(prompt), timeout + 15)
+        names = _parse_json_string_list(raw or "")
+        roster = _clean_terms(names, max_terms=30)
+        _ROSTER_CACHE[ckey] = roster
+        if roster:
+            logger.info(
+                "[%s] series-hint roster for %r: %d name(s): %s",
+                job_id or "-", hint, len(roster), ", ".join(roster[:12]))
+        return list(roster)
+    except Exception as e:
+        logger.debug("[%s] series-hint expansion skipped: %s", job_id or "-", e)
+        _ROSTER_CACHE[ckey] = []
+        return []
+
+
+def _parse_json_string_list(raw: str) -> list[str]:
+    """Parse a JSON array of strings from a possibly fenced/prose-wrapped reply."""
+    try:
+        txt = (raw or "").strip()
+        if "```" in txt:
+            import re as _re
+            m = _re.search(r"```(?:json)?\s*(.+?)```", txt, _re.S)
+            if m:
+                txt = m.group(1).strip()
+        start = txt.find("[")
+        end = txt.rfind("]")
+        if start == -1 or end == -1 or end <= start:
+            return []
+        data = json.loads(txt[start:end + 1])
+        if not isinstance(data, list):
+            return []
+        return [str(x).strip() for x in data if str(x or "").strip()]
+    except Exception:
+        return []
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  Roster-based garble correction (translated track)
 # ═══════════════════════════════════════════════════════════════════════════
 # The canonical-names pass above fixes the terms the glossary MINED — but

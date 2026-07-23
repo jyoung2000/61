@@ -149,11 +149,24 @@ def _vocab_bias_kwargs(transcribe_callable, language: str) -> dict:
     glossary is empty.
     """
     try:
-        from backend.services.custom_vocabulary import whisper_bias_kwargs
+        from backend.services.custom_vocabulary import whisper_bias_kwargs, load_vocabulary
+        # Merge the persisted glossary with the series-hint roster so mis-heard
+        # character/mecha names are biased right AT THE SOURCE (the surest fix
+        # for inconsistent romanizations). ``terms=None`` would load only the
+        # glossary; supplying the union keeps both.
+        terms = list(load_vocabulary())
+        try:
+            from backend.services.canonical_names import series_roster_terms
+            for t in series_roster_terms():
+                if t not in terms:
+                    terms.append(t)
+        except Exception:
+            pass
         return whisper_bias_kwargs(
             transcribe_callable,
             language=language,
             enabled=bool(getattr(settings, "CUSTOM_VOCABULARY_ENABLED", True)),
+            terms=terms or None,
         )
     except Exception as e:
         logger.warning("Custom vocabulary biasing skipped (%s)", e)
