@@ -638,7 +638,12 @@ async fn vision_health(State(ctx): State<ProxyCtx>, req: Request<Body>) -> Respo
     if ctx.state.config.lock().unwrap().paused {
         return paused();
     }
-    if !crate::vision::available(&ctx.resource_dir, &ctx.data_dir) {
+    // Available = a packaged/downloaded binary OR a vision server already
+    // running on the sidecar port (started from source). The latter is the
+    // CI-free path used when the release asset can't be built.
+    if !crate::vision::available(&ctx.resource_dir, &ctx.data_dir)
+        && !crate::vision::healthy().await
+    {
         return (StatusCode::NOT_FOUND, "no vision sidecar installed").into_response();
     }
     // Honor the user's Speed settings: eco profile / a small VRAM budget

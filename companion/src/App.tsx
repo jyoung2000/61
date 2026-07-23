@@ -1250,9 +1250,11 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
           {!status.vision_available && (
             <div style={{ margin: '0 0 8px 17px' }}>
               <div className="small muted" style={{ marginBottom: 6 }}>
-                Install this so ClipAI can run its heaviest analysis stage — face/subject
-                detection — on the {status.gpu.gpu_name || 'GPU'} instead of the small server
-                card. It’s a large CUDA download; needed only once.
+                Run ClipAI’s heaviest analysis stage — face/subject detection — on the
+                {' '}{status.gpu.gpu_name || 'GPU'} instead of the small server card. Two ways:
+                the one-click download below (needs a published release build), or run it
+                from source: <span className="mono">companion/sidecars/vision-server/run.ps1</span>
+                {' '}on this machine — the Companion auto-detects it on port 11511.
               </div>
               <div className="row" style={{ marginBottom: visionDl ? 6 : 0 }}>
                 <button className="secondary" onClick={doDownloadVision}

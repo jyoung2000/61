@@ -223,6 +223,14 @@ pub async fn ensure_running(
     resource_dir: PathBuf,
     data_dir: PathBuf,
 ) -> Result<(), String> {
+    // CI-free path: a vision server the user started from source (or that we
+    // launched earlier) is already answering on the sidecar port — use it
+    // as-is, no packaged binary required. This is how the offload works when
+    // the GitHub-release asset can't be built (e.g. Actions disabled) — the
+    // user runs sidecars/vision-server/run.{ps1,sh} on this machine.
+    if healthy().await {
+        return Ok(());
+    }
     let mut guard = state.vision_sidecar.lock().await;
     if let Some(child) = guard.as_mut() {
         let alive = child.try_wait().map(|s| s.is_none()).unwrap_or(false);

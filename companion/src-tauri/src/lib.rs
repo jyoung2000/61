@@ -175,8 +175,10 @@ async fn get_status(
     let dd = app.path().app_data_dir().unwrap_or_else(|_| rd.clone());
     let whisper_build = sidecar::build_kind(&rd, &dd);
     // Vision (face-detection) offload: whether the sidecar binary is present
-    // (bundled or downloaded) so ClipAI can push YOLO-World onto this GPU.
-    let vision_available = vision::available(&rd, &dd);
+    // (bundled or downloaded) OR a vision server is already answering on the
+    // sidecar port (run from source) — either lets ClipAI push YOLO-World
+    // onto this GPU.
+    let vision_available = vision::available(&rd, &dd) || vision::healthy().await;
     let (speed_parallel, speed_loaded) = state.resolve_speed_settings();
     let activity: Vec<state::ActivityEntry> =
         state.activity.lock().unwrap().iter().cloned().collect();
