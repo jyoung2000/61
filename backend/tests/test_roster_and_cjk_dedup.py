@@ -117,6 +117,35 @@ def test_resolver_requires_series_evidence(monkeypatch):
     assert out == {}
 
 
+def test_series_hint_unlocks_roster_pass_without_a_mined_map(monkeypatch):
+    # The observed failure: a generic filename left the canonical map empty, so
+    # BOTH name-repair passes were disabled and garbles shipped. An operator
+    # series hint must unlock the roster pass even with no mined evidence, and
+    # the hint must reach the model as the series context.
+    from backend.config import settings
+    monkeypatch.setattr(settings, "TRANSLATION_SERIES_HINT",
+                        "Mobile Suit Gundam Wing", raising=False)
+    _CACHE.pop("job:test-hint-only", None)
+
+    class _Fake:
+        def __init__(self):
+            self.prompts = []
+
+        async def text_completion(self, prompt, **kwargs):
+            self.prompts.append(prompt)
+            return '[{"wrong": "Gundarium", "right": "Gundanium"}]'
+
+    fake = _Fake()
+    out = asyncio.run(resolve_roster_corrections(
+        ["It can only be Gundarium alloy.",
+         "Gundanium armor is rare.", "Only Gundanium withstands this."],
+        fake, job_id="test-hint-only"))
+    assert out == {"Gundarium": "Gundanium"}
+    assert fake.prompts and "Gundam Wing" in fake.prompts[0]
+    _CACHE.pop("job:test-hint-only", None)
+    _CACHE.pop("roster:test-hint-only", None)
+
+
 def test_resolver_end_to_end_with_fake_llm():
     _CACHE["job:test-roster"] = {
         "ガンダム": "Gundam", "ゼクス": "Zechs", "リリーナ": "Relena",

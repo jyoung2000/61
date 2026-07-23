@@ -1725,6 +1725,15 @@ class Settings(BaseSettings):
     TRANSLATION_CANONICAL_NAMES_TIMEOUT: float = 45.0   # LLM call timeout (s)
     TRANSLATION_CANONICAL_NAMES_MAX_TERMS: int = 40     # terms sent per call
     TRANSLATION_CANONICAL_NAMES_MODEL: str = ""         # optional model override
+    # Optional operator hint naming the show/film this video is from, e.g.
+    # "Mobile Suit Gundam Wing". Anchors the canonical-name resolver so it maps
+    # mis-heard romaji to the official English names even when the filename is
+    # generic ("videoplayback.mp4"). Crucially it also UNLOCKS the post-
+    # translation roster-correction pass, which only runs once ≥3 canonical
+    # names are known — so with no title and no hint (the observed run) BOTH
+    # name-repair passes stay disabled and garbles like "Sex Unique" (Zechs)
+    # ship as-is. Blank = fall back to auto-identifying the work from the terms.
+    TRANSLATION_SERIES_HINT: str = ""
     # Push the LLM translator toward natural, idiomatic English (dub/localization
     # phrasing) instead of a structurally-literal rendering — while preserving
     # the exact meaning. Set False to revert to the plain faithful style.

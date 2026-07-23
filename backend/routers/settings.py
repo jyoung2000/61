@@ -104,6 +104,9 @@ _PERSISTABLE_KEYS = [
     # Translation engine + glossary toggles.
     "TRANSLATION_ENGINE", "TRANSLATION_CONTEXT_WINDOW",
     "TRANSLATION_GLOSSARY_ENABLED", "NMT_DEVICE",
+    # Operator series/show hint — anchors canonical-name + roster correction so
+    # mis-heard character/mecha names come out as the official spellings.
+    "TRANSLATION_SERIES_HINT",
     # Audio event detection toggles.
     "AUDIO_EVENT_DETECTION", "AUDIO_EVENTS_IN_SUBTITLES",
     "AUDIO_MUSIC_DETECTION",
@@ -3846,6 +3849,9 @@ class SaveTranscriptionSettingsRequest(BaseModel):
     gap_fill_no_speech_threshold: Optional[float] = None  # 0.0-1.0
     # Sentence-aware resegmentation toggle (Task 4).
     sentence_segmentation_enabled: Optional[bool] = None
+    # Operator hint naming the show/film (e.g. "Mobile Suit Gundam Wing") so
+    # mis-heard character/mecha names resolve to their official spellings.
+    series_hint: Optional[str] = None
 
 
 @router.get("/transcription/settings")
@@ -3866,6 +3872,7 @@ async def get_transcription_settings():
             settings, "WHISPER_GAP_FILL_NO_SPEECH_THRESHOLD", 0.25)),
         "sentence_segmentation_enabled": bool(getattr(
             settings, "SENTENCE_SEGMENTATION_ENABLED", True)),
+        "series_hint": str(getattr(settings, "TRANSLATION_SERIES_HINT", "") or ""),
     }
 
 
@@ -3919,6 +3926,9 @@ async def save_transcription_settings(req: SaveTranscriptionSettingsRequest):
     if req.sentence_segmentation_enabled is not None:
         settings.SENTENCE_SEGMENTATION_ENABLED = bool(req.sentence_segmentation_enabled)
 
+    if req.series_hint is not None:
+        settings.TRANSLATION_SERIES_HINT = str(req.series_hint).strip()[:200]
+
     _invalidate_status_cache()
     _persist_user_settings()
     return {
@@ -3936,6 +3946,7 @@ async def save_transcription_settings(req: SaveTranscriptionSettingsRequest):
             settings, "WHISPER_GAP_FILL_NO_SPEECH_THRESHOLD", 0.25)),
         "sentence_segmentation_enabled": bool(getattr(
             settings, "SENTENCE_SEGMENTATION_ENABLED", True)),
+        "series_hint": str(getattr(settings, "TRANSLATION_SERIES_HINT", "") or ""),
     }
 
 

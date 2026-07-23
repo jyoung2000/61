@@ -769,9 +769,12 @@ async def translate_via_llm(
                                           (getattr(_j, "file_path", "") or "").strip()))
                         except Exception:
                             _title = ""
+                    _series_hint = str(
+                        getattr(settings, "TRANSLATION_SERIES_HINT", "") or "").strip()
                     _canon_map = await resolve_canonical_names(
                         extract_recurring_terms(segments, source_language),
                         _title, orchestrator, job_id=job_id,
+                        series_hint=_series_hint,
                         model_override=model_override)
                     if _canon_map:
                         logger.info(

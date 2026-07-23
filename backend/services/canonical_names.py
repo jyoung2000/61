@@ -699,7 +699,12 @@ async def resolve_roster_corrections(
         if orchestrator is None or not texts:
             return {}
         series_map = dict(_CACHE.get(f"job:{job_id}") or {}) if job_id else {}
-        if len(series_map) < 3:
+        # Series evidence normally comes from the canonical-name pass (needs ≥3
+        # confirmed names). An explicit operator series hint identifies the work
+        # on its own, so it unlocks this pass even when the mined map is thin —
+        # exactly the generic-filename case where the map came back empty.
+        hint = str(getattr(s, "TRANSLATION_SERIES_HINT", "") or "").strip() if s else ""
+        if len(series_map) < 3 and not hint:
             return {}
         candidates = _mine_name_candidates(texts)
         if not candidates:
@@ -724,12 +729,20 @@ async def resolve_roster_corrections(
             "noise/known/frequency filtering",
             job_id or "-", len(candidates), len(ask))
         evidence = "; ".join(f"{k} = {v}" for k, v in list(series_map.items())[:20])
+        # With a thin/empty mined map, lead with the operator's series hint so
+        # the model still knows which work's roster to correct against.
+        evidence_line = (
+            f"This episode is from: {hint}. "
+            + (f"Canonical terms already verified: {evidence}. " if evidence else "")
+            if hint else
+            f"Canonical terms already verified for this episode: {evidence}. "
+        )
         cand_block = "\n".join(f'- "{t}"  (e.g. “{ex}”)' for t, ex in ask)
         prompt = (
             "You are repairing machine subtitles for one specific episode. "
             "Speech recognition mis-heard some Japanese proper nouns and the "
             "translator spelled them phonetically.\n"
-            f"Canonical terms already verified for this episode: {evidence}. "
+            f"{evidence_line}"
             "These identify the series precisely.\n\n"
             "For each candidate token below, decide whether it is a GARBLED "
             "rendering of a character, mecha, faction, place or term from "
