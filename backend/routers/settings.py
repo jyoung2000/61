@@ -3552,23 +3552,39 @@ async def available_models():
             # qwen3:4b-instruct-2507-q4_K_M) is invisible until it's pulled.
             (settings.OLLAMA_TRANSLATION_MODEL, False),
         ]
+        # Installed model names (from /api/tags above) so a configured model that
+        # is really PRESENT under a different spelling — a friendly
+        # "Qwen2.5-14B-Instruct" or an -instruct/quant tag vs the installed
+        # "qwen2.5:14b" — shows as READY instead of being stuck on "pulling…".
+        _installed_names = [i[len("ollama/"):] for i in _ollama_seen_ids
+                            if i.startswith("ollama/")]
         for _def_name, _def_is_vision in _defaults:
             if not _def_name:
                 continue
             _def_id = f"ollama/{_def_name}"
             if _def_id in _ollama_seen_ids:
                 continue  # Already listed from /api/tags
+            try:
+                _resolved = ollama_registry.resolve_installed_tag(_installed_names, _def_name)
+            except Exception:
+                _resolved = None
             _def_family = _def_name.split(":")[0].lower()
             _is_vision = _def_is_vision or any(vf in _def_family for vf in _VISION_FAMILIES)
+            if _resolved:
+                _def_label = f"{_def_name} (Ollama Local — installed as {_resolved})"
+                _def_desc = f"LOCAL — FREE — installed as {_resolved}"
+            else:
+                _def_label = f"{_def_name} (Ollama Local — pulling...)"
+                _def_desc = "LOCAL — FREE — downloading..."
             _def_entry = {
                 "id": _def_id,
-                "name": f"{_def_name} (Ollama Local — pulling...)",
+                "name": _def_label,
                 "provider": "ollama",
                 "is_free": True,
                 "cost_per_hour": 0,
                 "context_length": 0,
                 "created": int(time.time()),
-                "desc": "LOCAL — FREE — downloading...",
+                "desc": _def_desc,
                 "speed": "balanced",
                 "est_time_display": "varies by GPU",
                 "quality_score": 3,
