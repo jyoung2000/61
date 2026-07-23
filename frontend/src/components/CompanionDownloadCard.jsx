@@ -668,9 +668,9 @@ export default function CompanionDownloadCard({ isMobile = false }) {
         {vision?.phase === 'running' && (
           <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', marginTop: 6 }}>
             <span style={{ fontSize: 11, color: 'var(--success)', flex: 1, minWidth: 180 }}>
-              ⚡ Installed on the Companion GPU. Note: if Whisper also runs on that
-              same Companion, ClipAI keeps face detection local so the two don't
-              compete — set REMOTE_VISION_ALLOW_WITH_REMOTE_WHISPER=1 to override.
+              ⚡ Installed on the Companion GPU. When it has spare VRAM, face detection
+              runs here alongside Whisper for a big speedup; if VRAM is tight ClipAI keeps
+              faces on its own GPU so the two don't compete (auto-decided by free VRAM).
             </span>
             <button type="button" onClick={removeVisionInstall} disabled={removingVision}
               style={btnStyle('secondary')}

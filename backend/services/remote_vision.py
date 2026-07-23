@@ -59,6 +59,7 @@ class RemoteVisionDetector:
         self._healthy_at = 0.0
         self._healthy = False
         self._client = None
+        self._overlap_ok = None  # latched faces-alongside-Whisper decision
 
     # ── availability ──────────────────────────────────────────────────
     def _base(self) -> str:
@@ -79,24 +80,32 @@ class RemoteVisionDetector:
             pass
         return h
 
+    def _companion_free_mb(self, base: str) -> Optional[int]:
+        """Free VRAM (MB) the Companion reports on its own /v1/health, or None
+        when the reading is unavailable."""
+        try:
+            import httpx
+            r = httpx.get(f"{base}/v1/health", headers=self._headers(), timeout=3.0)
+            if r.status_code == 200:
+                h = r.json() or {}
+                return int(h.get("vram_free_mb", 0) or 0)
+        except Exception:
+            return None
+        return None
+
     def available(self) -> bool:
         if self._disabled or not bool(getattr(settings, "REMOTE_VISION_ENABLED", True)):
             return False
         base = self._base()
         if not base:
             return False
-        # Faces + Whisper run concurrently, and the vision sidecar shares the
-        # Companion GPU with remote Whisper. Offloading faces there starves the
-        # transcription (observed: an 18-min Whisper hang + an unresponsive
-        # Companion). When Whisper is remote on this same host, keep faces LOCAL
-        # unless the operator explicitly opts into sharing the GPU.
-        if not bool(getattr(settings, "REMOTE_VISION_ALLOW_WITH_REMOTE_WHISPER", False)):
-            if not self._disabled:
-                self._disabled = True
-                logger.info(
-                    "Vision offload stays LOCAL: the sidecar shares the Companion "
-                    "GPU with remote Whisper (faces + transcription run at once). "
-                    "Set REMOTE_VISION_ALLOW_WITH_REMOTE_WHISPER=1 to override.")
+        # Faces + Whisper both land on the Companion GPU. On a big card (a 4070's
+        # 12 GB) YOLO (~2-2.5 GB) and Whisper (~2 GB) coexist with room to spare;
+        # only a small, VRAM-starved card produces the "18-min Whisper hang" this
+        # guard was written for. So decide by the Companion's REAL free VRAM
+        # instead of a blanket block: overlap is allowed when it reports enough
+        # headroom. The operator can still force it, or force local, via config.
+        if not self._decide_overlap(base):
             return False
         now = time.monotonic()
         if now - self._healthy_at < 60.0:
@@ -123,6 +132,55 @@ class RemoteVisionDetector:
         except Exception:
             self._healthy = False
         return self._healthy
+
+    def _decide_overlap(self, base: str) -> bool:
+        """Latch the faces-alongside-remote-Whisper policy once per run.
+
+        Precedence: an explicit force (allow / force-local) wins; otherwise the
+        Companion's live free VRAM decides — overlap only when it can seat vision
+        without starving transcription. Latched so the face loop doesn't re-probe
+        VRAM every frame; the breaker still degrades to local on real failure."""
+        if getattr(self, "_overlap_ok", None) is not None:
+            return self._overlap_ok
+        force_allow = bool(getattr(settings, "REMOTE_VISION_ALLOW_WITH_REMOTE_WHISPER", False))
+        auto = bool(getattr(settings, "REMOTE_VISION_AUTO_WHEN_HEADROOM", True))
+        need = int(getattr(settings, "REMOTE_VISION_MIN_FREE_MB", 3500))
+        if force_allow:
+            self._overlap_ok = True
+            logger.info("Vision offload: forced ON alongside remote Whisper "
+                        "(REMOTE_VISION_ALLOW_WITH_REMOTE_WHISPER=1).")
+            return True
+        if not auto:
+            self._overlap_ok = False
+            self._disabled = True
+            logger.info(
+                "Vision offload stays LOCAL: auto-overlap disabled "
+                "(REMOTE_VISION_AUTO_WHEN_HEADROOM=0). Faces run on the local GPU.")
+            return False
+        free_mb = self._companion_free_mb(base)
+        if free_mb is None:
+            # Can't read the Companion's VRAM → be conservative and stay local
+            # rather than risk the starvation this guard exists to prevent.
+            self._overlap_ok = False
+            self._disabled = True
+            logger.info(
+                "Vision offload stays LOCAL: could not read the Companion's free "
+                "VRAM to confirm headroom for faces + Whisper. Faces run locally.")
+            return False
+        if free_mb < need:
+            self._overlap_ok = False
+            self._disabled = True
+            logger.info(
+                "Vision offload stays LOCAL: Companion has %d MB free VRAM, below "
+                "the %d MB needed to run faces alongside remote Whisper without "
+                "starving transcription. Faces run on the local GPU.", free_mb, need)
+            return False
+        self._overlap_ok = True
+        logger.info(
+            "Vision offload ENGAGED: Companion has %d MB free VRAM (≥ %d MB) — "
+            "face detection offloads to the Companion GPU alongside Whisper.",
+            free_mb, need)
+        return True
 
     def _fail(self, why: str) -> None:
         self._fails += 1

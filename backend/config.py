@@ -1221,12 +1221,24 @@ class Settings(BaseSettings):
     REMOTE_VISION_BREAKER_FAILS: int = 5
     # Face detection and Whisper run CONCURRENTLY in the pipeline. The vision
     # sidecar lives on the SAME Companion as remote Whisper, so offloading faces
-    # there makes the two fight over one GPU — observed: an 18-min Whisper hang
-    # and an unresponsive Companion while faces "offloaded". When Whisper is
-    # remote on that same host, keep face detection LOCAL by default (the fast,
-    # collision-free arrangement). Set True only if the Companion GPU has ample
-    # headroom to run both at once. No effect when Whisper is local.
+    # there CAN make the two fight over one GPU — observed on a small card: an
+    # 18-min Whisper hang and an unresponsive Companion while faces "offloaded".
+    # But on a big card (a 4070's 12 GB) YOLO (~2-2.5 GB) and Whisper (~2 GB)
+    # coexist with room to spare, and keeping faces on the small SERVER GPU there
+    # is the real bottleneck (a 1h+ face loop the user installed the offload to
+    # avoid). So the decision is now made by the Companion's REAL free VRAM
+    # (REMOTE_VISION_AUTO_WHEN_HEADROOM below), not a blanket block. This flag is
+    # a hard OVERRIDE: True forces the overlap on regardless of the VRAM reading.
     REMOTE_VISION_ALLOW_WITH_REMOTE_WHISPER: bool = False
+    # Auto-engage the vision offload alongside remote Whisper when the Companion
+    # reports at least REMOTE_VISION_MIN_FREE_MB of free VRAM — enough to seat
+    # YOLO without starving transcription. Set False to always keep faces local
+    # when Whisper is remote (the old blanket-block behavior).
+    REMOTE_VISION_AUTO_WHEN_HEADROOM: bool = True
+    # Free VRAM (MB) the Companion must report before faces overlap remote Whisper
+    # on it. ~2.5 GB YOLO + ~1 GB margin; a 12 GB card with Whisper resident
+    # clears this easily, a 4 GB shared card does not.
+    REMOTE_VISION_MIN_FREE_MB: int = 3500
     # Pull the pipeline's Ollama models onto the Companion in the background
     # when they're missing there (throttled; failures never touch the job).
     COMPANION_AUTOPULL_MODELS: bool = True

@@ -1290,8 +1290,9 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
                 {ready && (
                   <div style={{ margin: '0 0 8px 17px' }}>
                     <div className="small muted" style={{ marginBottom: 4 }}>
-                      ⚡ Vision offload installed. Note: while this GPU also runs Whisper for a job,
-                      ClipAI keeps face detection local so the two don’t compete.
+                      ⚡ Vision offload installed. When this GPU has spare VRAM, face detection
+                      runs here alongside Whisper; if VRAM is tight, ClipAI keeps faces on its own
+                      GPU so the two don’t compete.
                     </div>
                     <button className="secondary" onClick={doUninstallVision}
                       title="Stop and delete the vision offload; face detection returns to the ClipAI server GPU">
