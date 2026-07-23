@@ -83,6 +83,12 @@ _PUBLIC_EXACT = {
     "/api/downloads/companion/windows",
     "/api/downloads/companion/windows_msi",
     "/api/downloads/companion/mac",
+    # The YOLO-World weight the Companion streams during its from-source
+    # vision-offload install — same class of read-only public artifact, and
+    # the Companion (a cookieless LAN peer) 401'd on it otherwise. The
+    # install/status control routes (POST vision-install, GET .../status) are
+    # deliberately NOT here — they stay behind auth like /companion/refresh.
+    "/api/downloads/companion/vision-model",
 }
 
 _PUBLIC_PREFIXES = (
