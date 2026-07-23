@@ -845,6 +845,17 @@ class Perceiver:
                     cropped_diff = diff_frame[:cell_h * grid_rows, :cell_w * grid_cols]
                     grid = cropped_diff.reshape(grid_rows, cell_h, grid_cols, cell_w)
                     cell_means = grid.mean(axis=(1, 3))
+                    if _speed_profile:
+                        # Camera-motion compensation for the frame-diff path — the
+                        # dense path does this via median-flow subtraction. A global
+                        # pan/shake raises EVERY cell roughly equally and would drag
+                        # the centroid to frame centre; subtract the median cell
+                        # response so only ABOVE-GLOBAL local motion (the real
+                        # subject) drives the hotspot. A pure camera pan then
+                        # collapses to ~0 residual → below the intensity gate → the
+                        # hotspot is simply held (no robotic chase of the camera).
+                        cell_means = np.clip(
+                            cell_means - float(np.median(cell_means)), 0.0, None)
                     best_idx = np.argmax(cell_means)
                     best_gy, best_gx = divmod(best_idx, grid_cols)
                     best_intensity = float(cell_means[best_gy, best_gx]) / 255.0

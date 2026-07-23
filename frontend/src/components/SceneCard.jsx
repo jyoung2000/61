@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { cropColorAt } from '../utils/cropColors';
 
 function formatTime(seconds) {
   const m = Math.floor(seconds / 60);
@@ -299,7 +300,13 @@ export default function SceneCard({ scene, sceneIndex, jobId, onClick, onUpdated
                   chips.push({ label: scene.fusion_source.replace(/_/g, ' '), color: 'var(--text-muted)' });
                 }
                 if (typeof scene.subject_x === 'number') {
-                  chips.push({ label: `crop ${Math.round(scene.subject_x)}%`, color: 'var(--text-muted)' });
+                  // Same crop%→hue as the timeline element + overview map, as a
+                  // filled band (white label) so the chip reads as the same crop.
+                  chips.push({
+                    label: `crop ${Math.round(scene.subject_x)}%`,
+                    color: '#fff',
+                    bg: cropColorAt(scene.subject_x),
+                  });
                 }
                 if (typeof scene.subject_confidence === 'number' && scene.subject_confidence > 0) {
                   chips.push({
@@ -318,7 +325,7 @@ export default function SceneCard({ scene, sceneIndex, jobId, onClick, onUpdated
                   <span key={i} style={{
                     padding: '1px 6px',
                     borderRadius: 3,
-                    background: 'var(--badge-overlay-bg, rgba(127,127,127,0.12))',
+                    background: c.bg || 'var(--badge-overlay-bg, rgba(127,127,127,0.12))',
                     color: c.color,
                     border: '1px solid var(--border)',
                   }}>{c.label}</span>

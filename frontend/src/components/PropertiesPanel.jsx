@@ -15,6 +15,7 @@ import {
   TYPE_LABELS,
 } from '../utils/trackPresets';
 import { undoCoalesceHandlers } from '../utils/undoCoalesce';
+import { cropColorAt } from '../utils/cropColors';
 import ScrubInput from './ScrubInput';
 
 const SPEED_PRESETS = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 4.0];
@@ -717,10 +718,15 @@ export default function PropertiesPanel({ compact = false, settings = null, onSe
 
   if (!item) {
     if (selectedCropSeg) {
+      // Colour the badge + slider by the SAME crop%→hue the timeline element and
+      // overview map use, keyed to the value shown below, so the panel and the
+      // timeline read as the same element.
+      const cropXShown = Number.isFinite(selectedCropSeg.cropX) ? selectedCropSeg.cropX : 50;
+      const cropHue = cropColorAt(cropXShown);
       return (
         <div className={`ve-properties${compact ? ' ve-properties--compact' : ''}`}>
           <div className="ve-properties__header">
-            <span className="ve-properties__type-badge" data-type="crop" style={{ background: '#06B6D4', color: '#fff', padding: '2px 8px', borderRadius: 4, fontSize: 11, fontWeight: 600 }}>
+            <span className="ve-properties__type-badge" data-type="crop" style={{ background: cropHue, color: '#fff', padding: '2px 8px', borderRadius: 4, fontSize: 11, fontWeight: 600 }}>
               Crop
             </span>
           </div>
@@ -746,7 +752,7 @@ export default function PropertiesPanel({ compact = false, settings = null, onSe
                 });
               }}
               {...undoCoalesceHandlers()}
-              style={{ width: '100%', accentColor: '#06B6D4' }}
+              style={{ width: '100%', accentColor: cropHue }}
             />
             <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: 'var(--text-muted)' }}>
               <span>Left</span>

@@ -10,7 +10,8 @@ import {
 import ContextMenu from './ContextMenu';
 import Tooltip from './Tooltip';
 import useResponsive from '../hooks/useResponsive';
-import { getCropXForTime } from '../utils/subjectTracking';
+import { representativeCropX } from '../utils/subjectTracking';
+import { cropColorAt } from '../utils/cropColors';
 
 // ── Constants ────────────────────────────────────────────────────────────────
 // Track sizing modeled after Premiere Pro / DaVinci Resolve / VEED — a clear
@@ -96,37 +97,10 @@ const TRACK_ICONS = {
   crop: '\u2702',
 };
 
-// Crop segment cluster colors
-const CROP_CLUSTER_COLORS = [
-  '#3B82F6', // blue — speaker 0
-  '#10B981', // green — speaker 1
-  '#F59E0B', // amber — speaker 2
-  '#EC4899', // pink — speaker 3
-  '#8B5CF6', // purple — manual override / unknown
-];
-
-// ── Crop-track smooth-pan gradient ───────────────────────────────────────────
-// Each crop element is filled with a horizontal gradient sampled from the
-// SmoothDamp subject track, so a human-like pan (the crop X gliding across the
-// shot) reads as a smooth colour transition and a held shot stays a flat band.
-// The colour is the crop POSITION itself, mapped across a full hue spectrum: a
-// left-biased crop is warm (red/orange), a centred crop is green, a
-// right-biased crop is cool (blue/violet). That way the user literally sees the
-// human-operator's framing sweep — and a glide from 20%→80% reads as a rainbow
-// wipe rather than the old single-hue light/dark shimmer ("only blue & green").
-const CROP_HUE_SPAN = 280; // 0° red (left) → 280° violet-blue (right); no wrap back to red
-
-// Map a crop X (0–100 %) to a full-spectrum hue. ``baseHex`` is retained in the
-// signature for callers but no longer tints the fill — the position drives the
-// colour so the whole pan range is legible at a glance. Deliberately DARK
-// (low lightness): the element carries the white crop-% number, and a bright
-// fill washed the text out. Keeping the same hues but toning the lightness way
-// down gives every colour enough contrast for the label to stay readable.
-function cropColorAt(baseHex, cropX, alpha = 1) {
-  const x = Math.max(0, Math.min(100, Number.isFinite(cropX) ? cropX : 50)) / 100; // 0..1
-  const hue = Math.round(x * CROP_HUE_SPAN);
-  return `hsla(${hue}, 60%, 38%, ${alpha})`;
-}
+// Crop-element colours (cropColorAt = crop%→full-spectrum hue; CROP_CLUSTER_COLORS
+// = discrete speaker palette) live in ../utils/cropColors so the main track, the
+// overview minimap, the properties panel, and scene cards all draw the SAME
+// colour for the same crop % and can never diverge.
 
 function formatTime(s) {
   if (!s || isNaN(s) || s < 0) return '0:00';
@@ -195,7 +169,7 @@ function findSnapTarget(candidateTime, items, excludeItemId, playhead, duration,
 // without zooming out. Click anywhere to seek; drag the highlighted
 // viewport rectangle to pan; drag its edges to zoom.
 function TimelineMinimap({
-  tracks, items, cropSegments, duration, playhead,
+  tracks, items, cropSegments, subjectKeyframes, duration, playhead,
   scrollX, pps, labelWidth, canvasWidthRef, onScrollTo, onSeek, sceneCuts,
 }) {
   const miniRef = useRef(null);
@@ -251,14 +225,15 @@ function TimelineMinimap({
         ctx.fillRect(ix, ly, iw, Math.max(1, laneH - 1));
       }
 
-      // Crop track gets crop segments instead
+      // Crop track gets crop segments instead — coloured by the SAME crop%→hue
+      // as the main track (via the same representativeCropX), so a right-biased
+      // crop reads violet here exactly as it does above, not a cluster colour.
       if (track.type === 'crop' && cropSegments?.length) {
         for (const seg of cropSegments) {
           const cx = seg.startTime * pxPerSec;
           const cw = Math.max(1, (seg.endTime - seg.startTime) * pxPerSec);
-          const clrIdx = seg.isManualOverride ? 4 : Math.max(0, seg.clusterId);
-          const color = CROP_CLUSTER_COLORS[clrIdx % CROP_CLUSTER_COLORS.length];
-          ctx.fillStyle = color + 'C0';
+          const repCropX = representativeCropX(seg, cropSegments, subjectKeyframes);
+          ctx.fillStyle = cropColorAt(repCropX, 0.75);
           ctx.fillRect(cx, ly, cw, Math.max(1, laneH - 1));
         }
       }
@@ -320,7 +295,7 @@ function TimelineMinimap({
       ctx.stroke();
       ctx.setLineDash([]);
     }
-  }, [tracks, items, cropSegments, duration, playhead, scrollX, pps,
+  }, [tracks, items, cropSegments, subjectKeyframes, duration, playhead, scrollX, pps,
       hoverPx, totalDuration, canvasWidthRef, labelWidth, sceneCuts]);
 
   const pxToTime = useCallback((px) => {
@@ -1239,9 +1214,6 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
             const actualCW = Math.min(cx2, canvasW) - clipCX;
             const clipCW = Math.min(Math.max(actualCW, 4), availableCW || actualCW);
 
-            // Color by cluster or manual override
-            const clrIdx = seg.isManualOverride ? 4 : Math.max(0, seg.clusterId);
-            const baseColor = CROP_CLUSTER_COLORS[clrIdx % CROP_CLUSTER_COLORS.length];
             const isSelCrop = seg.id === selectedCropSegmentId;
             const isHoverCrop = hoverRef.current.cropId === seg.id;
 
@@ -1253,23 +1225,11 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
             // crop %: a held shot is exactly seg.cropX; a panning shot is
             // summarised by the AVERAGE smoothed crop across the element (one
             // value, not the pan range). The element reads as a single flat band
-            // whose hue tells you the framing at a glance.
+            // whose hue tells you the framing at a glance — the SAME crop%→hue
+            // (and the SAME representative %) the overview minimap now uses.
             const fillAlpha = isSelCrop ? 0.9 : (isHoverCrop ? 0.72 : 0.55);
-            const hasTrack = Array.isArray(subjectKeyframes) && subjectKeyframes.length > 1;
-            let repCropX = Number.isFinite(seg.cropX) ? seg.cropX : 50;
-            if (hasTrack && !seg.isManualOverride
-                && Number.isFinite(seg.startTime) && Number.isFinite(seg.endTime)
-                && seg.endTime > seg.startTime) {
-              let sum = 0, cnt = 0;
-              const N = 8;
-              for (let k = 0; k <= N; k++) {
-                const tt = seg.startTime + (seg.endTime - seg.startTime) * (k / N);
-                const v = getCropXForTime(tt, cropSegments, subjectKeyframes);
-                if (Number.isFinite(v)) { sum += v; cnt++; }
-              }
-              if (cnt) repCropX = sum / cnt;
-            }
-            ctx.fillStyle = cropColorAt(baseColor, repCropX, fillAlpha);
+            const repCropX = representativeCropX(seg, cropSegments, subjectKeyframes);
+            ctx.fillStyle = cropColorAt(repCropX, fillAlpha);
 
             if (isSelCrop) {
               ctx.save();
@@ -3132,6 +3092,7 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
         tracks={tracks}
         items={items}
         cropSegments={cropSegments}
+        subjectKeyframes={subjectKeyframes}
         duration={duration}
         playhead={playhead}
         scrollX={scrollX}

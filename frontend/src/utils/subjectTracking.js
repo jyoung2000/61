@@ -1504,6 +1504,32 @@ export function getCropXForTime(relTime, cropSegments, subjectKeyframes) {
 }
 
 /**
+ * The single representative crop X (0–100 %) for a whole crop segment, used to
+ * colour it consistently in every view (main track, overview minimap, panels).
+ * A held shot uses its own ``cropX``; a panning/tracked shot uses the mean of
+ * the smooth subject track sampled across the segment, so a pan reads as one
+ * blended hue rather than flickering. Kept here (next to getCropXForTime) so the
+ * timeline canvas and the minimap can never compute it differently.
+ */
+export function representativeCropX(seg, cropSegments, subjectKeyframes) {
+  let rep = Number.isFinite(seg.cropX) ? seg.cropX : 50;
+  const hasTrack = Array.isArray(subjectKeyframes) && subjectKeyframes.length > 1;
+  if (hasTrack && !seg.isManualOverride
+      && Number.isFinite(seg.startTime) && Number.isFinite(seg.endTime)
+      && seg.endTime > seg.startTime) {
+    let sum = 0, cnt = 0;
+    const N = 8;
+    for (let k = 0; k <= N; k++) {
+      const tt = seg.startTime + (seg.endTime - seg.startTime) * (k / N);
+      const v = getCropXForTime(tt, cropSegments, subjectKeyframes);
+      if (Number.isFinite(v)) { sum += v; cnt++; }
+    }
+    if (cnt) rep = sum / cnt;
+  }
+  return rep;
+}
+
+/**
  * Build preview keyframes directly from the backend's dense subject
  * track (``JobResult.subject_track``). The track is already at ~2 Hz
  * with the face → saliency → object → scene fallback cascade applied
