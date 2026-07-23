@@ -32,6 +32,11 @@ from backend.services.reframer_diarizer import SpeakerDiarizer
 logger = logging.getLogger("clipai.reframer_perceiver")
 
 
+class _SkipDenseFlow(Exception):
+    """Speed profile: take the cheap frame-diff motion path instead of dense
+    Farnebäck optical flow. Raised into the motion block's fallback branch."""
+
+
 def _emit_txn_event(on_progress, hint: str) -> None:
     """Send a transcription-lifecycle phase hint through the engine progress
     callback so the FRONTEND Processing Log shows Whisper starting and
@@ -485,6 +490,20 @@ class Perceiver:
         self._prev_sal_cy = None
         self._saliency_source_counts = {}  # {'u2netp+stack': n, 'spectral+stack': n, ...}
 
+        # SPEED PROFILE — skip the two heaviest OPTIONAL per-frame passes so the
+        # face loop hits its time budget on weak cards: the u2netp learned
+        # saliency (CPU forward, the biggest faceless-frame cost) falls back to
+        # the ~2 ms spectral map, and dense Farnebäck optical flow falls back to
+        # the cheap frame-diff motion centroid. Faces + YOLO subject detection
+        # still drive framing, so cuts and follows are unchanged; only the
+        # faceless-scene saliency/motion precision softens. Set
+        # REFRAMER_SPEED_PROFILE=0 for maximum reframing precision.
+        _speed_profile = bool(getattr(settings, 'REFRAMER_SPEED_PROFILE', False))
+        if _speed_profile:
+            log.log_stage('PERCEIVE', 'Speed profile ON — u2netp saliency + dense '
+                          'optical flow disabled (cheap spectral + frame-diff '
+                          'fallbacks); faces/YOLO still drive framing')
+
         # ════════════════════════════════════════════════════════════════
         #  YOLO-World Auto-Discovery Pass
         #  Sample a few frames, run YOLO-World with a broad vocabulary,
@@ -758,6 +777,11 @@ class Perceiver:
             _t_mot = _time_mod.perf_counter()
             if prev_gray_small is not None:
                 try:
+                    if _speed_profile:
+                        # Speed profile: skip dense optical flow (the heaviest
+                        # per-frame motion cost) and take the cheap frame-diff
+                        # centroid below — same downstream motion units.
+                        raise _SkipDenseFlow
                     # Downsample to half det resolution before computing flow.
                     # Farnebäck complexity is O(pixels), so halving each
                     # dimension gives 4x speedup. For locating the motion
@@ -809,7 +833,9 @@ class Perceiver:
                     # large displacement. Capped to match legacy 0–1 range.
                     best_intensity = float(min(1.0, np.percentile(mag, 99) / 10.0))
                 except Exception:
-                    # Fallback to legacy frame-diff path
+                    # Cheap frame-diff motion — reached when the speed profile
+                    # skipped dense flow (_SkipDenseFlow) OR farneback/opencv
+                    # failed. Same downstream motion_timeline/hotspot units.
                     diff_frame = cv2.absdiff(prev_gray_small, gray_small)
                     motion_mag = float(np.mean(diff_frame)) / 255.0 * 10.0
                     r.motion_timeline[time_ms] = motion_mag
@@ -928,7 +954,8 @@ class Perceiver:
                         # edge map for its subject mask (where a human looks,
                         # not what stands out). Suppression + fusion below still
                         # apply. Falls back to spectral on any failure.
-                        if getattr(settings, 'REFRAMER_U2NET_SALIENCY', False):
+                        if (getattr(settings, 'REFRAMER_U2NET_SALIENCY', False)
+                                and not _speed_profile):
                             try:
                                 # ── u2netp stride (REFRAMER_U2NET_STRIDE) ──
                                 # The CPU u2netp forward is by far the

@@ -789,6 +789,15 @@ class Settings(BaseSettings):
     # unchanged. The heavy open-vocab pass is the dominant per-run cost, so this
     # is the single biggest local speed lever short of the Companion offload.
     REFRAMER_YOLO_STRIDE: int = 3
+    # SPEED PROFILE (default ON) — prioritise a fast face loop over the last bit
+    # of reframing precision on faceless/scenic frames. Skips the two heaviest
+    # OPTIONAL per-frame passes: the u2netp learned-saliency CPU forward (→ the
+    # ~2 ms spectral saliency map) and dense Farnebäck optical flow (→ the cheap
+    # frame-diff motion centroid). Faces + YOLO subject detection still drive
+    # framing, so cuts/follows are unchanged; this is the single biggest local
+    # speed lever (removes the ~240 s motion + ~140 s saliency floor). Set False
+    # for maximum precision when analysis time is not a constraint.
+    REFRAMER_SPEED_PROFILE: bool = True
     # ── Reframe debug bundle ─────────────────────────────────────────────────
     # Write a machine-readable reframe_debug.json next to the JSONL trace at the
     # end of ReframeEngine.analyze(): per-scene measured signals + derived params
@@ -1224,7 +1233,16 @@ class Settings(BaseSettings):
     # installed, mid-run crash) everything runs locally exactly as before.
     # The breaker permanently drops to local for the run after this many
     # consecutive remote failures.
-    REMOTE_VISION_ENABLED: bool = True
+    #
+    # DEFAULT OFF: the offload moves only the strided YOLO call — YuNet faces,
+    # u2net saliency, and motion stay LOCAL every frame — so it never removed the
+    # real per-frame floor and, on a card shared with remote Whisper, added probe
+    # + contention risk without reaching the speed target. The speed profile
+    # (REFRAMER_SPEED_PROFILE, which cuts that local floor) is the effective
+    # lever instead. Set True to re-enable the Companion vision offload.
+    REMOTE_VISION_ENABLED: bool = False
+    REMOTE_VISION_TIMEOUT_S: float = 10.0
+    REMOTE_VISION_BREAKER_FAILS: int = 5
     REMOTE_VISION_TIMEOUT_S: float = 10.0
     REMOTE_VISION_BREAKER_FAILS: int = 5
     # Face detection and Whisper run CONCURRENTLY in the pipeline. The vision
