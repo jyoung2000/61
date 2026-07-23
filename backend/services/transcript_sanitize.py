@@ -379,6 +379,158 @@ def _pack_units(units: list[str], budget: int, min_chars: int) -> list[str]:
     return pieces
 
 
+# ── Missing-terminator repair (translator dropped the sentence period) ──────
+# The 1:1 LLM translation frequently welds two English sentences into one cue
+# WITHOUT the period between them ("feelings in the air tonight Holding your
+# wet shoulder", "our objective, Erase everything"). With no terminator the
+# run-on splitter below sees a single "sentence" and leaves the weld intact, so
+# the shipped cue reads as two thoughts crammed together — the exact opposite of
+# YouTube's one-thought-per-cue pacing. The signature of such a weld is precise:
+# a COMMON (lowercase-initial) word, ending in a letter or comma, immediately
+# followed by a Title-cased word that starts a fresh sentence. We restore the
+# dropped terminator so the splitter can do its job.
+#
+# Precision guards keep proper nouns mid-sentence from being mistaken for a new
+# sentence (the false-positive that would manufacture wrong breaks):
+#   * left word must be lower-initial — skips proper-noun PHRASES where every
+#     token is capitalised ("Mobile Suit", "Earth Sphere", "After Colony").
+#   * left word must not be an article / preposition / possessive / conjunction /
+#     object-pronoun / title — these introduce a capitalised name, not a new
+#     sentence ("a Gundam", "as Aries", "from Oz", "General Septem", "call
+#     myself Trois").
+#   * the capitalised word must be Title-case (upper then lower), never ALL-CAPS
+#     ("OZ", "AX-GY") and never a bare "I"/"I'm" — those are not sentence starts
+#     here.
+#   * ≥2 words on each side, so interjections ("Hey", "Yeah") aren't orphaned
+#     onto their own one-word cue.
+# Terminator is ATTACHED to the preceding token (comma dropped), so the
+# whitespace token count is unchanged and 1:1 word timings stay aligned.
+_CAPS_LEFT_STOP = frozenset({
+    # articles / determiners / demonstratives / quantifiers
+    "a", "an", "the", "this", "that", "these", "those", "some", "any", "each",
+    "every", "no", "another", "such", "both", "either", "neither", "one",
+    "all", "most", "many", "few", "several",
+    # possessives
+    "my", "your", "his", "her", "its", "our", "their", "whose",
+    # prepositions
+    "of", "to", "in", "on", "at", "by", "for", "with", "from", "into", "onto",
+    "over", "under", "about", "as", "like", "near", "off", "per", "via",
+    "through", "toward", "towards", "upon", "within", "without", "against",
+    "between", "among", "amongst", "across", "behind", "beside", "beyond",
+    # conjunctions / continuations that expect more to follow
+    "and", "or", "but", "nor", "yet", "so", "than", "then", "if", "when",
+    "while", "because", "although", "though", "unless", "until", "whether",
+    # linking verbs — a capital after a copula is a predicate NAME, not a new
+    # sentence ("This is Duo", "I am Heero", "he was Zechs").
+    "is", "am", "are", "was", "were", "be", "been", "being", "become",
+    "becomes", "became", "called", "named",
+    # object / reflexive pronouns (a name often follows "call myself X")
+    "me", "us", "him", "them", "it", "myself", "yourself", "himself",
+    "herself", "itself", "ourselves", "yourselves", "themselves",
+    # titles / honorifics — a capitalised name follows, not a new sentence
+    "mr", "mrs", "ms", "miss", "dr", "sir", "lady", "lord", "general",
+    "captain", "colonel", "major", "lieutenant", "lt", "sergeant", "sgt",
+    "commander", "admiral", "professor", "prof", "king", "queen", "prince",
+    "princess", "president", "chief", "officer", "agent", "saint", "st",
+})
+_TERMINATORS = ".!?…"
+
+
+def _looks_sentence_start(tok: str) -> bool:
+    """A Title-cased token that plausibly begins a new sentence — upper-then-lower
+    (so ALL-CAPS acronyms and bare ``I``/``I'm`` are excluded)."""
+    if len(tok) < 2:
+        return False
+    # Strip a leading opening quote/bracket so '"Turn' still qualifies.
+    core = tok.lstrip("\"'‘“([")
+    return len(core) >= 2 and core[0].isupper() and core[1].islower()
+
+
+_POSSESSIVE_RE = re.compile(r"['’]s$")
+
+
+def _mid_cap_core(tok: str) -> str:
+    """The bare Title-cased word inside a token (leading quotes/brackets and
+    trailing punctuation/possessive stripped), lowercased — or '' if the token
+    isn't Title-cased (upper-then-lower). ALL-CAPS ("OZ") and bare "I" return ''."""
+    core = tok.strip("\"'‘“([)]}.,!?…;:")
+    core = _POSSESSIVE_RE.sub("", core)
+    if len(core) < 2 or not core[0].isupper() or not any(c.islower() for c in core[1:]):
+        return ""
+    return core.lower()
+
+
+def collect_proper_nouns(rows) -> frozenset:
+    """Proper-noun cores mined from the transcript itself, so a capitalised word
+    that begins a *sentence* (common word) is told apart from a capitalised word
+    that names an *entity* (proper noun) without any external dictionary.
+
+    A word is judged a proper noun when it appears Title-cased in a NON
+    sentence-initial position at least twice — recurring mid-sentence capitals
+    ("on Earth", "Oz's fleet", "Mobile Suit") are names; a one-off sentence-start
+    common word ("…tonight Holding…") is not. Fail-soft: '' set on any error."""
+    try:
+        from collections import Counter
+        midcap: Counter = Counter()
+        for r in rows or []:
+            txt = (r.get("text") if isinstance(r, dict) else getattr(r, "text", "")) or ""
+            toks = txt.split()
+            prev_term = True  # first token counts as sentence-initial
+            for tok in toks:
+                if not tok:
+                    continue
+                core = _mid_cap_core(tok)
+                if core and not prev_term:
+                    midcap[core] += 1
+                prev_term = tok[-1] in _TERMINATORS
+        return frozenset(w for w, c in midcap.items() if c >= 2)
+    except Exception:
+        return frozenset()
+
+
+def insert_missing_sentence_breaks(text: str, proper_nouns=frozenset()) -> str:
+    """Restore a dropped sentence terminator at a high-confidence weld.
+
+    ``proper_nouns`` (lowercased cores, e.g. from :func:`collect_proper_nouns`)
+    suppresses splitting before a recognised entity name — the difference between
+    a real weld ("…rebellion Failed to…") and a proper-noun object of a verb
+    ("…recover Rio…", "…enter Earth's…"). Returns ``text`` unchanged when no
+    confident boundary is found. Pure string op; token count is preserved so
+    downstream 1:1 word partitions stay valid."""
+    t = (text or "").strip()
+    if not t or len(t) < 12:
+        return text
+    toks = t.split()
+    if len(toks) < 4:
+        return text
+    changed = False
+    for i in range(len(toks) - 1):
+        # ≥2 words on each side of the boundary between tok[i] and tok[i+1].
+        if i < 1 or (len(toks) - (i + 1)) < 2:
+            continue
+        left, right = toks[i], toks[i + 1]
+        if not left or not left[0].islower():
+            continue
+        # Left must end in a letter or a comma (not already terminated / a
+        # clause colon-semicolon we leave alone).
+        tail = left[-1]
+        if tail in _TERMINATORS or tail in ":;":
+            continue
+        core = left.rstrip(",")
+        if not core or not core[-1].isalpha():
+            continue
+        if core.lower() in _CAPS_LEFT_STOP:
+            continue
+        if not _looks_sentence_start(right):
+            continue
+        # The capitalised word is a recurring entity name, not a sentence start.
+        if _mid_cap_core(right) in proper_nouns:
+            continue
+        toks[i] = core + "."
+        changed = True
+    return " ".join(toks) if changed else text
+
+
 def split_run_on_cues(segments, target_lang: str = "en"):
     """Split run-on cues into YouTube-style one-thought-per-cue pieces.
 
@@ -411,8 +563,13 @@ def split_run_on_cues(segments, target_lang: str = "en"):
             max_chars = int(getattr(_s, "TRANSCRIPT_RUNON_MAX_CHARS", _RUNON_MAX_CHARS))
             max_pieces = int(getattr(_s, "TRANSCRIPT_RUNON_MAX_PIECES", _RUNON_MAX_PIECES))
             clause_split = bool(getattr(_s, "TRANSCRIPT_RUNON_CLAUSE_SPLIT", True))
+            caps_split = bool(getattr(_s, "TRANSCRIPT_RUNON_CAPS_SPLIT", True))
         except Exception:
             max_chars, max_pieces, clause_split = _RUNON_MAX_CHARS, _RUNON_MAX_PIECES, True
+            caps_split = True
+        # Mine entity names ONCE from the whole track so the weld repair below
+        # never mistakes a proper-noun object ("recover Rio") for a new sentence.
+        proper_nouns = collect_proper_nouns(rows) if caps_split else frozenset()
         out = []
         changed = False
         for seg in rows:
@@ -423,6 +580,16 @@ def split_run_on_cues(segments, target_lang: str = "en"):
             if _is_marker(text) or dur < 2 * _RUNON_MIN_PIECE_S or not text:
                 out.append(seg)
                 continue
+            # Restore any terminator the translator dropped between two welded
+            # sentences ("…tonight Holding…"), so the split below can see both
+            # thoughts. The period attaches to an existing token, so the word
+            # partition stays 1:1; propagate the repair onto the row either way.
+            if caps_split:
+                _repaired = insert_missing_sentence_breaks(text, proper_nouns)
+                if _repaired != text:
+                    text = _repaired
+                    seg = {**seg, "text": text}
+                    changed = True
             sentences = [s.strip() for s in _SENT_SPLIT_RE.split(text) if s.strip()]
             # A run-on is a cue that spills past one line OR carries ≥2 finished
             # thoughts (official subs give each its own cue regardless of length).

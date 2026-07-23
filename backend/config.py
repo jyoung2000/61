@@ -247,6 +247,11 @@ class Settings(BaseSettings):
     TRANSCRIPT_RUNON_MAX_CHARS: int = 50      # a cue past ~one 42-char line is a run-on
     TRANSCRIPT_RUNON_MAX_PIECES: int = 6      # cap pieces per cue (min-duration guards the floor)
     TRANSCRIPT_RUNON_CLAUSE_SPLIT: bool = True  # break long single sentences at clause boundaries
+    # Restore a sentence terminator the 1:1 translator dropped between two welded
+    # thoughts ("…tonight Holding your…") so the run-on splitter can give each its
+    # own YouTube-style cue. High-precision (lower-initial common word → Title-cased
+    # sentence start; proper-noun phrases and article/prep/title intros excluded).
+    TRANSCRIPT_RUNON_CAPS_SPLIT: bool = True
     # Collapse sung opening/ending THEME choruses (mis-transcribed as garbled,
     # duplicated dialogue) into a single "[♪ Opening/Ending theme ♪]" marker,
     # the way official subs do — instead of shipping the lyrics as dialogue.

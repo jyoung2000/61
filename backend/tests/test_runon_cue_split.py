@@ -196,3 +196,85 @@ def test_split_and_merge_are_disjoint():
     # Idempotent: a second pass changes nothing further.
     again, changed2 = split_run_on_cues(split, "en")
     assert not changed2
+
+
+# ── Missing-terminator repair (translator dropped the sentence period) ──────
+
+from backend.services.transcript_sanitize import (  # noqa: E402
+    insert_missing_sentence_breaks,
+    collect_proper_nouns,
+)
+
+
+def test_insert_break_repairs_true_welds():
+    # A lower-initial common word followed by a Title-cased sentence start, with
+    # the period dropped, is the exact 1:1-translation weld — restore it.
+    cases = [
+        ("feelings in the air tonight Holding your wet shoulder",
+         "feelings in the air tonight. Holding your wet shoulder"),
+        ("Your fingertips are searching for something Turn sorrow into love",
+         "Your fingertips are searching for something. Turn sorrow into love"),
+        ("Wasted units on rebellion Failed to stop growth",
+         "Wasted units on rebellion. Failed to stop growth"),
+        # A comma at the weld is upgraded to a full stop.
+        ("the Spaceport was our objective, Erase everything now",
+         "the Spaceport was our objective. Erase everything now"),
+        ("Probably just fragments Old satellites anyway now",
+         "Probably just fragments. Old satellites anyway now"),
+    ]
+    for src, want in cases:
+        assert insert_missing_sentence_breaks(src) == want
+
+
+def test_insert_break_guards_false_positives():
+    # None of these are welds — a proper noun / phrase follows an article,
+    # preposition, title, possessive, copula, or is part of a Title-case phrase.
+    unchanged = [
+        "as soon as Aries is ready now",              # preposition 'as'
+        "it can only be from a Gundanium alloy plate",  # article 'a'
+        "General Septem is waiting for us here",       # title 'General'
+        "please call myself Trois for this record",    # object pronoun 'myself'
+        "those Gundams are our fortune indeed here",   # determiner 'those'
+        "Mobile Suit Gundam Wing is titled something",  # Title-case phrase (upper-initial left)
+        "retrieved by Union forces with Marina now",   # preposition 'by'
+        "This is Duo speaking to you all now",         # copula 'is' + name
+        "reporting it as meteorite fall right now",    # no Title-case start
+    ]
+    for s in unchanged:
+        assert insert_missing_sentence_breaks(s) == s
+
+
+def test_insert_break_suppressed_by_mined_proper_nouns():
+    # 'Rio' is a name; when the corpus establishes it as a proper noun, the
+    # verb-object weld ("recover Rio") is NOT split.
+    rows = [
+        {"text": "We must protect Rio at all costs."},
+        {"text": "Send Rio to the front line now."},   # 2nd mid-sentence cap → proper
+    ]
+    pn = collect_proper_nouns(rows)
+    assert "rio" in pn
+    welded = "Should we recover Rio but pursue the enemy"
+    assert insert_missing_sentence_breaks(welded, pn) == welded
+    # Without the proper-noun evidence it would (wrongly) split — proving the
+    # corpus signal is what suppresses it.
+    assert insert_missing_sentence_breaks(welded) != welded
+
+
+def test_split_run_on_repairs_welded_cue_and_keeps_word_timing():
+    # A cue with a dropped terminator (single "sentence", one line) is repaired
+    # then split into two YouTube-style cues, word timings partitioned 1:1.
+    text = "The colony was our objective Erase everything down there"
+    toks = text.split()
+    words = [{"start": i * 6.0 / len(toks), "end": (i + 1) * 6.0 / len(toks),
+              "word": toks[i]} for i in range(len(toks))]
+    out, changed = split_run_on_cues([_cue(0.0, 6.0, text, words=words)], "en")
+    assert changed and len(out) == 2
+    assert out[0]["text"] == "The colony was our objective."
+    assert out[1]["text"] == "Erase everything down there"
+    # Contiguous, same window, exact word partition.
+    assert out[0]["start"] == 0.0 and out[-1]["end"] == 6.0
+    assert abs(out[0]["end"] - out[1]["start"]) < 1e-6
+    assert sum(len(p["words"] or []) for p in out) == len(words)
+    # Idempotent: the repaired+split track re-splits to nothing further.
+    again, ch2 = split_run_on_cues(out, "en")
+    assert not ch2
