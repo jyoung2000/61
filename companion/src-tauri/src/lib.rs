@@ -258,6 +258,7 @@ async fn get_status(
         "whisper_build": whisper_build,
         "vision_available": vision_available,
         "vision_running": vision_running,
+        "vision_install": state.vision_install.lock().unwrap().clone(),
         "busy": state.whisper_busy.load(Ordering::Relaxed),
         "current_job": current_job,
         "job_progress": job_progress,
@@ -496,22 +497,44 @@ fn refresh_vision(app: tauri::AppHandle) -> bool {
     vision::available(&rd, &dd)
 }
 
-/// Download the vision sidecar (YOLO-World face-detection offload) into app
-/// data (Windows), so ClipAI can run its FACES stage on THIS GPU instead of
-/// the server's small card. Progress arrives via `vision-progress` events.
+/// Install the vision sidecar (YOLO-World face-detection offload) FROM SOURCE
+/// on this GPU machine — Python (system or python.org), torch (pytorch.org),
+/// deps (PyPI), and the model weight (streamed from the paired ClipAI over the
+/// LAN). No GitHub. Runs in the background; the GUI watches `vision_install`
+/// from get_status. The remote container button drives the same installer via
+/// the proxy route /v1/vision/install.
 #[tauri::command]
-async fn download_vision(
+async fn install_vision(
     app: tauri::AppHandle,
     state: tauri::State<'_, SharedState>,
-) -> Result<String, String> {
+) -> Result<(), String> {
+    let rd = app.path().resource_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let dd = app
         .path()
         .app_data_dir()
         .map_err(|e| format!("no app data dir: {e}"))?;
-    // A live vision-server.exe holds a file lock on Windows; stop it first so
-    // the re-download can overwrite it. It restarts lazily on the next frame.
-    vision::shutdown(&state, "vision download requested").await;
-    vision::download_vision(&app, &dd).await
+    // The YOLO-World weight is served by the paired ClipAI container over the
+    // LAN (never GitHub). Prefer the explicitly-paired URL, else the one we've
+    // seen inbound traffic from.
+    let base = {
+        let cfg = state.config_snapshot();
+        let paired = cfg.paired_clipai_url.trim().trim_end_matches('/').to_string();
+        if !paired.is_empty() {
+            paired
+        } else {
+            state.seen_clipai_url.lock().unwrap().trim().trim_end_matches('/').to_string()
+        }
+    };
+    let model_url = if base.is_empty() {
+        None
+    } else {
+        Some(format!("{base}/api/downloads/companion/vision-model"))
+    };
+    let st = state.inner().clone();
+    tauri::async_runtime::spawn(async move {
+        vision::install_from_source(st, rd, dd, model_url, None).await;
+    });
+    Ok(())
 }
 
 /// Format a ms-epoch as local time, or "-" for 0/unset.
@@ -1593,7 +1616,7 @@ pub fn run() {
             refresh_sidecar,
             download_whisper,
             refresh_vision,
-            download_vision,
+            install_vision,
             export_logs,
             test_clipai,
             free_vram,

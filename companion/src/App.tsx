@@ -7,7 +7,7 @@ import {
   CompanionStatus, getStatus, setConfig, regenerateToken,
   installOllama, startOllama, pullModel, pairClipai,
   listModels, deleteModel, InstalledModel,
-  downloadWhisper, refreshSidecar, downloadVision, refreshVision, exportLogs, testClipai, ClipaiTest, freeVram, endActiveJob,
+  downloadWhisper, refreshSidecar, installVision, refreshVision, exportLogs, testClipai, ClipaiTest, freeVram, endActiveJob,
   checkAppUpdate, installAppUpdate, AppUpdateCheck,
 } from './api';
 
@@ -395,7 +395,6 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
   const [confirmDel, setConfirmDel] = useState('');
   const [deleting, setDeleting] = useState('');
   const [whisperDl, setWhisperDl] = useState<{ active: boolean; percent: number; message: string } | null>(null);
-  const [visionDl, setVisionDl] = useState<{ active: boolean; percent: number; message: string } | null>(null);
   const [syncing, setSyncing] = useState(false);
   const [syncMsg, setSyncMsg] = useState('');
   const [modelQuery, setModelQuery] = useState('');
@@ -413,16 +412,11 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
       setWhisperDl({ active: stage !== 'done' && stage !== 'error', percent, message });
       if (stage === 'done' || stage === 'error') setTimeout(() => setWhisperDl(null), 4000);
     });
-    const uV = listen<{ stage: string; percent: number; message: string }>('vision-progress', (e) => {
-      const { stage, percent, message } = e.payload;
-      setVisionDl({ active: stage !== 'done' && stage !== 'error', percent, message });
-      if (stage === 'done' || stage === 'error') setTimeout(() => setVisionDl(null), 4000);
-    });
     const uP = listen<{ model: string; status: string; percent: number }>('pull-progress', (e) => {
       const { model, status: st, percent } = e.payload;
       setSyncMsg(`${model}: ${st}${percent >= 0 ? ` ${Math.round(percent)}%` : ''}`);
     });
-    return () => { uW.then((f) => f()); uV.then((f) => f()); uP.then((f) => f()); };
+    return () => { uW.then((f) => f()); uP.then((f) => f()); };
   }, []);
 
   const loadModels = useCallback(() => {
@@ -457,16 +451,11 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
     refresh();
   };
 
-  const doDownloadVision = async () => {
-    setVisionDl({ active: true, percent: -1, message: 'Starting…' });
+  const doInstallVision = async () => {
     try {
-      await downloadVision();
-      await refreshVision();
+      await installVision();  // background; progress arrives via status.vision_install
       refresh();
-    } catch (e) {
-      setVisionDl({ active: false, percent: 0, message: `Failed: ${e}` });
-      setTimeout(() => setVisionDl(null), 6000);
-    }
+    } catch { /* surfaced via status.vision_install.error */ }
   };
 
   const doRefreshVision = async () => {
@@ -1247,37 +1236,44 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
               : status.vision_available ? 'ready (starts on demand)'
               : 'not installed (optional) — ClipAI’s face-detection runs on the ClipAI server’s GPU instead'}
           </div>
-          {!status.vision_available && (
-            <div style={{ margin: '0 0 8px 17px' }}>
-              <div className="small muted" style={{ marginBottom: 6 }}>
-                Run ClipAI’s heaviest analysis stage — face/subject detection — on the
-                {' '}{status.gpu.gpu_name || 'GPU'} instead of the small server card. Two ways:
-                the one-click download below (needs a published release build), or run it
-                from source: <span className="mono">companion/sidecars/vision-server/run.ps1</span>
-                {' '}on this machine — the Companion auto-detects it on port 11511.
-              </div>
-              <div className="row" style={{ marginBottom: visionDl ? 6 : 0 }}>
-                <button className="secondary" onClick={doDownloadVision}
-                  disabled={!!visionDl?.active}
-                  title="Download the YOLO-World face-detection sidecar so this GPU runs ClipAI's FACES stage">
-                  {visionDl?.active ? 'Downloading…' : 'Download Vision offload'}
-                </button>
-                <button className="secondary" onClick={doRefreshVision} disabled={!!visionDl?.active}
-                  title="Re-check whether the vision sidecar is installed">
-                  ↻ Refresh
-                </button>
-              </div>
-              {visionDl && (
-                <div>
-                  <div className="small muted" style={{ marginBottom: 3 }}>{visionDl.message}</div>
-                  <div className={`meter${visionDl.percent < 0 ? ' indeterminate' : ''}`}>
-                    <div style={visionDl.percent < 0 ? undefined
-                      : { width: `${Math.max(2, Math.min(100, visionDl.percent))}%` }} />
-                  </div>
+          {!status.vision_available && (() => {
+            const vi = status.vision_install;
+            const busy = !!vi?.active;
+            return (
+              <div style={{ margin: '0 0 8px 17px' }}>
+                <div className="small muted" style={{ marginBottom: 6 }}>
+                  Run ClipAI’s heaviest analysis stage — face/subject detection — on the
+                  {' '}{status.gpu.gpu_name || 'GPU'} instead of the small server card. Click
+                  Install and the Companion fetches everything itself (Python, PyTorch, the
+                  model) — no GitHub. You can also trigger this remotely from ClipAI → Settings.
                 </div>
-              )}
-            </div>
-          )}
+                <div className="row" style={{ marginBottom: busy || vi?.error ? 6 : 0 }}>
+                  <button className="secondary" onClick={doInstallVision} disabled={busy}
+                    title="Install the YOLO-World face-detection sidecar from source so this GPU runs ClipAI's FACES stage">
+                    {busy ? 'Installing…' : '⬇ Install Vision offload'}
+                  </button>
+                  <button className="secondary" onClick={doRefreshVision} disabled={busy}
+                    title="Re-check whether the vision sidecar is installed">
+                    ↻ Refresh
+                  </button>
+                </div>
+                {busy && (
+                  <div>
+                    <div className="small muted" style={{ marginBottom: 3 }}>{vi.message || 'Installing…'}</div>
+                    <div className={`meter${vi.percent < 0 ? ' indeterminate' : ''}`}>
+                      <div style={vi.percent < 0 ? undefined
+                        : { width: `${Math.max(2, Math.min(100, vi.percent))}%` }} />
+                    </div>
+                  </div>
+                )}
+                {!busy && vi?.error && (
+                  <div className="small" style={{ color: 'var(--accent-amber, #e0a52a)' }}>
+                    Install failed: {vi.error}
+                  </div>
+                )}
+              </div>
+            );
+          })()}
           {status.vision_available && (
             <div className="small muted" style={{ margin: '0 0 8px 17px' }}>
               ⚡ Vision offload installed — ClipAI’s face detection runs on the {status.gpu.gpu_name || 'GPU'}

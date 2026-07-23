@@ -698,6 +698,78 @@ async fn vision_detect(State(ctx): State<ProxyCtx>, req: Request<Body>) -> Respo
     }
 }
 
+#[derive(serde::Deserialize, Default)]
+struct VisionInstallReq {
+    /// URL the Companion should stream the YOLO-World weight from (ClipAI's
+    /// own /api/downloads/companion/vision-model). Keeps the install off GitHub.
+    model_url: Option<String>,
+    /// Optional bearer token for that URL (unused when the route is public).
+    token: Option<String>,
+}
+
+/// POST /v1/vision/install → kick off the from-source vision-offload install
+/// on THIS machine (Python, torch, deps, model — no GitHub). Returns 202
+/// immediately; ClipAI polls /v1/vision/install/status for progress.
+async fn vision_install(State(ctx): State<ProxyCtx>, req: Request<Body>) -> Response {
+    if !authorized(&ctx, req.headers()) {
+        return unauthorized();
+    }
+    if ctx.state.config.lock().unwrap().paused {
+        return paused();
+    }
+    let body = match axum::body::to_bytes(req.into_body(), 64 * 1024).await {
+        Ok(b) => b,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("bad body: {e}")).into_response(),
+    };
+    let parsed: VisionInstallReq = serde_json::from_slice(&body).unwrap_or_default();
+    // Model URL: honor an explicit one, else derive from the ClipAI base we
+    // already talk to (paired URL, else the peer we've seen) — the container
+    // needn't know its own reachable address. Never GitHub.
+    let model_url = parsed.model_url.filter(|s| !s.trim().is_empty()).or_else(|| {
+        let base = {
+            let paired = ctx.state.config.lock().unwrap().paired_clipai_url.trim().trim_end_matches('/').to_string();
+            if !paired.is_empty() {
+                paired
+            } else {
+                ctx.state.seen_clipai_url.lock().unwrap().trim().trim_end_matches('/').to_string()
+            }
+        };
+        if base.is_empty() {
+            None
+        } else {
+            Some(format!("{base}/api/downloads/companion/vision-model"))
+        }
+    });
+    let st = ctx.state.clone();
+    let rd = ctx.resource_dir.clone();
+    let dd = ctx.data_dir.clone();
+    tokio::spawn(async move {
+        crate::vision::install_from_source(st, rd, dd, model_url, parsed.token).await;
+    });
+    (StatusCode::ACCEPTED, "vision install started").into_response()
+}
+
+/// GET /v1/vision/install/status → live install progress + whether the sidecar
+/// is answering. ClipAI's Settings card polls this to drive its progress bar.
+async fn vision_install_status(State(ctx): State<ProxyCtx>, req: Request<Body>) -> Response {
+    if !authorized(&ctx, req.headers()) {
+        return unauthorized();
+    }
+    let snap = ctx.state.vision_install.lock().unwrap().clone();
+    let healthy = crate::vision::healthy().await;
+    Json(serde_json::json!({
+        "active": snap.active,
+        "stage": snap.stage,
+        "percent": snap.percent,
+        "message": snap.message,
+        "error": snap.error,
+        "updated_ms": snap.updated_ms,
+        "healthy": healthy,
+        "available": crate::vision::available(&ctx.resource_dir, &ctx.data_dir) || healthy,
+    }))
+    .into_response()
+}
+
 /// /v1/gpu/release → free the WHOLE GPU on request: whisper sidecar stopped
 /// (skipped, never killed, when a decode holds the slot) AND every resident
 /// Ollama model evicted. The full-scope sibling of /v1/sidecar/release, for
@@ -1354,6 +1426,8 @@ fn build_router(ctx: ProxyCtx) -> Router {
         .route("/v1/sidecar/warm", post(sidecar_warm))
         .route("/v1/vision/health", get(vision_health))
         .route("/v1/vision/detect", post(vision_detect))
+        .route("/v1/vision/install", post(vision_install))
+        .route("/v1/vision/install/status", get(vision_install_status))
         .route("/v1/update/install", post(update_install))
         .route("/v1/update/status", get(update_status))
         .route("/v1/gpu/release", post(gpu_release))

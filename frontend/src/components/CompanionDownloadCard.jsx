@@ -306,6 +306,82 @@ export default function CompanionDownloadCard({ isMobile = false }) {
     }
   };
 
+  // ── Remote vision-offload install: have the Companion set up the
+  // face-detection sidecar FROM SOURCE (Python, torch, deps, and the model
+  // weight it streams back from this server) — no GitHub, nobody at the GPU PC.
+  const [vision, setVision] = useState(null); // {phase,percent,message,error} | {phase:'running'}
+  const visionTimer = useRef(null);
+  const visionStarted = useRef(0);
+  useEffect(() => () => clearInterval(visionTimer.current), []);
+
+  // Quiet mount check so the card shows "running" when it's already installed.
+  useEffect(() => {
+    const t = setTimeout(async () => {
+      try {
+        const res = await fetch('/api/downloads/companion/vision-install/status');
+        const st = await res.json();
+        if (st.healthy && !st.active) setVision({ phase: 'running' });
+        else if (st.active) { setVision({ phase: st.stage, percent: st.percent, message: st.message }); startVisionPoll(); }
+      } catch { /* best-effort */ }
+    }, 1600);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const pollVision = async () => {
+    try {
+      const res = await fetch('/api/downloads/companion/vision-install/status');
+      const st = await res.json();
+      if (st.state === 'unsupported') {
+        clearInterval(visionTimer.current);
+        setVision({ phase: 'failed', error: 'This Companion build is too old — update the Companion app, then retry.' });
+        return;
+      }
+      if (st.error) {
+        clearInterval(visionTimer.current);
+        setVision({ phase: 'failed', error: st.error });
+        return;
+      }
+      if (st.healthy && !st.active) {
+        clearInterval(visionTimer.current);
+        setVision({ phase: 'running' });
+        showToast('Vision offload installed — face detection now runs on the Companion GPU ✓', 'success');
+        return;
+      }
+      // Installs (esp. torch) can take many minutes; give a generous budget.
+      if (Date.now() - visionStarted.current > 30 * 60 * 1000) {
+        clearInterval(visionTimer.current);
+        setVision({ phase: 'failed', error: 'Install is taking unusually long — check the Companion’s Processing Log.' });
+        return;
+      }
+      setVision({ phase: st.stage || 'installing', percent: st.percent, message: st.message });
+    } catch {
+      setVision((v) => v || { phase: 'installing' });
+    }
+  };
+
+  function startVisionPoll() {
+    clearInterval(visionTimer.current);
+    visionStarted.current = Date.now();
+    visionTimer.current = setInterval(pollVision, 2500);
+  }
+
+  const startVisionInstall = async () => {
+    setVision({ phase: 'starting', percent: 2 });
+    try {
+      const res = await fetch('/api/downloads/companion/vision-install', { method: 'POST' });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        setVision({ phase: 'failed', error: data.detail || `Could not start (HTTP ${res.status})` });
+        showToast(data.detail || 'Could not start the vision install', 'error');
+        return;
+      }
+      startVisionPoll();
+    } catch (e) {
+      setVision({ phase: 'failed', error: String(e) });
+    }
+  };
+
   // Round-trip proof that work actually runs on the paired Companion GPU —
   // not just that its token authenticates.
   const verifyOffload = async () => {
@@ -512,6 +588,71 @@ export default function CompanionDownloadCard({ isMobile = false }) {
           Remote update didn't finish: {push.error}
         </div>
       )}
+
+      {/* ── Vision (face-detection) offload install ─────────────────────── */}
+      <div style={{
+        padding: '8px 10px', marginBottom: 8, borderRadius: 8,
+        background: 'var(--bg-inset, var(--bg-secondary))', border: '1px solid var(--border)',
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+          <span style={{ fontSize: 11, color: 'var(--text-secondary)', flex: 1, minWidth: 200, lineHeight: 1.4 }}>
+            <strong style={{ color: 'var(--text-primary)' }}>Vision offload</strong>
+            {vision?.phase === 'running'
+              ? ' — installed. ClipAI’s heaviest stage (face/subject detection) runs on the Companion GPU.'
+              : ' — run ClipAI’s heaviest stage (face/subject detection) on the Companion GPU. The Companion installs everything itself (Python, PyTorch, the model) — no GitHub, nobody at the GPU PC.'}
+          </span>
+          {vision?.phase !== 'running' && (
+            <button type="button" onClick={startVisionInstall}
+              disabled={!!vision && vision.phase !== 'failed'}
+              style={btnStyle('primary')}
+              title="The Companion downloads its prerequisites and the model from this server, then serves face detection on its GPU">
+              {vision && vision.phase !== 'failed' ? 'Installing…' : '⬇ Install vision offload'}
+            </button>
+          )}
+        </div>
+
+        {vision && vision.phase !== 'running' && vision.phase !== 'failed' && (
+          <div style={{ marginTop: 8 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10.5, color: 'var(--text-muted)', marginBottom: 3 }}>
+              <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {vision.message || {
+                  starting: 'Contacting the Companion…',
+                  preparing: 'Preparing…',
+                  python: 'Setting up Python…',
+                  venv: 'Creating the Python environment…',
+                  torch: 'Installing PyTorch (CUDA) — the big one…',
+                  deps: 'Installing YOLO-World + dependencies…',
+                  model: 'Downloading the model from this server…',
+                  starting_sidecar: 'Starting the vision sidecar…',
+                }[vision.phase] || 'Installing…'}
+              </span>
+              {typeof vision.percent === 'number' && vision.percent >= 0 && (
+                <span style={{ marginLeft: 8 }}>{Math.round(vision.percent)}%</span>
+              )}
+            </div>
+            <div style={{ height: 6, borderRadius: 3, background: 'var(--bg-inset, var(--border))', overflow: 'hidden' }}>
+              <div style={{
+                height: '100%', borderRadius: 3, background: 'var(--accent-cyan)',
+                transition: 'width .4s ease',
+                width: typeof vision.percent === 'number' && vision.percent >= 0 ? `${Math.max(3, vision.percent)}%` : '100%',
+                animation: !(typeof vision.percent === 'number' && vision.percent >= 0) ? 'companionPulse 1.4s ease-in-out infinite' : 'none',
+                opacity: typeof vision.percent === 'number' && vision.percent >= 0 ? 1 : 0.75,
+              }} />
+            </div>
+            <style>{'@keyframes companionPulse { 0%,100% { opacity:.35 } 50% { opacity:.9 } }'}</style>
+          </div>
+        )}
+        {vision?.phase === 'running' && (
+          <div style={{ fontSize: 11, color: 'var(--success)', marginTop: 6 }}>
+            ⚡ Running on the Companion GPU (needs a non-eco speed profile and ≥5 GB VRAM budget).
+          </div>
+        )}
+        {vision?.phase === 'failed' && (
+          <div style={{ fontSize: 11, color: 'var(--accent-red, #e5484d)', marginTop: 6, lineHeight: 1.4 }}>
+            Install didn’t finish: {vision.error}
+          </div>
+        )}
+      </div>
 
       {showTest && (
         <TestModal
