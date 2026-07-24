@@ -782,13 +782,15 @@ class Settings(BaseSettings):
     # behind the 17-min face stage) runs every Nth sampled frame, carrying its
     # subject bboxes forward in between. YuNet faces + motion still run EVERY
     # frame, so framing density is unchanged; subjects don't teleport in one
-    # ~0.8s sample. 3 ≈ cuts the YOLO cost to a third; 1 restores every-frame
-    # detection. Raised 2→3 for weak local cards (GTX 1650, ~3.7 GB): the
-    # sub-second sample spacing means a subject carried ~2.4 s never teleports,
-    # while YuNet faces + motion keep running EVERY frame so framing density is
-    # unchanged. The heavy open-vocab pass is the dominant per-run cost, so this
-    # is the single biggest local speed lever short of the Companion offload.
-    REFRAMER_YOLO_STRIDE: int = 3
+    # ~0.8s sample. 5 ≈ cuts the YOLO cost to a fifth; 1 restores every-frame
+    # detection. Raised 3→5 for weak local cards (GTX 1650, ~3.7 GB): at ~1.2s
+    # sample spacing a subject is re-found every ~6 s, and YuNet faces + motion
+    # still run EVERY frame so framing density is unchanged — dialogue framing is
+    # identical; only very fast faceless action updates its open-vocab subject a
+    # couple seconds later. The heavy open-vocab pass is the dominant per-run
+    # cost (~500 s of a ~680 s face loop on the 1650), so this is the single
+    # biggest remaining local speed lever.
+    REFRAMER_YOLO_STRIDE: int = 5
     # SPEED PROFILE (default ON) — prioritise a fast face loop over the last bit
     # of reframing precision on faceless/scenic frames. Skips the two heaviest
     # OPTIONAL per-frame passes: the u2netp learned-saliency CPU forward (→ the
@@ -1227,44 +1229,6 @@ class Settings(BaseSettings):
     SENTENCE_MERGE_MAX_CUE_S: float = 12.0
     SENTENCE_MERGE_MAX_CHARS: int = 280
 
-    # ── Companion vision offload + model placement ──
-    # Face detection offloads to the Companion's vision sidecar when its
-    # /v1/vision/health answers; otherwise (older Companion, sidecar not
-    # installed, mid-run crash) everything runs locally exactly as before.
-    # The breaker permanently drops to local for the run after this many
-    # consecutive remote failures.
-    #
-    # DEFAULT OFF: the offload moves only the strided YOLO call — YuNet faces,
-    # u2net saliency, and motion stay LOCAL every frame — so it never removed the
-    # real per-frame floor and, on a card shared with remote Whisper, added probe
-    # + contention risk without reaching the speed target. The speed profile
-    # (REFRAMER_SPEED_PROFILE, which cuts that local floor) is the effective
-    # lever instead. Set True to re-enable the Companion vision offload.
-    REMOTE_VISION_ENABLED: bool = False
-    REMOTE_VISION_TIMEOUT_S: float = 10.0
-    REMOTE_VISION_BREAKER_FAILS: int = 5
-    REMOTE_VISION_TIMEOUT_S: float = 10.0
-    REMOTE_VISION_BREAKER_FAILS: int = 5
-    # Face detection and Whisper run CONCURRENTLY in the pipeline. The vision
-    # sidecar lives on the SAME Companion as remote Whisper, so offloading faces
-    # there CAN make the two fight over one GPU — observed on a small card: an
-    # 18-min Whisper hang and an unresponsive Companion while faces "offloaded".
-    # But on a big card (a 4070's 12 GB) YOLO (~2-2.5 GB) and Whisper (~2 GB)
-    # coexist with room to spare, and keeping faces on the small SERVER GPU there
-    # is the real bottleneck (a 1h+ face loop the user installed the offload to
-    # avoid). So the decision is now made by the Companion's REAL free VRAM
-    # (REMOTE_VISION_AUTO_WHEN_HEADROOM below), not a blanket block. This flag is
-    # a hard OVERRIDE: True forces the overlap on regardless of the VRAM reading.
-    REMOTE_VISION_ALLOW_WITH_REMOTE_WHISPER: bool = False
-    # Auto-engage the vision offload alongside remote Whisper when the Companion
-    # reports at least REMOTE_VISION_MIN_FREE_MB of free VRAM — enough to seat
-    # YOLO without starving transcription. Set False to always keep faces local
-    # when Whisper is remote (the old blanket-block behavior).
-    REMOTE_VISION_AUTO_WHEN_HEADROOM: bool = True
-    # Free VRAM (MB) the Companion must report before faces overlap remote Whisper
-    # on it. ~2.5 GB YOLO + ~1 GB margin; a 12 GB card with Whisper resident
-    # clears this easily, a 4 GB shared card does not.
-    REMOTE_VISION_MIN_FREE_MB: int = 3500
     # Pull the pipeline's Ollama models onto the Companion in the background
     # when they're missing there (throttled; failures never touch the job).
     COMPANION_AUTOPULL_MODELS: bool = True

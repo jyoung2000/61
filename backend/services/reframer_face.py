@@ -362,29 +362,6 @@ class FaceDetector:
         if self._yolo_model is None:
             raise RuntimeError("YOLO model not loaded")
         kwargs.pop('device', None)
-        # ── Companion offload (fail-safe) ──
-        # When the Companion's vision sidecar is up, run this inference on
-        # the big GPU instead of the local card. Identical model family +
-        # vocabulary (classes ride along per request); the client returns
-        # ultralytics-shaped results so downstream code can't tell the
-        # difference. ANY problem returns None → the local path below runs,
-        # and a breaker stops trying after repeated failures.
-        _rv = getattr(self, '_remote_vision', None)
-        if _rv is None:
-            try:
-                from backend.services.remote_vision import RemoteVisionDetector
-                _rv = self._remote_vision = RemoteVisionDetector()
-            except Exception:
-                _rv = self._remote_vision = False
-        if _rv and args and getattr(self, '_yolo_classes', None) and _rv.available():
-            _res = _rv.predict(
-                args[0], self._yolo_classes,
-                conf=float(kwargs.get('conf', 0.25)),
-                max_det=int(kwargs.get('max_det', 20)))
-            if _res is not None:
-                self._remote_frames = getattr(self, '_remote_frames', 0) + 1
-                return _res
-        self._local_frames = getattr(self, '_local_frames', 0) + 1
         try:
             return self._yolo_model.predict(*args, device=self._yolo_device, **kwargs)
         except Exception as e:

@@ -108,6 +108,6 @@ def test_carry_forward_reuses_cached_person_bboxes():
     assert seen_person == [[(1, 2, 3, 4)], [(1, 2, 3, 4)]]
 
 
-def test_default_stride_is_three():
+def test_default_stride_is_five():
     from backend.config import settings
-    assert settings.REFRAMER_YOLO_STRIDE == 3
+    assert settings.REFRAMER_YOLO_STRIDE == 5

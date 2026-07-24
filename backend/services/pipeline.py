@@ -698,28 +698,13 @@ def _adaptive_reframer_sample_cap(base_cap: int, job_id: str = "") -> int:
 
         cap = base * mult
 
-        # Offload headroom: YOLO leaves the local card, freeing a little per-frame
-        # budget — a modest boost, and ONLY above the weak tier (a weak card's
-        # local floor is untouched by offload, so more samples there just cost
-        # more). Config-proxy check (offload POSSIBLE); the perceiver's own
-        # detector makes the authoritative live decision.
-        offload_possible = False
-        try:
-            if bool(getattr(settings, "REMOTE_VISION_ENABLED", True)):
-                from backend.services.reframer_audio import _remote_whisper_base
-                offload_possible = bool(_remote_whisper_base())
-        except Exception:
-            offload_possible = False
-        if offload_possible and mult > 1.0:
-            cap *= 1.25
-
         ceiling = int(getattr(settings, "REFRAMER_SAMPLE_CAP_CEILING", 4200))
         cap = max(300, int(round(min(cap, float(ceiling)))))
         if job_id:
             logger.info(
                 "[%s] Adaptive reframer cap: %d samples (local GPU=%s, %.1f GB, "
-                "mult=%.2f, offload_possible=%s, base=%d)",
-                job_id, cap, name or "unknown", gb, mult, offload_possible, base)
+                "mult=%.2f, base=%d)",
+                job_id, cap, name or "unknown", gb, mult, base)
         return cap
     except Exception:
         return base
