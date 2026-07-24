@@ -350,6 +350,22 @@ _SENT_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+(?=[\"'‘“(\[]?[A-Z0-9])")
 _CLAUSE_SPLIT_RE = re.compile(r"(?<=[,;:—–])\s+")
 
 
+def _split_sentences_abbrev_safe(text: str) -> list[str]:
+    """Sentence-split, but NEVER break after a title abbreviation ("Mr." / "Dr."
+    / "Lt." …). ``_SENT_SPLIT_RE`` treats the period in "Mr." as a full stop and
+    would orphan the title onto its own cue ("Mr." | "Darlian") — the exact
+    honorific over-split seen against YouTube. Re-joins any piece whose
+    predecessor ends in a known abbreviation."""
+    parts = [s.strip() for s in _SENT_SPLIT_RE.split(text) if s.strip()]
+    out: list[str] = []
+    for p in parts:
+        if out and _ends_with_abbrev(out[-1]):
+            out[-1] = (out[-1] + " " + p).strip()
+        else:
+            out.append(p)
+    return out
+
+
 def _clause_units(sentence: str) -> list[str]:
     """Break one sentence into clause units at strong punctuation boundaries.
     Concatenates (with single spaces) back to the input, so token counts are
@@ -590,7 +606,7 @@ def split_run_on_cues(segments, target_lang: str = "en"):
                     text = _repaired
                     seg = {**seg, "text": text}
                     changed = True
-            sentences = [s.strip() for s in _SENT_SPLIT_RE.split(text) if s.strip()]
+            sentences = _split_sentences_abbrev_safe(text)
             # A run-on is a cue that spills past one line OR carries ≥2 finished
             # thoughts (official subs give each its own cue regardless of length).
             if not sentences or not (len(text) > max_chars or len(sentences) >= 2):

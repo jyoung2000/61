@@ -278,3 +278,19 @@ def test_split_run_on_repairs_welded_cue_and_keeps_word_timing():
     # Idempotent: the repaired+split track re-splits to nothing further.
     again, ch2 = split_run_on_cues(out, "en")
     assert not ch2
+
+
+def test_title_abbreviation_is_not_split_from_its_name():
+    # "Mr. Darlian" must stay one cue — the period after a title abbreviation is
+    # NOT a sentence boundary (the honorific over-split seen vs YouTube).
+    text = "Mr. Darlian, the shuttle will soon enter the atmosphere."
+    out, changed = split_run_on_cues([_cue(30.0, 36.0, text)], "en")
+    texts = [r["text"] for r in out]
+    assert not any(t.strip() == "Mr." for t in texts), texts
+    assert any(t.startswith("Mr. Darlian") for t in texts), texts
+    # A genuine two-sentence cue with an abbreviation still splits at the REAL
+    # boundary, keeping the title attached to its name.
+    text2 = "This is Mr. Darlian. Please fasten your seat belt now."
+    out2, _ = split_run_on_cues([_cue(30.0, 37.0, text2)], "en")
+    t2 = [r["text"] for r in out2]
+    assert "This is Mr. Darlian." in t2 and "Please fasten your seat belt now." in t2, t2
