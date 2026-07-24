@@ -1711,6 +1711,17 @@ class Settings(BaseSettings):
     # Minimum fraction of an LLM cue's words that must align to a Whisper-EN word
     # for the projection to be trusted (else the cue falls to tier B/C).
     HYBRID_MIN_ANCHOR_RATIO: float = 0.30
+    # Tier B/C used to lay word times at a UNIFORM char-proportional rate across
+    # the cue's whole source-derived window — sweeping the active-word highlight
+    # straight through leading/trailing silence and real speech pauses, so it
+    # drifted off the spoken word on the ~59% of cues tier A couldn't lexically
+    # match. When True (default), tiers B/C instead place the LLM tokens on the
+    # REAL voiced timeline the Whisper-EN reference already provides for the whole
+    # audio (speech onset→offset, honouring inter-word pauses), even without a
+    # lexical match — turning most of that 59% into audio-locked word timing.
+    # Falls back to the plain window distribution only when no reference word
+    # overlaps the cue.
+    HYBRID_REF_TIME_ANCHOR: bool = True
     # Time margin (s) around an LLM cue when gathering Whisper-EN candidate words
     # (the two translations drift, so allow slack at the edges).
     HYBRID_ALIGN_MARGIN_S: float = 2.0

@@ -1,10 +1,12 @@
 """Hybrid word-timing projection (subtitle_aligner) + word-timed splitting.
 
-Tier A = Whisper-EN audio projection (real per-word times). Tier B and Tier C
-both char-weight-distribute the cue's OWN [start,end] window across its English
-tokens (B for multi-token cues, C for the single-token remainder) so no dialogue
-cue ships word-less; bracketed non-speech markers are never filled. The LLM text
-is always authoritative — Whisper-EN supplies timing only.
+Tier A = Whisper-EN audio projection (real per-word times on lexically-matched
+cues). Tier B/C give the rest a timing skeleton: placed on the REAL Whisper-EN
+voiced timeline (speech onset/offset + pauses) when a reference word overlaps the
+cue, else char-weight-distributed across the cue's OWN [start,end] window (B for
+multi-token cues, C for the single-token remainder). No dialogue cue ships
+word-less; bracketed non-speech markers are never filled. The LLM text is always
+authoritative — Whisper-EN supplies timing only.
 """
 
 from backend.models import TranscriptSegment, WordTimestamp
@@ -121,6 +123,81 @@ def test_tier_b_skips_bracket_markers():
     llm = [_cue(20.0, 24.0, "[♪ music ♪]")]
     cues, n = attach_source_pause_timings(llm, None)
     assert n == 0 and not cues[0].words
+
+
+# ── Tier B/C: audio anchoring on the real Whisper-EN voiced timeline ──
+
+def test_tier_b_time_anchors_to_reference_span():
+    # The cue WINDOW is padded (9-15) but the real speech (Whisper-EN) is 10-14.
+    # With the reference stream, the highlight must sit on the REAL voiced span —
+    # NOT sweep uniformly through the 1s of leading/trailing silence (which is
+    # exactly how the highlight drifted off the spoken word).
+    ref = flatten_whisper_words(_whisper_ref())  # words span 10.0..14.0
+    llm = [_cue(9.0, 15.0, "I will destroy everything then leave")]
+    cues, n = attach_source_pause_timings(llm, None, whisper_en_words=ref)
+    assert n == 1
+    ws = cues[0].words
+    assert ws and len(ws) == len("I will destroy everything then leave".split())
+    # First word onsets at real speech (~10.0), not the padded window (9.0).
+    assert ws[0].start >= 10.0 - 1e-6
+    # Last word ends at real speech offset (~14.0), not the padded window (15.0).
+    assert ws[-1].end <= 14.0 + 1e-6
+    # Monotonic and inside the window.
+    for i in range(len(ws) - 1):
+        assert ws[i].end <= ws[i + 1].start + 1e-9
+    assert ws[0].start >= 9.0 - 1e-9 and ws[-1].end <= 15.0 + 1e-9
+
+
+def test_tier_b_no_overlapping_reference_falls_back_to_window():
+    # Reference words are elsewhere (10-14); cue is at 20-24 → no overlap → the
+    # plain window distribution (spans the full cue) is used, unchanged.
+    ref = flatten_whisper_words(_whisper_ref())
+    llm = [_cue(20.0, 24.0, "completely elsewhere in time here")]
+    cues, n = attach_source_pause_timings(llm, None, whisper_en_words=ref)
+    assert n == 1
+    ws = cues[0].words
+    assert abs(ws[0].start - 20.0) < 1e-6 and abs(ws[-1].end - 24.0) < 1e-6
+
+
+def test_distribute_over_reference_monotonic_and_clamped():
+    from backend.services.subtitle_aligner import distribute_over_reference
+    ref = [(10.0, 10.4), (10.4, 10.9), (11.6, 12.3), (13.0, 13.5)]
+    toks = "a bb ccc dddd eeeee".split()
+    out = distribute_over_reference(toks, ref, 9.0, 15.0)
+    assert len(out) == len(toks)
+    assert out[0]["start"] >= 10.0 - 1e-9      # real onset
+    assert out[-1]["end"] <= 13.5 + 1e-9       # real offset (last ref end)
+    prev = 9.0
+    for w in out:
+        assert w["start"] >= prev - 1e-9
+        assert w["end"] >= w["start"] - 1e-9
+        prev = w["end"]
+
+
+def test_distribute_over_reference_empty_ref_falls_back():
+    from backend.services.subtitle_aligner import distribute_over_reference
+    toks = "one two three".split()
+    out = distribute_over_reference(toks, [], 5.0, 8.0)
+    assert len(out) == 3
+    assert abs(out[0]["start"] - 5.0) < 1e-6 and abs(out[-1]["end"] - 8.0) < 1e-6
+
+
+def test_hybrid_reports_ref_anchored_and_places_on_audio():
+    # cue0 → tier A (lexical match at 10-14); cue1 → tier B, PADDED window (9-15)
+    # overlapping the reference → audio-anchored onto the real 10-14 voiced span.
+    llm = [
+        _cue(10.0, 14.0, "I will destroy everything and then I will leave"),
+        _cue(9.0, 15.0, "wholly different wording that shares the window"),
+    ]
+    tiers = project_hybrid_timings(
+        llm, whisper_en_segments=_whisper_ref(), source_cues=None)
+    assert tiers["tier_a"] == 1
+    assert tiers["tier_b"] == 1
+    assert tiers["ref_anchored"] >= 1
+    ws = llm[1].words
+    # Audio-anchored: words sit on the real voiced span (10-14), not the padded
+    # 9-15 window a uniform char-sweep would have used.
+    assert ws[0].start >= 10.0 - 1e-6 and ws[-1].end <= 14.0 + 1e-6
 
 
 # ── A→B→C ladder + idempotency ──

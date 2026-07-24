@@ -252,24 +252,112 @@ def distribute_cue_window(tokens: list[str], start: float, end: float) -> list[d
     return out
 
 
+def _ref_words_in_window(whisper_en_words: list, lo: float, hi: float) -> list:
+    """Whisper-EN words whose span overlaps ``[lo, hi]``, time-ordered.
+
+    These are the REAL speech onsets/offsets inside the cue — the audio the
+    highlight should track — even when their *text* never lexically matched the
+    LLM tokens (tier A's requirement)."""
+    out = []
+    for w in whisper_en_words or []:
+        try:
+            s = float(w["start"])
+            e = float(w["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if e >= lo and s <= hi:
+            out.append((s, e))
+    out.sort()
+    return out
+
+
+def distribute_over_reference(
+    tokens: list[str], ref_spans: list, lo: float, hi: float
+) -> list[dict]:
+    """Place ``tokens`` on the REAL speech timeline given by ``ref_spans``
+    (Whisper-EN word ``(start, end)`` pairs overlapping the cue window).
+
+    Whisper-EN already decoded the whole audio, so its word onsets mark where
+    speech actually is inside ``[lo, hi]``. Instead of sweeping the highlight at
+    a uniform char-rate across the padded window (silence and all), lay the LLM
+    tokens down by char-weight but map each token boundary onto the reference
+    onset grid — so the highlight starts at real speech onset, ends at real
+    speech offset, and a genuine inter-word pause lands between the right two
+    tokens. Both translations are the SAME English utterance in the SAME order,
+    so token-position ≈ reference-position is a sound anchor (unlike the old JA
+    source-word mapping, which had a different word order). Times are clamped to
+    ``[lo, hi]`` and monotonic. Falls back to :func:`distribute_cue_window` when
+    the reference is unusable. Returns ``{word,start,end}`` dicts 1:1 with
+    ``tokens``."""
+    n = len(tokens)
+    if n == 0:
+        return []
+    spans = [(s, e) for (s, e) in (ref_spans or []) if e >= s]
+    if not spans:
+        return distribute_cue_window(tokens, lo, hi)
+    ref_lo = max(lo, spans[0][0])
+    ref_hi = min(hi, max(e for _, e in spans))
+    if ref_hi <= ref_lo:
+        return distribute_cue_window(tokens, lo, hi)
+    # Content→time anchors: the reference word onsets inside the span, plus the
+    # closing offset so the last token reaches real speech end. Evenly spaced in
+    # "content" (word index), then interpolated by the tokens' char-weight
+    # cumulative fraction.
+    anchors = sorted({s for s, _ in spans if ref_lo <= s <= ref_hi} | {ref_lo, ref_hi})
+    m = len(anchors)
+    weights = [max(1, len(t)) for t in tokens]
+    total = float(sum(weights)) or 1.0
+    cum = [0.0]
+    for wgt in weights:
+        cum.append(cum[-1] + wgt / total)
+
+    def _map(frac: float) -> float:
+        frac = min(1.0, max(0.0, frac))
+        if m <= 1:
+            return ref_lo + (ref_hi - ref_lo) * frac
+        pos = frac * (m - 1)
+        k = int(pos)
+        if k >= m - 1:
+            return anchors[-1]
+        t = pos - k
+        return anchors[k] * (1.0 - t) + anchors[k + 1] * t
+
+    out, prev_end = [], ref_lo
+    for i, tok in enumerate(tokens):
+        s = max(prev_end, min(hi, _map(cum[i])))
+        e = max(s, min(hi, _map(cum[i + 1])))
+        if i == n - 1:
+            e = max(s, min(hi, ref_hi))
+        out.append({"word": tok, "start": round(s, 3), "end": round(e, 3)})
+        prev_end = e
+    return out
+
+
 def attach_source_pause_timings(
     llm_cues: list,
     source_cues: list,
     *,
     min_tokens: int = 2,
+    whisper_en_words: Optional[list] = None,
 ) -> tuple[list, int]:
-    """Tier B: give still-word-less LLM cues a highlight skeleton by
-    CHAR-WEIGHT-distributing the cue's own audio-aligned [start,end] window
-    across its DISPLAYED English tokens.
+    """Tier B: give still-word-less LLM cues a highlight skeleton.
 
-    (The old Tier B mapped each English token onto the JAPANESE source word at
-    the same POSITION — but Japanese is SOV with a different word count/order,
-    so the real audio pauses landed under the wrong English words and the
-    highlight drifted off the spoken word. Distributing the cue window across
-    the English tokens keeps the highlight advancing correctly inside the
-    cue's real span, and matches the export + preview fallback exactly.)
-    ``source_cues`` is kept in the signature for call-site compatibility but
-    no longer used. Only fills cues that don't already have words."""
+    When ``whisper_en_words`` (the flat, time-ordered Whisper-EN stream) is
+    supplied and a cue's window overlaps real reference words, the LLM tokens are
+    placed on that REAL voiced timeline (:func:`distribute_over_reference`) so the
+    highlight tracks actual speech onset/offset even without a lexical match —
+    the audio-locked path that turns most tier-B cues into real timing. When no
+    reference word overlaps (or none was supplied), it falls back to
+    char-weight-distributing the cue's own [start,end] window across its English
+    tokens — which still advances the highlight left-to-right at a uniform rate
+    and matches the export + preview fallback exactly.
+
+    (The very old Tier B mapped each English token onto the JAPANESE source word
+    at the same POSITION — but Japanese is SOV with a different word count/order,
+    so the real audio pauses landed under the wrong English words. The Whisper-EN
+    reference is already in English order, so position-based anchoring is sound.)
+    ``source_cues`` is kept in the signature for call-site compatibility but no
+    longer used. Only fills cues that don't already have words."""
     _ = source_cues  # retained for API stability; no longer consulted
     n_attached = 0
     for cue in (llm_cues or []):
@@ -282,7 +370,12 @@ def attach_source_pause_timings(
         end = _cue_attr(cue, "end", None)
         if start is None or end is None or float(end) <= float(start):
             continue
-        _set_words(cue, distribute_cue_window(en_tokens, float(start), float(end)))
+        lo, hi = float(start), float(end)
+        ref = _ref_words_in_window(whisper_en_words, lo, hi) if whisper_en_words else []
+        if ref:
+            _set_words(cue, distribute_over_reference(en_tokens, ref, lo, hi))
+        else:
+            _set_words(cue, distribute_cue_window(en_tokens, lo, hi))
         n_attached += 1
     return llm_cues, n_attached
 
@@ -296,20 +389,45 @@ def project_hybrid_timings(
     min_anchor_ratio: float = 0.30,
 ) -> dict:
     """Run the A→B→C ladder over ``llm_cues`` (mutating them) and report which
-    tier each cue ended on. Tier A projects real Whisper-EN audio times; Tier B
-    and Tier C both char-weight-distribute the cue's own [start,end] window
-    across its English tokens (B for multi-token cues, C for whatever remains —
-    e.g. single-token cues), so no dialogue cue ships word-less. Bracketed
-    non-speech markers are never filled. Returns a summary dict
-    ``{"tier_a", "tier_b", "tier_c", "total"}`` for one-line logging."""
+    tier each cue ended on. Tier A projects real Whisper-EN audio times onto
+    lexically-matched cues. Tier B/C give the rest a timing skeleton — placed on
+    the REAL Whisper-EN voiced timeline (speech onset/offset + pauses) when a
+    reference word overlaps the cue and ``HYBRID_REF_TIME_ANCHOR`` is on, else
+    char-weight-distributed across the cue's own window (B = multi-token cues,
+    C = whatever remains, e.g. single-token cues). No dialogue cue ships
+    word-less; bracketed non-speech markers are never filled. Returns a summary
+    dict ``{"tier_a", "tier_b", "tier_c", "ref_anchored", "total"}`` for
+    one-line logging (``ref_anchored`` = B/C cues that landed on real audio)."""
     total = len(llm_cues or [])
     whisper_words = flatten_whisper_words(whisper_en_segments)
+    try:
+        from backend.config import settings as _s
+        _anchor = bool(getattr(_s, "HYBRID_REF_TIME_ANCHOR", True))
+    except Exception:
+        _anchor = True
+    _ref_stream = whisper_words if _anchor else None
     _, n_a = project_word_timings(
         llm_cues, whisper_words, margin_s=margin_s, min_anchor_ratio=min_anchor_ratio)
-    _, n_b = attach_source_pause_timings(llm_cues, source_cues)
+    # Snapshot, among the cues tier A left word-less (i.e. the tier-B/C pool),
+    # how many overlap a real Whisper-EN word — the ones B/C will place on the
+    # audio timeline rather than the uniform window fallback.
+    ref_anchored = 0
+    if _ref_stream:
+        for cue in (llm_cues or []):
+            if _cue_has_words(cue) or _is_marker(_cue_text(cue)):
+                continue
+            s = _cue_attr(cue, "start", None)
+            e = _cue_attr(cue, "end", None)
+            if s is None or e is None or float(e) <= float(s):
+                continue
+            if _ref_words_in_window(_ref_stream, float(s), float(e)):
+                ref_anchored += 1
+    _, n_b = attach_source_pause_timings(
+        llm_cues, source_cues, whisper_en_words=_ref_stream)
     # Tier C: fill ANY remaining word-less cue (single-token, or an edge the
-    # tiers above skipped) by char-weight-distributing its window — so NO
-    # translated cue ships word-less and highlighting always has a real,
+    # tiers above skipped) — on the real reference timeline when a Whisper-EN
+    # word overlaps its window, else by char-weight-distributing the window — so
+    # NO translated cue ships word-less and highlighting always has a real,
     # cue-aligned skeleton (word-less cues were the systematically mis-aligned
     # case: preview/export both fell back to a pure synthetic estimate).
     n_c = 0
@@ -321,6 +439,12 @@ def project_hybrid_timings(
         e = _cue_attr(cue, "end", None)
         if not toks or s is None or e is None or float(e) <= float(s):
             continue
-        _set_words(cue, distribute_cue_window(toks, float(s), float(e)))
+        lo, hi = float(s), float(e)
+        ref = _ref_words_in_window(_ref_stream, lo, hi) if _ref_stream else []
+        if ref:
+            _set_words(cue, distribute_over_reference(toks, ref, lo, hi))
+        else:
+            _set_words(cue, distribute_cue_window(toks, lo, hi))
         n_c += 1
-    return {"tier_a": n_a, "tier_b": n_b, "tier_c": n_c, "total": total}
+    return {"tier_a": n_a, "tier_b": n_b, "tier_c": n_c,
+            "ref_anchored": ref_anchored, "total": total}

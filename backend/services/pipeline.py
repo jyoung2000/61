@@ -4320,9 +4320,12 @@ async def _background_post_processing(
                         translated = _llm_cues
                         logger.info(
                             "[%s] Hybrid timing projected: tier A (Whisper-EN)=%d, "
-                            "tier B (source-pause)=%d, tier C (kept whole)=%d of %d cue(s)",
+                            "tier B=%d, tier C=%d of %d cue(s); %d B/C cue(s) placed "
+                            "on the real Whisper-EN voiced timeline (audio-anchored, "
+                            "not char-proportional)",
                             job_id, _tiers["tier_a"], _tiers["tier_b"],
-                            _tiers["tier_c"], _tiers["total"])
+                            _tiers["tier_c"], _tiers["total"],
+                            _tiers.get("ref_anchored", 0))
                     except Exception as _hy_err:
                         logger.warning(
                             "[%s] Hybrid word-timing projection failed (%s) — keeping "
