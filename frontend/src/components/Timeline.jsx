@@ -10,7 +10,6 @@ import {
 import ContextMenu from './ContextMenu';
 import Tooltip from './Tooltip';
 import useResponsive from '../hooks/useResponsive';
-import { representativeCropX } from '../utils/subjectTracking';
 import { cropColorAt } from '../utils/cropColors';
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -169,7 +168,7 @@ function findSnapTarget(candidateTime, items, excludeItemId, playhead, duration,
 // without zooming out. Click anywhere to seek; drag the highlighted
 // viewport rectangle to pan; drag its edges to zoom.
 function TimelineMinimap({
-  tracks, items, cropSegments, subjectKeyframes, duration, playhead,
+  tracks, items, cropSegments, duration, playhead,
   scrollX, pps, labelWidth, canvasWidthRef, onScrollTo, onSeek, sceneCuts,
 }) {
   const miniRef = useRef(null);
@@ -226,14 +225,15 @@ function TimelineMinimap({
       }
 
       // Crop track gets crop segments instead — coloured by the SAME crop%→hue
-      // as the main track (via the same representativeCropX), so a right-biased
-      // crop reads violet here exactly as it does above, not a cluster colour.
+      // as the main track, keyed to each segment's own crop % (seg.cropX = the
+      // value its label shows), so a right-biased crop reads violet here exactly
+      // as it does above, and identical percentages share one colour.
       if (track.type === 'crop' && cropSegments?.length) {
         for (const seg of cropSegments) {
           const cx = seg.startTime * pxPerSec;
           const cw = Math.max(1, (seg.endTime - seg.startTime) * pxPerSec);
-          const repCropX = representativeCropX(seg, cropSegments, subjectKeyframes);
-          ctx.fillStyle = cropColorAt(repCropX, 0.75);
+          const cropPct = Number.isFinite(seg.cropX) ? seg.cropX : 50;
+          ctx.fillStyle = cropColorAt(cropPct, 0.75);
           ctx.fillRect(cx, ly, cw, Math.max(1, laneH - 1));
         }
       }
@@ -295,7 +295,7 @@ function TimelineMinimap({
       ctx.stroke();
       ctx.setLineDash([]);
     }
-  }, [tracks, items, cropSegments, subjectKeyframes, duration, playhead, scrollX, pps,
+  }, [tracks, items, cropSegments, duration, playhead, scrollX, pps,
       hoverPx, totalDuration, canvasWidthRef, labelWidth, sceneCuts]);
 
   const pxToTime = useCallback((px) => {
@@ -582,7 +582,6 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
   const tracks = useTimelineStore((s) => s.tracks);
   const items = useTimelineStore((s) => s.items);
   const cropSegments = useTimelineStore((s) => s.cropSegments);
-  const subjectKeyframes = useTimelineStore((s) => s.subjectKeyframes);
 
   // ── Mobile compact lanes (3.1) ──
   // Phones render slim lanes; tapping a track header expands one lane
@@ -1221,15 +1220,15 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
             const sBodyH = cropLaneH - 8;
             const sRr = 4;
 
-            // ONE solid colour per crop element, keyed to a SINGLE representative
-            // crop %: a held shot is exactly seg.cropX; a panning shot is
-            // summarised by the AVERAGE smoothed crop across the element (one
-            // value, not the pan range). The element reads as a single flat band
-            // whose hue tells you the framing at a glance — the SAME crop%→hue
-            // (and the SAME representative %) the overview minimap now uses.
+            // Colour is keyed to the segment's OWN crop % (seg.cropX) — the exact
+            // value its label shows (label = `${round(cropX)}%`, set together at
+            // creation). So every "34%" reads the SAME hue, on the main track and
+            // the overview map alike. (Deliberately NOT the smoothed-track average:
+            // that varies per segment with track-data coverage, which is what made
+            // two identical "34%" segments render different colours.)
             const fillAlpha = isSelCrop ? 0.9 : (isHoverCrop ? 0.72 : 0.55);
-            const repCropX = representativeCropX(seg, cropSegments, subjectKeyframes);
-            ctx.fillStyle = cropColorAt(repCropX, fillAlpha);
+            const cropPct = Number.isFinite(seg.cropX) ? seg.cropX : 50;
+            ctx.fillStyle = cropColorAt(cropPct, fillAlpha);
 
             if (isSelCrop) {
               ctx.save();
@@ -1302,9 +1301,9 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
               ctx.textAlign = 'left';
               ctx.shadowColor = 'rgba(0,0,0,0.45)';
               ctx.shadowBlur = 2;
-              // ONE number: the element's single representative crop % (the same
-              // value that picks its solid colour above).
-              const lbl = seg.label || `${Math.round(repCropX)}%`;
+              // ONE number: the segment's own crop % — the SAME value that picks
+              // its solid colour above, so label and hue can never disagree.
+              const lbl = seg.label || `${Math.round(cropPct)}%`;
               ctx.fillText(lbl, Math.max(cx1 + 8, contentLeft + 6), cy + cropLaneH / 2 + 4, cw - 16);
               ctx.shadowColor = 'transparent';
               ctx.shadowBlur = 0;
@@ -1501,7 +1500,7 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
         ctx.lineWidth = 1;
       }
     }
-  }, [tracks, items, duration, zoom, scrollX, selectedItemId, selectedItemIds, hoverTime, pps, compact, activeTool, segments, cropSegments, subjectKeyframes, selectedCropSegmentId, snapLine]);
+  }, [tracks, items, duration, zoom, scrollX, selectedItemId, selectedItemIds, hoverTime, pps, compact, activeTool, segments, cropSegments, selectedCropSegmentId, snapLine]);
   // ``playhead`` is intentionally absent: every play tick was both
   // recreating ``draw`` (causing the ``[draw]`` effect below to re-fire)
   // AND running the rAF loop. Two redraw mechanisms stacked.
@@ -3092,7 +3091,6 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
         tracks={tracks}
         items={items}
         cropSegments={cropSegments}
-        subjectKeyframes={subjectKeyframes}
         duration={duration}
         playhead={playhead}
         scrollX={scrollX}
