@@ -68,3 +68,54 @@ def test_degrades_to_baseline_without_torch(monkeypatch):
     monkeypatch.setattr(P, "_query_vram", lambda: None, raising=False)
     monkeypatch.setitem(__import__("sys").modules, "torch", None)
     assert P._adaptive_reframer_sample_cap(base_cap=1200, job_id="") == 1200
+
+
+# ── Early-translation overlap gate (face-loop priority) ────────────────────
+
+def _overlap(monkeypatch, *, total_mb, name, flag=True):
+    monkeypatch.setattr(P, "_query_vram", lambda: (total_mb // 2, total_mb), raising=False)
+
+    class _FakeCuda:
+        @staticmethod
+        def is_available():
+            return True
+
+        @staticmethod
+        def get_device_name(_i):
+            return name
+
+        @staticmethod
+        def mem_get_info():
+            return (total_mb * 1024 * 1024 // 2, total_mb * 1024 * 1024)
+
+    import types
+    monkeypatch.setitem(__import__("sys").modules, "torch",
+                        types.SimpleNamespace(cuda=_FakeCuda()))
+    monkeypatch.setattr(P.settings, "TRANSLATION_EARLY_OVERLAP", flag, raising=False)
+    return P._early_translation_overlap_allowed()
+
+
+def test_overlap_deferred_on_weak_card(monkeypatch):
+    # GTX 1650 → translation must NOT overlap the face loop (the measured 2.3x hit).
+    assert _overlap(monkeypatch, total_mb=4096, name="NVIDIA GeForce GTX 1650") is False
+
+
+def test_overlap_deferred_on_weak_card_by_name_even_if_vram_high(monkeypatch):
+    assert _overlap(monkeypatch, total_mb=8192, name="NVIDIA GeForce GTX 1650") is False
+
+
+def test_overlap_allowed_on_strong_card(monkeypatch):
+    # 12 GB (4070) → overlap is allowed (CPU likely has headroom).
+    assert _overlap(monkeypatch, total_mb=12288, name="NVIDIA GeForce RTX 4070") is True
+
+
+def test_overlap_force_disabled_by_config(monkeypatch):
+    assert _overlap(monkeypatch, total_mb=12288, name="NVIDIA GeForce RTX 4070", flag=False) is False
+
+
+def test_overlap_fails_open_without_torch(monkeypatch):
+    # Can't read the GPU → allow (don't silently change behaviour on unknown HW).
+    monkeypatch.setattr(P, "_query_vram", lambda: None, raising=False)
+    monkeypatch.setitem(__import__("sys").modules, "torch", None)
+    monkeypatch.setattr(P.settings, "TRANSLATION_EARLY_OVERLAP", True, raising=False)
+    assert P._early_translation_overlap_allowed() is True

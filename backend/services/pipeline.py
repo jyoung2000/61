@@ -710,6 +710,48 @@ def _adaptive_reframer_sample_cap(base_cap: int, job_id: str = "") -> int:
         return base
 
 
+def _early_translation_overlap_allowed() -> bool:
+    """Whether to start translation DURING the face loop.
+
+    The overlap hides wall-clock ONLY when the CPU has spare capacity. On a weak,
+    single-box setup the translation chain (resegment/sanitize/glossary/LLM
+    batching — all CPU + Python GIL) starves the concurrent local face loop:
+    measured on a GTX 1650, perceive went 5.4→12.6 min with the overlap on, for
+    zero net total-time gain (the face loop and its GPU feed sit behind the GIL).
+    So the overlap AUTO-DISABLES on weak local GPUs; translation then runs right
+    after the face loop, which keeps full speed. Config flag force-defers
+    everywhere. Fail-open (allow) when the GPU can't be read."""
+    try:
+        if not bool(getattr(settings, "TRANSLATION_EARLY_OVERLAP", True)):
+            return False
+        name = ""
+        total_mb = 0
+        try:
+            from backend.services.vram_ledger import _query_vram
+            _v = _query_vram()
+            if _v is not None:
+                total_mb = int(_v[1])
+        except Exception:
+            total_mb = 0
+        try:
+            import torch
+            if torch.cuda.is_available():
+                name = torch.cuda.get_device_name(0) or ""
+                if total_mb <= 0:
+                    total_mb = int(torch.cuda.mem_get_info()[1] / (1024 * 1024))
+        except Exception:
+            pass
+        if any(w in name for w in ("GTX 1650", "GTX 1050", "GTX 1630",
+                                   "MX", "P400", "T400", "T600")):
+            return False
+        gb = (total_mb / 1024.0) if total_mb > 0 else 0.0
+        if 0.0 < gb < 5.5:          # weak / budget card → prioritise the face loop
+            return False
+        return True
+    except Exception:
+        return True
+
+
 def _whisper_engine_cached() -> bool:
     """True when the reframer's Whisper engine is still loaded (so a Whisper-
     native translate can REUSE it with no second load). The analyze stage keeps
@@ -6866,6 +6908,16 @@ async def _run_analysis_inner(job_id: str, resume: bool = False):
                 _evt_wait.cancel()
         if not _evt.is_set():
             return None  # engine finished first — classic serial path
+        # Face-loop priority: on a weak local GPU the concurrent translation
+        # chain (CPU/GIL) starves the face loop ~2.3x for no net total-time gain
+        # (measured: perceive 5.4→12.6 min on a GTX 1650, total unchanged). Defer
+        # translation to the classic post-engine path so the face loop runs at
+        # full speed — the fast-analysis behaviour of the early Jul-19 runs.
+        if not _early_translation_overlap_allowed():
+            logger.info(
+                "[%s] EARLY translation overlap deferred (face-loop priority on "
+                "this GPU) — translation runs right after the face loop", job_id)
+            return None
         _segs = _payload.get("segments") or []
         _tl = _payload.get("timeline")
         _lang = _payload.get("language") or ""

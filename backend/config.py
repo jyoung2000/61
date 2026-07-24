@@ -800,6 +800,15 @@ class Settings(BaseSettings):
     # speed lever (removes the ~240 s motion + ~140 s saliency floor). Set False
     # for maximum precision when analysis time is not a constraint.
     REFRAMER_SPEED_PROFILE: bool = True
+    # Start translation DURING the face loop (overlap it to hide wall-clock).
+    # This helps only when the CPU has spare capacity: on a weak, single-box
+    # setup the translation chain (resegment, sanitize, glossary, LLM batching —
+    # all CPU/GIL) STARVES the concurrent face loop, measured ~2.3x slower
+    # (perceive 5.4→12.6 min) for ZERO net total-time gain. So it AUTO-DISABLES
+    # on weak local GPUs (GTX 1650-class) — translation then runs right after the
+    # face loop, which stays at full speed. Set False to force-defer everywhere;
+    # the auto-gate already handles the common case.
+    TRANSLATION_EARLY_OVERLAP: bool = True
     # ── Reframe debug bundle ─────────────────────────────────────────────────
     # Write a machine-readable reframe_debug.json next to the JSONL trace at the
     # end of ReframeEngine.analyze(): per-scene measured signals + derived params
