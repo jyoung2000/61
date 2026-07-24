@@ -18,6 +18,18 @@ from backend.config import settings
 from backend.models import TranscriptSegment
 
 
+def _apply_min_gap(segments: list) -> list:
+    """Nudge touching/overlapping cues apart by ``SUBTITLE_MIN_GAP_MS`` so no two
+    consecutive cues ship at a 0 ms gap (professional subtitles always leave a
+    small visible gap). Fail-soft: returns the input unchanged on any error."""
+    try:
+        from backend.services.subtitle_formatter import enforce_min_gap
+        min_gap_s = float(getattr(settings, "SUBTITLE_MIN_GAP_MS", 80)) / 1000.0
+        return enforce_min_gap(segments, min_gap_s=min_gap_s)
+    except Exception:
+        return segments
+
+
 def _format_srt_time(seconds: float) -> str:
     """Convert seconds to SRT timestamp format: HH:MM:SS,mmm"""
     hours = int(seconds // 3600)
@@ -105,7 +117,7 @@ def generate_srt(
                 max_cps=float(getattr(settings, "SUBTITLE_MAX_CPS", 20.0)),
                 max_chars_per_line=int(getattr(settings, "SUBTITLE_MAX_CHARS_PER_LINE", 42)),
                 min_duration_ms=int(getattr(settings, "SUBTITLE_MIN_DURATION_MS", 833)),
-                max_duration_ms=int(getattr(settings, "SUBTITLE_MAX_DURATION_MS", 9000)),
+                max_duration_ms=int(getattr(settings, "SUBTITLE_MAX_DURATION_MS", 7000)),
                 smart_line_breaks=bool(getattr(settings, "SUBTITLE_SMART_LINE_BREAKS", True)),
             )
         except Exception:
@@ -118,6 +130,12 @@ def generate_srt(
         (s for s in segments if (s.text or "").strip()),
         key=lambda s: (s.start, s.end),
     )
+    # Final invariant: guarantee a small inter-cue gap so consecutive cues never
+    # ship TOUCHING (the post-readability sentence splitter emits contiguous
+    # pieces). Runs UNCONDITIONALLY — even when readability enforcement is off —
+    # since it only nudges endpoints (never merges/splits/reorders). This is the
+    # last mutation before the SRT is serialized.
+    segments = _apply_min_gap(segments)
     include_speakers = effective_include_speakers(segments, include_speakers)
 
     lines: list[str] = []
@@ -227,9 +245,10 @@ def generate_bilingual_srt(
         except Exception:
             pass
 
-    # Pair each source segment with its translated line, then sort the pairs
-    # chronologically so cues are emitted in order (corrupt upstream ordering
-    # can't produce out-of-order cues).
+    # Guarantee a min inter-cue gap on the source timings that drive the cues
+    # (same invariant as generate_srt), then pair each source segment with its
+    # translated line and sort the pairs chronologically so cues emit in order.
+    segments = _apply_min_gap(list(segments))
     paired = sorted(
         ((seg, translated_texts[i]) for i, seg in enumerate(segments)),
         key=lambda p: (p[0].start, p[0].end),

@@ -252,6 +252,95 @@ def distribute_cue_window(tokens: list[str], start: float, end: float) -> list[d
     return out
 
 
+def snap_cue_windows_to_reference(
+    cues: list,
+    whisper_en_words: list,
+    *,
+    pad_threshold: float = 0.4,
+    max_shift: float = 1.5,
+    lead_in: float = 0.1,
+    min_gap: float = 0.12,
+    min_dur_s: float = 0.833,
+    max_cps: float = 17.0,
+) -> int:
+    """Pull each cue's DISPLAY [start,end] toward the real speech the Whisper-EN
+    reference shows, so the subtitle appears/disappears WITH the words instead of
+    on the padded source (Japanese) sentence window.
+
+    INWARD-ONLY: the start may only move LATER (trim leading padding) and the end
+    only EARLIER (trim trailing padding) — never past the real onset/offset, never
+    beyond the source edges. Because both edges only move inward, the operation
+    can never create an overlap or a new merge/split (the gap to each neighbour can
+    only grow), so it is cue-count- and readability-neutral by construction. Only
+    trims padding larger than ``pad_threshold``; caps each edge's movement at
+    ``max_shift``; keeps a ``lead_in`` before the real onset; and refuses any trim
+    that would drop the visible duration below ``min_dur_s`` or below the text's
+    reading time at ``max_cps`` (so it never manufactures a duration/CPS
+    violation). Bracket markers and word-less/empty cues are skipped. Mutates
+    ``cues`` in place; returns the number of cues whose window changed."""
+    n_snapped = 0
+    for cue in (cues or []):
+        text = _cue_text(cue)
+        if _is_marker(text) or not text.strip():
+            continue
+        s0 = _cue_attr(cue, "start", None)
+        e0 = _cue_attr(cue, "end", None)
+        if s0 is None or e0 is None:
+            continue
+        s0, e0 = float(s0), float(e0)
+        if e0 - s0 <= 0:
+            continue
+        ref = _ref_words_in_window(whisper_en_words, s0, e0)
+        if not ref:
+            continue
+        onset, offset = ref[0][0], ref[-1][1]
+        new_s, new_e = s0, e0
+        # IN: trim leading padding (move start later, bounded, never past onset).
+        if onset - s0 > pad_threshold:
+            new_s = min(onset - lead_in, s0 + max_shift)
+            new_s = max(new_s, s0)               # inward only
+        # OUT: trim trailing padding (move end earlier, bounded, never past offset).
+        if e0 - offset > pad_threshold:
+            new_e = max(offset + lead_in, e0 - max_shift)
+            new_e = min(new_e, e0)               # inward only
+        # Never shrink below the min duration or the text's reading time — keep the
+        # in-snap (onset accuracy matters most) and give back trailing time first.
+        required = max(min_dur_s, len(text.strip()) / max_cps if max_cps > 0 else 0.0)
+        if new_e - new_s < required:
+            new_e = min(e0, new_s + required)
+            if new_e - new_s < required:
+                new_s = max(s0, new_e - required)
+        if abs(new_s - s0) < 1e-3 and abs(new_e - e0) < 1e-3:
+            continue
+        new_s, new_e = round(new_s, 3), round(new_e, 3)
+        if new_e <= new_s:
+            continue
+        # Re-clamp existing word timings into the corrected window (monotonic).
+        words = _cue_attr(cue, "words", None)
+        if words:
+            clamped = []
+            prev = new_s
+            for w in words:
+                ws = float(_word_attr(w, "start", new_s) or new_s)
+                we = float(_word_attr(w, "end", ws) or ws)
+                ws = max(new_s, min(new_e, ws))
+                we = max(ws, min(new_e, we))
+                if ws < prev:
+                    ws = prev
+                if we < ws:
+                    we = ws
+                clamped.append({"word": _word_attr(w, "word", ""),
+                                "start": round(ws, 3), "end": round(we, 3)})
+                prev = we
+            _set_words(cue, clamped)
+        if isinstance(cue, dict):
+            cue["start"], cue["end"] = new_s, new_e
+        else:
+            cue.start, cue.end = new_s, new_e
+        n_snapped += 1
+    return n_snapped
+
+
 def _ref_words_in_window(whisper_en_words: list, lo: float, hi: float) -> list:
     """Whisper-EN words whose span overlaps ``[lo, hi]``, time-ordered.
 
@@ -446,5 +535,28 @@ def project_hybrid_timings(
         else:
             _set_words(cue, distribute_cue_window(toks, lo, hi))
         n_c += 1
+    # Cue-onset snap (final step, gated OFF by default): pull each cue's DISPLAY
+    # window toward the real Whisper-EN speech so the subtitle appears/disappears
+    # WITH the words, cutting the per-cue start variance. Uses the FULL Whisper-EN
+    # stream (independent of HYBRID_REF_TIME_ANCHOR) and only when enabled.
+    n_snapped = 0
+    try:
+        from backend.config import settings as _s3
+        _snap_on = bool(getattr(_s3, "HYBRID_CUE_SNAP_ENABLED", False))
+    except Exception:
+        _s3, _snap_on = None, False
+    if _snap_on and whisper_words:
+        try:
+            n_snapped = snap_cue_windows_to_reference(
+                llm_cues, whisper_words,
+                pad_threshold=float(getattr(_s3, "HYBRID_CUE_SNAP_PAD_THRESHOLD_S", 0.4)),
+                max_shift=float(getattr(_s3, "HYBRID_CUE_SNAP_MAX_SHIFT_S", 1.5)),
+                lead_in=float(getattr(_s3, "HYBRID_CUE_SNAP_LEAD_IN_S", 0.1)),
+                min_gap=float(getattr(_s3, "HYBRID_CUE_SNAP_MIN_GAP_S", 0.12)),
+                min_dur_s=float(getattr(_s3, "SUBTITLE_MIN_DURATION_MS", 833)) / 1000.0,
+                max_cps=float(getattr(_s3, "SUBTITLE_MAX_CPS", 17.0)),
+            )
+        except Exception:
+            n_snapped = 0
     return {"tier_a": n_a, "tier_b": n_b, "tier_c": n_c,
-            "ref_anchored": ref_anchored, "total": total}
+            "ref_anchored": ref_anchored, "cue_snapped": n_snapped, "total": total}

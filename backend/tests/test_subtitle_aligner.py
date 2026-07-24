@@ -12,7 +12,7 @@ authoritative — Whisper-EN supplies timing only.
 from backend.models import TranscriptSegment, WordTimestamp
 from backend.services.subtitle_aligner import (
     project_word_timings, attach_source_pause_timings, flatten_whisper_words,
-    project_hybrid_timings,
+    project_hybrid_timings, snap_cue_windows_to_reference,
 )
 from backend.services.subtitle_formatter import enforce_readability
 
@@ -282,6 +282,95 @@ def test_no_whisper_text_leaks_into_output():
 
 
 # ── Merge pause cap (step 5): no run-on across a large source pause ──
+
+# ── Cue-onset snap: pull display window toward real Whisper-EN speech ──
+
+_SNAP_KW = dict(pad_threshold=0.4, max_shift=1.5, lead_in=0.1, min_gap=0.12,
+                min_dur_s=0.833, max_cps=17.0)
+
+
+def _ref_stream():
+    # Real speech spans 11.0..13.5 inside a padded window.
+    return flatten_whisper_words([_cue(11.0, 13.5, "the speech happens here now", words=_w([
+        (11.0, 11.4, "the"), (11.4, 12.0, "speech"), (12.0, 12.6, "happens"),
+        (12.6, 13.0, "here"), (13.0, 13.5, "now"),
+    ]))])
+
+
+def test_snap_trims_leading_and_trailing_pad():
+    cue = _cue(9.0, 15.0, "the speech happens here now")
+    n = snap_cue_windows_to_reference([cue], _ref_stream(), **_SNAP_KW)
+    assert n == 1
+    # Start pulled toward onset (11.0) minus lead-in, bounded by max_shift.
+    assert cue.start >= 9.0 and cue.start <= 11.0
+    assert cue.start > 9.0                      # leading pad trimmed
+    # End pulled toward offset (13.5), never later than the source end.
+    assert cue.end <= 15.0 and cue.end >= 13.5 - 1e-6
+    assert cue.end < 15.0                       # trailing pad trimmed
+    assert cue.end - cue.start >= 0.833 - 1e-6
+
+
+def test_snap_is_inward_only():
+    # Speech starts BEFORE the window (window is late) -> start must not move
+    # earlier (inward-only never expands).
+    cue = _cue(12.2, 16.0, "the speech happens here now")
+    snap_cue_windows_to_reference([cue], _ref_stream(), **_SNAP_KW)
+    assert cue.start >= 12.2 - 1e-6             # never moved earlier than source start
+
+
+def test_snap_pad_below_threshold_noop():
+    cue = _cue(10.9, 13.7, "the speech happens here now")   # <0.4s pad each side
+    n = snap_cue_windows_to_reference([cue], _ref_stream(), **_SNAP_KW)
+    assert n == 0 and cue.start == 10.9 and cue.end == 13.7
+
+
+def test_snap_no_ref_overlap_noop():
+    cue = _cue(40.0, 44.0, "elsewhere entirely on the timeline")
+    n = snap_cue_windows_to_reference([cue], _ref_stream(), **_SNAP_KW)
+    assert n == 0 and cue.start == 40.0 and cue.end == 44.0
+
+
+def test_snap_skips_markers():
+    cue = _cue(9.0, 15.0, "[♪ music ♪]")
+    n = snap_cue_windows_to_reference([cue], _ref_stream(), **_SNAP_KW)
+    assert n == 0 and cue.start == 9.0 and cue.end == 15.0
+
+
+def test_snap_respects_min_duration():
+    # A very short real-speech island in a wide window: trimming both edges must
+    # not shrink the cue below min_dur_s.
+    ref = flatten_whisper_words([_cue(11.0, 11.3, "hi", words=_w([(11.0, 11.3, "hi")]))])
+    cue = _cue(9.0, 15.0, "hi there")
+    snap_cue_windows_to_reference([cue], ref, **_SNAP_KW)
+    assert cue.end - cue.start >= 0.833 - 1e-6
+
+
+def test_snap_reclamps_words_into_window():
+    cue = _cue(9.0, 15.0, "the speech happens here now", words=_w([
+        (9.2, 9.6, "the"), (11.2, 11.6, "speech"), (12.1, 12.5, "happens"),
+        (12.6, 13.0, "here"), (14.4, 14.8, "now"),
+    ]))
+    snap_cue_windows_to_reference([cue], _ref_stream(), **_SNAP_KW)
+    prev = cue.start - 1e-9
+    for wd in cue.words:
+        assert cue.start - 1e-6 <= wd.start <= cue.end + 1e-6
+        assert wd.start >= prev - 1e-6          # monotonic
+        prev = wd.end
+
+
+def test_snap_default_off_in_hybrid():
+    # HYBRID_CUE_SNAP_ENABLED defaults False -> project_hybrid_timings must leave
+    # every cue.start/end untouched (regression fence for the default).
+    llm = [_cue(9.0, 15.0, "the speech happens here now")]
+    before = [(c.start, c.end) for c in llm]
+    tiers = project_hybrid_timings(
+        llm, whisper_en_segments=[_cue(11.0, 13.5, "the speech happens here now",
+            words=_w([(11.0, 11.4, "the"), (11.4, 12.0, "speech"),
+                      (12.0, 12.6, "happens"), (12.6, 13.0, "here"), (13.0, 13.5, "now")]))],
+        source_cues=None)
+    assert [(c.start, c.end) for c in llm] == before
+    assert tiers.get("cue_snapped", 0) == 0
+
 
 def test_merge_hard_cap_blocks_large_pause():
     from backend.services.subtitle_formatter import _merge_for_readability

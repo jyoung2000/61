@@ -1462,6 +1462,24 @@ class Settings(BaseSettings):
                                                 # Clause-level resegmentation +
                                                 # the 2-line/CPS budget keep
                                                 # normal-pace cues ~4-5s.
+    # An un-splittable over-long cue (a single word like "Above?", or a
+    # ``[♪ music ♪]`` / ``[♪ Ending theme ♪]`` marker) has no linguistic boundary
+    # and no word-gap to split on, so the duration-splitter leaves it at its full
+    # source-window span — the ED-theme marker shipped as ONE 99.46s on-screen cue,
+    # and single words lingered 9-13s. A non-speech MARKER is capped to this short,
+    # fixed on-screen hold (a viewer reads "[♪ Ending theme ♪]" in a second or two;
+    # the rest of the instrumental plays with no caption, exactly like pro subs);
+    # an un-splittable DIALOGUE cue is capped to its reading time + SUBTITLE_MAX_LINGER_S
+    # (both clamped into [min,max] duration). 0 disables the marker cap.
+    SUBTITLE_MARKER_MAX_DURATION_S: float = 4.0
+    # Minimum gap (ms) guaranteed between consecutive cues at EXPORT time. The
+    # pipeline's post-readability sentence splitter emits contiguous pieces
+    # (left.end == right.start), so 176/327 cues shipped touching at 0 ms — pro
+    # subtitles (YouTube ~42ms, Netflix 2 frames ≈ 80ms @24fps) always leave a
+    # small gap so consecutive cues visibly re-draw. A final gap-only pass on every
+    # SRT/VTT export nudges touching/overlapping cue ends apart by this much
+    # (never merging, splitting, or reordering). 0 disables it.
+    SUBTITLE_MIN_GAP_MS: int = 80
     SUBTITLE_SMART_LINE_BREAKS: bool = True     # linguistic boundary breaks
     # Minimum characters a split piece may carry. Stops the duration
     # splitter from shattering slow / dramatic narration (Whisper detects
@@ -1722,6 +1740,22 @@ class Settings(BaseSettings):
     # Falls back to the plain window distribution only when no reference word
     # overlaps the cue.
     HYBRID_REF_TIME_ANCHOR: bool = True
+    # Cue-onset snap (in/out): the tiers above place cue.words on the real voiced
+    # timeline but keep the cue's DISPLAY [start,end] at the source (Japanese)
+    # sentence window — which is off by a per-cue-random amount (measured start
+    # variance stdev 2.24s vs a YouTube reference). When enabled, each cue whose
+    # window overlaps real Whisper-EN speech has its in/out pulled toward the real
+    # onset/offset. INWARD-ONLY (only trims leading/trailing padding — never moves
+    # a boundary earlier than the source start or later than the source end), so it
+    # can only pull the subtitle TOWARD the speech, never away. Ships OFF: it moves
+    # display windows, so validate on a real run before enabling. When on, it is
+    # bounded and guarded (see the knobs below) to stay cue-count- and
+    # readability-neutral by construction.
+    HYBRID_CUE_SNAP_ENABLED: bool = False
+    HYBRID_CUE_SNAP_PAD_THRESHOLD_S: float = 0.4   # only trim padding larger than this
+    HYBRID_CUE_SNAP_MAX_SHIFT_S: float = 1.5       # cap per-boundary movement
+    HYBRID_CUE_SNAP_LEAD_IN_S: float = 0.1         # keep a lead-in before real onset
+    HYBRID_CUE_SNAP_MIN_GAP_S: float = 0.12        # neighbour guard (≥ readability min_gap)
     # Time margin (s) around an LLM cue when gathering Whisper-EN candidate words
     # (the two translations drift, so allow slack at the edges).
     HYBRID_ALIGN_MARGIN_S: float = 2.0

@@ -100,7 +100,7 @@ def generate_vtt(
             max_cps=float(getattr(settings, "SUBTITLE_MAX_CPS", 20.0)),
             max_chars_per_line=int(getattr(settings, "SUBTITLE_MAX_CHARS_PER_LINE", 42)),
             min_duration_ms=int(getattr(settings, "SUBTITLE_MIN_DURATION_MS", 833)),
-            max_duration_ms=int(getattr(settings, "SUBTITLE_MAX_DURATION_MS", 9000)),
+            max_duration_ms=int(getattr(settings, "SUBTITLE_MAX_DURATION_MS", 7000)),
             smart_line_breaks=bool(getattr(settings, "SUBTITLE_SMART_LINE_BREAKS", True)),
         )
 
@@ -114,6 +114,16 @@ def generate_vtt(
         (s for s in segments if (s.text or "").strip()),
         key=lambda s: (s.start, s.end),
     )
+    # Final invariant: guarantee a small inter-cue gap so consecutive cues never
+    # ship touching (parity with generate_srt). Endpoint-nudge only; fail-soft.
+    try:
+        from backend.services.subtitle_formatter import enforce_min_gap
+        segments = enforce_min_gap(
+            segments,
+            min_gap_s=float(getattr(settings, "SUBTITLE_MIN_GAP_MS", 80)) / 1000.0,
+        )
+    except Exception:
+        pass
     from backend.services.srt_generator import effective_include_speakers
     include_speakers = effective_include_speakers(segments, include_speakers)
 

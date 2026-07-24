@@ -914,6 +914,16 @@ def enforce_readability(
     max_dur_s = max_duration_ms / 1000.0
     min_dur_s = min_duration_ms / 1000.0
     min_gap_s = min_gap_ms / 1000.0
+    # Trim caps for an over-long cue the splitter can't divide (single word /
+    # bracket marker): a non-speech marker gets a short fixed hold; a dialogue
+    # cue gets its reading time + a bounded linger. Both clamped into
+    # [min_dur_s, max_dur_s] so the trim can never violate the min-duration floor.
+    try:
+        from backend.config import settings as _cap_s
+        _marker_max_s = float(getattr(_cap_s, "SUBTITLE_MARKER_MAX_DURATION_S", 4.0) or 0.0)
+        _cap_linger_s = float(getattr(_cap_s, "SUBTITLE_MAX_LINGER_S", 2.5) or 0.0)
+    except Exception:
+        _marker_max_s, _cap_linger_s = 4.0, 2.5
 
     # ── Pass 0: repair implausibly-short giant cues ────────────────────
     # A corrupt upstream segment can carry a huge block of text with a tiny
@@ -1186,6 +1196,48 @@ def enforce_readability(
                 break
         for piece in queue:
             dur = piece.end - piece.start
+            # Pass 2b: cap an un-splittable over-long cue. The split loop above
+            # only ever SHRINKS via successful splits; a single word ("Above?")
+            # or a "[♪ … ♪]" marker has no linguistic boundary and no word-gap,
+            # so _try_split_one returned None and the piece kept its full
+            # source-window span (the ED-theme marker shipped at 99.46s). Trim
+            # the display end down: a bracket marker to a short fixed hold, a
+            # dialogue cue to its reading time + a bounded linger — both clamped
+            # into [min_dur_s, max_dur_s]. Text is never changed (the word still
+            # reads); only the on-screen hold shrinks. Trimming moves the end
+            # EARLIER, so it can only widen the gap to the next cue, never overrun
+            # it (Pass 4 gap enforcement below is unaffected).
+            if dur > max_dur_s:
+                _txt = (piece.text or "").strip()
+                if _is_bracket_marker(_txt) and _marker_max_s > 0:
+                    _target = _marker_max_s
+                else:
+                    _read_s = (_cps(_txt, 1.0) / max_cps) if max_cps > 0 else dur
+                    _target = _read_s + _cap_linger_s
+                _new_end = piece.start + max(min_dur_s, min(_target, max_dur_s))
+                if _new_end < piece.end:
+                    # Drop word timings that start past the trimmed end and clamp
+                    # an overhanging word's end back to the boundary, so the
+                    # karaoke highlight stays inside the shortened window.
+                    _words = piece.words
+                    if _words:
+                        _kept = []
+                        for _w in _words:
+                            _ws = _w.start if not isinstance(_w, dict) else _w.get("start", 0.0)
+                            if float(_ws or 0.0) < _new_end:
+                                _we = _w.end if not isinstance(_w, dict) else _w.get("end", 0.0)
+                                if float(_we or 0.0) > _new_end:
+                                    _w = WordTimestamp(
+                                        start=float(_ws or 0.0), end=round(_new_end, 3),
+                                        word=(_w.word if not isinstance(_w, dict) else _w.get("word", "")),
+                                    )
+                                _kept.append(_w)
+                        _words = _kept
+                    piece = TranscriptSegment(
+                        start=piece.start, end=round(_new_end, 3), text=piece.text,
+                        speaker=piece.speaker, words=_words, confidence=piece.confidence,
+                    )
+                    dur = piece.end - piece.start
             if dur < min_dur_s:
                 piece = TranscriptSegment(
                     start=piece.start, end=piece.start + min_dur_s, text=piece.text,
@@ -1295,6 +1347,43 @@ def enforce_readability(
         out3.append(seg)
 
     return out3
+
+
+def enforce_min_gap(segments, min_gap_s: float = 0.08):
+    """Guarantee at least ``min_gap_s`` between consecutive cues — the final,
+    export-time timing invariant.
+
+    ``enforce_readability`` is NOT the last transform on the translated track:
+    the pipeline's post-readability sentence splitter (``split_run_on_cues``)
+    emits contiguous pieces where ``left.end == right.start``, and the
+    marker/merge passes abut cues too, so cues shipped TOUCHING (0 ms gap) —
+    unlike professional subtitles, which always leave a small visible gap
+    (YouTube ~42 ms, Netflix ~80 ms) so consecutive cues re-draw.
+
+    This helper ONLY nudges endpoints: it walks chronologically and, whenever the
+    next cue starts before ``prev.end + min_gap_s`` (touching OR overlapping),
+    pulls ``prev.end`` back to open the gap. It NEVER merges, splits, reorders, or
+    edits text, so it can't undo an upstream sentence split or change the cue /
+    word count — safe to run unconditionally as the last step before serializing
+    an SRT/VTT. Idempotent. Prioritizes non-overlap over min-duration: if the gap
+    can't fit, ``prev.end`` sits flush at its own start rather than inverting.
+    Accepts ``TranscriptSegment`` objects (mutated in place) and returns them
+    sorted; a non-positive ``min_gap_s`` is a no-op passthrough."""
+    segs = sorted(
+        (s for s in (segments or []) if s is not None),
+        key=lambda s: (float(getattr(s, "start", 0.0) or 0.0),
+                       float(getattr(s, "end", 0.0) or 0.0)),
+    )
+    if min_gap_s <= 0:
+        return segs
+    for i in range(len(segs) - 1):
+        cur, nxt = segs[i], segs[i + 1]
+        if float(nxt.start) < float(cur.end) + min_gap_s:
+            new_end = round(float(nxt.start) - min_gap_s, 3)
+            if new_end < float(cur.start):
+                new_end = round(float(cur.start), 3)   # never invert
+            cur.end = new_end
+    return segs
 
 
 def _hard_wrap_lines(text: str, max_chars: int, max_lines: int) -> str:
