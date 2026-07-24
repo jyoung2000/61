@@ -858,8 +858,15 @@ class Settings(BaseSettings):
     # near-zero lag on fast moves, heavy smoothing when slow — the direct
     # "smooth AND snappy" lever. Set False to restore the fixed-band EMA.
     REFRAMER_ONE_EURO_FILTER: bool = True
-    REFRAMER_ONE_EURO_MINCUTOFF: float = 1.0   # Hz — lower = smoother when slow
-    REFRAMER_ONE_EURO_BETA: float = 0.02       # speed coefficient — higher = snappier
+    # Tuned for a GENTLER, more human-operator feel: a real camera op eases into
+    # a move and holds rock-steady on a near-still subject rather than snapping.
+    # mincutoff 1.0→0.7 smooths low-speed micro-jitter (steadier holds); beta
+    # 0.02→0.013 eases the follow so fast subject moves are tracked with a soft
+    # lead-in instead of a robotic jump. The subject-containment clamp bounds the
+    # extra lag so nobody drifts out of frame. Raise both to restore snappier
+    # (more reactive, less fluid) tracking.
+    REFRAMER_ONE_EURO_MINCUTOFF: float = 0.7   # Hz — lower = smoother when slow
+    REFRAMER_ONE_EURO_BETA: float = 0.013      # speed coefficient — higher = snappier
     REFRAMER_ONE_EURO_DCUTOFF: float = 1.0     # Hz — derivative smoothing cutoff
     # Non-causal Savitzky-Golay pass over the whole target-x trajectory after
     # the keyframe smoother (we render offline, so lookahead is free). Kills
