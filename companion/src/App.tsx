@@ -7,7 +7,7 @@ import {
   CompanionStatus, getStatus, setConfig, regenerateToken,
   installOllama, startOllama, pullModel, pairClipai,
   listModels, deleteModel, InstalledModel,
-  downloadWhisper, refreshSidecar, installVision, refreshVision, uninstallVision, exportLogs, testClipai, ClipaiTest, freeVram, endActiveJob,
+  downloadWhisper, refreshSidecar, exportLogs, testClipai, ClipaiTest, freeVram, endActiveJob,
   checkAppUpdate, installAppUpdate, AppUpdateCheck,
 } from './api';
 
@@ -448,24 +448,6 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
 
   const doRefreshWhisper = async () => {
     try { await refreshSidecar(); } catch {}
-    refresh();
-  };
-
-  const doInstallVision = async () => {
-    try {
-      await installVision();  // background; progress arrives via status.vision_install
-      refresh();
-    } catch { /* surfaced via status.vision_install.error */ }
-  };
-
-  const doRefreshVision = async () => {
-    try { await refreshVision(); } catch {}
-    refresh();
-  };
-
-  const doUninstallVision = async () => {
-    if (!window.confirm('Remove the vision offload? Face detection returns to the ClipAI server GPU. You can reinstall any time.')) return;
-    try { await uninstallVision(); } catch { /* ignore */ }
     refresh();
   };
 
@@ -1231,104 +1213,6 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
               ⚡ Whisper GPU build installed — transcription runs on the {status.gpu.gpu_name || 'GPU'}.
             </div>
           )}
-          {(() => {
-            const vi = status.vision_install;
-            const busy = !!vi?.active;
-            // Install is authoritative while it runs: available/running can flip
-            // true mid-install (the venv resolves before torch is even done), so
-            // the loading bar must be driven by `busy`, not availability.
-            const ready = !busy && (status.vision_running || status.vision_available);
-            // Friendly stage labels + a monotone floor so the bar only ever
-            // moves forward across the phases (python→venv→torch→deps→model→start).
-            const STAGE_LABEL: Record<string, string> = {
-              preparing: 'Preparing…',
-              python: 'Setting up Python…',
-              venv: 'Creating the Python environment…',
-              torch: 'Installing PyTorch (CUDA) — the big one, this takes a few minutes…',
-              deps: 'Installing YOLO-World + dependencies…',
-              model: 'Downloading the model from ClipAI…',
-              starting: 'Starting the vision sidecar…',
-              running: 'Running',
-              error: 'Failed',
-            };
-            const dotColor = busy ? 'var(--accent-amber, #e0a52a)'
-              : ready ? 'var(--success)'
-              : (vi?.stage === 'error' ? 'var(--accent-amber, #e0a52a)' : 'var(--muted)');
-            const pct = typeof vi?.percent === 'number' ? vi.percent : -1;
-            return (
-              <>
-                <div className="row small" style={{ marginBottom: 6 }}>
-                  <span className="dot" style={{ background: dotColor }} />
-                  Vision (face-detection) offload {busy ? 'installing…'
-                    : status.vision_running ? 'running'
-                    : status.vision_available ? 'ready (starts on demand)'
-                    : 'not installed (optional) — ClipAI’s face-detection runs on the ClipAI server’s GPU instead'}
-                </div>
-
-                {/* ── Loading bar: visible for the WHOLE install ── */}
-                {busy && (
-                  <div style={{ margin: '0 0 10px 17px' }}>
-                    <div className="row small" style={{ justifyContent: 'space-between', marginBottom: 3 }}>
-                      <span style={{ fontWeight: 600 }}>{STAGE_LABEL[vi.stage] || 'Installing…'}</span>
-                      {pct >= 0 && <span className="muted">{Math.round(pct)}%</span>}
-                    </div>
-                    <div className={`meter${pct < 0 ? ' indeterminate' : ''}`}>
-                      <div style={pct < 0 ? undefined : { width: `${Math.max(2, Math.min(100, pct))}%` }} />
-                    </div>
-                    {/* Live command / pip output line. */}
-                    {vi.message && (
-                      <div className="small muted mono" style={{
-                        marginTop: 4, whiteSpace: 'nowrap', overflow: 'hidden',
-                        textOverflow: 'ellipsis', opacity: 0.8,
-                      }}>
-                        {vi.message}
-                      </div>
-                    )}
-                  </div>
-                )}
-
-                {ready && (
-                  <div style={{ margin: '0 0 8px 17px' }}>
-                    <div className="small muted" style={{ marginBottom: 4 }}>
-                      ⚡ Vision offload installed. When this GPU has spare VRAM, face detection
-                      runs here alongside Whisper; if VRAM is tight, ClipAI keeps faces on its own
-                      GPU so the two don’t compete.
-                    </div>
-                    <button className="secondary" onClick={doUninstallVision}
-                      title="Stop and delete the vision offload; face detection returns to the ClipAI server GPU">
-                      ✕ Remove vision offload
-                    </button>
-                  </div>
-                )}
-
-                {!busy && !ready && (
-                  <div style={{ margin: '0 0 8px 17px' }}>
-                    <div className="small muted" style={{ marginBottom: 6 }}>
-                      Run ClipAI’s heaviest analysis stage — face/subject detection — on the
-                      {' '}{status.gpu.gpu_name || 'GPU'} instead of the small server card. Click
-                      Install and the Companion fetches everything itself (Python, PyTorch, the
-                      model) — no GitHub. You can also trigger this remotely from ClipAI → Settings.
-                    </div>
-                    <div className="row" style={{ marginBottom: vi?.error ? 6 : 0 }}>
-                      <button className="secondary" onClick={doInstallVision}
-                        title="Install the YOLO-World face-detection sidecar from source so this GPU runs ClipAI's FACES stage">
-                        ⬇ Install Vision offload
-                      </button>
-                      <button className="secondary" onClick={doRefreshVision}
-                        title="Re-check whether the vision sidecar is installed">
-                        ↻ Refresh
-                      </button>
-                    </div>
-                    {vi?.error && (
-                      <div className="small" style={{ color: 'var(--accent-amber, #e0a52a)' }}>
-                        Install failed: {vi.error}
-                      </div>
-                    )}
-                  </div>
-                )}
-              </>
-            );
-          })()}
           <div className="small muted" style={{ margin: '8px 0 4px' }}>
             Ollama endpoint for ClipAI (easiest: use “Pair now” below — it fills this in
             automatically):

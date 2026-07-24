@@ -12,7 +12,6 @@ pub mod pairing;
 pub mod proxy;
 pub mod sidecar;
 pub mod state;
-pub mod vision;
 
 use serde::Deserialize;
 use state::AppState;
@@ -151,7 +150,6 @@ async fn get_status(
         whisper_model
     };
     let sidecar_running = state.sidecar.lock().await.is_some();
-    let vision_running = state.vision_sidecar.lock().await.is_some();
     // VRAM ClipAI is actively holding: resident Ollama models (/api/ps) plus a
     // rough whisper-model footprint while transcribing (whisper.cpp VRAM isn't
     // in /api/ps). Lets the GUI color ClipAI's use vs unrelated apps (games).
@@ -174,11 +172,6 @@ async fn get_status(
     let rd = app.path().resource_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let dd = app.path().app_data_dir().unwrap_or_else(|_| rd.clone());
     let whisper_build = sidecar::build_kind(&rd, &dd);
-    // Vision (face-detection) offload: whether the sidecar binary is present
-    // (bundled or downloaded) OR a vision server is already answering on the
-    // sidecar port (run from source) — either lets ClipAI push YOLO-World
-    // onto this GPU.
-    let vision_available = vision::available(&rd, &dd) || vision::healthy().await;
     let (speed_parallel, speed_loaded) = state.resolve_speed_settings();
     let activity: Vec<state::ActivityEntry> =
         state.activity.lock().unwrap().iter().cloned().collect();
@@ -256,9 +249,6 @@ async fn get_status(
         "sidecar_available": state.sidecar_available.load(Ordering::Relaxed),
         "sidecar_running": sidecar_running,
         "whisper_build": whisper_build,
-        "vision_available": vision_available,
-        "vision_running": vision_running,
-        "vision_install": state.vision_install.lock().unwrap().clone(),
         "busy": state.whisper_busy.load(Ordering::Relaxed),
         "current_job": current_job,
         "job_progress": job_progress,
@@ -486,70 +476,6 @@ async fn download_whisper(
         .sidecar_available
         .store(sidecar::available(&rd, &dd), Ordering::Relaxed);
     Ok(msg)
-}
-
-/// Re-probe whether the vision sidecar binary is present (bundled or
-/// downloaded) — the "Refresh" button after a Download. Returns availability.
-#[tauri::command]
-fn refresh_vision(app: tauri::AppHandle) -> bool {
-    let rd = app.path().resource_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let dd = app.path().app_data_dir().unwrap_or_else(|_| rd.clone());
-    vision::available(&rd, &dd)
-}
-
-/// Install the vision sidecar (YOLO-World face-detection offload) FROM SOURCE
-/// on this GPU machine — Python (system or python.org), torch (pytorch.org),
-/// deps (PyPI), and the model weight (streamed from the paired ClipAI over the
-/// LAN). No GitHub. Runs in the background; the GUI watches `vision_install`
-/// from get_status. The remote container button drives the same installer via
-/// the proxy route /v1/vision/install.
-#[tauri::command]
-async fn install_vision(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, SharedState>,
-) -> Result<(), String> {
-    let rd = app.path().resource_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let dd = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("no app data dir: {e}"))?;
-    // The YOLO-World weight is served by the paired ClipAI container over the
-    // LAN (never GitHub). Prefer the explicitly-paired URL, else the one we've
-    // seen inbound traffic from.
-    let base = {
-        let cfg = state.config_snapshot();
-        let paired = cfg.paired_clipai_url.trim().trim_end_matches('/').to_string();
-        if !paired.is_empty() {
-            paired
-        } else {
-            state.seen_clipai_url.lock().unwrap().trim().trim_end_matches('/').to_string()
-        }
-    };
-    let model_url = if base.is_empty() {
-        None
-    } else {
-        Some(format!("{base}/api/downloads/companion/vision-model"))
-    };
-    let st = state.inner().clone();
-    tauri::async_runtime::spawn(async move {
-        vision::install_from_source(st, rd, dd, model_url, None).await;
-    });
-    Ok(())
-}
-
-/// Remove the vision offload: stop the sidecar and delete its venv/model so
-/// ClipAI stops offloading face detection to this GPU — a clean revert to the
-/// faster faces-local arrangement. Mirrors the remote /v1/vision/uninstall.
-#[tauri::command]
-async fn uninstall_vision(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, SharedState>,
-) -> Result<(), String> {
-    let dd = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("no app data dir: {e}"))?;
-    vision::uninstall(&state, &dd).await
 }
 
 /// Format a ms-epoch as local time, or "-" for 0/unset.
@@ -1630,9 +1556,6 @@ pub fn run() {
             delete_model,
             refresh_sidecar,
             download_whisper,
-            refresh_vision,
-            install_vision,
-            uninstall_vision,
             export_logs,
             test_clipai,
             free_vram,

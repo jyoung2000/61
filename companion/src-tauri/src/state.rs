@@ -280,11 +280,6 @@ pub struct AppState {
     pub gpu: Mutex<GpuSnapshot>,
     /// Whisper sidecar child (spawned lazily, reaped on idle).
     pub sidecar: tokio::sync::Mutex<Option<crate::sidecar::SidecarHandle>>,
-    /// Vision sidecar child (face-detection offload; lazily spawned).
-    pub vision_sidecar: tokio::sync::Mutex<Option<tokio::process::Child>>,
-    /// Live progress of a from-source vision-offload install (prerequisites +
-    /// deps). Read by the local GUI and the remote container status route.
-    pub vision_install: Mutex<crate::vision::InstallProgress>,
     /// Managed Ollama child (None when an external Ollama is used).
     pub ollama_child: tokio::sync::Mutex<Option<tokio::process::Child>>,
     /// Guard so concurrent ensure_running() calls don't spawn `ollama serve`
@@ -421,8 +416,6 @@ impl AppState {
             last_auto_apply_ms: AtomicU64::new(0),
             last_auto_baseline_mb: AtomicU64::new(u64::MAX),
             whisper_slot: tokio::sync::Semaphore::new(1),
-            vision_sidecar: tokio::sync::Mutex::new(None),
-            vision_install: Mutex::new(crate::vision::InstallProgress::default()),
             last_request_ms: AtomicU64::new(now_ms()),
             last_gpu_free_marker: AtomicU64::new(0),
             whisper_busy: AtomicBool::new(false),

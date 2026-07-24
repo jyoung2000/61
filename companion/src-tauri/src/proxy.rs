@@ -485,28 +485,6 @@ async fn whisper_proxy(State(ctx): State<ProxyCtx>, req: Request<Body>) -> Respo
             .into_response();
     };
     ctx.state.whisper_busy.store(true, Ordering::Relaxed);
-    // The vision offload and Whisper both want THIS GPU. On a small, contended
-    // card a resident vision sidecar + a concurrent decode starved transcription
-    // and made the Companion unresponsive — so a decode used to kill vision
-    // outright. But on a big card (a 4070's 12 GB) YOLO (~2 GB) + Whisper (~2 GB)
-    // coexist with room to spare, and killing vision there just forces faces back
-    // onto ClipAI's small SERVER GPU (the 1h+ face loop the offload exists to
-    // avoid). So decide by LIVE free VRAM: keep vision running when the GPU still
-    // has headroom for the decode, stop it only when memory is tight.
-    const KEEP_VISION_MIN_FREE_MB: u64 = 1536;
-    let free_mb = crate::gpu::snapshot().vram_free_mb;
-    if free_mb >= KEEP_VISION_MIN_FREE_MB {
-        log::info!(
-            "vision offload kept running alongside whisper decode \
-             ({free_mb} MB free >= {KEEP_VISION_MIN_FREE_MB} MB headroom)"
-        );
-    } else {
-        crate::vision::shutdown(
-            &ctx.state,
-            "whisper decode starting (low VRAM, no room for both)",
-        )
-        .await;
-    }
 
     let activity = ctx.state.begin_activity(
         "whisper",
@@ -649,161 +627,6 @@ async fn sidecar_warm(State(ctx): State<ProxyCtx>, req: Request<Body>) -> Respon
     (StatusCode::ACCEPTED, "warming").into_response()
 }
 
-/// /v1/vision/health → 200 when the vision sidecar is (or can be) serving.
-/// Lazily STARTS the sidecar: ClipAI only probes this when face detection is
-/// about to run, so the probe doubles as the warm-up. 404 when no vision
-/// binary is installed — ClipAI then keeps detection local, no error.
-async fn vision_health(State(ctx): State<ProxyCtx>, req: Request<Body>) -> Response {
-    if !authorized(&ctx, req.headers()) {
-        return unauthorized();
-    }
-    if ctx.state.config.lock().unwrap().paused {
-        return paused();
-    }
-    // Available = a packaged/downloaded binary OR a vision server already
-    // running on the sidecar port (started from source). The latter is the
-    // CI-free path used when the release asset can't be built.
-    if !crate::vision::available(&ctx.resource_dir, &ctx.data_dir)
-        && !crate::vision::healthy().await
-    {
-        return (StatusCode::NOT_FOUND, "no vision sidecar installed").into_response();
-    }
-    // Honor the user's Speed settings: eco profile / a small VRAM budget
-    // keep face detection on the ClipAI server (ClipAI treats any non-200
-    // as "stay local", so this degrades silently and safely).
-    {
-        let (profile, budget) = (
-            ctx.state.config.lock().unwrap().speed_profile.clone(),
-            ctx.state.effective_budget_gb(),
-        );
-        if !crate::vision::allowed(&profile, budget) {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "vision offload disabled by speed settings (eco profile or <5 GB budget)",
-            )
-                .into_response();
-        }
-    }
-    match crate::vision::ensure_running(
-        &ctx.state, ctx.resource_dir.clone(), ctx.data_dir.clone()).await
-    {
-        Ok(()) => (StatusCode::OK, "ok").into_response(),
-        Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
-    }
-}
-
-/// /v1/vision/detect → forward one frame to the vision sidecar. Any failure
-/// maps to a plain error status; ClipAI's client counts failures and falls
-/// back to local inference (breaker after a few in a row).
-async fn vision_detect(State(ctx): State<ProxyCtx>, req: Request<Body>) -> Response {
-    if !authorized(&ctx, req.headers()) {
-        return unauthorized();
-    }
-    if ctx.state.config.lock().unwrap().paused {
-        return paused();
-    }
-    let body = match axum::body::to_bytes(req.into_body(), 32 * 1024 * 1024).await {
-        Ok(b) => b,
-        Err(e) => return (StatusCode::BAD_REQUEST, format!("bad body: {e}")).into_response(),
-    };
-    let upstream = ctx
-        .client
-        .post(format!("{}/v1/vision/detect", crate::vision::vision_url()))
-        .header("content-type", "application/json")
-        .body(body.to_vec())
-        .send()
-        .await;
-    match upstream {
-        Ok(resp) => relay(resp),
-        Err(e) => (StatusCode::BAD_GATEWAY, format!("vision sidecar failed: {e}"))
-            .into_response(),
-    }
-}
-
-#[derive(serde::Deserialize, Default)]
-struct VisionInstallReq {
-    /// URL the Companion should stream the YOLO-World weight from (ClipAI's
-    /// own /api/downloads/companion/vision-model). Keeps the install off GitHub.
-    model_url: Option<String>,
-    /// Optional bearer token for that URL (unused when the route is public).
-    token: Option<String>,
-}
-
-/// POST /v1/vision/install → kick off the from-source vision-offload install
-/// on THIS machine (Python, torch, deps, model — no GitHub). Returns 202
-/// immediately; ClipAI polls /v1/vision/install/status for progress.
-async fn vision_install(State(ctx): State<ProxyCtx>, req: Request<Body>) -> Response {
-    if !authorized(&ctx, req.headers()) {
-        return unauthorized();
-    }
-    if ctx.state.config.lock().unwrap().paused {
-        return paused();
-    }
-    let body = match axum::body::to_bytes(req.into_body(), 64 * 1024).await {
-        Ok(b) => b,
-        Err(e) => return (StatusCode::BAD_REQUEST, format!("bad body: {e}")).into_response(),
-    };
-    let parsed: VisionInstallReq = serde_json::from_slice(&body).unwrap_or_default();
-    // Model URL: honor an explicit one, else derive from the ClipAI base we
-    // already talk to (paired URL, else the peer we've seen) — the container
-    // needn't know its own reachable address. Never GitHub.
-    let model_url = parsed.model_url.filter(|s| !s.trim().is_empty()).or_else(|| {
-        let base = {
-            let paired = ctx.state.config.lock().unwrap().paired_clipai_url.trim().trim_end_matches('/').to_string();
-            if !paired.is_empty() {
-                paired
-            } else {
-                ctx.state.seen_clipai_url.lock().unwrap().trim().trim_end_matches('/').to_string()
-            }
-        };
-        if base.is_empty() {
-            None
-        } else {
-            Some(format!("{base}/api/downloads/companion/vision-model"))
-        }
-    });
-    let st = ctx.state.clone();
-    let rd = ctx.resource_dir.clone();
-    let dd = ctx.data_dir.clone();
-    tokio::spawn(async move {
-        crate::vision::install_from_source(st, rd, dd, model_url, parsed.token).await;
-    });
-    (StatusCode::ACCEPTED, "vision install started").into_response()
-}
-
-/// POST /v1/vision/uninstall → stop + remove the from-source vision offload,
-/// reverting to faces-local. Lets ClipAI (or the GUI) undo a bad install
-/// remotely when the offload is hurting the pipeline.
-async fn vision_uninstall(State(ctx): State<ProxyCtx>, req: Request<Body>) -> Response {
-    if !authorized(&ctx, req.headers()) {
-        return unauthorized();
-    }
-    match crate::vision::uninstall(&ctx.state, &ctx.data_dir).await {
-        Ok(()) => (StatusCode::OK, "vision offload removed").into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-    }
-}
-
-/// GET /v1/vision/install/status → live install progress + whether the sidecar
-/// is answering. ClipAI's Settings card polls this to drive its progress bar.
-async fn vision_install_status(State(ctx): State<ProxyCtx>, req: Request<Body>) -> Response {
-    if !authorized(&ctx, req.headers()) {
-        return unauthorized();
-    }
-    let snap = ctx.state.vision_install.lock().unwrap().clone();
-    let healthy = crate::vision::healthy().await;
-    Json(serde_json::json!({
-        "active": snap.active,
-        "stage": snap.stage,
-        "percent": snap.percent,
-        "message": snap.message,
-        "error": snap.error,
-        "updated_ms": snap.updated_ms,
-        "healthy": healthy,
-        "available": crate::vision::available(&ctx.resource_dir, &ctx.data_dir) || healthy,
-    }))
-    .into_response()
-}
 
 /// /v1/gpu/release → free the WHOLE GPU on request: whisper sidecar stopped
 /// (skipped, never killed, when a decode holds the slot) AND every resident
@@ -833,8 +656,8 @@ async fn gpu_release(State(ctx): State<ProxyCtx>, req: Request<Body>) -> Respons
 
 /// /v1/jobs/force-end → remotely end EVERYTHING the Companion is doing for
 /// ClipAI: clear + suppress the active-job display, kill the whisper sidecar
-/// EVEN MID-DECODE (that decode belongs to the job being ended), shut the
-/// vision sidecar down and evict every resident Ollama model.
+/// EVEN MID-DECODE (that decode belongs to the job being ended), and evict
+/// every resident Ollama model.
 ///
 /// The remote sibling of the GUI "Force end" button (``end_active_job`` in
 /// lib.rs), driven by ClipAI's Settings → GPU Companion card. Unlike
@@ -1459,11 +1282,6 @@ fn build_router(ctx: ProxyCtx) -> Router {
         .route("/v1/progress", post(progress_report))
         .route("/v1/sidecar/release", post(sidecar_release))
         .route("/v1/sidecar/warm", post(sidecar_warm))
-        .route("/v1/vision/health", get(vision_health))
-        .route("/v1/vision/detect", post(vision_detect))
-        .route("/v1/vision/install", post(vision_install))
-        .route("/v1/vision/install/status", get(vision_install_status))
-        .route("/v1/vision/uninstall", post(vision_uninstall))
         .route("/v1/update/install", post(update_install))
         .route("/v1/update/status", get(update_status))
         .route("/v1/gpu/release", post(gpu_release))

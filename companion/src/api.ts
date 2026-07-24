@@ -84,19 +84,6 @@ export interface CompanionStatus {
   sidecar_running: boolean;
   /** Which whisper build is installed: "gpu" (CUDA), "cpu", "bundled", "none". */
   whisper_build: 'gpu' | 'cpu' | 'bundled' | 'none';
-  /** Vision (face-detection) offload sidecar present (binary or from-source). */
-  vision_available: boolean;
-  /** Vision sidecar process currently running. */
-  vision_running: boolean;
-  /** Live from-source vision-install progress. */
-  vision_install: {
-    active: boolean;
-    stage: string;
-    percent: number;
-    message: string;
-    error: string | null;
-    updated_ms: number;
-  };
   busy: boolean;
   current_job: ActivityEntry | null;
   job_progress: number | null;
@@ -126,12 +113,6 @@ export const listModels = () => invoke<InstalledModel[]>('list_models');
 export const deleteModel = (model: string) => invoke('delete_model', { model });
 export const downloadWhisper = () => invoke<string>('download_whisper');
 export const refreshSidecar = () => invoke<boolean>('refresh_sidecar');
-/** Install the vision offload FROM SOURCE (Python/torch/deps/model — no GitHub).
- *  Runs in the background; watch `vision_install` from getStatus(). */
-export const installVision = () => invoke<void>('install_vision');
-export const refreshVision = () => invoke<boolean>('refresh_vision');
-/** Remove the vision offload (stop + delete) — reverts to faces-local. */
-export const uninstallVision = () => invoke<void>('uninstall_vision');
 /** Write a full diagnostics report to Downloads and reveal it; returns the path. */
 export const exportLogs = () => invoke<string>('export_logs');
 export interface ClipaiTest {
