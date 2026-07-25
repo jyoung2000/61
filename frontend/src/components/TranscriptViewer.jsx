@@ -63,33 +63,12 @@ function _cjkRatio(text) {
 }
 
 
-function toSRT(segments) {
-  // Match the backend / hand-authored SRT format: chronological cues, and
-  // omit the "Speaker:" prefix when the whole transcript is a single speaker
-  // (narration / solo talking-head) — keep it only for multi-speaker content.
-  const cues = (segments || [])
-    .filter((s) => (s.text || '').trim() && cueSeconds(s.end) >= cueSeconds(s.start))
-    .slice()
-    .sort(compareCues);
-  const distinctSpeakers = new Set(
-    cues.map((s) => (s.speaker || '').trim()).filter(Boolean),
-  );
-  const showSpeaker = distinctSpeakers.size > 1;
-  return cues
-    .map((seg, i) => {
-      const startH = Math.floor(seg.start / 3600);
-      const startM = Math.floor((seg.start % 3600) / 60);
-      const startS = Math.floor(seg.start % 60);
-      const startMs = Math.floor((seg.start % 1) * 1000);
-      const endH = Math.floor(seg.end / 3600);
-      const endM = Math.floor((seg.end % 3600) / 60);
-      const endS = Math.floor(seg.end % 60);
-      const endMs = Math.floor((seg.end % 1) * 1000);
-      const body = showSpeaker && seg.speaker ? `${seg.speaker}: ${seg.text}` : seg.text;
-      return `${i + 1}\n${String(startH).padStart(2, '0')}:${String(startM).padStart(2, '0')}:${String(startS).padStart(2, '0')},${String(startMs).padStart(3, '0')} --> ${String(endH).padStart(2, '0')}:${String(endM).padStart(2, '0')}:${String(endS).padStart(2, '0')},${String(endMs).padStart(3, '0')}\n${body}`;
-    })
-    .join('\n\n');
-}
+// NOTE: SRT/VTT are deliberately NOT formatted here. A browser-side formatter
+// cannot apply the invariants a subtitle file must satisfy (line wrapping to the
+// character budget, max display duration, minimum inter-cue gap, frame-aligned
+// in/out points), so exporting locally shipped 90-character lines, cues touching
+// at 0 ms and off-grid timestamps while the API's own download was correct.
+// Use downloadSubtitles() below, which fetches the backend-rendered file.
 
 function toTXT(segments) {
   // Sort chronologically so the export is ordered even if upstream data is not
@@ -418,6 +397,35 @@ export default function TranscriptViewer({ transcript, rawTranscript = [], trans
     a.download = filename;
     a.click();
     URL.revokeObjectURL(url);
+  };
+
+  // Subtitle exports are fetched from the BACKEND, never formatted here.
+  // The backend applies the invariants a subtitle file has to satisfy — line
+  // wrapping to the char budget, the max display duration, a minimum inter-cue
+  // gap, and frame-aligned in/out points. A browser-side formatter cannot see
+  // any of that, so exporting locally silently shipped 90-character lines,
+  // cues touching at 0 ms, and timestamps off the frame grid while the API's own
+  // download was correct. One formatter, one source of truth.
+  const downloadSubtitles = async (ext) => {
+    if (!jobId) return;
+    const params = new URLSearchParams({
+      translated: String(Boolean(hasTranslation && !showingOriginal)),
+    });
+    // Mirror the panel's time filter so a filtered view exports the same rows.
+    if (timeRange) {
+      params.set('start', String(timeRange.start));
+      params.set('end', String(timeRange.end));
+    }
+    try {
+      const res = await fetch(`/api/jobs/${jobId}/transcript.${ext}?${params}`);
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      download(await res.text(), _exportName(ext));
+    } catch (err) {
+      // Fail loudly. Silently falling back to a locally-built file is what hid
+      // the formatting gap in the first place.
+      console.error(`Subtitle export failed (${ext}):`, err);
+      alert(`Could not export .${ext}: ${err.message}`);
+    }
   };
 
   const copyAll = () => {
@@ -1052,7 +1060,7 @@ export default function TranscriptViewer({ transcript, rawTranscript = [], trans
           .txt
         </button>
         <button
-          onClick={() => download(toSRT(timeFiltered), _exportName('srt'))}
+          onClick={() => downloadSubtitles('srt')}
           style={{
             padding: '8px 12px',
             background: 'var(--bg-elevated)',

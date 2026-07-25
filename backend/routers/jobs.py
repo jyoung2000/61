@@ -3,6 +3,7 @@ import glob
 import logging
 import os
 from datetime import datetime, timezone
+from typing import Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from fastapi.responses import Response
@@ -546,11 +547,36 @@ async def trigger_analysis(job_id: str, background_tasks: BackgroundTasks):
     return {"job_id": job_id, "status": "analysis_started"}
 
 
+def _filter_cue_range(segments: list, start: Optional[float], end: Optional[float]) -> list:
+    """Keep cues overlapping ``[start, end]`` — the server-side equivalent of the
+    transcript panel's time filter.
+
+    Exists so a RANGE export can still go through ``generate_srt``. Without it
+    the UI had to format a filtered subset itself, which bypassed every subtitle
+    invariant (line wrapping, duration cap, min gap, frame alignment)."""
+    if start is None and end is None:
+        return segments
+    lo = float(start) if start is not None else float("-inf")
+    hi = float(end) if end is not None else float("inf")
+    out = []
+    for s in segments:
+        try:
+            s_start = float(getattr(s, "start", 0.0) or 0.0)
+            s_end = float(getattr(s, "end", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if s_start < hi and s_end > lo:
+            out.append(s)
+    return out
+
+
 @router.get("/jobs/{job_id}/transcript.srt")
 async def download_srt(
     job_id: str,
     speakers: bool = True,
     translated: bool = True,
+    start: Optional[float] = None,
+    end: Optional[float] = None,
 ):
     """Download the transcript as a speaker-separated SRT subtitle file.
 
@@ -558,6 +584,10 @@ async def download_srt(
     ``translated_transcript``, the translated version is served and the
     filename gets a ``_translated`` suffix. Pass ``translated=false`` to
     force the original-language transcript.
+
+    ``start`` / ``end`` (seconds) export only the cues overlapping that window,
+    mirroring the transcript panel's time filter, so a filtered export still gets
+    the full readability / timing treatment.
     """
     job = await database.load_job(job_id)
     if not job:
@@ -573,6 +603,7 @@ async def download_srt(
         raise HTTPException(status_code=404, detail="No transcript available")
 
     segments = [TranscriptSegment(**s) if isinstance(s, dict) else s for s in source]
+    segments = _filter_cue_range(segments, start, end)
     # Pass the video's frame rate so cue in/out points land on real frame
     # boundaries (what hand-authored subtitle tracks do).
     srt_content = generate_srt(
@@ -616,6 +647,8 @@ async def download_vtt(
     include_position: bool = False,
     platform: str = "horizontal",
     translated: bool = True,
+    start: Optional[float] = None,
+    end: Optional[float] = None,
 ):
     """Download the transcript as a WebVTT subtitle file.
 
@@ -640,6 +673,7 @@ async def download_vtt(
 
     from backend.services.vtt_generator import generate_vtt
     segments = [TranscriptSegment(**s) if isinstance(s, dict) else s for s in source]
+    segments = _filter_cue_range(segments, start, end)
     vtt_content = generate_vtt(
         segments,
         include_speakers=speakers,

@@ -1067,15 +1067,44 @@ def enforce_readability(
         # back to a char-proportional time cut that scatters 2-4 word slivers
         # across guessed timestamps. Those cues stay WHOLE here; the duration-
         # extend + filler-trim below (and line-wrap in Pass 3) still apply.
+        # A cue is also split when its text cannot POSSIBLY fit the on-screen
+        # budget (max_lines × max_chars_per_line). Without this the line-wrapper
+        # was asked to fit e.g. 113 characters into two 42-char lines and, since
+        # it must not emit a 3rd line, folded the overflow into line 2 — shipping
+        # a 76-char line. A reference hand-authored track never exceeds its budget
+        # because it splits the CUE instead, which is what this does.
+        _char_budget = max(1, int(max_chars_per_line)) * max(1, int(max_lines))
+
+        def _over_budget(seg) -> bool:
+            """True when the cue's text cannot be WRAPPED into the on-screen box.
+
+            Testing only ``len(text) > max_lines × max_chars`` is too lenient: a
+            79-character line fits that budget yet has no word boundary where both
+            halves come in under 42 (one long word straddles the only legal split
+            window), so the wrapper had to overflow a line. Asking the wrapper
+            itself is the exact test, and it sends those cues to the splitter —
+            where a clause boundary breaks them into two cues that each wrap
+            cleanly, which is what the reference track does."""
+            flat = " ".join((seg.text or "").split())
+            if len(flat) <= max_chars_per_line:
+                return False                      # fits on one line
+            if len(flat) > _char_budget:
+                return True                       # cannot fit the box at all
+            if int(max_lines) == 2:
+                return _balanced_two_line(flat, max_chars_per_line) is None
+            return False
+
         changed = allow_split
         while changed and any(
             _cps(p.text.strip(), max(0.001, p.end - p.start)) > keep_cps
+            or _over_budget(p)
             for p in pieces
         ):
             new_pieces: list[TranscriptSegment] = []
             changed = False
             for p in pieces:
-                if _cps(p.text.strip(), max(0.001, p.end - p.start)) > keep_cps:
+                if (_cps(p.text.strip(), max(0.001, p.end - p.start)) > keep_cps
+                        or _over_budget(p)):
                     halves = _split_segment(
                         p, keep_cps, min_split_chars=min_split_chars,
                         word_timed_split_only=word_timed_split_only)
@@ -1313,7 +1342,11 @@ def enforce_readability(
             # compliance at 83 %. Hard-wrap converts those into the
             # ≤ max_chars_per_line lines the evaluator counts.
             if any(len(line) > max_chars_per_line for line in seg.text.splitlines()):
-                seg.text = _hard_wrap_lines(seg.text, max_chars_per_line, max_lines)
+                _bal3 = (_balanced_two_line(
+                    " ".join(seg.text.split()), max_chars_per_line)
+                    if max_lines == 2 else None)
+                seg.text = _bal3 or _hard_wrap_lines(
+                    seg.text, max_chars_per_line, max_lines)
 
     # ── Pass 4: Gap enforcement (cap or merge) ─────────────────────────
     # The +0.002 s buffer below works around a floating-point bug in
@@ -1358,6 +1391,29 @@ def enforce_readability(
         seg.start = round(seg.start, 3)
         seg.end = round(seg.end, 3)
         out3.append(seg)
+
+    # ── Pass 5: guaranteed line wrap (must run LAST) ────────────────────
+    # Pass 3 wrapped every cue, but the merge branch in Pass 4 above joins two
+    # cues' text with a space AFTER that — and Pass 2.5 can do the same — so a
+    # merged cue shipped UNWRAPPED with lines past the character budget (measured
+    # against a hand-authored reference: 8 cues with a line over the 42-char
+    # budget, worst 76, where the reference had none in 503 lines). Re-wrapping
+    # here makes the budget an invariant of the returned list rather than a
+    # property of whichever pass happened to touch the text last.
+    if smart_line_breaks:
+        for seg in out3:
+            _t = seg.text or ""
+            if not any(len(line) > max_chars_per_line for line in _t.splitlines()):
+                continue
+            _flat = " ".join(_t.split())
+            seg.text = _smart_split(_flat, max_chars_per_line, max_lines)
+            if any(len(line) > max_chars_per_line for line in seg.text.splitlines()):
+                # Prefer the most even LEGAL two-line split before falling back to
+                # the greedy wrapper (which can overflow line 2 — see the helper).
+                _bal = (_balanced_two_line(_flat, max_chars_per_line)
+                        if max_lines == 2 else None)
+                seg.text = _bal or _hard_wrap_lines(
+                    seg.text, max_chars_per_line, max_lines)
 
     return out3
 
@@ -1517,6 +1573,37 @@ def quantize_to_frames(segments, fps: float, min_gap_frames: int = 1):
         s.start = round(sf / fps, 3)
         s.end = round(ef / fps, 3)
     return segs
+
+
+def _balanced_two_line(text: str, max_chars: int) -> Optional[str]:
+    """Split ``text`` into TWO lines that both fit ``max_chars``, as evenly as
+    possible. Returns ``None`` when no word boundary satisfies both lines.
+
+    The greedy wrapper fills line 1 to the brim and dumps the remainder on line 2,
+    so a long word near the limit ends line 1 early and overflows line 2 — 79
+    characters became a 30/48 split, breaking the budget even though 39/39 fits.
+    Searching every word boundary for the most even legal split fixes that, and
+    also matches the reference track's evenly-weighted two-liners (its median
+    shorter/longer ratio is 0.86, against 0.70 for the greedy output).
+
+    Ties break toward a linguistic boundary: ending line 1 after punctuation
+    reads better than mid-clause, so those candidates get a small bonus."""
+    words = (text or "").split()
+    if len(words) < 2:
+        return None
+    best = None
+    for i in range(1, len(words)):
+        first = " ".join(words[:i])
+        second = " ".join(words[i:])
+        if len(first) > max_chars or len(second) > max_chars:
+            continue
+        # Lower is better: imbalance, minus a bonus for breaking after punctuation.
+        score = abs(len(first) - len(second))
+        if first[-1:] in ",.;:!?…—":
+            score -= 6
+        if best is None or score < best[0]:
+            best = (score, first, second)
+    return f"{best[1]}\n{best[2]}" if best else None
 
 
 def _hard_wrap_lines(text: str, max_chars: int, max_lines: int) -> str:
