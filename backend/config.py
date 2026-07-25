@@ -1251,8 +1251,16 @@ class Settings(BaseSettings):
     # uncapped merge chain produced 30-40 s paragraph cues in the shipped
     # subtitles. No merge may exceed these; longer content stays as separate
     # cues (the readability enforcer still merges/extends within ITS caps).
-    SENTENCE_MERGE_MAX_CUE_S: float = 12.0
-    SENTENCE_MERGE_MAX_CHARS: int = 280
+    # Tightened from 12.0s / 280 chars: these caps set the FLOOR on how many cues
+    # can exist downstream, because this merge runs on the SOURCE track before
+    # translation and the translated cues inherit its boundaries 1:1. A 12 s /
+    # 280-char weld is 4-6 reference cues' worth of content in one unit, so no
+    # later pass could recover YouTube-like cadence (measured 277 cues / 3.00 s
+    # median vs the reference's 347 / 2.12 s). 6 s / 140 chars is still ~2x a
+    # normal cue, so genuine run-on ASR is still consolidated, but a paragraph
+    # weld can't form. The readability enforcer still merges within its own caps.
+    SENTENCE_MERGE_MAX_CUE_S: float = 6.0
+    SENTENCE_MERGE_MAX_CHARS: int = 140
 
     # Pull the pipeline's Ollama models onto the Companion in the background
     # when they're missing there (throttled; failures never touch the job).
@@ -1458,7 +1466,17 @@ class Settings(BaseSettings):
     # toward the strict 20 cps, so lines read at the proper speed where there's
     # room and only the cramped ones run fast. 1.0 restores strict Netflix CPS;
     # raise toward 2.0 for even fuller (faster-reading) lines.
-    SUBTITLE_SPLIT_CPS_TOLERANCE: float = 1.5
+    #
+    # Set to 1.0 (strict) after measuring against a reference YouTube track: at
+    # 1.5 a cue was kept whole up to 25.5 cps, which produced FEWER, LONGER cues
+    # than the reference (277 cues / 3.00 s / 34 chars vs 347 / 2.12 s / 31 chars)
+    # — the transcript read slower than YouTube's, not faster, because cues were
+    # held rather than cramped. At 1.0 the profile moves to 299 cues / 2.59 s /
+    # 30 chars with end-times landing dead on the reference (+0.00 s) and no new
+    # sub-minimum-duration cues. The anti-choppiness protection the 1.5 was added
+    # for now comes from the size-based phrase merge + SUBTITLE_MIN_SPLIT_CHARS,
+    # not from tolerating unreadable cues.
+    SUBTITLE_SPLIT_CPS_TOLERANCE: float = 1.0
     SUBTITLE_MAX_CHARS_PER_LINE: int = 42       # Netflix Latin standard
     SUBTITLE_MIN_DURATION_MS: int = 833         # 5/6 second (Netflix minimum)
     SUBTITLE_MAX_DURATION_MS: int = 7000        # Netflix maximum per event (7s).
@@ -1510,7 +1528,10 @@ class Settings(BaseSettings):
     # splitter from shattering slow / dramatic narration (Whisper detects
     # multi-second pauses *between* words) into unreadable one-word cues,
     # which also wrecks per-cue translation. 0 disables the guard.
-    SUBTITLE_MIN_SPLIT_CHARS: int = 14
+    # 10 rather than 14: measured against a reference YouTube track, 14 blocked
+    # legitimate clause splits and left cues over-long; 10 recovered them without
+    # producing any sub-minimum-duration flash (the guard's actual purpose).
+    SUBTITLE_MIN_SPLIT_CHARS: int = 10
     # Before splitting an over-fast (CPS > cap) cue into 2-3 word flashes, first
     # STRETCH its on-screen time into the idle gap after it (bounded by the next
     # cue + the max display duration — never overruns a neighbour). Translated
@@ -1537,14 +1558,24 @@ class Settings(BaseSettings):
     # on real runs, most within ~6s of their continuation. Still bounded by the
     # 2-line / max-duration / CPS caps, so parts that are genuinely far apart
     # (sparse speech) stay split. 0 disables the wider bridge.
-    SUBTITLE_SENTENCE_MERGE_GAP_MS: int = 6000
+    # 1200 rather than 6000: bridging six seconds of silence to finish a sentence
+    # welds two separate utterances into one long cue, which is a main reason cues
+    # ran longer than a reference YouTube track's (3.00s vs 2.12s median). A
+    # continuation that is genuinely the same breath follows within about a
+    # second; past that it is a new line, and the reference keeps it separate.
+    # 1200 still completes real fragments.
+    SUBTITLE_SENTENCE_MERGE_GAP_MS: int = 1200
     # Hard ceiling (ms) on the gap the phrase-merge will EVER bridge, even for a
     # mid-sentence continuation. Diarization labels everything "Speaker 1" on
     # single-speaker content, so the sentence-merge bridge (6 s) could glue cues
     # across a genuine pause into a run-on. This caps that: a silence larger than
     # this is treated as a real boundary and never merged across. 0 disables the
     # cap (legacy behavior).
-    SUBTITLE_MERGE_MAX_PAUSE_MS: int = 4000
+    # 800 rather than 4000: a silence approaching a second is already a cue
+    # boundary in a professionally-authored track, so bridging up to four seconds
+    # produced run-on cues. This is the backstop that keeps the merge honest even
+    # when diarization mislabels two speakers as one.
+    SUBTITLE_MERGE_MAX_PAUSE_MS: int = 800
     SUBTITLE_PLATFORM_SAFE_ZONES: bool = True   # per-platform margin profiles
     SUBTITLE_PLATFORM_PROFILE: str = ""         # "" | tiktok | reels | shorts | horizontal | square
 
