@@ -279,7 +279,17 @@ def snap_cue_windows_to_reference(
     violation). Bracket markers and word-less/empty cues are skipped. Mutates
     ``cues`` in place; returns the number of cues whose window changed."""
     n_snapped = 0
-    for cue in (cues or []):
+    # Does a later readability pass extend a too-fast cue's END into the idle time
+    # before the next cue? If so, the trim below can be bounded by that reachable
+    # end rather than by the cue's current one (see the `room_end` note).
+    try:
+        from backend.config import settings as _xs
+        _extend_after = bool(getattr(_xs, "SUBTITLE_EXTEND_BEFORE_SPLIT", True))
+    except Exception:
+        _extend_after = True
+
+    cue_list = list(cues or [])
+    for i, cue in enumerate(cue_list):
         text = _cue_text(cue)
         if _is_marker(text) or not text.strip():
             continue
@@ -290,9 +300,31 @@ def snap_cue_windows_to_reference(
         s0, e0 = float(s0), float(e0)
         if e0 - s0 <= 0:
             continue
+        prev_end = None
+        if i > 0:
+            _pe = _cue_attr(cue_list[i - 1], "end", None)
+            prev_end = float(_pe) if _pe is not None else None
+        next_start = None
+        if i + 1 < len(cue_list):
+            _ns = _cue_attr(cue_list[i + 1], "start", None)
+            next_start = float(_ns) if _ns is not None else None
         ref = _ref_words_in_window(whisper_en_words, s0, e0)
         if not ref:
             continue
+        # Drop the PREVIOUS speaker's tail. _ref_words_in_window selects by
+        # overlap, so a word that begins before this cue and merely spills across
+        # its start becomes ref[0] — making onset <= s0, so the leading-pad test
+        # below is false and the whole in-trim silently no-ops. That is the common
+        # case on back-to-back dialogue (over half the cues in a real export
+        # touched their neighbour), i.e. it defeated the snap exactly where it was
+        # needed. A word starting before s0 whose bulk lies in the previous cue's
+        # span is that cue's, not this one's.
+        if prev_end is not None:
+            ref = [(ws, we) for (ws, we) in ref
+                   if not (ws < s0
+                           and (min(we, prev_end) - ws) >= 0.5 * max(1e-6, we - ws))]
+            if not ref:
+                continue
         onset, offset = ref[0][0], ref[-1][1]
         new_s, new_e = s0, e0
         # IN: trim leading padding (move start later, bounded, never past onset).
@@ -303,10 +335,19 @@ def snap_cue_windows_to_reference(
         if e0 - offset > pad_threshold:
             new_e = max(offset + lead_in, e0 - max_shift)
             new_e = min(new_e, e0)               # inward only
-        # Never shrink below the min duration or the text's reading time — keep the
-        # in-snap (onset accuracy matters most) and give back trailing time first.
+        # Never leave less than the min duration or the text's reading time.
+        # The budget is measured against the end this cue can actually REACH, not
+        # its current end: the readability pass that runs after this one extends a
+        # too-fast cue into the idle time before the next cue (and never moves a
+        # start back). Bounding by e0 instead made every cue already sitting at the
+        # CPS budget an unconditional no-op however much leading padding it had —
+        # which, with cues deliberately kept whole well above the strict CPS cap,
+        # silently excluded a whole band of them.
         required = max(min_dur_s, len(text.strip()) / max_cps if max_cps > 0 else 0.0)
-        if new_e - new_s < required:
+        room_end = e0
+        if _extend_after and next_start is not None:
+            room_end = max(e0, next_start - max(min_gap, 0.0))
+        if room_end - new_s < required:
             new_e = min(e0, new_s + required)
             if new_e - new_s < required:
                 new_s = max(s0, new_e - required)

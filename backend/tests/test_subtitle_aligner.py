@@ -377,6 +377,52 @@ def test_snap_runs_in_hybrid_when_enabled():
     assert llm[0].start <= 11.0 and llm[0].end >= 13.5 - 1e-6   # never past speech
 
 
+def test_snap_ignores_previous_speakers_tail():
+    # _ref_words_in_window selects by OVERLAP, so a previous speaker's word that
+    # merely spills across this cue's start used to become ref[0] — forcing
+    # onset <= start, so the leading-pad test was false and the in-trim silently
+    # no-opped. That is the common case on back-to-back dialogue, so the snap did
+    # nothing exactly where it was needed.
+    prev = _cue(8.0, 10.4, "previous speaker line", speaker="A")
+    cue = _cue(10.0, 14.0, "the actual speech here", speaker="B")
+    ref = [{"word": "tail", "start": 9.6, "end": 10.4},
+           {"word": "the", "start": 11.5, "end": 11.8},
+           {"word": "actual", "start": 11.8, "end": 12.3},
+           {"word": "speech", "start": 12.3, "end": 12.8},
+           {"word": "here", "start": 12.8, "end": 13.2}]
+    snap_cue_windows_to_reference([prev, cue], ref, **_SNAP_KW)
+    assert cue.start > 10.5          # trimmed to the real onset, not blocked
+    assert cue.start <= 11.5         # never past the real speech
+    assert cue.start >= 10.0 and cue.end <= 14.0     # still inward-only
+
+
+def test_snap_not_blocked_by_cps_budget_when_idle_room_follows():
+    # A cue already sitting AT its reading-time budget used to be an unconditional
+    # no-op however much leading padding it had, because the budget was measured
+    # against the cue's CURRENT end. The later readability pass extends a too-fast
+    # cue into the idle time before the next cue, so the budget is measured
+    # against the end this cue can REACH.
+    text = "x" * 34                       # 34 chars / 17 cps = 2.0 s required
+    cue = _cue(10.0, 12.0, text)          # exactly 2.0 s — zero slack
+    nxt = _cue(15.0, 16.0, "next")        # 3 s of idle room after the cue
+    ref = [{"word": "w", "start": 11.0, "end": 11.4},
+           {"word": "w2", "start": 11.4, "end": 11.9}]
+    snap_cue_windows_to_reference([cue, nxt], ref, **_SNAP_KW)
+    assert cue.start > 10.5
+    assert cue.end <= nxt.start           # never overruns the next cue
+
+
+def test_snap_still_blocked_when_no_room_after():
+    # Same cue at its budget, but the next cue starts immediately — there is no
+    # idle time to reach into, so trimming the start would make it unreadable.
+    text = "x" * 34
+    cue = _cue(10.0, 12.0, text)
+    nxt = _cue(12.05, 13.0, "next")
+    ref = [{"word": "w", "start": 11.0, "end": 11.4}]
+    snap_cue_windows_to_reference([cue, nxt], ref, **_SNAP_KW)
+    assert cue.end - cue.start >= 2.0 - 1e-6      # reading time preserved
+
+
 def test_snap_flag_off_leaves_windows_untouched(monkeypatch):
     # Regression fence: with the flag off, project_hybrid_timings must not move
     # any cue.start/end (the snap is fully reversible via config).
