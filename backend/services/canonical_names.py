@@ -639,6 +639,18 @@ def _roster_phonetic_ok(wrong: str, right: str) -> tuple[bool, float]:
     b = _normalize(" ".join(rs)) or _normalize(right)
     if not a or not b:
         return False, 0.0
+    # An ASR mishearing keeps the LEADING sound. Whisper garbles interior vowels
+    # and consonants ("Zecks"/"Zechs", "Airies"/"Aries", "Dorian"/"Darlian") but a
+    # changed initial means a DIFFERENT name, not a misrecognition. A real run
+    # rewrote "Marina" — the Alliance's salvage ship, used consistently three
+    # times — into the character "Relena" because they rhyme and Relena was more
+    # frequent, corrupting three cues into nonsense ("Alliance's Relena is trying
+    # to recover that machine"). This one check also rejects three other recorded
+    # failures: "Hero Yuu"→"Trowa Barton", "Earth Sphere Alliance"→"Zeon", and
+    # "Operation Meteor"→"Operation Endgame" (whose shared first word is stripped
+    # above, leaving Meteor vs Endgame).
+    if a[:1] != b[:1]:
+        return False, 0.0
     ratio = difflib.SequenceMatcher(None, a, b).ratio()
     ok = ratio >= 0.5 or (len(a) >= 4 and len(b) >= 4
                           and (a.startswith(b) or b.startswith(a)))

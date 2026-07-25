@@ -351,3 +351,35 @@ def test_vocab_bias_kwargs_includes_series_roster(monkeypatch):
     assert "Zechs Merquise" in blob and "MyOwnTerm" in blob
     settings.TRANSLATION_SERIES_HINT = ""
     CN._ROSTER_CACHE.clear()
+
+
+# ── Roster precision: an ASR garble keeps the leading sound ──
+
+def test_roster_rejects_pairs_with_a_different_initial():
+    """A changed first letter means a DIFFERENT name, not a mishearing.
+
+    A real run rewrote "Marina" — the Alliance's salvage ship, used consistently
+    three times — into the character "Relena" because they rhyme and Relena was
+    more frequent, corrupting three cues ("Alliance's Relena is trying to recover
+    that machine"). The same rule rejects three other recorded failures.
+    """
+    from backend.services.canonical_names import _roster_phonetic_ok
+    for wrong, right in [
+        ("Marina", "Relena"),                       # ship -> character
+        ("Hero Yuu", "Trowa Barton"),               # wrong character entirely
+        ("Earth Sphere Alliance", "Zeon"),          # wrong franchise
+        ("Operation Meteor", "Operation Endgame"),  # shared word stripped first
+    ]:
+        allowed, _ = _roster_phonetic_ok(wrong, right)
+        assert not allowed, f"{wrong!r} -> {right!r} must be rejected"
+
+
+def test_roster_still_allows_real_mishearings():
+    """Interior-sound garbles are exactly what this pass exists to consolidate."""
+    from backend.services.canonical_names import _roster_phonetic_ok
+    for wrong, right in [
+        ("Zecks", "Zechs"), ("Zexes", "Zechs"), ("Hero-kun", "Heero"),
+        ("Airies", "Aries"), ("Dorian", "Darlian"), ("Trois", "Treize"),
+    ]:
+        allowed, _ = _roster_phonetic_ok(wrong, right)
+        assert allowed, f"{wrong!r} -> {right!r} must still be allowed"
