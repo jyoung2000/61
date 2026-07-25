@@ -618,7 +618,16 @@ class Settings(BaseSettings):
     # holds. Capping the linger keeps the hold reasonable; a cue that still needs
     # more time to hit CPS is split into tighter pieces instead (more
     # YouTube-like). Seconds past the cue's own end; 0 disables the cap.
-    SUBTITLE_MAX_LINGER_S: float = 2.5
+    #
+    # Measured against a reference YouTube track on the same episode: cue STARTS
+    # already matched well (median offset -0.04 s) but ENDS ran late (+0.22 s
+    # median, +0.81 s mean) and cues held 1.17-1.21x longer than YouTube's for the
+    # same amount of text — i.e. the subtitle stayed up after the speech stopped,
+    # which is what reads as "the words aren't timed right". The 2.5 s allowance
+    # was the dominant cause; 0.6 s (~14 frames) cut the mean end overshoot to
+    # +0.25 s and the duration ratio to 1.12x while still leaving a comfortable
+    # read-out tail. Raise it if cues start feeling clipped on sparse dialogue.
+    SUBTITLE_MAX_LINGER_S: float = 0.6
     # Second, fail-soft LLM pass after translation that fixes ASR-garbled
     # proper nouns the mined glossary missed ("Ail Reese"→Aries,
     # "Gundarium"→Gundanium, "Hero Yui"→Heero Yuy — all shipped on a real
