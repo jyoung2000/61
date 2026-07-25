@@ -627,6 +627,16 @@ def generate_ass(
     # exceeds the next segment's start.  This mirrors the frontend, which
     # only renders one active segment at any given playback time.
     if len(clip_segments) > 1:
+        # Leave the configured inter-cue gap rather than butting the cues flush
+        # together. Clamping to exactly ``next_start`` made every clamped pair
+        # touch at 0 ms on the burned-in subtitles even when the SRT download had
+        # proper gaps — professional tracks always leave a small gap (one frame at
+        # 24 fps) so consecutive cues visibly re-draw.
+        try:
+            from backend.config import settings as _gs
+            _min_gap_s = float(getattr(_gs, "SUBTITLE_MIN_GAP_MS", 42)) / 1000.0
+        except Exception:
+            _min_gap_s = 0.042
         clip_segments.sort(key=lambda s: s[0])
         clamped = []
         for i, seg in enumerate(clip_segments):
@@ -634,8 +644,9 @@ def generate_ass(
             sw = seg[4] if len(seg) > 4 else None
             if i < len(clip_segments) - 1:
                 next_start = clip_segments[i + 1][0]
-                if ce > next_start:
-                    ce = next_start
+                if ce > next_start - _min_gap_s:
+                    # Never invert: a cue shorter than the gap keeps a sliver.
+                    ce = max(cs, next_start - _min_gap_s)
             if ce - cs >= 0.05:
                 clamped.append((cs, ce, txt, sp, sw))
         clip_segments = clamped

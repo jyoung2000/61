@@ -4777,6 +4777,32 @@ async def _background_post_processing(
                 except Exception as _ref_e:
                     logger.warning("[%s] Reference conform skipped (%s)", job_id, _ref_e)
 
+            # ── Export-parity timing normalization (single source of truth) ──
+            # collapse_song_choruses (which mints the [♪ … theme ♪] marker across a
+            # whole sung region), repair/merge_fragments and split_run_on_cues all
+            # run AFTER the last readability pass above, so without this the
+            # PERSISTED rows still carry an over-long marker (one shipped at 99.5 s)
+            # and cues touching at 0 ms. Every non-SRT surface renders these rows —
+            # the transcript panel, the NLE preview, and the burned-in subtitles on
+            # exported clips — so normalizing here is what makes them agree with the
+            # SRT download. Both helpers are count-preserving, text-preserving and
+            # idempotent: they only pull an over-long end earlier and nudge touching
+            # cues apart, never merging, splitting or reordering.
+            try:
+                from backend.services.subtitle_formatter import (
+                    clamp_cue_durations, enforce_min_gap,
+                )
+                _translated_out = clamp_cue_durations(_translated_out)
+                _translated_out = enforce_min_gap(
+                    _translated_out,
+                    min_gap_s=float(
+                        getattr(settings, "SUBTITLE_MIN_GAP_MS", 42)) / 1000.0,
+                )
+            except Exception as _norm_e:
+                logger.warning(
+                    "[%s] Persist-time cue timing normalization skipped (%s)",
+                    job_id, _norm_e)
+
             logger.info(
                 "[%s] Persisting translated_transcript (%d segments)",
                 job_id, len(_translated_out),

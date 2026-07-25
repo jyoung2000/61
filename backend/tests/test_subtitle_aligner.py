@@ -358,16 +358,34 @@ def test_snap_reclamps_words_into_window():
         prev = wd.end
 
 
-def test_snap_default_off_in_hybrid():
-    # HYBRID_CUE_SNAP_ENABLED defaults False -> project_hybrid_timings must leave
-    # every cue.start/end untouched (regression fence for the default).
+def _snap_ref_segments():
+    return [_cue(11.0, 13.5, "the speech happens here now", words=_w([
+        (11.0, 11.4, "the"), (11.4, 12.0, "speech"), (12.0, 12.6, "happens"),
+        (12.6, 13.0, "here"), (13.0, 13.5, "now"),
+    ]))]
+
+
+def test_snap_runs_in_hybrid_when_enabled():
+    # HYBRID_CUE_SNAP_ENABLED ships True: a padded cue overlapping real reference
+    # speech must have its display window pulled toward the actual onset/offset.
+    llm = [_cue(9.0, 15.0, "the speech happens here now")]
+    tiers = project_hybrid_timings(
+        llm, whisper_en_segments=_snap_ref_segments(), source_cues=None)
+    assert tiers.get("cue_snapped", 0) == 1
+    assert llm[0].start > 9.0            # leading padding trimmed
+    assert llm[0].end < 15.0             # trailing padding trimmed
+    assert llm[0].start <= 11.0 and llm[0].end >= 13.5 - 1e-6   # never past speech
+
+
+def test_snap_flag_off_leaves_windows_untouched(monkeypatch):
+    # Regression fence: with the flag off, project_hybrid_timings must not move
+    # any cue.start/end (the snap is fully reversible via config).
+    from backend.config import settings
+    monkeypatch.setattr(settings, "HYBRID_CUE_SNAP_ENABLED", False, raising=False)
     llm = [_cue(9.0, 15.0, "the speech happens here now")]
     before = [(c.start, c.end) for c in llm]
     tiers = project_hybrid_timings(
-        llm, whisper_en_segments=[_cue(11.0, 13.5, "the speech happens here now",
-            words=_w([(11.0, 11.4, "the"), (11.4, 12.0, "speech"),
-                      (12.0, 12.6, "happens"), (12.6, 13.0, "here"), (13.0, 13.5, "now")]))],
-        source_cues=None)
+        llm, whisper_en_segments=_snap_ref_segments(), source_cues=None)
     assert [(c.start, c.end) for c in llm] == before
     assert tiers.get("cue_snapped", 0) == 0
 

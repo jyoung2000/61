@@ -146,7 +146,94 @@ def _parse_gaps(srt: str):
 
 def test_generate_srt_has_no_touching_cues():
     # Contiguous pieces (left.end == right.start) mimic split_run_on_cues output.
+    from backend.config import settings
+    min_gap_s = float(getattr(settings, "SUBTITLE_MIN_GAP_MS", 42)) / 1000.0
     segs = [_cue(i * 2.0, (i + 1) * 2.0, f"line {i}") for i in range(6)]
     srt = generate_srt(segs, include_speakers=False)
     gaps = _parse_gaps(srt)
-    assert gaps and all(g >= 0.079 for g in gaps)   # >= 80ms within 1ms rounding
+    assert gaps and all(g >= min_gap_s - 0.0011 for g in gaps)
+
+
+# ── Frame quantization (the "authored like YouTube" invariant) ──
+
+def test_frame_quantize_puts_every_cue_on_the_frame_grid():
+    from backend.services.subtitle_formatter import quantize_to_frames
+    fps = 24000 / 1001   # 23.976 — NTSC-pulldown, the real source rate
+    segs = [_cue(1.234, 3.777, "a"), _cue(3.777, 6.111, "b"), _cue(6.5, 9.01, "c")]
+    out = quantize_to_frames(segs, fps, min_gap_frames=1)
+    for s in out:
+        for t in (s.start, s.end):
+            frames = t * fps
+            assert abs(frames - round(frames)) / fps <= 0.0011
+
+
+def test_frame_quantize_keeps_one_frame_gap():
+    from backend.services.subtitle_formatter import quantize_to_frames
+    fps = 24.0
+    # Touching cues: quantizing must leave exactly one frame between them.
+    segs = [_cue(1.0, 2.0, "a"), _cue(2.0, 3.0, "b"), _cue(3.0, 4.0, "c")]
+    out = quantize_to_frames(segs, fps, min_gap_frames=1)
+    for i in range(len(out) - 1):
+        gap = out[i + 1].start - out[i].end
+        assert gap >= (1.0 / fps) - 0.0011
+        assert gap <= (1.0 / fps) + 0.0011     # exactly one frame, not two
+
+
+def test_frame_quantize_is_idempotent():
+    from backend.services.subtitle_formatter import quantize_to_frames
+    fps = 24000 / 1001
+    segs = [_cue(1.234, 3.777, "a"), _cue(3.777, 6.111, "b")]
+    once = quantize_to_frames(segs, fps)
+    t1 = [(s.start, s.end) for s in once]
+    twice = quantize_to_frames(once, fps)
+    assert [(s.start, s.end) for s in twice] == t1
+
+
+def test_frame_quantize_noop_without_fps():
+    from backend.services.subtitle_formatter import quantize_to_frames
+    segs = [_cue(1.234, 3.777, "a")]
+    out = quantize_to_frames(segs, 0.0)
+    assert (out[0].start, out[0].end) == (1.234, 3.777)
+
+
+def test_srt_timestamps_round_not_truncate():
+    # 29.988 s must emit as ,988 — the old per-field arithmetic truncated
+    # (29.988 % 1 == 0.98799…) and emitted ,987, one ms early.
+    from backend.services.srt_generator import _format_srt_time
+    assert _format_srt_time(29.988) == "00:00:29,988"
+    assert _format_srt_time(0.0) == "00:00:00,000"
+    assert _format_srt_time(3661.5) == "01:01:01,500"
+
+
+def test_generate_srt_frame_aligns_when_fps_given():
+    fps = 24000 / 1001
+    segs = [_cue(i * 2.0 + 0.137, (i + 1) * 2.0, f"line {i}") for i in range(5)]
+    srt = generate_srt(segs, include_speakers=False, fps=fps)
+    times = []
+    for m in re.finditer(
+            r"(\d+):(\d+):(\d+),(\d+)\s*-->\s*(\d+):(\d+):(\d+),(\d+)", srt):
+        g = list(map(int, m.groups()))
+        times.append(g[0]*3600+g[1]*60+g[2]+g[3]/1000)
+        times.append(g[4]*3600+g[5]*60+g[6]+g[7]/1000)
+    assert times
+    for t in times:
+        frames = t * fps
+        assert abs(frames - round(frames)) / fps <= 0.0011
+
+
+# ── clamp_cue_durations on the persisted dict rows ──
+
+def test_clamp_cue_durations_on_dict_rows():
+    from backend.services.subtitle_formatter import clamp_cue_durations
+    rows = [{"start": 1287.42, "end": 1386.88, "text": "[♪ Ending theme ♪]"},
+            {"start": 1400.0, "end": 1402.0, "text": "normal cue"}]
+    clamp_cue_durations(rows)
+    assert abs((rows[0]["end"] - rows[0]["start"]) - MARKER_MAX_S) < 1e-3
+    assert rows[1]["end"] == 1402.0          # already short — untouched
+
+
+def test_enforce_min_gap_on_dict_rows():
+    rows = [{"start": 0.0, "end": 2.0, "text": "a"},
+            {"start": 2.0, "end": 4.0, "text": "b"}]
+    out = enforce_min_gap(rows, min_gap_s=0.042)
+    assert out[1]["start"] - out[0]["end"] >= 0.042 - 1e-6

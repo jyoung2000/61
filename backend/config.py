@@ -1475,11 +1475,27 @@ class Settings(BaseSettings):
     # Minimum gap (ms) guaranteed between consecutive cues at EXPORT time. The
     # pipeline's post-readability sentence splitter emits contiguous pieces
     # (left.end == right.start), so 176/327 cues shipped touching at 0 ms — pro
-    # subtitles (YouTube ~42ms, Netflix 2 frames ≈ 80ms @24fps) always leave a
-    # small gap so consecutive cues visibly re-draw. A final gap-only pass on every
-    # SRT/VTT export nudges touching/overlapping cue ends apart by this much
-    # (never merging, splitting, or reordering). 0 disables it.
-    SUBTITLE_MIN_GAP_MS: int = 80
+    # subtitles always leave a small gap so consecutive cues visibly re-draw. A
+    # final gap-only pass on every SRT/VTT export nudges touching/overlapping cue
+    # ends apart by this much (never merging, splitting, or reordering).
+    # 42 ms = ONE FRAME at 24 fps, measured as the exact gap on a reference
+    # YouTube subtitle track (193 of its 206 consecutive-cue gaps are exactly one
+    # frame). Netflix's house style is 2 frames (~80 ms) — raise it for that look.
+    # 0 disables the pass. When SUBTITLE_FRAME_QUANTIZE is on and the video's fps
+    # is known, the gap is enforced as whole FRAMES instead of this millisecond
+    # value, so the result is exactly one frame regardless of frame rate.
+    SUBTITLE_MIN_GAP_MS: int = 42
+    # Snap every cue in/out point to the video's FRAME GRID. This is what makes a
+    # subtitle track read as professionally authored rather than machine-generated:
+    # a reference YouTube track had 694/694 timestamps sitting exactly on a 24 fps
+    # frame boundary (max error 0.3 ms — pure millisecond rounding), because a
+    # caption must change on a frame boundary of the video it plays over. ClipAI
+    # emits raw Whisper float seconds, of which only 5% landed on a frame. The
+    # quantizer converts each cue to integer frames, guarantees a one-frame gap in
+    # frame space (so quantizing can never re-touch two cues), and converts back —
+    # exact and idempotent. Needs the video fps; falls back to the millisecond gap
+    # pass when fps is unknown (0/None). 0 or False disables it.
+    SUBTITLE_FRAME_QUANTIZE: bool = True
     SUBTITLE_SMART_LINE_BREAKS: bool = True     # linguistic boundary breaks
     # Minimum characters a split piece may carry. Stops the duration
     # splitter from shattering slow / dramatic narration (Whisper detects
@@ -1747,11 +1763,11 @@ class Settings(BaseSettings):
     # window overlaps real Whisper-EN speech has its in/out pulled toward the real
     # onset/offset. INWARD-ONLY (only trims leading/trailing padding — never moves
     # a boundary earlier than the source start or later than the source end), so it
-    # can only pull the subtitle TOWARD the speech, never away. Ships OFF: it moves
-    # display windows, so validate on a real run before enabling. When on, it is
-    # bounded and guarded (see the knobs below) to stay cue-count- and
-    # readability-neutral by construction.
-    HYBRID_CUE_SNAP_ENABLED: bool = False
+    # can only pull the subtitle TOWARD the speech, never away. Bounded and guarded
+    # (see the knobs below) to stay cue-count- and readability-neutral by
+    # construction: it only ever shrinks a window, which can only widen the gap to
+    # a neighbour, so it cannot create an overlap, a new merge, or a new split.
+    HYBRID_CUE_SNAP_ENABLED: bool = True
     HYBRID_CUE_SNAP_PAD_THRESHOLD_S: float = 0.4   # only trim padding larger than this
     HYBRID_CUE_SNAP_MAX_SHIFT_S: float = 1.5       # cap per-boundary movement
     HYBRID_CUE_SNAP_LEAD_IN_S: float = 0.1         # keep a lead-in before real onset

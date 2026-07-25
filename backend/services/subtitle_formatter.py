@@ -820,7 +820,7 @@ def enforce_readability(
     max_lines: int = 2,
     min_duration_ms: int = 833,
     max_duration_ms: Optional[int] = None,
-    min_gap_ms: int = 80,
+    min_gap_ms: Optional[int] = None,
     smart_line_breaks: bool = True,
     auto_cjk: bool = True,
     min_split_chars: Optional[int] = None,
@@ -867,6 +867,19 @@ def enforce_readability(
             max_duration_ms = int(getattr(_ds, "SUBTITLE_MAX_DURATION_MS", 7000))
         except Exception:
             max_duration_ms = 7000   # Netflix maximum per event (7 s)
+
+    # Resolve the inter-cue gap from config when the caller didn't pass one, so
+    # Pass 4 opens the SAME gap the export pass and the scorer use. A hard-coded
+    # 80 ms here silently overrode a configured 42 ms (YouTube's one-frame gap):
+    # Pass 4 spaced cues at 80 ms and the later frame-quantizer, seeing a gap
+    # already wider than one frame, left it alone — so the track shipped at 2
+    # frames no matter how the knob was set.
+    if min_gap_ms is None:
+        try:
+            from backend.config import settings as _gs
+            min_gap_ms = int(getattr(_gs, "SUBTITLE_MIN_GAP_MS", 42))
+        except Exception:
+            min_gap_ms = 42
 
     # Resolve the minimum-text split guard (prevents one-word cues on slow
     # speech). 0 disables it (legacy behaviour).
@@ -1349,6 +1362,71 @@ def enforce_readability(
     return out3
 
 
+def _seg_get(seg, key, default=0.0):
+    """Field read that works for BOTH plain dict rows (the shape the pipeline
+    persists, after ``model_dump()``) and ``TranscriptSegment`` models."""
+    v = seg.get(key, default) if isinstance(seg, dict) else getattr(seg, key, default)
+    return default if v is None else v
+
+
+def _seg_set(seg, key, value) -> None:
+    if isinstance(seg, dict):
+        seg[key] = value
+    else:
+        setattr(seg, key, value)
+
+
+def clamp_cue_durations(
+    segments,
+    max_dur_s: Optional[float] = None,
+    marker_max_s: Optional[float] = None,
+    min_dur_s: Optional[float] = None,
+    max_cps: Optional[float] = None,
+):
+    """Cap any cue that would sit on screen longer than the per-event maximum.
+
+    The same ceiling ``enforce_readability`` Pass 2b applies, but standalone and
+    dict-aware, for use on the rows the pipeline PERSISTS. It is needed there
+    because ``collapse_song_choruses`` (which mints the ``[♪ … theme ♪]`` marker
+    spanning a whole sung region) and ``split_run_on_cues`` run AFTER the last
+    readability pass — so the persisted track, which is what the transcript panel,
+    the NLE preview and the burned-in subtitles all render, still carried a
+    99-second marker even though the SRT download was clean.
+
+    Never splits, merges, reorders, or edits text — it only pulls an over-long
+    ``end`` earlier, so it can only widen the gap to the next cue. Idempotent."""
+    try:
+        from backend.config import settings as _s
+        max_dur_s = max_dur_s if max_dur_s is not None else float(
+            getattr(_s, "SUBTITLE_MAX_DURATION_MS", 7000)) / 1000.0
+        marker_max_s = marker_max_s if marker_max_s is not None else float(
+            getattr(_s, "SUBTITLE_MARKER_MAX_DURATION_S", 4.0) or 0.0)
+        min_dur_s = min_dur_s if min_dur_s is not None else float(
+            getattr(_s, "SUBTITLE_MIN_DURATION_MS", 833)) / 1000.0
+        max_cps = max_cps if max_cps is not None else float(
+            getattr(_s, "SUBTITLE_MAX_CPS", 17.0))
+        _linger = float(getattr(_s, "SUBTITLE_MAX_LINGER_S", 2.5) or 0.0)
+    except Exception:
+        max_dur_s, marker_max_s = max_dur_s or 7.0, marker_max_s or 4.0
+        min_dur_s, max_cps, _linger = min_dur_s or 0.833, max_cps or 17.0, 2.5
+    for seg in (segments or []):
+        if seg is None:
+            continue
+        start = float(_seg_get(seg, "start", 0.0))
+        end = float(_seg_get(seg, "end", 0.0))
+        if end - start <= max_dur_s:
+            continue
+        text = str(_seg_get(seg, "text", "") or "").strip()
+        if _is_bracket_marker(text) and marker_max_s > 0:
+            target = marker_max_s
+        else:
+            target = ((_cps(text, 1.0) / max_cps) if max_cps > 0 else max_dur_s) + _linger
+        new_end = start + max(min_dur_s, min(target, max_dur_s))
+        if new_end < end:
+            _seg_set(seg, "end", round(new_end, 3))
+    return segments
+
+
 def enforce_min_gap(segments, min_gap_s: float = 0.08):
     """Guarantee at least ``min_gap_s`` between consecutive cues — the final,
     export-time timing invariant.
@@ -1367,22 +1445,77 @@ def enforce_min_gap(segments, min_gap_s: float = 0.08):
     word count — safe to run unconditionally as the last step before serializing
     an SRT/VTT. Idempotent. Prioritizes non-overlap over min-duration: if the gap
     can't fit, ``prev.end`` sits flush at its own start rather than inverting.
-    Accepts ``TranscriptSegment`` objects (mutated in place) and returns them
-    sorted; a non-positive ``min_gap_s`` is a no-op passthrough."""
+    Accepts ``TranscriptSegment`` models OR plain dict rows (the shape the
+    pipeline persists), mutated in place and returned sorted; a non-positive
+    ``min_gap_s`` is a no-op passthrough."""
     segs = sorted(
         (s for s in (segments or []) if s is not None),
-        key=lambda s: (float(getattr(s, "start", 0.0) or 0.0),
-                       float(getattr(s, "end", 0.0) or 0.0)),
+        key=lambda s: (float(_seg_get(s, "start", 0.0)),
+                       float(_seg_get(s, "end", 0.0))),
     )
     if min_gap_s <= 0:
         return segs
     for i in range(len(segs) - 1):
         cur, nxt = segs[i], segs[i + 1]
-        if float(nxt.start) < float(cur.end) + min_gap_s:
-            new_end = round(float(nxt.start) - min_gap_s, 3)
-            if new_end < float(cur.start):
-                new_end = round(float(cur.start), 3)   # never invert
-            cur.end = new_end
+        nxt_start = float(_seg_get(nxt, "start", 0.0))
+        if nxt_start < float(_seg_get(cur, "end", 0.0)) + min_gap_s:
+            new_end = round(nxt_start - min_gap_s, 3)
+            cur_start = float(_seg_get(cur, "start", 0.0))
+            if new_end < cur_start:
+                new_end = round(cur_start, 3)   # never invert
+            _seg_set(cur, "end", new_end)
+    return segs
+
+
+def quantize_to_frames(segments, fps: float, min_gap_frames: int = 1):
+    """Snap every cue in/out point to the video's FRAME GRID, guaranteeing a
+    ``min_gap_frames`` gap — the single behaviour that most distinguishes a
+    professionally-authored subtitle track from a machine-generated one.
+
+    A caption can only actually change on a frame boundary of the video it plays
+    over, so hand-authored tracks are frame-quantized: on a reference YouTube
+    track, 694 of 694 timestamps sat exactly on a 24 fps frame (max error 0.3 ms —
+    pure millisecond rounding), and its inter-cue gap was consistently ONE frame.
+    ClipAI emits raw Whisper float seconds, of which only ~5% land on a frame.
+
+    Works in INTEGER FRAME space, which is what makes it exact: each cue becomes
+    ``(start_frame, end_frame)``, the gap is enforced as whole frames (so
+    quantizing can never round two cues back into contact — the failure mode of
+    doing gap-then-quantize as separate passes), every cue keeps at least one frame
+    of duration, and the frames convert back to seconds at the end. Idempotent:
+    re-running finds everything already on-grid. Only nudges endpoints — never
+    merges, splits, reorders, or edits text.
+
+    ``fps`` must be the real frame rate of the video (e.g. 23.976 for NTSC-pulldown
+    content, 24.0 for film). A non-positive ``fps`` returns the input sorted and
+    unmodified, so callers that don't know the frame rate degrade to the
+    millisecond-based :func:`enforce_min_gap` instead."""
+    segs = sorted(
+        (s for s in (segments or []) if s is not None),
+        key=lambda s: (float(getattr(s, "start", 0.0) or 0.0),
+                       float(getattr(s, "end", 0.0) or 0.0)),
+    )
+    if fps is None or fps <= 0 or not segs:
+        return segs
+    gap = max(0, int(min_gap_frames))
+    # 1. Seconds → integer frames (every cue at least one frame long).
+    grid: list[list[int]] = []
+    for s in segs:
+        sf = int(round(float(s.start or 0.0) * fps))
+        ef = int(round(float(s.end or 0.0) * fps))
+        if ef <= sf:
+            ef = sf + 1
+        grid.append([sf, ef])
+    # 2. Enforce the inter-cue gap in FRAME space (exact — no rounding can undo it).
+    for i in range(len(grid) - 1):
+        cur, nxt = grid[i], grid[i + 1]
+        if nxt[0] < cur[1] + gap:
+            target = nxt[0] - gap
+            cur[1] = target if target > cur[0] else cur[0] + 1
+    # 3. Frames → seconds, at millisecond precision (same as the SRT/VTT writers).
+    for s, (sf, ef) in zip(segs, grid):
+        s.start = round(sf / fps, 3)
+        s.end = round(ef / fps, 3)
     return segs
 
 
@@ -1489,8 +1622,9 @@ def compute_readability_report(
         from backend.config import settings as _rs
         _cfg_cps = float(getattr(_rs, "SUBTITLE_MAX_CPS", 17.0))
         _cfg_cpl = int(getattr(_rs, "SUBTITLE_MAX_CHARS_PER_LINE", 42))
+        _min_gap_s = float(getattr(_rs, "SUBTITLE_MIN_GAP_MS", 42)) / 1000.0
     except Exception:
-        _cfg_cps, _cfg_cpl = 17.0, 42
+        _cfg_cps, _cfg_cpl, _min_gap_s = 17.0, 42, 0.042
     if max_cps is None:
         max_cps = 13.0 if is_cjk else _cfg_cps       # Netflix adult limit
     if ideal_cps is None:
@@ -1535,16 +1669,18 @@ def compute_readability_report(
                 else f"dur={dur:.2f}s>{max_dur_s:.1f}s"
             )
 
-        # Gap to the next segment
+        # Gap to the next segment. Judged against the SAME configured minimum the
+        # enforcer applies — a hard-coded 80 ms here would score every cue of a
+        # deliberately YouTube-style 42 ms track as a violation.
         if i + 1 < len(segments):
             nxt = segments[i + 1]
             gap = nxt.start - seg.end
-            if gap >= 0.080:
+            if gap >= _min_gap_s - 0.0005:
                 gap_ok += 1
             else:
                 seg_problems.append(
                     f"overlap={-gap*1000:.0f}ms" if gap < 0
-                    else f"gap={gap*1000:.0f}ms<80ms"
+                    else f"gap={gap*1000:.0f}ms<{_min_gap_s*1000:.0f}ms"
                 )
         else:
             gap_ok += 1

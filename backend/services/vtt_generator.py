@@ -76,6 +76,7 @@ def generate_vtt(
     video_height: int = 1080,
     enforce_readability_rules: Optional[bool] = None,
     include_timestamps_in_text: bool = False,
+    fps: Optional[float] = None,
 ) -> str:
     """Convert transcript segments to WebVTT format.
 
@@ -114,16 +115,10 @@ def generate_vtt(
         (s for s in segments if (s.text or "").strip()),
         key=lambda s: (s.start, s.end),
     )
-    # Final invariant: guarantee a small inter-cue gap so consecutive cues never
-    # ship touching (parity with generate_srt). Endpoint-nudge only; fail-soft.
-    try:
-        from backend.services.subtitle_formatter import enforce_min_gap
-        segments = enforce_min_gap(
-            segments,
-            min_gap_s=float(getattr(settings, "SUBTITLE_MIN_GAP_MS", 80)) / 1000.0,
-        )
-    except Exception:
-        pass
+    # Final invariant: frame-align cues + guarantee a one-frame gap so consecutive
+    # cues never ship touching (exact parity with generate_srt). Fail-soft.
+    from backend.services.srt_generator import _apply_min_gap
+    segments = _apply_min_gap(segments, fps=fps)
     from backend.services.srt_generator import effective_include_speakers
     include_speakers = effective_include_speakers(segments, include_speakers)
 

@@ -18,24 +18,47 @@ from backend.config import settings
 from backend.models import TranscriptSegment
 
 
-def _apply_min_gap(segments: list) -> list:
-    """Nudge touching/overlapping cues apart by ``SUBTITLE_MIN_GAP_MS`` so no two
-    consecutive cues ship at a 0 ms gap (professional subtitles always leave a
-    small visible gap). Fail-soft: returns the input unchanged on any error."""
+def _apply_min_gap(segments: list, fps: Optional[float] = None) -> list:
+    """Apply the final cue-timing invariants before serialization.
+
+    With a known video ``fps`` and ``SUBTITLE_FRAME_QUANTIZE`` on, every cue in/out
+    is snapped to the video's frame grid with a one-frame gap — what a
+    hand-authored track looks like (a reference YouTube track was 100 %
+    frame-aligned with one-frame gaps). Without fps, degrade to the
+    millisecond-based gap pass so cues still never ship touching. Fail-soft:
+    returns the input unchanged on any error."""
     try:
-        from backend.services.subtitle_formatter import enforce_min_gap
-        min_gap_s = float(getattr(settings, "SUBTITLE_MIN_GAP_MS", 80)) / 1000.0
+        from backend.services.subtitle_formatter import (
+            enforce_min_gap, quantize_to_frames,
+        )
+        min_gap_s = float(getattr(settings, "SUBTITLE_MIN_GAP_MS", 42)) / 1000.0
+        if fps and float(fps) > 0 and bool(
+                getattr(settings, "SUBTITLE_FRAME_QUANTIZE", True)):
+            # Gap expressed in whole FRAMES so quantizing can't re-touch two cues.
+            # Rounded (not ceiled): the default 42 ms is one frame at 24 fps, and
+            # 0.042 × 23.976 = 1.007 must read as 1 frame, not 2.
+            gap_frames = max(1, int(round(min_gap_s * float(fps))))
+            return quantize_to_frames(segments, float(fps),
+                                      min_gap_frames=gap_frames)
         return enforce_min_gap(segments, min_gap_s=min_gap_s)
     except Exception:
         return segments
 
 
 def _format_srt_time(seconds: float) -> str:
-    """Convert seconds to SRT timestamp format: HH:MM:SS,mmm"""
-    hours = int(seconds // 3600)
-    minutes = int((seconds % 3600) // 60)
-    secs = int(seconds % 60)
-    millis = int((seconds % 1) * 1000)
+    """Convert seconds to SRT timestamp format: HH:MM:SS,mmm
+
+    Rounds to the nearest millisecond via a single integer conversion. The old
+    per-field arithmetic TRUNCATED the fraction (``int((seconds % 1) * 1000)``),
+    and because binary floats can't hold most decimals exactly — ``29.988 % 1``
+    is 0.98799999… — that silently emitted every affected cue up to 1 ms EARLY,
+    which was enough to knock frame-quantized times back off the frame grid."""
+    if seconds < 0:
+        seconds = 0.0
+    total_ms = int(round(float(seconds) * 1000))
+    hours, rem = divmod(total_ms, 3_600_000)
+    minutes, rem = divmod(rem, 60_000)
+    secs, millis = divmod(rem, 1000)
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 
@@ -86,6 +109,7 @@ def generate_srt(
     enforce_readability_rules: Optional[bool] = None,
     *,
     include_timestamps_in_text: bool = False,
+    fps: Optional[float] = None,
 ) -> str:
     """Convert transcript segments to SRT format with optional speaker labels.
 
@@ -130,12 +154,12 @@ def generate_srt(
         (s for s in segments if (s.text or "").strip()),
         key=lambda s: (s.start, s.end),
     )
-    # Final invariant: guarantee a small inter-cue gap so consecutive cues never
-    # ship TOUCHING (the post-readability sentence splitter emits contiguous
-    # pieces). Runs UNCONDITIONALLY — even when readability enforcement is off —
-    # since it only nudges endpoints (never merges/splits/reorders). This is the
-    # last mutation before the SRT is serialized.
-    segments = _apply_min_gap(segments)
+    # Final invariant: frame-align every cue and guarantee a one-frame gap (or,
+    # with no fps, a millisecond gap) so consecutive cues never ship TOUCHING —
+    # the post-readability sentence splitter emits contiguous pieces. Runs
+    # UNCONDITIONALLY, even when readability enforcement is off, since it only
+    # nudges endpoints (never merges/splits/reorders). Last mutation before write.
+    segments = _apply_min_gap(segments, fps=fps)
     include_speakers = effective_include_speakers(segments, include_speakers)
 
     lines: list[str] = []
@@ -166,6 +190,7 @@ def generate_vtt(
     enforce_readability_rules: Optional[bool] = None,
     *,
     include_timestamps_in_text: bool = False,
+    fps: Optional[float] = None,
     **kwargs,
 ) -> str:
     """WebVTT export. Delegates to ``vtt_generator.generate_vtt`` (so the
@@ -180,6 +205,7 @@ def generate_vtt(
         include_speakers=include_speakers,
         enforce_readability_rules=enforce_readability_rules,
         include_timestamps_in_text=include_timestamps_in_text,
+        fps=fps,
         **kwargs,
     )
 

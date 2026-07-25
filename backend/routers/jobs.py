@@ -573,7 +573,10 @@ async def download_srt(
         raise HTTPException(status_code=404, detail="No transcript available")
 
     segments = [TranscriptSegment(**s) if isinstance(s, dict) else s for s in source]
-    srt_content = generate_srt(segments, include_speakers=speakers)
+    # Pass the video's frame rate so cue in/out points land on real frame
+    # boundaries (what hand-authored subtitle tracks do).
+    srt_content = generate_srt(
+        segments, include_speakers=speakers, fps=getattr(job, "fps", 0.0))
 
     base = job.filename.rsplit(".", 1)[0] if "." in job.filename else job.filename
     base = (base or "").strip() or "transcript"
@@ -595,7 +598,8 @@ async def download_original_srt(job_id: str, speakers: bool = True):
     if not job.transcript:
         raise HTTPException(status_code=404, detail="No transcript available")
     segments = [TranscriptSegment(**s) if isinstance(s, dict) else s for s in job.transcript]
-    srt_content = generate_srt(segments, include_speakers=speakers)
+    srt_content = generate_srt(
+        segments, include_speakers=speakers, fps=getattr(job, "fps", 0.0))
     base = job.filename.rsplit(".", 1)[0] if "." in job.filename else job.filename
     base = (base or "").strip() or "transcript"
     return Response(
@@ -641,6 +645,7 @@ async def download_vtt(
         include_speakers=speakers,
         include_position=include_position,
         platform=platform,
+        fps=getattr(job, "fps", 0.0),
     )
 
     base = job.filename.rsplit(".", 1)[0] if "." in job.filename else job.filename
@@ -745,6 +750,7 @@ async def download_subtitles(
                 segments, include_speakers=speakers,
                 include_timestamps_in_text=timestamps,
                 include_position=include_position, platform=platform,
+                fps=getattr(job, "fps", 0.0),
             )
             media_type = "text/vtt; charset=utf-8"
             ext = f"{lang_suffix}.vtt"
@@ -752,6 +758,7 @@ async def download_subtitles(
             content = generate_srt(
                 segments, include_speakers=speakers,
                 include_timestamps_in_text=timestamps,
+                fps=getattr(job, "fps", 0.0),
             )
             media_type = "text/srt; charset=utf-8"
             ext = f"{lang_suffix}.srt"
