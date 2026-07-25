@@ -232,6 +232,38 @@ def test_clamp_cue_durations_on_dict_rows():
     assert rows[1]["end"] == 1402.0          # already short — untouched
 
 
+def test_quantize_to_frames_accepts_dict_rows():
+    # Attribute-only access made a dict row read every start as 0.0 and then raise
+    # on assignment; the caller's fail-soft wrapper turned that into "return the
+    # cues unchanged", silently dropping BOTH quantization and the gap.
+    from backend.services.subtitle_formatter import quantize_to_frames
+    fps = 24000 / 1001
+    rows = [{"start": 1.234, "end": 3.777, "text": "a"},
+            {"start": 3.777, "end": 6.111, "text": "b"}]
+    out = quantize_to_frames(rows, fps, min_gap_frames=1)
+    for r in out:
+        for k in ("start", "end"):
+            frames = r[k] * fps
+            assert abs(frames - round(frames)) / fps <= 0.0011
+    assert out[1]["start"] - out[0]["end"] >= (1.0 / fps) - 0.0011
+
+
+def test_balanced_two_line_prefers_even_legal_split():
+    from backend.services.subtitle_formatter import _balanced_two_line
+    # 79 chars: the greedy wrapper produced 30/48 (line 2 over budget) because a
+    # long word ended line 1 early. No legal 42/42 split exists here, so the
+    # helper must decline rather than emit an over-budget line.
+    assert _balanced_two_line(
+        "They're not intimidated by our intimidation tactics; "
+        "attack and shoot them down", 42) is None
+    # Where a legal split DOES exist it must be chosen, and be near-even.
+    got = _balanced_two_line("alpha beta gamma delta epsilon zeta eta theta", 30)
+    assert got is not None
+    a, b = got.split("\n")
+    assert len(a) <= 30 and len(b) <= 30
+    assert abs(len(a) - len(b)) <= 12
+
+
 def test_enforce_min_gap_on_dict_rows():
     rows = [{"start": 0.0, "end": 2.0, "text": "a"},
             {"start": 2.0, "end": 4.0, "text": "b"}]

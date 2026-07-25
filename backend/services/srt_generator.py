@@ -145,8 +145,12 @@ def generate_srt(
                 smart_line_breaks=bool(getattr(settings, "SUBTITLE_SMART_LINE_BREAKS", True)),
             )
         except Exception:
-            # Never let readability formatting break SRT generation.
-            pass
+            # Never let readability formatting break SRT generation — but say so.
+            # Swallowing this silently meant one bad cue could ship the WHOLE file
+            # unwrapped and un-capped with nothing to show it had happened.
+            logger.warning(
+                "SRT readability formatting failed — emitting unformatted cues "
+                "(lines may exceed the character budget)", exc_info=True)
 
     # SRT cues MUST be chronological; sort defensively so corrupt upstream
     # ordering can't emit out-of-order / backwards cues.

@@ -304,7 +304,19 @@ def _restore_user_settings():
         # observed case: REFRAMER_MAX_SAMPLES=1800 (the old default) persisted
         # on every save, so the 1200-sample speedup never took effect. Any
         # persisted value matching a RETIRED default adopts the new default.
-        _RETIRED_DEFAULTS = {"REFRAMER_MAX_SAMPLES": (1800, 1500)}
+        _RETIRED_DEFAULTS = {
+            "REFRAMER_MAX_SAMPLES": (1800, 1500),
+            # Subtitle tuning has the same failure mode, and it bites harder
+            # because every int/bool is snapshotted unconditionally on save: a
+            # settings save made while these were the shipped defaults pins them
+            # in /data/logs/user_settings.json (a docker volume, so it survives
+            # rebuilds) and silently defeats the new value. Observed: cues shipped
+            # at 7.3-7.7s against a 7.0s cap because a persisted 9000 ms was still
+            # in force, which also made the over-long-cue trim look broken.
+            "SUBTITLE_MAX_DURATION_MS": (9000,),
+            "SUBTITLE_MAX_CPS": (20, 20.0),
+            "SUBTITLE_MIN_SPLIT_CHARS": (14,),
+        }
         for _k, _olds in _RETIRED_DEFAULTS.items():
             if _k in data and data.get(_k) in _olds:
                 logger.info(

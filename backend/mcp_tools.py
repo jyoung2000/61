@@ -199,7 +199,9 @@ def register_tools(mcp):
 
         if format == "srt":
             from backend.services.srt_generator import generate_srt
-            return {"format": "srt", "content": generate_srt(job.transcript)}
+            return {"format": "srt",
+                    "content": generate_srt(job.transcript,
+                                            fps=getattr(job, "fps", 0.0))}
 
         if format == "txt":
             lines = [f"[{s.speaker}] {s.text}" for s in job.transcript]

@@ -764,6 +764,7 @@ async def download_subtitles(
         content = generate_bilingual_srt(
             source_segments, translated_segments, order=order,
             include_speakers=speakers, include_timestamps_in_text=timestamps,
+            fps=getattr(job, "fps", 0.0),
         )
         media_type = "text/srt; charset=utf-8"
         ext = f"_bilingual_{target_lang}.srt"

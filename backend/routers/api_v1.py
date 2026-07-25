@@ -358,31 +358,24 @@ async def get_transcript(
 
     if format == "srt":
         from backend.services.srt_generator import generate_srt
-        content = generate_srt(job.transcript)
+        content = generate_srt(job.transcript, fps=getattr(job, "fps", 0.0))
         return Response(content=content, media_type="text/plain")
 
-    if format in ("vtt", "txt"):
-        lines = []
-        if format == "vtt":
-            lines.append("WEBVTT\n")
-        for s in job.transcript:
-            if format == "vtt":
-                start = _fmt_vtt_time(s.start)
-                end = _fmt_vtt_time(s.end)
-                lines.append(f"{start} --> {end}")
-                lines.append(f"{s.speaker}: {s.text}\n")
-            else:
-                lines.append(f"[{s.speaker}] {s.text}")
+    if format == "vtt":
+        # Use the shared generator, not a local formatter. Hand-rolling WebVTT
+        # here skipped every subtitle invariant (line wrapping, max display
+        # duration, minimum inter-cue gap, frame-aligned times), so this route
+        # emitted cues the SRT route on the same job would never produce.
+        from backend.services.vtt_generator import generate_vtt
+        content = generate_vtt(job.transcript, fps=getattr(job, "fps", 0.0))
+        return Response(content=content, media_type="text/plain")
+
+    if format == "txt":
+        lines = [f"[{s.speaker}] {s.text}" for s in job.transcript]
         return Response(content="\n".join(lines), media_type="text/plain")
 
     _err("INVALID_FORMAT", f"Unknown format: {format}")
 
-
-def _fmt_vtt_time(seconds: float) -> str:
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = seconds % 60
-    return f"{h:02d}:{m:02d}:{s:06.3f}"
 
 
 @router.get("/videos/{job_id}/scenes", summary="Get detected scenes", dependencies=[Depends(verify_api_key)])

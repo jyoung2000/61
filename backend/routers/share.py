@@ -475,7 +475,10 @@ async def public_share_transcript_srt(token: str):
     else:
         segments = [TranscriptSegment(**raw) if isinstance(raw, dict) else raw
                     for raw in source_segments]
-    body = generate_srt(segments, include_speakers=True)
+    # Pass the video fps so a share-link SRT is frame-aligned like every
+    # other download; without it this route silently shipped 0% on-grid cues.
+    body = generate_srt(segments, include_speakers=True,
+                        fps=getattr(job, "fps", 0.0))
     base = (getattr(job, "filename", "") or token).rsplit(".", 1)[0]
     return Response(
         content=body,

@@ -1545,11 +1545,17 @@ def quantize_to_frames(segments, fps: float, min_gap_frames: int = 1):
     ``fps`` must be the real frame rate of the video (e.g. 23.976 for NTSC-pulldown
     content, 24.0 for film). A non-positive ``fps`` returns the input sorted and
     unmodified, so callers that don't know the frame rate degrade to the
-    millisecond-based :func:`enforce_min_gap` instead."""
+    millisecond-based :func:`enforce_min_gap` instead.
+
+    Accepts ``TranscriptSegment`` models OR plain dict rows, like
+    :func:`enforce_min_gap`. Attribute-only access here was a live hazard: a dict
+    row read every start as 0.0 and then raised on assignment, and the caller's
+    fail-soft wrapper turned that into "return the cues unchanged" — silently
+    dropping BOTH the quantization and the gap with nothing in the log."""
     segs = sorted(
         (s for s in (segments or []) if s is not None),
-        key=lambda s: (float(getattr(s, "start", 0.0) or 0.0),
-                       float(getattr(s, "end", 0.0) or 0.0)),
+        key=lambda s: (float(_seg_get(s, "start", 0.0)),
+                       float(_seg_get(s, "end", 0.0))),
     )
     if fps is None or fps <= 0 or not segs:
         return segs
@@ -1557,8 +1563,8 @@ def quantize_to_frames(segments, fps: float, min_gap_frames: int = 1):
     # 1. Seconds → integer frames (every cue at least one frame long).
     grid: list[list[int]] = []
     for s in segs:
-        sf = int(round(float(s.start or 0.0) * fps))
-        ef = int(round(float(s.end or 0.0) * fps))
+        sf = int(round(float(_seg_get(s, "start", 0.0)) * fps))
+        ef = int(round(float(_seg_get(s, "end", 0.0)) * fps))
         if ef <= sf:
             ef = sf + 1
         grid.append([sf, ef])
@@ -1570,8 +1576,8 @@ def quantize_to_frames(segments, fps: float, min_gap_frames: int = 1):
             cur[1] = target if target > cur[0] else cur[0] + 1
     # 3. Frames → seconds, at millisecond precision (same as the SRT/VTT writers).
     for s, (sf, ef) in zip(segs, grid):
-        s.start = round(sf / fps, 3)
-        s.end = round(ef / fps, 3)
+        _seg_set(s, "start", round(sf / fps, 3))
+        _seg_set(s, "end", round(ef / fps, 3))
     return segs
 
 
