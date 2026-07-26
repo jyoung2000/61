@@ -94,13 +94,43 @@ def test_set_build_version_zero_is_noop(tmp_path):
     assert (tmp_path / "src-tauri/tauri.conf.json").read_text() == before
 
 
+def _dockerfiles_that_build_the_companion() -> dict:
+    """Every Dockerfile in the repo root with a companion-builder stage.
+
+    Checking only ``Dockerfile`` is how the stamping silently stopped working:
+    compose builds ``Dockerfile.gpu``, which had neither the ARG nor the script
+    call, so ``--build-arg COMPANION_BUILD_NUMBER=...`` was discarded and every
+    from-source build reported the repo's base version. Enumerate instead of
+    naming one file, so a new build path can't skip the stamp either."""
+    out = {}
+    for name in sorted(os.listdir(REPO)):
+        if not (name == "Dockerfile" or name.startswith("Dockerfile.")):
+            continue
+        path = os.path.join(REPO, name)
+        if not os.path.isfile(path):
+            continue
+        with open(path) as f:
+            text = f.read()
+        if "AS companion-builder" in text:
+            out[name] = text
+    return out
+
+
+def test_every_companion_build_path_stamps_the_version():
+    files = _dockerfiles_that_build_the_companion()
+    # Sanity: the enumeration must actually find the build paths.
+    assert "Dockerfile" in files and "Dockerfile.gpu" in files, sorted(files)
+    for name, text in files.items():
+        assert "ARG COMPANION_BUILD_NUMBER" in text, (
+            f"{name} builds the Companion but never declares "
+            "COMPANION_BUILD_NUMBER — docker discards the build-arg and the "
+            "version never moves")
+        assert "set_build_version.py" in text, (
+            f"{name} builds the Companion but never runs set_build_version.py")
+
+
 def test_build_number_is_wired_through_the_build():
-    # Cheap drift guards: the Dockerfile must accept the arg + run the script,
-    # and update-all.sh must pass the commit count.
-    with open(os.path.join(REPO, "Dockerfile")) as f:
-        dockerfile = f.read()
-    assert "ARG COMPANION_BUILD_NUMBER" in dockerfile
-    assert "set_build_version.py" in dockerfile
+    # update-all.sh must compute and pass the commit count.
     with open(os.path.join(REPO, "update-all.sh")) as f:
         upd = f.read()
     assert "COMPANION_BUILD_NUMBER" in upd

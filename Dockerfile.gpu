@@ -70,6 +70,15 @@ ARG COMPANION_BUILD_FROM_SOURCE=0
 # from-source rebuild apart from the running binary even when the semver is
 # unchanged — otherwise "up to date" sticks and the new code never installs.
 ARG BUILD_SHA=unknown
+# Monotonic build number (update-all.sh passes the repo's commit count). The
+# builder stamps it into the version's PATCH slot, 0.10.0 -> 0.10.<n>, so each
+# deploy's Companion reports a strictly higher version than the last.
+#
+# This ARG was missing here while the non-GPU Dockerfile had it, and compose
+# builds THIS file — so `--build-arg COMPANION_BUILD_NUMBER=...` was silently
+# discarded and every from-source build reported the repo's base version
+# forever. update-all.sh even logged the version it *thought* it was building.
+ARG COMPANION_BUILD_NUMBER=0
 WORKDIR /build
 COPY companion/ ./companion/
 ENV XWIN_ACCEPT_LICENSE=1 XWIN_CACHE_DIR=/xwin-cache
@@ -102,6 +111,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     rustup target add x86_64-pc-windows-msvc; \
     command -v cargo-xwin >/dev/null 2>&1 || CARGO_INSTALL_ROOT=/opt/xwin-tools cargo install cargo-xwin --locked; \
     cd companion; \
+    python3 scripts/set_build_version.py "${COMPANION_BUILD_NUMBER:-0}"; \
     BUNDLE_DIR=src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis; \
     rm -f "$BUNDLE_DIR"/*-setup.exe 2>/dev/null || true; \
     export CLIPAI_COMPANION_BUILD_ID="$BUILD_SHA"; \

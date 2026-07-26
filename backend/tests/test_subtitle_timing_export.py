@@ -269,3 +269,60 @@ def test_enforce_min_gap_on_dict_rows():
             {"start": 2.0, "end": 4.0, "text": "b"}]
     out = enforce_min_gap(rows, min_gap_s=0.042)
     assert out[1]["start"] - out[0]["end"] >= 0.042 - 1e-6
+
+
+# ── the wrapper must never invent text ────────────────────────────────────
+
+def test_greedy_wrap_does_not_duplicate_a_repeated_word():
+    from backend.services.subtitle_formatter import _greedy_wrap
+    # The wrap point lands on "the", which also appears near the START of the
+    # cue. Locating the tail by VALUE instead of by position rebuilt the last
+    # line from that earlier "the", re-emitting a whole clause: one measured cue
+    # grew 81 -> 134 characters with "the machine might be fine," repeated.
+    text = ("While the machine might be fine, the reckless pilot "
+            "who flew it should have died.")
+    got = _greedy_wrap(text.split(), 34, 2)
+    assert " ".join(got.split()) == text, got
+    # Same shape, every common word as the wrap point.
+    for filler in ("the", "a", "to", "of", "and"):
+        t = f"Alpha {filler} bravo charlie delta echo {filler} foxtrot golf hotel india"
+        out = _greedy_wrap(t.split(), 20, 2)
+        assert " ".join(out.split()) == t, (filler, out)
+
+
+def test_readability_never_grows_a_cue_at_a_tight_budget():
+    # End-to-end guard on the same defect: the shipped text may be re-split
+    # across cues or re-wrapped, but the words must survive unchanged.
+    text = ("While the machine might be fine, the reckless pilot "
+            "who flew it should have died.")
+    for budget in (28, 34, 42):
+        out = enforce_readability(
+            [TranscriptSegment(start=10.0, end=15.0, text=text,
+                               speaker="Speaker 1")],
+            max_chars_per_line=budget, max_lines=2)
+        flat = " ".join(" ".join((c.text or "").split()) for c in out)
+        assert len(flat) <= len(text) + 4, (budget, flat)
+
+
+def test_unfittable_text_shares_the_overflow_instead_of_stacking_it():
+    from backend.services.subtitle_formatter import _hard_wrap_lines
+    # 94 chars cannot fit 2 x 34. Folding everything into line 2 gave the worst
+    # shape in the file (34 over 62); both lines are over budget either way, so
+    # the excess must be SHARED.
+    text = ("However, Zechs of Oz was using a new mobile suit "
+            "called Cancer to securely capture the Gundam.")
+    lines = _hard_wrap_lines(text, 34, 2).split("\n")
+    assert len(lines) == 2
+    assert " ".join(" ".join(lines).split()) == text
+    a, b = (len(l) for l in lines)
+    assert min(a, b) / max(a, b) >= 0.8, (a, b)
+    # A cue that DOES fit is untouched by the sharing path.
+    assert _hard_wrap_lines("alpha bravo charlie delta", 14, 2).split("\n") == [
+        "alpha bravo", "charlie delta"]
+
+
+def test_default_line_budget_matches_the_reference_track():
+    from backend.config import settings
+    # The reference YouTube track's line lengths stop dead at 34; shipping 42
+    # is what put our own lines in the 40-44 bucket.
+    assert settings.SUBTITLE_MAX_CHARS_PER_LINE == 34

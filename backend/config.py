@@ -1477,7 +1477,18 @@ class Settings(BaseSettings):
     # for now comes from the size-based phrase merge + SUBTITLE_MIN_SPLIT_CHARS,
     # not from tolerating unreadable cues.
     SUBTITLE_SPLIT_CPS_TOLERANCE: float = 1.0
-    SUBTITLE_MAX_CHARS_PER_LINE: int = 42       # Netflix Latin standard
+    # Netflix's Latin spec allows 42, but the reference YouTube track this
+    # pipeline is measured against does not go near it: its line-length
+    # distribution stops DEAD at 34 characters (0 of 503 lines longer; 151 in
+    # the 25-29 bucket, 48 in 30-34). At 42 our own output put 29 lines in the
+    # 40-44 bucket and a few past 45, which is what "spacing doesn't look like
+    # YouTube" actually is — and because a 42-char line swallows text that
+    # should have wrapped, it also made cues one-liners where the reference
+    # used two (99 two-line cues vs its 156) and left the two-line split
+    # lopsided (balance 0.74 vs 0.86). Budgeting to the reference's real wall
+    # fixes all three at once. Raise toward 42 only for a platform that
+    # genuinely renders wider.
+    SUBTITLE_MAX_CHARS_PER_LINE: int = 34
     SUBTITLE_MIN_DURATION_MS: int = 833         # 5/6 second (Netflix minimum)
     SUBTITLE_MAX_DURATION_MS: int = 7000        # Netflix maximum per event (7s).
                                                 # The phrase-merge still combines

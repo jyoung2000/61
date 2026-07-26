@@ -316,6 +316,10 @@ def _restore_user_settings():
             "SUBTITLE_MAX_DURATION_MS": (9000,),
             "SUBTITLE_MAX_CPS": (20, 20.0),
             "SUBTITLE_MIN_SPLIT_CHARS": (14,),
+            # 42 was the Netflix-spec line budget; the reference track's real
+            # wall is 34, and a persisted 42 would keep shipping 40-plus-char
+            # lines no matter what the default says.
+            "SUBTITLE_MAX_CHARS_PER_LINE": (42,),
         }
         for _k, _olds in _RETIRED_DEFAULTS.items():
             if _k in data and data.get(_k) in _olds:

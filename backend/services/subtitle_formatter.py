@@ -216,7 +216,7 @@ def _greedy_wrap(words: list[str], max_chars: int, max_lines: int) -> str:
     noun, matching the smart-split guard rather than only the scored path."""
     lines: list[str] = []
     current = ""
-    for w in words:
+    for idx, w in enumerate(words):
         candidate = (current + " " + w).strip() if current else w
         if len(candidate) <= max_chars:
             current = candidate
@@ -228,7 +228,16 @@ def _greedy_wrap(words: list[str], max_chars: int, max_lines: int) -> str:
                 # Stuff the rest onto the final line — the caller's
                 # downstream split-into-events will pick this up if it
                 # still violates CPS.
-                rest = [current] + words[words.index(w) + 1:]
+                #
+                # The tail MUST come from this loop's position. Looking the word
+                # up with ``words.index(w)`` returned its FIRST occurrence, so
+                # whenever the wrap landed on a word that appears earlier in the
+                # cue — "the", "a", "to", any common word — the line was rebuilt
+                # from that earlier point and re-emitted text the viewer had
+                # already read. One measured cue grew from 81 characters to 134
+                # with a clause repeated twice. Silent, and it corrupts content,
+                # not just layout.
+                rest = [current] + words[idx + 1:]
                 lines.append(" ".join(rest))
                 return _fix_trailing_function_words("\n".join(lines), max_chars)
     if current:
@@ -1648,14 +1657,62 @@ def _hard_wrap_lines(text: str, max_chars: int, max_lines: int) -> str:
             current = unit
     if current:
         lines.append(current)
-    # Enforce the line cap: fold any overflow into the last allowed line so we
-    # never emit more than max_lines (Netflix: ≤ 2).
+    # Enforce the line cap: we must never emit more than max_lines (Netflix: ≤ 2).
+    #
+    # Folding the overflow into the LAST line is only acceptable when the
+    # overflow is small. Dumping it there unconditionally produced the worst
+    # shape in the whole file: a 34-char top line over a 62-char bottom one,
+    # because everything past the first wrap landed on line 2. When the text
+    # genuinely cannot fit cap × max_chars, both lines are going over budget
+    # regardless — so SHARE the excess instead of stacking it, which keeps the
+    # cue readable and keeps the bottom-heavy shape the split pass aims for.
     cap = max(1, int(max_lines))
     if len(lines) > cap:
-        head = lines[:cap - 1]
-        tail = join.join(lines[cap - 1:])
-        lines = head + [tail]
+        flat = join.join(lines)
+        even = _split_evenly(flat, cap, join)
+        if even is not None:
+            lines = even
+        else:
+            lines = lines[:cap - 1] + [join.join(lines[cap - 1:])]
     return "\n".join(lines)
+
+
+def _split_evenly(text: str, cap: int, join: str):
+    """``cap`` lines of as-equal length as the word boundaries allow, or None.
+
+    Used only when the text cannot fit the budget at all: the goal stops being
+    "respect max_chars" (impossible) and becomes "don't leave one line twice the
+    length of the other". Returns None for text with no usable break points
+    (a single long token, CJK) so the caller keeps its own fallback."""
+    if cap < 2 or not join:
+        return None
+    units = text.split()
+    if len(units) < cap:
+        return None
+    target = len(text) / cap
+    lines: list[str] = []
+    i = 0
+    for slot in range(cap):
+        remaining_slots = cap - slot - 1
+        current = ""
+        while i < len(units):
+            # Always take at least one word, and leave one for every later line.
+            must_take = not current
+            if not must_take and len(units) - i <= remaining_slots:
+                break
+            candidate = (current + " " + units[i]) if current else units[i]
+            # Stop once this line is closer to target than it would be with the
+            # next word added — greedy-to-centre rather than greedy-to-full.
+            if (not must_take
+                    and abs(len(candidate) - target) > abs(len(current) - target)):
+                break
+            current = candidate
+            i += 1
+        if current:
+            lines.append(current)
+    if i < len(units):                       # anything left goes on the last line
+        lines[-1] = " ".join([lines[-1]] + units[i:])
+    return lines if len(lines) == cap else None
 
 
 # ── Standalone readability scoring ───────────────────────────────────────
