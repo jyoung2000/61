@@ -420,3 +420,88 @@ def test_default_line_budget_matches_the_reference_track():
     # The reference YouTube track's line lengths stop dead at 34; shipping 42
     # is what put our own lines in the 40-44 bucket.
     assert settings.SUBTITLE_MAX_CHARS_PER_LINE == 34
+
+
+# ── defects found by adversarial review of the word-timing commit ──────────
+
+def test_fabricated_word_rows_are_not_evidence_for_a_time_cut():
+    """Rebuilding ``words`` must not promote a word-less cue to "word-timed".
+
+    "Has a words array matching the token count" is what every consumer reads as
+    "has real audio times". The resync pass rebuilds that array, so a tier-C cue
+    came back looking word-timed — and because the pipeline feeds
+    enforce_readability's output back into itself up to four times, the next
+    iteration split those cues at guessed midpoints. That is exactly the
+    char-proportional time cut ``word_timed_split_only`` exists to forbid; a
+    12 s cue cascaded 1 -> 2 -> 4.
+    """
+    from backend.services.subtitle_formatter import (
+        _word_timed_midpoint, _word_gap_split_point,
+    )
+    text = ("This is a long tier C cue with no word timings at all and it "
+            "should stay whole rather than be cut at a guessed midpoint")
+    kw = dict(max_cps=17.0, max_chars_per_line=34, max_lines=2,
+              min_duration_ms=833, max_duration_ms=7000,
+              allow_split=True, word_timed_split_only=True)
+    first = enforce_readability(
+        [_cue(0.0, 12.0, text, words=None)], **kw)
+    assert all(c.words_synthetic for c in first)
+    # The split helpers must refuse the fabricated array…
+    assert _word_timed_midpoint(first[0], 40) is None
+    assert _word_gap_split_point(first[0]) is None
+    # …so a second pass cannot cascade.
+    again = enforce_readability([c.model_copy(deep=True) for c in first], **kw)
+    assert len(again) == len(first), [c.text for c in again]
+
+
+def test_real_word_times_are_never_marked_synthetic():
+    text = "One two three four five"
+    out = enforce_readability(
+        [_cue(0.0, 2.5, text, words=_words_for(text, 0.0, 2.5))],
+        max_chars_per_line=34, max_lines=2,
+        allow_split=True, word_timed_split_only=True)
+    assert not any(c.words_synthetic for c in out)
+
+
+def test_over_budget_predicate_is_shared_by_loop_and_splitter():
+    """The two used separate expressions and disagreed on the no-legal-wrap
+    case: the loop asked for a split, the splitter saw a cue inside the
+    character budget and returned it unchanged, and the cue shipped with an
+    over-long line — the very failure the budget test was added to prevent."""
+    from backend.services.subtitle_formatter import (
+        _text_over_budget, _balanced_two_line,
+    )
+    # Inside 2x34=68 chars, so the arithmetic budget says it fits — but one
+    # 33-char token straddles every boundary, so no split leaves BOTH halves
+    # under the per-line cap. This is the case the two predicates disagreed on.
+    flat = "a counterintelligencereconnaissance apparatus"
+    assert len(flat) <= 68
+    assert _balanced_two_line(flat, 34) is None      # genuinely unwrappable
+    assert _text_over_budget(flat, 34, 2) is True
+    # Fits one line -> never over budget.
+    assert _text_over_budget("short line", 34, 2) is False
+    # Past the box entirely.
+    assert _text_over_budget("x" * 80, 34, 2) is True
+
+
+def test_concat_words_rejects_an_end_overrun():
+    """Start-ordering is not a usable schedule.
+
+    The ASS export anchors each word to the PREVIOUS word's end, so an array
+    where a word's end overruns the next word's start renders the karaoke out of
+    order — measured: word 4 highlighted before word 3, then jumping back.
+    """
+    from backend.services.subtitle_formatter import _concat_words
+    a = _cue(11.5, 12.0, "Not now", words=[
+        WordTimestamp(start=11.52, end=11.70, word="Not"),
+        WordTimestamp(start=11.70, end=12.28, word="now")])   # end past 12.05
+    b = _cue(12.05, 13.5, "and get down", words=[
+        WordTimestamp(start=12.10, end=12.22, word="and"),
+        WordTimestamp(start=12.22, end=12.60, word="get"),
+        WordTimestamp(start=12.60, end=13.50, word="down")])
+    assert _concat_words(a, b, "Not now and get down") == []
+    # A clean, non-overlapping pair still concatenates.
+    a2 = _cue(11.5, 12.0, "Not now", words=[
+        WordTimestamp(start=11.52, end=11.70, word="Not"),
+        WordTimestamp(start=11.70, end=11.99, word="now")])
+    assert len(_concat_words(a2, b, "Not now and get down")) == 5

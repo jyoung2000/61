@@ -306,6 +306,33 @@ def _is_cjk(text: str) -> bool:
     return total > 0 and (cjk / total) >= 0.30
 
 
+def _text_over_budget(text: str, max_chars_per_line: int, max_lines: int) -> bool:
+    """True when ``text`` cannot be WRAPPED into the on-screen box.
+
+    Testing only ``len(text) > max_lines × max_chars`` is too lenient: a
+    79-character line fits that budget yet may have no word boundary where both
+    halves come in under the per-line cap (one long word straddles the only legal
+    split window), so the wrapper has to overflow a line. Asking the wrapper
+    itself is the exact test, and it sends those cues to the splitter — where a
+    boundary breaks them into two cues that each wrap cleanly, which is what a
+    reference track does.
+
+    ONE definition, shared by the loop that decides a cue needs splitting and by
+    ``_split_segment`` which decides whether to bother. They were two separate
+    expressions and disagreed on exactly this no-legal-wrap case: the loop asked
+    for a split, the splitter saw a cue inside the character budget, returned it
+    unchanged, and the cue shipped with an over-long line — the very failure the
+    budget test was added to prevent."""
+    flat = " ".join((text or "").split())
+    if len(flat) <= max_chars_per_line:
+        return False                                  # fits on one line
+    if len(flat) > max(1, int(max_chars_per_line)) * max(1, int(max_lines)):
+        return True                                   # cannot fit the box at all
+    if int(max_lines) == 2:
+        return _balanced_two_line(flat, max_chars_per_line) is None
+    return False
+
+
 def _split_candidates(text: str) -> list[int]:
     """Break points in ``text``, best first, as character indices.
 
@@ -462,6 +489,11 @@ def _word_gap_split_point(
     words = getattr(seg, 'words', None)
     if not words or len(words) < 2:
         return None
+    # A char-proportional rebuild has no real silences in it — every "gap" is an
+    # artefact of the distribution, so splitting on one invents a pause the
+    # speaker never took (see resync_cue_words).
+    if _seg_get(seg, "words_synthetic", False):
+        return None
     text = seg.text
     duration = max(0.001, seg.end - seg.start)
 
@@ -546,6 +578,9 @@ def _word_timed_midpoint(
     words = getattr(seg, 'words', None)
     if not words:
         return None
+    # Fabricated rows are not evidence of a real pause (see resync_cue_words).
+    if _seg_get(seg, "words_synthetic", False):
+        return None
     text = seg.text
     # Walk through the segment text, accumulating character offsets
     # as we encounter each word from ``seg.words``. We're matching the
@@ -594,6 +629,8 @@ def _split_segment(
     min_split_chars: int = 0,
     word_timed_split_only: bool = False,
     max_cue_chars: int = 0,
+    max_chars_per_line: int = 0,
+    max_lines: int = 2,
 ) -> list[TranscriptSegment]:
     """Try to split a single segment in two at a linguistic boundary so
     each half satisfies the CPS limit. Returns ``[seg]`` if no useful
@@ -610,8 +647,12 @@ def _split_segment(
     long line. Pass the budget and the CPS shortcut yields to it."""
     text = seg.text.strip()
     duration = max(0.001, seg.end - seg.start)
-    _over_box = (max_cue_chars > 0
-                 and len(" ".join(text.split())) > max_cue_chars)
+    if max_chars_per_line > 0:
+        # Same predicate the caller's loop uses, so the two cannot disagree.
+        _over_box = _text_over_budget(text, max_chars_per_line, max_lines)
+    else:
+        _over_box = (max_cue_chars > 0
+                     and len(" ".join(text.split())) > max_cue_chars)
     if _cps(text, duration) <= target_cps and not _over_box:
         return [seg]
     # Guard against over-fragmentation: never split a segment that's
@@ -1151,23 +1192,8 @@ def enforce_readability(
         _char_budget = max(1, int(max_chars_per_line)) * max(1, int(max_lines))
 
         def _over_budget(seg) -> bool:
-            """True when the cue's text cannot be WRAPPED into the on-screen box.
-
-            Testing only ``len(text) > max_lines × max_chars`` is too lenient: a
-            79-character line fits that budget yet has no word boundary where both
-            halves come in under 42 (one long word straddles the only legal split
-            window), so the wrapper had to overflow a line. Asking the wrapper
-            itself is the exact test, and it sends those cues to the splitter —
-            where a clause boundary breaks them into two cues that each wrap
-            cleanly, which is what the reference track does."""
-            flat = " ".join((seg.text or "").split())
-            if len(flat) <= max_chars_per_line:
-                return False                      # fits on one line
-            if len(flat) > _char_budget:
-                return True                       # cannot fit the box at all
-            if int(max_lines) == 2:
-                return _balanced_two_line(flat, max_chars_per_line) is None
-            return False
+            return _text_over_budget(
+                seg.text or "", max_chars_per_line, max_lines)
 
         changed = allow_split
         while changed and any(
@@ -1183,7 +1209,9 @@ def enforce_readability(
                     halves = _split_segment(
                         p, keep_cps, min_split_chars=min_split_chars,
                         word_timed_split_only=word_timed_split_only,
-                        max_cue_chars=_char_budget)
+                        max_cue_chars=_char_budget,
+                        max_chars_per_line=max_chars_per_line,
+                        max_lines=max_lines)
                     if len(halves) > 1:
                         new_pieces.extend(halves)
                         changed = True
@@ -1743,9 +1771,13 @@ def _concat_words(prev, seg, merged_text: str) -> list:
         return []
     if len(joined) != len(str(merged_text or "").split()):
         return []
-    # Word times must be non-decreasing for the highlight schedule to be usable.
+    # The array must be a usable SCHEDULE, not merely start-ordered. Comparing
+    # starts alone accepts a word whose end overruns the next word's start, and
+    # the ASS export anchors each word to the PREVIOUS word's end — so such an
+    # array renders the karaoke out of order (measured: a merged pair
+    # highlighted word 4 before word 3, then jumped back). Check end-vs-start.
     for a, b in zip(joined, joined[1:]):
-        if b["start"] < a["start"] - 1e-6:
+        if b["start"] < a["end"] - 1e-6 or b["end"] < b["start"]:
             return []
     return joined
 
@@ -1806,6 +1838,17 @@ def resync_cue_words(segments, *, rebuild: bool = True):
             continue
         from backend.services.subtitle_aligner import distribute_cue_window
         _store(seg, distribute_cue_window(tokens, s, e))
+        # Mark the array as FABRICATED. "Has a words array matching the token
+        # count" is what every downstream consumer reads as "has real audio
+        # times", so rebuilding silently promoted a word-less tier-C cue to
+        # looking word-timed — and the readability loop, which feeds its own
+        # output back in up to four times, then split those cues at guessed
+        # midpoints. That is exactly the char-proportional time cut
+        # ``word_timed_split_only`` exists to forbid. The rows are still useful
+        # for HIGHLIGHTING (the consumers' own fallback computes the same
+        # char-proportional schedule), so keep them — just don't let the
+        # splitter treat them as evidence.
+        _seg_set(seg, "words_synthetic", True)
         rebuilt += 1
     return kept, rebuilt
 

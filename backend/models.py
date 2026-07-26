@@ -118,6 +118,13 @@ class TranscriptSegment(BaseModel):
     text: str
     speaker: str  # "Speaker 1", "Speaker 2", etc.
     words: Optional[list[WordTimestamp]] = None  # per-word timestamps from Whisper
+    # True when ``words`` was REBUILT from the cue window by character weight
+    # rather than measured against audio. Consumers read "words array matches the
+    # token count" as "has real audio times", so a rebuilt array would otherwise
+    # promote a word-less cue to looking audio-timed — and the splitter would cut
+    # it at a guessed midpoint, which is precisely what ``word_timed_split_only``
+    # forbids. Good enough to drive a highlight, never evidence for a time cut.
+    words_synthetic: Optional[bool] = None
     confidence: Optional[float] = None  # 0.0-1.0, derived from avg_logprob
     avg_logprob: Optional[float] = None  # Raw Whisper log probability
     no_speech_prob: Optional[float] = None  # Probability this is not speech

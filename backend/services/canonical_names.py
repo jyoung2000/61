@@ -401,6 +401,7 @@ async def resolve_canonical_names(
             stored = _persist_load().get(key)
             if stored:
                 _cache_put(key, stored)
+                _publish_series_evidence(job_id, stored)
                 logger.info(
                     "[%s] canonical names reused from the durable store: "
                     "%d mapping(s) — same title+terms as an earlier run, so the "
@@ -448,6 +449,7 @@ async def resolve_canonical_names(
             if job_id:
                 _persist_put(key, result)
         _cache_put(key, result)
+        _publish_series_evidence(job_id, result)
         return dict(result)
     except Exception as e:
         logger.debug("[%s] canonical name resolution skipped: %s", job_id or "-", e)
@@ -791,7 +793,8 @@ def _word_is_near_typo(word: str) -> bool:
 def _vet_roster_pairs(pairs, candidates: set,
                       frequent: set | None = None,
                       max_pairs: int = 8,
-                      corpus: str | None = None) -> dict[str, str]:
+                      corpus: str | None = None,
+                      known_names: set | None = None) -> dict[str, str]:
     """Keep only corrections that are safe to auto-apply: the wrong form must
     be one of OUR mined candidates verbatim, the right form must look like a
     name (letters/spaces/apostrophes, ≤40 chars, ≤4 words), differ from the
@@ -850,17 +853,66 @@ def _vet_roster_pairs(pairs, candidates: set,
             continue
         if _PROFANITY_RE.search(right):
             continue
-        if corpus is not None and _attested(right) <= _attested(wrong):
-            # Consistency rule: consolidate toward the transcript's dominant
-            # spelling only. A right the transcript never (or more rarely)
-            # uses is the model inventing, not correcting.
-            continue
         ok, ratio = _roster_phonetic_ok(wrong, right)
         if not ok:
             continue
+        # Attestation, and the one thing that can safely override it.
+        #
+        # Requiring the RIGHT spelling to already out-appear the wrong one makes
+        # a genuine knowledge correction mathematically impossible: a name the
+        # ASR never once got right is attested zero times. Traced on a real run,
+        # Dorian→Darlian, Aires→Aries and Hero Yu→Heero Yuy each cleared mining,
+        # the ask-list, the ordinary-word and near-typo guards and the phonetic
+        # check (ratios 0.67-0.86), then all died here on 0-vs-N.
+        #
+        # But attestation cannot simply be dropped. It is also what caught the
+        # inverse failure, recorded from a fast-model run: the pass UN-corrected
+        # names that were already right — Duo→Dewo, General Septem→General
+        # Septain, Katul→Kattul. Those are invented homophones, so they clear the
+        # phonetic gate by construction, and they have zero attestation too.
+        # Attestation alone cannot tell "never heard right" from "already right".
+        #
+        # What separates them is external ground truth about which spelling is a
+        # real name: the series roster, the canonical map, the operator's custom
+        # vocabulary. Darlian is in the roster; Dewo is in nothing. So an
+        # unattested correction is allowed ONLY when its right-hand side is
+        # corroborated by ``known_names``; otherwise attestation still rules.
+        _att_r, _att_w = _attested(right), _attested(wrong)
+        _corroborated = bool(known_names) and right.lower() in {
+            str(k).lower() for k in known_names}
+        if corpus is not None and _att_r <= _att_w and not _corroborated:
+            continue
+        # Keep the signal as ranking too: a consolidation toward the
+        # transcript's own dominant spelling outranks an unattested correction
+        # of equal phonetic closeness when ``max_pairs`` truncates.
+        if corpus is not None and _att_r > _att_w:
+            ratio += 0.25
         scored.append((ratio, wrong, right))
     scored.sort(key=lambda t: -t[0])
     return {w: r for _s, w, r in scored[:max_pairs]}
+
+
+def _publish_series_evidence(job_id: str, mapping: dict) -> None:
+    """Republish a resolved canonical map under the per-job key the roster pass
+    reads its series evidence from.
+
+    ``resolve_roster_corrections`` looks up ``job:<id>``, but the resolver caches
+    under a CONTENT key (``sig:<title>|<terms>``) — a determinism change that
+    keyed the cache on the inputs rather than the run, and moved the entry out
+    from under the reader without updating it. Nothing wrote ``job:<id>``
+    afterwards, so ``series_map`` was always empty; with no operator series hint
+    the roster pass then returned before making any LLM call, and has therefore
+    never run on a real job. The unit tests missed it because they seed
+    ``job:<id>`` by hand.
+
+    Keeping BOTH keys costs one dict copy and lets the content key stay the
+    deterministic identity while the job key stays the reader's handle."""
+    if not job_id or not mapping:
+        return
+    try:
+        _cache_put(f"job:{job_id}", dict(mapping))
+    except Exception:
+        pass
 
 
 def roster_corrections_for_job(job_id: str) -> dict[str, str]:
@@ -1039,9 +1091,24 @@ async def resolve_roster_corrections(
         except TypeError:
             raw = await asyncio.wait_for(
                 orchestrator.text_completion(prompt), timeout + 15)
+        # Ground truth that can vouch for an UNATTESTED correction: the series
+        # roster / canonical map resolved for this job, plus the operator's own
+        # vocabulary. Without a corroborating source the vetting can only
+        # consolidate spellings the transcript already uses (see _vet_roster_pairs).
+        _known: set = set(series_map.values()) if series_map else set()
+        try:
+            from backend.services.custom_vocabulary import load_vocabulary
+            _known |= {str(t) for t in (load_vocabulary() or [])}
+        except Exception:
+            pass
+        try:
+            _known |= {str(t) for t in (series_roster_terms() or [])}
+        except Exception:
+            pass
         mapping = _vet_roster_pairs(
             _parse_json_pairs(raw or ""), {t for t, _ in ask},
-            corpus=" ".join(str(t) for t in texts))
+            corpus=" ".join(str(t) for t in texts),
+            known_names=_known)
         if not mapping:
             # Visible at INFO: a silent no-op here shipped "Gundarium" after
             # the infrastructure was in place — diagnosability matters more

@@ -385,6 +385,116 @@ def test_roster_still_allows_real_mishearings():
         assert allowed, f"{wrong!r} -> {right!r} must still be allowed"
 
 
+_MISSES = [{"wrong": "Dorian", "right": "Darlian"},
+           {"wrong": "Aires", "right": "Aries"},
+           {"wrong": "Hero Yu", "right": "Heero Yuy"},
+           {"wrong": "Hero-kun", "right": "Heero"}]
+_MISS_CORPUS = ("Relena Dorian arrived. Dorian spoke. Dorian left. Aires unit. "
+                "Aires again. Aires third. Hero Yu piloted. Hero-kun waited. "
+                "Hero-kun again.")
+_ROSTER = {"Relena Darlian", "Darlian", "Heero Yuy", "Heero", "Aries",
+           "Zechs Merquise", "Duo Maxwell"}
+
+
+def test_a_never_heard_name_is_correctable_when_ground_truth_vouches_for_it():
+    """The attestation rule required the RIGHT spelling to already out-appear
+    the wrong one — which makes a genuine knowledge correction mathematically
+    impossible, because a name the ASR never got right is attested zero times.
+
+    Traced on a real run, these four cleared mining, the ask-list, the
+    ordinary-word and near-typo guards and the phonetic check (ratios
+    0.67-0.86), then all died on 0-vs-N. They are recoverable only because an
+    independent source — the series roster / canonical map / operator
+    vocabulary — confirms the right-hand side is a real name.
+    """
+    from backend.services.canonical_names import _vet_roster_pairs
+    got = _vet_roster_pairs(_MISSES, {p["wrong"] for p in _MISSES},
+                            corpus=_MISS_CORPUS, known_names=_ROSTER)
+    assert got == {"Dorian": "Darlian", "Aires": "Aries",
+                   "Hero Yu": "Heero Yuy", "Hero-kun": "Heero"}, got
+
+
+def test_without_ground_truth_an_unattested_correction_is_still_refused():
+    """No corroborating source → the pass stays a CONSISTENCY tool, which is
+    the only safe default: attestation alone cannot tell "never heard right"
+    from "already right"."""
+    from backend.services.canonical_names import _vet_roster_pairs
+    got = _vet_roster_pairs(_MISSES, {p["wrong"] for p in _MISSES},
+                            corpus=_MISS_CORPUS)
+    assert got == {}, got
+
+
+def test_ground_truth_does_not_unlock_un_corrections():
+    """The inverse failure the attestation rule was protecting against.
+
+    A fast-model run UN-corrected names that were already right: Duo→Dewo,
+    General Septem→General Septain, Katul→Kattul. Those are invented
+    homophones, so they clear the phonetic gate by construction and have zero
+    attestation just like a real correction. What separates them is that the
+    invented spelling appears in NO ground-truth source — so a roster must not
+    launder them through.
+    """
+    from backend.services.canonical_names import _vet_roster_pairs
+    pairs = [{"wrong": "Duo", "right": "Dewo"},
+             {"wrong": "General Septem", "right": "General Septain"},
+             {"wrong": "Katul", "right": "Kattul"}]
+    got = _vet_roster_pairs(
+        pairs, {p["wrong"] for p in pairs},
+        corpus="This is Duo! General Septem is waiting. This is Katul reporting.",
+        known_names=_ROSTER)
+    assert got == {}, got
+
+
+def test_attestation_bonus_still_prefers_a_consolidation():
+    """The signal the veto was protecting survives as ranking.
+
+    When ``max_pairs`` truncates, a correction toward the transcript's own
+    dominant spelling outranks an unattested one of similar phonetic closeness.
+    """
+    from backend.services.canonical_names import _vet_roster_pairs
+    got = _vet_roster_pairs(
+        [{"wrong": "Zeks", "right": "Zechs"},
+         {"wrong": "Dorian", "right": "Darlian"}],
+        {"Zeks", "Dorian"},
+        corpus="Zechs Zechs Zechs Zeks Dorian Dorian", max_pairs=1)
+    assert got == {"Zeks": "Zechs"}, got
+
+
+def test_dropping_the_veto_kept_every_other_guard():
+    """The hallucination cases the veto also caught are covered elsewhere."""
+    from backend.services.canonical_names import _vet_roster_pairs
+    for wrong, right, corpus in [
+        ("Marina", "Relena", "Marina ship Marina"),        # phonetic guard
+        ("Justlove", "Justice", "Justlove"),               # ordinary-word guard
+        ("Septem", "Gneral Septem", "Septem"),             # near-typo guard
+    ]:
+        got = _vet_roster_pairs([{"wrong": wrong, "right": right}],
+                                {wrong}, corpus=corpus)
+        assert got == {}, f"{wrong!r} -> {right!r} must still be rejected: {got}"
+
+
+def test_resolved_names_are_published_where_the_roster_pass_reads_them():
+    """``resolve_roster_corrections`` reads its series evidence from
+    ``job:<id>``; the resolver caches under a CONTENT key.
+
+    Keying the cache on title+terms for determinism moved the entry out from
+    under that reader without updating it, and nothing wrote ``job:<id>``
+    afterwards — so ``series_map`` was always empty and, with no operator series
+    hint, the roster pass returned before making any LLM call. It had therefore
+    never run on a real job. The existing tests missed it because they seed
+    ``job:<id>`` by hand.
+    """
+    CN._CACHE.clear()
+    CN._publish_series_evidence("job-abc", {"ゼクス": "Zechs", "リリーナ": "Relena"})
+    assert CN._CACHE.get("job:job-abc") == {"ゼクス": "Zechs", "リリーナ": "Relena"}
+    # Fail-soft / no-op cases must not create junk entries.
+    CN._publish_series_evidence("", {"a": "b"})
+    CN._publish_series_evidence("job-empty", {})
+    assert "job:" not in CN._CACHE
+    assert "job:job-empty" not in CN._CACHE
+    CN._CACHE.clear()
+
+
 # ── Determinism: a resolved name map must survive across runs ──
 
 def test_canonical_map_persists_and_is_reused(tmp_path, monkeypatch):

@@ -189,6 +189,7 @@ def align_translated_cues(audio_path: str, cues: list) -> dict:
         return stats
 
     max_cue_shift = float(getattr(settings, "SUBTITLE_ALIGN_MAX_CUE_SHIFT_S", 0.75))
+    min_dur_s = float(getattr(settings, "SUBTITLE_MIN_DURATION_MS", 833)) / 1000.0
     device = _pick_device()
     try:
         backend = _get_backend("en", device)
@@ -252,7 +253,13 @@ def align_translated_cues(audio_path: str, cues: list) -> dict:
         prev_end = None
         ok = True
         for tok, (ws, we) in zip(tokens, spans):
-            n_s, n_e = round(s0 + ws, 3), round(s0 + we, 3)
+            # Clamp back into the cue. Alignment runs over a padded window, so a
+            # row could otherwise end up to ``pad`` past the cue's own end —
+            # which crosses the one-frame inter-cue gap into the NEXT cue, makes
+            # a later merge produce a non-monotonic array, and lets the burn-in
+            # extend the cue beyond what the SRT says.
+            n_s = round(min(max(s0 + ws, c_s), c_e), 3)
+            n_e = round(min(max(s0 + we, c_s), c_e), 3)
             if n_e <= n_s or (prev_end is not None and n_s < prev_end - 0.05):
                 ok = False       # non-monotonic → the aligner lost the thread
                 break
@@ -267,9 +274,17 @@ def align_translated_cues(audio_path: str, cues: list) -> dict:
         # Tighten the cue onto its own speech: pull the start up to the first
         # voiced word (never push it later than the audio), bounded so a
         # mis-anchor cannot move the cue far.
+        # Never tighten a cue below the minimum display duration. A 0.10 s floor
+        # only guaranteed start < end: a 1.0 s cue whose speech began 0.70 s in
+        # became a 0.30 s cue, and the readability pass then restored the minimum
+        # by pushing the END out — leaving the cue on screen 0.53 s LONGER than
+        # the window the timing tiers set, the opposite of the intent. Skip the
+        # tightening rather than shrink past the floor.
         new_start = rows[0]["start"]
-        if c_s < new_start - 0.02 and (new_start - c_s) <= max_cue_shift:
-            _set(cue, "start", round(min(new_start, c_e - 0.10), 3))
+        cand = min(new_start, c_e - min_dur_s)
+        if c_s < new_start - 0.02 and (new_start - c_s) <= max_cue_shift \
+                and cand > c_s + 0.02:
+            _set(cue, "start", round(cand, 3))
             stats["starts_tightened"] += 1
         stats["cues_aligned"] += 1
         stats["words_aligned"] += len(rows)

@@ -581,7 +581,14 @@ def generate_ass(
             seg_words = [
                 (w.start - start_time, w.end - start_time, w.word)
                 for w in seg.words
-                if w.end > (max(seg.start, start_time)) and w.start < (min(seg.end, end_time))
+                # Bound by the CLIP window, not the cue's own end. The frontend filters
+        # against the clip window (timelineStore), so filtering tighter here
+        # dropped words that legitimately run past a cue end — a cue end that
+        # gap enforcement capped without touching `words` — which broke the
+        # count match and silently demoted the burned-in export to
+        # char-proportional timing while the preview stayed audio-true. The two
+        # then highlighted different words at the same timestamp.
+        if w.end > start_time and w.start < end_time
             ]
             if not seg_words:
                 seg_words = None
@@ -979,7 +986,19 @@ def generate_ass(
         clip_start, clip_end, text, speaker = seg[0], seg[1], seg[2], seg[3]
         seg_word_ts = seg[4] if len(seg) > 4 else None
         style_name = _sanitize_style_name(speaker)
-        safe_text = text.replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
+        # An ASS Dialogue event is ONE physical line: a literal newline in the
+        # text terminates the event and libass discards the remainder. Cue text
+        # really does contain newlines here — this function runs
+        # ``enforce_readability(..., smart_line_breaks=True)`` above — so every
+        # two-line cue was emitting a broken Layer-0 event whose second line was
+        # dropped, while the Layer-1 colour events (rebuilt by joining tokens
+        # with a space) laid the same cue out as one long line. The two layers
+        # disagreed on line layout, which renders as ghosted/offset text with the
+        # outline covering only the first line. ``\N`` is the ASS hard break.
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        safe_text = (text.replace("\\", "\\\\")
+                     .replace("{", "\\{").replace("}", "\\}")
+                     .replace("\n", "\\N"))
 
         if active_word_enabled:
             prefix = f"{speaker}: " if show_speaker_labels and speaker else ""
@@ -1010,7 +1029,34 @@ def generate_ass(
             # text, and inline <span style="color:gold"> only changes
             # the fill color on top.
 
-            words = safe_text.split()
+            # Tokens come from the UNESCAPED text so a newline still acts as a
+            # separator (splitting ``safe_text`` would glue two words together
+            # across the literal ``\N`` and corrupt the word count the highlight
+            # indexes by). Track which token opens a new line so the rebuilt
+            # runs below can re-insert ``\N`` at exactly the same places Layer 0
+            # breaks — joining everything with spaces is what made the two
+            # layers lay the cue out differently.
+            words = [w.replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
+                     for w in text.split()]
+            _line_of: list[int] = []
+            for _li, _line in enumerate(text.split("\n")):
+                _line_of.extend([_li] * len(_line.split()))
+
+            def _join_run(lo: int, hi: int) -> str:
+                """Tokens ``[lo, hi)`` re-joined with the cue's own line breaks."""
+                out = ""
+                for _i in range(lo, hi):
+                    if _i > lo:
+                        out += "\\N" if _line_of[_i] != _line_of[_i - 1] else " "
+                    out += words[_i]
+                return out
+
+            def _sep_before(idx: int) -> str:
+                """The separator that precedes token ``idx`` (empty at token 0)."""
+                if idx <= 0:
+                    return ""
+                return "\\N" if _line_of[idx] != _line_of[idx - 1] else " "
+
             if len(words) <= 1:
                 # Single word — no color transitions, so no segmentation
                 # issue.  Just use a single layer with active word color.
@@ -1128,9 +1174,9 @@ def generate_ass(
                     # Layer 1: Color layer — full text, per-word colors,
                     # NO border/box.  In outline mode: \bord0\shad0\3a&HFF&.
                     # In background mode: _AW style (BorderStyle=1, no box).
-                    before = " ".join(words[:word_idx])
+                    before = _join_run(0, word_idx)
                     active = words[word_idx]
-                    after = " ".join(words[word_idx + 1:])
+                    after = _join_run(word_idx + 1, len(words))
                     nobord_prefix = "{" + aw_nobord_tag + "}" if aw_nobord_tag else ""
                     # base_tag: non-active word color + transparent box
                     if aw_bg_color:
@@ -1156,10 +1202,10 @@ def generate_ass(
                         reset_tag = base_tag
                     parts = []
                     if before:
-                        parts.append(f"{base_tag}{before} ")
+                        parts.append(f"{base_tag}{before}{_sep_before(word_idx)}")
                     parts.append(f"{aw_tag}{active}")
                     if after:
-                        parts.append(f"{reset_tag} {after}")
+                        parts.append(f"{reset_tag}{_sep_before(word_idx + 1)}{after}")
                     color_event_text = nobord_prefix + prefix + "".join(parts)
                     pending_word_events.append((w_start, w_end, style_name + aw_style_suffix, color_event_text))
             else:
@@ -1271,9 +1317,9 @@ def generate_ass(
                         base_text_events.append((shifted_start, word_end, style_name, border_event_text))
 
                     # Layer 1: Color layer — per-word coloring, no border/box.
-                    before = " ".join(words[:word_idx])
+                    before = _join_run(0, word_idx)
                     active = words[word_idx]
-                    after = " ".join(words[word_idx + 1:])
+                    after = _join_run(word_idx + 1, len(words))
                     nobord_prefix = "{" + aw_nobord_tag + "}" if aw_nobord_tag else ""
                     # base_tag: non-active word color + transparent box
                     if aw_bg_color:
@@ -1299,10 +1345,10 @@ def generate_ass(
                         reset_tag = base_tag
                     parts = []
                     if before:
-                        parts.append(f"{base_tag}{before} ")
+                        parts.append(f"{base_tag}{before}{_sep_before(word_idx)}")
                     parts.append(f"{aw_tag}{active}")
                     if after:
-                        parts.append(f"{reset_tag} {after}")
+                        parts.append(f"{reset_tag}{_sep_before(word_idx + 1)}{after}")
                     color_event_text = nobord_prefix + prefix + "".join(parts)
                     pending_word_events.append((shifted_start, word_end, style_name + aw_style_suffix, color_event_text))
         else:

@@ -3405,7 +3405,18 @@ async def _condense_over_cps_cues(
             "These subtitle lines display too briefly for a viewer to read "
             "them at their current length. Rewrite EACH line within its "
             "character budget while preserving its meaning, tone and any "
-            "names — cut filler and redundancy, never the substance. "
+            "names. "
+            # Register, repeated here on purpose. This pass rewrites the
+            # LONGEST cues, which are exactly the over-formal ones the
+            # translation prompt's register rule targets — and with no register
+            # guidance of its own it will happily trade a spoken verb for a
+            # shorter written-register synonym, undoing that work on the cues
+            # where it is most visible.
+            "Write plain spoken dialogue: prefer the short common word over the "
+            "formal or latinate one, keep contractions and forms of address "
+            "(sir, Lieutenant, Colonel), and never swap a spoken verb for a "
+            "written-register synonym just to save characters. "
+            "Cut filler and redundancy, never the substance. "
             f"Return ONLY a JSON array of exactly {len(offenders)} strings, "
             "in order.\n\n"
             f"Lines:\n{numbered}"
@@ -4349,7 +4360,21 @@ async def _background_post_processing(
                     # fail-soft — no backend or no audio leaves timings as-is.
                     try:
                         from backend.services.forced_aligner import align_translated_cues
-                        _fa_path = getattr(job, "file_path", None)
+                        # Hand the aligner the DEMUXED wav, never the container.
+                        # torchaudio can only open an mp4 through its ffmpeg
+                        # backend, and the GPU image builds FFmpeg 7.1
+                        # (libavutil.so.59) which torchaudio 2.5.1 does not know
+                        # how to load — so the container decode raises, the pass
+                        # returns zeroes, and the whole alignment silently does
+                        # nothing on exactly the image this runs on. Every other
+                        # audio consumer here demuxes first; this is the sibling
+                        # wav the extraction stage already wrote (16 kHz mono),
+                        # which also avoids materialising ~550 MB of float32 for
+                        # a 24-minute stereo track.
+                        _fa_video = getattr(job, "file_path", None) or ""
+                        _fa_wav = os.path.join(
+                            os.path.dirname(_fa_video) or ".", "audio.wav")
+                        _fa_path = _fa_wav if os.path.isfile(_fa_wav) else _fa_video
                         if _fa_path and translated:
                             _fa = await asyncio.to_thread(
                                 align_translated_cues, _fa_path, translated)

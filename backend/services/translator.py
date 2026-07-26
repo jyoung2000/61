@@ -1423,6 +1423,17 @@ SUPPORTED_LANGUAGES = {
     "st": "Sesotho",
 }
 
+# NOT THE LIVE PROMPT. This feeds ``translate_segments`` (~line 2251), which has
+# no production caller — the pipeline goes through ``translate_via_llm`` and the
+# batch prompt built inside its ``_call`` helper (~line 862). Only
+# test_translation_fail_loud exercises this path.
+#
+# Flagged because it is the most inviting prompt in the file — a module-level
+# constant with a CRITICAL RULES block — so it is where someone tuning wording
+# will naturally edit, and measure no change. Worse, its register rule pulls the
+# OTHER way ("match each line's register") than the live prompt's plain-spoken
+# rule, so copying an idea from here into production would regress wording.
+# Edit the live prompt in ``_call`` instead.
 TRANSLATION_PROMPT = """Translate the following subtitle segments from {source_lang} to {target_lang}.
 
 These are scripted dialogue lines from a film / TV / streaming production
