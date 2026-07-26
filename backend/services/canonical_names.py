@@ -41,6 +41,7 @@ import asyncio
 import difflib
 import json
 import logging
+import os
 import re
 
 logger = logging.getLogger("clipai.canonical_names")
@@ -86,6 +87,82 @@ def _cache_put(key: str, value: dict[str, str]) -> None:
         except Exception:
             _CACHE.clear()
     _CACHE[key] = value
+
+
+# ── Durable store: keep a RESOLVED name map across runs ──────────────────
+# The in-memory cache is keyed per job, so re-running the same video asks the
+# model again — and the answer varies. Two consecutive runs of one episode
+# resolved 6 names and then 0: the first produced "Relena"/"Zechs"/"Gundanium",
+# the second "Lilyana"/"Sixes"/"Eries". Persisting a SUCCESSFUL map under a
+# content fingerprint makes names deterministic run-over-run and lets a title
+# improve once and stay improved. Only non-empty results are stored, so a
+# transient provider failure can't be cached forever.
+_PERSIST_NAME = "canonical_names.json"
+_PERSIST_MAX = 200
+
+
+def _persist_path() -> str:
+    """Path to the durable store, or "" when there is nowhere durable to write.
+
+    Deliberately ONLY the deployment volume — no home-directory fallback. A
+    library that writes to a global path outside a real deployment makes runs
+    order-dependent on whatever a previous run left behind: an earlier version of
+    this store fell back to ~/.clipai, and a test that resolved names then wrote
+    an entry that the NEXT run read back, so the model was never called and the
+    test failed depending on execution order. Restricting the store to the mounted
+    volume makes persistence a property of deployments, not of the library."""
+    docker_dir = "/data/logs"
+    if not os.path.isdir(docker_dir):
+        return ""
+    return os.path.join(docker_dir, _PERSIST_NAME)
+
+
+def _persist_load() -> dict[str, dict[str, str]]:
+    """Fail-soft read of the durable map store ({} on any problem)."""
+    try:
+        path = _persist_path()
+        if not path or not os.path.isfile(path):
+            return {}
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        entries = data.get("entries") if isinstance(data, dict) else None
+        if not isinstance(entries, dict):
+            return {}
+        return {
+            k: {str(a): str(b) for a, b in v.items()}
+            for k, v in entries.items() if isinstance(v, dict)
+        }
+    except Exception:
+        return {}
+
+
+def _persist_put(key: str, value: dict[str, str]) -> None:
+    """Store a non-empty resolved map. Never raises."""
+    if not key or not value:
+        return
+    try:
+        path = _persist_path()
+        if not path:
+            return                      # no deployment volume -> no persistence
+        entries = _persist_load()
+        entries[key] = value
+        if len(entries) > _PERSIST_MAX:            # drop oldest insertions
+            for k in list(entries)[:len(entries) - _PERSIST_MAX]:
+                entries.pop(k, None)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"entries": entries}, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def _content_key(title: str, terms: list[str]) -> str:
+    """Fingerprint a resolution request by what it actually depends on — the
+    title and the mined terms — so the same video reuses the same answer
+    instead of re-asking under a fresh job id."""
+    return "sig:" + (title or "").strip().lower() + "|" + "|".join(
+        sorted(t.strip().lower() for t in (terms or []) if t and t.strip()))
 
 
 def _settings():
@@ -306,11 +383,30 @@ async def resolve_canonical_names(
         if not _informative_title(title) and not hint and len(terms) < 4:
             return {}
 
-        key = f"job:{job_id}" if job_id else (
-            "anon:" + title.lower() + "|" + "|".join(sorted(t.lower() for t in terms)))
+        # Key on CONTENT (title + mined terms), not the job id. Keying per job
+        # meant re-running the same video asked the model again, and the answer
+        # varies: consecutive runs of one episode resolved 6 names and then 0,
+        # shipping "Relena"/"Zechs"/"Gundanium" one time and
+        # "Lilyana"/"Sixes"/"Eries" the next. A content key makes the same video
+        # reuse the same answer, and the durable store carries it across restarts.
+        key = _content_key(title, terms)
         cached = _CACHE.get(key)
         if cached is not None:
             return dict(cached)
+        # The durable store is a PIPELINE concern, so it is only consulted for a
+        # real run (job_id set). A direct call with no job id — a unit test or an
+        # ad-hoc probe — always asks the model, so behaviour can't depend on
+        # whatever a previous run happened to leave on disk.
+        if job_id:
+            stored = _persist_load().get(key)
+            if stored:
+                _cache_put(key, stored)
+                logger.info(
+                    "[%s] canonical names reused from the durable store: "
+                    "%d mapping(s) — same title+terms as an earlier run, so the "
+                    "names stay identical instead of being re-guessed",
+                    job_id, len(stored))
+                return dict(stored)
 
         timeout = float(getattr(s, "TRANSLATION_CANONICAL_NAMES_TIMEOUT", _DEF_TIMEOUT) or _DEF_TIMEOUT) if s else _DEF_TIMEOUT
         # Model priority: explicit config pin > the caller's translation model
@@ -346,6 +442,11 @@ async def resolve_canonical_names(
                 "[%s] canonical names resolved for %d/%d term(s): %s",
                 job_id or "-", len(result), len(terms),
                 "; ".join(f"{k}→{v}" for k, v in list(result.items())[:8]))
+            # Persist only a SUCCESSFUL map, so a transient provider failure is
+            # never cached forever and a later run can still resolve the names.
+            # Pipeline runs only, matching the read gate above.
+            if job_id:
+                _persist_put(key, result)
         _cache_put(key, result)
         return dict(result)
     except Exception as e:

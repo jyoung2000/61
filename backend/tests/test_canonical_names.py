@@ -383,3 +383,39 @@ def test_roster_still_allows_real_mishearings():
     ]:
         allowed, _ = _roster_phonetic_ok(wrong, right)
         assert allowed, f"{wrong!r} -> {right!r} must still be allowed"
+
+
+# ── Determinism: a resolved name map must survive across runs ──
+
+def test_canonical_map_persists_and_is_reused(tmp_path, monkeypatch):
+    """Keying the cache per job made the same video re-ask the model, and the
+    answer varied: consecutive runs of one episode resolved 6 names then 0,
+    shipping "Relena"/"Zechs" one time and "Lilyana"/"Sixes" the next.
+    A content key plus a durable store makes it deterministic."""
+    from backend.services import canonical_names as CN
+    monkeypatch.setattr(CN, "_persist_path", lambda: str(tmp_path / "cn.json"))
+    CN.clear_cache()
+    key = CN._content_key("Gundam Wing Episode 1", ["リリーナ", "ゼクス"])
+    CN._persist_put(key, {"リリーナ": "Relena", "ゼクス": "Zechs"})
+    assert CN._persist_load().get(key) == {"リリーナ": "Relena", "ゼクス": "Zechs"}
+    # Same title + terms in any order → same key (so a re-run reuses it).
+    assert CN._content_key("Gundam Wing Episode 1", ["ゼクス", "リリーナ"]) == key
+    # Different terms → different key (no cross-title bleed).
+    assert CN._content_key("Gundam Wing Episode 1", ["ハロ"]) != key
+
+
+def test_canonical_persist_ignores_empty_results(tmp_path, monkeypatch):
+    """A transient provider failure must never be cached forever."""
+    from backend.services import canonical_names as CN
+    monkeypatch.setattr(CN, "_persist_path", lambda: str(tmp_path / "cn.json"))
+    key = CN._content_key("Some Show", ["term"])
+    CN._persist_put(key, {})
+    assert CN._persist_load().get(key) is None
+
+
+def test_canonical_persist_is_failsoft_on_corrupt_store(tmp_path, monkeypatch):
+    from backend.services import canonical_names as CN
+    p = tmp_path / "cn.json"
+    p.write_text("{ not json", encoding="utf-8")
+    monkeypatch.setattr(CN, "_persist_path", lambda: str(p))
+    assert CN._persist_load() == {}

@@ -547,6 +547,40 @@ async def trigger_analysis(job_id: str, background_tasks: BackgroundTasks):
     return {"job_id": job_id, "status": "analysis_started"}
 
 
+async def _effective_fps(job) -> float:
+    """The video's frame rate for subtitle frame-alignment, probing if needed.
+
+    ``job.fps`` is written from the analysis probe, but it is 0.0 on any job
+    whose record predates that step or was restored from a checkpoint — and a
+    0 silently drops the frame quantizer back to the millisecond gap pass. That
+    is invisible in the output except as timestamps sitting off the frame grid
+    (one run shipped 5% on-grid while the reference track was 100%). Probing the
+    file closes the hole; the probe is a single ffprobe and only runs when the
+    stored value is missing. Returns 0.0 when the frame rate can't be determined,
+    which leaves the millisecond fallback in charge."""
+    try:
+        fps = float(getattr(job, "fps", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        fps = 0.0
+    if fps > 0:
+        return fps
+    path = str(getattr(job, "file_path", "") or "")
+    if not path or not os.path.isfile(path):
+        return 0.0
+    try:
+        from backend.services.frame_extractor import get_video_metadata
+        meta = await get_video_metadata(path)
+        probed = float((meta or {}).get("fps") or 0.0)
+        if probed > 0:
+            logger.info(
+                "Subtitle export: job.fps was unset — probed %.3f fps from the "
+                "media so cues can be frame-aligned", probed)
+            return probed
+    except Exception as e:
+        logger.debug("Subtitle export: fps probe failed (%s)", e)
+    return 0.0
+
+
 def _filter_cue_range(segments: list, start: Optional[float], end: Optional[float]) -> list:
     """Keep cues overlapping ``[start, end]`` — the server-side equivalent of the
     transcript panel's time filter.
@@ -607,7 +641,7 @@ async def download_srt(
     # Pass the video's frame rate so cue in/out points land on real frame
     # boundaries (what hand-authored subtitle tracks do).
     srt_content = generate_srt(
-        segments, include_speakers=speakers, fps=getattr(job, "fps", 0.0))
+        segments, include_speakers=speakers, fps=await _effective_fps(job))
 
     base = job.filename.rsplit(".", 1)[0] if "." in job.filename else job.filename
     base = (base or "").strip() or "transcript"
@@ -630,7 +664,7 @@ async def download_original_srt(job_id: str, speakers: bool = True):
         raise HTTPException(status_code=404, detail="No transcript available")
     segments = [TranscriptSegment(**s) if isinstance(s, dict) else s for s in job.transcript]
     srt_content = generate_srt(
-        segments, include_speakers=speakers, fps=getattr(job, "fps", 0.0))
+        segments, include_speakers=speakers, fps=await _effective_fps(job))
     base = job.filename.rsplit(".", 1)[0] if "." in job.filename else job.filename
     base = (base or "").strip() or "transcript"
     return Response(
@@ -679,7 +713,7 @@ async def download_vtt(
         include_speakers=speakers,
         include_position=include_position,
         platform=platform,
-        fps=getattr(job, "fps", 0.0),
+        fps=await _effective_fps(job),
     )
 
     base = job.filename.rsplit(".", 1)[0] if "." in job.filename else job.filename
@@ -764,7 +798,7 @@ async def download_subtitles(
         content = generate_bilingual_srt(
             source_segments, translated_segments, order=order,
             include_speakers=speakers, include_timestamps_in_text=timestamps,
-            fps=getattr(job, "fps", 0.0),
+            fps=await _effective_fps(job),
         )
         media_type = "text/srt; charset=utf-8"
         ext = f"_bilingual_{target_lang}.srt"
@@ -785,7 +819,7 @@ async def download_subtitles(
                 segments, include_speakers=speakers,
                 include_timestamps_in_text=timestamps,
                 include_position=include_position, platform=platform,
-                fps=getattr(job, "fps", 0.0),
+                fps=await _effective_fps(job),
             )
             media_type = "text/vtt; charset=utf-8"
             ext = f"{lang_suffix}.vtt"
@@ -793,7 +827,7 @@ async def download_subtitles(
             content = generate_srt(
                 segments, include_speakers=speakers,
                 include_timestamps_in_text=timestamps,
-                fps=getattr(job, "fps", 0.0),
+                fps=await _effective_fps(job),
             )
             media_type = "text/srt; charset=utf-8"
             ext = f"{lang_suffix}.srt"
