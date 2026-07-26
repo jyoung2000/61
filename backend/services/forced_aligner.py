@@ -160,6 +160,148 @@ def _get_backend(language: str, device: str):
     return _aligner_cache[key]
 
 
+def align_translated_cues(audio_path: str, cues: list) -> dict:
+    """Force-align ENGLISH subtitle cues against the audio, in place.
+
+    ``refine_word_timestamps`` below is written for the reframer's segment shape
+    (``start_sec``/``end_sec`` dicts) and for REFINING timings that are already
+    roughly right — it rejects a whole segment when any word moves more than
+    ``_MAX_SHIFT_S``. Neither fits the shipped subtitle track:
+
+      * subtitle cues are ``TranscriptSegment``-shaped (``start``/``end``);
+      * only about half of them carry real audio word times. The rest are
+        distributed across the cue window by character width, so their words are
+        routinely more than 0.6 s from the truth — exactly the cues that most
+        need aligning are the ones the refine guard throws out.
+
+    So this entry point keeps the cue WINDOW as the trusted anchor (it came from
+    the ASR/timing tiers) and places the words inside it from the audio, with no
+    prior-shift veto. It also pulls the cue's own start back to its first voiced
+    word, which is what stops a cue appearing before the speech it captions —
+    bounded by ``max_cue_shift_s`` so a mis-anchored cue can't wander.
+
+    Returns stats; never raises. On any failure the caller's timings stand."""
+    stats = {"enabled": False, "backend": None, "cues_aligned": 0,
+             "words_aligned": 0, "mean_shift_ms": 0.0, "starts_tightened": 0}
+    if not bool(getattr(settings, "SUBTITLE_FORCED_ALIGN", True)):
+        return stats
+    if not cues or not audio_path:
+        return stats
+
+    max_cue_shift = float(getattr(settings, "SUBTITLE_ALIGN_MAX_CUE_SHIFT_S", 0.75))
+    device = _pick_device()
+    try:
+        backend = _get_backend("en", device)
+    except Exception as e:
+        logger.info("Cue alignment skipped: %s", e)
+        return stats
+    if backend is None or backend == "ctc_fa":
+        return stats
+
+    try:
+        import torchaudio
+        waveform, sr = torchaudio.load(audio_path)
+        if waveform.shape[0] > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+        if sr != backend.sample_rate:
+            waveform = torchaudio.functional.resample(
+                waveform, sr, backend.sample_rate)
+            sr = backend.sample_rate
+    except Exception as e:
+        logger.info("Cue alignment: audio load failed (%s)", e)
+        return stats
+
+    stats["enabled"] = True
+    stats["backend"] = f"torchaudio/{device}"
+    pad = 0.30
+    total_shift = 0.0
+
+    def _get(c, k, d=None):
+        return (c.get(k, d) if isinstance(c, dict) else getattr(c, k, d))
+
+    def _set(c, k, v):
+        if isinstance(c, dict):
+            c[k] = v
+        else:
+            setattr(c, k, v)
+
+    for cue in cues:
+        text = str(_get(cue, "text", "") or "")
+        tokens = text.split()
+        if not tokens or not all(_normalize_en(t) for t in tokens):
+            continue
+        try:
+            c_s = float(_get(cue, "start", 0.0) or 0.0)
+            c_e = float(_get(cue, "end", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if c_e - c_s < 0.10:
+            continue
+        s0 = max(0.0, c_s - pad)
+        a, b = int(s0 * sr), int((c_e + pad) * sr)
+        if a >= waveform.shape[1] or b - a < sr // 10:
+            continue
+        try:
+            spans = backend.align_words(
+                waveform[:, a:min(b, waveform.shape[1])], tokens)
+        except Exception:
+            spans = None
+        if not spans or len(spans) != len(tokens):
+            continue
+        rows = []
+        prev_end = None
+        ok = True
+        for tok, (ws, we) in zip(tokens, spans):
+            n_s, n_e = round(s0 + ws, 3), round(s0 + we, 3)
+            if n_e <= n_s or (prev_end is not None and n_s < prev_end - 0.05):
+                ok = False       # non-monotonic → the aligner lost the thread
+                break
+            rows.append({"word": tok, "start": n_s, "end": n_e})
+            prev_end = n_e
+        if not ok:
+            continue
+        # Accumulate how far the words moved, for the log line.
+        for old, new in zip(_iter_word_starts(cue), rows):
+            total_shift += abs(new["start"] - old)
+        _set(cue, "words", _as_word_rows(cue, rows))
+        # Tighten the cue onto its own speech: pull the start up to the first
+        # voiced word (never push it later than the audio), bounded so a
+        # mis-anchor cannot move the cue far.
+        new_start = rows[0]["start"]
+        if c_s < new_start - 0.02 and (new_start - c_s) <= max_cue_shift:
+            _set(cue, "start", round(min(new_start, c_e - 0.10), 3))
+            stats["starts_tightened"] += 1
+        stats["cues_aligned"] += 1
+        stats["words_aligned"] += len(rows)
+
+    if stats["words_aligned"]:
+        stats["mean_shift_ms"] = round(
+            total_shift / stats["words_aligned"] * 1000, 1)
+    return stats
+
+
+def _iter_word_starts(cue) -> list:
+    raw = (cue.get("words") if isinstance(cue, dict) else getattr(cue, "words", None)) or []
+    out = []
+    for w in raw:
+        v = w.get("start") if isinstance(w, dict) else getattr(w, "start", None)
+        out.append(float(v) if v is not None else 0.0)
+    return out
+
+
+def _as_word_rows(cue, rows: list):
+    """Word rows in whatever shape ``cue`` already stores — a dict row keeps
+    dicts, a pydantic segment keeps ``WordTimestamp`` (assignment is not
+    validated, so bare dicts there would break every ``w.end`` consumer)."""
+    if isinstance(cue, dict):
+        return rows
+    try:
+        from backend.models import WordTimestamp
+        return [WordTimestamp(**r) for r in rows]
+    except Exception:
+        return rows
+
+
 def refine_word_timestamps(audio_path: str, segments: list,
                            language: str = "en") -> dict:
     """Refine ``segments[i]['words']`` in place against the audio.

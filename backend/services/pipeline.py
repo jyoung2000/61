@@ -4330,6 +4330,48 @@ async def _background_post_processing(
                         logger.warning(
                             "[%s] Hybrid word-timing projection failed (%s) — keeping "
                             "LLM cues whole", job_id, _hy_err)
+
+                    # ── Forced-align the ENGLISH cues against the audio ──
+                    # The tiers above give roughly half the cues real audio word
+                    # times; the rest are spread across the cue window by
+                    # character width. Those fabricated times cost three things
+                    # at once: per-word highlighting advances by text length
+                    # instead of speech, the readability splitter refuses to cut
+                    # a cue it has no real word time for (so over-long cues ship
+                    # whole), and the cue's own start cannot be tightened onto
+                    # its first voiced word — which is why a cue can appear
+                    # before the speech it captions.
+                    #
+                    # CTC forced alignment fixes all three at the source: it is
+                    # the one step that yields true per-word onsets for EVERY
+                    # cue. It runs on the translated (English) track, which the
+                    # torchaudio wav2vec2 backend supports directly, and is
+                    # fail-soft — no backend or no audio leaves timings as-is.
+                    try:
+                        from backend.services.forced_aligner import align_translated_cues
+                        _fa_path = getattr(job, "file_path", None)
+                        if _fa_path and translated:
+                            _fa = await asyncio.to_thread(
+                                align_translated_cues, _fa_path, translated)
+                            if _fa.get("cues_aligned"):
+                                logger.info(
+                                    "[%s] Cue alignment: %d/%d cue(s) force-aligned "
+                                    "to the audio via %s — %d word(s), mean shift "
+                                    "%.0f ms, %d cue start(s) tightened onto their "
+                                    "first voiced word",
+                                    job_id, _fa["cues_aligned"], len(translated),
+                                    _fa.get("backend"), _fa["words_aligned"],
+                                    _fa.get("mean_shift_ms", 0.0),
+                                    _fa.get("starts_tightened", 0))
+                            elif _fa.get("enabled"):
+                                logger.info(
+                                    "[%s] Cue alignment: backend %s ready but no cue "
+                                    "aligned — keeping projected word timings",
+                                    job_id, _fa.get("backend"))
+                    except Exception as _fa_err:
+                        logger.info(
+                            "[%s] Cue forced alignment skipped (%s) — keeping "
+                            "projected word timings", job_id, _fa_err)
             elif getattr(settings, "SENTENCE_SEGMENTATION_ENABLED", True) and not _pre_resegmented:
                 try:
                     from backend.services.sentence_segmenter import resegment_by_sentence

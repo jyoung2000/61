@@ -532,6 +532,15 @@ class Settings(BaseSettings):
     # ~1 frame of speech onset/offset. No-op when no aligner backend is
     # available. GPU is used only when >1.5GB VRAM is free, else CPU.
     SUBTITLE_FORCED_ALIGN: bool = True
+    # How far forced alignment may pull a cue's START to reach its first VOICED
+    # word. This is the knob that stops a cue appearing before the speech it
+    # captions: the tiers hand over a window derived from ASR segment
+    # boundaries, which land at the preceding silence, so the cue is on screen
+    # while the actor is still drawing breath. Pulling the start onto the real
+    # onset removes that — but only within a bound, so a mis-anchored cue cannot
+    # wander far from the window the timing tiers established. 0 disables the
+    # tightening while leaving per-word alignment on.
+    SUBTITLE_ALIGN_MAX_CUE_SHIFT_S: float = 0.75
     # ── TACT phantom-hallucination filter (confidence-gated) ──
     # Whisper invents short, low-confidence cues over silence / music — the
     # "Don't let", "So nice", "Hmm." fragments (and repeated verbatim run-ons)

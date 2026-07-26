@@ -306,11 +306,60 @@ def _is_cjk(text: str) -> bool:
     return total > 0 and (cjk / total) >= 0.30
 
 
+def _split_candidates(text: str) -> list[int]:
+    """Break points in ``text``, best first, as character indices.
+
+    ``_find_split_point`` returns only the winner of the first non-empty
+    category, and that single answer is often unusable — which silently defeats
+    the whole splitter. Measured case: a 119-character cue whose ONLY match in
+    any category was the conjunction in "report that your", at index 19. Index
+    19 of 119 is nowhere near the centre; it strands a 0.44 s left piece, below
+    the minimum cue duration, so the split was refused and the cue shipped at
+    119 characters — 58 past the on-screen budget — taking a 64-character line
+    with it. The whitespace boundary near the middle would have produced two
+    clean halves, but the caller never got to see it because the conjunction
+    category was non-empty.
+
+    So return every category's candidates, in preference order, and let the
+    caller keep asking until one actually works. Within a category the ones
+    nearest the centre come first (a balanced cut both reads better and is more
+    likely to leave two pieces that each satisfy the duration floor)."""
+    out: list[int] = []
+    seen: set[int] = set()
+
+    def _add(idxs):
+        for i in sorted(idxs, key=lambda i: abs(i - (len(text) // 2))):
+            if 0 < i < len(text) and i not in seen:
+                seen.add(i)
+                out.append(i)
+
+    if _is_cjk(text):
+        _add([i + 1 for i, ch in enumerate(text) if ch in _CJK_SENTENCE_PUNCT])
+        _add([i + 1 for i, ch in enumerate(text) if ch in _CJK_CLAUSE_PUNCT])
+        _add([m.end() for m in _CJK_PARTICLE_BREAK_RE.finditer(text)])
+        _add([i + 1 for i, ch in enumerate(text) if ch in ".,!?;:"])
+        if not out:
+            _add([len(text) // 2])
+        return out
+
+    _add([m.end() for m in re.finditer(r"[.!?]\s+", text)])
+    _add([m.end() for m in re.finditer(r"[,;:]\s+", text)])
+    _add([m.start() for m in re.finditer(
+        r"\s+(and|but|or|so|because|when|if|that|which)\s+", text, re.IGNORECASE)])
+    # Plain word boundaries last: a mid-clause cut is what a professional track
+    # does when a line is simply too long to hold, and it beats overflowing.
+    _add([i + 1 for i, ch in enumerate(text) if ch.isspace()])
+    return out
+
+
 def _find_split_point(text: str) -> Optional[int]:
     """Return the character index just past the best break point in
     ``text`` (sentence end → clause end → conjunction → word midpoint).
     CJK-aware: also looks for 。、！？・ and Japanese particle boundaries
-    so a long Japanese subtitle has somewhere to break."""
+    so a long Japanese subtitle has somewhere to break.
+
+    Kept for callers that want a single answer; prefer ``_split_candidates``
+    when a rejected boundary should fall through to the next-best one."""
     mid = len(text) // 2
 
     if _is_cjk(text):
@@ -544,15 +593,26 @@ def _split_segment(
     min_piece_duration: float = 0.5,
     min_split_chars: int = 0,
     word_timed_split_only: bool = False,
+    max_cue_chars: int = 0,
 ) -> list[TranscriptSegment]:
     """Try to split a single segment in two at a linguistic boundary so
     each half satisfies the CPS limit. Returns ``[seg]`` if no useful
     split exists or if either resulting piece would be shorter than
     ``min_piece_duration`` seconds (preventing over-fragmentation on
-    pathologically fast speech)."""
+    pathologically fast speech).
+
+    ``max_cue_chars`` (the on-screen budget, max_lines × max_chars_per_line)
+    gives the SECOND reason to split. A cue can be comfortably inside the CPS
+    limit and still not fit the box: measured cues of 72-96 characters sat at
+    12-17 CPS, under the cap, so the CPS early-return below declined to split
+    them — while the caller's loop was asking precisely because they overflowed
+    the budget. The two disagreed and the cue shipped whole, over budget, with a
+    long line. Pass the budget and the CPS shortcut yields to it."""
     text = seg.text.strip()
     duration = max(0.001, seg.end - seg.start)
-    if _cps(text, duration) <= target_cps:
+    _over_box = (max_cue_chars > 0
+                 and len(" ".join(text.split())) > max_cue_chars)
+    if _cps(text, duration) <= target_cps and not _over_box:
         return [seg]
     # Guard against over-fragmentation: never split a segment that's
     # already shorter than 2x the minimum piece duration. If we did,
@@ -581,73 +641,79 @@ def _split_segment(
                     speaker=seg.speaker, words=right_words, confidence=seg.confidence,
                 )
                 return [left, right]
-    # PRIORITY 2: text-level boundary (sentence > clause > particle > word)
-    split_idx = _find_split_point(text)
+    # PRIORITY 2: text-level boundary (sentence > clause > particle > word).
+    # Walk the RANKED candidates: a boundary rejected for stranding a piece or
+    # for leaving one side under the duration floor must fall through to the
+    # next-best one. Taking only the top candidate meant a cue whose single
+    # match sat far off-centre never split at all, and shipped over budget.
+    #
     # Edge buffer: 2 chars for short text (≤ 20 chars, typical of CJK after
     # one prior split) or 5 chars for normal-length text. This stops the
     # splitter from emitting orphan single-letter Latin tokens while still
     # allowing a CJK 11-char clause to be cut at the particle near position 7.
     _edge = 2 if len(text) <= 20 else 5
-    if split_idx is None or split_idx < _edge or split_idx > len(text) - _edge:
-        return [seg]
-    left_text = text[:split_idx].strip()
-    right_text = text[split_idx:].strip()
-    if not left_text or not right_text:
-        return [seg]
-    if _split_would_strand(left_text, right_text, min_split_chars):
-        # Splitting here would strand a sub-readable (e.g. one-word) cue —
-        # keep the phrase together even if it runs a little long.
-        return [seg]
+    _proportional_fallback = None
+    for split_idx in _split_candidates(text):
+        if split_idx < _edge or split_idx > len(text) - _edge:
+            continue
+        left_text = text[:split_idx].strip()
+        right_text = text[split_idx:].strip()
+        if not left_text or not right_text:
+            continue
+        if _split_would_strand(left_text, right_text, min_split_chars):
+            # Splitting here would strand a sub-readable (e.g. one-word) cue —
+            # keep looking for a boundary that leaves both sides readable.
+            continue
 
-    # Prefer Whisper's word-level timestamps over character-proportional
-    # interpolation. The proportional path drifts whenever speech rate
-    # is non-uniform (lyrics, drawn-out emphasis, language transitions)
-    # AND the per-segment ``words=[]`` empty-out below used to delete
-    # the timing data downstream passes need. The word-timed path
-    # preserves the word arrays so subsequent splits stay accurate.
-    word_timed = _word_timed_midpoint(seg, split_idx)
-    if word_timed is not None:
-        midpoint, left_words, right_words = word_timed
-        # Clamp the midpoint to within the segment so a slightly out-of-
-        # range word timestamp can't shrink either side to zero.
-        midpoint = max(seg.start + 0.05, min(seg.end - 0.05, midpoint))
-        left_dur = midpoint - seg.start
-        right_dur = seg.end - midpoint
-        if left_dur < min_piece_duration or right_dur < min_piece_duration:
-            return [seg]
-        left = TranscriptSegment(
-            start=seg.start, end=midpoint, text=left_text,
-            speaker=seg.speaker, words=left_words, confidence=seg.confidence,
-        )
-        right = TranscriptSegment(
-            start=midpoint, end=seg.end, text=right_text,
-            speaker=seg.speaker, words=right_words, confidence=seg.confidence,
-        )
-        return [left, right]
+        # Prefer Whisper's word-level timestamps over character-proportional
+        # interpolation. The proportional path drifts whenever speech rate
+        # is non-uniform (lyrics, drawn-out emphasis, language transitions).
+        # The word-timed path also preserves the word arrays so subsequent
+        # splits — and the per-word highlight — stay accurate.
+        word_timed = _word_timed_midpoint(seg, split_idx)
+        if word_timed is not None:
+            midpoint, left_words, right_words = word_timed
+            # Clamp the midpoint to within the segment so a slightly out-of-
+            # range word timestamp can't shrink either side to zero.
+            midpoint = max(seg.start + 0.05, min(seg.end - 0.05, midpoint))
+            if (midpoint - seg.start) < min_piece_duration or (
+                    seg.end - midpoint) < min_piece_duration:
+                continue
+            return [
+                TranscriptSegment(
+                    start=seg.start, end=midpoint, text=left_text,
+                    speaker=seg.speaker, words=left_words,
+                    confidence=seg.confidence),
+                TranscriptSegment(
+                    start=midpoint, end=seg.end, text=right_text,
+                    speaker=seg.speaker, words=right_words,
+                    confidence=seg.confidence),
+            ]
 
-    # No word timing for this split point. When ``word_timed_split_only`` is set
-    # (the hybrid LLM path), refuse the char-proportional fallback — a word-less
-    # cue is kept WHOLE rather than scrambled across guessed timestamps. Tier C.
-    if word_timed_split_only:
-        return [seg]
+        # No word timing at THIS cut. On the hybrid LLM path we never accept a
+        # char-proportional time cut (tier C: a word-less cue stays whole rather
+        # than being scrambled across guessed timestamps), so keep looking.
+        if word_timed_split_only:
+            continue
+        # Otherwise remember the first usable proportional cut and keep looking
+        # for a word-timed one, which is strictly better.
+        if _proportional_fallback is None:
+            left_dur = duration * (len(left_text) / len(text))
+            if (left_dur >= min_piece_duration
+                    and (duration - left_dur) >= min_piece_duration):
+                _proportional_fallback = (seg.start + left_dur, left_text, right_text)
 
-    # No word timing — fall back to character-proportional duration
-    # (the legacy behaviour). Used to be the default; now reserved for
-    # legacy / corrupted segments without a ``words`` array.
-    left_dur = duration * (len(left_text) / len(text))
-    right_dur = duration - left_dur
-    if left_dur < min_piece_duration or right_dur < min_piece_duration:
-        return [seg]
-    midpoint = seg.start + left_dur
-    left = TranscriptSegment(
-        start=seg.start, end=midpoint, text=left_text,
-        speaker=seg.speaker, words=[], confidence=seg.confidence,
-    )
-    right = TranscriptSegment(
-        start=midpoint, end=seg.end, text=right_text,
-        speaker=seg.speaker, words=[], confidence=seg.confidence,
-    )
-    return [left, right]
+    if _proportional_fallback is not None:
+        midpoint, left_text, right_text = _proportional_fallback
+        return [
+            TranscriptSegment(
+                start=seg.start, end=midpoint, text=left_text,
+                speaker=seg.speaker, words=[], confidence=seg.confidence),
+            TranscriptSegment(
+                start=midpoint, end=seg.end, text=right_text,
+                speaker=seg.speaker, words=[], confidence=seg.confidence),
+        ]
+    return [seg]
 
 
 _TRAILING_FILLERS = re.compile(
@@ -1116,7 +1182,8 @@ def enforce_readability(
                         or _over_budget(p)):
                     halves = _split_segment(
                         p, keep_cps, min_split_chars=min_split_chars,
-                        word_timed_split_only=word_timed_split_only)
+                        word_timed_split_only=word_timed_split_only,
+                        max_cue_chars=_char_budget)
                     if len(halves) > 1:
                         new_pieces.extend(halves)
                         changed = True
@@ -1189,22 +1256,27 @@ def enforce_readability(
                         confidence=seg.confidence,
                     ),
                 ]
-        # Priority 2: text-level boundary.
-        split_idx = _find_split_point(seg.text)
+        # Priority 2: text-level boundary. Walk the ranked candidates rather
+        # than betting on one — a rejected boundary must fall through to the
+        # next-best, or a cue with a single bad candidate never splits at all.
         _edge = 2 if len(seg.text) <= 20 else 5
-        if split_idx and _edge <= split_idx <= len(seg.text) - _edge:
+        for split_idx in _split_candidates(seg.text):
+            if not (_edge <= split_idx <= len(seg.text) - _edge):
+                continue
             left_text = seg.text[:split_idx].strip()
             right_text = seg.text[split_idx:].strip()
             if _split_would_strand(left_text, right_text, min_split_chars):
-                return None
+                continue
             word_timed = _word_timed_midpoint(seg, split_idx)
             if word_timed is not None:
                 mid, left_words, right_words = word_timed
                 mid = max(seg.start + 0.05, min(seg.end - 0.05, mid))
             elif word_timed_split_only:
-                # Hybrid LLM path: no real per-word time for this cut → keep the
-                # cue whole rather than char-proportionally scrambling it (tier C).
-                return None
+                # Hybrid LLM path: no real per-word time for THIS cut → try the
+                # next candidate rather than abandoning the cue. Only when every
+                # candidate lacks a word time do we keep it whole, instead of
+                # char-proportionally scrambling it (tier C).
+                continue
             else:
                 dur = seg.end - seg.start
                 ratio = len(left_text) / max(1, len(seg.text))
@@ -1323,7 +1395,9 @@ def enforce_readability(
                 if merged_end - prev.start <= max_dur_s:
                     merged[-1] = TranscriptSegment(
                         start=prev.start, end=merged_end, text=merged_text,
-                        speaker=prev.speaker, words=[], confidence=prev.confidence,
+                        speaker=prev.speaker,
+                        words=_concat_words(prev, seg, merged_text),
+                        confidence=prev.confidence,
                     )
                     continue
         merged.append(seg)
@@ -1384,7 +1458,8 @@ def enforce_readability(
                             start=round(prev.start, 3),
                             end=round(merged_end, 3),
                             text=merged_text,
-                            speaker=prev.speaker, words=[],
+                            speaker=prev.speaker,
+                            words=_concat_words(prev, seg, merged_text),
                             confidence=prev.confidence,
                         )
                         continue
@@ -1423,6 +1498,17 @@ def enforce_readability(
                         if max_lines == 2 else None)
                 seg.text = _bal or _hard_wrap_lines(
                     seg.text, max_chars_per_line, max_lines)
+
+    # ── Pass 6: word-timing count parity (must run LAST) ────────────────
+    # The passes above trim fillers, merge, split, condense and re-wrap text.
+    # Every one of those can change a cue's token count while leaving ``words``
+    # behind, and a cue whose word count no longer matches its text gets NO
+    # per-word highlighting at all downstream — the frontend and the export both
+    # require an exact 1:1 match before they will use word timings. Restoring
+    # that invariant here makes it a property of what this function RETURNS
+    # rather than of whichever pass touched the text last. Real audio times are
+    # preserved wherever the count already agrees.
+    resync_cue_words(out3)
 
     return out3
 
@@ -1619,6 +1705,109 @@ def _balanced_two_line(text: str, max_chars: int) -> Optional[str]:
         if best is None or score < best[0]:
             best = (score, first, second)
     return f"{best[1]}\n{best[2]}" if best else None
+
+
+def _words_of(seg) -> list:
+    """A cue's per-word timing rows as plain dicts, or []."""
+    raw = _seg_get(seg, "words", None) or []
+    out = []
+    for w in raw:
+        if isinstance(w, dict):
+            wd, ws, we = w.get("word"), w.get("start"), w.get("end")
+        else:
+            wd, ws, we = (getattr(w, "word", None), getattr(w, "start", None),
+                          getattr(w, "end", None))
+        if wd is None or ws is None or we is None:
+            continue
+        out.append({"word": str(wd), "start": float(ws), "end": float(we)})
+    return out
+
+
+def _concat_words(prev, seg, merged_text: str) -> list:
+    """The two cues' word timings, concatenated, when they still describe the
+    merged text — else [] so the resync pass rebuilds them.
+
+    A merge used to hard-code ``words=[]``, throwing away BOTH cues' real audio
+    word times. That is expensive in three separate ways, because a cue with no
+    usable word array:
+      * cannot be split later — ``word_timed_split_only`` keeps it whole rather
+        than cutting on a guessed timestamp, so it ships over the line budget;
+      * loses per-word highlighting — the frontend only uses word timings when
+        their count matches the displayed token count, so it silently falls back
+        to character-proportional karaoke;
+      * cannot anchor its own start to the first VOICED word.
+    The merged text is exactly ``prev.text + ' ' + seg.text``, so the two word
+    lists in order already describe it. Verify that rather than assume it."""
+    joined = _words_of(prev) + _words_of(seg)
+    if not joined:
+        return []
+    if len(joined) != len(str(merged_text or "").split()):
+        return []
+    # Word times must be non-decreasing for the highlight schedule to be usable.
+    for a, b in zip(joined, joined[1:]):
+        if b["start"] < a["start"] - 1e-6:
+            return []
+    return joined
+
+
+def resync_cue_words(segments, *, rebuild: bool = True):
+    """Guarantee every cue's ``words`` array lines up 1:1 with its DISPLAYED
+    tokens, in place. Returns (kept_real, rebuilt) counts.
+
+    This is the contract the consumers actually enforce: the frontend uses word
+    timings only when ``segment.words.length === text.split(/\\s+/).length``
+    (frontend/src/utils/activeWordTiming.js), and the export mirrors it. Any
+    pass that rewrites a cue's text without touching ``words`` therefore breaks
+    the count and silently demotes that cue to character-proportional karaoke —
+    and several passes do exactly that (the MT post-edit clears ``words`` on any
+    text change; the over-CPS condensation rewrites text and leaves ``words``
+    stale). The symptom is not slightly-wrong highlighting, it is NO word
+    timing being used at all for those cues.
+
+    Where the count already matches, the real audio times are kept untouched.
+    Where it does not, the cue window is redistributed across the new tokens —
+    still monotonic and still inside the cue, just not audio-true. ``rebuild``
+    False leaves mismatched cues alone (report-only)."""
+    from backend.models import WordTimestamp
+
+    def _store(seg, rows):
+        # Keep the row TYPE the segment already uses. ``TranscriptSegment.words``
+        # is typed ``list[WordTimestamp]`` and pydantic does not validate on
+        # attribute assignment, so writing bare dicts would leave the model
+        # holding rows that every ``w.end`` consumer crashes on.
+        if isinstance(seg, dict):
+            _seg_set(seg, "words", rows)
+        else:
+            _seg_set(seg, "words", [WordTimestamp(**r) for r in rows])
+
+    kept = rebuilt = 0
+    for seg in segments or []:
+        text = str(_seg_get(seg, "text", "") or "")
+        tokens = text.split()
+        if not tokens:
+            continue
+        words = _words_of(seg)
+        if len(words) == len(tokens):
+            # Trust the times; re-label so a text edit that only changed
+            # spelling/punctuation cannot leave the labels stale.
+            for w, tok in zip(words, tokens):
+                w["word"] = tok
+            _store(seg, words)
+            kept += 1
+            continue
+        if not rebuild:
+            continue
+        try:
+            s = float(_seg_get(seg, "start", 0.0))
+            e = float(_seg_get(seg, "end", 0.0))
+        except (TypeError, ValueError):
+            continue
+        if e <= s:
+            continue
+        from backend.services.subtitle_aligner import distribute_cue_window
+        _store(seg, distribute_cue_window(tokens, s, e))
+        rebuilt += 1
+    return kept, rebuilt
 
 
 def _hard_wrap_lines(text: str, max_chars: int, max_lines: int) -> str:

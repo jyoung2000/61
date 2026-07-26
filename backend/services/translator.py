@@ -880,7 +880,30 @@ async def translate_via_llm(
                 )
             ) +
             "- Translate faithfully: never summarise, merge meaning, or invent "
-            "words to fill a gap. If unsure, translate as literally as possible.\n"
+            "words to fill a gap. Where the meaning is unclear, stay close to "
+            "the source rather than guessing — but say it the way a person "
+            "would, not word-for-word.\n"
+            # Register. Measured against a professional reference track for the
+            # same episode, the single largest difference was not accuracy but
+            # register: the reference reaches for the plain spoken verb where
+            # this pipeline reached for the formal latinate one (bring/convey,
+            # salvage/retrieve, take/transport, put down/subjugate, troops/units,
+            # find/locate), and the reference keeps military address forms that
+            # were being dropped. Nothing in this prompt used to say what
+            # register to write in, so the model defaulted to document prose.
+            "- REGISTER: this is spoken dialogue for a dub-style subtitle "
+            "track, not written prose. Use the plain, common English word over "
+            "the formal or latinate one (bring, not convey; salvage, not "
+            "retrieve; take, not transport; find, not locate; troops, not "
+            "units; put down, not subjugate). Prefer active voice and "
+            "contractions the way people actually speak.\n"
+            "- Keep forms of address and rank when the speaker uses them "
+            "(sir, ma'am, Lieutenant, Colonel, Captain, Your Excellency) — they "
+            "carry the character relationship and a professional track keeps "
+            "them.\n"
+            "- Say it the way the character would say it out loud. If a line "
+            "reads like a report or a manual, rewrite it as speech while "
+            "keeping the same meaning.\n"
             "- The source lines are SPEECH-RECOGNITION output and can contain "
             "mis-recognized homophones or garbled words. When the literal "
             "reading is absurd for the scene, translate the contextually "

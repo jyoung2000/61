@@ -19,6 +19,14 @@ def _cue(start, end, text, words=None, speaker="Speaker 1"):
     return TranscriptSegment(start=start, end=end, text=text, speaker=speaker, words=words)
 
 
+def _words_for(text, start, end):
+    """A plausible per-word timing array for ``text``, 1:1 with its tokens —
+    what every cue carries once the pipeline's tiers have run."""
+    from backend.services.subtitle_aligner import distribute_cue_window
+    return [WordTimestamp(**w)
+            for w in distribute_cue_window(text.split(), start, end)]
+
+
 MAX_DUR_S = 7.0
 MARKER_MAX_S = 4.0
 
@@ -319,6 +327,92 @@ def test_unfittable_text_shares_the_overflow_instead_of_stacking_it():
     # A cue that DOES fit is untouched by the sharing path.
     assert _hard_wrap_lines("alpha bravo charlie delta", 14, 2).split("\n") == [
         "alpha bravo", "charlie delta"]
+
+
+def test_split_candidates_are_ranked_not_a_single_bet():
+    from backend.services.subtitle_formatter import _split_candidates
+    # The measured failure: this cue's ONLY match in any category was the
+    # conjunction in "report that your" at index 19 of 119. The old single-answer
+    # finder returned 19, which strands a sub-minimum piece, so the cue never
+    # split and shipped 58 characters over budget.
+    text = ("I received a report that your subordinate under Treize Khushrenada "
+            "lost three mobile suits during atmospheric re-entry.")
+    cands = _split_candidates(text)
+    assert len(cands) > 5, cands
+    assert 19 in cands                       # the conjunction is still offered…
+    # …and a boundary near the centre is offered too, so a rejected top pick
+    # falls through to one that actually works.
+    assert any(abs(c - len(text) // 2) <= 8 for c in cands), cands
+    # Every candidate is a real position inside the text.
+    assert all(0 < c < len(text) for c in cands)
+
+
+def test_over_budget_cue_splits_even_when_cps_is_fine():
+    # 96 chars at ~17 CPS: inside the CPS cap, but nearly 30 chars past the
+    # 2 x 34 on-screen budget. The CPS early-return used to decline the split
+    # while the caller's loop was asking for it precisely because of the budget.
+    text = ("Now then, today's agenda is about experimenting with a solidarity "
+            "organization between colonies.")
+    seg = _cue(100.0, 105.63, text,
+               words=_words_for(text, 100.0, 105.63))
+    out = enforce_readability([seg], max_chars_per_line=34, max_lines=2,
+                              allow_split=True, word_timed_split_only=True)
+    assert len(out) >= 2, [c.text for c in out]
+    for c in out:
+        assert len(" ".join((c.text or "").split())) <= 68, c.text
+    # No text invented or lost.
+    assert " ".join(" ".join(c.text.split()) for c in out).replace("  ", " ") \
+        .count("solidarity") == 1
+
+
+def test_merge_keeps_both_cues_word_timings():
+    from backend.services.subtitle_formatter import _concat_words
+    a = _cue(10.0, 10.4, "one two", words=[
+        WordTimestamp(start=10.0, end=10.2, word="one"),
+        WordTimestamp(start=10.2, end=10.4, word="two")])
+    b = _cue(10.45, 10.9, "three four", words=[
+        WordTimestamp(start=10.45, end=10.7, word="three"),
+        WordTimestamp(start=10.7, end=10.9, word="four")])
+    got = _concat_words(a, b, "one two three four")
+    assert [w["word"] for w in got] == ["one", "two", "three", "four"]
+    assert [w["start"] for w in got] == [10.0, 10.2, 10.45, 10.7]
+    # A count that no longer describes the merged text is rejected outright,
+    # so the resync pass rebuilds rather than shipping a mismatched array.
+    assert _concat_words(a, b, "one two three") == []
+    # Non-monotonic input is rejected too — the highlight schedule needs order.
+    c = _cue(9.0, 9.4, "zero", words=[
+        WordTimestamp(start=9.0, end=9.4, word="zero")])
+    assert _concat_words(a, c, "one two zero") == []
+
+
+def test_readability_returns_cues_whose_word_count_matches_their_text():
+    from backend.services.subtitle_formatter import resync_cue_words
+    # This is the contract the frontend enforces before it will use word
+    # timings at all (activeWordTiming.js requires an exact count match), so a
+    # pass that rewrites text without touching words silently kills karaoke.
+    text = "One two three four five six seven eight nine ten eleven twelve"
+    segs = [_cue(0.0, 4.0, text, words=_words_for(text, 0.0, 4.0)),
+            _cue(4.2, 5.0, "short bit", words=_words_for("short bit", 4.2, 5.0))]
+    out = enforce_readability(segs, max_chars_per_line=34, max_lines=2,
+                             allow_split=True, word_timed_split_only=True)
+    for c in out:
+        assert len(c.words or []) == len((c.text or "").split()), c.text
+
+    # Stale array from a text rewrite → rebuilt to match.
+    seg = _cue(0.0, 2.0, "a rewritten line with more tokens now",
+               words=_words_for("original", 0.0, 2.0))
+    kept, rebuilt = resync_cue_words([seg])
+    assert (kept, rebuilt) == (0, 1)
+    assert len(seg.words) == 7
+    # Rebuilt rows keep the model's row TYPE, not bare dicts.
+    assert all(isinstance(w, WordTimestamp) for w in seg.words)
+    # Matching count → real times preserved untouched.
+    seg2 = _cue(0.0, 2.0, "two words", words=[
+        WordTimestamp(start=0.5, end=0.9, word="two"),
+        WordTimestamp(start=1.4, end=1.8, word="words")])
+    kept, rebuilt = resync_cue_words([seg2])
+    assert (kept, rebuilt) == (1, 0)
+    assert [w.start for w in seg2.words] == [0.5, 1.4]
 
 
 def test_default_line_budget_matches_the_reference_track():
