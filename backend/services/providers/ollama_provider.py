@@ -88,9 +88,18 @@ def _normalize_ollama_model(model: Optional[str]) -> str:
 
 def _ollama_names_match(a: Optional[str], b: Optional[str]) -> bool:
     """True when two Ollama model ids refer to the same model, tolerating the
-    ``ollama/`` prefix and a missing ``:latest`` tag (so "qwen2.5:3b-instruct"
-    matches the ``/api/ps`` report of the same model). Different sizes/tags
-    (``qwen2.5:3b`` vs ``qwen2.5:7b``) do NOT match."""
+    ``ollama/`` prefix, a missing ``:latest`` tag, and the ``-instruct``/quant
+    spelling difference between a configured id and the installed tag
+    ``/api/ps`` reports. Different sizes/tags (``qwen2.5:3b`` vs
+    ``qwen2.5:7b``) do NOT match.
+
+    The suffix tolerance matters because the caller's model id and the daemon's
+    are routinely different spellings of one model: settings can hold the
+    display name ``Qwen2.5-14B-Instruct`` while ``/api/ps`` reports
+    ``qwen2.5:14b``. Every residency question in this module (keep-list,
+    GPU fraction, is-loaded) is asked with the CALLER's spelling, so a strict
+    comparison answers "not loaded" about a model that is loaded — and the
+    keep-list then evicts it right before we call it."""
     a = _normalize_ollama_model(a or "")
     b = _normalize_ollama_model(b or "")
     if not a or not b:
@@ -99,7 +108,13 @@ def _ollama_names_match(a: Optional[str], b: Optional[str]) -> bool:
         return True
     a_base = a[:-7] if a.endswith(":latest") else a
     b_base = b[:-7] if b.endswith(":latest") else b
-    return a_base == b_base
+    if a_base == b_base:
+        return True
+    try:
+        from backend.services import ollama_registry
+        return ollama_registry.same_model(a, b)
+    except Exception:
+        return False
 
 
 # ── Phase 2 parity — content-type vision routing for Ollama ──
@@ -569,7 +584,11 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
             if resp.status_code == 200:
                 for m in resp.json().get("models", []):
                     name = m.get("name", "")
-                    if model_name.split(":")[0] in name:
+                    # Identity, not substring: a display-name id
+                    # ("Qwen2.5-14B-Instruct") shares no prefix with the
+                    # installed tag ("qwen2.5:14b"), and a bare family prefix
+                    # would match a DIFFERENT size of the same family.
+                    if _ollama_names_match(name, model_name):
                         size_vram = m.get("size_vram", 0)
                         size = m.get("size", 0)
                         if size > 0 and size_vram > 0:

@@ -31,6 +31,20 @@ def test_names_dont_match_different_size():
     assert not _ollama_names_match("", "qwen2.5:3b")
 
 
+def test_names_match_display_name_against_installed_tag():
+    # The keep-list is asked with the CALLER's spelling — settings can hold the
+    # model picker's display name while /api/ps reports the installed tag. A
+    # strict compare answered "different model" and the keeper evicted the model
+    # it was protecting, costing a multi-GB reload on the very next call.
+    assert _ollama_names_match("qwen2.5:14b", "Qwen2.5-14B-Instruct")
+    assert _ollama_names_match("Qwen2.5-14B-Instruct", "qwen2.5:14b")
+    assert _ollama_names_match("qwen2.5:14b", "qwen2.5:14b-instruct-q4_K_M")
+    # …without letting a different size or family through.
+    assert not _ollama_names_match("qwen2.5:7b", "Qwen2.5-14B-Instruct")
+    assert not _ollama_names_match("qwen2.5:7b", "qwen2.5vl:7b-q4_K_M")
+    assert not _ollama_names_match("llava:7b", "Qwen2.5-14B-Instruct")
+
+
 # ── clear_vram(except_model=...) ──────────────────────────────────────────
 
 class _Resp:
@@ -94,3 +108,53 @@ def test_clear_vram_tolerates_latest_tag():
     ])
     asyncio.run(OllamaProvider.clear_vram(prov, except_model="qwen2.5"))
     assert client.unloaded == []                     # kept despite :latest tag
+
+
+def test_clear_vram_keeps_target_named_by_display_id():
+    # The observed regression: settings held "Qwen2.5-14B-Instruct", /api/ps
+    # reported "qwen2.5:14b", and the keeper evicted the 8.9 GB translation
+    # model before every single batch.
+    prov, client = _fake_provider([
+        {"name": "qwen2.5:14b", "size_vram": 8945, "size": 8945},
+    ])
+    asyncio.run(OllamaProvider.clear_vram(
+        prov, except_model="Qwen2.5-14B-Instruct"))
+    assert client.unloaded == []
+
+
+def test_clear_vram_still_evicts_a_different_size_of_the_same_family():
+    prov, client = _fake_provider([
+        {"name": "qwen2.5:3b", "size_vram": 1800, "size": 1900},
+    ])
+    asyncio.run(OllamaProvider.clear_vram(
+        prov, except_model="Qwen2.5-14B-Instruct"))
+    assert client.unloaded == ["qwen2.5:3b"]
+
+
+def test_gpu_fraction_finds_a_model_reported_under_its_installed_tag():
+    # Same mismatch on the residency probe: it returned None ("not resident")
+    # for a fully-resident model, which permanently swapped the tight warm
+    # timeout for the cold-load ceiling and triggered pointless defrags.
+    prov, _client = _fake_provider([
+        {"name": "qwen2.5:14b", "size_vram": 8945, "size": 8945},
+    ])
+    frac = asyncio.run(OllamaProvider.model_gpu_fraction(
+        prov, "Qwen2.5-14B-Instruct"))
+    assert frac == pytest.approx(1.0)
+
+
+def test_gpu_fraction_reports_a_cpu_spilled_model():
+    prov, _client = _fake_provider([
+        {"name": "qwen2.5:14b", "size_vram": 2000, "size": 8000},
+    ])
+    frac = asyncio.run(OllamaProvider.model_gpu_fraction(
+        prov, "Qwen2.5-14B-Instruct"))
+    assert frac == pytest.approx(0.25)
+
+
+def test_gpu_fraction_is_none_for_a_model_that_is_not_loaded():
+    prov, _client = _fake_provider([
+        {"name": "llava:7b", "size_vram": 4000, "size": 4000},
+    ])
+    assert asyncio.run(OllamaProvider.model_gpu_fraction(
+        prov, "Qwen2.5-14B-Instruct")) is None

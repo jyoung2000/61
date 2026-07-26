@@ -116,6 +116,35 @@ def _model_size_key(tag: str):
     return (base, m.group(1))
 
 
+def same_model(a: str, b: str) -> bool:
+    """True when two Ollama model ids name the SAME weights, across every
+    spelling the app hands around: the installed tag (``qwen2.5:14b``), the
+    configured tag (``qwen2.5:14b-instruct-q4_K_M``), and the friendly display
+    name the model picker stores (``Qwen2.5-14B-Instruct``).
+
+    This is the identity test for "is the model I'm about to call already
+    loaded". Getting it wrong is expensive in one specific way: the VRAM
+    keep-list compares the model we asked for against what ``/api/ps``
+    reports, so a display-name-vs-tag mismatch makes the keeper evict the
+    very model it was told to protect — and the next call then pays a
+    multi-GB cold load. A real run lost 5 minutes on a single translation
+    batch that way (the reload landed while a Whisper sidecar held the same
+    card), so treat any two spellings of one model as equal here.
+
+    Different sizes or families never match (``qwen2.5:7b`` vs
+    ``qwen2.5:14b``, ``qwen2.5:7b`` vs ``qwen2.5vl:7b``)."""
+    a_n = str(a or "").split("/")[-1].strip().lower()
+    b_n = str(b or "").split("/")[-1].strip().lower()
+    if not a_n or not b_n:
+        return False
+    if a_n == b_n:
+        return True
+    if a_n.removesuffix(":latest") == b_n.removesuffix(":latest"):
+        return True
+    ka, kb = _model_size_key(a_n), _model_size_key(b_n)
+    return ka is not None and ka == kb
+
+
 def resolve_installed_tag(installed: list, requested: str):
     """The installed Ollama tag to actually CALL for ``requested``, or ``None``.
 

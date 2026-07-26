@@ -1,6 +1,7 @@
 import React, { useState, useMemo, useCallback, useRef, useEffect } from 'react';
 import useResponsive from '../hooks/useResponsive';
 import { spokenWindow } from '../utils/subtitleTiming';
+import { dispositionName, saveTextAs } from '../utils/downloadFile';
 
 const SPEAKER_COLORS_LIST = [
   'var(--accent-cyan)',
@@ -389,15 +390,8 @@ export default function TranscriptViewer({ transcript, rawTranscript = [], trans
     return `${_baseName}${langSuffix}.${ext}`;
   };
 
-  const download = (content, filename) => {
-    const blob = new Blob([content], { type: 'text/plain' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = filename;
-    a.click();
-    URL.revokeObjectURL(url);
-  };
+  const download = (content, filename) =>
+    saveTextAs(content, filename || 'transcript.txt');
 
   // Subtitle exports are fetched from the BACKEND, never formatted here.
   // The backend applies the invariants a subtitle file has to satisfy — line
@@ -419,7 +413,11 @@ export default function TranscriptViewer({ transcript, rawTranscript = [], trans
     try {
       const res = await fetch(`/api/jobs/${jobId}/transcript.${ext}?${params}`);
       if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-      download(await res.text(), _exportName(ext));
+      // The endpoint already names the file after the source video in its
+      // Content-Disposition; honor that so the panel export and the page's
+      // own download links can't drift apart. ``_exportName`` is the fallback
+      // when a proxy strips the header — either way the file gets a name.
+      download(await res.text(), dispositionName(res) || _exportName(ext));
     } catch (err) {
       // Fail loudly. Silently falling back to a locally-built file is what hid
       // the formatting gap in the first place.
