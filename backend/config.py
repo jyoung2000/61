@@ -209,7 +209,20 @@ class Settings(BaseSettings):
     # later. Fail-soft: no gaps / no demucs / ASR failure → nothing changes.
     VOCAL_GAP_RECOVERY_ENABLED: bool = True
     # A hole must be at least this long to schedule a recovery span.
-    VOCAL_GAP_MIN_S: float = 8.0
+    #
+    # 8.0 made the whole pass structurally unable to see what it was built for.
+    # Measured against a reference track, every genuinely missed line sat in a
+    # hole of 2.1-5.7 s (two-cue radio calls and combat exchanges under score),
+    # so not one of them could ever qualify — while the selector spent its full
+    # 240 s budget on 14-25 s spans that held only theme music. Dropping the
+    # floor is only safe because VOCAL_GAP_REQUIRE_VOICE now screens candidates
+    # against Silero VAD; without that check a 2 s floor would flood the list
+    # with silence.
+    VOCAL_GAP_MIN_S: float = 2.0
+    # Screen candidate holes against VAD speech regions, so the budget goes to
+    # holes that actually contain a voice instead of to song and title cards.
+    # A measured run separated 228 s of music and recovered nothing.
+    VOCAL_GAP_REQUIRE_VOICE: bool = True
     # Lead-in/out seconds around each hole (Whisper needs context; the pad is
     # clipped back out of the recovered cues so existing ones never double).
     VOCAL_GAP_PAD_S: float = 2.0

@@ -51,12 +51,24 @@ def test_gap_finder_ignores_small_holes_and_respects_caps():
 
 
 def test_gap_finder_per_span_cap_can_be_disabled():
-    # With the per-gap cap OFF, the old largest-first / total-budget behavior
-    # holds: the 196s hole exceeds 150s alone and is skipped; the 136s fits.
+    # With the per-gap cap OFF, every hole is eligible and only the seconds
+    # budget limits the picks.
+    #
+    # This used to assert largest-first (taking the 136s hole and skipping the
+    # 196s one). The priority is now SMALLEST-first, which inverts it: the 50s
+    # hole is taken and the 136s one no longer fits the 150s budget. That is a
+    # deliberate change — largest-first contradicted this module's own premise
+    # that music-buried dialogue arrives as SHORT holes, and on a reference
+    # episode it spent the entire budget on 14-25s spans that held only theme
+    # music while every real miss (2.1-5.7s) went unexamined.
     segs = _track((0, 10, "a"), (60, 64, "c"), (200, 204, "d"), (400, 404, "e"))
     gaps = find_coverage_gaps(segs, min_gap_s=8.0, pad_s=0.0,
                               max_spans=8, max_total_s=150.0, max_span_s=0)
-    assert gaps == [(64.0, 200.0)]
+    assert gaps == [(10.0, 60.0)]
+    # A budget big enough for two takes the two SMALLEST, in timeline order.
+    gaps2 = find_coverage_gaps(segs, min_gap_s=8.0, pad_s=0.0,
+                               max_spans=8, max_total_s=200.0, max_span_s=0)
+    assert gaps2 == [(10.0, 60.0), (64.0, 200.0)]
 
 
 def test_gap_finder_skips_the_long_music_scene():
@@ -188,3 +200,86 @@ def test_post_complete_recovery_noop_without_gap_hits(monkeypatch, tmp_path):
         _fake_recover)
     asyncio.run(pl._post_complete_gap_recovery("j-none", None))
     assert (d / "job.json").read_text() == before  # nothing rewritten
+
+
+# ── Voice-gated span selection ────────────────────────────────────────────
+# The selector computes holes against OUR OWN transcript, so "no cue here"
+# also covers every second of theme music. A measured run spent its whole
+# 228 s budget separating song and title spans and correctly recovered
+# nothing, while the five holes that did contain speech (2.1-5.7 s) were
+# below the 8 s floor and never considered at all.
+
+def _seg(s, e):
+    return {"start": s, "end": e, "text": "x"}
+
+
+def _track_with_holes(holes):
+    """A transcript whose interior holes are exactly ``holes``."""
+    segs, t = [], 10.0
+    for a, b in holes:
+        segs.append(_seg(t, a))
+        t = b
+    segs.append(_seg(t, t + 5.0))
+    return segs
+
+
+# Measured on the reference episode: three song holes, one narration hole and
+# four dialogue holes.
+_SONG = [(26.0, 41.8), (47.9, 62.0), (1358.9, 1365.1)]
+_SPEECH = [(129.2, 134.9), (211.0, 214.6), (556.6, 558.7),
+           (583.8, 586.2), (1001.9, 1004.7)]
+_VOICE = [(a + 0.3, b - 0.3) for a, b in _SPEECH]      # VAD sees only speech
+
+
+def test_voice_check_rejects_song_holes_and_keeps_speech_holes():
+    segs = _track_with_holes(sorted(_SONG + _SPEECH))
+    picked = find_coverage_gaps(segs, min_gap_s=2.0, pad_s=2.0, max_spans=14,
+                                max_total_s=240.0, max_span_s=45.0,
+                                voice_regions=_VOICE)
+    assert len(picked) == len(_SPEECH), picked
+    for a, _b in _SPEECH:
+        assert any(g[0] <= a <= g[1] for g in picked), a
+    for a, _b in _SONG:
+        assert not any(g[0] <= a <= g[1] for g in picked), a
+    # And it costs a fraction of the old budget.
+    assert sum(b - a for a, b in picked) < 60.0
+
+
+def test_the_old_floor_could_not_see_any_real_miss():
+    """Pins WHY the pass never recovered anything: every measured miss was
+    shorter than the 8 s floor, so no amount of budget or sorting helped."""
+    segs = _track_with_holes(sorted(_SPEECH))
+    assert find_coverage_gaps(segs, min_gap_s=8.0, pad_s=2.0, max_spans=14,
+                              max_total_s=240.0, max_span_s=45.0) == []
+    assert find_coverage_gaps(segs, min_gap_s=2.0, pad_s=2.0, max_spans=14,
+                              max_total_s=240.0, max_span_s=45.0)
+
+
+def test_smallest_first_so_short_holes_survive_the_budget():
+    """Largest-first contradicted the module's own premise and spent the budget
+    on the spans least likely to hold dialogue."""
+    segs = _track_with_holes([(100.0, 103.0), (200.0, 240.0)])
+    picked = find_coverage_gaps(segs, min_gap_s=2.0, pad_s=0.0, max_spans=14,
+                                max_total_s=10.0, max_span_s=45.0)
+    assert picked == [(100.0, 103.0)], picked
+
+
+def test_no_voice_regions_leaves_selection_unfiltered():
+    """Fail-soft: a box without VAD keeps the previous behaviour."""
+    segs = _track_with_holes(sorted(_SONG + _SPEECH))
+    assert find_coverage_gaps(segs, min_gap_s=2.0, pad_s=2.0, max_spans=14,
+                              max_total_s=240.0, max_span_s=45.0,
+                              voice_regions=None)
+
+
+def test_overlaps_voice_measures_the_unpadded_interior():
+    from backend.services.vocal_gap_recovery import _overlaps_voice
+    gap = (10.0, 20.0)          # padded; interior is 12.0-18.0 at pad=2
+    # Voice only inside the PAD must not qualify — those seconds already
+    # belong to the neighbouring cues.
+    assert not _overlaps_voice(gap, [(10.2, 11.8)], pad_s=2.0)
+    assert _overlaps_voice(gap, [(14.0, 16.0)], pad_s=2.0)
+    # A brush of voice below the minimum is not enough.
+    assert not _overlaps_voice(gap, [(15.0, 15.1)], pad_s=2.0)
+    # Malformed regions are ignored, not crashed on.
+    assert not _overlaps_voice(gap, [None, ("x", "y"), ()], pad_s=2.0)

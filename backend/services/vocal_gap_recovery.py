@@ -53,6 +53,33 @@ def _seg_text(seg) -> str:
     return (t or "").strip()
 
 
+def _overlaps_voice(gap: tuple[float, float], voice: list, pad_s: float,
+                    min_voice_s: float = 0.4) -> bool:
+    """True when the gap's UNPADDED interior contains at least ``min_voice_s``
+    of VAD-detected speech.
+
+    This is the signal the selector was missing. Holes are computed against our
+    own transcript, so "no cue here" also covers every second of theme music —
+    and a measured run spent its whole 228-second budget on song and title
+    spans, ran a Demucs separation over them, and correctly reported no new
+    dialogue. Meanwhile the five spans that DID hold speech were never
+    considered. Silero VAD answers the question the transcript cannot: is there
+    a voice in this hole at all."""
+    lo, hi = gap[0] + pad_s, gap[1] - pad_s
+    if hi <= lo:
+        return False
+    total = 0.0
+    for v in voice or []:
+        try:
+            vs, ve = float(v[0]), float(v[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        total += max(0.0, min(ve, hi) - max(vs, lo))
+        if total >= min_voice_s:
+            return True
+    return False
+
+
 def find_coverage_gaps(
     segments,
     *,
@@ -61,6 +88,7 @@ def find_coverage_gaps(
     max_spans: int = 8,
     max_total_s: float = 240.0,
     max_span_s: float = 45.0,
+    voice_regions: list | None = None,
 ) -> list[tuple[float, float]]:
     """Uncovered timeline holes between the first and last cue, ``min_gap_s`` ≤
     length ≤ ``max_span_s``.
@@ -84,7 +112,18 @@ def find_coverage_gaps(
         if hole >= min_gap_s and (max_span_s <= 0 or hole <= max_span_s):
             gaps.append((max(0.0, cover_end - pad_s), a + pad_s))
         cover_end = max(cover_end, b)
-    gaps.sort(key=lambda g: g[0] - g[1])  # largest first
+    if voice_regions:
+        # Keep only holes that actually contain a voice. Without this the
+        # budget goes to song and title spans (which have no dialogue by
+        # definition) and the real misses never get considered.
+        gaps = [g for g in gaps if _overlaps_voice(g, voice_regions, pad_s)]
+    # SMALLEST first. Largest-first contradicted this module's own premise —
+    # music-buried dialogue arrives as SHORT holes, so the big spans it
+    # preferred are the least likely to contain speech, and they consumed the
+    # budget before the short ones were reached. Measured: the real misses on a
+    # reference episode were 2.1-5.7 s while the selector spent 228 s on spans
+    # of 14-25 s that held only song.
+    gaps.sort(key=lambda g: g[1] - g[0])
     picked: list[tuple[float, float]] = []
     total = 0.0
     for g in gaps[: max(0, max_spans)]:
@@ -286,6 +325,22 @@ async def recover_gap_dialogue(
         except Exception:
             _speech = list(segments or [])
 
+        # VAD voice regions, straight from the audio and independent of any
+        # Whisper decode — the one signal that can tell a hole holding buried
+        # speech from a hole holding music. Computed here rather than reused
+        # because the producers upstream collapse the region list to a scalar
+        # and never persist it. Fail-soft: no VAD → unfiltered behaviour.
+        _voice: list = []
+        if bool(getattr(settings, "VOCAL_GAP_REQUIRE_VOICE", True)):
+            try:
+                from backend.services.speech_coverage import voice_activity_regions
+                _voice = voice_activity_regions(audio_path, speech_pad_ms=0) or []
+                logger.info("[%s] gap recovery: VAD found %d voice region(s) to "
+                            "screen candidate holes against", job_id, len(_voice))
+            except Exception as _vad_e:
+                logger.info("[%s] gap recovery: VAD unavailable (%s) — selecting "
+                            "holes without a voice check", job_id, _vad_e)
+
         pad = float(getattr(settings, "VOCAL_GAP_PAD_S", 2.0))
         gaps = find_coverage_gaps(
             _speech,
@@ -294,6 +349,7 @@ async def recover_gap_dialogue(
             max_spans=int(getattr(settings, "VOCAL_GAP_MAX_SPANS", 8)),
             max_total_s=float(getattr(settings, "VOCAL_GAP_MAX_TOTAL_S", 240.0)),
             max_span_s=float(getattr(settings, "VOCAL_GAP_MAX_SPAN_S", 45.0)),
+            voice_regions=_voice,
         )
         if not gaps:
             logger.info("[%s] gap recovery: no coverage gaps ≥ threshold", job_id)

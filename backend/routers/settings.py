@@ -320,6 +320,10 @@ def _restore_user_settings():
             # wall is 34, and a persisted 42 would keep shipping 40-plus-char
             # lines no matter what the default says.
             "SUBTITLE_MAX_CHARS_PER_LINE": (42,),
+            # 8.0 s made gap recovery unable to see the holes it exists for —
+            # every measured miss was 2.1-5.7 s. A persisted 8.0 would keep the
+            # pass blind on an already-deployed box no matter what ships.
+            "VOCAL_GAP_MIN_S": (8.0, 8),
         }
         for _k, _olds in _RETIRED_DEFAULTS.items():
             if _k in data and data.get(_k) in _olds:
