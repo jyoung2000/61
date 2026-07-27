@@ -99,6 +99,9 @@ def _cache_put(key: str, value: dict[str, str]) -> None:
 # transient provider failure can't be cached forever.
 _PERSIST_NAME = "canonical_names.json"
 _PERSIST_MAX = 200
+# Bump to retire every stored map. v1 could hold guesses made with no
+# informative title and no series hint; those are no longer persisted.
+_PERSIST_VERSION = 2
 
 
 def _persist_path() -> str:
@@ -125,7 +128,15 @@ def _persist_load() -> dict[str, dict[str, str]]:
             return {}
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        entries = data.get("entries") if isinstance(data, dict) else None
+        # A schema version, so a store written under older rules can be
+        # discarded wholesale. Needed because entries were previously persisted
+        # even when the resolution was a terms-only GUESS: a real deployment has
+        # wrong names ("Aires" for Aries, "Dorian" for Darlian) pinned on disk
+        # and reused on every run. Bumping the version retires them; without
+        # this, the only cure is deleting the file by hand.
+        if not isinstance(data, dict) or int(data.get("v") or 0) != _PERSIST_VERSION:
+            return {}
+        entries = data.get("entries")
         if not isinstance(entries, dict):
             return {}
         return {
@@ -151,7 +162,8 @@ def _persist_put(key: str, value: dict[str, str]) -> None:
                 entries.pop(k, None)
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"entries": entries}, f, ensure_ascii=False, indent=2)
+            json.dump({"v": _PERSIST_VERSION, "entries": entries}, f,
+                      ensure_ascii=False, indent=2)
         os.replace(tmp, path)
     except Exception:
         pass
@@ -446,8 +458,29 @@ async def resolve_canonical_names(
             # Persist only a SUCCESSFUL map, so a transient provider failure is
             # never cached forever and a later run can still resolve the names.
             # Pipeline runs only, matching the read gate above.
-            if job_id:
+            #
+            # AND only when the resolution had a real anchor. With an
+            # uninformative filename and no operator hint we fall through above
+            # on the mined terms alone, which is a GUESS — and a guess must not
+            # become permanent. A real run proves the cost: from the title
+            # "videoplayback.mp4" the model returned six names, two of them
+            # wrong (Aries as "Aires", Darlian as "Dorian"). Persisted, those
+            # came back on every later run as "reused from the durable store",
+            # and once the roster pass started working it began ENFORCING them
+            # (correcting "Dorien" to the wrong "Dorian"). A determinism store
+            # that pins a wrong answer is worse than re-asking.
+            #
+            # Terms-only resolutions still live in the in-process cache, so a
+            # single run stays internally consistent — they just don't outlive it.
+            if job_id and (_informative_title(title) or hint):
                 _persist_put(key, result)
+            elif job_id:
+                logger.info(
+                    "[%s] canonical names NOT persisted — resolved from mined "
+                    "terms with no informative title and no series hint, so the "
+                    "map is a guess. Set TRANSLATION_SERIES_HINT (or give the "
+                    "file a descriptive name) to make it authoritative.",
+                    job_id)
         _cache_put(key, result)
         _publish_series_evidence(job_id, result)
         return dict(result)

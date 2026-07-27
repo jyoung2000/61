@@ -529,3 +529,61 @@ def test_canonical_persist_is_failsoft_on_corrupt_store(tmp_path, monkeypatch):
     p.write_text("{ not json", encoding="utf-8")
     monkeypatch.setattr(CN, "_persist_path", lambda: str(p))
     assert CN._persist_load() == {}
+
+
+# ── The durable store must not pin a GUESS ────────────────────────────────
+
+def test_store_is_versioned_so_older_entries_are_retired(tmp_path, monkeypatch):
+    """A store written under older rules must be discarded, not reused.
+
+    v1 persisted maps resolved from mined terms alone. A real deployment ended
+    up with wrong names on disk ("Aires" for Aries, "Dorian" for Darlian),
+    reused on every later run as "reused from the durable store" — and once the
+    roster pass began working it ENFORCED them. Without a version the only cure
+    was deleting the file by hand.
+    """
+    store = tmp_path / "canonical_names.json"
+    monkeypatch.setattr(CN, "_persist_path", lambda: str(store))
+    # An unversioned (v1-shaped) store is ignored wholesale.
+    store.write_text(json.dumps({"entries": {"sig:x|y": {"エアリーズ": "Aires"}}}),
+                     encoding="utf-8")
+    assert CN._persist_load() == {}
+    # A current-version store round-trips.
+    CN._persist_put("sig:a|b", {"ゼクス": "Zechs"})
+    assert CN._persist_load() == {"sig:a|b": {"ゼクス": "Zechs"}}
+    assert json.loads(store.read_text(encoding="utf-8"))["v"] == CN._PERSIST_VERSION
+
+
+def test_terms_only_resolution_is_not_persisted(tmp_path, monkeypatch):
+    """With no informative title and no series hint the map is a guess.
+
+    It still lives in the in-process cache so one run stays self-consistent, but
+    it must not outlive the run — a determinism store that pins a wrong answer is
+    worse than re-asking.
+    """
+    store = tmp_path / "canonical_names.json"
+    monkeypatch.setattr(CN, "_persist_path", lambda: str(store))
+    CN.clear_cache()
+
+    calls = []
+
+    class _Orch:
+        async def text_completion(self, prompt, **kw):
+            calls.append(prompt)
+            return json.dumps({"ドーリアン": "Dorian", "エアリーズ": "Aires",
+                               "ゼクス": "Zechs", "リリーナ": "Relena"})
+
+    terms = ["ドーリアン", "エアリーズ", "ゼクス", "リリーナ", "ガンダム"]
+    got = asyncio.run(resolve_canonical_names(
+        terms, "videoplayback.mp4", _Orch(), job_id="job-guess"))
+    assert got, "a terms-only resolution should still be USED for this run"
+    assert len(calls) == 1
+    # …but nothing durable was written.
+    assert CN._persist_load() == {}, CN._persist_load()
+
+    # An INFORMATIVE title is authoritative enough to persist.
+    CN.clear_cache()
+    got2 = asyncio.run(resolve_canonical_names(
+        terms, "MOBILE SUIT GUNDAM WING Episode 1", _Orch(), job_id="job-real"))
+    assert got2
+    assert CN._persist_load(), "an anchored resolution should persist"

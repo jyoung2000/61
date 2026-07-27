@@ -1060,6 +1060,23 @@ async def translate_via_llm(
             try:
                 _prov = (getattr(orchestrator, "_providers", {}) or {}).get("ollama") \
                     if orchestrator else None
+                # The Whisper sidecar is a SEPARATE process on the same card, so
+                # clear_vram (which only speaks to Ollama) cannot move it. On a
+                # measured run the EN-reference pre-warm requested the sidecar
+                # two seconds before this eviction, so the 14B loaded beside it
+                # on a 9.2 GB budget and spilled to CPU: the first two batches
+                # took 252 s and 277 s while every later batch — after the
+                # sidecar released — took 4-7 s. That single collision was
+                # 8m49s of a 17m21s job. Release it first; the reference decode
+                # re-warms it on demand when it actually runs.
+                try:
+                    from backend.services.reframer_audio import (
+                        remote_whisper_release as _rel,
+                    )
+                    await asyncio.to_thread(_rel)
+                except Exception as _sc_e:
+                    logger.debug(
+                        "LLM translate: whisper sidecar release skipped (%s)", _sc_e)
                 if _prov is not None and hasattr(_prov, "clear_vram"):
                     await _prov.clear_vram()   # except_model=None → evict all
                     logger.info("LLM translate: cleared Companion VRAM so %s loads "
