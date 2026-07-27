@@ -272,6 +272,18 @@ def _sanitize_mapping(raw: dict, terms: list[str]) -> dict[str, str]:
             continue  # identity mapping adds nothing
         if _PROFANITY_RE.search(val):
             continue
+        if not _canonical_sounds_plausible(src, val):
+            # A canonical mapping is a SPELLING of the same name, so it has to
+            # sound like the katakana. Without this the model could answer with
+            # any name from the series it thought it recognised: a real run
+            # returned エアリーズ (eariizu — "Aries", a mobile suit) as
+            # "Peacecraft" and レン as "Heero", and both shipped — the transcript
+            # called Relena Darlian "Relena Peacecraft" and misattributed lines.
+            logger.info(
+                "canonical names: dropped %r → %r — the English name does not "
+                "sound like the katakana (romaji %r)",
+                src, val, _kana_to_romaji(src))
+            continue
         out[src] = val
 
     # Duplicate-canonical guard: two sources may share a canonical value only
@@ -754,6 +766,106 @@ def _roster_worth_asking(token: str, known_words: set) -> bool:
     if all(w in _ROSTER_SAFE_WORDS or w in _ROSTER_COMMON_WORDS for w in words):
         return False
     return True
+
+
+# Katakana → rough romaji. Only needs to be good enough to compare SOUNDS: a
+# canonical English name is a romanization of the same name the katakana spells,
+# so the two must be phonetically related. Digraphs first (longest match wins).
+_KANA_ROMAJI = [
+    ("キャ", "kya"), ("キュ", "kyu"), ("キョ", "kyo"), ("シャ", "sha"),
+    ("シュ", "shu"), ("ショ", "sho"), ("チャ", "cha"), ("チュ", "chu"),
+    ("チョ", "cho"), ("ニャ", "nya"), ("ニュ", "nyu"), ("ニョ", "nyo"),
+    ("ヒャ", "hya"), ("ヒュ", "hyu"), ("ヒョ", "hyo"), ("ミャ", "mya"),
+    ("ミュ", "myu"), ("ミョ", "myo"), ("リャ", "rya"), ("リュ", "ryu"),
+    ("リョ", "ryo"), ("ギャ", "gya"), ("ギュ", "gyu"), ("ギョ", "gyo"),
+    ("ジャ", "ja"), ("ジュ", "ju"), ("ジョ", "jo"), ("ビャ", "bya"),
+    ("ビュ", "byu"), ("ビョ", "byo"), ("ピャ", "pya"), ("ピュ", "pyu"),
+    ("ピョ", "pyo"), ("ティ", "ti"), ("ディ", "di"), ("トゥ", "tu"),
+    ("ドゥ", "du"), ("ファ", "fa"), ("フィ", "fi"), ("フェ", "fe"),
+    ("フォ", "fo"), ("ヴァ", "va"), ("ヴィ", "vi"), ("ヴェ", "ve"),
+    ("ヴォ", "vo"), ("ウィ", "wi"), ("ウェ", "we"), ("ウォ", "wo"),
+    ("ア", "a"), ("イ", "i"), ("ウ", "u"), ("エ", "e"), ("オ", "o"),
+    ("カ", "ka"), ("キ", "ki"), ("ク", "ku"), ("ケ", "ke"), ("コ", "ko"),
+    ("サ", "sa"), ("シ", "shi"), ("ス", "su"), ("セ", "se"), ("ソ", "so"),
+    ("タ", "ta"), ("チ", "chi"), ("ツ", "tsu"), ("テ", "te"), ("ト", "to"),
+    ("ナ", "na"), ("ニ", "ni"), ("ヌ", "nu"), ("ネ", "ne"), ("ノ", "no"),
+    ("ハ", "ha"), ("ヒ", "hi"), ("フ", "fu"), ("ヘ", "he"), ("ホ", "ho"),
+    ("マ", "ma"), ("ミ", "mi"), ("ム", "mu"), ("メ", "me"), ("モ", "mo"),
+    ("ヤ", "ya"), ("ユ", "yu"), ("ヨ", "yo"),
+    ("ラ", "ra"), ("リ", "ri"), ("ル", "ru"), ("レ", "re"), ("ロ", "ro"),
+    ("ワ", "wa"), ("ヲ", "o"), ("ン", "n"),
+    ("ガ", "ga"), ("ギ", "gi"), ("グ", "gu"), ("ゲ", "ge"), ("ゴ", "go"),
+    ("ザ", "za"), ("ジ", "ji"), ("ズ", "zu"), ("ゼ", "ze"), ("ゾ", "zo"),
+    ("ダ", "da"), ("ヂ", "ji"), ("ヅ", "zu"), ("デ", "de"), ("ド", "do"),
+    ("バ", "ba"), ("ビ", "bi"), ("ブ", "bu"), ("ベ", "be"), ("ボ", "bo"),
+    ("パ", "pa"), ("ピ", "pi"), ("プ", "pu"), ("ペ", "pe"), ("ポ", "po"),
+    ("ヴ", "vu"), ("ァ", "a"), ("ィ", "i"), ("ゥ", "u"), ("ェ", "e"),
+    ("ォ", "o"), ("ャ", "ya"), ("ュ", "yu"), ("ョ", "yo"), ("ッ", ""),
+    ("ー", ""), ("・", " "),
+]
+
+
+def _kana_to_romaji(text: str) -> str:
+    """Rough romaji for katakana input; non-kana characters pass through."""
+    out, i, n = [], 0, len(text or "")
+    while i < n:
+        for kana, roman in _KANA_ROMAJI:
+            if text.startswith(kana, i):
+                out.append(roman)
+                i += len(kana)
+                break
+        else:
+            out.append(text[i])
+            i += 1
+    return "".join(out)
+
+
+def _canonical_sounds_plausible(term: str, value: str) -> bool:
+    """True when ``value`` could be the official romanization of ``term``.
+
+    A canonical mapping is a SPELLING change, not a translation: the English
+    name and the katakana are the same name, so they must sound alike. Without
+    this the model was free to answer with any name from the series it thought
+    it recognised, and a real run returned エアリーズ (eariizu — "Aries", a
+    mobile suit) as "Peacecraft" (a person's surname) and レン as "Heero". Both
+    shipped: the transcript called Relena Darlian "Relena Peacecraft" and gave
+    Zechs's lines to other characters.
+
+    Only applied to katakana terms — a term already in Latin script is handled
+    by the existing duplicate/ordinary-word rules — and deliberately lenient,
+    since romanizations differ a lot ("Zechs" for ゼクス, "Heero" for ヒイロ).
+    It only has to reject pairs that share almost no sound at all."""
+    romaji = _normalize(_kana_to_romaji(term))
+    if not romaji or romaji == _normalize(term):
+        return True                      # not katakana → not our business
+    target = _normalize(value)
+    if not target:
+        return True
+    # The LEADING SOUND is what a romanization preserves. Compared by sound
+    # class, not letter, because the same sound is spelled differently across
+    # romanizations: earizu/Aries (both vowel-initial), katoru/Quatre (k/q),
+    # koroni/Colony (k/c). A ratio alone is not enough — "marina" scores 0.5
+    # against "Relena" and 0.36 against "Peacecraft", which is exactly how a
+    # ship became a character in a shipped transcript.
+    if _lead_class(romaji) != _lead_class(target):
+        return False
+    return difflib.SequenceMatcher(None, romaji, target).ratio() >= 0.22
+
+
+def _lead_class(s: str) -> str:
+    """The first sound of ``s`` reduced to a class, so equivalent spellings of
+    one sound compare equal (k/c/q, r/l, b/v, g/j, and all vowels)."""
+    c = (s or "")[:1].lower()
+    if not c:
+        return ""
+    # w/y are glides: Japanese ウ/イ regularly romanize into them
+    # (ウーフェイ -> "ufei" but written "Wufei"), so they group with the vowels.
+    if c in "aeiouwy":
+        return "V"
+    for group in ("kcq", "rl", "bv", "gj", "sz", "fh"):
+        if c in group:
+            return group[0]
+    return c
 
 
 def _roster_phonetic_ok(wrong: str, right: str) -> tuple[bool, float]:

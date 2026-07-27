@@ -587,3 +587,56 @@ def test_terms_only_resolution_is_not_persisted(tmp_path, monkeypatch):
         terms, "MOBILE SUIT GUNDAM WING Episode 1", _Orch(), job_id="job-real"))
     assert got2
     assert CN._persist_load(), "an anchored resolution should persist"
+
+
+# ── A canonical name must SOUND like the katakana it replaces ──────────────
+
+def test_canonical_mapping_must_sound_like_the_katakana():
+    """A canonical mapping is a SPELLING of the same name, not a translation.
+
+    Without this the model was free to answer with any name from the series it
+    thought it recognised. A real run returned エアリーズ (romaji "earizu" —
+    Aries, a mobile suit) as "Peacecraft" (a person's surname) and レン as
+    "Heero", and both shipped: the transcript called Relena Darlian "Relena
+    Peacecraft" and misattributed dialogue. A ratio alone cannot catch it —
+    "marina" scores 0.5 against "Relena" — so the LEADING SOUND has to match.
+    """
+    from backend.services.canonical_names import _canonical_sounds_plausible as ok
+    for term, value in [
+        ("リリーナ", "Relena"), ("ゼクス", "Zechs"), ("ガンダム", "Gundam"),
+        ("マリーナ", "Marina"), ("ヒイロ", "Heero"), ("デュオ", "Duo"),
+        ("トロワ", "Trowa"), ("ガンダニウム", "Gundanium"),
+        # Equivalent spellings of one sound must still pass:
+        ("エアリーズ", "Aries"),      # vowel-initial either way (e / a)
+        ("カトル", "Quatre"),         # k / q
+        ("コロニー", "Colony"),       # k / c
+        ("ウーフェイ", "Wufei"),       # vowel / w glide
+        ("ドーリアン", "Darlian"), ("トレーズ", "Treize"),
+    ]:
+        assert ok(term, value), f"{term} -> {value} must be allowed"
+
+    for term, value in [
+        ("エアリーズ", "Peacecraft"),  # the shipped failure
+        ("レン", "Heero"),            # the other shipped failure
+        ("マリーナ", "Relena"),        # the recurring ship-to-character swap
+        ("ゼクス", "Trowa"), ("ガンダム", "Deathscythe"), ("トロワ", "Quatre"),
+    ]:
+        assert not ok(term, value), f"{term} -> {value} must be rejected"
+
+
+def test_latin_terms_are_not_subject_to_the_sound_gate():
+    """Terms already in Latin script are covered by the other rules; the kana
+    gate must not start rejecting them."""
+    from backend.services.canonical_names import _canonical_sounds_plausible as ok
+    assert ok("Ririna", "Relena")
+    assert ok("Hero Yuu", "Heero Yuy")
+    assert ok("Shuttle", "Shuttle")
+
+
+def test_kana_romaji_covers_the_shapes_names_actually_use():
+    from backend.services.canonical_names import _kana_to_romaji as r
+    assert r("リリーナ") == "ririna"          # long vowel mark dropped
+    assert r("デュオ") == "deyuo"             # small-yu digraph
+    assert r("ガンダニウム") == "gandaniumu"   # voiced + n
+    assert r("ウーフェイ") == "ufei"           # fe digraph
+    assert r("Relena") == "Relena"           # non-kana passes through
