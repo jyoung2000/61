@@ -1047,7 +1047,8 @@ class RemoteWhisperEngine:
 
     def transcribe_wav(self, audio_path: str,
                        language: Optional[str] = None,
-                       translate: bool = False) -> Optional[dict]:
+                       translate: bool = False,
+                       tuning_overrides: Optional[dict] = None) -> Optional[dict]:
         """Returns ``{'segments', 'language', 'provider', 'model'}`` in the
         local schema (same contract as ``cloud_transcription.transcribe_cloud``)
         or ``None`` on any failure — the caller falls back to local.
@@ -1090,6 +1091,12 @@ class RemoteWhisperEngine:
         # Decode-tuning parity with the local path: the Companion sidecar
         # honors these; other servers ignore the extra multipart fields.
         data.update(_remote_tuning_fields())
+        # Per-call overrides ON TOP of the tuned fields. The gap re-listen
+        # exists to re-decode spans the tuned first pass DROPPED — sending the
+        # identical thresholds again just reproduces the identical silence, so
+        # that caller lowers the gates for its short, VAD-vetted slices.
+        if tuning_overrides:
+            data.update({k: str(v) for k, v in tuning_overrides.items()})
         if translate:
             # whisper.cpp server reads this to run task=translate (→ English).
             data["translate"] = "true"

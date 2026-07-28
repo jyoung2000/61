@@ -587,48 +587,113 @@ async def recover_gap_dialogue(
 
         offsets = _concat_offsets([d for _, d in planned], SEP_S)
         recovered: list[dict] = []
+        # Failure accounting so an infrastructure failure can never masquerade
+        # as silence again. A run whose 15 stems all errored into a cold
+        # sidecar logged the same "found no new dialogue" as genuine quiet.
+        n_failed = n_empty = n_heard = n_culled = 0
+        # The FIRST stem pays the sidecar's cold-start (measured 11 s of model
+        # load, during which every request errors); later stems hit it warm.
+        _patience = float(getattr(
+            settings, "VOCAL_GAP_ASR_WARMUP_PATIENCE_S", 90.0))
         for (gap, dur), off in zip(planned, offsets):
             stem = os.path.join(work_dir, f"stem_{int(gap[0])}.wav")
             if not await asyncio.to_thread(_slice_wav, vocals, stem, off, off + dur):
                 continue
-            segs = await asyncio.to_thread(_transcribe_stem, stem, source_lang)
+            segs = await asyncio.to_thread(
+                _transcribe_stem, stem, source_lang, _patience)
+            _patience = 20.0    # warm now; keep a small cushion per stem
+            if segs is None:
+                n_failed += 1
+                continue
+            if not segs:
+                n_empty += 1
+                continue
+            n_heard += 1
             for s in segs:
                 s["start"] = float(s.get("start", 0.0)) + gap[0]
                 s["end"] = float(s.get("end", 0.0)) + gap[0]
                 s = _clip_to_gap(s, gap, pad)
                 if s is None:
+                    n_culled += 1
                     continue
                 txt = _seg_text(s)
                 if not txt or _JUNK_RE.match(txt):
+                    n_culled += 1
                     continue
                 if float(s.get("no_speech_prob", 0.0) or 0.0) > 0.85:
+                    n_culled += 1
                     continue
                 s["speaker"] = _default_speaker(segments, s["start"])
                 s["text"] = txt
                 recovered.append(s)
         if recovered:
             logger.info(
-                "[%s] %s: %d cue(s) recovered from %s",
+                "[%s] %s: %d cue(s) recovered from %s "
+                "(%d/%d span(s) heard speech, %d empty, %d ASR-failed, %d culled)",
                 job_id, tag, len(recovered),
-                "buried audio" if separate else "a second listen")
+                "buried audio" if separate else "a second listen",
+                n_heard, len(planned), n_empty, n_failed, n_culled)
         else:
-            logger.info("[%s] %s: found no new dialogue", job_id, tag)
+            logger.info(
+                "[%s] %s: found no new dialogue "
+                "(%d span(s): %d decoded empty, %d ASR-FAILED, %d culled)%s",
+                job_id, tag, len(planned), n_empty, n_failed, n_culled,
+                " — the failures mean this verdict is NOT trustworthy"
+                if n_failed else "")
         return recovered
     except Exception as e:
         logger.warning("[%s] gap recovery skipped (%s)", job_id, e)
         return []
 
 
-def _transcribe_stem(wav_path: str, source_lang: str) -> list[dict]:
+# Decode gates for the SECOND listen. These spans were selected precisely
+# because the tuned first pass dropped them, so re-sending the identical
+# thresholds reproduces the identical silence. Silero already vetted that a
+# voice is in the slice; the junk regex and the no_speech cull downstream
+# handle what a laxer decode lets through.
+_RELISTEN_TUNING = {
+    "vad_threshold": 0.05,
+    "no_speech_threshold": 0.80,
+    "log_prob_threshold": -2.0,
+    "condition_on_previous_text": "false",
+    "hallucination_silence_threshold": 4.0,
+}
+
+
+def _transcribe_stem(wav_path: str, source_lang: str,
+                     patience_s: float = 0.0) -> Optional[list[dict]]:
     """ASR one vocal stem → list of {start,end,text,no_speech_prob} dicts.
-    Remote Companion whisper when configured; [] on any failure."""
+
+    Remote Companion whisper when configured. Returns ``None`` when the
+    TRANSPORT failed (every attempt errored) and ``[]`` when the decode
+    succeeded but heard nothing — the caller must not confuse the two: a
+    measured run fired 15 stems into a sidecar that was still loading its
+    model, every request failed inside the 11-second warmup, and the pass
+    reported "found no new dialogue" over spans with plainly audible speech.
+    ``patience_s`` re-tries across exactly that window; the first stem pays
+    it once and the rest hit a warm sidecar."""
     try:
+        import time as _t
         from backend.services.reframer_audio import (
             RemoteWhisperEngine, remote_whisper_configured)
         if not remote_whisper_configured():
-            return []
-        res = RemoteWhisperEngine().transcribe_wav(
-            wav_path, language=(source_lang or None))
+            return None
+        deadline = _t.monotonic() + max(0.0, float(patience_s or 0.0))
+        attempt = 0
+        while True:
+            attempt += 1
+            res = None
+            try:
+                res = RemoteWhisperEngine().transcribe_wav(
+                    wav_path, language=(source_lang or None),
+                    tuning_overrides=_RELISTEN_TUNING)
+            except Exception as e:
+                logger.info("gap recovery ASR attempt %d failed (%s)", attempt, e)
+            if res is not None:
+                break
+            if _t.monotonic() >= deadline:
+                return None
+            _t.sleep(4.0)
         segs = (res or {}).get("segments") or []
         out = []
         for s in segs:
@@ -642,4 +707,4 @@ def _transcribe_stem(wav_path: str, source_lang: str) -> list[dict]:
         return out
     except Exception as e:
         logger.info("gap recovery ASR failed (%s)", e)
-        return []
+        return None

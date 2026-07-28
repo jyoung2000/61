@@ -299,6 +299,13 @@ class Settings(BaseSettings):
     TRANSCRIPT_THEME_HEAD_S: float = 150.0    # opening-theme search window (from first cue)
     TRANSCRIPT_THEME_TAIL_S: float = 210.0    # ending-theme search window (to last cue)
     TRANSCRIPT_THEME_MIN_REPEATS: int = 2     # distinct repeated chorus lines to call it a song
+    # A sung theme is one CONTINUOUS block of audio, so cues separated by more
+    # than this many seconds can never belong to the same collapse run. This
+    # bound is what stops chorus lines detected late in the window from
+    # reaching back across a scene of dialogue: a measured run absorbed 19
+    # cues starting a full minute before the ending theme — including
+    # "I'll kill you.", the episode's signature line — into one marker.
+    TRANSCRIPT_THEME_MAX_GAP_S: float = 10.0
     # Stop the export-time readability merge from welding two ALREADY-COMPLETE
     # sentences back into a run-on (it re-runs inside the SRT/VTT/ASS
     # generators and otherwise undoes the finer cadence above). False =

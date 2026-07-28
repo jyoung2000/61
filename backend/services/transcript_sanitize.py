@@ -821,6 +821,42 @@ def collapse_song_choruses(segments, target_lang: str = "en"):
         def _is_preview(txt):
             return bool(_PREVIEW_RE.search(txt)) or _proper_noun_count(txt) >= 2
 
+        try:
+            from backend.config import settings as _gs
+            max_gap = float(getattr(_gs, "TRANSCRIPT_THEME_MAX_GAP_S", 10.0))
+        except Exception:
+            max_gap = 10.0
+
+        def _groups(cand: list) -> list:
+            """Split window indices into TIME-CONTIGUOUS groups (gap ≤ max_gap).
+
+            This is the load-bearing constraint the collapse was missing: a
+            real sung theme is one continuous block of audio, so no legitimate
+            chorus run contains a minute of silence. Without it, chorus lines
+            at 22:38-23:07 bounded a run that reached back across a 60-second
+            gap and absorbed a whole scene of dialogue starting at 21:34 —
+            including "I'll kill you.", the episode's signature line. Nineteen
+            cues shipped as one four-second marker."""
+            out, cur = [], []
+            for i in cand:
+                if cur and _st(rows[i]) - _en(rows[cur[-1]]) > max_gap:
+                    out.append(cur)
+                    cur = []
+                cur.append(i)
+            if cur:
+                out.append(cur)
+            return out
+
+        def _absorbable(i: int) -> bool:
+            """A cue that can ride along INSIDE/AROUND a detected song block:
+            no proper nouns, not a preview, lyric-length. Extension uses a
+            slightly looser length cap than the in-run test — translated lyric
+            lines are often full sentences."""
+            txt = (rows[i].get("text") or "").strip()
+            return (not _is_preview(txt)
+                    and _proper_noun_count(txt) == 0
+                    and len(txt) <= max(_LYRIC_MAX_CHARS, 60))
+
         drop = set()
         marker_at = {}
         for w0, w1, label in windows:
@@ -830,6 +866,11 @@ def collapse_song_choruses(segments, target_lang: str = "en"):
                     and w0 - 0.01 <= _st(r) <= w1 + 0.01]
             if len(idxs) < 4:
                 continue
+            # Chorus lines are identified over the WHOLE window (a chorus and
+            # its reprise are often separated by a verse or a narrated
+            # preview), but a collapse run must live inside ONE contiguous
+            # group — repetition says "this window holds a song"; contiguity
+            # says "these particular cues are it".
             counts = {}
             for i in idxs:
                 for s in _sent_split(rows[i].get("text") or ""):
@@ -839,46 +880,68 @@ def collapse_song_choruses(segments, target_lang: str = "en"):
             chorus = {ns for ns, c in counts.items() if c >= 2}
             if len(chorus) < min_rep:
                 # No repeated chorus, but a THROUGH-COMPOSED theme (an OP with
-                # all-distinct verse lines, or an ED with only a short hook) is a
-                # long single-speaker, proper-noun-free run. Collapse that run to
-                # the theme marker; any speaker change / proper noun / preview
-                # ends it, so dialogue is preserved. This catches the sung
-                # cold-open that shipped as "Speaker 1" dialogue — which the
-                # audio classifier misses because the vocals read as speech.
-                trun = _longest_theme_run(rows, idxs, _is_preview)
-                if len(trun) >= _THEME_RUN_MIN_CUES:
-                    tm_start = min(_st(rows[i]) for i in trun)
-                    tm_end = max(_en(rows[i]) for i in trun)
-                    if tm_end - tm_start >= _THEME_RUN_MIN_SPAN_S:
-                        drop.update(trun)
-                        marker_at[min(trun)] = (tm_start, tm_end, label)
+                # all-distinct verse lines, or an ED with only a short hook) is
+                # a long single-speaker, proper-noun-free run. Per contiguous
+                # group, so the run can no longer bridge a scene of dialogue.
+                for grp in _groups(idxs):
+                    trun = _longest_theme_run(rows, grp, _is_preview)
+                    if len(trun) >= _THEME_RUN_MIN_CUES:
+                        tm_start = min(_st(rows[i]) for i in trun)
+                        tm_end = max(_en(rows[i]) for i in trun)
+                        if tm_end - tm_start >= _THEME_RUN_MIN_SPAN_S:
+                            drop.update(trun)
+                            marker_at[min(trun)] = (tm_start, tm_end, label)
                 continue   # window handled (or genuinely not a song)
-            chorus_idxs = [i for i in idxs
-                           if not _is_preview((rows[i].get("text") or "").strip())
-                           and any(_song_norm(s) in chorus
-                                   for s in _sent_split(rows[i].get("text") or ""))]
-            if len(chorus_idxs) < 3:
-                continue
-            lo, hi = min(chorus_idxs), max(chorus_idxs)
-            run = []
-            for i in idxs:
-                if not (lo <= i <= hi):
+            for grp in _groups(idxs):
+                g_hits = [i for i in grp
+                          if not _is_preview((rows[i].get("text") or "").strip())
+                          and any(_song_norm(s) in chorus
+                                  for s in _sent_split(rows[i].get("text") or ""))]
+                if len(g_hits) < 2:
+                    # A group with at most one chorus-shaped cue is a scene of
+                    # dialogue, even when the window as a whole holds a song.
+                    # This is the exact guard the collapse was missing: chorus
+                    # hits at 22:38-23:07 used to bound a run that reached back
+                    # across a 60-second gap and ate 19 dialogue cues from
+                    # 21:34 — including "I'll kill you.", the episode's
+                    # signature line.
                     continue
-                txt = (rows[i].get("text") or "").strip()
-                if _is_preview(txt):
-                    continue   # preserve preview/dialogue interleaved in the run
-                is_chorus = any(_song_norm(s) in chorus for s in _sent_split(txt))
-                lyric_like = _proper_noun_count(txt) == 0 and len(txt) <= _LYRIC_MAX_CHARS
-                if is_chorus or lyric_like:
-                    run.append(i)
-            if len(run) < 3:
-                continue
-            m_start = min(_st(rows[i]) for i in run)
-            m_end = max(_en(rows[i]) for i in run)
-            if m_end - m_start < _THEME_MIN_SPAN_S:
-                continue
-            drop.update(run)
-            marker_at[lo] = (m_start, m_end, label)
+                lo, hi = min(g_hits), max(g_hits)
+                run = []
+                for i in grp:
+                    if not (lo <= i <= hi):
+                        continue
+                    txt = (rows[i].get("text") or "").strip()
+                    if _is_preview(txt):
+                        continue   # preserve preview/dialogue interleaved in the run
+                    is_chorus = any(_song_norm(s) in chorus for s in _sent_split(txt))
+                    lyric_like = (_proper_noun_count(txt) == 0
+                                  and len(txt) <= _LYRIC_MAX_CHARS)
+                    if is_chorus or lyric_like:
+                        run.append(i)
+                if len(run) < 2:
+                    continue
+                # Extend over the song's own head/tail INSIDE the group: the
+                # verse lines before the first chorus repeat and after the last
+                # one are part of the same continuous song, and leaving them
+                # made half the ending theme collapse while the other half
+                # shipped as dialogue. Proper nouns / previews still stop the
+                # walk, so the next-episode narration over the outro survives.
+                g_lo, g_hi = grp.index(min(run)), grp.index(max(run))
+                j = g_lo - 1
+                while j >= 0 and _absorbable(grp[j]):
+                    run.append(grp[j])
+                    j -= 1
+                j = g_hi + 1
+                while j < len(grp) and _absorbable(grp[j]):
+                    run.append(grp[j])
+                    j += 1
+                m_start = min(_st(rows[i]) for i in run)
+                m_end = max(_en(rows[i]) for i in run)
+                if m_end - m_start < _THEME_MIN_SPAN_S:
+                    continue
+                drop.update(run)
+                marker_at[min(run)] = (m_start, m_end, label)
 
         if not drop:
             return rows, False

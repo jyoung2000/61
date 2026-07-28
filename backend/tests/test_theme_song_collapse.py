@@ -34,9 +34,12 @@ def test_collapses_ending_theme_chorus_to_marker():
     out, changed = collapse_song_choruses(rows, "en")
     assert changed
     texts = [r["text"] for r in out]
-    # A single ending-theme marker was inserted.
+    # The song is interrupted by the narrated preview, so each sung block
+    # gets its own marker — one before the preview, one after. (A single
+    # marker spanning both would claim the preview narration is part of the
+    # song.) What matters: markers exist and no lyric ships as dialogue.
     markers = [t for t in texts if _is_marker(t) and "Ending theme" in t]
-    assert len(markers) == 1
+    assert 1 <= len(markers) <= 2
     # The repeated chorus lyric no longer appears as dialogue.
     assert "I don't like just love. It irritates me." not in texts
 
@@ -151,3 +154,69 @@ def test_ordinary_dialogue_scene_is_not_collapsed():
     out, changed = collapse_song_choruses(rows, "en")
     assert not changed
     assert not any(_is_marker(r["text"]) for r in out)
+
+
+# ── A chorus run must be time-CONTIGUOUS ───────────────────────────────────
+# Measured on a shipped run: chorus lines detected at 22:38-23:07 bounded a
+# collapse run that reached back across a 60-second gap and absorbed a whole
+# scene of dialogue starting at 21:34 — nineteen cues, including
+# "I'll kill you.", the episode's signature line — into one 4-second marker.
+# Meanwhile the song's own tail (past the last chorus repeat) shipped as
+# dialogue. Contiguity + extension fix both directions.
+
+def _run5_tail_transcript():
+    # Turn-taking speakers on the body so the through-composed run detector
+    # (single-speaker runs) has nothing to bite on — the chorus path is the
+    # one under test here, exactly as in the measured run.
+    rows = [{**_cue(60 + i * 6, 66 + i * 6, f"Dialogue line number {i} here."),
+             "speaker": "Speaker 1" if i % 2 else "Speaker 2"}
+            for i in range(200)]                      # ends ~1260s
+    tail = [
+        # A quiet scene WELL before the song — must never be absorbed.
+        _cue(1294, 1298, "It's my birthday tomorrow."),
+        _cue(1299, 1302, "I hope you can make it to the party."),
+        _cue(1324, 1326, "I'll kill you."),
+        _cue(1341, 1343, "What kind of person is he?!"),
+        # The ending theme: verse, chorus ×2 ×2 lines, verse tail — contiguous.
+        _cue(1359, 1365, "I give him a call out of the blue"),
+        _cue(1366, 1372, "He gets on my nerves, just love."),      # chorus A
+        _cue(1373, 1377, "He makes me wait, how dare he do that"),  # chorus B
+        _cue(1378, 1384, "He gets on my nerves, just love."),      # chorus A repeat
+        _cue(1385, 1389, "He makes me wait, how dare he do that"),  # chorus B repeat
+        _cue(1390, 1394, "That's why."),                           # song tail (past last chorus)
+        _cue(1396, 1401, "You're pushing your luck saying things you can't do"),
+        # Next-episode preview — proper nouns — must survive.
+        _cue(1410, 1416, "The Gundam that sank is retrieved by Zechs."),
+    ]
+    for c in tail:
+        c.setdefault("speaker", "Speaker 1")
+    return rows + tail
+
+
+def test_chorus_run_cannot_bridge_a_gap_into_dialogue():
+    out, changed = collapse_song_choruses(_run5_tail_transcript(), "en")
+    assert changed
+    texts = [r["text"] for r in out]
+    # The dialogue scene before the song survives in full.
+    assert "It's my birthday tomorrow." in texts
+    assert "I hope you can make it to the party." in texts
+    assert "I'll kill you." in texts
+    assert "What kind of person is he?!" in texts
+    # The preview survives.
+    assert any("Zechs" in t for t in texts)
+
+
+def test_song_tail_past_the_last_chorus_is_absorbed():
+    out, _ = collapse_song_choruses(_run5_tail_transcript(), "en")
+    texts = [r["text"] for r in out]
+    # Every sung line — verses AND the tail after the final chorus repeat —
+    # collapses into the marker instead of shipping as dialogue.
+    assert "He gets on my nerves, just love." not in texts
+    assert "I give him a call out of the blue" not in texts
+    assert "That's why." not in texts
+    assert "You're pushing your luck saying things you can't do" not in texts
+    markers = [r for r in out if _is_marker(r["text"]) and "Ending theme" in r["text"]]
+    assert len(markers) == 1, markers
+    # The marker spans the SONG, not the dialogue a minute earlier.
+    assert 1355.0 <= markers[0]["start"] <= 1360.0
+    assert markers[0]["end"] >= 1400.0
