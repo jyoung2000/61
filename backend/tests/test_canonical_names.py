@@ -583,7 +583,8 @@ def test_terms_only_resolution_is_provisional_not_authoritative(tmp_path, monkey
         async def text_completion(self, prompt, **kw):
             calls.append(prompt)
             return json.dumps({"ドーリアン": "Dorian", "エアリーズ": "Aires",
-                               "ゼクス": "Zechs", "リリーナ": "Relena"})
+                               "ゼクス": "Zechs", "リリーナ": "Relena",
+                               "ガンダム": "Gundam"})
 
     terms = ["ドーリアン", "エアリーズ", "ゼクス", "リリーナ", "ガンダム"]
     got = asyncio.run(resolve_canonical_names(
@@ -693,3 +694,97 @@ def test_kana_romaji_covers_the_shapes_names_actually_use():
     assert r("ガンダニウム") == "gandaniumu"   # voiced + n
     assert r("ウーフェイ") == "ufei"           # fe digraph
     assert r("Relena") == "Relena"           # non-kana passes through
+
+
+# ── Second chance for terms the first resolution left behind ───────────────
+# A measured run resolved 9/17 terms (Relena, Zechs, OZ, Gundam…) and left
+# ヒイロ / ドーリアン / トロワ unresolved. Those leftovers are exactly the
+# ground truth the downstream garble corrector needs: with no "Heero Yuy" in
+# the known-names set, "Hero Yu" → "Heero Yuy" is uncorroborated and dies in
+# vetting. Once ≥2 names are resolved the work is identified, so re-asking
+# about the remainder with those anchors is retrieval, not guessing.
+
+def test_partial_resolution_gets_a_second_chance(tmp_path, monkeypatch):
+    store = tmp_path / "cn.json"
+    monkeypatch.setattr(CN, "_persist_path", lambda: str(store))
+    CN.clear_cache()
+    calls = []
+
+    class _Orch:
+        async def text_completion(self, prompt, **kw):
+            calls.append(prompt)
+            if len(calls) == 1:
+                # First call: partial — knows the leads, misses the rest.
+                return json.dumps({"リリーナ": "Relena", "ゼクス": "Zechs"})
+            # Second call: anchors in-context → resolves the leftovers,
+            # including one cross-name swap the gate must kill.
+            assert "Relena" in prompt and "Zechs" in prompt
+            assert "romaji" in prompt
+            return json.dumps({"series": "Mobile Suit Gundam Wing",
+                               "mappings": {"ヒイロ": "Heero Yuy",
+                                            "ドーリアン": "Darlian",
+                                            "エアリーズ": "Peacecraft"}})
+
+    terms = ["リリーナ", "ゼクス", "ヒイロ", "ドーリアン", "エアリーズ"]
+    got = asyncio.run(resolve_canonical_names(
+        terms, "videoplayback.mp4", _Orch(), job_id="job-2nd"))
+    assert len(calls) == 2
+    assert got["リリーナ"] == "Relena" and got["ゼクス"] == "Zechs"
+    assert got["ヒイロ"] == "Heero Yuy"
+    assert got["ドーリアン"] == "Darlian"
+    # The phonetic gate still rules the second answer: エアリーズ (earizu)
+    # does not sound like "Peacecraft", no matter how confident the model is.
+    assert "エアリーズ" not in got
+
+
+def test_no_second_chance_without_anchors(tmp_path, monkeypatch):
+    # One resolved name identifies nothing — a second ask would be a guess
+    # about a guess, so it must not happen.
+    store = tmp_path / "cn.json"
+    monkeypatch.setattr(CN, "_persist_path", lambda: str(store))
+    CN.clear_cache()
+    calls = []
+
+    class _Orch:
+        async def text_completion(self, prompt, **kw):
+            calls.append(prompt)
+            return json.dumps({"ゼクス": "Zechs"})
+
+    terms = ["ゼクス", "ヒイロ", "ドーリアン", "エアリーズ", "リリーナ"]
+    got = asyncio.run(resolve_canonical_names(
+        terms, "videoplayback.mp4", _Orch(), job_id="job-1anchor"))
+    assert len(calls) == 1
+    assert got == {"ゼクス": "Zechs"}
+
+
+def test_second_chance_names_reach_the_roster_corroboration_set(tmp_path, monkeypatch):
+    """The whole point: leftovers resolved on the second pass land in the
+    per-job series evidence, so the roster garble pass can corroborate
+    'Hero Yu' → 'Heero Yuy' even though the transcript never once spelled it
+    right (attestation 0-vs-N)."""
+    store = tmp_path / "cn.json"
+    monkeypatch.setattr(CN, "_persist_path", lambda: str(store))
+    CN.clear_cache()
+
+    class _Orch:
+        async def text_completion(self, prompt, **kw):
+            if "Remaining terms:" not in prompt:
+                return json.dumps({"リリーナ": "Relena", "ゼクス": "Zechs"})
+            return json.dumps({"series": "Mobile Suit Gundam Wing",
+                               "mappings": {"ヒイロ": "Heero Yuy",
+                                            "トロワ": "Trowa"}})
+
+    # ≥4 terms: with a generic filename, fewer can't fingerprint the work
+    # and the resolver correctly refuses to call the model at all.
+    terms = ["リリーナ", "ゼクス", "ヒイロ", "トロワ"]
+    asyncio.run(resolve_canonical_names(
+        terms, "videoplayback.mp4", _Orch(), job_id="job-evidence"))
+    evidence = CN._CACHE.get("job:job-evidence") or {}
+    assert evidence.get("ヒイロ") == "Heero Yuy"
+    # And the vet accepts the unattested correction once corroborated.
+    pairs = [{"wrong": "Hero Yu", "right": "Heero Yuy"}]
+    corpus = "Hero Yu said hello. Hero Yu sat down."     # right form attested 0×
+    vetted = CN._vet_roster_pairs(
+        pairs, {"Hero Yu"}, corpus=corpus,
+        known_names=set(evidence.values()))
+    assert vetted.get("Hero Yu") == "Heero Yuy"

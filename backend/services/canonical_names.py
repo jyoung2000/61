@@ -498,6 +498,45 @@ async def resolve_canonical_names(
 
         data = _parse_json_object(raw or "")
         result = _sanitize_mapping(data, terms) if data else {}
+        # Second chance for the LEFTOVERS. A partial first answer is the
+        # common real outcome (a measured run resolved 9/17 — Relena, Zechs,
+        # OZ, Gundam — and left ヒイロ, ドーリアン, トロワ unresolved), and
+        # the terms that stay unresolved are precisely the ones the
+        # downstream garble corrector needs as ground truth: with no
+        # "Heero Yuy" in the known-names set, the correction "Hero Yu" →
+        # "Heero Yuy" is uncorroborated and dies in vetting, so the episode
+        # ships phonetic romanizations of half its cast. Once ≥2 names ARE
+        # resolved, the work is identified — re-asking about the remainder
+        # with those anchors in-context turns a guess into retrieval. Every
+        # answer still passes the katakana phonetic gate.
+        if result and len(result) >= 2:
+            # "Remaining" means UNANSWERED — a term the model mapped to itself
+            # was recognized and dropped as an identity, and re-asking about it
+            # ("Shuttle", "Colony") is pure waste. Only terms the raw reply
+            # never mentioned get the second ask.
+            _term_lower = {t.lower(): t for t in terms}
+            _answered = set(result)
+
+            def _mark_answered(d, depth=0):
+                if not isinstance(d, dict) or depth > 2:
+                    return
+                for k, v in d.items():
+                    if isinstance(v, dict):
+                        _mark_answered(v, depth + 1)
+                    elif isinstance(k, str) and k.strip().lower() in _term_lower:
+                        _answered.add(_term_lower[k.strip().lower()])
+
+            _mark_answered(data)
+            _remaining = [t for t in terms if t not in _answered]
+            if _remaining:
+                try:
+                    _extra = await _resolve_remaining_terms(
+                        job_id, _remaining, result, orchestrator, timeout, model)
+                    if _extra:
+                        result.update(_extra)
+                except Exception as _rr_e:
+                    logger.debug("[%s] second-chance term resolution skipped: %s",
+                                 job_id or "-", _rr_e)
         if not result:
             # Say so. A silent empty result is how a whole episode shipped
             # "Zekus"/"Lilyana"/"Hero" with nothing in the log to show that the
@@ -1093,6 +1132,75 @@ def _vet_roster_pairs(pairs, candidates: set,
         scored.append((ratio, wrong, right))
     scored.sort(key=lambda t: -t[0])
     return {w: r for _s, w, r in scored[:max_pairs]}
+
+
+async def _resolve_remaining_terms(
+    job_id: str,
+    remaining: list[str],
+    resolved: dict[str, str],
+    orchestrator,
+    timeout: float,
+    model: str,
+) -> dict[str, str]:
+    """One follow-up call for the terms the first resolution left behind.
+
+    The anchors make this retrieval, not guessing: the model is shown the
+    names it already identified and asked to (1) name the specific work and
+    (2) spell the remaining names the way the official English release does.
+    Romaji is included per term so the model has the phonetic ground truth in
+    Latin script. Results pass ``_sanitize_mapping`` — including the katakana
+    phonetic gate, so a cross-name swap (エアリーズ → "Peacecraft") still
+    dies here no matter how confident the model sounds."""
+    if not remaining or orchestrator is None:
+        return {}
+    anchors = "; ".join(f"{k} = {v}" for k, v in list(resolved.items())[:10])
+    lines = "\n".join(
+        f"- {t}  (romaji: {_kana_to_romaji(t) or '?'})" for t in remaining[:12])
+    prompt = (
+        "All of these terms come from ONE Japanese anime episode. Names "
+        f"already identified from it: {anchors}.\n\n"
+        "First, identify the specific series these belong to. Then give the "
+        "OFFICIAL English spelling — exactly as the official English release "
+        "spells it — for each remaining name below. A term may be a "
+        "character, mecha, faction, place or technology name. Omit any term "
+        "you do not recognize, and never map a term to a DIFFERENT "
+        "character's name.\n\n"
+        f"Remaining terms:\n{lines}\n\n"
+        'Reply with ONLY JSON: {"series": "<series name>", '
+        '"mappings": {"<term>": "<official spelling>"}}'
+    )
+    kwargs: dict = {
+        "max_tokens": 300 + 24 * len(remaining),
+        "timeout": timeout,
+        "job_id": job_id or "",
+        "skip_circuit_breaker": True,
+        "json_mode": True,
+    }
+    if model:
+        kwargs["model_override"] = model
+    try:
+        raw = await asyncio.wait_for(
+            orchestrator.text_completion(prompt, **kwargs), timeout + 15)
+    except TypeError:
+        raw = await asyncio.wait_for(
+            orchestrator.text_completion(prompt), timeout + 15)
+    data = _parse_json_object(raw or "") or {}
+    series = str(data.get("series") or "").strip()
+    mappings = data.get("mappings")
+    extra = _sanitize_mapping(mappings, remaining) if isinstance(mappings, dict) else {}
+    if extra:
+        logger.info(
+            "[%s] canonical names: second chance resolved %d/%d leftover "
+            "term(s)%s: %s",
+            job_id or "-", len(extra), len(remaining),
+            f" (series identified as {series!r})" if series else "",
+            "; ".join(f"{k}→{v}" for k, v in list(extra.items())[:8]))
+    else:
+        logger.info(
+            "[%s] canonical names: second chance resolved none of %d leftover "
+            "term(s)%s", job_id or "-", len(remaining),
+            f" (series identified as {series!r})" if series else "")
+    return extra
 
 
 def _publish_series_evidence(job_id: str, mapping: dict) -> None:
