@@ -259,3 +259,74 @@ def test_phase2_flag_defaults():
     assert settings.REFRAMER_EXPORT_KEYPOINT_HZ == pytest.approx(10.0)
     assert settings.REFRAMER_TILED_ADAPTIVE is True
     assert settings.REFRAMER_TILED_MIN_FACE_FRAC == pytest.approx(0.04)
+
+
+# ── Conversation cadence: no tennis-match camera ───────────────────────────
+# A measured 39-second two-person scene carried 38 keyframes — the speaker
+# follow swung A→B→A→B every second. Dejitter only removes one quick bounce;
+# a sustained rally survived every pass. Humans hold a two-shot for close
+# subjects and hold each side for seconds when they are far apart.
+
+from backend.services.reframer_models import RenderPlan
+from backend.services.reframer_smoother import Smoother
+
+
+def _plan(kfs, crop_w=600, source_w=1920):
+    p = RenderPlan(source_width=source_w, crop_w=crop_w)
+    p.keyframes = kfs
+    return p
+
+
+def _kf(t_ms, x, transition="ease_in_out"):
+    return {"time_ms": int(t_ms), "x": int(x), "transition": transition,
+            "transition_ms": 300}
+
+
+def test_close_pingpong_becomes_a_two_shot_hold():
+    # A at x=200, B at x=380 (separation 180 < 0.45×600), swap every 1.6s —
+    # slow enough that dejitter's 3-second A→B→A window doesn't claim it
+    # (dejitter's answer to a fast rally is to plant the camera on ONE
+    # speaker; the cadence pass frames BOTH), fast enough that no leg earns
+    # its 2.5-second operator hold.
+    kfs = [_kf(0, 200, "cut")]
+    t = 1600
+    for i in range(8):
+        kfs.append(_kf(t, 380 if i % 2 == 0 else 200))
+        t += 1600
+    out = Smoother(max_vel_px_per_sec=5000).smooth(_plan(list(kfs))).keyframes
+    span = [k for k in out if 0 < k["time_ms"] <= t]
+    # The rally collapses to (at most) a single move to the midpoint.
+    assert len(span) <= 2, span
+    assert any(abs(k["x"] - 290) <= 40 for k in span), span
+
+
+def test_far_pingpong_is_thinned_to_operator_cadence():
+    # A at x=0, B at x=560 — far beyond a two-shot. Swap every 1.0s for 10s.
+    kfs = [_kf(0, 0, "cut")]
+    t = 1000
+    for i in range(10):
+        kfs.append(_kf(t, 560 if i % 2 == 0 else 0))
+        t += 1000
+    out = Smoother(max_vel_px_per_sec=50000).smooth(_plan(list(kfs))).keyframes
+    moves = [k for k in out if 0 < k["time_ms"] <= t]
+    # ≥2.5s dwell per swing → at most ~4 moves survive the 10s rally.
+    assert len(moves) <= 4, moves
+    for a, b in zip(moves, moves[1:]):
+        assert b["time_ms"] - a["time_ms"] >= 2000, (a, b)
+
+
+def test_ordinary_pan_sequence_is_untouched_by_cadence():
+    # Distinct forward pans with real dwell — not a rally. The cadence pass
+    # must leave them alone (anticipation may shift times slightly earlier).
+    kfs = [_kf(0, 100, "cut"), _kf(4000, 300), _kf(9000, 500), _kf(15000, 350)]
+    out = Smoother(max_vel_px_per_sec=5000).smooth(_plan(list(kfs))).keyframes
+    xs = [k["x"] for k in out]
+    assert xs == [100, 300, 500, 350], out
+
+
+def test_anticipation_leads_the_detection():
+    from backend.config import settings
+    kfs = [_kf(0, 100, "cut"), _kf(5000, 400)]
+    out = Smoother(max_vel_px_per_sec=5000).smooth(_plan(list(kfs))).keyframes
+    lead = int(getattr(settings, "REFRAMER_ANTICIPATE_MS", 180))
+    assert out[-1]["time_ms"] == 5000 - lead, out

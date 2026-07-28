@@ -895,6 +895,21 @@ class Settings(BaseSettings):
     # Pan consolidation: same-direction eased steps within this window collapse
     # into ONE cinematic pan (stuttery 3-step pans were surviving at 1.5s).
     REFRAMER_PAN_CONSOLIDATE_WINDOW_S: float = 2.5
+    # Conversation cadence. A two-person dialogue drives the speaker-follow
+    # into strict A→B→A→B alternation — a measured 39-second classroom scene
+    # carried 38 keyframes, a camera move every second. No human operator
+    # shoots a conversation that way: for a close two-shot they frame BOTH
+    # speakers and hold; for a wide separation each side still holds a couple
+    # of seconds. Legs shorter than the hold collapse: sides closer than
+    # TWOSHOT_PCT × crop width become one midpoint hold, farther rallies are
+    # thinned so every swing dwells at least the hold time.
+    REFRAMER_PINGPONG_MIN_HOLD_S: float = 2.5
+    REFRAMER_PINGPONG_TWOSHOT_PCT: float = 0.45
+    # Begin each eased move this many ms BEFORE the detection that motivated
+    # it. Perception lags the event (a speaker change is detected after the
+    # first word), so an unshifted pan always arrives late and reads as
+    # chasing; an operator leads the action. 0 disables.
+    REFRAMER_ANTICIPATE_MS: int = 180
     # On a STATIC frame with no face, no person, AND no motion (a title card /
     # logo / credits), spectral saliency latches onto the highest-contrast EDGE
     # (e.g. a centered logo's wing-tip) and mis-frames the crop off to the side.

@@ -327,6 +327,113 @@ class Smoother:
                 consolidated.append(kf)
                 i += 1
 
+        # Pass 4.7: Conversation cadence — collapse ping-pong.
+        #
+        # A two-person dialogue drives the speaker-follow into strict
+        # alternation: A→B→A→B every second or so (a measured 39-second
+        # classroom scene carried 38 keyframes). Dejitter only removes a
+        # single quick A→B→A bounce; a sustained rally survives every pass
+        # and reads as a tennis-match camera. No human operator does this —
+        # for a close two-shot they frame BOTH speakers and hold; for a wide
+        # separation they still hold each side for a couple of seconds
+        # instead of chasing every line.
+        _pp_hold_s = float(getattr(settings, "REFRAMER_PINGPONG_MIN_HOLD_S", 2.5))
+        _pp_twoshot = float(getattr(settings, "REFRAMER_PINGPONG_TWOSHOT_PCT", 0.45))
+        cadenced = [consolidated[0]]
+        pingpong_collapsed = 0
+        i = 1
+        while i < len(consolidated):
+            kf = consolidated[i]
+            if kf.get('transition') == 'cut' or kf.get('_centering'):
+                cadenced.append(kf)
+                i += 1
+                continue
+            # Measure the alternation run starting here: eased moves whose
+            # direction flips every step, each leg shorter than the hold.
+            run = [i]
+            prev_x = cadenced[-1]['x']
+            direction = 0
+            j = i
+            while j < len(consolidated):
+                nkf = consolidated[j]
+                if nkf.get('transition') == 'cut' or nkf.get('_centering'):
+                    break
+                base = consolidated[j - 1] if j > i else cadenced[-1]
+                dt = (nkf['time_ms'] - base['time_ms']) / 1000.0
+                d = 1 if nkf['x'] > base['x'] else -1 if nkf['x'] < base['x'] else 0
+                if j > i and (d == 0 or d == direction or dt >= _pp_hold_s):
+                    break
+                direction = d
+                if j > i:
+                    run.append(j)
+                j += 1
+            if len(run) >= 4:
+                xs = [consolidated[k]['x'] for k in run]
+                side_a, side_b = xs[0::2], xs[1::2]
+                spread_ok = (max(side_a) - min(side_a) <= plan.crop_w * 0.15
+                             and max(side_b) - min(side_b) <= plan.crop_w * 0.15)
+                sep = abs(sum(side_a) / len(side_a) - sum(side_b) / len(side_b))
+                if spread_ok and sep <= plan.crop_w * _pp_twoshot:
+                    # Close enough to frame both: ONE move to the midpoint,
+                    # then hold for the whole rally.
+                    mid = clamp_x(int(round(sum(xs) / len(xs))), plan.max_x)
+                    first = consolidated[run[0]]
+                    cadenced.append({
+                        'time_ms': first['time_ms'], 'x': mid,
+                        'transition': 'ease_in_out', 'transition_ms': 450,
+                    })
+                    for k in run:
+                        dk = consolidated[k]
+                        self.tracer.event('smoother_drop',
+                                          pass_name='pingpong',
+                                          t_ms=dk['time_ms'], x=dk['x'],
+                                          twoshot_x=mid, run_length=len(run),
+                                          reason='pingpong_two_shot_hold')
+                    pingpong_collapsed += len(run)
+                    i = run[-1] + 1
+                    continue
+                if spread_ok:
+                    # Too far apart for a two-shot: keep the rally but slow
+                    # it to operator cadence — each side holds ≥ the minimum
+                    # before the camera swings back.
+                    last_kept_t = cadenced[-1]['time_ms']
+                    for k in run:
+                        dk = consolidated[k]
+                        if dk['time_ms'] - last_kept_t >= _pp_hold_s * 1000.0:
+                            cadenced.append(dk)
+                            last_kept_t = dk['time_ms']
+                        else:
+                            self.tracer.event('smoother_drop',
+                                              pass_name='pingpong',
+                                              t_ms=dk['time_ms'], x=dk['x'],
+                                              run_length=len(run),
+                                              reason='pingpong_hold_not_met')
+                            pingpong_collapsed += 1
+                    i = run[-1] + 1
+                    continue
+            cadenced.append(kf)
+            i += 1
+
+        # Pass 4.8: Anticipation — begin each eased move slightly BEFORE the
+        # detection that motivated it. Perception lags the event (a face is
+        # found some frames after it appears; a speaker change lands after the
+        # first word), so an unshifted pan always arrives late and reads as
+        # chasing. A human operator leads the action. Bounded by the previous
+        # keyframe so ordering is preserved.
+        _lead_ms = int(getattr(settings, "REFRAMER_ANTICIPATE_MS", 180))
+        anticipated = 0
+        if _lead_ms > 0:
+            for idx in range(1, len(cadenced)):
+                kf = cadenced[idx]
+                if kf.get('transition') == 'cut':
+                    continue
+                floor_t = cadenced[idx - 1]['time_ms'] + 50
+                new_t = max(floor_t, kf['time_ms'] - _lead_ms)
+                if new_t < kf['time_ms']:
+                    kf['time_ms'] = new_t
+                    anticipated += 1
+        consolidated = cadenced
+
         # Pass 5: Micro-drift suppression — remove eased moves smaller than
         # the drift threshold. These are too small for the viewer to notice
         # but they add perceived jitter and hurt the stability score. A
@@ -381,6 +488,8 @@ class Smoother:
             f'centering-protected {centering_protected}, '
             f'merged {merge_count}, '
             f'consolidated {consol_count} pans, hold-enforced {hold_enforced}, '
+            f'ping-pong-collapsed {pingpong_collapsed}, '
+            f'anticipated {anticipated}, '
             f'drift-suppressed {drift_suppressed})')
         self.tracer.event('smoother_complete',
                           input_keyframes=len(kfs),
@@ -391,6 +500,8 @@ class Smoother:
                           centering_protected=centering_protected,
                           merged=merge_count,
                           consolidated=consol_count,
+                          pingpong_collapsed=pingpong_collapsed,
+                          anticipated=anticipated,
                           hold_enforced=hold_enforced,
                           drift_suppressed=drift_suppressed)
         return plan
