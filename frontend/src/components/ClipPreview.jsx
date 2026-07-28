@@ -1,6 +1,6 @@
 import React, { useRef, useState, useEffect, useMemo, useCallback } from 'react';
 import { processKeyframes, getCropXForTime, isDynamic, safeSubjectX, subjectXToCenterPct, computeLayoutAtTime, computeFaceYCenter, faceYToCenterPct } from '../utils/subjectTracking';
-import { BASE_OVERHEAD_S, ANTICIPATION_S, AUDIO_BUFFER_S, PUNCT_PAUSE, FAST_WORDS } from '../utils/activeWordTiming';
+import { BASE_OVERHEAD_S, ANTICIPATION_S, AUDIO_BUFFER_S, PUNCT_PAUSE, FAST_WORDS, getCurrentWordIndex } from '../utils/activeWordTiming';
 import ReframeDebugOverlay from './ReframeDebugOverlay';
 import useTimelineStore from '../stores/timelineStore';
 import { outlineTextShadow } from '../utils/textOutline';
@@ -125,9 +125,10 @@ function hexToRgba(hex, opacity) {
 //  3. Character-proportional duration with natural speech weighting
 //  4. Anticipation offset so highlight leads audio for perceptual sync
 // Constants imported from the shared module so this preview can never
-// drift from SubtitleOverlay / RenderEngine (client export). The word-
-// index algorithm below intentionally stays local: ClipPreview's word
-// timestamps are always clip-relative by construction.
+// drift from SubtitleOverlay / RenderEngine (client export). The word
+// index uses the SAME shared implementation as the NLE preview; clip-
+// relative word timestamps share the clip-relative cue clock, which the
+// shared function handles without rebasing.
 const _BASE_OVERHEAD_S = BASE_OVERHEAD_S;
 const _ANTICIPATION_S  = ANTICIPATION_S;
 const _AUDIO_BUFFER_S  = AUDIO_BUFFER_S;
@@ -154,80 +155,12 @@ function computeSpeakerRates(clipSegments) {
   return rates;
 }
 
-function getCurrentWordIndex(segment, relativeTime, speakerRates) {
-  if (!segment || !segment.text) return -1;
-  const words = segment.text.split(/\s+/).filter(Boolean);
-  if (words.length <= 1) return words.length === 1 ? 0 : -1;
+// Active-word index comes from the ONE shared implementation
+// (utils/activeWordTiming). The copy that lived here used a naive
+// first-end-past-t scan, which skips words whose raw timings come
+// back out of order after alignment — the shared version clamps them
+// to a feasible monotonic schedule so no word is ever skipped.
 
-  // Use real per-word timestamps from Whisper when available and word count
-  // matches the display text (user may have edited the transcript text).
-  // Words are already in clip-relative time (offset during clipSegments construction).
-  // Apply the same audio buffer compensation as the fallback path — browsers
-  // report video.currentTime ~120ms before the user actually hears the audio
-  // (output pipeline latency).  Combined with the 100ms anticipation lead, the
-  // net perceptual effect is: highlight appears ~100ms before the word is heard,
-  // which feels like natural "reading ahead" sync.
-  if (segment.words && segment.words.length === words.length) {
-    const anticipation = 0.10; // 100ms lead for perceptual sync
-    const adjusted = relativeTime + anticipation - _AUDIO_BUFFER_S;
-    // Before the first word's audio but with the cue on screen, light the FIRST
-    // word so karaoke begins at the start of the line (not dark through a
-    // lead-in silence, then jumping in mid-sentence).
-    if (adjusted < segment.words[0].start) {
-      return relativeTime >= segment.start - 0.05 ? 0 : -1;
-    }
-    for (let i = 0; i < segment.words.length; i++) {
-      if (adjusted < segment.words[i].end) return i;
-    }
-    return segment.words.length - 1;
-  }
-
-  // Fallback: character-proportional estimation for segments without word data
-  const totalChars = words.reduce((sum, w) => sum + w.length, 0);
-  if (totalChars === 0) return -1;
-  const segDuration = segment.end - segment.start;
-
-  // Per-speaker speech rate scaling: faster speakers → less overhead
-  const speakerWps = (speakerRates && speakerRates[segment.speaker]) || 3.0;
-  const rateScale = Math.max(0.6, Math.min(1.6, 3.0 / speakerWps));
-
-  // Anticipation scales with speech rate; audio buffer is constant browser latency
-  const anticipation = _ANTICIPATION_S * rateScale;
-  const elapsed = (relativeTime - segment.start) + anticipation - _AUDIO_BUFFER_S;
-  if (elapsed < 0) return -1;
-
-  // Compute punctuation pauses for each word
-  const punctPauses = words.map((w) => {
-    const last = w[w.length - 1];
-    return (_PUNCT_PAUSE[last] || 0) * rateScale;
-  });
-  const totalPunct = punctPauses.reduce((a, b) => a + b, 0);
-
-  // Base overhead budget (gaps between words)
-  const baseOverhead = _BASE_OVERHEAD_S * rateScale * words.length;
-  const totalPause = baseOverhead + totalPunct;
-
-  // Remaining time is distributed proportionally by character count
-  const charTime = Math.max(segDuration - totalPause, segDuration * 0.45);
-  const pauseScale = (segDuration - charTime) / Math.max(totalPause, 0.01);
-
-  let t = 0;
-  for (let i = 0; i < words.length; i++) {
-    const charDur = charTime * (words[i].length / totalChars);
-    const pause = (_BASE_OVERHEAD_S * rateScale + punctPauses[i]) * pauseScale;
-    let wordDur = charDur + pause;
-    // Function words are spoken faster
-    const stripped = words[i].toLowerCase().replace(/[.,!?;:\u2014\u2013]+$/, '');
-    if (_FAST_WORDS.has(stripped)) wordDur *= 0.75;
-    // First word emphasis (slightly longer hold)
-    if (i === 0) wordDur *= 1.15;
-    // Last word trailing emphasis
-    else if (i === words.length - 1) wordDur *= 1.10;
-    if (elapsed < t + wordDur) return i;
-    t += wordDur;
-  }
-  return words.length - 1;
-}
 
 /**
  * Split subtitle segments so no segment exceeds maxWords.

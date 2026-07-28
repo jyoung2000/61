@@ -188,6 +188,8 @@ def generate_srt(
                 min_duration_ms=int(getattr(settings, "SUBTITLE_MIN_DURATION_MS", 833)),
                 max_duration_ms=int(getattr(settings, "SUBTITLE_MAX_DURATION_MS", 7000)),
                 smart_line_breaks=bool(getattr(settings, "SUBTITLE_SMART_LINE_BREAKS", True)),
+                word_timed_split_only=bool(getattr(
+                    settings, "SUBTITLE_EXPORT_WORD_TIMED_SPLIT_ONLY", True)),
             )
         except Exception:
             # Never let readability formatting break SRT generation — but say so.

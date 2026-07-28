@@ -4,6 +4,7 @@ import { ShareButton } from '../components/ShareDialog';
 import { showToast } from '../components/Toast';
 import { processKeyframes, interpolateSubjectX, isDynamic, computeClipSubjectX, fetchRenderPlan } from '../utils/subjectTracking';
 import { stripInlineTimestamps } from '../utils/stripTimestamps';
+import { getCurrentWordIndex } from '../utils/activeWordTiming';
 import ClipSettingsPanel from '../components/ClipSettingsPanel';
 import TranscriptViewer from '../components/TranscriptViewer';
 import VideoEditor from '../components/VideoEditor';
@@ -88,29 +89,11 @@ function getCurrentSubtitle(transcript, currentTime, clipStart, clipEnd) {
   );
 }
 
-const _WORD_OVERHEAD_S = 0.06;
-const _ANTICIPATION_S = 0.0;      // perceptual lead (0 = neutral)
-const _AUDIO_BUFFER_S = 0.12;     // compensate for browser audio output lag
-function getCurrentWordIndex(segment, relativeTime) {
-  if (!segment || !segment.text) return -1;
-  const words = segment.text.split(/\s+/).filter(Boolean);
-  if (words.length <= 1) return words.length === 1 ? 0 : -1;
-  const totalChars = words.reduce((sum, w) => sum + w.length, 0);
-  if (totalChars === 0) return -1;
-  const segDuration = segment.end - segment.start;
-  const elapsed = (relativeTime - segment.start) + _ANTICIPATION_S - _AUDIO_BUFFER_S;
-  if (elapsed < 0) return -1;
-  const totalOverhead = _WORD_OVERHEAD_S * words.length;
-  const charTime = Math.max(segDuration - totalOverhead, segDuration * 0.5);
-  const overheadPer = (segDuration - charTime) / words.length;
-  let t = 0;
-  for (let i = 0; i < words.length; i++) {
-    const wordDur = charTime * (words[i].length / totalChars) + overheadPer;
-    if (elapsed < t + wordDur) return i;
-    t += wordDur;
-  }
-  return words.length - 1;
-}
+// Active-word index comes from the ONE shared implementation
+// (utils/activeWordTiming): this page carried its own char-proportional
+// copy that ignored real word timestamps entirely, so its highlight
+// drifted from the audio wherever the NLE preview was exact.
+
 
 // ── Platform metadata (display labels + colors). Slugs match the
 //    PLATFORM_PROFILES keys in backend/services/prompts.py so a user

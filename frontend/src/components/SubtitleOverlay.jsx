@@ -151,7 +151,6 @@ export default function SubtitleOverlay({
 }) {
   const containerRef = useRef(null);
   const [containerSize, setContainerSize] = useState({ w: 0, h: 0 });
-  const [currentWordIdx, setCurrentWordIdx] = useState(-1);
   const [isEditing, setIsEditing] = useState(false);
   const editRef = useRef(null);
 
@@ -567,14 +566,13 @@ export default function SubtitleOverlay({
     if (e.key === 'Escape') setIsEditing(false);
   }, []);
 
-  // Active word tracking
-  useEffect(() => {
-    if (!activeWordEnabled || !currentSubtitle) {
-      setCurrentWordIdx(-1);
-      return;
-    }
-    const idx = getCurrentWordIndex(currentSubtitle, relTime, speakerRates);
-    setCurrentWordIdx(idx);
+  // Active word tracking. useMemo, NOT state-set-in-effect: the effect ran
+  // AFTER the render that consumed the old index, so every word boundary
+  // painted one frame with the PREVIOUS word highlighted before correcting —
+  // a per-word visible stutter at exactly the moment the eye is watching.
+  const currentWordIdx = useMemo(() => {
+    if (!activeWordEnabled || !currentSubtitle) return -1;
+    return getCurrentWordIndex(currentSubtitle, relTime, speakerRates);
   }, [activeWordEnabled, currentSubtitle, relTime, speakerRates]);
 
   // Output dims for font scaling
@@ -750,34 +748,54 @@ export default function SubtitleOverlay({
 
   let textContent;
   if (activeWordEnabled && currentWordIdx >= 0) {
-    const words = resolvedSubtitleText.split(/\s+/).filter(Boolean);
+    // Per-LINE word spans: splitting the whole text on /\s+/ and re-joining
+    // with plain spaces destroyed the formatter's line breaks, so the moment
+    // highlighting turned on, every carefully balanced two-line cue collapsed
+    // into one long line (and overflowed the safe zone). The container is
+    // whiteSpace: pre-wrap, so emitting '\n' between line fragments renders
+    // exactly like the non-highlighted path. The word index stays GLOBAL
+    // across lines — getCurrentWordIndex splits on /\s+/, which counts '\n'
+    // as a separator too, so the numbering matches.
+    const lines = resolvedSubtitleText.split('\n');
     const prefix = showLabels && currentSubtitle.speaker ? `${currentSubtitle.speaker}: ` : '';
     const awOlHex = awOutlineColor.replace('#', '');
     const awOlR = parseInt(awOlHex.substring(0, 2), 16) || 0;
     const awOlG = parseInt(awOlHex.substring(2, 4), 16) || 0;
     const awOlB = parseInt(awOlHex.substring(4, 6), 16) || 0;
+    let wordCursor = 0;
     textContent = (
       <>
         {prefix}
-        {words.map((word, idx) => {
-          const isActive = idx === currentWordIdx;
-          const wordStyle = isActive ? {
-            color: awColor,
-            ...(!bgEnabled && scaledOlWidth > 0 ? {
-              WebkitTextStroke: `${scaledOlWidth * 2}px rgba(${awOlR},${awOlG},${awOlB},${olOpacity})`,
-              paintOrder: 'stroke fill',
-              textShadow: outlineTextShadow(scaledOlWidth, `rgba(${awOlR},${awOlG},${awOlB},${olOpacity})`),
-            } : {}),
-            ...(awBgOpacity > 0 ? {
-              backgroundColor: hexToRgba(awBgColor, awBgOpacity / 100),
-              padding: `${Math.max(1, 1 * subtitleScale)}px ${Math.max(1, 2 * subtitleScale)}px`,
-              borderRadius: `${(settings.activeWordBgRadius ?? 4) * subtitleScale}px`,
-            } : {}),
-          } : {};
+        {lines.map((line, li) => {
+          const lineWords = line.split(/\s+/).filter(Boolean);
+          const base = wordCursor;
+          wordCursor += lineWords.length;
           return (
-            <span key={idx} style={wordStyle}>
-              {word}{idx < words.length - 1 ? ' ' : ''}
-            </span>
+            <React.Fragment key={li}>
+              {li > 0 ? '\n' : null}
+              {lineWords.map((word, wi) => {
+                const idx = base + wi;
+                const isActive = idx === currentWordIdx;
+                const wordStyle = isActive ? {
+                  color: awColor,
+                  ...(!bgEnabled && scaledOlWidth > 0 ? {
+                    WebkitTextStroke: `${scaledOlWidth * 2}px rgba(${awOlR},${awOlG},${awOlB},${olOpacity})`,
+                    paintOrder: 'stroke fill',
+                    textShadow: outlineTextShadow(scaledOlWidth, `rgba(${awOlR},${awOlG},${awOlB},${olOpacity})`),
+                  } : {}),
+                  ...(awBgOpacity > 0 ? {
+                    backgroundColor: hexToRgba(awBgColor, awBgOpacity / 100),
+                    padding: `${Math.max(1, 1 * subtitleScale)}px ${Math.max(1, 2 * subtitleScale)}px`,
+                    borderRadius: `${(settings.activeWordBgRadius ?? 4) * subtitleScale}px`,
+                  } : {}),
+                } : {};
+                return (
+                  <span key={idx} style={wordStyle}>
+                    {word}{wi < lineWords.length - 1 ? ' ' : ''}
+                  </span>
+                );
+              })}
+            </React.Fragment>
           );
         })}
       </>

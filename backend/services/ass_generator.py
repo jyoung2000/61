@@ -458,6 +458,8 @@ def generate_ass(
                 min_duration_ms=int(getattr(_app_settings, "SUBTITLE_MIN_DURATION_MS", 833)),
                 max_duration_ms=int(getattr(_app_settings, "SUBTITLE_MAX_DURATION_MS", 9000)),
                 smart_line_breaks=bool(getattr(_app_settings, "SUBTITLE_SMART_LINE_BREAKS", True)),
+                word_timed_split_only=bool(getattr(
+                    _app_settings, "SUBTITLE_EXPORT_WORD_TIMED_SPLIT_ONLY", True)),
             )
         except Exception:
             # Never let readability formatting break ASS generation.

@@ -1578,6 +1578,12 @@ class Settings(BaseSettings):
     # diarizer's placeholder labels are suppressed on export unless a speaker
     # has actually been renamed; set False to emit "[Speaker N]" again.
     SUBTITLE_SPEAKER_LABELS_REQUIRE_NAMES: bool = True
+    # Export-time formatting never cuts a cue at a char-proportional guess:
+    # a proportional time cut scatters the cue's words across fabricated
+    # timestamps, and the per-word highlight then tracks the fabrication
+    # instead of the audio. Cues with real word times still split normally;
+    # a word-less cue is kept whole (the box-overflow escape still applies).
+    SUBTITLE_EXPORT_WORD_TIMED_SPLIT_ONLY: bool = True
     SUBTITLE_MIN_DURATION_MS: int = 833         # 5/6 second (Netflix minimum)
     SUBTITLE_MAX_DURATION_MS: int = 7000        # Netflix maximum per event (7s).
                                                 # The phrase-merge still combines
