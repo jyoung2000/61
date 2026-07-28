@@ -3928,6 +3928,44 @@ async def _background_post_processing(
             logger.debug("[%s] timing-reference pre-fetch skipped: %s",
                          job_id, _pf_err)
             _ref_pretask = None
+        # AWAIT the pre-fetch before any text-model work. "Concurrently with
+        # the translation below" was a false parallelism: the reference decode
+        # and the text model share ONE remote card, and running them together
+        # makes both slower — measured end-state on a real run: the canonical
+        # -names call cold-loaded the 14B beside the running decode, the
+        # sidecar release-wait then burned its full 240 s and gave up SEVEN
+        # SECONDS before the decode finished, the 14B loaded onto the still-
+        # occupied card, hit OOM, was reloaded with partial CPU offload for
+        # the rest of the job, and after three 300-second stalls the circuit
+        # breaker abandoned the provider entirely — the episode shipped
+        # offline-NMT output 44 minutes late. Sequential is strictly faster
+        # here. The wait is BOUNDED: past the cap, the sidecar is released
+        # (killing the decode — timing degrades to tier B) so translation
+        # always starts on a free card.
+        if _ref_pretask is not None:
+            _pf_cap = float(getattr(settings, "HYBRID_PREFETCH_AWAIT_S", 420.0))
+            _pf_t0 = _time.monotonic()
+            try:
+                await asyncio.wait_for(asyncio.shield(_ref_pretask), timeout=_pf_cap)
+                logger.info(
+                    "[%s] Hybrid timing: reference decode finished in %.0fs — "
+                    "the Companion card is free for the text model",
+                    job_id, _time.monotonic() - _pf_t0)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "[%s] Hybrid timing: reference decode still running after "
+                    "%.0fs — releasing the sidecar (timing degrades to tier B) "
+                    "so translation starts on a free card rather than beside a "
+                    "busy one", job_id, _pf_cap)
+                try:
+                    from backend.services.reframer_audio import (
+                        remote_whisper_release as _pf_rel)
+                    await asyncio.to_thread(_pf_rel)
+                except Exception:
+                    pass
+            except Exception as _pf_await_err:
+                logger.debug("[%s] pre-fetch await failed (%s) — continuing",
+                             job_id, _pf_await_err)
         try:
             # ── (a) Translate (LLM-first, then Whisper-native / offline NMT) ──
             logger.info("[%s] Translate START: %s → %s (%d segments)",
@@ -4270,6 +4308,21 @@ async def _background_post_processing(
                 # with the orchestrator's (possibly different) editorial model.
                 logger.info("[%s] AI post-edit skipped — offline NMT path already "
                             "MTPE-polished the draft (OLLAMA_TRANSLATION_MODEL)", job_id)
+            elif (bool(getattr(settings, "TRANSLATION_PREFER_LLM", True))
+                  and not _used_llm):
+                # The LLM path was PREFERRED and still didn't produce this
+                # track — the translator just spent its retries failing on
+                # this exact provider. A 300-segment post-edit is the same
+                # workload on the same dying model, and a measured run paid
+                # for trying anyway: ten more minutes of degraded partial-
+                # offload inference whose edits corrupted words mid-token
+                # ("liv in g", "reach ed") — strictly worse than the raw NMT
+                # draft it rewrote. Keep the draft.
+                logger.info(
+                    "[%s] AI post-edit skipped — the preferred LLM translation "
+                    "path just failed on this provider, so a full post-edit "
+                    "would repeat the failure; keeping the raw NMT draft",
+                    job_id)
             else:
                 logger.info(
                     "[%s] AI post-edit START on translated text (lang=%s, %d segments, "

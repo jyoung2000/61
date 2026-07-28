@@ -590,7 +590,12 @@ async def recover_gap_dialogue(
         # Failure accounting so an infrastructure failure can never masquerade
         # as silence again. A run whose 15 stems all errored into a cold
         # sidecar logged the same "found no new dialogue" as genuine quiet.
-        n_failed = n_empty = n_heard = n_culled = 0
+        # Culls are broken down BY REASON with samples: the very next run
+        # decoded 44 segments across 15 spans and culled every one of them
+        # behind a single opaque counter — undiagnosable from the log.
+        n_failed = n_empty = n_heard = 0
+        n_cull_clip = n_cull_junk = n_cull_nospeech = 0
+        _cull_samples: list[str] = []
         # The FIRST stem pays the sidecar's cold-start (measured 11 s of model
         # load, during which every request errors); later stems hit it warm.
         _patience = float(getattr(
@@ -610,34 +615,46 @@ async def recover_gap_dialogue(
                 continue
             n_heard += 1
             for s in segs:
+                _raw_txt = _seg_text(s)
                 s["start"] = float(s.get("start", 0.0)) + gap[0]
                 s["end"] = float(s.get("end", 0.0)) + gap[0]
                 s = _clip_to_gap(s, gap, pad)
                 if s is None:
-                    n_culled += 1
+                    n_cull_clip += 1
+                    if len(_cull_samples) < 4:
+                        _cull_samples.append(f"clip:{_raw_txt[:40]!r}")
                     continue
                 txt = _seg_text(s)
                 if not txt or _JUNK_RE.match(txt):
-                    n_culled += 1
+                    n_cull_junk += 1
+                    if len(_cull_samples) < 4:
+                        _cull_samples.append(f"junk:{txt[:40]!r}")
                     continue
                 if float(s.get("no_speech_prob", 0.0) or 0.0) > 0.85:
-                    n_culled += 1
+                    n_cull_nospeech += 1
+                    if len(_cull_samples) < 4:
+                        _cull_samples.append(f"nospeech:{txt[:40]!r}")
                     continue
                 s["speaker"] = _default_speaker(segments, s["start"])
                 s["text"] = txt
                 recovered.append(s)
+        n_culled = n_cull_clip + n_cull_junk + n_cull_nospeech
+        _cull_detail = (
+            f"{n_culled} culled ({n_cull_clip} outside-gap, {n_cull_junk} junk, "
+            f"{n_cull_nospeech} no-speech"
+            + (f"; e.g. {'; '.join(_cull_samples)}" if _cull_samples else "") + ")")
         if recovered:
             logger.info(
                 "[%s] %s: %d cue(s) recovered from %s "
-                "(%d/%d span(s) heard speech, %d empty, %d ASR-failed, %d culled)",
+                "(%d/%d span(s) heard speech, %d empty, %d ASR-failed, %s)",
                 job_id, tag, len(recovered),
                 "buried audio" if separate else "a second listen",
-                n_heard, len(planned), n_empty, n_failed, n_culled)
+                n_heard, len(planned), n_empty, n_failed, _cull_detail)
         else:
             logger.info(
                 "[%s] %s: found no new dialogue "
-                "(%d span(s): %d decoded empty, %d ASR-FAILED, %d culled)%s",
-                job_id, tag, len(planned), n_empty, n_failed, n_culled,
+                "(%d span(s): %d decoded empty, %d ASR-FAILED, %s)%s",
+                job_id, tag, len(planned), n_empty, n_failed, _cull_detail,
                 " — the failures mean this verdict is NOT trustworthy"
                 if n_failed else "")
         return recovered
