@@ -314,7 +314,11 @@ def _restore_user_settings():
             # at 7.3-7.7s against a 7.0s cap because a persisted 9000 ms was still
             # in force, which also made the over-long-cue trim look broken.
             "SUBTITLE_MAX_DURATION_MS": (9000,),
-            "SUBTITLE_MAX_CPS": (20, 20.0),
+            # Every prior shipped default for this knob: 20 (original), then
+            # 17 (Netflix-strict era). The default is 20 again — 17 turned out
+            # to be the MERGE ceiling and vetoed the anti-choppiness pass —
+            # and a persisted 17 from the strict era would silently keep it.
+            "SUBTITLE_MAX_CPS": (17, 17.0),
             "SUBTITLE_MIN_SPLIT_CHARS": (14,),
             # 42 was the Netflix-spec line budget; the reference track's real
             # wall is 34, and a persisted 42 would keep shipping 40-plus-char

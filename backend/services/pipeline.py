@@ -4425,11 +4425,13 @@ async def _background_post_processing(
                                     "[%s] Cue alignment: %d/%d cue(s) force-aligned "
                                     "to the audio via %s — %d word(s), mean shift "
                                     "%.0f ms, %d cue start(s) tightened onto their "
-                                    "first voiced word",
+                                    "first voiced word, %d end(s) extended to the "
+                                    "voiced extent",
                                     job_id, _fa["cues_aligned"], len(translated),
                                     _fa.get("backend"), _fa["words_aligned"],
                                     _fa.get("mean_shift_ms", 0.0),
-                                    _fa.get("starts_tightened", 0))
+                                    _fa.get("starts_tightened", 0),
+                                    _fa.get("ends_extended", 0))
                             elif _fa.get("enabled"):
                                 logger.info(
                                     "[%s] Cue alignment: backend %s ready but no cue "

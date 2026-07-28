@@ -306,6 +306,24 @@ def _is_cjk(text: str) -> bool:
     return total > 0 and (cjk / total) >= 0.30
 
 
+def _flatten_cue_text(text: str) -> str:
+    """Collapse interior line breaks back to flowing text.
+
+    Latin scripts re-join with a space; a break BETWEEN two CJK glyphs joins
+    with nothing, because CJK text carries no inter-word spaces and a naive
+    space-join would inject one mid-word."""
+    parts = [p.strip() for p in (text or "").split("\n") if p.strip()]
+    if len(parts) <= 1:
+        return " ".join((text or "").split())
+    out = parts[0]
+    for p in parts[1:]:
+        if out and _is_cjk(out[-1]) and _is_cjk(p[0]):
+            out += p
+        else:
+            out += " " + p
+    return " ".join(out.split()) if not any(_is_cjk(c) for c in out) else out
+
+
 def _text_over_budget(text: str, max_chars_per_line: int, max_lines: int) -> bool:
     """True when ``text`` cannot be WRAPPED into the on-screen box.
 
@@ -1090,6 +1108,20 @@ def enforce_readability(
         (s for s in segments if s and (s.text or "").strip()),
         key=lambda x: (x.start, x.end),
     )
+    # FLATTEN interior line breaks before anything else. This function is the
+    # wrapping authority — a break in its input is a display artifact from a
+    # PREVIOUS formatting pass (the persisted track stores wrapped text, and
+    # every export runs the formatter again), not content. Pass 3 used to
+    # "respect upstream choice" and skip already-wrapped cues, but by then the
+    # split passes had cut the wrapped text at new positions, so the shipped
+    # break landed wherever the old one happened to fall: a measured track
+    # carried lines of 3 and 30 characters ("let" / "the heat flow freely In
+    # my life") and its two-line balance sat at 0.73 against the reference's
+    # 0.86. Flattening makes re-formatting idempotent: same input, same wraps,
+    # on every surface.
+    for _fseg in _sorted_in:
+        if "\n" in (_fseg.text or ""):
+            _fseg.text = _flatten_cue_text(_fseg.text)
     repaired: list[TranscriptSegment] = []
     for i, seg in enumerate(_sorted_in):
         _txt = seg.text.strip()
@@ -1434,7 +1466,17 @@ def enforce_readability(
             # with a small gap, or (c) merging them stays under max_dur.
             close_enough = gap < 0.6
             too_short = prev_dur < min_dur_s or seg_dur < min_dur_s
-            if close_enough and too_short and same_speaker:
+            # A SUB-HALF-SECOND cue is subliminal — it cannot be read at any
+            # line length, so absorbing it beats every alternative, including
+            # across a speaker change. The diarizer's label on a 0.2 s sliver
+            # is noise anyway (a measured track shipped a 0.209 s cue that
+            # could not extend — the next cue started 42 ms later — and could
+            # not merge only because ECAPA had put the two fragments of one
+            # exchange under different speakers).
+            subliminal = (min(prev_dur, seg_dur) < 0.45 and gap < 0.2
+                          and not _is_bracket_marker((prev.text or "").strip())
+                          and not _is_bracket_marker((seg.text or "").strip()))
+            if close_enough and too_short and (same_speaker or subliminal):
                 joiner = " " if prev.text and seg.text else ""
                 merged_text = (prev.text or "") + joiner + (seg.text or "")
                 merged_end = max(prev.end, seg.end)
@@ -1465,13 +1507,26 @@ def enforce_readability(
     out2.sort(key=lambda s: (s.start, s.end))
 
     # ── Pass 3: Smart line breaks (with hard-wrap safety) ──────────────
+    # Entry flatten means no cue reaches this pass pre-wrapped: this function
+    # is the wrapping authority, and every cue gets a fresh wrap computed for
+    # the text it ACTUALLY carries now (post-merge, post-split).
     if smart_line_breaks:
         for seg in out2:
-            if "\n" in seg.text:
-                # Already wrapped — respect upstream choice.
-                continue
             wrapped = _smart_split(seg.text, max_chars_per_line, max_lines)
             seg.text = wrapped
+            # A legal wrap can still be badly lopsided ("let" / "the heat flow
+            # freely In my life" is 3/31 — both under budget). The reference
+            # track's two-line balance sits at 0.86; when the smart split
+            # lands under 0.55, prefer the most even LEGAL split instead.
+            _p3lines = seg.text.splitlines()
+            if (max_lines == 2 and len(_p3lines) == 2
+                    and all(len(l) <= max_chars_per_line for l in _p3lines)):
+                _a, _b = (len(_p3lines[0]), len(_p3lines[1]))
+                if min(_a, _b) / max(1, max(_a, _b)) < 0.55:
+                    _bal_p3 = _balanced_two_line(
+                        " ".join(seg.text.split()), max_chars_per_line)
+                    if _bal_p3:
+                        seg.text = _bal_p3
             # Hard-wrap fallback: if any line is STILL over the budget
             # (long unbreakable URLs, glued punctuation, etc.), force a
             # break at the last fitting word boundary. The smart splitter

@@ -89,3 +89,63 @@ def test_cue_shift_bound_is_configured_and_bounded():
     # window the timing tiers established.
     v = float(getattr(settings, "SUBTITLE_ALIGN_MAX_CUE_SHIFT_S", 0.0))
     assert 0.0 < v <= 2.0
+
+
+# ── End extension to the voiced extent ─────────────────────────────────────
+# Tier B/C placement squeezes some cue windows well under their real voiced
+# span; the guillotined end is what makes a subtitle vanish while its line is
+# still being spoken, and the fake over-CPS reading then drives the splitter.
+# When the aligner hears the last word running past the cue's end, the end
+# moves to the voiced extent — bounded by the padded listening window and the
+# next cue's start, so only idle time is ever borrowed.
+
+def _fake_backend(spans):
+    class _B:
+        sample_rate = 16000
+        def align_words(self, wav, tokens):
+            return spans[:len(tokens)]
+    return _B()
+
+
+def _run_aligned(cues, spans, monkeypatch, tmp_path):
+    import numpy as np
+    import types, sys
+    from backend.services import forced_aligner as FA
+    # A fake torchaudio: load() returns 1 channel of silence at 16 kHz.
+    fake_ta = types.ModuleType("torchaudio")
+    class _T:
+        def __init__(self, arr): self._a = arr
+        @property
+        def shape(self): return (1, len(self._a))
+        def __getitem__(self, key): return self
+        def mean(self, dim, keepdim): return self
+    fake_ta.load = lambda p: (_T(np.zeros(16000 * 60)), 16000)
+    fake_ta.functional = types.SimpleNamespace(
+        resample=lambda w, a, b: w)
+    monkeypatch.setitem(sys.modules, "torchaudio", fake_ta)
+    monkeypatch.setattr(FA, "_pick_device", lambda: "cpu")
+    monkeypatch.setattr(FA, "_get_backend", lambda lang, dev: _fake_backend(spans))
+    wav = tmp_path / "a.wav"
+    wav.write_bytes(b"RIFF0000WAVE")
+    return FA.align_translated_cues(str(wav), cues)
+
+
+def test_end_extends_to_the_voiced_extent(monkeypatch, tmp_path):
+    # Cue window 10.0-11.0 but the aligner hears "world" ending at ~11.5
+    # (window-relative: s0 = 10.0 - 0.3 pad = 9.7; 11.5 - 9.7 = 1.8).
+    cues = [_cue(10.0, 11.0, "hello world"),
+            _cue(13.0, 14.0, "next cue here")]
+    stats = _run_aligned(cues, [(0.4, 0.9), (1.0, 1.8)], monkeypatch, tmp_path)
+    assert stats["ends_extended"] >= 1
+    # Extended toward the voiced extent, but never past window pad or the
+    # next cue.
+    assert 11.0 < cues[0].end <= 11.3 + 0.001
+    assert cues[0].words[-1].end <= cues[0].end + 0.001
+
+
+def test_end_extension_never_reaches_the_next_cue(monkeypatch, tmp_path):
+    cues = [_cue(10.0, 11.0, "hello world"),
+            _cue(11.05, 12.0, "tight next")]
+    stats = _run_aligned(cues, [(0.4, 0.9), (1.0, 1.8)], monkeypatch, tmp_path)
+    # Only ~0 room before the next cue: no meaningful extension.
+    assert cues[0].end <= 11.05 - 0.084 + 0.02 or cues[0].end == 11.0

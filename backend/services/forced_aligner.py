@@ -182,7 +182,8 @@ def align_translated_cues(audio_path: str, cues: list) -> dict:
 
     Returns stats; never raises. On any failure the caller's timings stand."""
     stats = {"enabled": False, "backend": None, "cues_aligned": 0,
-             "words_aligned": 0, "mean_shift_ms": 0.0, "starts_tightened": 0}
+             "words_aligned": 0, "mean_shift_ms": 0.0, "starts_tightened": 0,
+             "ends_extended": 0}
     if not bool(getattr(settings, "SUBTITLE_FORCED_ALIGN", True)):
         return stats
     if not cues or not audio_path:
@@ -226,7 +227,21 @@ def align_translated_cues(audio_path: str, cues: list) -> dict:
         else:
             setattr(c, k, v)
 
-    for cue in cues:
+    # Each cue's successor start, so the end-extension below can borrow only
+    # genuinely idle time. Computed over a sorted view — the caller's list is
+    # normally chronological, but nothing here should depend on it.
+    def _f(c):
+        try:
+            return float(_get(c, "start", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+    _order = sorted(range(len(cues)), key=lambda k: _f(cues[k]))
+    _next_start = {}
+    for _k, _idx in enumerate(_order):
+        _next_start[_idx] = (_f(cues[_order[_k + 1]])
+                             if _k + 1 < len(_order) else None)
+
+    for _i_cue, cue in enumerate(cues):
         text = str(_get(cue, "text", "") or "")
         tokens = text.split()
         if not tokens or not all(_normalize_en(t) for t in tokens):
@@ -249,17 +264,32 @@ def align_translated_cues(audio_path: str, cues: list) -> dict:
             spans = None
         if not spans or len(spans) != len(tokens):
             continue
+        # The cue window itself can be WRONG — tier B/C placement squeezes
+        # some cues well under their real voiced extent, and the guillotined
+        # end is what makes a subtitle vanish while its line is still being
+        # spoken (and fakes an over-CPS reading that the splitter then
+        # "fixes"). When the aligner hears the last word running past the
+        # cue's end, extend the end to the voiced extent — bounded by the
+        # padded window it actually listened to and by the next cue's start,
+        # so it can only ever borrow idle time.
+        e_eff = c_e
+        _last_we = s0 + float(spans[-1][1])
+        if _last_we > c_e + 0.04:
+            _nxt = _next_start.get(_i_cue)
+            _room = (_nxt - 0.084) if _nxt is not None else _last_we + 0.15
+            e_eff = max(c_e, min(_last_we + 0.10, c_e + pad, _room))
         rows = []
         prev_end = None
         ok = True
         for tok, (ws, we) in zip(tokens, spans):
-            # Clamp back into the cue. Alignment runs over a padded window, so a
-            # row could otherwise end up to ``pad`` past the cue's own end —
-            # which crosses the one-frame inter-cue gap into the NEXT cue, makes
-            # a later merge produce a non-monotonic array, and lets the burn-in
-            # extend the cue beyond what the SRT says.
-            n_s = round(min(max(s0 + ws, c_s), c_e), 3)
-            n_e = round(min(max(s0 + we, c_s), c_e), 3)
+            # Clamp back into the (possibly extended) cue. Alignment runs over
+            # a padded window, so a row could otherwise end up to ``pad`` past
+            # the cue's own end — which crosses the one-frame inter-cue gap
+            # into the NEXT cue, makes a later merge produce a non-monotonic
+            # array, and lets the burn-in extend the cue beyond what the SRT
+            # says.
+            n_s = round(min(max(s0 + ws, c_s), e_eff), 3)
+            n_e = round(min(max(s0 + we, c_s), e_eff), 3)
             if n_e <= n_s or (prev_end is not None and n_s < prev_end - 0.05):
                 ok = False       # non-monotonic → the aligner lost the thread
                 break
@@ -267,6 +297,10 @@ def align_translated_cues(audio_path: str, cues: list) -> dict:
             prev_end = n_e
         if not ok:
             continue
+        if e_eff > c_e + 0.02:
+            _set(cue, "end", round(e_eff, 3))
+            c_e = e_eff
+            stats["ends_extended"] += 1
         # Accumulate how far the words moved, for the log line.
         for old, new in zip(_iter_word_starts(cue), rows):
             total_shift += abs(new["start"] - old)

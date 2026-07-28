@@ -1516,7 +1516,18 @@ class Settings(BaseSettings):
     # output here is translated (usually non-English), so 17 is the correct
     # target. ``_cps()`` separately down-weights CJK glyphs, so CJK content lands
     # near Netflix's ~13 cps CJK-equivalent without a second knob.
-    SUBTITLE_MAX_CPS: float = 17.0             # Netflix language-specific adult limit
+    # 20, not the Netflix-strict 17. This value is the MERGE ceiling as much
+    # as a reading-speed target: the anti-choppiness pass refuses any merge
+    # whose result would read faster than it, while the splitter only fires at
+    # 1.5× it — so at 17 the pipeline was rejecting merges at 17.1 cps while
+    # happily shipping un-split cues at 25, strict in exactly the wrong
+    # direction. The reference track itself runs 67 of 347 cues above 17
+    # (p90 = 19.1): professional subtitlers trade reading speed for fuller,
+    # complete lines, and 20 is the ceiling that lets the merge pass make the
+    # same trade. Measured cost of 17: three-cue fragment chains ("But they're
+    # actually / Moving combat pilots who / will operate those weapons") whose
+    # pairwise merges all died at the 17-cps gate.
+    SUBTITLE_MAX_CPS: float = 20.0
     # Keep a cue WHOLE up to ``SUBTITLE_MAX_CPS × this`` and only split above it.
     # The reading-speed cap alone shatters every merged sentence right back into
     # 2-3 word flashes (a 193→174 merge re-exploded to 500+ cues), which is the

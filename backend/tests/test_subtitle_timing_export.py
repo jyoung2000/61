@@ -601,3 +601,53 @@ def test_budget_split_still_ships_a_clean_srt():
     for ln in body.splitlines():
         if ln and "-->" not in ln and not ln.isdigit():
             assert len(ln) <= 34, ln
+
+
+# ── The formatter is the wrapping authority ────────────────────────────────
+# The persisted track stores WRAPPED text and every export runs the formatter
+# again. Pass 3 used to skip already-wrapped cues ("respect upstream choice"),
+# but the split passes had already cut the wrapped text at new positions, so
+# the shipped break landed wherever the old one happened to fall: measured
+# lines of 3 and 30 characters against a 0.86-balance reference.
+
+def test_prewrapped_text_is_reflowed_not_respected():
+    seg = _cue(10.0, 14.0, "let\nthe heat flow freely In my life")
+    out = enforce_readability([seg], max_cps=20.0, max_chars_per_line=34,
+                              min_duration_ms=833, max_duration_ms=7000)
+    lines = out[0].text.split("\n")
+    assert all(len(l) <= 34 for l in lines)
+    a, b = (len(lines[0]), len(lines[-1])) if len(lines) == 2 else (1, 1)
+    assert min(a, b) / max(a, b) >= 0.4, lines
+
+
+def test_flatten_joins_cjk_without_injecting_a_space():
+    from backend.services.subtitle_formatter import _flatten_cue_text
+    assert _flatten_cue_text("日本語の\n続きです") == "日本語の続きです"
+    assert _flatten_cue_text("hello\nworld") == "hello world"
+
+
+def test_lopsided_legal_wrap_is_rebalanced():
+    # Both lines fit the budget, but 4/28 reads terribly; the reference's
+    # two-line balance is 0.86. The wrapper prefers the most even legal split.
+    seg = _cue(10.0, 14.0, "They prefer stealth operations tonight")
+    out = enforce_readability([seg], max_cps=20.0, max_chars_per_line=34,
+                              min_duration_ms=833, max_duration_ms=7000)
+    for o in out:
+        lines = o.text.split("\n")
+        if len(lines) == 2:
+            a, b = len(lines[0]), len(lines[1])
+            assert min(a, b) / max(a, b) >= 0.5, lines
+
+
+def test_subliminal_sliver_is_absorbed_even_across_speakers():
+    # 0.209 s cannot be read at any line length. The diarizer's label on a
+    # sliver that short is noise — a measured track shipped one because ECAPA
+    # had put the two fragments of one exchange under different speakers.
+    a = _cue(10.0, 10.209, "Zechs spotted something odd.", speaker="Speaker 2")
+    b = _cue(10.251, 12.0, "They report it as a meteor fall.", speaker="Speaker 1")
+    out = enforce_readability([a, b], max_cps=20.0, max_chars_per_line=34,
+                              min_duration_ms=833, max_duration_ms=7000)
+    assert all((o.end - o.start) >= 0.45 for o in out), \
+        [(o.start, o.end, o.text) for o in out]
+    joined = " ".join(o.text.replace("\n", " ") for o in out)
+    assert "Zechs spotted something odd." in joined
