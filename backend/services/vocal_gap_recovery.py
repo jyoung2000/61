@@ -80,6 +80,123 @@ def _overlaps_voice(gap: tuple[float, float], voice: list, pad_s: float,
     return False
 
 
+# Longest pause treated as "still the same utterance run" when grouping VAD
+# regions. A breath, not a beat of silence — see ``_under_transcribed_spans``.
+_VOICE_BRIDGE_S = 0.6
+
+
+def _chunk(lo: float, hi: float, max_span_s: float) -> list[tuple[float, float]]:
+    """``[lo, hi)`` cut into pieces no longer than ``max_span_s``."""
+    if max_span_s <= 0 or hi - lo <= max_span_s:
+        return [(lo, hi)]
+    out, t = [], lo
+    while t < hi:
+        out.append((t, min(t + max_span_s, hi)))
+        t += max_span_s
+    return out
+
+
+def _voiced_subspans(
+    gap: tuple[float, float], voice: list, pad_s: float,
+    max_span_s: float, min_gap_s: float,
+) -> list[tuple[float, float]]:
+    """Split an over-long hole into the parts VAD says carry a voice.
+
+    A 45s+ hole used to be dropped whole, on the reasoning that a continuous
+    hole that long is a non-speech scene. VAD makes that testable, and on a
+    reference episode it was wrong: the 70-second hole before the ending theme
+    held two lines of dialogue and the "to be continued" card. Dropping the
+    hole dropped them. Keeping the voiced parts costs Demucs only the seconds
+    that actually contain speech."""
+    lo, hi = gap
+    out: list[tuple[float, float]] = []
+    for v in sorted(voice or [], key=lambda r: float(r[0])):
+        try:
+            vs, ve = float(v[0]), float(v[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        s, e = max(vs, lo + pad_s), min(ve, hi - pad_s)
+        if e - s <= 0:
+            continue
+        if out and s - out[-1][1] < min_gap_s:
+            out[-1] = (out[-1][0], e)          # bridge neighbouring utterances
+        else:
+            out.append((s, e))
+    return [(max(0.0, s - pad_s), e + pad_s) for s, e in out
+            if max_span_s <= 0 or (e - s) <= max_span_s]
+
+
+def _under_transcribed_spans(
+    spans: list[tuple[float, float]],
+    segments,
+    voice: list,
+    *,
+    pad_s: float,
+    min_gap_s: float,
+    max_span_s: float,
+    density_ratio: float,
+) -> list[tuple[float, float]]:
+    """Voiced runs the transcript nominally COVERS but barely transcribes.
+
+    ``find_coverage_gaps`` only ever saw holes, and most of a real track's
+    missing dialogue is not a hole. Measured on a reference episode: a
+    17-second press scrum where the reference has nine lines came back as two
+    cues totalling fifteen characters — 0.9 characters per second against the
+    track's own median of 9.0. There is no gap there to find, so the recovery
+    pass never looked, and it was the single largest content miss in the file.
+
+    Density is measured against the track's OWN median rather than an absolute
+    floor, so the test travels across languages and speaking rates."""
+    if not voice or density_ratio <= 0:
+        return []
+    rows = [(b, _seg_text(s)) for s in (segments or []) if (b := _seg_bounds(s))]
+    rows = [(b, t) for b, t in rows if t]
+    if len(rows) < 8:
+        return []
+
+    def _chars_in(lo: float, hi: float) -> int:
+        return sum(len(t) for (a, b), t in rows if a < hi and b > lo)
+
+    # Median density over the cues we DO have, so the yardstick is this
+    # track's own speaking rate.
+    per_cue = sorted(len(t) / max(0.25, b - a) for (a, b), t in rows)
+    median = per_cue[len(per_cue) // 2]
+    if median <= 0:
+        return []
+    floor = median * density_ratio
+
+    # Bridge only across BREATH-length pauses. Bridging across ``min_gap_s``
+    # welded a 17-second scrum to the scene after it into one 48-second run,
+    # which then tripped the span cap and was dropped — the detector found the
+    # exact span it was built for and threw it away.
+    runs: list[list[float]] = []
+    for v in sorted(voice, key=lambda r: float(r[0])):
+        try:
+            vs, ve = float(v[0]), float(v[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if runs and vs - runs[-1][1] < _VOICE_BRIDGE_S:
+            runs[-1][1] = max(runs[-1][1], ve)
+        else:
+            runs.append([vs, ve])
+
+    out: list[tuple[float, float]] = []
+    for lo, hi in runs:
+        if hi - lo < min_gap_s:
+            continue
+        if _chars_in(lo, hi) / (hi - lo) >= floor:
+            continue
+        # A long run is CHUNKED, not skipped: the cap exists to bound one
+        # Demucs call, not to decide whether speech is there.
+        for c_lo, c_hi in _chunk(lo, hi, max_span_s):
+            cand = (max(0.0, c_lo - pad_s), c_hi + pad_s)
+            # Don't re-list something the hole scan already picked up.
+            if any(cand[0] < b and cand[1] > a for a, b in spans):
+                continue
+            out.append(cand)
+    return out
+
+
 def find_coverage_gaps(
     segments,
     *,
@@ -89,34 +206,45 @@ def find_coverage_gaps(
     max_total_s: float = 240.0,
     max_span_s: float = 45.0,
     voice_regions: list | None = None,
+    density_ratio: float = 0.0,
 ) -> list[tuple[float, float]]:
-    """Uncovered timeline holes between the first and last cue, ``min_gap_s`` ≤
-    length ≤ ``max_span_s``.
+    """Spans worth re-transcribing: uncovered timeline holes, plus — when VAD
+    regions are supplied — voiced runs the transcript barely transcribes.
 
     Interior only — silence before the first or after the last cue is
-    normally logos/credits, not buried dialogue. A hole LONGER than
-    ``max_span_s`` is skipped: music-buried DIALOGUE arrives as short holes,
-    whereas a continuous 45s+ hole is a non-speech scene (music / action) —
-    Demucs-separating minutes of it costs many post-COMPLETE minutes and
-    recovers nothing. Spans are padded by ``pad_s`` on each side (Whisper
-    needs lead-in context), largest ELIGIBLE first, capped at ``max_spans``
-    and ``max_total_s`` recovered seconds so a pathological transcript can't
+    normally logos/credits, not buried dialogue. A hole longer than
+    ``max_span_s`` is not dropped outright any more: with VAD it is reduced to
+    the parts that carry a voice, because "long" turned out to be a bad proxy
+    for "no speech". Spans are padded by ``pad_s`` on each side (Whisper needs
+    lead-in context), smallest ELIGIBLE first, capped at ``max_spans`` and
+    ``max_total_s`` recovered seconds so a pathological transcript can't
     schedule half the episode."""
     spans = sorted(b for s in (segments or []) if (b := _seg_bounds(s)))
     if len(spans) < 2:
         return []
     gaps: list[tuple[float, float]] = []
+    oversized: list[tuple[float, float]] = []
     cover_end = spans[0][1]
     for a, b in spans[1:]:
         hole = a - cover_end
-        if hole >= min_gap_s and (max_span_s <= 0 or hole <= max_span_s):
-            gaps.append((max(0.0, cover_end - pad_s), a + pad_s))
+        if hole >= min_gap_s:
+            if max_span_s <= 0 or hole <= max_span_s:
+                gaps.append((max(0.0, cover_end - pad_s), a + pad_s))
+            else:
+                oversized.append((max(0.0, cover_end - pad_s), a + pad_s))
         cover_end = max(cover_end, b)
     if voice_regions:
         # Keep only holes that actually contain a voice. Without this the
         # budget goes to song and title spans (which have no dialogue by
         # definition) and the real misses never get considered.
         gaps = [g for g in gaps if _overlaps_voice(g, voice_regions, pad_s)]
+        for g in oversized:
+            gaps.extend(_voiced_subspans(
+                g, voice_regions, pad_s, max_span_s, min_gap_s))
+        gaps.extend(_under_transcribed_spans(
+            gaps, segments, voice_regions, pad_s=pad_s, min_gap_s=min_gap_s,
+            max_span_s=max_span_s, density_ratio=density_ratio))
+        gaps.sort()
     # SMALLEST first. Largest-first contradicted this module's own premise —
     # music-buried dialogue arrives as SHORT holes, so the big spans it
     # preferred are the least likely to contain speech, and they consumed the
@@ -124,6 +252,35 @@ def find_coverage_gaps(
     # reference episode were 2.1-5.7 s while the selector spent 228 s on spans
     # of 14-25 s that held only song.
     gaps.sort(key=lambda g: g[1] - g[0])
+    if voice_regions:
+        # Rank by EXPECTED YIELD — voiced seconds inside the span that no cue
+        # currently covers — rather than by span length. Smallest-first was a
+        # proxy adopted when long spans reliably meant song; VAD screens for
+        # that directly now, and the proxy had started costing content: with
+        # both detectors feeding it, the candidate list came to 458 s against
+        # a 240 s budget and the two largest real misses (a five-line exchange
+        # and a whole reaction beat) were evicted in favour of shorter spans
+        # holding nothing. Ranking by the quantity we are trying to recover
+        # spends the same budget on the most missing dialogue.
+        _cov = sorted(b for s in (segments or []) if (b := _seg_bounds(s)))
+
+        def _yield_s(g: tuple[float, float]) -> float:
+            lo, hi = g[0] + pad_s, g[1] - pad_s
+            got = 0.0
+            for v in voice_regions:
+                try:
+                    vs, ve = float(v[0]), float(v[1])
+                except (TypeError, ValueError, IndexError):
+                    continue
+                s0, e0 = max(vs, lo), min(ve, hi)
+                if e0 <= s0:
+                    continue
+                covered = sum(max(0.0, min(cb, e0) - max(ca, s0))
+                              for ca, cb in _cov if ca < e0 and cb > s0)
+                got += max(0.0, (e0 - s0) - covered)
+            return got
+
+        gaps.sort(key=lambda g: (-_yield_s(g), g[1] - g[0]))
     picked: list[tuple[float, float]] = []
     total = 0.0
     for g in gaps[: max(0, max_spans)]:
@@ -299,9 +456,21 @@ async def recover_gap_dialogue(
     segments: list,
     source_lang: str,
     work_dir: str,
+    *,
+    separate: bool = True,
 ) -> list[dict]:
     """Run the full recovery for one job; returns recovered SOURCE-language
-    cues (possibly empty). Never raises."""
+    cues (possibly empty). Never raises.
+
+    ``separate=False`` is the CHEAP tier: re-ASR the selected spans straight
+    from the job audio with no Demucs pass. Most missing dialogue is not buried
+    under music at all — it is ordinary speech Whisper's VAD dropped, and a
+    plain second listen at a lower threshold gets it back. Measured on a
+    reference episode, of nine missing exchanges only the crowd-noise press
+    scrum actually needed separation. That matters because it decides WHERE the
+    pass can run: separation is minutes of CPU and has to stay post-COMPLETE,
+    while a second listen is one warm Whisper call and can run inside the job,
+    so its lines reach the subtitle file the user actually downloads."""
     try:
         from backend.config import settings
         from backend.services import vocal_separator
@@ -311,9 +480,10 @@ async def recover_gap_dialogue(
         if not audio_path or not os.path.exists(audio_path):
             logger.info("[%s] gap recovery: job audio missing — skipping", job_id)
             return []
-        if not vocal_separator.is_available():
+        if separate and not vocal_separator.is_available():
             logger.info("[%s] gap recovery: demucs not installed — skipping", job_id)
             return []
+        tag = "gap recovery" if separate else "gap re-listen"
 
         # Music markers ("[♪ music ♪]") are NOT coverage — they are the exact
         # spans where buried dialogue lives. Compute holes against speech
@@ -350,12 +520,14 @@ async def recover_gap_dialogue(
             max_total_s=float(getattr(settings, "VOCAL_GAP_MAX_TOTAL_S", 240.0)),
             max_span_s=float(getattr(settings, "VOCAL_GAP_MAX_SPAN_S", 45.0)),
             voice_regions=_voice,
+            density_ratio=float(getattr(
+                settings, "VOCAL_GAP_DENSITY_RATIO", 0.35)),
         )
         if not gaps:
-            logger.info("[%s] gap recovery: no coverage gaps ≥ threshold", job_id)
+            logger.info("[%s] %s: no coverage gaps ≥ threshold", job_id, tag)
             return []
         logger.info(
-            "[%s] gap recovery: %d gap(s), %.0fs total — %s", job_id, len(gaps),
+            "[%s] %s: %d span(s), %.0fs total — %s", job_id, tag, len(gaps),
             sum(b - a for a, b in gaps),
             ", ".join(f"{int(a) // 60}:{int(a) % 60:02d}-{int(b) // 60}:{int(b) % 60:02d}"
                       for a, b in gaps))
@@ -382,7 +554,7 @@ async def recover_gap_dialogue(
             raws.append(raw)
             planned.append((gap, dur))
         if not raws:
-            logger.info("[%s] gap recovery: no usable span audio", job_id)
+            logger.info("[%s] %s: no usable span audio", job_id, tag)
             return []
 
         sep_wav = os.path.join(work_dir, "sep_silence.wav")
@@ -390,24 +562,28 @@ async def recover_gap_dialogue(
         if not (await asyncio.to_thread(_make_silence, sep_wav, SEP_S)
                 and await asyncio.to_thread(
                     _concat_wavs, raws, sep_wav, concat_wav, work_dir)):
-            logger.info("[%s] gap recovery: span concatenation failed — skipping",
-                        job_id)
+            logger.info("[%s] %s: span concatenation failed — skipping", job_id, tag)
             return []
 
         total_s = sum(d for _, d in planned) + SEP_S * max(0, len(planned) - 1)
-        # CPU on purpose: recovery may overlap SEO's GPU work, and one pass over
-        # a couple of concatenated minutes stays comfortably bounded.
-        vocals = await asyncio.to_thread(
-            vocal_separator.separate_vocals, concat_wav,
-            os.path.join(work_dir, "sep"),
-            model=str(getattr(settings, "VOCAL_SEPARATION_MODEL", "htdemucs")),
-            device=str(getattr(settings, "VOCAL_GAP_DEVICE", "cpu")),
-            segment=int(getattr(settings, "VOCAL_SEPARATION_SEGMENT", 7)),
-            timeout=int(120 + total_s * 4),
-        )
-        if not vocals:
-            logger.info("[%s] gap recovery: separation unavailable", job_id)
-            return []
+        if separate:
+            # CPU on purpose: recovery may overlap SEO's GPU work, and one pass
+            # over a couple of concatenated minutes stays comfortably bounded.
+            vocals = await asyncio.to_thread(
+                vocal_separator.separate_vocals, concat_wav,
+                os.path.join(work_dir, "sep"),
+                model=str(getattr(settings, "VOCAL_SEPARATION_MODEL", "htdemucs")),
+                device=str(getattr(settings, "VOCAL_GAP_DEVICE", "cpu")),
+                segment=int(getattr(settings, "VOCAL_SEPARATION_SEGMENT", 7)),
+                timeout=int(120 + total_s * 4),
+            )
+            if not vocals:
+                logger.info("[%s] %s: separation unavailable", job_id, tag)
+                return []
+        else:
+            # Cheap tier: listen again to the ORIGINAL audio. No separation, so
+            # the concatenated track is already what we want to transcribe.
+            vocals = concat_wav
 
         offsets = _concat_offsets([d for _, d in planned], SEP_S)
         recovered: list[dict] = []
@@ -432,10 +608,11 @@ async def recover_gap_dialogue(
                 recovered.append(s)
         if recovered:
             logger.info(
-                "[%s] gap recovery: %d cue(s) recovered from buried audio",
-                job_id, len(recovered))
+                "[%s] %s: %d cue(s) recovered from %s",
+                job_id, tag, len(recovered),
+                "buried audio" if separate else "a second listen")
         else:
-            logger.info("[%s] gap recovery: separation found no new dialogue", job_id)
+            logger.info("[%s] %s: found no new dialogue", job_id, tag)
         return recovered
     except Exception as e:
         logger.warning("[%s] gap recovery skipped (%s)", job_id, e)

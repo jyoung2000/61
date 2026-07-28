@@ -231,15 +231,39 @@ class Settings(BaseSettings):
     # the seconds budget did and squeezed out the smaller holes (exactly the
     # press-conference-sized ones this exists for), so spans lead generously
     # and the seconds budget stays the real limiter.
-    VOCAL_GAP_MAX_SPANS: int = 14
+    # Measured: 14 spans averaging 7s is 100s against a 240s budget, so the
+    # COUNT was the real limiter after all and it starved the density
+    # candidates and the hole candidates of each other — adding a detector
+    # silently evicted spans the old one was finding. Let the seconds budget
+    # be the limiter it was meant to be.
+    VOCAL_GAP_MAX_SPANS: int = 32
     VOCAL_GAP_MAX_TOTAL_S: float = 240.0
-    # Skip any SINGLE hole longer than this. Music-buried DIALOGUE arrives as
+    # Longest SINGLE span to hand Demucs. Music-buried DIALOGUE arrives as
     # short holes (a line or two the VAD lost under the bed); a continuous
-    # 45s+ hole is a non-speech SCENE (music / action / ambience), and
+    # 45s+ hole is usually a non-speech SCENE (music / action / ambience), and
     # Demucs-separating minutes of it on CPU costs many post-COMPLETE minutes
     # and reliably recovers nothing — the measured 179s-gap → 8-min-for-zero
     # tail that kept the Companion busy long after "Analysis complete".
+    # A hole over the cap is no longer DROPPED, though: VAD reduces it to the
+    # parts carrying a voice. "Long" was a bad proxy for "no speech" — a
+    # 70-second hole before the ending theme held two lines of dialogue and
+    # the "to be continued" card, and dropping the hole dropped them.
     VOCAL_GAP_MAX_SPAN_S: float = 45.0
+    # A voiced run whose transcript density falls below this fraction of the
+    # track's own median is treated as a recovery candidate even though it is
+    # nominally covered. Holes are not where most missing dialogue lives: a
+    # measured 17-second press scrum that the reference renders as nine lines
+    # came back as two cues totalling fifteen characters — 0.9 chars/second
+    # against a track median of 9.0 — and, having cues in it, was invisible to
+    # a hole-based scan. 0 disables the density test.
+    VOCAL_GAP_DENSITY_RATIO: float = 0.35
+    # Run the SEPARATION-FREE tier of gap recovery inside the job, before
+    # translation, so recovered lines reach the subtitle file the user
+    # downloads. Most missing dialogue is not buried under music — it is
+    # ordinary speech Whisper's VAD dropped, and one more listen at a lower
+    # threshold gets it back for the cost of a single warm Whisper call.
+    # Demucs-grade recovery still runs post-COMPLETE for the rest.
+    VOCAL_GAP_RELISTEN_INLINE: bool = True
     # Demucs device for the short recovery slices. CPU by default: recovery
     # may overlap SEO's GPU work and the slices are small.
     VOCAL_GAP_DEVICE: str = "cpu"

@@ -3831,6 +3831,48 @@ async def _background_post_processing(
             except Exception as _sdd_err:
                 logger.warning("[%s] Pre-translate source dedup skipped (%s)",
                                job_id, _sdd_err)
+        # ── (a-relisten) Second listen over the spans the first pass dropped ──
+        # Whisper's VAD silently discards ordinary dialogue: measured against a
+        # reference track for the same episode, 30 of its 347 cues had no
+        # ClipAI counterpart at all — 985 characters, which was 93 % of the
+        # whole content deficit. The Demucs-based recovery pass exists for
+        # exactly this but runs post-COMPLETE, so its lines land after the
+        # subtitle file has already been written and the user downloads a track
+        # that is missing them. This is the cheap tier of that same pass: no
+        # separation, one more Whisper call over the selected spans only. It
+        # runs HERE, before resegmentation and translation, so recovered lines
+        # are resegmented, translated, timed and formatted with everything else
+        # rather than being spliced into a finished track. Separation-grade
+        # recovery still follows post-COMPLETE for what a second listen can't
+        # crack (dialogue genuinely buried under crowd noise or a music bed).
+        if (_trans_input
+                and bool(getattr(settings, "VOCAL_GAP_RELISTEN_INLINE", True))):
+            try:
+                from backend.models import TranscriptSegment as _TSrl
+                from backend.services.vocal_gap_recovery import (
+                    merge_recovered, recover_gap_dialogue)
+                _rl_audio = os.path.join(database._job_dir(job_id), "audio.wav")
+                if os.path.isfile(_rl_audio):
+                    _rl_rows = [s.model_dump() if hasattr(s, "model_dump") else dict(s)
+                                for s in _trans_input]
+                    _rl_new = await recover_gap_dialogue(
+                        job_id, _rl_audio, _rl_rows, source_lang,
+                        os.path.join(database._job_dir(job_id), "gap_relisten"),
+                        separate=False)
+                    if _rl_new:
+                        _rl_merged, _rl_added = merge_recovered(_rl_rows, _rl_new)
+                        if _rl_added:
+                            _trans_input = [
+                                _TSrl(**r) if isinstance(r, dict) else r
+                                for r in _rl_merged]
+                            logger.info(
+                                "[%s] Second listen recovered %d dialogue cue(s) the "
+                                "first pass dropped — merged BEFORE translation so "
+                                "they ship in the subtitle file",
+                                job_id, _rl_added)
+            except Exception as _rl_e:
+                logger.warning("[%s] Second-listen recovery skipped (%s)", job_id, _rl_e)
+
         # ── (a0) Resegment the SOURCE into one-utterance-per-cue units before
         # translating (Task 5). NMT translates cleaner sentence units far more
         # reliably than run-on blocks, and it keeps source↔target cue counts

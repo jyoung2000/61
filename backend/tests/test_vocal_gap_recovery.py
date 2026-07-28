@@ -283,3 +283,117 @@ def test_overlaps_voice_measures_the_unpadded_interior():
     assert not _overlaps_voice(gap, [(15.0, 15.1)], pad_s=2.0)
     # Malformed regions are ignored, not crashed on.
     assert not _overlaps_voice(gap, [None, ("x", "y"), ()], pad_s=2.0)
+
+
+# ── Most missing dialogue is not a HOLE ────────────────────────────────────
+# Measured against a reference track for the same episode: 30 of its 347 cues
+# had no ClipAI counterpart, 985 characters, 93 % of the whole content deficit.
+# The largest single miss was a 17-second press scrum the transcript nominally
+# COVERED with two cues totalling fifteen characters — no hole to find, so a
+# hole-based scan never looked at it.
+
+def test_density_detector_finds_an_under_transcribed_voiced_run():
+    segs = _track(
+        (0.0, 3.0, "A perfectly ordinary line of dialogue here."),
+        (5.0, 8.0, "Another perfectly ordinary line of dialogue."),
+        (10.0, 13.0, "And a third ordinary line to set the median."),
+        (15.0, 18.0, "A fourth ordinary line of dialogue as well."),
+        (20.0, 23.0, "A fifth ordinary line of dialogue as well."),
+        (25.0, 28.0, "A sixth ordinary line of dialogue as well."),
+        (30.0, 33.0, "A seventh ordinary line of dialogue too."),
+        (35.0, 38.0, "An eighth ordinary line of dialogue too."),
+        # 40-60s: continuous voice, CONTINUOUSLY COVERED by cues (so there is
+        # no hole to find), but only a handful of characters transcribed.
+        (40.0, 43.0, "Over"),
+        (43.0, 46.0, "Yes"),
+        (46.0, 49.0, "No"),
+        (49.0, 52.0, "Wait"),
+        (52.0, 55.0, "First"),
+        (55.0, 58.0, "Sir"),
+        (58.0, 60.0, "Hm"),
+        (62.0, 65.0, "Back to ordinary dialogue after the scrum."),
+    )
+    voice = [(40.0 + i * 0.5, 40.4 + i * 0.5) for i in range(40)]   # 40-60s
+    off = find_coverage_gaps(segs, min_gap_s=4.0, pad_s=1.0, max_spans=14,
+                             max_total_s=240.0, max_span_s=45.0,
+                             voice_regions=voice, density_ratio=0.0)
+    on = find_coverage_gaps(segs, min_gap_s=4.0, pad_s=1.0, max_spans=14,
+                            max_total_s=240.0, max_span_s=45.0,
+                            voice_regions=voice, density_ratio=0.35)
+    def _covers(picked, t):
+        return any(a <= t <= b for a, b in picked)
+    assert not _covers(off, 46.0), "hole scan should not see a covered span"
+    assert _covers(on, 46.0), f"density scan missed the scrum: {on}"
+
+
+def test_density_detector_leaves_a_normally_transcribed_run_alone():
+    segs = _track(*[(i * 5.0, i * 5.0 + 3.0,
+                     "A perfectly ordinary line of dialogue here.")
+                    for i in range(12)])
+    voice = [(i * 5.0, i * 5.0 + 3.0) for i in range(12)]
+    picked = find_coverage_gaps(segs, min_gap_s=4.0, pad_s=1.0, max_spans=14,
+                                max_total_s=240.0, max_span_s=45.0,
+                                voice_regions=voice, density_ratio=0.35)
+    assert picked == [], picked
+
+
+def test_overlong_hole_is_reduced_to_its_voiced_parts_not_dropped():
+    """"Longer than the cap" was a proxy for "no speech in it". On a reference
+    episode it was wrong: a 70-second hole before the ending theme held two
+    lines of dialogue and the "to be continued" card, and the cap dropped
+    them along with the hole."""
+    segs = _track((0.0, 5.0, "before the hole"), (80.0, 85.0, "after the hole"))
+    voice = [(30.0, 33.0), (40.0, 42.0)]      # two utterances inside a 75s hole
+    dropped = find_coverage_gaps(segs, min_gap_s=4.0, pad_s=1.0, max_spans=14,
+                                 max_total_s=240.0, max_span_s=45.0,
+                                 voice_regions=None)
+    kept = find_coverage_gaps(segs, min_gap_s=4.0, pad_s=1.0, max_spans=14,
+                              max_total_s=240.0, max_span_s=45.0,
+                              voice_regions=voice, density_ratio=0.0)
+    assert dropped == [], "a 75s hole is over the cap"
+    assert kept, "the voiced parts of that hole must survive"
+    assert all(b - a <= 45.0 + 2.0 for a, b in kept), kept
+    assert any(a <= 31.0 <= b for a, b in kept), kept
+
+
+def test_selection_prefers_the_span_holding_more_missing_speech():
+    """Yield ranking, not size ranking. Size was a proxy adopted when long
+    spans meant song; with both detectors feeding the selector the candidate
+    list outgrew the budget and the proxy started evicting the biggest real
+    misses in favour of short spans holding nothing."""
+    segs = _track((0.0, 5.0, "one"), (15.0, 20.0, "two"),
+                  (30.0, 35.0, "three"), (45.0, 50.0, "four"))
+    # Hole 5-15s: barely any voice. Hole 35-45s: voice throughout.
+    voice = [(6.0, 6.4)] + [(35.5 + i * 0.5, 35.9 + i * 0.5) for i in range(18)]
+    # Budget fits exactly ONE of the two 10s holes, so the ranking decides.
+    picked = find_coverage_gaps(segs, min_gap_s=4.0, pad_s=0.0, max_spans=14,
+                                max_total_s=10.0, max_span_s=45.0,
+                                voice_regions=voice, density_ratio=0.0)
+    assert len(picked) == 1, picked
+    assert picked[0][0] >= 35.0, \
+        f"the voice-dense span should win the budget, not the emptier one: {picked}"
+
+
+def test_chunk_splits_a_long_run_instead_of_discarding_it():
+    from backend.services.vocal_gap_recovery import _chunk
+    assert _chunk(0.0, 10.0, 45.0) == [(0.0, 10.0)]
+    assert _chunk(0.0, 100.0, 45.0) == [(0.0, 45.0), (45.0, 90.0), (90.0, 100.0)]
+    assert _chunk(0.0, 100.0, 0.0) == [(0.0, 100.0)]      # cap disabled
+
+
+def test_relisten_tier_needs_no_demucs(monkeypatch, tmp_path):
+    """The cheap tier is what lets recovered lines reach the shipped file: it
+    runs inside the job, before translation. Requiring Demucs would have kept
+    it in the post-COMPLETE task with everything else."""
+    from backend.services import vocal_gap_recovery as V
+    import backend.services.vocal_separator as VS
+    monkeypatch.setattr(VS, "is_available", lambda: False)
+    audio = tmp_path / "audio.wav"
+    audio.write_bytes(b"RIFF0000WAVE")
+    segs = _track((0.0, 5.0, "one"), (60.0, 65.0, "two"))
+    # separate=True bails on the missing Demucs; separate=False gets past it
+    # and only stops later, at the (unstubbed) slicing step.
+    assert asyncio.run(V.recover_gap_dialogue(
+        "j", str(audio), segs, "ja", str(tmp_path / "w"), separate=True)) == []
+    assert asyncio.run(V.recover_gap_dialogue(
+        "j", str(audio), segs, "ja", str(tmp_path / "w2"), separate=False)) == []
