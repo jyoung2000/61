@@ -505,3 +505,99 @@ def test_concat_words_rejects_an_end_overrun():
         WordTimestamp(start=11.52, end=11.70, word="Not"),
         WordTimestamp(start=11.70, end=11.99, word="now")])
     assert len(_concat_words(a2, b, "Not now and get down")) == 5
+
+
+# ── An over-budget cue always splits ──────────────────────────────────────
+# Measured on a shipped 24-minute track: seven cues carried a line over the
+# 34-char budget and five exceeded the 68-char two-line box, worst 124
+# characters. Three separate guards were each declining to split a cue that
+# physically could not be drawn. All three now yield to the budget.
+
+def _synthetic(start, end, text, speaker="Speaker 1"):
+    """A cue whose word rows were fabricated by char-proportional projection —
+    tier B/C of the hybrid timing path, which is most of a translated track."""
+    toks = text.split()
+    step = (end - start) / max(1, len(toks))
+    return TranscriptSegment(
+        start=start, end=end, text=text, speaker=speaker, words_synthetic=True,
+        words=[WordTimestamp(start=start + i * step, end=start + (i + 1) * step,
+                             word=t) for i, t in enumerate(toks)])
+
+
+def _lines(cues):
+    return [ln for c in cues for ln in (c.text or "").split("\n")]
+
+
+def test_unfittable_cue_splits_even_without_real_word_times():
+    # ``word_timed_split_only`` forbids a char-proportional time cut so a
+    # word-less cue is not scattered across guessed timestamps. That is right
+    # for a CPS-driven split and wrong for a cue that cannot fit the box: held
+    # whole, this one shipped two lines of 37 and 38 characters.
+    text = ("I didn't know the Alliance and Oz had "
+            "technology for making Mobile Suits too")
+    out = enforce_readability(
+        [_synthetic(553.2, 559.1, text)], max_cps=17.0, max_chars_per_line=34,
+        min_duration_ms=833, max_duration_ms=7000, word_timed_split_only=True)
+    assert len(out) > 1
+    assert max(len(ln) for ln in _lines(out)) <= 34
+
+
+def test_sub_second_cue_splits_when_it_cannot_fit_the_box():
+    # The anti-cascade floor ("never split a cue shorter than 2x the minimum
+    # piece") held a 0.83 s cue carrying 69 characters whole. Both halves being
+    # short is repairable by the duration passes; an overflow is not.
+    text = "Oh The new semester just started yet It's rare for Miss Lilyana not to"
+    out = enforce_readability(
+        [_synthetic(1194.996, 1195.830, text)], max_cps=17.0,
+        max_chars_per_line=34, min_duration_ms=833, max_duration_ms=7000,
+        word_timed_split_only=True)
+    assert len(out) > 1
+    assert max(len(ln) for ln in _lines(out)) <= 34
+
+
+def test_short_cue_merge_will_not_recreate_an_overflow():
+    # Pass 1 split a 75-char cue because it overflowed; each half landed under
+    # the 833 ms floor, and the too-short merge welded them straight back.
+    # The duration repair must not undo the budget repair.
+    text = "that our team investigating fallen capsules met their demise like ours did."
+    out = enforce_readability(
+        [_synthetic(1164.887, 1166.180, text)], max_cps=17.0,
+        max_chars_per_line=34, min_duration_ms=833, max_duration_ms=7000,
+        word_timed_split_only=True)
+    assert len(out) > 1, "the split halves were merged back over budget"
+    assert max(len(ln) for ln in _lines(out)) <= 34
+
+
+def test_gap_enforcement_merge_will_not_recreate_an_overflow():
+    # Pass 4 resolves a too-small gap by merging when capping would shrink the
+    # previous cue below the minimum duration. Same rule: capping costs display
+    # time, merging over the budget costs legibility.
+    a = _synthetic(10.0, 10.5, "Their vanguard has already landed near")
+    b = _synthetic(10.52, 11.0, "the eastern coast before dawn today")
+    out = enforce_readability(
+        [a, b], max_cps=17.0, max_chars_per_line=34, min_duration_ms=833,
+        max_duration_ms=7000, word_timed_split_only=True)
+    assert max(len(ln) for ln in _lines(out)) <= 34
+
+
+def test_budget_split_still_ships_a_clean_srt():
+    # End to end: the relaxed duration floor must not leave overlapping cues
+    # behind. ``generate_srt`` is the last word on cue timing.
+    cues = [
+        _synthetic(1163.0, 1164.5, "Their vanguard has already landed."),
+        _synthetic(1164.887, 1166.180,
+                   "that our team investigating fallen capsules "
+                   "met their demise like ours did."),
+        _synthetic(1166.222, 1169.349, "So four units in total?", "Speaker 2"),
+    ]
+    body = generate_srt(cues, include_speakers=False, fps=24.0)
+    times = re.findall(r"(\d+):(\d\d):(\d\d),(\d+) --> (\d+):(\d\d):(\d\d),(\d+)", body)
+    assert times
+    secs = [(int(a) * 3600 + int(b) * 60 + int(c) + int(d) / 1000,
+             int(e) * 3600 + int(f) * 60 + int(g) + int(h) / 1000)
+            for a, b, c, d, e, f, g, h in times]
+    for (_, prev_end), (nxt_start, _) in zip(secs, secs[1:]):
+        assert nxt_start >= prev_end, f"overlap at {prev_end} → {nxt_start}"
+    for ln in body.splitlines():
+        if ln and "-->" not in ln and not ln.isdigit():
+            assert len(ln) <= 34, ln

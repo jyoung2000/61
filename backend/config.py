@@ -595,6 +595,12 @@ class Settings(BaseSettings):
     # because the remote server dropped. Blank = fully local (unchanged).
     WHISPER_REMOTE_URL: str = ""
     WHISPER_REMOTE_API_KEY: str = ""
+    # How long to wait for a mid-decode Companion whisper sidecar to free the
+    # card before loading a large text model next to it. Sharing an 8 GB card
+    # spills LLM layers to CPU: a measured run's first translation batch took
+    # 447 s against 86 s for the remaining 285 cues once the sidecar was gone.
+    # 0 disables the wait (release once, proceed either way).
+    WHISPER_SIDECAR_RELEASE_WAIT_S: float = 240.0
     # Model to request from the remote server. Blank = auto ladder:
     # large-v3-turbo for English/auto jobs, large-v3 for pinned
     # non-English (multilingual accuracy), unless the user explicitly
@@ -1511,6 +1517,10 @@ class Settings(BaseSettings):
     # fixes all three at once. Raise toward 42 only for a platform that
     # genuinely renders wider.
     SUBTITLE_MAX_CHARS_PER_LINE: int = 34
+    # "[Speaker 2] " is 12 of those 34 characters and names nobody. The
+    # diarizer's placeholder labels are suppressed on export unless a speaker
+    # has actually been renamed; set False to emit "[Speaker N]" again.
+    SUBTITLE_SPEAKER_LABELS_REQUIRE_NAMES: bool = True
     SUBTITLE_MIN_DURATION_MS: int = 833         # 5/6 second (Netflix minimum)
     SUBTITLE_MAX_DURATION_MS: int = 7000        # Netflix maximum per event (7s).
                                                 # The phrase-merge still combines

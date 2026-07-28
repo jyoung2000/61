@@ -507,7 +507,8 @@ def test_canonical_map_persists_and_is_reused(tmp_path, monkeypatch):
     CN.clear_cache()
     key = CN._content_key("Gundam Wing Episode 1", ["リリーナ", "ゼクス"])
     CN._persist_put(key, {"リリーナ": "Relena", "ゼクス": "Zechs"})
-    assert CN._persist_load().get(key) == {"リリーナ": "Relena", "ゼクス": "Zechs"}
+    assert CN._persist_load().get(key) == {
+        "map": {"リリーナ": "Relena", "ゼクス": "Zechs"}, "provisional": False}
     # Same title + terms in any order → same key (so a re-run reuses it).
     assert CN._content_key("Gundam Wing Episode 1", ["ゼクス", "リリーナ"]) == key
     # Different terms → different key (no cross-title bleed).
@@ -550,16 +551,27 @@ def test_store_is_versioned_so_older_entries_are_retired(tmp_path, monkeypatch):
     assert CN._persist_load() == {}
     # A current-version store round-trips.
     CN._persist_put("sig:a|b", {"ゼクス": "Zechs"})
-    assert CN._persist_load() == {"sig:a|b": {"ゼクス": "Zechs"}}
+    assert CN._persist_load() == {
+        "sig:a|b": {"map": {"ゼクス": "Zechs"}, "provisional": False}}
     assert json.loads(store.read_text(encoding="utf-8"))["v"] == CN._PERSIST_VERSION
 
+    # A v2 store predates the provisional flag and only ever held ANCHORED
+    # resolutions, so it reads forward as authoritative rather than being
+    # thrown away — retiring it would cost the very determinism it bought.
+    store.write_text(json.dumps({"v": 2, "entries": {"sig:v2": {"ゼクス": "Zechs"}}}),
+                     encoding="utf-8")
+    assert CN._persist_load() == {
+        "sig:v2": {"map": {"ゼクス": "Zechs"}, "provisional": False}}
 
-def test_terms_only_resolution_is_not_persisted(tmp_path, monkeypatch):
+
+def test_terms_only_resolution_is_provisional_not_authoritative(tmp_path, monkeypatch):
     """With no informative title and no series hint the map is a guess.
 
-    It still lives in the in-process cache so one run stays self-consistent, but
-    it must not outlive the run — a determinism store that pins a wrong answer is
-    worse than re-asking.
+    A guess must not be PINNED — every later run asks the model again, so a
+    better answer always wins. It must not be thrown away either: v2 discarded
+    it, and consecutive runs of one episode then shipped "Relena"/"Zechs" and
+    "Lilyana"/"Zekus", because the second run's model call came back empty and
+    had nothing to fall back on. Stored provisionally, it is a floor.
     """
     store = tmp_path / "canonical_names.json"
     monkeypatch.setattr(CN, "_persist_path", lambda: str(store))
@@ -578,15 +590,56 @@ def test_terms_only_resolution_is_not_persisted(tmp_path, monkeypatch):
         terms, "videoplayback.mp4", _Orch(), job_id="job-guess"))
     assert got, "a terms-only resolution should still be USED for this run"
     assert len(calls) == 1
-    # …but nothing durable was written.
-    assert CN._persist_load() == {}, CN._persist_load()
+    stored = CN._persist_load()
+    assert stored and all(e["provisional"] for e in stored.values()), stored
 
-    # An INFORMATIVE title is authoritative enough to persist.
+    # A later run with the same content re-asks (the guess does not
+    # short-circuit) and the fresh answer replaces it.
+    CN.clear_cache()
+    asyncio.run(resolve_canonical_names(
+        terms, "videoplayback.mp4", _Orch(), job_id="job-guess-2"))
+    assert len(calls) == 2, "a provisional map must not short-circuit the model"
+
+    # An INFORMATIVE title is authoritative: stored unmarked, and reused
+    # without another call.
     CN.clear_cache()
     got2 = asyncio.run(resolve_canonical_names(
         terms, "MOBILE SUIT GUNDAM WING Episode 1", _Orch(), job_id="job-real"))
-    assert got2
-    assert CN._persist_load(), "an anchored resolution should persist"
+    assert got2 and len(calls) == 3
+    CN.clear_cache()
+    asyncio.run(resolve_canonical_names(
+        terms, "MOBILE SUIT GUNDAM WING Episode 1", _Orch(), job_id="job-real-2"))
+    assert len(calls) == 3, "an anchored map should be reused, not re-asked"
+
+
+def test_stored_guess_covers_a_run_whose_model_returns_nothing(tmp_path, monkeypatch):
+    """The whole point of keeping the guess: never regress to raw romanization.
+
+    A real run's model call came back with no usable mapping and the episode
+    shipped "Zekus"/"Lilyana"/"Hero" where the previous run had shipped the
+    official spellings.
+    """
+    store = tmp_path / "canonical_names.json"
+    monkeypatch.setattr(CN, "_persist_path", lambda: str(store))
+    CN.clear_cache()
+    terms = ["ドーリアン", "エアリーズ", "ゼクス", "リリーナ", "ガンダム"]
+
+    class _Good:
+        async def text_completion(self, prompt, **kw):
+            return json.dumps({"ゼクス": "Zechs", "リリーナ": "Relena"})
+
+    class _Empty:
+        async def text_completion(self, prompt, **kw):
+            return "{}"
+
+    first = asyncio.run(resolve_canonical_names(
+        terms, "videoplayback.mp4", _Good(), job_id="job-1"))
+    assert first == {"ゼクス": "Zechs", "リリーナ": "Relena"}
+
+    CN.clear_cache()
+    second = asyncio.run(resolve_canonical_names(
+        terms, "videoplayback.mp4", _Empty(), job_id="job-2"))
+    assert second == first, "the empty run should fall back, not ship romaji"
 
 
 # ── A canonical name must SOUND like the katakana it replaces ──────────────

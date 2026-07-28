@@ -9,6 +9,7 @@ episode into one 0.8s cue.
 
 import re
 
+from backend.config import settings
 from backend.models import TranscriptSegment, WordTimestamp
 from backend.services.srt_generator import generate_srt, effective_include_speakers
 from backend.services.subtitle_formatter import enforce_readability
@@ -52,16 +53,63 @@ def test_single_speaker_suppresses_labels():
 
 
 def test_multi_speaker_keeps_labels():
+    # Two NAMED speakers: the labels carry information, so they ship.
+    segs = [_seg(1.0, 2.0, "alpha", "Zechs"),
+            _seg(3.0, 4.0, "beta", "Noin")]
+    out = generate_srt(segs, include_speakers=True, enforce_readability_rules=False)
+    assert "[Zechs]" in out and "[Noin]" in out
+
+
+def test_placeholder_speaker_labels_are_suppressed():
+    # Two speakers, but both still carry the diarizer's own placeholder.
+    # "[Speaker 2]" names nobody and costs 12 of a 34-character line, so a
+    # reference-grade track omits it — same as the single-speaker case.
+    segs = [_seg(1.0, 2.0, "alpha", "Speaker 1"),
+            _seg(3.0, 4.0, "beta", "Speaker 2")]
+    out = generate_srt(segs, include_speakers=True, enforce_readability_rules=False)
+    assert "[Speaker 1]" not in out and "[Speaker 2]" not in out
+    assert "alpha" in out and "beta" in out
+
+
+def test_naming_one_speaker_turns_labels_back_on():
+    segs = [_seg(1.0, 2.0, "alpha", "Zechs"),
+            _seg(3.0, 4.0, "beta", "Speaker 2")]
+    out = generate_srt(segs, include_speakers=True, enforce_readability_rules=False)
+    assert "[Zechs]" in out and "[Speaker 2]" in out
+
+
+def test_placeholder_suppression_is_reversible(monkeypatch):
+    from backend.services import srt_generator as sg
+    monkeypatch.setattr(
+        sg.settings, "SUBTITLE_SPEAKER_LABELS_REQUIRE_NAMES", False, raising=False)
     segs = [_seg(1.0, 2.0, "alpha", "Speaker 1"),
             _seg(3.0, 4.0, "beta", "Speaker 2")]
     out = generate_srt(segs, include_speakers=True, enforce_readability_rules=False)
     assert "[Speaker 1]" in out and "[Speaker 2]" in out
 
 
+def test_speaker_label_does_not_break_the_line_budget():
+    # The label is prepended AFTER the readability pass wrapped the cue, so it
+    # has to be re-wrapped or line 1 ships over the on-screen budget.
+    budget = int(settings.SUBTITLE_MAX_CHARS_PER_LINE)
+    # A one-line cue sitting right at the budget: undecorated it is legal, and
+    # "[Zechs] " must not be allowed to push it over.
+    line = "Their vanguard has already landed"
+    assert len(line) <= budget
+    segs = [_seg(1.0, 6.0, line, "Zechs"),
+            _seg(7.0, 9.0, "beta", "Noin")]
+    out = generate_srt(segs, include_speakers=True, enforce_readability_rules=False)
+    body = [ln for ln in out.splitlines()
+            if ln and "-->" not in ln and not ln.isdigit()]
+    assert body and all(len(ln) <= budget for ln in body), body
+
+
 def test_effective_include_speakers_logic():
     assert effective_include_speakers([_seg(0, 1, "a")], True) is False
     assert effective_include_speakers(
-        [_seg(0, 1, "a", "Speaker 1"), _seg(1, 2, "b", "Speaker 2")], True) is True
+        [_seg(0, 1, "a", "Zechs"), _seg(1, 2, "b", "Noin")], True) is True
+    assert effective_include_speakers(
+        [_seg(0, 1, "a", "Speaker 1"), _seg(1, 2, "b", "Speaker 2")], True) is False
     assert effective_include_speakers([_seg(0, 1, "a", "Speaker 1")], False) is False
 
 

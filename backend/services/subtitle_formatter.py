@@ -659,8 +659,18 @@ def _split_segment(
     # already shorter than 2x the minimum piece duration. If we did,
     # both halves would be tiny enough to trigger more splits, and we'd
     # end up with a runaway cascade on fast speech.
-    if duration < 2 * min_piece_duration:
+    #
+    # A cue that cannot FIT THE BOX is exempt. The floor exists to stop a
+    # cascade on fast speech, not to license an overflow: a measured 0.83 s cue
+    # carrying 69 characters was held whole by this guard and shipped two lines
+    # of 36 and 33 against a 34-char budget. Both halves being short is
+    # repairable downstream (Pass 2 extends, Pass 2.5 re-merges when it fits);
+    # text running off the screen is not. Halve the floor rather than drop it,
+    # so the cascade guard still bites once the pieces do fit.
+    if duration < 2 * min_piece_duration and not _over_box:
         return [seg]
+    if duration < 2 * min_piece_duration:
+        min_piece_duration = duration / 2.0
     # PRIORITY 1: word-level silence — Whisper observed an actual pause
     # the speaker took, so we know the cut won't fall mid-clause AND
     # the timestamp is exact (no character-proportional drift).
@@ -733,8 +743,16 @@ def _split_segment(
 
         # No word timing at THIS cut. On the hybrid LLM path we never accept a
         # char-proportional time cut (tier C: a word-less cue stays whole rather
-        # than being scrambled across guessed timestamps), so keep looking.
-        if word_timed_split_only:
+        # than being scrambled across guessed timestamps), so keep looking —
+        # UNLESS the cue cannot fit the on-screen box at all. That veto was
+        # written to stop CPS-driven fragmentation of word-less cues, and it is
+        # right for that; it is wrong here. A cue held whole for want of a real
+        # word time still has to be drawn, and the wrapper then has to overflow
+        # a line — measured at 124 characters across two lines against a 68-char
+        # box. An approximate mid-time is a smaller error than text running off
+        # the screen, so an over-budget cue falls through to the proportional
+        # cut below. Pieces that fit the box are once again subject to the veto.
+        if word_timed_split_only and not _over_box:
             continue
         # Otherwise remember the first usable proportional cut and keep looking
         # for a word-timed one, which is strictly better.
@@ -1420,7 +1438,17 @@ def enforce_readability(
                 joiner = " " if prev.text and seg.text else ""
                 merged_text = (prev.text or "") + joiner + (seg.text or "")
                 merged_end = max(prev.end, seg.end)
-                if merged_end - prev.start <= max_dur_s:
+                # The merged cue must still FIT THE BOX. Without this the
+                # duration repair undid the budget repair: Pass 1 split a
+                # 75-char cue into two halves precisely because it overflowed,
+                # each half came out under the 833 ms floor, and this merge
+                # welded them straight back — Pass 5 then hard-wrapped the
+                # result into a 40-char line. A cue that is too short is a
+                # smaller defect than one that runs off the screen, and Pass 2
+                # can still lengthen it by extending the end.
+                if (merged_end - prev.start <= max_dur_s
+                        and not _text_over_budget(
+                            merged_text, max_chars_per_line, max_lines)):
                     merged[-1] = TranscriptSegment(
                         start=prev.start, end=merged_end, text=merged_text,
                         speaker=prev.speaker,
@@ -1481,7 +1509,12 @@ def enforce_readability(
                     joiner = " " if prev.text and seg.text else ""
                     merged_text = (prev.text or "") + joiner + (seg.text or "")
                     merged_end = max(prev.end, seg.end)
-                    if merged_end - prev.start <= max_dur_s:
+                    # Same rule as Pass 2.5: never buy a gap/duration fix with
+                    # an on-screen overflow. Capping ``prev.end`` below is the
+                    # correct fallback — it costs display time, not legibility.
+                    if (merged_end - prev.start <= max_dur_s
+                            and not _text_over_budget(
+                                merged_text, max_chars_per_line, max_lines)):
                         out3[-1] = TranscriptSegment(
                             start=round(prev.start, 3),
                             end=round(merged_end, 3),

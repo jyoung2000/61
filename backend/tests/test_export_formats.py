@@ -13,9 +13,12 @@ def _seg(start, end, text, speaker="Speaker 1"):
 
 
 def _segments():
+    # Named speakers: the diarizer's "Speaker N" placeholders are suppressed on
+    # export (they name nobody and eat the line budget), so a fixture that wants
+    # to exercise the label toggles has to carry real names.
     return [
-        _seg(1.2, 4.8, "Hello everyone, welcome to the show.", "Speaker 1"),
-        _seg(65.0, 68.3, "Thanks for having me!", "Speaker 2"),
+        _seg(1.2, 4.8, "Hello everyone, welcome to the show.", "Ada"),
+        _seg(65.0, 68.3, "Thanks for having me!", "Grace"),
     ]
 
 
@@ -27,8 +30,8 @@ def test_vtt_header_and_dot_ms_timing():
     # Dot-millisecond timing (HH:MM:SS.mmm).
     assert re.search(r"\d{2}:\d{2}:\d{2}\.\d{3} --> \d{2}:\d{2}:\d{2}\.\d{3}", out)
     # Voice tags when speakers included.
-    assert "<v Speaker 1>" in out
-    assert "<v Speaker 2>" in out
+    assert "<v Ada>" in out
+    assert "<v Grace>" in out
 
 
 def test_vtt_strips_speakers_when_disabled():
@@ -89,9 +92,9 @@ def test_bilingual_original_top():
 def test_srt_speaker_and_timestamp_toggles():
     segs = _segments()
     with_labels = generate_srt(segs, include_speakers=True, enforce_readability_rules=False)
-    assert "[Speaker 1]" in with_labels
+    assert "[Ada]" in with_labels
     no_labels = generate_srt(segs, include_speakers=False, enforce_readability_rules=False)
-    assert "[Speaker 1]" not in no_labels
+    assert "[Ada]" not in no_labels
     inline = generate_srt(
         segs, include_speakers=False,
         include_timestamps_in_text=True, enforce_readability_rules=False)

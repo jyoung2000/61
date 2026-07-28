@@ -100,8 +100,10 @@ def _cache_put(key: str, value: dict[str, str]) -> None:
 _PERSIST_NAME = "canonical_names.json"
 _PERSIST_MAX = 200
 # Bump to retire every stored map. v1 could hold guesses made with no
-# informative title and no series hint; those are no longer persisted.
-_PERSIST_VERSION = 2
+# informative title and no series hint. v2 dropped those entirely; v3 keeps
+# them again but marked ``provisional`` so they act as a fallback rather than
+# an authority. v2 entries are read forward as authoritative.
+_PERSIST_VERSION = 3
 
 
 def _persist_path() -> str:
@@ -120,8 +122,13 @@ def _persist_path() -> str:
     return os.path.join(docker_dir, _PERSIST_NAME)
 
 
-def _persist_load() -> dict[str, dict[str, str]]:
-    """Fail-soft read of the durable map store ({} on any problem)."""
+def _persist_load() -> dict[str, dict]:
+    """Fail-soft read of the durable store ({} on any problem).
+
+    Returns ``{key: {"map": {...}, "provisional": bool}}``. A v2 entry was a
+    bare mapping and was only ever written for an ANCHORED resolution, so it
+    reads back as authoritative.
+    """
     try:
         path = _persist_path()
         if not path or not os.path.isfile(path):
@@ -134,21 +141,42 @@ def _persist_load() -> dict[str, dict[str, str]]:
         # wrong names ("Aires" for Aries, "Dorian" for Darlian) pinned on disk
         # and reused on every run. Bumping the version retires them; without
         # this, the only cure is deleting the file by hand.
-        if not isinstance(data, dict) or int(data.get("v") or 0) != _PERSIST_VERSION:
+        ver = int(data.get("v") or 0) if isinstance(data, dict) else 0
+        if ver not in (2, _PERSIST_VERSION):
             return {}
         entries = data.get("entries")
         if not isinstance(entries, dict):
             return {}
-        return {
-            k: {str(a): str(b) for a, b in v.items()}
-            for k, v in entries.items() if isinstance(v, dict)
-        }
+        out: dict[str, dict] = {}
+        for k, v in entries.items():
+            if not isinstance(v, dict):
+                continue
+            if ver == 2:
+                out[k] = {"map": {str(a): str(b) for a, b in v.items()},
+                          "provisional": False}
+                continue
+            m = v.get("map")
+            if isinstance(m, dict) and m:
+                out[k] = {"map": {str(a): str(b) for a, b in m.items()},
+                          "provisional": bool(v.get("provisional"))}
+        return out
     except Exception:
         return {}
 
 
-def _persist_put(key: str, value: dict[str, str]) -> None:
-    """Store a non-empty resolved map. Never raises."""
+def _persist_put(key: str, value: dict[str, str], provisional: bool = False) -> None:
+    """Store a non-empty resolved map. Never raises.
+
+    ``provisional`` marks a map resolved from the mined terms alone (no
+    informative filename, no operator hint). Those are not authoritative — the
+    model is guessing which work this is — so they never short-circuit a later
+    run's own resolution. They are still worth keeping: without them a run
+    whose model call comes back empty ships raw phonetic romanization
+    ("Zekus", "Lilyana", "Hero") where the previous run shipped the official
+    spellings, and the track's names change every time it is re-processed.
+    Storing them turns that into a floor: this run's answer wins when it has
+    one, and last run's answer covers it when it does not.
+    """
     if not key or not value:
         return
     try:
@@ -156,7 +184,7 @@ def _persist_put(key: str, value: dict[str, str]) -> None:
         if not path:
             return                      # no deployment volume -> no persistence
         entries = _persist_load()
-        entries[key] = value
+        entries[key] = {"map": dict(value), "provisional": bool(provisional)}
         if len(entries) > _PERSIST_MAX:            # drop oldest insertions
             for k in list(entries)[:len(entries) - _PERSIST_MAX]:
                 entries.pop(k, None)
@@ -421,9 +449,12 @@ async def resolve_canonical_names(
         # real run (job_id set). A direct call with no job id — a unit test or an
         # ad-hoc probe — always asks the model, so behaviour can't depend on
         # whatever a previous run happened to leave on disk.
+        anchored = bool(_informative_title(title) or hint)
+        fallback: dict[str, str] = {}
         if job_id:
-            stored = _persist_load().get(key)
-            if stored:
+            entry = _persist_load().get(key) or {}
+            stored = entry.get("map") or {}
+            if stored and not entry.get("provisional"):
                 _cache_put(key, stored)
                 _publish_series_evidence(job_id, stored)
                 logger.info(
@@ -432,6 +463,11 @@ async def resolve_canonical_names(
                     "names stay identical instead of being re-guessed",
                     job_id, len(stored))
                 return dict(stored)
+            # Provisional: keep it as a floor, but still ask this run's model.
+            # A guess must not outrank a fresh answer; it must also not be
+            # thrown away, or a run whose model call comes back empty ships
+            # raw romanization where the last run shipped official spellings.
+            fallback = dict(stored)
 
         timeout = float(getattr(s, "TRANSLATION_CANONICAL_NAMES_TIMEOUT", _DEF_TIMEOUT) or _DEF_TIMEOUT) if s else _DEF_TIMEOUT
         # Model priority: explicit config pin > the caller's translation model
@@ -462,6 +498,21 @@ async def resolve_canonical_names(
 
         data = _parse_json_object(raw or "")
         result = _sanitize_mapping(data, terms) if data else {}
+        if not result:
+            # Say so. A silent empty result is how a whole episode shipped
+            # "Zekus"/"Lilyana"/"Hero" with nothing in the log to show that the
+            # name pass had run at all, let alone why it produced nothing.
+            logger.info(
+                "[%s] canonical names: no usable mapping from %d term(s) "
+                "(model returned %d raw key(s), %d survived vetting)%s",
+                job_id or "-", len(terms), len(data or {}), 0,
+                "" if not fallback else
+                f" — falling back to {len(fallback)} mapping(s) from the "
+                "durable store so the names match the previous run")
+            if fallback:
+                _cache_put(key, fallback)
+                _publish_series_evidence(job_id, fallback)
+                return dict(fallback)
         if result:
             logger.info(
                 "[%s] canonical names resolved for %d/%d term(s): %s",
@@ -482,16 +533,23 @@ async def resolve_canonical_names(
             # (correcting "Dorien" to the wrong "Dorian"). A determinism store
             # that pins a wrong answer is worse than re-asking.
             #
-            # Terms-only resolutions still live in the in-process cache, so a
-            # single run stays internally consistent — they just don't outlive it.
-            if job_id and (_informative_title(title) or hint):
-                _persist_put(key, result)
-            elif job_id:
+            # A terms-only resolution is stored PROVISIONALLY (see
+            # ``_persist_put``): it never short-circuits a later run's own
+            # resolution, so a wrong guess can't outlive the next model call,
+            # but it does cover a run whose call comes back empty. Dropping it
+            # entirely — which is what v2 did — cost real quality: consecutive
+            # runs of the same episode shipped "Relena"/"Zechs"/"Heero" and
+            # then "Lilyana"/"Zekus"/"Hero", because the second had nothing to
+            # fall back on.
+            if job_id:
+                _persist_put(key, result, provisional=not anchored)
+            if job_id and not anchored:
                 logger.info(
-                    "[%s] canonical names NOT persisted — resolved from mined "
-                    "terms with no informative title and no series hint, so the "
-                    "map is a guess. Set TRANSLATION_SERIES_HINT (or give the "
-                    "file a descriptive name) to make it authoritative.",
+                    "[%s] canonical names stored PROVISIONALLY — resolved from "
+                    "mined terms with no informative title and no series hint, "
+                    "so the map is a guess and every later run re-asks. Set "
+                    "TRANSLATION_SERIES_HINT (or give the file a descriptive "
+                    "name) to make it authoritative.",
                     job_id)
         _cache_put(key, result)
         _publish_series_evidence(job_id, result)

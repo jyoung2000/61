@@ -1069,11 +1069,19 @@ async def translate_via_llm(
                 # sidecar released — took 4-7 s. That single collision was
                 # 8m49s of a 17m21s job. Release it first; the reference decode
                 # re-warms it on demand when it actually runs.
+                #
+                # A 409 (decode in flight) is NOT a reason to give up and load
+                # anyway. The next run of the same collision proved the cost
+                # again: the release 409'd, the 14B loaded beside the resident
+                # sidecar, and the first batch of 20 took 447 s where the other
+                # 285 cues took 86 s total once the card was clear. Wait for it.
                 try:
                     from backend.services.reframer_audio import (
                         remote_whisper_release as _rel,
                     )
-                    await asyncio.to_thread(_rel)
+                    _wait = float(getattr(
+                        settings, "WHISPER_SIDECAR_RELEASE_WAIT_S", 240.0) or 0.0)
+                    await asyncio.to_thread(_rel, _wait)
                 except Exception as _sc_e:
                     logger.debug(
                         "LLM translate: whisper sidecar release skipped (%s)", _sc_e)

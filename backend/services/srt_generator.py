@@ -12,6 +12,7 @@ caption-export surface and adds, beyond the single SRT flavour:
     ``include_timestamps_in_text`` on every generator.
 """
 
+import re
 from typing import Optional
 
 from backend.config import settings
@@ -74,11 +75,23 @@ def inline_timestamp(seconds: float) -> str:
     return f"[{minutes:02d}:{secs:02d}]"
 
 
+_PLACEHOLDER_SPEAKER = re.compile(r"^\s*speaker[\s_-]*\d+\s*$", re.IGNORECASE)
+
+
 def effective_include_speakers(segments, include_speakers: bool) -> bool:
     """Speaker labels add no value (and clutter the file) when the whole
     transcript is a single speaker — the common case for narration / a solo
     talking-head. In that case suppress them even if ``include_speakers`` is
-    True, matching how hand-authored SRTs omit "[Speaker 1]" everywhere."""
+    True, matching how hand-authored SRTs omit "[Speaker 1]" everywhere.
+
+    They also add no value when every label is still the diarizer's own
+    placeholder. "[Speaker 2]" names nobody: it tells a viewer only that the
+    voice changed, which the dialogue already tells them, and it costs 12
+    characters off a 34-character line on every single cue. A reference
+    broadcast track carries either a real name or nothing. So labels ship once
+    at least one speaker has been given a name — renaming one speaker turns
+    them on for the whole file. Set
+    ``SUBTITLE_SPEAKER_LABELS_REQUIRE_NAMES=False`` to emit the placeholders."""
     if not include_speakers:
         return False
     distinct = {
@@ -86,7 +99,12 @@ def effective_include_speakers(segments, include_speakers: bool) -> bool:
         for s in (segments or [])
     }
     distinct = {d for d in distinct if d.strip()}
-    return len(distinct) > 1
+    if len(distinct) <= 1:
+        return False
+    if bool(getattr(settings, "SUBTITLE_SPEAKER_LABELS_REQUIRE_NAMES", True)):
+        if all(_PLACEHOLDER_SPEAKER.match(d) for d in distinct):
+            return False
+    return True
 
 
 def _decorate_text(
@@ -95,12 +113,39 @@ def _decorate_text(
     include_speakers: bool,
     include_timestamps_in_text: bool,
 ) -> str:
-    """Apply the speaker-label + inline-timestamp toggles to a line of text."""
+    """Apply the speaker-label + inline-timestamp toggles to a line of text.
+
+    Both prefixes are added AFTER the readability pass has wrapped the cue to
+    the per-line budget, so they push line 1 past it — "[Speaker 1] " alone
+    costs 12 characters, and a 34-char line became 46 on screen. Re-wrap the
+    decorated text so the budget survives decoration."""
+    decorated = text
     if include_timestamps_in_text:
-        text = f"{inline_timestamp(seg.start)} {text}"
+        decorated = f"{inline_timestamp(seg.start)} {decorated}"
     if include_speakers and seg.speaker:
-        text = f"[{seg.speaker}] {text}"
-    return text
+        decorated = f"[{seg.speaker}] {decorated}"
+    if decorated is text:
+        return text
+    return _rewrap(decorated)
+
+
+def _rewrap(text: str) -> str:
+    """Re-flow ``text`` into the configured line box, best-effort."""
+    budget = int(getattr(settings, "SUBTITLE_MAX_CHARS_PER_LINE", 42) or 0)
+    if budget <= 0 or all(len(ln) <= budget for ln in text.splitlines()):
+        return text
+    try:
+        from backend.services.subtitle_formatter import (
+            _balanced_two_line, _hard_wrap_lines, _smart_split)
+    except Exception:
+        return text
+    flat = " ".join(text.split())
+    max_lines = max(1, int(getattr(settings, "SUBTITLE_MAX_LINES", 2) or 2))
+    out = _smart_split(flat, budget, max_lines)
+    if any(len(ln) > budget for ln in out.splitlines()):
+        out = (_balanced_two_line(flat, budget) if max_lines == 2 else None) \
+            or _hard_wrap_lines(out, budget, max_lines)
+    return out
 
 
 def generate_srt(

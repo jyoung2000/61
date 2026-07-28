@@ -492,3 +492,70 @@ def test_remote_whisper_falls_back_to_env_url(monkeypatch):
         assert RA._remote_whisper_token() == "envkey"
     finally:
         R.reset_state()
+
+
+# ── Sidecar release must WAIT for a decode in flight ──────────────────────
+# A 409 means the sidecar is mid-decode, not that releasing is impossible.
+# Giving up on the first 409 and loading a 14B model beside the resident
+# sidecar cost a measured run 447 s for its FIRST batch of 20 cues; the other
+# 285 cues took 86 s in total once the card was clear.
+
+def _release_probe(monkeypatch, codes, wait_s):
+    """Drive remote_whisper_release against a scripted sequence of statuses."""
+    calls = {"n": 0, "slept": 0.0}
+
+    class _Resp:
+        def __init__(self, code):
+            self.status_code = code
+
+    class _FakeHttpx:
+        @staticmethod
+        def post(url, headers=None, timeout=None):
+            i = min(calls["n"], len(codes) - 1)
+            calls["n"] += 1
+            return _Resp(codes[i])
+
+    monkeypatch.setattr(settings, "WHISPER_REMOTE_URL", "http://c:11500", raising=False)
+    monkeypatch.setattr(settings, "WHISPER_REMOTE_API_KEY", "k", raising=False)
+    monkeypatch.setattr(RA, "remote_whisper_configured", lambda: True)
+    monkeypatch.setattr(RA, "_remote_whisper_base", lambda: "http://c:11500")
+    monkeypatch.setattr(RA, "_remote_whisper_token", lambda: "k")
+    monkeypatch.setitem(sys.modules, "httpx", _FakeHttpx)
+
+    import time as _t
+    real_sleep, real_mono = _t.sleep, _t.monotonic
+    clock = {"t": 0.0}
+    monkeypatch.setattr(_t, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(_t, "sleep", lambda s: (clock.__setitem__("t", clock["t"] + s),
+                                                calls.__setitem__("slept", calls["slept"] + s)))
+    try:
+        return RA.remote_whisper_release(wait_s), calls
+    finally:
+        _t.sleep, _t.monotonic = real_sleep, real_mono
+
+
+def test_release_retries_while_the_sidecar_is_mid_decode(monkeypatch):
+    ok, calls = _release_probe(monkeypatch, [409, 409, 409, 200], wait_s=60.0)
+    assert ok is True
+    assert calls["n"] == 4, "should have re-polled until the sidecar freed up"
+    assert calls["slept"] > 0
+
+
+def test_release_gives_up_at_the_deadline_rather_than_hanging(monkeypatch):
+    ok, calls = _release_probe(monkeypatch, [409], wait_s=6.0)
+    assert ok is False
+    # 2 s between polls, so a 6 s budget is a handful of attempts, not a hang.
+    assert 2 <= calls["n"] <= 6, calls["n"]
+
+
+def test_release_does_not_wait_when_the_route_is_missing(monkeypatch):
+    # 404 = an older Companion with no release route. Retrying cannot help.
+    ok, calls = _release_probe(monkeypatch, [404], wait_s=600.0)
+    assert ok is False
+    assert calls["n"] == 1 and calls["slept"] == 0.0
+
+
+def test_release_default_is_a_single_attempt(monkeypatch):
+    ok, calls = _release_probe(monkeypatch, [409], wait_s=0.0)
+    assert ok is False
+    assert calls["n"] == 1, "no wait budget → one attempt, same as before"

@@ -768,7 +768,7 @@ def remote_whisper_warm() -> None:
                      daemon=True).start()
 
 
-def remote_whisper_release() -> bool:
+def remote_whisper_release(wait_s: float = 0.0) -> bool:
     """Ask the Companion to shut its whisper sidecar down NOW (free VRAM).
 
     Called right after a job's transcription stage completes: the next
@@ -779,24 +779,58 @@ def remote_whisper_release() -> bool:
     any later whisper request (native-translate timing pass, a new job)
     cold-restarts the sidecar automatically.
 
+    ``wait_s`` re-polls while the sidecar answers 409 (a decode in flight).
+    Returning False on the first 409 and letting the caller load anyway is the
+    expensive branch: in a measured run the release 409'd, the 14B model
+    cold-loaded next to a resident sidecar, and the FIRST batch of 20 cues took
+    447 s — the remaining 285 cues took 86 s once the sidecar was gone. Waiting
+    for the card is nearly always cheaper than sharing it, so a caller about to
+    load a large model should pass a real budget.
+
     Best-effort in every direction: unknown route on an older Companion
-    (404), a decode in flight (409), or any transport error just returns
-    False and nothing changes — the idle reaper remains the backstop.
+    (404), a still-busy sidecar, or any transport error just returns False and
+    nothing changes — the idle reaper remains the backstop.
     """
     if not remote_whisper_configured():
         return False
+    import time as _time
+    deadline = _time.monotonic() + max(0.0, float(wait_s or 0.0))
+    busy_since = None
     try:
         import httpx
         headers = {}
         token = _remote_whisper_token()
         if token:
             headers["Authorization"] = f"Bearer {token}"
-        r = httpx.post(f"{_remote_whisper_base()}/v1/sidecar/release",
-                       headers=headers, timeout=5.0)
-        if r.status_code == 200:
-            logger.info("Companion whisper sidecar released (VRAM freed for the LLM phase)")
-            return True
-        return False
+        url = f"{_remote_whisper_base()}/v1/sidecar/release"
+        while True:
+            r = httpx.post(url, headers=headers, timeout=5.0)
+            if r.status_code == 200:
+                if busy_since is not None:
+                    logger.info(
+                        "Companion whisper sidecar released after waiting "
+                        "%.0fs for its decode to finish (VRAM freed for the "
+                        "LLM phase)", _time.monotonic() - busy_since)
+                else:
+                    logger.info(
+                        "Companion whisper sidecar released "
+                        "(VRAM freed for the LLM phase)")
+                return True
+            if r.status_code != 409 or _time.monotonic() >= deadline:
+                if r.status_code == 409:
+                    logger.info(
+                        "Companion whisper sidecar still busy after %.0fs — "
+                        "proceeding with it resident. The LLM may spill layers "
+                        "to CPU; raise WHISPER_SIDECAR_RELEASE_WAIT_S to wait "
+                        "longer.", max(0.0, float(wait_s or 0.0)))
+                return False
+            if busy_since is None:
+                busy_since = _time.monotonic()
+                logger.info(
+                    "Companion whisper sidecar is mid-decode — waiting up to "
+                    "%.0fs for it to free the card before loading the LLM",
+                    float(wait_s))
+            _time.sleep(2.0)
     except Exception:
         return False
 
