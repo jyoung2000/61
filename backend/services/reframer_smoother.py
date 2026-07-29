@@ -348,31 +348,40 @@ class Smoother:
                 cadenced.append(kf)
                 i += 1
                 continue
-            # Measure the alternation run starting here: eased moves whose
-            # direction flips every step, each leg shorter than the hold.
+            # Measure the rally window starting here: consecutive eased moves
+            # each landing sooner than the hold. Membership on a side is
+            # decided by CLUSTERING afterwards, not by per-step direction —
+            # the strict flip-every-step test detected NOTHING on a measured
+            # two-speaker episode (827 keyframes, 0 collapses) because a real
+            # speaker-follow rally contains small same-side corrections
+            # (A→B→B′→A) that broke the run at step two every time.
             run = [i]
-            prev_x = cadenced[-1]['x']
-            direction = 0
-            j = i
+            j = i + 1
             while j < len(consolidated):
                 nkf = consolidated[j]
                 if nkf.get('transition') == 'cut' or nkf.get('_centering'):
                     break
-                base = consolidated[j - 1] if j > i else cadenced[-1]
-                dt = (nkf['time_ms'] - base['time_ms']) / 1000.0
-                d = 1 if nkf['x'] > base['x'] else -1 if nkf['x'] < base['x'] else 0
-                if j > i and (d == 0 or d == direction or dt >= _pp_hold_s):
+                dt = (nkf['time_ms'] - consolidated[j - 1]['time_ms']) / 1000.0
+                if dt >= _pp_hold_s:
                     break
-                direction = d
-                if j > i:
-                    run.append(j)
+                run.append(j)
                 j += 1
             if len(run) >= 4:
                 xs = [consolidated[k]['x'] for k in run]
-                side_a, side_b = xs[0::2], xs[1::2]
-                spread_ok = (max(side_a) - min(side_a) <= plan.crop_w * 0.15
+                # Two sides = the clusters left/right of the window's midline.
+                _mid_x = (max(xs) + min(xs)) / 2.0
+                _sides = [0 if x <= _mid_x else 1 for x in xs]
+                side_a = [x for x, s in zip(xs, _sides) if s == 0]
+                side_b = [x for x, s in zip(xs, _sides) if s == 1]
+                # A rally must actually ALTERNATE between the clusters — a
+                # slow monotonic drift also lands inside the window but only
+                # crosses the midline once, and must not be collapsed.
+                _swings = sum(1 for a, b in zip(_sides, _sides[1:]) if a != b)
+                spread_ok = (bool(side_a) and bool(side_b) and _swings >= 3
+                             and max(side_a) - min(side_a) <= plan.crop_w * 0.15
                              and max(side_b) - min(side_b) <= plan.crop_w * 0.15)
-                sep = abs(sum(side_a) / len(side_a) - sum(side_b) / len(side_b))
+                sep = (abs(sum(side_a) / len(side_a) - sum(side_b) / len(side_b))
+                       if side_a and side_b else 0.0)
                 if spread_ok and sep <= plan.crop_w * _pp_twoshot:
                     # Close enough to frame both: ONE move to the midpoint,
                     # then hold for the whole rally.

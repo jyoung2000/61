@@ -330,3 +330,32 @@ def test_anticipation_leads_the_detection():
     out = Smoother(max_vel_px_per_sec=5000).smooth(_plan(list(kfs))).keyframes
     lead = int(getattr(settings, "REFRAMER_ANTICIPATE_MS", 180))
     assert out[-1]["time_ms"] == 5000 - lead, out
+
+
+def test_rally_with_same_side_corrections_still_collapses():
+    # A real speaker-follow rally contains small same-side corrections
+    # (A→B→B′→A): the strict flip-every-step detector saw 0 rallies on a
+    # measured two-speaker episode because of them. Clustered alternation
+    # must still collapse this into a two-shot hold.
+    kfs = [_kf(0, 200, "cut")]
+    seq = [380, 372, 200, 384, 208, 200, 380, 204]  # B B' A B A A B A
+    t = 1600
+    for x in seq:
+        kfs.append(_kf(t, x))
+        t += 1600
+    out = Smoother(max_vel_px_per_sec=5000).smooth(_plan(list(kfs))).keyframes
+    span = [k for k in out if 0 < k["time_ms"] <= t]
+    assert len(span) <= 2, span
+    assert any(abs(k["x"] - 290) <= 60 for k in span), span
+
+
+def test_slow_monotonic_drift_is_not_a_rally():
+    # Consecutive small same-direction steps land inside the rally window but
+    # only cross the midline once — the cadence pass must not collapse a
+    # deliberate multi-step pan into a hold.
+    kfs = [_kf(0, 100, "cut"), _kf(1600, 180), _kf(3200, 260),
+           _kf(4800, 340), _kf(6400, 420)]
+    out = Smoother(max_vel_px_per_sec=5000).smooth(_plan(list(kfs))).keyframes
+    xs = [k["x"] for k in out]
+    assert xs[-1] == 420, out
+    assert len([k for k in out if 0 < k["time_ms"]]) >= 2, out
