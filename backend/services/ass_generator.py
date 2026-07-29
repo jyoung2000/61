@@ -445,6 +445,20 @@ def generate_ass(
         from backend.config import settings as _app_settings
     except Exception:
         _app_settings = None
+    # Strip labels baked INTO cue text unconditionally (parity with the
+    # SRT/VTT exports): this generator prepends its own "Name: " prefix when
+    # labels are requested, so baked text would double it — and with
+    # readability enforcement off nothing else would remove it.
+    try:
+        from backend.services.subtitle_formatter import strip_baked_speaker_label
+        for _seg in (segments or []):
+            _t = getattr(_seg, "text", "") or ""
+            _s = strip_baked_speaker_label(_t, getattr(_seg, "speaker", None))
+            if _s != _t:
+                _seg.text = _s
+    except Exception:
+        pass
+
     _enforce = enforce_readability_rules
     if _enforce is None:
         _enforce = bool(getattr(_app_settings, "SUBTITLE_CPS_ENFORCEMENT", False))

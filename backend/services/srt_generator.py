@@ -12,11 +12,14 @@ caption-export surface and adds, beyond the single SRT flavour:
     ``include_timestamps_in_text`` on every generator.
 """
 
+import logging
 import re
 from typing import Optional
 
 from backend.config import settings
 from backend.models import TranscriptSegment
+
+logger = logging.getLogger(__name__)
 
 
 def _apply_min_gap(segments: list, fps: Optional[float] = None) -> list:
@@ -176,6 +179,33 @@ def generate_srt(
         enforce_readability_rules = bool(
             getattr(settings, "SUBTITLE_CPS_ENFORCEMENT", True)
         )
+    # Labels baked INTO cue text are stripped UNCONDITIONALLY — even with
+    # readability enforcement off — because attribution lives in the cue's
+    # ``speaker`` field and labels are rendered only by ``_decorate_text``.
+    # A measured download shipped "Speaker 1:" verbatim on every cue
+    # (including music markers) from text that arrived pre-labelled.
+    _n_debaked = 0
+    try:
+        from backend.services.subtitle_formatter import strip_baked_speaker_label
+        for seg in (segments or []):
+            _t = seg.text or ""
+            _s = strip_baked_speaker_label(_t, getattr(seg, "speaker", None))
+            if _s != _t:
+                seg.text = _s
+                _n_debaked += 1
+    except Exception:
+        pass
+    # One line of provenance per export, so "why does my file look raw" is a
+    # single grep: which formatting profile actually applied to THIS download.
+    logger.info(
+        "SRT export: %d cue(s), readability=%s, budget=%d×%d, cps=%.0f, "
+        "speaker_labels=%s%s",
+        len(segments or []), "on" if enforce_readability_rules else "OFF",
+        int(getattr(settings, "SUBTITLE_MAX_LINES", 2) or 2),
+        int(getattr(settings, "SUBTITLE_MAX_CHARS_PER_LINE", 42)),
+        float(getattr(settings, "SUBTITLE_MAX_CPS", 20.0)),
+        "requested" if include_speakers else "off",
+        f", {_n_debaked} baked label(s) stripped" if _n_debaked else "")
     if enforce_readability_rules and segments:
         # Lazy import — keeps SRT generation working when the formatter
         # module fails to import for any reason.
@@ -300,11 +330,31 @@ def generate_bilingual_srt(
         enforce_readability_rules = bool(
             getattr(settings, "SUBTITLE_CPS_ENFORCEMENT", True))
 
+    # Same unconditional de-baking as generate_srt: labels live in the
+    # ``speaker`` field, never in the text.
+    try:
+        from backend.services.subtitle_formatter import strip_baked_speaker_label
+        for seg in (segments or []):
+            _t = seg.text or ""
+            _s = strip_baked_speaker_label(_t, getattr(seg, "speaker", None))
+            if _s != _t:
+                seg.text = _s
+    except Exception:
+        pass
+
     # Optionally normalise the translated line via the readability pass,
     # but only adopt the result if it keeps the cue count (1:1 alignment).
     translated_texts = [
         _translated_text_for(translated_segments, i) for i in range(len(segments))
     ]
+    try:
+        translated_texts = [
+            strip_baked_speaker_label(
+                t, getattr(segments[i], "speaker", None)) if t else t
+            for i, t in enumerate(translated_texts)
+        ]
+    except Exception:
+        pass
     if enforce_readability_rules and translated_segments:
         try:
             from backend.services.subtitle_formatter import enforce_readability

@@ -95,6 +95,18 @@ def generate_vtt(
         enforce_readability_rules = bool(
             getattr(settings, "SUBTITLE_CPS_ENFORCEMENT", True)
         )
+    # Strip labels baked INTO cue text unconditionally (parity with
+    # generate_srt): attribution lives in the ``speaker`` field and the voice
+    # tag below is the only label renderer for VTT.
+    try:
+        from backend.services.subtitle_formatter import strip_baked_speaker_label
+        for seg in (segments or []):
+            _t = seg.text or ""
+            _s = strip_baked_speaker_label(_t, getattr(seg, "speaker", None))
+            if _s != _t:
+                seg.text = _s
+    except Exception:
+        pass
     if enforce_readability_rules and segments:
         segments = enforce_readability(
             segments,

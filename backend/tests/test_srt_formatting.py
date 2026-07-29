@@ -134,3 +134,38 @@ def test_srt_from_oversized_block_has_many_cues():
     out = generate_srt([_seg(50.0, 50.8, text)])
     cue_count = len([l for l in out.split("\n\n") if l.strip()])
     assert cue_count > 3
+
+
+def test_baked_speaker_prefix_is_stripped_even_with_enforcement_off():
+    # A measured download shipped "Speaker 1:" verbatim on every cue —
+    # including the music markers — from text that arrived pre-labelled.
+    # Attribution lives in the ``speaker`` field; text labels are stripped
+    # UNCONDITIONALLY, even when the readability formatter is bypassed.
+    segs = [
+        _seg(1.0, 3.0, "Speaker 1: [♪ Opening theme ♪]", speaker="Speaker 1"),
+        _seg(4.0, 6.0, "Speaker 2: Believe in myself", speaker="Speaker 2"),
+        _seg(7.0, 9.0, "[Speaker 1] Hello there", speaker="Speaker 1"),
+        _seg(10.0, 12.0, "Relena: Who are you?", speaker="Relena"),
+    ]
+    out = generate_srt(segs, include_speakers=False, enforce_readability_rules=False)
+    assert "Speaker 1:" not in out
+    assert "Speaker 2:" not in out
+    assert "[Speaker 1]" not in out
+    assert "Relena:" not in out
+    assert "[♪ Opening theme ♪]" in out
+    assert "Believe in myself" in out
+    assert "Who are you?" in out
+
+
+def test_baked_prefix_never_eats_real_dialogue():
+    from backend.services.subtitle_formatter import strip_baked_speaker_label
+    # A different speaker's name mid-transcript is CONTENT, not a label.
+    assert strip_baked_speaker_label("Zechs: report in.", "Speaker 1") == \
+        "Zechs: report in."
+    # Colon-free text is untouched.
+    assert strip_baked_speaker_label("Speaker of the house", "Speaker 1") == \
+        "Speaker of the house"
+    # Own-name label is presentation → stripped.
+    assert strip_baked_speaker_label("Zechs: report in.", "Zechs") == "report in."
+    # Generic placeholder is stripped regardless of the speaker field.
+    assert strip_baked_speaker_label("Speaker 7: hello", None) == "hello"

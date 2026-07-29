@@ -292,17 +292,38 @@ def find_coverage_gaps(
     return picked
 
 
-def _clip_to_gap(seg: dict, gap: tuple[float, float], pad_s: float) -> Optional[dict]:
-    """Keep a recovered cue only where it lands INSIDE the (unpadded) gap —
-    the padded lead-in/out overlaps existing cues and would double them."""
+def _clip_to_gap(seg: dict, gap: tuple[float, float], pad_s: float,
+                 existing: Optional[list] = None) -> Optional[dict]:
+    """Keep a recovered cue where it lands inside the gap.
+
+    The pad's PURPOSE is to avoid double-captioning audio an existing cue
+    already covers (the padded lead-in/out overlaps those cues) — so a decode
+    that only touches the pad is tested against the existing cues DIRECTLY
+    instead of being discarded by geometry. Blanket-culling by geometry threw
+    away real recovered dialogue: a measured run decoded speech in all 15
+    spans ("了解", "ゼクス…") and culled 37/37 segments as "outside-gap",
+    which is precisely the dialogue the pass exists to recover."""
     b = _seg_bounds(seg)
     if b is None:
         return None
     lo, hi = gap[0] + pad_s, gap[1] - pad_s
-    if b[1] <= lo or b[0] >= hi:
-        return None
+    if b[1] > lo and b[0] < hi:
+        # Overlaps the gap interior — the unambiguous keep.
+        out = dict(seg)
+        out["start"], out["end"] = max(b[0], lo), min(b[1], hi)
+        return out if out["end"] - out["start"] >= 0.3 else None
+    if b[1] <= gap[0] or b[0] >= gap[1]:
+        return None                     # outside even the padded window
+    # Pad-only decode: keep it unless an existing cue already covers that
+    # audio (≥ 0.2 s overlap) — then it is a boundary re-hearing, not a find.
+    for e in (existing or []):
+        eb = _seg_bounds(e)
+        if eb is None:
+            continue
+        if min(eb[1], b[1]) - max(eb[0], b[0]) > 0.2:
+            return None
     out = dict(seg)
-    out["start"], out["end"] = max(b[0], lo), min(b[1], hi)
+    out["start"], out["end"] = max(b[0], gap[0]), min(b[1], gap[1])
     return out if out["end"] - out["start"] >= 0.3 else None
 
 
@@ -594,7 +615,7 @@ async def recover_gap_dialogue(
         # decoded 44 segments across 15 spans and culled every one of them
         # behind a single opaque counter — undiagnosable from the log.
         n_failed = n_empty = n_heard = 0
-        n_cull_clip = n_cull_junk = n_cull_nospeech = 0
+        n_cull_clip = n_cull_junk = n_cull_nospeech = n_cull_notimes = 0
         _cull_samples: list[str] = []
         # The FIRST stem pays the sidecar's cold-start (measured 11 s of model
         # load, during which every request errors); later stems hit it warm.
@@ -628,17 +649,32 @@ async def recover_gap_dialogue(
                 _span_rows.append(f"{_span_lbl}=empty")
                 continue
             n_heard += 1
-            _sp_kept = _sp_clip = _sp_junk = _sp_nospeech = 0
+            _sp_kept = _sp_clip = _sp_junk = _sp_nospeech = _sp_notimes = 0
             for s in segs:
                 _raw_txt = _seg_text(s)
                 s["start"] = float(s.get("start", 0.0)) + gap[0]
                 s["end"] = float(s.get("end", 0.0)) + gap[0]
-                s = _clip_to_gap(s, gap, pad)
+                _b0 = _seg_bounds(s)
+                if _b0 is None:
+                    # Decoded text with no usable timestamps — a DIFFERENT
+                    # failure from landing outside the span, and previously
+                    # indistinguishable from it in the log.
+                    n_cull_notimes += 1
+                    _sp_notimes += 1
+                    if len(_cull_samples) < 4:
+                        _cull_samples.append(f"no-times:{_raw_txt[:40]!r}")
+                    continue
+                s = _clip_to_gap(s, gap, pad, existing=_speech)
                 if s is None:
                     n_cull_clip += 1
                     _sp_clip += 1
                     if len(_cull_samples) < 4:
-                        _cull_samples.append(f"clip:{_raw_txt[:40]!r}")
+                        # Carry the decoded bounds: whether the cull was a
+                        # boundary re-hearing or a mis-clocked decode is
+                        # readable straight off the numbers.
+                        _cull_samples.append(
+                            f"clip[{_b0[0]:.1f}-{_b0[1]:.1f} vs span "
+                            f"{gap[0]:.1f}-{gap[1]:.1f}]:{_raw_txt[:40]!r}")
                     continue
                 txt = _seg_text(s)
                 if not txt or _JUNK_RE.match(txt):
@@ -664,14 +700,16 @@ async def recover_gap_dialogue(
                 _sp_bits.append(f"{_sp_junk} junk")
             if _sp_nospeech:
                 _sp_bits.append(f"{_sp_nospeech} no-speech")
+            if _sp_notimes:
+                _sp_bits.append(f"{_sp_notimes} no-times")
             _span_rows.append(f"{_span_lbl}=" + "/".join(_sp_bits))
         if _span_rows:
             logger.info("[%s] %s: per-span outcomes: %s",
                         job_id, tag, "; ".join(_span_rows))
-        n_culled = n_cull_clip + n_cull_junk + n_cull_nospeech
+        n_culled = n_cull_clip + n_cull_junk + n_cull_nospeech + n_cull_notimes
         _cull_detail = (
             f"{n_culled} culled ({n_cull_clip} outside-gap, {n_cull_junk} junk, "
-            f"{n_cull_nospeech} no-speech"
+            f"{n_cull_nospeech} no-speech, {n_cull_notimes} no-times"
             + (f"; e.g. {'; '.join(_cull_samples)}" if _cull_samples else "") + ")")
         if recovered:
             logger.info(

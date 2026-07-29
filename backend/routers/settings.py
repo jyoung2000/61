@@ -336,6 +336,35 @@ def _restore_user_settings():
                     "adopting the current default %s", _k, data[_k], getattr(settings, _k, None))
                 data.pop(_k)
 
+        # One-shot self-heal for the readability/export stack. These booleans
+        # are the difference between a professionally formatted subtitle file
+        # and a raw dump (unwrapped 90-char lines, uncapped durations, leaked
+        # placeholder labels) — a snapshot that pinned any of them OFF re-ships
+        # raw output on every download, forever, and the value alone can't
+        # distinguish a stale snapshot from a deliberate choice. So this runs
+        # ONCE per install (marked in the file, and "_"-prefixed markers are
+        # preserved across saves): the pinned False is dropped in favour of the
+        # shipped default, and turning the toggle off afterwards sticks.
+        _STACK_MARKER = "_READABILITY_STACK_HEALED_V1"
+        _STACK_KEYS = ("SUBTITLE_CPS_ENFORCEMENT", "SUBTITLE_SMART_LINE_BREAKS",
+                       "SUBTITLE_SPEAKER_LABELS_REQUIRE_NAMES")
+        if not data.get(_STACK_MARKER):
+            _healed = [k for k in _STACK_KEYS if data.get(k) is False]
+            for _k in _healed:
+                logger.warning(
+                    "Healing %s: a persisted False disabled the subtitle "
+                    "readability/export stack (raw unwrapped downloads) — "
+                    "restoring the default. Turning it off again in Settings "
+                    "will now stick.", _k)
+                data.pop(_k)
+            data[_STACK_MARKER] = True
+            try:
+                with open(USER_SETTINGS_PATH, "w") as _fh:
+                    json.dump(data, _fh, indent=2)
+            except Exception as _heal_err:
+                logger.warning("Could not persist readability-stack heal "
+                               "marker: %s", _heal_err)
+
         for key, val in data.items():
             if key not in _PERSISTABLE_KEYS:
                 continue

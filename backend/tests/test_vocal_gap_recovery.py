@@ -87,8 +87,11 @@ def test_clip_to_gap_strips_the_padded_leadin():
     gap = (95.0, 132.0)  # padded by 2s on each side → real hole 97..130
     inside = _clip_to_gap({"start": 100.0, "end": 104.0, "text": "x"}, gap, 2.0)
     assert inside == {"start": 100.0, "end": 104.0, "text": "x"}
-    # A cue entirely inside the lead-in pad re-hears an EXISTING cue — drop.
-    assert _clip_to_gap({"start": 95.2, "end": 96.8, "text": "x"}, gap, 2.0) is None
+    # A cue entirely inside the lead-in pad that re-hears an EXISTING cue —
+    # drop. (Pad decodes with NO covering cue are kept now: the pad guards
+    # against double-captioning, not against recovery itself.)
+    assert _clip_to_gap({"start": 95.2, "end": 96.8, "text": "x"}, gap, 2.0,
+                        existing=[{"start": 94.0, "end": 96.5, "text": "y"}]) is None
     # Straddling the pad boundary: clipped to the real hole.
     edge = _clip_to_gap({"start": 96.0, "end": 101.0, "text": "x"}, gap, 2.0)
     assert edge["start"] == 97.0 and edge["end"] == 101.0
@@ -397,3 +400,42 @@ def test_relisten_tier_needs_no_demucs(monkeypatch, tmp_path):
         "j", str(audio), segs, "ja", str(tmp_path / "w"), separate=True)) == []
     assert asyncio.run(V.recover_gap_dialogue(
         "j", str(audio), segs, "ja", str(tmp_path / "w2"), separate=False)) == []
+
+
+def test_clip_to_gap_keeps_pad_edge_decode_when_no_existing_cue_covers_it():
+    # The pad exists to avoid double-captioning audio an existing cue already
+    # covers. A decode landing in the pad where the transcript has NOTHING is
+    # exactly the dialogue the pass exists to recover — a measured run culled
+    # 37/37 decoded segments (real lines like 了解) by pure geometry.
+    from backend.services.vocal_gap_recovery import _clip_to_gap
+    gap, pad = (100.0, 113.0), 2.0
+    seg = {"start": 100.3, "end": 101.6, "text": "了解"}
+    kept = _clip_to_gap(seg, gap, pad, existing=[])
+    assert kept is not None
+    assert kept["start"] >= gap[0] and kept["end"] <= gap[1]
+
+
+def test_clip_to_gap_drops_pad_edge_decode_that_rehears_an_existing_cue():
+    from backend.services.vocal_gap_recovery import _clip_to_gap
+    gap, pad = (100.0, 113.0), 2.0
+    seg = {"start": 100.3, "end": 101.6, "text": "了解"}
+    existing = [{"start": 99.0, "end": 101.2, "text": "了解です"}]
+    assert _clip_to_gap(seg, gap, pad, existing=existing) is None
+
+
+def test_clip_to_gap_interior_decode_still_clips_to_interior():
+    from backend.services.vocal_gap_recovery import _clip_to_gap
+    gap, pad = (100.0, 113.0), 2.0
+    seg = {"start": 101.0, "end": 106.0, "text": "本当の話"}
+    kept = _clip_to_gap(seg, gap, pad, existing=[])
+    assert kept is not None
+    assert abs(kept["start"] - 102.0) < 1e-6  # clipped to interior lo
+
+
+def test_clip_to_gap_still_rejects_fully_outside_decodes():
+    from backend.services.vocal_gap_recovery import _clip_to_gap
+    gap, pad = (100.0, 113.0), 2.0
+    assert _clip_to_gap({"start": 90.0, "end": 95.0, "text": "x"},
+                        gap, pad, existing=[]) is None
+    assert _clip_to_gap({"start": 120.0, "end": 125.0, "text": "x"},
+                        gap, pad, existing=[]) is None

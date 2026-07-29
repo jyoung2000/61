@@ -869,6 +869,39 @@ def _is_bracket_marker(text: str) -> bool:
     return t.startswith("[") and t.endswith("]")
 
 
+# A speaker label BAKED INTO the cue text ("Speaker 1: ..." / "[Speaker 1] ...").
+# The cue's ``speaker`` field is the one source of truth for attribution and the
+# export decorators are the one place labels are rendered — text that arrives
+# already carrying a label (an import, an old persisted track, an external edit)
+# would otherwise ship it verbatim past the placeholder suppression and eat
+# 10-12 characters of every line budget. A measured download shipped
+# "Speaker 1:" on every cue, including the music markers.
+_BAKED_LABEL_RE = re.compile(
+    r"^\s*(?:\[speaker\s+\d+\]\s*[:：]?\s*|speaker\s+\d+\s*[:：]\s*)",
+    re.IGNORECASE)
+
+
+def strip_baked_speaker_label(text: str, speaker: Optional[str] = None) -> str:
+    """Remove a leading speaker label embedded in ``text`` itself.
+
+    Strips a generic placeholder label ("Speaker 3: ", "[Speaker 3] ") always,
+    and a label matching the cue's OWN ``speaker`` value ("Relena: ") when one
+    is given — presentation is the export decorator's job, and it re-adds the
+    label when the caller asked for labels. Content is never touched beyond the
+    one leading prefix."""
+    t = text or ""
+    m = _BAKED_LABEL_RE.match(t)
+    if m:
+        return t[m.end():]
+    spk = (speaker or "").strip()
+    if spk:
+        lead = t.lstrip()
+        if lead.lower().startswith(spk.lower()) and \
+                lead[len(spk):len(spk) + 1] in (":", "："):
+            return lead[len(spk) + 1:].lstrip()
+    return t
+
+
 def _ends_sentence(text: str, treat_ellipsis_as_end: bool = True) -> bool:
     """True when ``text`` reads as a finished sentence (ends in terminal
     punctuation, ignoring trailing quotes/brackets). Used to decide whether a
@@ -1172,6 +1205,13 @@ def enforce_readability(
     for _fseg in _sorted_in:
         if "\n" in (_fseg.text or ""):
             _fseg.text = _flatten_cue_text(_fseg.text)
+        # A label baked into the text is presentation, not content — strip it
+        # here so wrapping/CPS measure the real line and the export decorator
+        # stays the only label renderer.
+        _debaked = strip_baked_speaker_label(
+            _fseg.text, getattr(_fseg, "speaker", None))
+        if _debaked != (_fseg.text or ""):
+            _fseg.text = _debaked
     repaired: list[TranscriptSegment] = []
     for i, seg in enumerate(_sorted_in):
         _txt = seg.text.strip()
