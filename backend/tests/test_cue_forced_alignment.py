@@ -147,5 +147,17 @@ def test_end_extension_never_reaches_the_next_cue(monkeypatch, tmp_path):
     cues = [_cue(10.0, 11.0, "hello world"),
             _cue(11.05, 12.0, "tight next")]
     stats = _run_aligned(cues, [(0.4, 0.9), (1.0, 1.8)], monkeypatch, tmp_path)
-    # Only ~0 room before the next cue: no meaningful extension.
-    assert cues[0].end <= 11.05 - 0.084 + 0.02 or cues[0].end == 11.0
+    # Only ~0 room before the next cue: no meaningful extension. The room
+    # bound parks ONE frame (0.043 s) short of the successor.
+    assert cues[0].end <= 11.05 - 0.043 + 0.001 or cues[0].end == 11.0
+
+
+def test_end_extension_parks_one_frame_before_next_cue(monkeypatch, tmp_path):
+    # Voiced extent runs well past the cue end AND past the next cue: the
+    # extension must stop one frame (0.043 s) before the successor — the old
+    # two-frame bound (0.084) doubled the track's median inter-cue gap.
+    cues = [_cue(10.0, 11.0, "hello world"),
+            _cue(11.2, 12.4, "next cue here")]
+    stats = _run_aligned(cues, [(0.4, 0.9), (1.0, 1.8)], monkeypatch, tmp_path)
+    assert stats["ends_extended"] >= 1
+    assert abs(cues[0].end - (11.2 - 0.043)) <= 0.002

@@ -688,7 +688,12 @@ def _split_segment(
     if duration < 2 * min_piece_duration and not _over_box:
         return [seg]
     if duration < 2 * min_piece_duration:
-        min_piece_duration = duration / 2.0
+        # Halve the FLOOR (not "set it to half the duration": duration/2 left a
+        # zero-width legal window — only a perfectly centred cut could pass, so
+        # an over-box cue never split and shipped with lines off the screen).
+        # The duration*0.25 bound guarantees a half-duration-wide window exists
+        # however short the cue is.
+        min_piece_duration = min(min_piece_duration / 2.0, duration * 0.25)
     # PRIORITY 1: word-level silence — Whisper observed an actual pause
     # the speaker took, so we know the cut won't fall mid-clause AND
     # the timestamp is exact (no character-proportional drift).
@@ -747,6 +752,20 @@ def _split_segment(
             midpoint = max(seg.start + 0.05, min(seg.end - 0.05, midpoint))
             if (midpoint - seg.start) < min_piece_duration or (
                     seg.end - midpoint) < min_piece_duration:
+                # An over-box cue whose word times are CLUSTERED (forced
+                # alignment packs the real speech into a fraction of the padded
+                # window) puts EVERY candidate's midpoint inside the duration
+                # floor — and because each candidate HAS a word time, the
+                # word-less proportional path below is never reached, so the cue
+                # shipped whole with lines far past the budget. Text off the
+                # screen outranks timing purity: remember a proportional cut so
+                # the cue still splits when no word-timed candidate survives.
+                if _over_box and _proportional_fallback is None:
+                    left_dur = duration * (len(left_text) / len(text))
+                    if (left_dur >= min_piece_duration
+                            and (duration - left_dur) >= min_piece_duration):
+                        _proportional_fallback = (
+                            seg.start + left_dur, left_text, right_text)
                 continue
             return [
                 TranscriptSegment(
@@ -930,7 +949,23 @@ def _merge_for_readability(
         # silence into a run-on.
         if hard_max_gap_s is not None and hard_max_gap_s > 0:
             eff_gap = min(eff_gap, hard_max_gap_s)
-        if (txt and prev_txt and same_speaker
+        # A mid-sentence fragment that CONTINUES across a "speaker change" is
+        # almost never a real change — a sentence doesn't switch mouths mid-
+        # thought; the diarizer's label on a sub-second sliver is noise. The
+        # measured case: one sentence shipped as three 0.6-1.0 s flashes
+        # ("I was too busy with" / "work and didn’t" / "have time for you.")
+        # solely because ECAPA labelled the fragments differently, which
+        # blocked both this merge and the Pass 2.5 absorb. Bridge the label
+        # when the previous cue is unfinished, the gap is tiny, and the
+        # continuation starts LOWERCASE (a genuine interruption — "But I—"
+        # "Enough!" — starts a new sentence with a capital and stays split).
+        # An em-dash/hyphen tail marks an interruption, never a continuation.
+        frag_xspk = (bool(txt) and bool(prev_txt) and not same_speaker
+                     and 0.0 <= gap <= 0.3
+                     and not _ends_sentence(prev_txt, treat_ellipsis_as_end=False)
+                     and not prev_txt.endswith(("—", "–", "-"))
+                     and txt[:1].islower())
+        if (txt and prev_txt and (same_speaker or frag_xspk)
                 and not _is_bracket_marker(prev_txt) and not _is_bracket_marker(txt)
                 and 0.0 <= gap <= eff_gap):
             joiner = "" if (_is_cjk(prev_txt) and _is_cjk(txt)) else " "
@@ -947,9 +982,24 @@ def _merge_for_readability(
             # Only merge when the RESULT is still fully readable: fits a 2-line
             # cue, stays within the max display duration, and reads at/under the
             # CPS cap (``_cps`` weights CJK glyphs). Otherwise leave them split.
+            #
+            # COMPLETING an unfinished sentence earns a small CPS overdraft: a
+            # sentence chopped into 0.6-1.0 s flashes is a worse read at ANY
+            # speed than one full cue a shade over the cap (the measured chain
+            # died at 20.9 vs a 20 cap and shipped as three fragments). Pass 0.7
+            # then extends the merged cue back toward the reading target
+            # wherever idle time exists, so the overdraft is usually temporary.
+            _cand_cap = max_cps
+            if not _ends_sentence(prev_txt, treat_ellipsis_as_end=False):
+                try:
+                    from backend.config import settings as _fct
+                    _cand_cap = max_cps * max(1.0, float(getattr(
+                        _fct, "SUBTITLE_FRAGMENT_MERGE_CPS_TOLERANCE", 1.15)))
+                except Exception:
+                    _cand_cap = max_cps * 1.15
             if (cand_dur <= max_dur_s
                     and len(cand.replace("\n", " ")) <= char_budget
-                    and _cps(cand, cand_dur) <= max_cps):
+                    and _cps(cand, cand_dur) <= _cand_cap):
                 out[-1] = TranscriptSegment(
                     start=prev.start, end=cand_end, text=cand,
                     speaker=prev.speaker,
@@ -1183,18 +1233,31 @@ def enforce_readability(
     except Exception:
         _extend_before_split = True
     if _extend_before_split:
+        # Extend toward a LOWER target than the merge/split cap. The cap (20)
+        # is the ceiling that lets the phrase merge build full lines; the
+        # reference track actually READS at ~17 (its over-17 cue count is a
+        # third of ours was). Extending every cue that has idle room down to
+        # the reading target — not merely under the ceiling — is free display
+        # time: it is bounded by the next cue and the linger cap, so it only
+        # consumes genuine silence.
+        try:
+            _ext_target = float(getattr(
+                _es, "SUBTITLE_EXTEND_TARGET_CPS", 17.0) or 0.0)
+        except Exception:
+            _ext_target = 17.0
+        _ext_target = min(max_cps, _ext_target) if _ext_target > 0 else max_cps
         _ext: list[TranscriptSegment] = []
         _n = len(segments)
         _n_extended = 0
         for _i, seg in enumerate(segments):
             _t = (seg.text or "").strip()
             _d = max(0.001, seg.end - seg.start)
-            if _t and not _is_bracket_marker(_t) and _cps(_t, _d) > max_cps:
+            if _t and not _is_bracket_marker(_t) and _cps(_t, _d) > _ext_target:
                 # ``_cps(text, 1.0)`` is the cue's effective (CJK-weighted) length;
-                # dividing by the cap gives the duration that hits it exactly. The
-                # 8% headroom lands the cue just UNDER the cap so the splitter
-                # below doesn't re-fire on a floating-point-equal CPS.
-                _target_dur = (_cps(_t, 1.0) / max_cps) * 1.08 if max_cps > 0 else _d
+                # dividing by the target gives the duration that hits it exactly.
+                # The 8% headroom lands the cue just UNDER the target so the
+                # splitter below doesn't re-fire on a floating-point-equal CPS.
+                _target_dur = (_cps(_t, 1.0) / _ext_target) * 1.08 if _ext_target > 0 else _d
                 _next_start = (segments[_i + 1].start
                                if _i + 1 < _n else seg.end + _target_dur)
                 _new_end = max(seg.end, min(seg.start + min(_target_dur, max_dur_s),
@@ -1245,19 +1308,38 @@ def enforce_readability(
             return _text_over_budget(
                 seg.text or "", max_chars_per_line, max_lines)
 
+        # A COMPLETE sentence that fits the box earns the same small CPS
+        # overdraft the fragment-completing merge gets — otherwise Pass 0.5's
+        # merge of a chopped sentence (allowed up to cap × tolerance) is undone
+        # right here and the fragments ship after all. Splitting a complete
+        # sentence mid-clause to shave ~2 CPS is the worse read; the reference
+        # track ships plenty of complete sentences in this band.
+        try:
+            from backend.config import settings as _fts
+            _frag_tol = max(1.0, float(getattr(
+                _fts, "SUBTITLE_FRAGMENT_MERGE_CPS_TOLERANCE", 1.15)))
+        except Exception:
+            _frag_tol = 1.15
+
+        def _split_cap(p) -> float:
+            t = (p.text or "").strip()
+            if _ends_sentence(t) and not _over_budget(p):
+                return keep_cps * _frag_tol
+            return keep_cps
+
         changed = allow_split
         while changed and any(
-            _cps(p.text.strip(), max(0.001, p.end - p.start)) > keep_cps
+            _cps(p.text.strip(), max(0.001, p.end - p.start)) > _split_cap(p)
             or _over_budget(p)
             for p in pieces
         ):
             new_pieces: list[TranscriptSegment] = []
             changed = False
             for p in pieces:
-                if (_cps(p.text.strip(), max(0.001, p.end - p.start)) > keep_cps
+                if (_cps(p.text.strip(), max(0.001, p.end - p.start)) > _split_cap(p)
                         or _over_budget(p)):
                     halves = _split_segment(
-                        p, keep_cps, min_split_chars=min_split_chars,
+                        p, _split_cap(p), min_split_chars=min_split_chars,
                         word_timed_split_only=word_timed_split_only,
                         max_cue_chars=_char_budget,
                         max_chars_per_line=max_chars_per_line,
@@ -1454,6 +1536,12 @@ def enforce_readability(
     # be capped back below min_dur by gap enforcement to fit their
     # neighbour. Merging removes the conflict entirely.
     merged: list[TranscriptSegment] = []
+    try:
+        from backend.config import settings as _sub_s
+        _subliminal_s = float(getattr(
+            _sub_s, "SUBTITLE_SUBLIMINAL_ABSORB_S", 0.55) or 0.0)
+    except Exception:
+        _subliminal_s = 0.55
     for seg in out2:
         if merged:
             prev = merged[-1]
@@ -1472,8 +1560,9 @@ def enforce_readability(
             # is noise anyway (a measured track shipped a 0.209 s cue that
             # could not extend — the next cue started 42 ms later — and could
             # not merge only because ECAPA had put the two fragments of one
-            # exchange under different speakers).
-            subliminal = (min(prev_dur, seg_dur) < 0.45 and gap < 0.2
+            # exchange under different speakers). 0.55 rather than 0.45: a
+            # measured 0.459 s flash sat just past the old bound and shipped.
+            subliminal = (min(prev_dur, seg_dur) < _subliminal_s and gap < 0.2
                           and not _is_bracket_marker((prev.text or "").strip())
                           and not _is_bracket_marker((seg.text or "").strip()))
             if close_enough and too_short and (same_speaker or subliminal):

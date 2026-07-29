@@ -1562,6 +1562,24 @@ class Settings(BaseSettings):
     # for now comes from the size-based phrase merge + SUBTITLE_MIN_SPLIT_CHARS,
     # not from tolerating unreadable cues.
     SUBTITLE_SPLIT_CPS_TOLERANCE: float = 1.0
+    # COMPLETING an unfinished sentence may overdraw the CPS cap by this factor
+    # (20 × 1.15 ≈ 23): a sentence chopped into 0.6-1.0 s flashes is a worse
+    # read at any speed than one full cue a shade over cap. The same overdraft
+    # protects a complete, box-fitting sentence from being re-split by the CPS
+    # pass — the reference track ships complete sentences in this band rather
+    # than cutting them mid-clause. 1.0 restores the strict cap everywhere.
+    SUBTITLE_FRAGMENT_MERGE_CPS_TOLERANCE: float = 1.15
+    # Pass 0.7 extends an over-fast cue into idle time toward THIS reading
+    # speed, not merely under the 20-cps ceiling. The ceiling is what lets the
+    # phrase merge build full lines; the reference track actually reads at ~17
+    # (our over-17 cue count was 108 vs its 67). Extension is bounded by the
+    # next cue and the linger cap, so it only ever consumes genuine silence.
+    SUBTITLE_EXTEND_TARGET_CPS: float = 17.0
+    # A cue shorter than this many seconds is subliminal — unreadable at any
+    # line length — so Pass 2.5 absorbs it into its neighbour even across a
+    # (noise) speaker-label change. 0.55 rather than 0.45: a measured 0.459 s
+    # flash sat just past the old bound and shipped.
+    SUBTITLE_SUBLIMINAL_ABSORB_S: float = 0.55
     # Netflix's Latin spec allows 42, but the reference YouTube track this
     # pipeline is measured against does not go near it: its line-length
     # distribution stops DEAD at 34 characters (0 of 503 lines longer; 151 in

@@ -23,6 +23,7 @@ Gated by ``SUBTITLE_FORCED_ALIGN`` (default ON).
 from __future__ import annotations
 
 import logging
+import os
 import re
 from typing import Optional
 
@@ -192,11 +193,26 @@ def align_translated_cues(audio_path: str, cues: list) -> dict:
     max_cue_shift = float(getattr(settings, "SUBTITLE_ALIGN_MAX_CUE_SHIFT_S", 0.75))
     min_dur_s = float(getattr(settings, "SUBTITLE_MIN_DURATION_MS", 833)) / 1000.0
     device = _pick_device()
+    # Time the backend acquisition separately from the per-cue work: the first
+    # call after an image rebuild DOWNLOADS the ~360 MB wav2vec2 checkpoint
+    # with no log output at all — a measured run sat 5 minutes inside "Cue
+    # alignment" on a step that takes ~25 s warm, and nothing in the log said
+    # why. (TORCH_HOME now points into the persisted model volume so this
+    # should happen at most once per host; the log proves it either way.)
+    import time as _time
+    _t0 = _time.monotonic()
     try:
         backend = _get_backend("en", device)
     except Exception as e:
         logger.info("Cue alignment skipped: %s", e)
         return stats
+    _load_s = _time.monotonic() - _t0
+    if _load_s > 15.0:
+        logger.warning(
+            "Cue alignment: backend took %.0f s to become ready — the wav2vec2 "
+            "checkpoint was (re)downloaded. Persist TORCH_HOME "
+            "(%s) across container rebuilds to avoid this stall.",
+            _load_s, os.environ.get("TORCH_HOME", "~/.cache/torch"))
     if backend is None or backend == "ctc_fa":
         return stats
 
@@ -276,7 +292,11 @@ def align_translated_cues(audio_path: str, cues: list) -> dict:
         _last_we = s0 + float(spans[-1][1])
         if _last_we > c_e + 0.04:
             _nxt = _next_start.get(_i_cue)
-            _room = (_nxt - 0.084) if _nxt is not None else _last_we + 0.15
+            # Stop ONE frame short of the successor, not two: the 0.084 bound
+            # doubled the track's median inter-cue gap (0.042 → 0.083) because
+            # every extended end parked 2 frames early. 0.043 ≈ one 23.976-fps
+            # frame + ε, the reference track's own cadence.
+            _room = (_nxt - 0.043) if _nxt is not None else _last_we + 0.15
             e_eff = max(c_e, min(_last_we + 0.10, c_e + pad, _room))
         rows = []
         prev_end = None
@@ -326,6 +346,7 @@ def align_translated_cues(audio_path: str, cues: list) -> dict:
     if stats["words_aligned"]:
         stats["mean_shift_ms"] = round(
             total_shift / stats["words_aligned"] * 1000, 1)
+    stats["elapsed_s"] = round(_time.monotonic() - _t0, 1)
     return stats
 
 

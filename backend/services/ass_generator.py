@@ -1303,6 +1303,14 @@ def generate_ass(
                     _cum_before = _cum
                     _cum += word_dur
                     shifted_start = max(clip_start, clip_start + _cum_before - _net_offset)
+                    if word_idx == 0:
+                        # Light the FIRST word from the moment the cue appears
+                        # (preview parity: getCurrentWordIndex returns 0 while
+                        # the cue is visible pre-roll — CapCut-style karaoke
+                        # never sits dark and then jumps in mid-line). A
+                        # negative net offset otherwise left a 20-60 ms dark
+                        # window at the cue's start.
+                        shifted_start = clip_start
                     word_end = clip_start + _cum - _net_offset
                     if word_idx == len(words) - 1:
                         word_end = min(word_end + 0.3, clip_end)

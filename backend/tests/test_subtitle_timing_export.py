@@ -651,3 +651,83 @@ def test_subliminal_sliver_is_absorbed_even_across_speakers():
         [(o.start, o.end, o.text) for o in out]
     joined = " ".join(o.text.replace("\n", " ") for o in out)
     assert "Zechs spotted something odd." in joined
+
+
+def test_clustered_word_times_cannot_hold_an_over_box_cue_whole():
+    # Forced alignment packs the real speech into a fraction of the padded
+    # window, so EVERY split candidate's word-timed midpoint fails the
+    # duration floor. A measured 92-char cue shipped two 45/47-char lines
+    # that way. Over-box outranks timing purity: the cue must still split.
+    text = ("I received a report that Treize's subordinate lost three "
+            "Mobile Suits upon atmospheric entry,")
+    toks = text.split()
+    s, e = 863.928, 867.389
+    lo = e - 1.2  # all word times clustered into the final 1.2 s
+    words = [WordTimestamp(start=round(lo + 1.2 * i / len(toks), 3),
+                           end=round(lo + 1.2 * (i + 1) / len(toks), 3),
+                           word=t) for i, t in enumerate(toks)]
+    seg = _cue(s, e, text)
+    seg.words = words
+    nxt = _cue(867.431, 868.432, "but what does it mean?")
+    out = enforce_readability([seg, nxt], max_cps=20.0, max_chars_per_line=34,
+                              min_duration_ms=833, max_duration_ms=7000,
+                              word_timed_split_only=True)
+    for o in out:
+        for line in o.text.splitlines():
+            assert len(line) <= 34, (line, [x.text for x in out])
+
+
+def test_mid_sentence_fragment_chain_merges_across_speaker_labels():
+    # One sentence chopped into three sub-second flashes only because the
+    # diarizer labelled each fragment differently. A sentence cannot switch
+    # mouths mid-thought: a lowercase continuation with a tiny gap merges.
+    frags = [
+        _cue(292.494, 293.536, "I was too busy with", speaker="Speaker 1"),
+        _cue(293.578, 294.412, "work and didn’t", speaker="Speaker 2"),
+        _cue(294.495, 295.121, "have time for you.", speaker="Speaker 3"),
+    ]
+    out = enforce_readability(frags, max_cps=20.0, max_chars_per_line=34,
+                              min_duration_ms=833, max_duration_ms=7000,
+                              word_timed_split_only=True)
+    joined = " ".join(o.text.replace("\n", " ") for o in out)
+    assert "I was too busy with work and didn’t have time for you." in joined
+    assert len(out) == 1, [(o.start, o.end, o.text) for o in out]
+
+
+def test_interruption_does_not_merge_across_speakers():
+    # A genuine interruption starts a new sentence with a capital — the
+    # cross-speaker fragment bridge must not weld it.
+    a = _cue(10.0, 10.9, "But I was going to", speaker="Speaker 1")
+    b = _cue(11.0, 12.4, "Enough! Get out.", speaker="Speaker 2")
+    out = enforce_readability([a, b], max_cps=20.0, max_chars_per_line=34,
+                              min_duration_ms=833, max_duration_ms=7000,
+                              word_timed_split_only=True)
+    assert len(out) == 2
+    assert out[0].text.startswith("But I")
+
+
+def test_just_over_half_second_sliver_is_absorbed():
+    # 0.459 s sat just past the old 0.45 subliminal bound and shipped as an
+    # unreadable flash; the bound is 0.55 now.
+    a = _cue(10.0, 10.459, "Wait, what was that?", speaker="Speaker 2")
+    b = _cue(10.5, 12.4, "It looked like a shooting star.", speaker="Speaker 1")
+    out = enforce_readability([a, b], max_cps=20.0, max_chars_per_line=34,
+                              min_duration_ms=833, max_duration_ms=7000,
+                              word_timed_split_only=True)
+    assert all((o.end - o.start) >= 0.55 for o in out), \
+        [(o.start, o.end, o.text) for o in out]
+    joined = " ".join(o.text.replace("\n", " ") for o in out)
+    assert "Wait, what was that?" in joined
+
+
+def test_complete_sentence_in_overdraft_band_is_not_resplit():
+    # A complete, box-fitting sentence at ~21 CPS (cap 20, overdraft 1.15 →
+    # allowed to 23) reads better whole than split mid-clause.
+    text = "I was too busy with work and didn’t have time for you."
+    seg = _cue(100.0, 100.0 + len(text) / 21.0, text)
+    nxt = _cue(seg.end + 0.05, seg.end + 3.0, "Understood.")
+    out = enforce_readability([seg, nxt], max_cps=20.0, max_chars_per_line=34,
+                              min_duration_ms=833, max_duration_ms=7000,
+                              word_timed_split_only=True)
+    joined_first = out[0].text.replace("\n", " ")
+    assert joined_first == text, [o.text for o in out]

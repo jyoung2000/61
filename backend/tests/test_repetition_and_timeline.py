@@ -258,11 +258,18 @@ def test_merge_respects_max_duration_and_cps_and_markers():
     a = _merge_for_readability([_ts(0.0, 3.0, "Aaa"), _ts(3.1, 6.5, "Bbb")],
                                20.0, 42, 2, 4.5, 1.2)
     assert len(a) == 2
-    # Merge would read at 22 CPS (>20) → not merged.
-    b = _merge_for_readability([_ts(0.0, 0.5, "abcdefghijk"),
-                                _ts(0.5, 1.0, "lmnopqrstuv")],
+    # Merge would read at ~27 CPS — past even the fragment-completion
+    # overdraft (20 × 1.15 = 23) → not merged.
+    b = _merge_for_readability([_ts(0.0, 0.42, "abcdefghijk"),
+                                _ts(0.42, 0.84, "lmnopqrstuv")],
                                20.0, 42, 2, 4.5, 1.2)
     assert len(b) == 2
+    # COMPLETING an unfinished fragment may overdraw the cap slightly
+    # (22 CPS ≤ 23): a chopped sentence reads worse than a shade-fast cue.
+    b2 = _merge_for_readability([_ts(0.0, 0.5, "abcdefghijk"),
+                                 _ts(0.5, 1.0, "lmnopqrstuv")],
+                                20.0, 42, 2, 4.5, 1.2)
+    assert len(b2) == 1
     # A [♪ music ♪] marker never merges into dialogue.
     c = _merge_for_readability([_ts(0.0, 1.0, "[♪ music ♪]"),
                                 _ts(1.1, 2.0, "Hello")],
