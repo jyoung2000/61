@@ -139,6 +139,10 @@ ENV NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
 # with protobuf>=4 (required by torch/pyannote). The C++ implementation
 # rejects 3.x-format graph definitions under protobuf 4.x.
 ENV PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
+# Torch-hub checkpoints (forced-alignment wav2vec2, ~360 MB) live inside the
+# huggingface cache volume so they survive image rebuilds — otherwise the model
+# re-downloads mid-pipeline on the first job after every rebuild.
+ENV TORCH_HOME=/root/.cache/huggingface/torch
 
 # Install system dependencies (ca-certificates ensures HTTPS model downloads work)
 RUN apt-get update && apt-get install -y --no-install-recommends \

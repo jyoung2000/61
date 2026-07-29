@@ -600,20 +600,35 @@ async def recover_gap_dialogue(
         # load, during which every request errors); later stems hit it warm.
         _patience = float(getattr(
             settings, "VOCAL_GAP_ASR_WARMUP_PATIENCE_S", 90.0))
+        # Per-SPAN ledger: which span produced what, and where each decoded
+        # segment went. The aggregate counters below say "44 culled" but not
+        # WHICH hole stayed open or why — the two persistently-missing spans
+        # (a measured 6:58-7:08 and 11:41-11:58) were undiagnosable without
+        # a per-span verdict line.
+        _span_rows: list[str] = []
+
+        def _mmss(t: float) -> str:
+            return f"{int(t // 60)}:{t % 60:04.1f}"
+
         for (gap, dur), off in zip(planned, offsets):
+            _span_lbl = f"{_mmss(gap[0])}-{_mmss(gap[1])}"
             stem = os.path.join(work_dir, f"stem_{int(gap[0])}.wav")
             if not await asyncio.to_thread(_slice_wav, vocals, stem, off, off + dur):
+                _span_rows.append(f"{_span_lbl}=slice-failed")
                 continue
             segs = await asyncio.to_thread(
                 _transcribe_stem, stem, source_lang, _patience)
             _patience = 20.0    # warm now; keep a small cushion per stem
             if segs is None:
                 n_failed += 1
+                _span_rows.append(f"{_span_lbl}=ASR-FAILED")
                 continue
             if not segs:
                 n_empty += 1
+                _span_rows.append(f"{_span_lbl}=empty")
                 continue
             n_heard += 1
+            _sp_kept = _sp_clip = _sp_junk = _sp_nospeech = 0
             for s in segs:
                 _raw_txt = _seg_text(s)
                 s["start"] = float(s.get("start", 0.0)) + gap[0]
@@ -621,23 +636,38 @@ async def recover_gap_dialogue(
                 s = _clip_to_gap(s, gap, pad)
                 if s is None:
                     n_cull_clip += 1
+                    _sp_clip += 1
                     if len(_cull_samples) < 4:
                         _cull_samples.append(f"clip:{_raw_txt[:40]!r}")
                     continue
                 txt = _seg_text(s)
                 if not txt or _JUNK_RE.match(txt):
                     n_cull_junk += 1
+                    _sp_junk += 1
                     if len(_cull_samples) < 4:
                         _cull_samples.append(f"junk:{txt[:40]!r}")
                     continue
                 if float(s.get("no_speech_prob", 0.0) or 0.0) > 0.85:
                     n_cull_nospeech += 1
+                    _sp_nospeech += 1
                     if len(_cull_samples) < 4:
                         _cull_samples.append(f"nospeech:{txt[:40]!r}")
                     continue
                 s["speaker"] = _default_speaker(segments, s["start"])
                 s["text"] = txt
                 recovered.append(s)
+                _sp_kept += 1
+            _sp_bits = [f"{len(segs)} dec", f"{_sp_kept} kept"]
+            if _sp_clip:
+                _sp_bits.append(f"{_sp_clip} outside-gap")
+            if _sp_junk:
+                _sp_bits.append(f"{_sp_junk} junk")
+            if _sp_nospeech:
+                _sp_bits.append(f"{_sp_nospeech} no-speech")
+            _span_rows.append(f"{_span_lbl}=" + "/".join(_sp_bits))
+        if _span_rows:
+            logger.info("[%s] %s: per-span outcomes: %s",
+                        job_id, tag, "; ".join(_span_rows))
         n_culled = n_cull_clip + n_cull_junk + n_cull_nospeech
         _cull_detail = (
             f"{n_culled} culled ({n_cull_clip} outside-gap, {n_cull_junk} junk, "

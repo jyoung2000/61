@@ -312,6 +312,30 @@ def _sanitize_mapping(raw: dict, terms: list[str]) -> dict[str, str]:
                 "sound like the katakana (romaji %r)",
                 src, val, _kana_to_romaji(src))
             continue
+        # The phonetic gate above only means anything for KATAKANA sources; a
+        # term already in Latin script sails through it, and the model is then
+        # free to "canonicalize" a garbled name into plain English vocabulary —
+        # a real run mapped "Justlove" → "Justice", turning a mishearing into an
+        # ordinary word that reads as dialogue, not a name. A Latin-script
+        # source may only be RESPELLED (a near-variant); a value made entirely
+        # of ordinary English words that isn't one is a guess, not a spelling.
+        if _normalize(_kana_to_romaji(src)) == _normalize(src):
+            _vwords = [w.strip(".,!?'\"’“”").lower() for w in val.split()]
+            _vwords = [w for w in _vwords if w]
+            # Stricter than ``_similar`` (0.5): "Justlove"/"Justice" share
+            # enough letters to score 0.67, but a genuine RESPELLING keeps
+            # nearly the whole word ("Uing"→"Wing" 0.75, "Dorian"→"Dorlian"
+            # 0.92). Ordinary-word values must clear the respelling bar.
+            _respelling = difflib.SequenceMatcher(
+                None, _normalize(src), _normalize(val)).ratio() >= 0.75
+            if (_vwords and all(w in _ROSTER_SAFE_WORDS
+                                or w in _ROSTER_COMMON_WORDS for w in _vwords)
+                    and not _respelling):
+                logger.info(
+                    "canonical names: dropped %r → %r — ordinary English "
+                    "word(s) offered as the canonical form of a Latin-script "
+                    "term (a respelling must resemble the source)", src, val)
+                continue
         out[src] = val
 
     # Duplicate-canonical guard: two sources may share a canonical value only

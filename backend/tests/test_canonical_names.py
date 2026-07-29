@@ -788,3 +788,26 @@ def test_second_chance_names_reach_the_roster_corroboration_set(tmp_path, monkey
         pairs, {"Hero Yu"}, corpus=corpus,
         known_names=set(evidence.values()))
     assert vetted.get("Hero Yu") == "Heero Yuy"
+
+
+def test_latin_term_cannot_canonicalize_into_an_ordinary_word():
+    """The phonetic gate only bites on katakana sources; a Latin-script term
+    could be "canonicalized" into plain English vocabulary — a real run mapped
+    "Justlove" → "Justice", turning a mishearing into an ordinary word that
+    reads as dialogue. A Latin source may only be RESPELLED (a near-variant)."""
+    from backend.services.canonical_names import _sanitize_mapping
+    out = _sanitize_mapping(
+        {"Justlove": "Justice", "Uing": "Wing", "Relena Dorian": "Relena Darlian"},
+        ["Justlove", "Uing", "Relena Dorian"])
+    assert "Justlove" not in out, out
+    # A genuine respelling into a (list-)ordinary word survives: it keeps
+    # nearly the whole spelling.
+    assert out.get("Uing") == "Wing"
+    # Ordinary-word guard leaves real name-to-name respellings alone.
+    assert out.get("Relena Dorian") == "Relena Darlian"
+
+
+def test_katakana_terms_keep_their_phonetic_respellings():
+    from backend.services.canonical_names import _sanitize_mapping
+    out = _sanitize_mapping({"ヒイロ": "Heero"}, ["ヒイロ"])
+    assert out.get("ヒイロ") == "Heero"

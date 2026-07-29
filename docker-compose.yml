@@ -35,6 +35,13 @@ services:
       - whisper_models:/root/.cache/huggingface
     environment:
       - PYTHONUNBUFFERED=1
+      # Persist torch-hub checkpoints (the forced-alignment wav2vec2 model,
+      # ~360 MB) inside the whisper_models volume. Without this the model
+      # re-downloads MID-PIPELINE on the first job after every image rebuild —
+      # a measured run spent 5 minutes inside "Cue alignment" on a step that
+      # takes ~25 s warm, and the stall is invisible (no log line while the
+      # download runs).
+      - TORCH_HOME=/root/.cache/huggingface/torch
       # GPU selection — set CLIPAI_GPU_ID in .env to a GPU index (0, 1, ...)
       # or a UUID from `nvidia-smi -L` to pin ClipAI to one card (e.g. a
       # GTX 1650). This is what stops a multi-GPU host from also spinning
