@@ -905,33 +905,57 @@ def collapse_song_choruses(segments, target_lang: str = "en"):
                     and w0 - 0.01 <= _st(r) <= w1 + 0.01]
             if len(idxs) < 4:
                 continue
-            # Sung HOOKS: a TitleCase phrase recurring across ≥2 cues of this
-            # window is the song's refrain title ("Just Love"), not a person.
-            # Strip hooks before counting proper nouns, or every verse carrying
-            # the hook scores pn≥2 and reads as a "preview" — which is exactly
-            # how a measured ending theme shipped its verses as dialogue.
-            _hook_seen: dict = {}
+            # Sung HOOKS: a TitleCase phrase recurring across this window's
+            # LYRIC-SHAPED cues is the song's refrain title ("Just Love"), not
+            # a person — but the raw counter scored it 2 proper nouns, which
+            # flagged every verse carrying it as a "preview" and shipped the
+            # ending theme's verses as dialogue. Qualification is strict so a
+            # character named in ordinary dialogue can never become a hook:
+            # the phrase must recur in ≥2 cues that are UNPUNCTUATED and hold
+            # no OTHER capitalized content (interjection stoplist applied),
+            # and must never appear in a punctuated (dialogue-shaped) cue of
+            # the window.
+            def _neutral_caps(txt: str) -> str:
+                """Lowercase stoplisted interjection tokens IN PLACE — deleting
+                them shifted sentence-position tracking (a name right after a
+                cue-initial "Oh" became sentence-initial and stopped counting)
+                and dropped terminal periods riding on the deleted token."""
+                out = []
+                for t in (txt or "").split():
+                    core = t.strip(".,!?;:\"'()[]…—–“”’")
+                    out.append(t.lower() if core.lower() in _LYRIC_CAP_STOP
+                               else t)
+                return " ".join(out)
+
+            _hook_qual: dict = {}
+            _hook_dialog: set = set()
             for _i in idxs:
-                for _m in set(_HOOK_RE.findall(rows[_i].get("text") or "")):
-                    _hook_seen[_m] = _hook_seen.get(_m, 0) + 1
-            hooks = {h for h, c in _hook_seen.items() if c >= 2 and len(h) > 2}
+                _t = (rows[_i].get("text") or "").strip()
+                for _m in set(_HOOK_RE.findall(_t)):
+                    if len(_m) <= 2:
+                        continue
+                    if _ends_terminal(_t):
+                        _hook_dialog.add(_m)
+                        continue
+                    _rest = re.sub(r"\b" + re.escape(_m) + r"\b", " ", _t)
+                    if _proper_noun_count(_neutral_caps(_rest)) == 0:
+                        _hook_qual[_m] = _hook_qual.get(_m, 0) + 1
+            hooks = {h for h, c in _hook_qual.items()
+                     if c >= 2 and h not in _hook_dialog}
 
             def _strip_hooks(txt: str) -> str:
                 for h in hooks:
-                    txt = txt.replace(h, " ")
+                    txt = re.sub(r"\b" + re.escape(h) + r"\b", h.lower(), txt)
                 return txt
 
             def _pn(txt: str) -> int:
                 """Proper nouns that count as DIALOGUE evidence: hooks are the
                 song's refrain, and stoplisted interjections are ASR garble —
                 fragment-gluing capitalizes them mid-cue ("cool the heat Uh",
-                "Protecting your gaze Right"), and each one broke the verse
-                run at the strict counter."""
-                s = _strip_hooks(txt)
-                toks = [t for t in s.split()
-                        if t.strip(".,!?;:\"'()[]…—–“”’").lower()
-                        not in _LYRIC_CAP_STOP]
-                return _proper_noun_count(" ".join(toks))
+                "Protecting your gaze Right"). Both are NEUTRALIZED (lower-
+                cased in place), never deleted, so token positions and the
+                terminal punctuation they carry stay intact for the counter."""
+                return _proper_noun_count(_neutral_caps(_strip_hooks(txt)))
 
             def _is_preview(txt):
                 return bool(_PREVIEW_RE.search(txt)) or _pn(txt) >= 2
@@ -962,7 +986,7 @@ def collapse_song_choruses(segments, target_lang: str = "en"):
                 punct = sum(
                     1 for i in trun
                     if _ends_terminal((rows[i].get("text") or "").strip()))
-                return (strict >= max(3, len(trun) // 2)
+                return (strict >= max(3, len(trun) // 2 + 1)
                         and punct <= len(trun) * 0.34)
 
             _w_markers: list = []

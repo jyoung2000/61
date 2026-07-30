@@ -882,3 +882,34 @@ def test_glossary_identity_entries_reach_roster_evidence(monkeypatch):
     ev = dict(CN._CACHE.get("job:jobX") or {})
     assert ev.get("ゼクス") == "Zechs"
     assert ev.get("Heero Yuy") == "Heero Yuy"
+
+
+def test_glossary_snap_guards_identity_and_full_names():
+    from backend.services.canonical_names import _apply_glossary_spellings
+    glossary = ["Lucrezia Noin", "Lady Une", "Relena Darlian"]
+    # A value whose every word is already official is a FULL NAME, not a
+    # misspelling — snapping would truncate it to a bare given name.
+    out, n = _apply_glossary_spellings({"ノイン": "Lucrezia Noin"}, glossary)
+    assert out["ノイン"] == "Lucrezia Noin" and n == 0
+    # A katakana source only snaps to a value it could actually SOUND like.
+    out2, n2 = _apply_glossary_spellings({"ゼクス": "Lady Um"}, glossary)
+    assert out2["ゼクス"] == "Lady Um" and n2 == 0   # "Lady Une" fails the sound gate
+
+
+def test_skeleton_fallback_requires_some_letter_overlap():
+    # Consonant-poor names reduce to 1-2 classes and trivially "match" — the
+    # fallback needs the full ratio to clear a low floor, which still admits
+    # the motivating earizu/"Aires" (0.18) but kills zero-overlap pairs.
+    from backend.services.canonical_names import _canonical_sounds_plausible as ok
+    assert ok("エアリーズ", "Aires")
+    assert not ok("レイ", "Law")
+
+
+def test_glossary_miner_ignores_paragraph_initial_words():
+    from backend.services.canonical_names import _mine_glossary_names
+    text = ("The pilot flies well.\n\nHeero is calm. People trust Heero "
+            "completely, and everyone respects Heero here.\n\nMeanwhile "
+            "the war goes on.\n\nMeanwhile the fleet waits in orbit.")
+    names = _mine_glossary_names(text)
+    assert "Meanwhile" not in names     # paragraph-initial never counts
+    assert "Heero" in names             # two mid-sentence uses qualify it

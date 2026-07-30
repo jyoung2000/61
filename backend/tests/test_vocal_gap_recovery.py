@@ -470,3 +470,41 @@ def test_repair_stem_times_leaves_valid_decodes_alone():
             {"start": 2.2, "end": 4.0, "text": "b"}]
     out, n = _repair_stem_times(segs, 10.0)
     assert n == 0 and out is segs
+
+
+def test_repair_stem_times_never_touches_a_partially_valid_decode():
+    # Whisper commonly emits ONE zero-length trailing artifact beside
+    # well-timed segments. Redistributing everything for it drifted real
+    # lines by seconds (and the nearest-cue speaker guess with them) — the
+    # repair fires only on the measured failure mode: NO usable time at all.
+    from backend.services.vocal_gap_recovery import _repair_stem_times
+    segs = [
+        {"start": 0.8, "end": 2.1, "text": "A line with exact times"},
+        {"start": 3.0, "end": 4.4, "text": "second"},
+        {"start": 7.5, "end": 9.2, "text": "third exact line"},
+        {"start": 9.2, "end": 9.2, "text": ""},        # the artifact
+    ]
+    out, n = _repair_stem_times(segs, 10.0)
+    assert n == 0 and out is segs
+    assert out[0]["start"] == 0.8 and out[2]["end"] == 9.2
+
+
+def test_repair_stem_times_distributes_inside_the_pad_trimmed_interior():
+    # The stem includes 2s pads that overlap existing cues by construction;
+    # a short first line placed inside the lead pad was culled as a boundary
+    # re-hearing — the exact line the repair exists to save.
+    from backend.services.vocal_gap_recovery import _repair_stem_times, _clip_to_gap
+    segs = [{"start": 0.0, "end": 0.0, "text": "了解"},
+            {"start": 0.0, "end": 0.0, "text": "こちらは長い台詞でありますから続きます"}]
+    out, n = _repair_stem_times(segs, 12.0, pad_s=2.0)
+    assert n == 2
+    assert out[0]["start"] >= 2.0 - 1e-6          # never inside the lead pad
+    assert out[-1]["end"] <= 10.0 + 1e-6          # never inside the tail pad
+    # End-to-end: with a boundary cue covering the pad, the short line survives.
+    gap = (100.0, 112.0)
+    existing = [{"start": 96.0, "end": 100.5, "text": "previous cue"}]
+    for s in out:
+        s2 = dict(s)
+        s2["start"] += gap[0]
+        s2["end"] += gap[0]
+        assert _clip_to_gap(s2, gap, 2.0, existing=existing) is not None

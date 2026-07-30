@@ -1986,6 +1986,13 @@ class Settings(BaseSettings):
     # name-repair passes stay disabled and garbles like "Sex Unique" (Zechs)
     # ship as-is. Blank = fall back to auto-identifying the work from the terms.
     TRANSLATION_SERIES_HINT: str = ""
+    # Once the name pass identifies the series, fetch the OFFICIAL English
+    # spellings from Wikipedia (one small API call, cached in a mount-backed
+    # store so it happens at most once per series ever) and snap near-variant
+    # name mappings onto them — the local models identify the show reliably
+    # but misspell its cast ("Hero Yu", "Dorian", "Aires"). Fail-soft: no
+    # network just means names stay model-resolved. Set False to never fetch.
+    TRANSLATION_SERIES_GLOSSARY: bool = True
     # Optional REFERENCE transcript (e.g. YouTube's official captions) to match.
     # When set, the subtitle track is conformed to it — the surest way to match
     # a known-good source's words, timing AND segmentation. Accepts SRT, VTT, or

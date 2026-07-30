@@ -978,6 +978,13 @@ def _canonical_sounds_plausible(term: str, value: str) -> bool:
     # preserves the CONSONANT skeleton far more faithfully than the vowels
     # (which shift freely between systems), so compare that as a fallback —
     # class-normalized, same groups as the lead check (r/l, s/z, k/c/q…).
+    # The skeleton is a FALLBACK for near-misses, not a bypass: consonant-poor
+    # names reduce to 1-2 classes and trivially "match" (rei/"Law" both shrink
+    # to nothing alike yet scored), so the full-string ratio must still clear
+    # a low floor — 0.15 admits the motivating earizu/"Aires" (0.18) while a
+    # zero-letter-overlap cross-name pair stays dead.
+    if difflib.SequenceMatcher(None, romaji, target).ratio() < 0.15:
+        return False
     sk_r = _consonant_skeleton(romaji)
     sk_t = _consonant_skeleton(target)
     return bool(sk_r and sk_t
@@ -1335,9 +1342,14 @@ def _mine_glossary_names(text: str, cap: int = 80) -> list[str]:
         if all(w in _ROSTER_SAFE_WORDS or w in _ROSTER_COMMON_WORDS
                or w in _WIKI_STOP for w in words):
             continue
-        i = m.start()
-        prev = (text[max(0, i - 2):i] or "").strip()
-        if i == 0 or (prev and prev[-1:] in ".!?:=\n"):
+        # Mid-sentence check: scan back over ALL whitespace to the previous
+        # non-space character. A fixed 2-char peek treated a paragraph break
+        # (``\n\n`` — ubiquitous in Wikipedia plaintext) and ``.  `` as
+        # mid-sentence, counting every paragraph-initial word as a name.
+        k = m.start() - 1
+        while k >= 0 and text[k].isspace():
+            k -= 1
+        if k < 0 or text[k] in ".!?:=":
             continue
         counts[s] = counts.get(s, 0) + 1
     ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
@@ -1351,9 +1363,21 @@ async def _get_series_glossary(series: str, job_id: str = "") -> list[str]:
     key = (series or "").strip().lower()
     if not key:
         return []
+    try:
+        from backend.config import settings as _gset
+        if not bool(getattr(_gset, "TRANSLATION_SERIES_GLOSSARY", True)):
+            return []
+    except Exception:
+        pass
     store = _glossary_store_load()
     if isinstance(store.get(key), list) and store[key]:
         return list(store[key])
+    # Never reach the network from a unit test: an order-dependent pass/fail
+    # keyed on whether some earlier test populated the durable store (or on
+    # the CI runner's connectivity) is exactly what this module's persist
+    # docstring forbids. Cache hits above still work under pytest.
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return []
     texts: list[str] = []
     try:
         import httpx
@@ -1432,18 +1456,41 @@ def _apply_glossary_spellings(
     for src, val in mapping.items():
         if (val or "").lower() in tok_lower:
             continue
+        # A value whose EVERY word is already an official token is not a
+        # misspelling — it is a full name the mined list happens to store in
+        # pieces, and "snapping" it would truncate ("Lucrezia Noin" →
+        # "Lucrezia").
+        _vwords = [w.lower() for w in (val or "").split()]
+        if _vwords and all(w in tok_lower for w in _vwords):
+            continue
         nv = _normalize(val)
-        best, best_r = None, 0.0
-        for tok in toks:
-            r = difflib.SequenceMatcher(None, nv, _normalize(tok)).ratio()
-            if r > best_r:
-                best, best_r = tok, r
-        if best is not None and best_r >= 0.72:
-            out[src] = best
-            fixed += 1
-            logger.info(
-                "canonical names: glossary respelled %r → %r (was %r, "
-                "similarity %.2f)", src, best, val, best_r)
+        ranked = sorted(
+            ((difflib.SequenceMatcher(None, nv, _normalize(tok)).ratio(), tok)
+             for tok in toks), reverse=True)
+        if not ranked:
+            continue
+        best_r, best = ranked[0]
+        # The winner must clear the respelling bar, clearly beat the
+        # runner-up (a near-tie means two official names are both close —
+        # identity is ambiguous and must not be guessed), keep phonetic
+        # faith with a katakana source, and not collide with a value some
+        # OTHER term already holds.
+        if best_r < 0.72:
+            continue
+        if len(ranked) > 1 and best_r - ranked[1][0] < 0.05 \
+                and ranked[1][1].lower() != best.lower():
+            continue
+        if _normalize(_kana_to_romaji(src)) != _normalize(src) \
+                and not _canonical_sounds_plausible(src, best):
+            continue
+        if any(o_src != src and (o_val or "").lower() == best.lower()
+               for o_src, o_val in out.items()):
+            continue
+        out[src] = best
+        fixed += 1
+        logger.info(
+            "canonical names: glossary respelled %r → %r (was %r, "
+            "similarity %.2f)", src, best, val, best_r)
     return out, fixed
 
 

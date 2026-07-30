@@ -327,7 +327,8 @@ def _clip_to_gap(seg: dict, gap: tuple[float, float], pad_s: float,
     return out if out["end"] - out["start"] >= 0.3 else None
 
 
-def _repair_stem_times(segs: list, stem_dur: float) -> tuple[list, int]:
+def _repair_stem_times(segs: list, stem_dur: float,
+                       pad_s: float = 0.0) -> tuple[list, int]:
     """Give decoded segments usable STEM-RELATIVE times when the decode
     returned degenerate ones.
 
@@ -337,11 +338,21 @@ def _repair_stem_times(segs: list, stem_dur: float) -> tuple[list, int]:
     segment came back with start == end, so `_seg_bounds` rejected it and
     both known transcript holes stayed open. The TEXT is the recovery's
     whole value and the stem is only a few seconds wide — approximate
-    placement beats discarding the line every time. Segments keep their
-    own times when the whole set is sane; otherwise the stem window is
-    distributed across them in order, weighted by text length (mirrors
-    the char-proportional model used everywhere else in the pipeline).
-    Returns ``(segs, n_repaired)``."""
+    placement beats discarding the line every time.
+
+    Redistribution fires ONLY when NO segment carries a usable time (the
+    measured failure mode). A mixed list keeps its exact-timed segments
+    verbatim — Whisper routinely emits one zero-length trailing artifact
+    beside well-timed segments, and rewriting the good ones for it would
+    drift real lines by seconds (and with them the nearest-cue speaker
+    guess). The lone artifact still dies in the per-segment no-times cull.
+
+    The window distributed is the PAD-TRIMMED interior: the stem includes
+    ``pad_s`` of lead-in/out that overlaps existing cues by construction,
+    and a short first/last segment placed wholly inside a pad would be
+    culled as a boundary re-hearing — dropping exactly the line the repair
+    exists to save. Weighted by text length (the char-proportional model
+    used everywhere else in the pipeline). Returns ``(segs, n_repaired)``."""
     if not segs or stem_dur <= 0.2:
         return segs, 0
 
@@ -350,17 +361,21 @@ def _repair_stem_times(segs: list, stem_dur: float) -> tuple[list, int]:
         return (b is not None and b[0] >= -0.5
                 and b[1] <= stem_dur + 5.0 and b[1] - b[0] >= 0.05)
 
-    if all(_valid(s) for s in segs):
+    if any(_valid(s) for s in segs):
         return segs, 0
+    inset = min(max(0.0, pad_s), stem_dur / 4.0)
+    lo, hi = inset, stem_dur - inset
+    if hi - lo <= 0.2:
+        lo, hi = 0.0, stem_dur
     weights = [max(1, len(_seg_text(s))) for s in segs]
     total = float(sum(weights))
     out = []
-    cursor = 0.0
+    cursor = lo
     for s, w in zip(segs, weights):
         d = dict(s)
-        span = stem_dur * (w / total)
+        span = (hi - lo) * (w / total)
         d["start"] = round(cursor, 3)
-        d["end"] = round(min(stem_dur, cursor + span), 3)
+        d["end"] = round(min(hi, cursor + span), 3)
         cursor = d["end"]
         out.append(d)
     return out, len(out)
@@ -692,7 +707,7 @@ async def recover_gap_dialogue(
             # distributed across them instead of a guaranteed "no-times" cull
             # — the measured failure mode was EVERY relisten segment arriving
             # timeless, which silently kept both known transcript holes open.
-            segs, _sp_repaired = _repair_stem_times(segs, dur)
+            segs, _sp_repaired = _repair_stem_times(segs, dur, pad_s=pad)
             if _sp_repaired:
                 n_times_repaired += _sp_repaired
             _sp_kept = _sp_clip = _sp_junk = _sp_nospeech = _sp_notimes = 0

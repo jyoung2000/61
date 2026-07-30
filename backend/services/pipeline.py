@@ -474,6 +474,15 @@ def _hybrid_split_candidate_windows(translated_cues, total_s: float):
         for c in translated_cues or []:
             txt = (c.get("text") if isinstance(c, dict)
                    else getattr(c, "text", "")) or ""
+            # A cue that already carries REAL word timestamps never consumes
+            # tier-A projection (project_word_timings skips worded cues), so
+            # decoding its window buys nothing. On the whisper-native path
+            # most cues arrive worded, and counting them here both inflated
+            # the windows and — past the 60% coverage bail — forced a FULL
+            # duplicate reference decode whose output was then discarded.
+            _w = c.get("words") if isinstance(c, dict) else getattr(c, "words", None)
+            if _w:
+                continue
             start = c.get("start") if isinstance(c, dict) else getattr(c, "start", None)
             end = c.get("end") if isinstance(c, dict) else getattr(c, "end", None)
             if start is None or end is None:
@@ -4428,12 +4437,18 @@ async def _background_post_processing(
                             "reference consumed (%d cue(s)) — its decode "
                             "ran concurrently with translation", job_id,
                             len(_whisper_ref or []))
-                    else:
+                    elif str(target_lang or "").lower().startswith("en"):
                         _whisper_ref = await _get_whisper_en_timing_reference(
                             getattr(job, "file_path", None), source_lang,
                             [s.model_dump() if hasattr(s, "model_dump") else dict(s)
                              for s in _trans_input] if _trans_input else None,
                             job_id, translated_cues=_llm_cues)
+                    else:
+                        # Non-English target: the Whisper →EN decode is a
+                        # reference for ENGLISH text and buys nothing here.
+                        # Tiers B/C below are language-neutral and still give
+                        # every cue a word-timing skeleton.
+                        _whisper_ref = None
                     _tiers = project_hybrid_timings(
                         _llm_cues, whisper_en_segments=_whisper_ref,
                         source_cues=list(_trans_input) if _trans_input else None,
@@ -4470,7 +4485,17 @@ async def _background_post_processing(
                 # cue. It runs on the translated (English) track, which the
                 # torchaudio wav2vec2 backend supports directly, and is
                 # fail-soft — no backend or no audio leaves timings as-is.
+                #
+                # ENGLISH TARGETS ONLY: the backend is WAV2VEC2_ASR_BASE_960H,
+                # an English acoustic model, and its normalizer lets any
+                # Latin-script text through — on a non-English target it would
+                # "align" the words to a monotonic-by-construction garbage
+                # path and then OVERWRITE exact 1:1 timings with it.
                 try:
+                    if not str(target_lang or "").lower().startswith("en"):
+                        raise RuntimeError(
+                            f"target '{target_lang}' is not English — "
+                            "wav2vec2 EN alignment would corrupt timings")
                     from backend.services.forced_aligner import align_translated_cues
                     # Hand the aligner the DEMUXED wav, never the container.
                     # torchaudio can only open an mp4 through its ffmpeg

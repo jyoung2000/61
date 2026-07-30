@@ -319,3 +319,44 @@ def test_school_chatter_is_not_a_theme_despite_soft_tolerance():
     texts = [r["text"] for r in out]
     assert any("richest person" in t for t in texts)
     assert not any(_is_marker(t) and "Opening theme" in t for t in texts)
+
+
+def test_dialogue_names_cannot_become_hooks():
+    # A character named in ≥2 dialogue cues must NOT be mined as a song hook
+    # — hooks only qualify from unpunctuated cues with no other capitalized
+    # content, and never when the phrase also appears in a punctuated cue.
+    lines = [
+        ("Good morning, Relena!", "Speaker 1"),
+        ("Relena returned from space yesterday", "Speaker 1"),
+        ("Tomorrow is my birthday.", "Speaker 1"),
+        ("Of course I'll come to the party.", "Speaker 1"),
+        ("That's terrible.", "Speaker 1"),
+        ("Who's that person over there?", "Speaker 1"),
+    ]
+    rows = [_spk(_cue(30 + i * 6, 34 + i * 6, t), s) for i, (t, s) in enumerate(lines)]
+    rows += [_spk(_cue(300 + i * 6, 304 + i * 6, f"Dialogue line {i}."),
+                  "Speaker 1" if i % 2 else "Speaker 2") for i in range(150)]
+    out, changed = collapse_song_choruses(rows, "en")
+    texts = [r["text"] for r in out]
+    assert any("Relena returned" in t for t in texts)
+    assert not any(_is_marker(t) and "theme" in t.lower() for t in texts)
+
+
+def test_interjection_neutralization_preserves_adjacent_names():
+    # "Oh Relena, wait for me" — deleting the stoplisted "Oh" made "Relena"
+    # sentence-initial and invisible to the proper-noun counter; lowercasing
+    # in place keeps its true position so the name still blocks absorption.
+    rows = [
+        _spk(_cue(30, 36, "la la la singing something soft tonight"), "Speaker 1"),
+        _spk(_cue(37, 43, "more wordless singing drifting far away"), "Speaker 1"),
+        _spk(_cue(44, 50, "the melody carries on and on for now"), "Speaker 1"),
+        _spk(_cue(51, 57, "still the song continues without a name"), "Speaker 1"),
+        _spk(_cue(58, 64, "one more verse before the fade begins"), "Speaker 1"),
+        _spk(_cue(65, 71, "Oh Relena, wait for me"), "Speaker 1"),
+    ]
+    rows += [_spk(_cue(300 + i * 6, 304 + i * 6, f"Dialogue line {i}."),
+                  "Speaker 1" if i % 2 else "Speaker 2") for i in range(150)]
+    out, changed = collapse_song_choruses(rows, "en")
+    texts = [r["text"] for r in out]
+    # The named cue survives even when the verse run before it collapses.
+    assert any("Relena" in t for t in texts)
