@@ -220,3 +220,102 @@ def test_song_tail_past_the_last_chorus_is_absorbed():
     # The marker spans the SONG, not the dialogue a minute earlier.
     assert 1355.0 <= markers[0]["start"] <= 1360.0
     assert markers[0]["end"] >= 1400.0
+
+
+def _spk(c, s):
+    return {**c, "speaker": s}
+
+
+def test_run62_opening_verses_collapse_despite_garbled_capitals():
+    # The measured OP escape: 10 verse cues 0:30-1:31 whose mid-cue capitals
+    # ("Uh", "There", "Right", "Turning") each scored a proper noun and broke
+    # the strict run at every second cue — no marker shipped at all.
+    op_lines = [
+        "The rain isn't falling,",
+        "so I can't cool the heat Uh",
+        "I want to convey my feelings in the air tonight",
+        "Holding you as if warming your wet shoulder There",
+        "Your trembling fingertips wander seeking what?",
+        "Protecting your gaze Right",
+        "want to Turning sorrow into love that's strong trust",
+        "in myself",
+        "don't reveal the storm letting my hot sweat flow",
+        "In my life",
+    ]
+    rows = [_spk(_cue(30 + i * 6, 34 + i * 6, t), "Speaker 1")
+            for i, t in enumerate(op_lines)]
+    # Narration follows after a >10s gap (its own group), then dialogue.
+    rows += [_spk(_cue(112, 116, "The Earth Sphere Unified Nation overwhelmed each colony."), "Speaker 2")]
+    rows += [_spk(_cue(300 + i * 6, 304 + i * 6, f"Dialogue line {i}."),
+                  "Speaker 1" if i % 2 else "Speaker 2") for i in range(150)]
+    out, changed = collapse_song_choruses(rows, "en")
+    assert changed
+    texts = [r["text"] for r in out]
+    assert any(_is_marker(t) and "Opening theme" in t for t in texts), texts[:6]
+    assert not any("trembling fingertips" in t for t in texts)
+    assert not any("Turning sorrow" in t for t in texts)
+    assert any("Earth Sphere Unified Nation" in t for t in texts)
+
+
+def test_run62_ending_verses_chain_into_the_marker_and_preview_survives():
+    # The measured ED shape: the chorus collapses to a marker, then after a
+    # ~24s instrumental bridge the verses ("Just Love …" — the repeated
+    # TitleCase HOOK scored 2 proper nouns and read as a preview) shipped as
+    # dialogue. They must chain into the same marker; the next-episode
+    # preview and the 22:03 signature line must survive.
+    rows = [_spk(_cue(100 + i * 7, 104 + i * 7, f"Dialogue line {i}."),
+                 "Speaker 1" if i % 2 else "Speaker 2") for i in range(150)]
+    rows += [
+        _spk(_cue(1290.0, 1294.0, "That's terrible."), "Speaker 1"),
+        _spk(_cue(1323.4, 1330.9, "I'm gonna kill you What?"), "Speaker 1"),
+        _spk(_cue(1341.2, 1343.1, "Who's that person over there?"), "Speaker 1"),
+        # sung chorus (repeats → chorus path creates the marker)
+        _spk(_cue(1353.0, 1357.0, "Just wild beat communication tonight"), "Speaker 1"),
+        _spk(_cue(1358.0, 1362.0, "standing in the lashing rain forever"), "Speaker 1"),
+        _spk(_cue(1363.0, 1367.0, "Just wild beat communication tonight"), "Speaker 1"),
+        _spk(_cue(1368.0, 1372.0, "standing in the lashing rain forever"), "Speaker 1"),
+        # instrumental bridge ~24s, then the verses with the TitleCase hook
+        _spk(_cue(1396.0, 1401.0, "Just Love irritates me I Ts"), "Speaker 1"),
+        _spk(_cue(1402.0, 1407.0, "It annoys me when you act like that"), "Speaker 1"),
+        _spk(_cue(1408.0, 1414.0, "That's why I say this Just Love gets on my nerves Uh Again"), "Speaker 1"),
+        _spk(_cue(1415.0, 1418.0, "don't make unreasonable demands on me"), "Speaker 1"),
+        _spk(_cue(1419.0, 1422.0, "Please be careful"), "Speaker 1"),
+        # next-episode preview — name-dense, must survive
+        _spk(_cue(1431.0, 1437.0, "The Gundam sank to the bottom of the sea near Jack Star"), "Speaker 1"),
+        _spk(_cue(1438.0, 1444.0, "But Zechs from Oz was using the new Mobile Suit Cancer"), "Speaker 1"),
+        _spk(_cue(1445.0, 1451.0, "Mobile Suit Gundam Wing Episode 2 The Deathscythe Gundam"), "Speaker 1"),
+    ]
+    out, changed = collapse_song_choruses(rows, "en")
+    assert changed
+    texts = [r["text"] for r in out]
+    assert not any("Just Love" in t for t in texts), \
+        [t for t in texts if "Just Love" in t]
+    assert not any("lashing rain" in t for t in texts)
+    assert any("I'm gonna kill you" in t for t in texts)
+    assert any("Zechs" in t for t in texts)
+    assert any("Deathscythe" in t for t in texts)
+    end_markers = [r for r in out if _is_marker(r["text"]) and "Ending theme" in r["text"]]
+    assert len(end_markers) == 1
+    # Marker extended across the bridge to cover the verse block.
+    assert end_markers[0]["end"] >= 1422.0
+
+
+def test_school_chatter_is_not_a_theme_despite_soft_tolerance():
+    # Same-speaker, 6+ cues, ≥25s — but the cues close their sentences, which
+    # is dialogue's signature. The punctuation gate must reject the run.
+    lines = [
+        "Well, there's nothing we can do about that.",
+        "You see, she just came back yesterday.",
+        "Of course, being the richest person at our school is just different.",
+        "I'd love to go into space once in my life too.",
+        "Oh, by the way, it's her birthday tomorrow.",
+        "That's right, who is she inviting to the party?",
+    ]
+    rows = [_spk(_cue(30 + i * 6, 34 + i * 6, t), "Speaker 1")
+            for i, t in enumerate(lines)]
+    rows += [_spk(_cue(300 + i * 6, 304 + i * 6, f"Dialogue line {i}."),
+                  "Speaker 1" if i % 2 else "Speaker 2") for i in range(150)]
+    out, changed = collapse_song_choruses(rows, "en")
+    texts = [r["text"] for r in out]
+    assert any("richest person" in t for t in texts)
+    assert not any(_is_marker(t) and "Opening theme" in t for t in texts)

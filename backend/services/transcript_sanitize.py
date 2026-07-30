@@ -748,34 +748,83 @@ def _proper_noun_count(text: str) -> int:
     return n
 
 
-def _longest_theme_run(rows, idxs, is_preview):
+# Sung-hook mining: a TitleCase phrase repeated across cues of one window is
+# the song's HOOK ("Just Love", "Wild Wing"), not a person — but the raw
+# proper-noun counter scored it 2, which flagged every verse containing it as
+# a "preview" and shipped the ending theme's verses as dialogue.
+_HOOK_RE = re.compile(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\b")
+
+# Capitalized tokens that are never character names — interjections and
+# lyric filler the ASR capitalizes when it glues sung fragments into one cue.
+# Exempted from the proper-noun count INSIDE theme windows only.
+_LYRIC_CAP_STOP = frozenset("""
+uh uhh ah ahh oh ohh ha hey yeah yea la na naa ooh oooh whoa woah huh hmm mm
+mmm wow ts tonight baby love again right there
+""".split())
+
+
+def _ends_terminal(text: str) -> bool:
+    """Does the cue end like a finished spoken sentence? Sung verse lines are
+    translated as unpunctuated fragments; dialogue closes with .!?…"""
+    t = (text or "").rstrip().rstrip('"\'’”)')
+    return bool(t) and t[-1] in ".!?…。！？"
+
+
+def _longest_theme_run(rows, idxs, is_preview, pn_fn=None, soft=False):
     """Longest run of consecutive (within ``idxs``) cues that read as a sung
-    theme: same speaker (when the cue is labelled), zero proper nouns, and not a
-    next-episode preview. A speaker change, a proper noun, or a preview cue ends
+    theme: same speaker (when the cue is labelled), no proper nouns, and not a
+    next-episode preview. A speaker change, proper nouns, or a preview cue end
     the run — so real dialogue (which turn-takes and names people/places) can
     never be absorbed. No per-cue length cap: translated lyric lines are often
-    long full sentences. Returns the row indices of the best run."""
+    long full sentences. Returns the row indices of the best run.
+
+    ``soft=True`` lets a cue with EXACTLY ONE capitalized token CONTINUE (not
+    start) a run: ASR garble routinely capitalizes an interjection mid-lyric
+    ("cool the heat Uh", "Protecting your gaze Right"), and the strict rule
+    broke a measured 10-cue opening theme into fragments too short to
+    collapse. The caller must re-vet a soft run (strict majority + terminal-
+    punctuation scarcity) before acting on it."""
+    pn = pn_fn or _proper_noun_count
     best: list = []
     cur: list = []
     cur_spk = None
+    soft_idx: set = set()
+
+    def _trimmed(run: list) -> list:
+        # A soft cue may only be INTERIOR: lyrics tolerate a stray capital
+        # mid-song, but a run must open and close on strictly-clean cues —
+        # otherwise a single-name narration line adjacent to the song rides
+        # along as its trailing edge.
+        out = list(run)
+        while out and out[-1] in soft_idx:
+            out.pop()
+        return out
+
     for i in idxs:
         txt = (rows[i].get("text") or "").strip()
         spk = rows[i].get("speaker")
-        theme_like = bool(txt) and not is_preview(txt) and _proper_noun_count(txt) == 0
+        n_pn = pn(txt) if txt else 99
+        strict_ok = bool(txt) and not is_preview(txt) and n_pn == 0
+        soft_ok = (soft and bool(txt) and not is_preview(txt) and n_pn == 1)
+        theme_like = strict_ok or (soft_ok and bool(cur))
         same_spk = cur_spk is None or spk in (None, "") or spk == cur_spk
         if theme_like and (not cur or same_spk):
             if not cur:
                 cur_spk = spk
+            if not strict_ok:
+                soft_idx.add(i)
             cur.append(i)
         else:
-            if len(cur) > len(best):
-                best = list(cur)
-            if theme_like:
+            t = _trimmed(cur)
+            if len(t) > len(best):
+                best = t
+            if strict_ok:
                 cur, cur_spk = [i], spk
             else:
                 cur, cur_spk = [], None
-    if len(cur) > len(best):
-        best = list(cur)
+    t = _trimmed(cur)
+    if len(t) > len(best):
+        best = t
     return best
 
 
@@ -818,7 +867,7 @@ def collapse_song_choruses(segments, target_lang: str = "en"):
         windows = [(first_t, first_t + head_s, _THEME_OPEN_LABEL),
                    (last_t - tail_s, last_t, _THEME_END_LABEL)]
 
-        def _is_preview(txt):
+        def _is_preview_raw(txt):
             return bool(_PREVIEW_RE.search(txt)) or _proper_noun_count(txt) >= 2
 
         try:
@@ -847,16 +896,6 @@ def collapse_song_choruses(segments, target_lang: str = "en"):
                 out.append(cur)
             return out
 
-        def _absorbable(i: int) -> bool:
-            """A cue that can ride along INSIDE/AROUND a detected song block:
-            no proper nouns, not a preview, lyric-length. Extension uses a
-            slightly looser length cap than the in-run test — translated lyric
-            lines are often full sentences."""
-            txt = (rows[i].get("text") or "").strip()
-            return (not _is_preview(txt)
-                    and _proper_noun_count(txt) == 0
-                    and len(txt) <= max(_LYRIC_MAX_CHARS, 60))
-
         drop = set()
         marker_at = {}
         for w0, w1, label in windows:
@@ -866,6 +905,67 @@ def collapse_song_choruses(segments, target_lang: str = "en"):
                     and w0 - 0.01 <= _st(r) <= w1 + 0.01]
             if len(idxs) < 4:
                 continue
+            # Sung HOOKS: a TitleCase phrase recurring across ≥2 cues of this
+            # window is the song's refrain title ("Just Love"), not a person.
+            # Strip hooks before counting proper nouns, or every verse carrying
+            # the hook scores pn≥2 and reads as a "preview" — which is exactly
+            # how a measured ending theme shipped its verses as dialogue.
+            _hook_seen: dict = {}
+            for _i in idxs:
+                for _m in set(_HOOK_RE.findall(rows[_i].get("text") or "")):
+                    _hook_seen[_m] = _hook_seen.get(_m, 0) + 1
+            hooks = {h for h, c in _hook_seen.items() if c >= 2 and len(h) > 2}
+
+            def _strip_hooks(txt: str) -> str:
+                for h in hooks:
+                    txt = txt.replace(h, " ")
+                return txt
+
+            def _pn(txt: str) -> int:
+                """Proper nouns that count as DIALOGUE evidence: hooks are the
+                song's refrain, and stoplisted interjections are ASR garble —
+                fragment-gluing capitalizes them mid-cue ("cool the heat Uh",
+                "Protecting your gaze Right"), and each one broke the verse
+                run at the strict counter."""
+                s = _strip_hooks(txt)
+                toks = [t for t in s.split()
+                        if t.strip(".,!?;:\"'()[]…—–“”’").lower()
+                        not in _LYRIC_CAP_STOP]
+                return _proper_noun_count(" ".join(toks))
+
+            def _is_preview(txt):
+                return bool(_PREVIEW_RE.search(txt)) or _pn(txt) >= 2
+
+            def _absorbable(i: int) -> bool:
+                """A cue that can ride along INSIDE/AROUND a detected song
+                block: no proper nouns (hooks exempt), not a preview,
+                lyric-length. Extension uses a slightly looser length cap than
+                the in-run test — translated lyric lines are often full
+                sentences."""
+                txt = (rows[i].get("text") or "").strip()
+                return (not _is_preview(txt)
+                        and _pn(txt) == 0
+                        and len(txt) <= max(_LYRIC_MAX_CHARS, 60))
+
+            def _vet_soft_run(trun: list) -> bool:
+                """A soft (pn≤1-tolerant) run must still LOOK sung before it
+                may collapse: mostly strictly-clean cues, and mostly WITHOUT
+                terminal punctuation. Verse translations arrive as
+                unpunctuated fragments; dialogue closes its sentences — a
+                measured school-chatter run passed every other test and died
+                only here (5/7 cues ended in .!?)."""
+                if not trun:
+                    return False
+                strict = sum(
+                    1 for i in trun
+                    if _pn((rows[i].get("text") or "").strip()) == 0)
+                punct = sum(
+                    1 for i in trun
+                    if _ends_terminal((rows[i].get("text") or "").strip()))
+                return (strict >= max(3, len(trun) // 2)
+                        and punct <= len(trun) * 0.34)
+
+            _w_markers: list = []
             # Chorus lines are identified over the WHOLE window (a chorus and
             # its reprise are often separated by a verse or a narrated
             # preview), but a collapse run must live inside ONE contiguous
@@ -883,16 +983,21 @@ def collapse_song_choruses(segments, target_lang: str = "en"):
                 # all-distinct verse lines, or an ED with only a short hook) is
                 # a long single-speaker, proper-noun-free run. Per contiguous
                 # group, so the run can no longer bridge a scene of dialogue.
+                # Soft mode + vetting: one garbled interjection-capital per cue
+                # is tolerated, but the run must stay strict-majority and
+                # mostly unpunctuated to collapse.
                 for grp in _groups(idxs):
-                    trun = _longest_theme_run(rows, grp, _is_preview)
-                    if len(trun) >= _THEME_RUN_MIN_CUES:
+                    trun = _longest_theme_run(rows, grp, _is_preview,
+                                              pn_fn=_pn, soft=True)
+                    if len(trun) >= _THEME_RUN_MIN_CUES and _vet_soft_run(trun):
                         tm_start = min(_st(rows[i]) for i in trun)
                         tm_end = max(_en(rows[i]) for i in trun)
                         if tm_end - tm_start >= _THEME_RUN_MIN_SPAN_S:
                             drop.update(trun)
                             marker_at[min(trun)] = (tm_start, tm_end, label)
-                continue   # window handled (or genuinely not a song)
-            for grp in _groups(idxs):
+                            _w_markers.append(min(trun))
+            else:
+              for grp in _groups(idxs):
                 g_hits = [i for i in grp
                           if not _is_preview((rows[i].get("text") or "").strip())
                           and any(_song_norm(s) in chorus
@@ -915,7 +1020,7 @@ def collapse_song_choruses(segments, target_lang: str = "en"):
                     if _is_preview(txt):
                         continue   # preserve preview/dialogue interleaved in the run
                     is_chorus = any(_song_norm(s) in chorus for s in _sent_split(txt))
-                    lyric_like = (_proper_noun_count(txt) == 0
+                    lyric_like = (_pn(txt) == 0
                                   and len(txt) <= _LYRIC_MAX_CHARS)
                     if is_chorus or lyric_like:
                         run.append(i)
@@ -942,6 +1047,40 @@ def collapse_song_choruses(segments, target_lang: str = "en"):
                     continue
                 drop.update(run)
                 marker_at[min(run)] = (m_start, m_end, label)
+                _w_markers.append(min(run))
+
+            # ── Markers-only policy: chain trailing VERSE blocks into the
+            # marker. The chorus path collapses the repeats, but the verses
+            # that follow after an instrumental bridge are the SAME song — a
+            # measured run kept its "[♪ Ending theme ♪]" marker AND shipped
+            # five verse cues 24s later as dialogue. A relaxed lyric run that
+            # OPENS a group within 60s of a marker's end is absorbed and the
+            # marker extended; previews and dialogue still break the run, and
+            # the soft-run vetting (strict majority + unpunctuated majority)
+            # applies in full.
+            for mk in list(_w_markers):
+                _more = True
+                while _more:
+                    _more = False
+                    m_s, m_e, lab = marker_at[mk]
+                    for grp in _groups(idxs):
+                        g_live = [i for i in grp if i not in drop]
+                        if not g_live:
+                            continue
+                        g0 = _st(rows[g_live[0]])
+                        if not (m_e - 0.01 <= g0 <= m_e + 60.0):
+                            continue
+                        trun = _longest_theme_run(rows, g_live, _is_preview,
+                                                  pn_fn=_pn, soft=True)
+                        if (len(trun) >= 3 and trun[0] == g_live[0]
+                                and _vet_soft_run(trun)
+                                and (max(_en(rows[i]) for i in trun)
+                                     - min(_st(rows[i]) for i in trun)) >= 6.0):
+                            drop.update(trun)
+                            marker_at[mk] = (
+                                m_s, max(_en(rows[i]) for i in trun), lab)
+                            _more = True
+                            break
 
         if not drop:
             return rows, False
