@@ -4381,120 +4381,7 @@ async def _background_post_processing(
             if _used_llm:
                 logger.info(
                     "[%s] Translated resegmentation skipped — LLM cues are already "
-                    "1:1 and inherit the source's word-timed boundaries; instead "
-                    "projecting real word timings so the splitter can break run-ons",
-                    job_id)
-                # ── (c-hybrid) Project audio-aligned word timings onto the LLM text ──
-                # The LLM gives faithful English but NO timing. Get Whisper's
-                # native English word timestamps as a TIMING REFERENCE (its text is
-                # discarded) and project them onto the LLM cues via same-language
-                # EN↔EN alignment (tier A); fall back to the 1:1 source cue's word
-                # pauses (tier B); else keep the cue whole (tier C). Cues that gain
-                # word timing can then be split at REAL audio pauses below.
-                if getattr(settings, "HYBRID_WORD_TIMING_ENABLED", True):
-                    try:
-                        from backend.services.subtitle_aligner import project_hybrid_timings
-                        from backend.models import TranscriptSegment as _TSh
-                        _llm_cues = [
-                            t if isinstance(t, _TSh)
-                            else _TSh(**(t.model_dump() if hasattr(t, "model_dump") else t))
-                            for t in translated
-                        ]
-                        if _ref_pretask is not None:
-                            # Started before the LLM loop — by now the decode
-                            # normally finished minutes ago; awaiting is a
-                            # no-op join, not a serial pass.
-                            _whisper_ref = await _ref_pretask
-                            _ref_pretask = None
-                            logger.info(
-                                "[%s] Hybrid timing: PRE-FETCHED Whisper-EN "
-                                "reference consumed (%d cue(s)) — its decode "
-                                "ran concurrently with translation", job_id,
-                                len(_whisper_ref or []))
-                        else:
-                            _whisper_ref = await _get_whisper_en_timing_reference(
-                                getattr(job, "file_path", None), source_lang,
-                                [s.model_dump() if hasattr(s, "model_dump") else dict(s)
-                                 for s in _trans_input] if _trans_input else None,
-                                job_id, translated_cues=_llm_cues)
-                        _tiers = project_hybrid_timings(
-                            _llm_cues, whisper_en_segments=_whisper_ref,
-                            source_cues=list(_trans_input) if _trans_input else None,
-                            margin_s=float(getattr(settings, "HYBRID_ALIGN_MARGIN_S", 2.0)),
-                            min_anchor_ratio=float(getattr(settings, "HYBRID_MIN_ANCHOR_RATIO", 0.30)),
-                        )
-                        translated = _llm_cues
-                        logger.info(
-                            "[%s] Hybrid timing projected: tier A (Whisper-EN)=%d, "
-                            "tier B=%d, tier C=%d of %d cue(s); %d B/C cue(s) placed "
-                            "on the real Whisper-EN voiced timeline (audio-anchored, "
-                            "not char-proportional)",
-                            job_id, _tiers["tier_a"], _tiers["tier_b"],
-                            _tiers["tier_c"], _tiers["total"],
-                            _tiers.get("ref_anchored", 0))
-                    except Exception as _hy_err:
-                        logger.warning(
-                            "[%s] Hybrid word-timing projection failed (%s) — keeping "
-                            "LLM cues whole", job_id, _hy_err)
-
-                    # ── Forced-align the ENGLISH cues against the audio ──
-                    # The tiers above give roughly half the cues real audio word
-                    # times; the rest are spread across the cue window by
-                    # character width. Those fabricated times cost three things
-                    # at once: per-word highlighting advances by text length
-                    # instead of speech, the readability splitter refuses to cut
-                    # a cue it has no real word time for (so over-long cues ship
-                    # whole), and the cue's own start cannot be tightened onto
-                    # its first voiced word — which is why a cue can appear
-                    # before the speech it captions.
-                    #
-                    # CTC forced alignment fixes all three at the source: it is
-                    # the one step that yields true per-word onsets for EVERY
-                    # cue. It runs on the translated (English) track, which the
-                    # torchaudio wav2vec2 backend supports directly, and is
-                    # fail-soft — no backend or no audio leaves timings as-is.
-                    try:
-                        from backend.services.forced_aligner import align_translated_cues
-                        # Hand the aligner the DEMUXED wav, never the container.
-                        # torchaudio can only open an mp4 through its ffmpeg
-                        # backend, and the GPU image builds FFmpeg 7.1
-                        # (libavutil.so.59) which torchaudio 2.5.1 does not know
-                        # how to load — so the container decode raises, the pass
-                        # returns zeroes, and the whole alignment silently does
-                        # nothing on exactly the image this runs on. Every other
-                        # audio consumer here demuxes first; this is the sibling
-                        # wav the extraction stage already wrote (16 kHz mono),
-                        # which also avoids materialising ~550 MB of float32 for
-                        # a 24-minute stereo track.
-                        _fa_video = getattr(job, "file_path", None) or ""
-                        _fa_wav = os.path.join(
-                            os.path.dirname(_fa_video) or ".", "audio.wav")
-                        _fa_path = _fa_wav if os.path.isfile(_fa_wav) else _fa_video
-                        if _fa_path and translated:
-                            _fa = await asyncio.to_thread(
-                                align_translated_cues, _fa_path, translated)
-                            if _fa.get("cues_aligned"):
-                                logger.info(
-                                    "[%s] Cue alignment: %d/%d cue(s) force-aligned "
-                                    "to the audio via %s — %d word(s), mean shift "
-                                    "%.0f ms, %d cue start(s) tightened onto their "
-                                    "first voiced word, %d end(s) extended to the "
-                                    "voiced extent (%.0f s)",
-                                    job_id, _fa["cues_aligned"], len(translated),
-                                    _fa.get("backend"), _fa["words_aligned"],
-                                    _fa.get("mean_shift_ms", 0.0),
-                                    _fa.get("starts_tightened", 0),
-                                    _fa.get("ends_extended", 0),
-                                    _fa.get("elapsed_s", 0.0))
-                            elif _fa.get("enabled"):
-                                logger.info(
-                                    "[%s] Cue alignment: backend %s ready but no cue "
-                                    "aligned — keeping projected word timings",
-                                    job_id, _fa.get("backend"))
-                    except Exception as _fa_err:
-                        logger.info(
-                            "[%s] Cue forced alignment skipped (%s) — keeping "
-                            "projected word timings", job_id, _fa_err)
+                    "1:1 and inherit the source's word-timed boundaries", job_id)
             elif getattr(settings, "SENTENCE_SEGMENTATION_ENABLED", True) and not _pre_resegmented:
                 try:
                     from backend.services.sentence_segmenter import resegment_by_sentence
@@ -4506,6 +4393,125 @@ async def _background_post_processing(
                                 job_id, _pre_seg, len(translated))
                 except Exception as _rs_err:
                     logger.warning("[%s] Translated resegmentation failed (%s)", job_id, _rs_err)
+            # ── (c-hybrid) Timing refinement — EVERY translation path ──
+            # Runs regardless of which engine produced the text: the LLM
+            # path's cues carry no word timing at all, and the NMT/whisper-
+            # native fallbacks previously shipped with ZERO refinement
+            # because this block was gated on _used_llm — a fallback run got
+            # no per-word highlight timing, no run-on splitting, and no CTC
+            # start-tightening. Timing parity is enforced by this machinery,
+            # not by the translator, so it must not depend on the translator.
+            # ── (c-hybrid) Project audio-aligned word timings onto the LLM text ──
+            # The LLM gives faithful English but NO timing. Get Whisper's
+            # native English word timestamps as a TIMING REFERENCE (its text is
+            # discarded) and project them onto the LLM cues via same-language
+            # EN↔EN alignment (tier A); fall back to the 1:1 source cue's word
+            # pauses (tier B); else keep the cue whole (tier C). Cues that gain
+            # word timing can then be split at REAL audio pauses below.
+            if getattr(settings, "HYBRID_WORD_TIMING_ENABLED", True):
+                try:
+                    from backend.services.subtitle_aligner import project_hybrid_timings
+                    from backend.models import TranscriptSegment as _TSh
+                    _llm_cues = [
+                        t if isinstance(t, _TSh)
+                        else _TSh(**(t.model_dump() if hasattr(t, "model_dump") else t))
+                        for t in translated
+                    ]
+                    if _ref_pretask is not None:
+                        # Started before the LLM loop — by now the decode
+                        # normally finished minutes ago; awaiting is a
+                        # no-op join, not a serial pass.
+                        _whisper_ref = await _ref_pretask
+                        _ref_pretask = None
+                        logger.info(
+                            "[%s] Hybrid timing: PRE-FETCHED Whisper-EN "
+                            "reference consumed (%d cue(s)) — its decode "
+                            "ran concurrently with translation", job_id,
+                            len(_whisper_ref or []))
+                    else:
+                        _whisper_ref = await _get_whisper_en_timing_reference(
+                            getattr(job, "file_path", None), source_lang,
+                            [s.model_dump() if hasattr(s, "model_dump") else dict(s)
+                             for s in _trans_input] if _trans_input else None,
+                            job_id, translated_cues=_llm_cues)
+                    _tiers = project_hybrid_timings(
+                        _llm_cues, whisper_en_segments=_whisper_ref,
+                        source_cues=list(_trans_input) if _trans_input else None,
+                        margin_s=float(getattr(settings, "HYBRID_ALIGN_MARGIN_S", 2.0)),
+                        min_anchor_ratio=float(getattr(settings, "HYBRID_MIN_ANCHOR_RATIO", 0.30)),
+                    )
+                    translated = _llm_cues
+                    logger.info(
+                        "[%s] Hybrid timing projected: tier A (Whisper-EN)=%d, "
+                        "tier B=%d, tier C=%d of %d cue(s); %d B/C cue(s) placed "
+                        "on the real Whisper-EN voiced timeline (audio-anchored, "
+                        "not char-proportional)",
+                        job_id, _tiers["tier_a"], _tiers["tier_b"],
+                        _tiers["tier_c"], _tiers["total"],
+                        _tiers.get("ref_anchored", 0))
+                except Exception as _hy_err:
+                    logger.warning(
+                        "[%s] Hybrid word-timing projection failed (%s) — keeping "
+                        "LLM cues whole", job_id, _hy_err)
+
+                # ── Forced-align the ENGLISH cues against the audio ──
+                # The tiers above give roughly half the cues real audio word
+                # times; the rest are spread across the cue window by
+                # character width. Those fabricated times cost three things
+                # at once: per-word highlighting advances by text length
+                # instead of speech, the readability splitter refuses to cut
+                # a cue it has no real word time for (so over-long cues ship
+                # whole), and the cue's own start cannot be tightened onto
+                # its first voiced word — which is why a cue can appear
+                # before the speech it captions.
+                #
+                # CTC forced alignment fixes all three at the source: it is
+                # the one step that yields true per-word onsets for EVERY
+                # cue. It runs on the translated (English) track, which the
+                # torchaudio wav2vec2 backend supports directly, and is
+                # fail-soft — no backend or no audio leaves timings as-is.
+                try:
+                    from backend.services.forced_aligner import align_translated_cues
+                    # Hand the aligner the DEMUXED wav, never the container.
+                    # torchaudio can only open an mp4 through its ffmpeg
+                    # backend, and the GPU image builds FFmpeg 7.1
+                    # (libavutil.so.59) which torchaudio 2.5.1 does not know
+                    # how to load — so the container decode raises, the pass
+                    # returns zeroes, and the whole alignment silently does
+                    # nothing on exactly the image this runs on. Every other
+                    # audio consumer here demuxes first; this is the sibling
+                    # wav the extraction stage already wrote (16 kHz mono),
+                    # which also avoids materialising ~550 MB of float32 for
+                    # a 24-minute stereo track.
+                    _fa_video = getattr(job, "file_path", None) or ""
+                    _fa_wav = os.path.join(
+                        os.path.dirname(_fa_video) or ".", "audio.wav")
+                    _fa_path = _fa_wav if os.path.isfile(_fa_wav) else _fa_video
+                    if _fa_path and translated:
+                        _fa = await asyncio.to_thread(
+                            align_translated_cues, _fa_path, translated)
+                        if _fa.get("cues_aligned"):
+                            logger.info(
+                                "[%s] Cue alignment: %d/%d cue(s) force-aligned "
+                                "to the audio via %s — %d word(s), mean shift "
+                                "%.0f ms, %d cue start(s) tightened onto their "
+                                "first voiced word, %d end(s) extended to the "
+                                "voiced extent (%.0f s)",
+                                job_id, _fa["cues_aligned"], len(translated),
+                                _fa.get("backend"), _fa["words_aligned"],
+                                _fa.get("mean_shift_ms", 0.0),
+                                _fa.get("starts_tightened", 0),
+                                _fa.get("ends_extended", 0),
+                                _fa.get("elapsed_s", 0.0))
+                        elif _fa.get("enabled"):
+                            logger.info(
+                                "[%s] Cue alignment: backend %s ready but no cue "
+                                "aligned — keeping projected word timings",
+                                job_id, _fa.get("backend"))
+                except Exception as _fa_err:
+                    logger.info(
+                        "[%s] Cue forced alignment skipped (%s) — keeping "
+                        "projected word timings", job_id, _fa_err)
 
             # A pre-fetched timing reference no branch consumed (whisper-native
             # or NMT engine won, or the hybrid block errored before the join):
