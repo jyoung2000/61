@@ -811,3 +811,74 @@ def test_katakana_terms_keep_their_phonetic_respellings():
     from backend.services.canonical_names import _sanitize_mapping
     out = _sanitize_mapping({"ヒイロ": "Heero"}, ["ヒイロ"])
     assert out.get("ヒイロ") == "Heero"
+
+
+_WIKI_FIXTURE = """
+The story follows Heero Yuy, a pilot trained by Doctor J. Along the way Heero Yuy
+meets Relena Darlian, who later learns she is Relena Peacecraft. The pilot Zechs
+Merquise, brother of Relena Darlian, flies the Tallgeese. Other pilots include
+Duo Maxwell, Trowa Barton, Quatre Raberba Winner and Chang Wufei. The mass-produced
+Leo and the aerial Aries are fielded by OZ under Treize Khushrenada. Lady Une
+serves Treize Khushrenada. The Gundam Deathscythe is flown by Duo Maxwell, and
+the Sandrock by Quatre Raberba Winner. Later the Aries and the Leo appear again
+when Zechs Merquise attacks. In battle Chang Wufei pilots the Shenlong.
+The series aired in March and April.
+"""
+
+
+def test_glossary_mining_finds_cast_and_skips_wiki_prose():
+    from backend.services.canonical_names import _mine_glossary_names
+    names = _mine_glossary_names(_WIKI_FIXTURE)
+    joined = " ".join(names)
+    assert "Heero Yuy" in names
+    assert "Relena Darlian" in names
+    assert "Aries" in names and "Leo" in names
+    assert "March" not in joined and "April" not in joined
+
+
+def test_glossary_snaps_misspelled_values_to_official_forms():
+    # The measured knowledge ceiling: the model identifies Gundam Wing every
+    # run but ships "Hero", "Dorian", "Aires". Spelling is retrieval.
+    from backend.services.canonical_names import (
+        _apply_glossary_spellings, _glossary_resolve_terms, _mine_glossary_names)
+    names = _mine_glossary_names(_WIKI_FIXTURE)
+    snapped, n = _apply_glossary_spellings(
+        {"ヒーロ": "Hero", "ドーリアン": "Dorian", "エアリーズ": "Aires",
+         "ゼクス": "Zechs"}, names)
+    assert snapped["ヒーロ"] == "Heero"
+    assert snapped["ドーリアン"] == "Darlian"
+    assert snapped["エアリーズ"] == "Aries"
+    assert snapped["ゼクス"] == "Zechs"        # nothing close → untouched
+    assert n == 3
+    # A term the model never answered resolves phonetically from the glossary.
+    assert _glossary_resolve_terms(["カトル"], names) == {"カトル": "Quatre"}
+
+
+def test_vowel_heavy_katakana_passes_the_sound_gate_by_skeleton():
+    # earizu vs "Aires" scored 0.18 (under the 0.22 floor) and the gate dropped
+    # a correct-but-misspelled answer; the consonant skeleton (rz vs rs) is a
+    # class match, which now carries it.
+    from backend.services.canonical_names import _canonical_sounds_plausible as ok
+    assert ok("エアリーズ", "Aires")
+    assert ok("エアリーズ", "Aries")
+    assert not ok("エアリーズ", "Peacecraft")   # cross-name swap still dies
+
+
+def test_series_glossary_uses_durable_cache_without_network(tmp_path, monkeypatch):
+    import asyncio, json as _json
+    from backend.services import canonical_names as CN
+    p = tmp_path / "series_glossaries.json"
+    p.write_text(_json.dumps({"gundam wing": ["Heero Yuy", "Relena Darlian"]}))
+    monkeypatch.setattr(CN, "_GLOSSARY_STORE_PATH", str(p))
+    # No httpx call is possible in this test env — a cache hit must not need one.
+    names = asyncio.run(CN._get_series_glossary("Gundam Wing"))
+    assert names == ["Heero Yuy", "Relena Darlian"]
+
+
+def test_glossary_identity_entries_reach_roster_evidence(monkeypatch):
+    from backend.services import canonical_names as CN
+    CN._cache_put("glossary:jobX", {"Heero Yuy": "Heero Yuy"})
+    CN._publish_series_evidence("jobX", {"ゼクス": "Zechs"})
+    ev = dict(CN._CACHE.get("job:jobX") or {})
+    assert ev.get("ゼクス") == "Zechs"
+    assert ev.get("Heero Yuy") == "Heero Yuy"

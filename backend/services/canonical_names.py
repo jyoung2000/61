@@ -970,7 +970,25 @@ def _canonical_sounds_plausible(term: str, value: str) -> bool:
     # ship became a character in a shipped transcript.
     if _lead_class(romaji) != _lead_class(target):
         return False
-    return difflib.SequenceMatcher(None, romaji, target).ratio() >= 0.22
+    if difflib.SequenceMatcher(None, romaji, target).ratio() >= 0.22:
+        return True
+    # Vowel-heavy names can score under the ratio floor even when nearly
+    # right: earizu vs "Aires" is 0.18, so the gate dropped a correct-but-
+    # misspelled Aries and the mobile suit stayed garbled. Romanization
+    # preserves the CONSONANT skeleton far more faithfully than the vowels
+    # (which shift freely between systems), so compare that as a fallback —
+    # class-normalized, same groups as the lead check (r/l, s/z, k/c/q…).
+    sk_r = _consonant_skeleton(romaji)
+    sk_t = _consonant_skeleton(target)
+    return bool(sk_r and sk_t
+                and difflib.SequenceMatcher(None, sk_r, sk_t).ratio() >= 0.6)
+
+
+def _consonant_skeleton(s: str) -> str:
+    """The consonants of ``s`` reduced to sound classes ("earizu" → "rs",
+    "aires" → "rs"), so romanization vowel drift can't hide a match."""
+    return "".join(_lead_class(c) for c in (s or "")
+                   if c.isalpha() and c.lower() not in "aeiouwy")
 
 
 def _lead_class(s: str) -> str:
@@ -1212,6 +1230,33 @@ async def _resolve_remaining_terms(
     series = str(data.get("series") or "").strip()
     mappings = data.get("mappings")
     extra = _sanitize_mapping(mappings, remaining) if isinstance(mappings, dict) else {}
+    # Series identified → pull the OFFICIAL spellings and snap everything to
+    # them. The model names the show correctly but misspells its cast (a
+    # measured knowledge ceiling: "Hero", "Dorian", "Aires" four runs in a
+    # row); spelling is retrieval, so retrieve.
+    if series:
+        try:
+            _gnames = await _get_series_glossary(series, job_id)
+        except Exception:
+            _gnames = []
+        if _gnames:
+            _cache_put(f"glossary:{job_id}",
+                       {n: n for n in _gnames[:60]})
+            extra, _n_fix1 = _apply_glossary_spellings(extra, _gnames)
+            _res_fix, _n_fix2 = _apply_glossary_spellings(resolved, _gnames)
+            if _n_fix2:
+                resolved.clear()
+                resolved.update(_res_fix)
+            _still = [t for t in remaining if t not in extra]
+            _direct = _glossary_resolve_terms(_still, _gnames)
+            if _direct:
+                extra.update(_direct)
+            if _n_fix1 or _n_fix2 or _direct:
+                logger.info(
+                    "[%s] canonical names: glossary enforced official "
+                    "spellings — %d respelled, %d resolved directly from "
+                    "the glossary", job_id or "-", _n_fix1 + _n_fix2,
+                    len(_direct))
     if extra:
         logger.info(
             "[%s] canonical names: second chance resolved %d/%d leftover "
@@ -1225,6 +1270,205 @@ async def _resolve_remaining_terms(
             "term(s)%s", job_id or "-", len(remaining),
             f" (series identified as {series!r})" if series else "")
     return extra
+
+
+# ── Authoritative series glossary ─────────────────────────────────────────
+# The local models reliably IDENTIFY the series ("Gundam Wing") but cannot
+# SPELL its names — qwen2.5:14b shipped "Hero Yu", "Dorian", "Kato" and
+# "Aires" across four consecutive runs while naming the show correctly every
+# time. Spelling is retrieval, not generation: once the series is known, one
+# small Wikipedia fetch yields the official English spellings, cached in a
+# mount-backed store so it happens at most once per series ever. Fail-soft
+# throughout — no network, no glossary, names stay model-resolved.
+
+_GLOSSARY_STORE_PATH = os.path.join(
+    "/data/logs" if os.path.isdir("/data/logs") else
+    os.path.join(os.path.expanduser("~"), ".clipai"),
+    "series_glossaries.json")
+
+_GLOSSARY_NAME_RE = re.compile(
+    r"\b([A-Z][a-zA-Zà-ÿ'\-]{2,}(?:\s+[A-Z][a-zA-Zà-ÿ'\-]{2,}){0,2})\b")
+
+# Wiki-prose capitalized words that are never character/mecha names. The
+# roster word lists cover most ordinary vocabulary; these are the leftovers
+# specific to encyclopedia text.
+_WIKI_STOP = frozenset("""
+january february march april may june july august september october november
+december wikipedia english japanese japan america american north south west
+east press media network animation studio director producer writer episode
+episodes series season seasons volume volumes chapter chapters manga anime
+television film movie ova soundtrack theme opening ending release released
+adaptation adapted broadcast aired  original story plot character characters
+list history production reception development staff cast voice actor actress
+""".split())
+
+
+def _glossary_store_load() -> dict:
+    try:
+        with open(_GLOSSARY_STORE_PATH, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _glossary_store_save(store: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(_GLOSSARY_STORE_PATH), exist_ok=True)
+        with open(_GLOSSARY_STORE_PATH, "w", encoding="utf-8") as fh:
+            json.dump(store, fh, ensure_ascii=False, indent=1)
+    except Exception as e:
+        logger.debug("glossary store save failed: %s", e)
+
+
+def _mine_glossary_names(text: str, cap: int = 80) -> list[str]:
+    """TitleCase runs that read as proper names, most-frequent first.
+
+    Mid-sentence occurrences only (sentence-initial capitalization proves
+    nothing), ordinary/wiki words excluded, and a name must recur — an
+    article mentions its cast constantly, so a once-only TitleCase run is
+    prose, not a name."""
+    counts: dict[str, int] = {}
+    for m in _GLOSSARY_NAME_RE.finditer(text or ""):
+        s = m.group(1).strip()
+        words = [w.lower() for w in s.split()]
+        if all(w in _ROSTER_SAFE_WORDS or w in _ROSTER_COMMON_WORDS
+               or w in _WIKI_STOP for w in words):
+            continue
+        i = m.start()
+        prev = (text[max(0, i - 2):i] or "").strip()
+        if i == 0 or (prev and prev[-1:] in ".!?:=\n"):
+            continue
+        counts[s] = counts.get(s, 0) + 1
+    ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    return [n for n, c in ranked if c >= 2][:cap]
+
+
+async def _get_series_glossary(series: str, job_id: str = "") -> list[str]:
+    """Official-spelling name list for ``series`` — durable-cached, one
+    Wikipedia API round-trip per series ever. Empty on any failure (and
+    failures are never cached, so a flaky network can retry next run)."""
+    key = (series or "").strip().lower()
+    if not key:
+        return []
+    store = _glossary_store_load()
+    if isinstance(store.get(key), list) and store[key]:
+        return list(store[key])
+    texts: list[str] = []
+    try:
+        import httpx
+        async with httpx.AsyncClient(
+                timeout=8.0,
+                headers={"User-Agent": "ClipAI/1.0 (subtitle glossary)"}) as cl:
+            for q in (f"List of {series} characters", series):
+                r = await cl.get(
+                    "https://en.wikipedia.org/w/api.php",
+                    params={"action": "opensearch", "search": q,
+                            "limit": "1", "format": "json"})
+                if r.status_code != 200:
+                    continue
+                titles = (r.json() or [None, []])[1] or []
+                if not titles:
+                    continue
+                r2 = await cl.get(
+                    "https://en.wikipedia.org/w/api.php",
+                    params={"action": "query", "prop": "extracts",
+                            "explaintext": "1", "redirects": "1",
+                            "format": "json", "titles": titles[0]})
+                if r2.status_code != 200:
+                    continue
+                pages = ((r2.json().get("query") or {}).get("pages") or {})
+                for p in pages.values():
+                    ex = (p.get("extract") or "")[:80000]
+                    if ex:
+                        texts.append(ex)
+    except Exception as e:
+        logger.info("[%s] series glossary fetch failed (%s) — names stay "
+                    "model-resolved", job_id or "-", e)
+        return []
+    names = _mine_glossary_names("\n".join(texts)) if texts else []
+    if names:
+        store[key] = names
+        _glossary_store_save(store)
+        logger.info(
+            "[%s] series glossary: %d authoritative name(s) for %r cached "
+            "(e.g. %s)", job_id or "-", len(names), series,
+            ", ".join(names[:6]))
+    return names
+
+
+def _glossary_tokens(glossary: list[str]) -> list[str]:
+    """Individual name tokens plus full multi-word names, deduped."""
+    toks: list[str] = []
+    seen: set[str] = set()
+    for name in glossary or []:
+        for tok in name.split():
+            tl = tok.lower()
+            if len(tok) >= 3 and tl not in seen:
+                seen.add(tl)
+                toks.append(tok)
+        nl = name.lower()
+        if " " in name and nl not in seen:
+            seen.add(nl)
+            toks.append(name)
+    return toks
+
+
+def _apply_glossary_spellings(
+        mapping: dict[str, str], glossary: list[str]) -> tuple[dict[str, str], int]:
+    """Snap mapping VALUES onto authoritative glossary spellings.
+
+    Only a near-variant is touched (similarity ≥ 0.72): the model already
+    said essentially the right name with the wrong letters ("Hero"→"Heero",
+    "Dorian"→"Darlian", "Aires"→"Aries"). A value that is already a glossary
+    spelling, or that resembles nothing in the glossary, is left alone — the
+    glossary corrects spelling, it never re-answers identity."""
+    toks = _glossary_tokens(glossary)
+    if not mapping or not toks:
+        return dict(mapping or {}), 0
+    out = dict(mapping)
+    fixed = 0
+    tok_lower = {t.lower() for t in toks}
+    for src, val in mapping.items():
+        if (val or "").lower() in tok_lower:
+            continue
+        nv = _normalize(val)
+        best, best_r = None, 0.0
+        for tok in toks:
+            r = difflib.SequenceMatcher(None, nv, _normalize(tok)).ratio()
+            if r > best_r:
+                best, best_r = tok, r
+        if best is not None and best_r >= 0.72:
+            out[src] = best
+            fixed += 1
+            logger.info(
+                "canonical names: glossary respelled %r → %r (was %r, "
+                "similarity %.2f)", src, best, val, best_r)
+    return out, fixed
+
+
+def _glossary_resolve_terms(
+        terms: list[str], glossary: list[str]) -> dict[str, str]:
+    """Resolve still-unanswered KATAKANA terms straight from the glossary by
+    phonetics — retrieval where the model had no answer at all. Conservative:
+    the winner must pass the phonetic gate and beat the runner-up clearly."""
+    toks = [t for t in _glossary_tokens(glossary) if " " not in t]
+    out: dict[str, str] = {}
+    for term in terms or []:
+        romaji = _normalize(_kana_to_romaji(term))
+        if not romaji or romaji == _normalize(term):
+            continue                       # Latin-script term — not phonetics' call
+        scored = []
+        for tok in toks:
+            if not _canonical_sounds_plausible(term, tok):
+                continue
+            r = difflib.SequenceMatcher(None, romaji, _normalize(tok)).ratio()
+            scored.append((r, tok))
+        scored.sort(reverse=True)
+        if scored and scored[0][0] >= 0.4 and (
+                len(scored) == 1 or scored[0][0] - scored[1][0] >= 0.1):
+            out[term] = scored[0][1]
+    return out
 
 
 def _publish_series_evidence(job_id: str, mapping: dict) -> None:
@@ -1245,7 +1489,15 @@ def _publish_series_evidence(job_id: str, mapping: dict) -> None:
     if not job_id or not mapping:
         return
     try:
-        _cache_put(f"job:{job_id}", dict(mapping))
+        merged = dict(mapping)
+        # Glossary names ride along as identity entries so the roster pass's
+        # known-names corroboration accepts corrections whose RIGHT side is
+        # an official spelling the mined terms never surfaced ("Hero Yu" →
+        # "Heero Yuy" needs "Heero Yuy" in the evidence set to survive
+        # vetting). Identity entries add evidence, never rewrites.
+        for n in (_CACHE.get(f"glossary:{job_id}") or {}).values():
+            merged.setdefault(n, n)
+        _cache_put(f"job:{job_id}", merged)
     except Exception:
         pass
 
