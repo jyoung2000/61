@@ -328,7 +328,8 @@ def _clip_to_gap(seg: dict, gap: tuple[float, float], pad_s: float,
 
 
 def _repair_stem_times(segs: list, stem_dur: float,
-                       pad_s: float = 0.0) -> tuple[list, int]:
+                       pad_s: float = 0.0,
+                       voiced: Optional[list] = None) -> tuple[list, int]:
     """Give decoded segments usable STEM-RELATIVE times when the decode
     returned degenerate ones.
 
@@ -352,7 +353,15 @@ def _repair_stem_times(segs: list, stem_dur: float,
     and a short first/last segment placed wholly inside a pad would be
     culled as a boundary re-hearing — dropping exactly the line the repair
     exists to save. Weighted by text length (the char-proportional model
-    used everywhere else in the pipeline). Returns ``(segs, n_repaired)``."""
+    used everywhere else in the pipeline).
+
+    ``voiced`` (optional) is the span's VAD voice intervals in STEM-RELATIVE
+    seconds. When provided, the char-weight timeline is distributed across
+    the CONCATENATED voiced intervals instead of the flat interior, so a
+    repaired cue — and the active-word skeleton later derived from it —
+    sits on audible speech rather than straddling silence. Fail-soft: too
+    little voiced audio (< 0.3 s inside the interior) falls back to the
+    flat interior. Returns ``(segs, n_repaired)``."""
     if not segs or stem_dur <= 0.2:
         return segs, 0
 
@@ -367,16 +376,46 @@ def _repair_stem_times(segs: list, stem_dur: float,
     lo, hi = inset, stem_dur - inset
     if hi - lo <= 0.2:
         lo, hi = 0.0, stem_dur
+
+    # Anchor to VAD voice intervals (clipped to the interior, merged) when
+    # they cover enough audio to be trustworthy; otherwise the flat interior.
+    clipped: list[tuple[float, float]] = []
+    for v in voiced or []:
+        try:
+            vs, ve = max(float(v[0]), lo), min(float(v[1]), hi)
+        except (TypeError, ValueError, IndexError):
+            continue
+        if ve - vs >= 0.1:
+            clipped.append((vs, ve))
+    spans: list[list[float]] = []
+    for vs, ve in sorted(clipped):
+        if spans and vs <= spans[-1][1]:
+            spans[-1][1] = max(spans[-1][1], ve)
+        else:
+            spans.append([vs, ve])
+    voiced_total = sum(ve - vs for vs, ve in spans)
+    if voiced_total < 0.3:
+        spans = [[lo, hi]]
+        voiced_total = hi - lo
+
+    def _at(t: float) -> float:
+        """Position ``t`` on the concatenated voiced timeline → stem time."""
+        for vs, ve in spans:
+            if t <= (ve - vs) + 1e-9:
+                return vs + t
+            t -= ve - vs
+        return spans[-1][1]
+
     weights = [max(1, len(_seg_text(s))) for s in segs]
     total = float(sum(weights))
     out = []
-    cursor = lo
+    cursor = 0.0
     for s, w in zip(segs, weights):
         d = dict(s)
-        span = (hi - lo) * (w / total)
-        d["start"] = round(cursor, 3)
-        d["end"] = round(min(hi, cursor + span), 3)
-        cursor = d["end"]
+        nxt = min(voiced_total, cursor + voiced_total * (w / total))
+        d["start"] = round(_at(cursor), 3)
+        d["end"] = round(max(_at(nxt), d["start"]), 3)
+        cursor = nxt
         out.append(d)
     return out, len(out)
 
@@ -707,7 +746,19 @@ async def recover_gap_dialogue(
             # distributed across them instead of a guaranteed "no-times" cull
             # — the measured failure mode was EVERY relisten segment arriving
             # timeless, which silently kept both known transcript holes open.
-            segs, _sp_repaired = _repair_stem_times(segs, dur, pad_s=pad)
+            # Stem-relative VAD intervals for this span: repaired times land
+            # on audible speech, not distributed across silence.
+            _stem_voice = []
+            for _v in _voice:
+                try:
+                    _vs = max(float(_v[0]), gap[0]) - gap[0]
+                    _ve = min(float(_v[1]), gap[1]) - gap[0]
+                except (TypeError, ValueError, IndexError):
+                    continue
+                if _ve > _vs:
+                    _stem_voice.append((_vs, _ve))
+            segs, _sp_repaired = _repair_stem_times(
+                segs, dur, pad_s=pad, voiced=_stem_voice)
             if _sp_repaired:
                 n_times_repaired += _sp_repaired
             _sp_kept = _sp_clip = _sp_junk = _sp_nospeech = _sp_notimes = 0

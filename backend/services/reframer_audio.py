@@ -362,6 +362,54 @@ def _wait_for_sibling_audio(final_path: str, part_path: str,
     return os.path.isfile(final_path) and os.path.getsize(final_path) > 1024
 
 
+def _absolutize_slice_segment(seg: dict, ss: float, dur: float) -> bool:
+    """Shift a slice-decoded segment's timestamps to ABSOLUTE video time, on
+    BOTH schemas, and attest it lies inside its own slice.
+
+    ``transcribe_wav`` returns the local schema (``start``/``end``); this
+    function used to shift ``start_sec``/``end_sec`` — keys those dicts don't
+    carry. Every recovered segment came out with ``start_sec == end_sec ==
+    ss`` (a zero-width phantom) while the REAL ``start``/``end`` stayed
+    slice-relative — so consumers preferring ``start`` placed the recovered
+    press-scrum lines at 0:00-0:13 of the video, subtitles rendering over
+    pure silence at the head of the timeline. The words, shifted with the
+    correct keys, disagreed with their own cue.
+
+    Writes ``start``/``end`` AND ``start_sec``/``end_sec`` as the same
+    absolute values (word rows too). Returns False when the shifted segment
+    still doesn't lie within its slice (±1.5s) — a mistimed decode must be
+    dropped, never shipped somewhere it doesn't belong."""
+    try:
+        s0 = float(seg.get('start', seg.get('start_sec', 0.0)) or 0.0)
+        e0 = float(seg.get('end', seg.get('end_sec', s0)) or s0)
+    except (TypeError, ValueError):
+        return False
+    if e0 < s0:
+        return False
+    # A decode already carrying plausible ABSOLUTE times (some engines return
+    # them) must not be double-shifted: only slice-relative values (inside
+    # [0, dur] with tolerance) get the offset.
+    if -1.0 <= s0 <= dur + 1.5:
+        s0, e0 = s0 + ss, e0 + ss
+    a, b = round(s0, 3), round(e0, 3)
+    if not (ss - 1.5 <= a and b <= ss + dur + 1.5):
+        return False
+    if b - a < 0.05:
+        return False
+    seg['start'] = seg['start_sec'] = a
+    seg['end'] = seg['end_sec'] = b
+    for w in seg.get('words') or []:
+        for k in ('start', 'end'):
+            try:
+                v = float(w.get(k))
+            except (TypeError, ValueError):
+                continue
+            if -1.0 <= v <= dur + 1.5:
+                v += ss
+            w[k] = round(min(max(v, a), b), 3)
+    return True
+
+
 def _gap_boost_af_args() -> list:
     """FFmpeg ``-af`` arguments that lift quiet / off-mic speech in a gap
     slice before the retry decode: high-pass out the rumble, denoise, then
@@ -2894,13 +2942,12 @@ class AudioIntelligence:
                         continue
                     if (whisper_lang and _wrong_script_for_language(text, whisper_lang)):
                         continue
-                    # Shift slice-relative timestamps back to absolute video time.
-                    seg['start_sec'] = round(float(seg.get('start_sec', 0) or 0) + ss, 3)
-                    seg['end_sec'] = round(float(seg.get('end_sec', 0) or 0) + ss, 3)
-                    for w in seg.get('words') or []:
-                        for k in ('start', 'end'):
-                            if isinstance(w.get(k), (int, float)):
-                                w[k] = round(w[k] + ss, 3)
+                    if not _absolutize_slice_segment(seg, ss, dur):
+                        log.log_stage('AUDIO',
+                            'Gap recovery: dropped a mistimed recovered cue '
+                            f'({text[:32]!r} outside its own slice '
+                            f'{ss:.1f}-{ss + dur:.1f}s)')
+                        continue
                     seg['source'] = 'gap_recovery'
                     seg['text'] = _collapse_repeated_phrases(text)
                     out.append(seg)

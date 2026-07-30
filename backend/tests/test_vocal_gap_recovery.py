@@ -508,3 +508,64 @@ def test_repair_stem_times_distributes_inside_the_pad_trimmed_interior():
         s2["start"] += gap[0]
         s2["end"] += gap[0]
         assert _clip_to_gap(s2, gap, 2.0, existing=existing) is not None
+
+
+def test_repair_stem_times_anchors_to_vad_voice_intervals():
+    # With the span's VAD intervals in hand, repaired times land ON the
+    # voiced audio instead of straddling silence — the cue (and the
+    # active-word skeleton later derived from it) sits where the voice is.
+    from backend.services.vocal_gap_recovery import _repair_stem_times
+    segs = [{"start": 0.0, "end": 0.0, "text": "短い"},
+            {"start": 0.0, "end": 0.0, "text": "こちらは長い台詞でありますから"}]
+    # Voice only at 3-5s and 8-11s of a 14s stem; the rest is silence.
+    out, n = _repair_stem_times(segs, 14.0, pad_s=2.0,
+                                voiced=[(3.0, 5.0), (8.0, 11.0)])
+    assert n == 2
+    voiced = [(3.0, 5.0), (8.0, 11.0)]
+
+    def _on_voice(t):
+        return any(vs - 1e-6 <= t <= ve + 1e-6 for vs, ve in voiced)
+
+    for s in out:
+        assert _on_voice(s["start"]), s
+        assert _on_voice(s["end"]), s
+    # Ordered and non-overlapping on the concatenated voiced timeline.
+    assert out[0]["start"] < out[0]["end"] <= out[1]["start"] < out[1]["end"]
+    # First (short) line fits inside the first interval; the long one gets
+    # the larger share, spilling into the second interval.
+    assert out[0]["end"] <= 5.0 + 1e-6
+    assert out[1]["end"] > 8.0
+
+
+def test_repair_stem_times_vad_intervals_are_clipped_to_the_interior():
+    # Voice inside the pads belongs to the NEIGHBORING cues by construction;
+    # anchoring a repaired line there would get it culled as a boundary
+    # re-hearing. Pad-overlapping intervals are trimmed to the interior.
+    from backend.services.vocal_gap_recovery import _repair_stem_times
+    segs = [{"start": 0.0, "end": 0.0, "text": "台詞がひとつだけあります"}]
+    out, n = _repair_stem_times(segs, 12.0, pad_s=2.0,
+                                voiced=[(0.0, 12.0)])
+    assert n == 1
+    assert out[0]["start"] >= 2.0 - 1e-6
+    assert out[0]["end"] <= 10.0 + 1e-6
+
+
+def test_repair_stem_times_falls_back_when_vad_is_empty_or_tiny():
+    # Fail-soft: no usable voiced audio inside the interior → the flat
+    # pad-trimmed interior distribution (the pre-VAD behavior), never a cull.
+    from backend.services.vocal_gap_recovery import _repair_stem_times
+    segs = [{"start": 0.0, "end": 0.0, "text": "了解"}]
+    flat, _ = _repair_stem_times(segs, 10.0, pad_s=2.0)
+    for voiced in ([], None, [(4.0, 4.1)], [("bad", None)]):
+        out, n = _repair_stem_times(
+            [dict(s) for s in segs], 10.0, pad_s=2.0, voiced=voiced)
+        assert n == 1
+        assert out[0]["start"] == flat[0]["start"]
+        assert out[0]["end"] == flat[0]["end"]
+
+
+def test_repair_stem_times_vad_never_touches_valid_decodes():
+    from backend.services.vocal_gap_recovery import _repair_stem_times
+    segs = [{"start": 0.5, "end": 2.0, "text": "exact"}]
+    out, n = _repair_stem_times(segs, 10.0, pad_s=2.0, voiced=[(5.0, 7.0)])
+    assert n == 0 and out is segs

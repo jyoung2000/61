@@ -559,3 +559,68 @@ def test_release_default_is_a_single_attempt(monkeypatch):
     ok, calls = _release_probe(monkeypatch, [409], wait_s=0.0)
     assert ok is False
     assert calls["n"] == 1, "no wait budget → one attempt, same as before"
+
+
+# ---------------------------------------------------------------------------
+# _absolutize_slice_segment — the 0:00 phantom-subtitle fix. Gap recovery
+# decodes a SLICE of the video; a measured run shifted start_sec/end_sec
+# (keys transcribe_wav output doesn't carry) so every recovered cue shipped
+# zero-width at the slice offset while its real start/end stayed
+# slice-relative — press-scrum lines rendered at 0:00-0:13 over silence.
+# ---------------------------------------------------------------------------
+
+def test_absolutize_shifts_slice_relative_times_onto_both_schemas():
+    seg = {"start": 1.2, "end": 3.4, "text": "了解",
+           "words": [{"word": "了解", "start": 1.2, "end": 3.4}]}
+    assert RA._absolutize_slice_segment(seg, ss=705.0, dur=17.0) is True
+    # BOTH schemas carry the same absolute times: every downstream consumer
+    # (start-preferring and start_sec-preferring alike) agrees on placement.
+    assert seg["start"] == seg["start_sec"] == 706.2
+    assert seg["end"] == seg["end_sec"] == 708.4
+    assert seg["words"][0]["start"] == 706.2
+    assert seg["words"][0]["end"] == 708.4
+
+
+def test_absolutize_does_not_double_shift_absolute_decodes():
+    # Some engines return absolute times already. A value far outside
+    # [0, dur] is absolute — shifting it again would land past the slice
+    # and (correctly) fail the containment attestation.
+    seg = {"start": 706.2, "end": 708.4, "text": "了解"}
+    assert RA._absolutize_slice_segment(seg, ss=705.0, dur=17.0) is True
+    assert seg["start"] == seg["start_sec"] == 706.2
+    assert seg["end"] == seg["end_sec"] == 708.4
+
+
+def test_absolutize_drops_a_decode_outside_its_own_slice():
+    # The attestation: a recovered cue must lie inside the slice it was
+    # decoded from (±1.5 s). A mistimed decode is dropped, never shipped
+    # somewhere else on the timeline.
+    seg = {"start": 40.0, "end": 44.0, "text": "phantom"}
+    assert RA._absolutize_slice_segment(seg, ss=705.0, dur=17.0) is False
+
+
+def test_absolutize_drops_zero_width_and_inverted_decodes():
+    assert RA._absolutize_slice_segment(
+        {"start": 2.0, "end": 2.0, "text": "x"}, ss=100.0, dur=10.0) is False
+    assert RA._absolutize_slice_segment(
+        {"start": 5.0, "end": 2.0, "text": "x"}, ss=100.0, dur=10.0) is False
+
+
+def test_absolutize_clamps_word_rows_into_the_cue():
+    # Word rows drive active-word highlighting: they must land inside their
+    # own cue after the shift, or the highlight disagrees with the subtitle.
+    seg = {"start": 1.0, "end": 4.0, "text": "a b",
+           "words": [{"word": "a", "start": 0.2, "end": 1.5},
+                     {"word": "b", "start": 3.9, "end": 6.0}]}
+    assert RA._absolutize_slice_segment(seg, ss=200.0, dur=10.0) is True
+    for w in seg["words"]:
+        assert seg["start"] <= w["start"] <= w["end"] <= seg["end"]
+
+
+def test_absolutize_legacy_start_sec_only_schema_still_works():
+    # Defensive: a caller feeding the OLD schema (start_sec/end_sec only)
+    # gets the same absolute result instead of a silent zero-width phantom.
+    seg = {"start_sec": 1.0, "end_sec": 2.5, "text": "x"}
+    assert RA._absolutize_slice_segment(seg, ss=50.0, dur=8.0) is True
+    assert seg["start"] == seg["start_sec"] == 51.0
+    assert seg["end"] == seg["end_sec"] == 52.5
