@@ -327,6 +327,45 @@ def _clip_to_gap(seg: dict, gap: tuple[float, float], pad_s: float,
     return out if out["end"] - out["start"] >= 0.3 else None
 
 
+def _repair_stem_times(segs: list, stem_dur: float) -> tuple[list, int]:
+    """Give decoded segments usable STEM-RELATIVE times when the decode
+    returned degenerate ones.
+
+    A measured run culled 86/86 recovered segments across two passes as
+    "no-times": the relisten decode heard real dialogue in every span
+    (連合本部に察知されていた, - 観戦の破片だろうがな! - 了解!) but each
+    segment came back with start == end, so `_seg_bounds` rejected it and
+    both known transcript holes stayed open. The TEXT is the recovery's
+    whole value and the stem is only a few seconds wide — approximate
+    placement beats discarding the line every time. Segments keep their
+    own times when the whole set is sane; otherwise the stem window is
+    distributed across them in order, weighted by text length (mirrors
+    the char-proportional model used everywhere else in the pipeline).
+    Returns ``(segs, n_repaired)``."""
+    if not segs or stem_dur <= 0.2:
+        return segs, 0
+
+    def _valid(s) -> bool:
+        b = _seg_bounds(s)
+        return (b is not None and b[0] >= -0.5
+                and b[1] <= stem_dur + 5.0 and b[1] - b[0] >= 0.05)
+
+    if all(_valid(s) for s in segs):
+        return segs, 0
+    weights = [max(1, len(_seg_text(s))) for s in segs]
+    total = float(sum(weights))
+    out = []
+    cursor = 0.0
+    for s, w in zip(segs, weights):
+        d = dict(s)
+        span = stem_dur * (w / total)
+        d["start"] = round(cursor, 3)
+        d["end"] = round(min(stem_dur, cursor + span), 3)
+        cursor = d["end"]
+        out.append(d)
+    return out, len(out)
+
+
 def _similar(a: str, b: str) -> float:
     a, b = (a or "").lower().strip(), (b or "").lower().strip()
     if not a or not b:
@@ -614,7 +653,7 @@ async def recover_gap_dialogue(
         # Culls are broken down BY REASON with samples: the very next run
         # decoded 44 segments across 15 spans and culled every one of them
         # behind a single opaque counter — undiagnosable from the log.
-        n_failed = n_empty = n_heard = 0
+        n_failed = n_empty = n_heard = n_times_repaired = 0
         n_cull_clip = n_cull_junk = n_cull_nospeech = n_cull_notimes = 0
         _cull_samples: list[str] = []
         # The FIRST stem pays the sidecar's cold-start (measured 11 s of model
@@ -649,6 +688,13 @@ async def recover_gap_dialogue(
                 _span_rows.append(f"{_span_lbl}=empty")
                 continue
             n_heard += 1
+            # Degenerate decode times (start == end) get the stem window
+            # distributed across them instead of a guaranteed "no-times" cull
+            # — the measured failure mode was EVERY relisten segment arriving
+            # timeless, which silently kept both known transcript holes open.
+            segs, _sp_repaired = _repair_stem_times(segs, dur)
+            if _sp_repaired:
+                n_times_repaired += _sp_repaired
             _sp_kept = _sp_clip = _sp_junk = _sp_nospeech = _sp_notimes = 0
             for s in segs:
                 _raw_txt = _seg_text(s)
@@ -702,6 +748,8 @@ async def recover_gap_dialogue(
                 _sp_bits.append(f"{_sp_nospeech} no-speech")
             if _sp_notimes:
                 _sp_bits.append(f"{_sp_notimes} no-times")
+            if _sp_repaired:
+                _sp_bits.append(f"{_sp_repaired} times-repaired")
             _span_rows.append(f"{_span_lbl}=" + "/".join(_sp_bits))
         if _span_rows:
             logger.info("[%s] %s: per-span outcomes: %s",
@@ -710,7 +758,9 @@ async def recover_gap_dialogue(
         _cull_detail = (
             f"{n_culled} culled ({n_cull_clip} outside-gap, {n_cull_junk} junk, "
             f"{n_cull_nospeech} no-speech, {n_cull_notimes} no-times"
-            + (f"; e.g. {'; '.join(_cull_samples)}" if _cull_samples else "") + ")")
+            + (f"; e.g. {'; '.join(_cull_samples)}" if _cull_samples else "") + ")"
+            + (f"; {n_times_repaired} degenerate decode time(s) repaired"
+               if n_times_repaired else ""))
         if recovered:
             logger.info(
                 "[%s] %s: %d cue(s) recovered from %s "

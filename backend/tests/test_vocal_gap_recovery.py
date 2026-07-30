@@ -439,3 +439,34 @@ def test_clip_to_gap_still_rejects_fully_outside_decodes():
                         gap, pad, existing=[]) is None
     assert _clip_to_gap({"start": 120.0, "end": 125.0, "text": "x"},
                         gap, pad, existing=[]) is None
+
+
+def test_repair_stem_times_distributes_degenerate_decodes():
+    # A measured run culled 86/86 recovered segments as "no-times": every
+    # relisten segment came back with start == end. The repair distributes
+    # the stem window by text weight so the recovered lines survive.
+    from backend.services.vocal_gap_recovery import _repair_stem_times
+    segs = [
+        {"start": 0.0, "end": 0.0, "text": "連合本部に察知されていた"},
+        {"start": 0.0, "end": 0.0, "text": "了解"},
+    ]
+    out, n = _repair_stem_times(segs, 10.0)
+    assert n == 2
+    assert out[0]["start"] == 0.0 and out[-1]["end"] == 10.0
+    assert out[0]["end"] == out[1]["start"]          # contiguous, ordered
+    assert out[0]["end"] - out[0]["start"] > out[1]["end"] - out[1]["start"]
+    # +gap[0] then produces in-gap absolute times → kept, not culled.
+    from backend.services.vocal_gap_recovery import _clip_to_gap
+    for s in out:
+        s2 = dict(s)
+        s2["start"] += 100.0
+        s2["end"] += 100.0
+        assert _clip_to_gap(s2, (100.0, 110.0), 2.0, existing=[]) is not None
+
+
+def test_repair_stem_times_leaves_valid_decodes_alone():
+    from backend.services.vocal_gap_recovery import _repair_stem_times
+    segs = [{"start": 0.5, "end": 2.0, "text": "a"},
+            {"start": 2.2, "end": 4.0, "text": "b"}]
+    out, n = _repair_stem_times(segs, 10.0)
+    assert n == 0 and out is segs
