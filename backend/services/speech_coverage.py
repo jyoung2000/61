@@ -202,3 +202,95 @@ def voice_activity_regions(audio_path: str,
         except (KeyError, TypeError, ValueError):
             continue
     return merge_intervals(regions)
+
+
+# ── Voice attestation: no subtitle over silent audio ───────────────────────
+
+# One VAD pass per audio file per process. The map is consulted at several
+# boundaries of the same job (inline relisten, persist-time attestation,
+# post-COMPLETE recovery) and each fresh pass decodes the full track — the
+# cache makes every consult after the first free. Keyed on (path, mtime,
+# size) so a re-extracted file re-computes. Failures are never cached: VAD
+# can become available mid-process (model download finishing).
+_VAD_CACHE: Dict[tuple, List[Interval]] = {}
+_VAD_CACHE_MAX = 8
+
+
+def voice_activity_regions_cached(audio_path: str, **kwargs) -> List[Interval]:
+    """``voice_activity_regions`` behind a per-file cache (see above)."""
+    import os
+    try:
+        st = os.stat(audio_path)
+        key = (os.path.abspath(audio_path), st.st_mtime_ns, st.st_size,
+               tuple(sorted(kwargs.items())))
+    except OSError:
+        return []
+    hit = _VAD_CACHE.get(key)
+    if hit is not None:
+        return list(hit)
+    regions = voice_activity_regions(audio_path, **kwargs)
+    if regions:
+        while len(_VAD_CACHE) >= _VAD_CACHE_MAX:
+            _VAD_CACHE.pop(next(iter(_VAD_CACHE)))
+        _VAD_CACHE[key] = list(regions)
+    return list(regions)
+
+
+def attest_cues_to_voice(rows: list, audio_path: str,
+                         min_overlap_s: float = 0.15,
+                         ) -> tuple[list, list]:
+    """Drop SPEECH cues that overlap no VAD-detected voice at all.
+
+    The final audio-truth gate before subtitles are persisted: a measured
+    run shipped an 11-cue block at 0:00-0:09 of the timeline — over pure
+    silence before the opening theme — because a translation-stage defect
+    manufactured cues with degenerate times and the formatter dutifully
+    packed them at the head. Wherever such a cue comes from (mistimed
+    recovery, orphan LLM output, decode hallucination over music), the one
+    property it cannot fake is voiced audio under its window, so that is
+    what is attested here.
+
+    Deliberately recall-biased for REAL speech: the bar is a small ABSOLUTE
+    overlap (no fractional requirement — readability extension legitimately
+    stretches a cue well past its voiced audio), and bracketed markers
+    ("[♪ Opening theme ♪]", "[Music]") are exempt because they annotate
+    music on purpose. Zero-width and time-less cues have no audio under
+    them by definition and are dropped. Fail-soft: no VAD map → rows
+    returned unchanged.
+
+    Returns ``(kept_rows, dropped_samples)``.
+    """
+    if not rows:
+        return rows, []
+    regions = voice_activity_regions_cached(audio_path)
+    if not regions:
+        return rows, []
+    try:
+        from backend.services.audio_analyzer import is_subtitle_marker
+    except Exception:
+        def is_subtitle_marker(_t: str) -> bool:
+            return False
+    kept, dropped = [], []
+    for r in rows:
+        if isinstance(r, dict):
+            txt = (r.get("text") or "").strip()
+            a, b = r.get("start"), r.get("end")
+        else:
+            txt = (getattr(r, "text", "") or "").strip()
+            a, b = getattr(r, "start", None), getattr(r, "end", None)
+        if not txt or is_subtitle_marker(txt):
+            kept.append(r)
+            continue
+        try:
+            a, b = float(a), float(b)
+        except (TypeError, ValueError):
+            a, b = 0.0, 0.0
+        if b > a and overlaps_voice(regions, a, b,
+                                    min_overlap_s=min_overlap_s,
+                                    min_overlap_frac=0.0):
+            kept.append(r)
+            continue
+        dropped.append(f"{a:.2f}-{b:.2f}s {txt[:40]!r}")
+    if not dropped:
+        return rows, []
+    return kept, dropped

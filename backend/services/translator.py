@@ -544,6 +544,43 @@ def strip_llm_preamble(text: str) -> str:
     return t2 if t2 else t
 
 
+# The model TALKING ABOUT the line instead of translating it. A measured run
+# shipped a 12-cue block of exactly this ("This sentence appears to be in
+# Japanese and seems to contain multiple characters that do not form coherent
+# words…") as subtitles — the per-cue recovery path accepted any non-empty,
+# non-source-language reply. These phrasings never occur in real dialogue
+# subtitles; each one is a verbatim shipped artifact or a stock refusal shape.
+_META_RESPONSE_RE = re.compile(
+    r"(?i)\b(?:"
+    r"appears? to be|seems? to (?:be|contain)|do(?:es)? not (?:appear|form)"
+    r"|cannot be (?:provided|translated|determined)|can'?t be translated"
+    r"|unable to translate|no translation (?:is )?(?:possible|available)"
+    r"|without more (?:information|context)|if we were to interpret"
+    r"|the (?:provided|given|original) (?:text|sentence|phrase|line)"
+    r"|this (?:sentence|phrase|text) (?:is|appears|seems|contains)"
+    r"|as an ai|i'?m sorry,? (?:but|i)|i apologi[sz]e"
+    r"|coherent (?:words|sentences)|valid japanese|please provide"
+    r"|nonsensical english|accurate translation"
+    r")\b")
+
+
+def looks_like_meta_response(text: str, src_text: Optional[str] = None) -> bool:
+    """True when an LLM "translation" is commentary ABOUT the line rather than
+    the line itself — a refusal, an analysis, a request for context. Also
+    flags a reply that has blown up to many times its source's length with
+    ``src_text`` given (a one-line subtitle never legitimately translates to
+    a paragraph; EN runs ~1-3x the chars of CJK)."""
+    t = (text or "").strip()
+    if not t:
+        return False
+    if _META_RESPONSE_RE.search(t):
+        return True
+    s = (src_text or "").strip()
+    if s and len(t) > max(120, 5 * len(s)):
+        return True
+    return False
+
+
 def _parse_json_array(response: str, expected: int) -> Optional[list[str]]:
     """Parse the LLM's ``["...", "..."]`` reply into exactly ``expected`` strings."""
     import re

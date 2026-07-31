@@ -1295,10 +1295,13 @@ async def translate_subtitles(segments, source_lang, target_lang, *, video_path=
     return out, "nmt"
 
 
-def _validate_translation(raw, source_lang):
+def _validate_translation(raw, source_lang, src_text=None):
     """Strip + verify a candidate translation; '' when unusable (empty, a
-    preamble echo, or still in the source language)."""
-    from backend.services.translator import _is_untranslated
+    preamble echo, still in the source language, or the model talking ABOUT
+    the line instead of translating it — a run shipped a 12-cue refusal
+    paragraph as subtitles because only empty/source-echo was checked)."""
+    from backend.services.translator import (
+        _is_untranslated, looks_like_meta_response)
     v = (raw or "").strip().strip('"').strip()
     try:
         from backend.services.translator import strip_llm_preamble
@@ -1306,6 +1309,8 @@ def _validate_translation(raw, source_lang):
     except Exception:
         pass
     if not v or _is_untranslated(v, source_lang):
+        return ""
+    if looks_like_meta_response(v, src_text):
         return ""
     return v
 
@@ -1386,7 +1391,7 @@ async def _batch_prefill_translations(orchestrator, unique_texts, source_lang,
         parsed = _parse_batch_translation_response(raw or "", len(batch))
         pairs = []
         for src, cand in zip(batch, parsed):
-            v = _validate_translation(cand, source_lang)
+            v = _validate_translation(cand, source_lang, src_text=src)
             if v:
                 pairs.append((src, v))
         return pairs
@@ -1578,7 +1583,7 @@ async def _llm_cleanup_untranslated(segments, source_lang, target_lang,
                     prompt, timeout=60, job_id=job_id or "", skip_circuit_breaker=True)
             except Exception:
                 resp = None
-            t = _validate_translation(resp, source_lang)
+            t = _validate_translation(resp, source_lang, src_text=src_text)
             if not t:
                 # Local chain dead OR it echoed the source back (the 21:32
                 # run: 6/17 flagged cues shipped because qwen2.5:3b echoed
@@ -1589,7 +1594,8 @@ async def _llm_cleanup_untranslated(segments, source_lang, target_lang,
                     from backend.services.transcript_polisher import (
                         _cloud_polish_completion)
                     t = _validate_translation(
-                        await _cloud_polish_completion(prompt, 60), source_lang)
+                        await _cloud_polish_completion(prompt, 60), source_lang,
+                        src_text=src_text)
                 except Exception:
                     t = ""
             _cache[src_text] = t or ""
@@ -3166,6 +3172,19 @@ async def _post_complete_gap_recovery(job_id: str, orchestrator) -> None:
     _merged_src, _added = merge_recovered(_src, recovered)
     if not _added:
         return
+    # Voice attestation on the merged result: recovered cues are VAD-screened
+    # by construction, but the merge is the last writer of the shipped
+    # transcript — the same audio-truth gate the translate path applies.
+    try:
+        from backend.services.speech_coverage import attest_cues_to_voice
+        _merged_src, _sv = attest_cues_to_voice(_merged_src, _audio)
+        if _sv:
+            logger.info(
+                "[%s] Gap recovery: voice attestation dropped %d merged "
+                "cue(s) with no voiced audio: %s",
+                job_id, len(_sv), "; ".join(_sv[:6]))
+    except Exception:
+        pass
     updates: dict = {"transcript": _merged_src}
 
     # Translate the recovered lines when the job ships a translated track —
@@ -3180,6 +3199,7 @@ async def _post_complete_gap_recovery(job_id: str, orchestrator) -> None:
         _tgt = (getattr(job, "subtitle_language", "") or "en").strip().lower() or "en"
         _tgt_name = SUPPORTED_LANGUAGES.get(_tgt, "English")
         translated_new: list[dict] = []
+        _n_meta = 0
         for r in recovered:
             try:
                 _out = await orchestrator.text_completion(
@@ -3187,11 +3207,25 @@ async def _post_complete_gap_recovery(job_id: str, orchestrator) -> None:
                     f"Reply with ONLY the translation, no quotes.\n\n{r['text']}",
                     max_tokens=200, timeout=60, job_id=job_id,
                     skip_circuit_breaker=True)
-                _out = (_out or "").strip().strip('"')
+                # Full validation, not just non-empty: this surface shipped a
+                # 12-cue refusal paragraph ("This sentence appears to be in
+                # Japanese and seems to contain…") as subtitles because any
+                # non-empty reply was merged verbatim. A recovered line whose
+                # translation is unusable stays a hole — a hole reads better
+                # than the model's commentary.
+                _out = _validate_translation(
+                    _out, source_lang, src_text=r.get("text"))
                 if _out:
                     translated_new.append({**r, "text": _out})
+                else:
+                    _n_meta += 1
             except Exception:
                 continue
+        if _n_meta:
+            logger.info(
+                "[%s] Gap recovery: dropped %d recovered line(s) whose LLM "
+                "translation was unusable (refusal/meta/echo)",
+                job_id, _n_meta)
         if translated_new:
             _map = roster_corrections_for_job(job_id)
             if _map:
@@ -3201,6 +3235,17 @@ async def _post_complete_gap_recovery(job_id: str, orchestrator) -> None:
                     t["text"] = txt
             _merged_tt, _added_tt = merge_recovered(_tt, translated_new)
             if _added_tt:
+                try:
+                    from backend.services.speech_coverage import (
+                        attest_cues_to_voice)
+                    _merged_tt, _tv = attest_cues_to_voice(_merged_tt, _audio)
+                    if _tv:
+                        logger.info(
+                            "[%s] Gap recovery: voice attestation dropped %d "
+                            "translated cue(s) with no voiced audio: %s",
+                            job_id, len(_tv), "; ".join(_tv[:6]))
+                except Exception:
+                    pass
                 updates["translated_transcript"] = _merged_tt
 
     await database.update_job_status(job_id, **updates)
@@ -4984,6 +5029,28 @@ async def _background_post_processing(
             # SRT download. Both helpers are count-preserving, text-preserving and
             # idempotent: they only pull an over-long end earlier and nudge touching
             # cues apart, never merging, splitting or reordering.
+            # ── Voice attestation: no subtitle over silent audio ──
+            # The final audio-truth gate. Wherever a phantom cue comes from
+            # (mistimed recovery, orphan LLM output, hallucinated decode over
+            # music), the one property it cannot fake is voiced audio under
+            # its window — a measured run shipped an 11-cue block at 0:00-0:09
+            # over the silence before the opening theme. Markers exempt,
+            # fail-soft without a VAD map.
+            try:
+                from backend.services.speech_coverage import attest_cues_to_voice
+                _att_audio = os.path.join(database._job_dir(job_id), "audio.wav")
+                if os.path.isfile(_att_audio):
+                    _translated_out, _voiceless = attest_cues_to_voice(
+                        _translated_out, _att_audio)
+                    if _voiceless:
+                        logger.info(
+                            "[%s] Voice attestation dropped %d cue(s) with no "
+                            "voiced audio under them: %s",
+                            job_id, len(_voiceless), "; ".join(_voiceless[:6]))
+            except Exception as _att_e:
+                logger.warning("[%s] Voice attestation skipped (%s)",
+                               job_id, _att_e)
+
             try:
                 from backend.services.subtitle_formatter import (
                     clamp_cue_durations, enforce_min_gap,
