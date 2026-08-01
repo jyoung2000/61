@@ -95,7 +95,12 @@ function TestModal({ verifying, result, error, onClose, onRetry }) {
             }}>
               {result.verified
                 ? `PASS — everything AI runs on ${result.host?.gpu_name || result.host?.name || 'the Companion'}`
-                : 'PARTIAL — some work will fall back to this server'}
+                : (result.ollama_ok && w.busy
+                  // The one non-green case that is NOT a fallback: the GPU was
+                  // mid-transcription for the whole test window. Offload still
+                  // works — jobs simply queue on the Companion.
+                  ? 'BUSY — Companion GPU was mid-transcription; everything still offloads'
+                  : 'PARTIAL — some work will fall back to this server')}
             </div>
 
             <CapRow ok={result.ollama_ok} label="LLM + vision (Ollama)"
@@ -107,10 +112,15 @@ function TestModal({ verifying, result, error, onClose, onRetry }) {
             ))}
             <CapRow ok={wOk} label="Whisper transcription"
               detail={wOk
-                ? 'a test clip transcribed on the Companion GPU'
-                : (w.configured
-                  ? `test transcription failed${w.error ? `: ${w.error}` : ''} — runs on this server`
-                  : `not offloaded${w.error ? ` (${w.error})` : ''} — runs on this server`)} />
+                ? (w.detail || 'a test clip transcribed on the Companion GPU')
+                : (w.busy
+                  // Busy ≠ broken: the Companion serializes GPU decodes, so a
+                  // running job's transcription holds the slot for the whole
+                  // test. Offload still works — jobs queue on that GPU.
+                  ? `${w.error || 'GPU busy with another transcription'} — offload still works; jobs queue on the Companion`
+                  : (w.configured
+                    ? `test transcription failed${w.error ? `: ${w.error}` : ''} — runs on this server`
+                    : `not offloaded${w.error ? ` (${w.error})` : ''} — runs on this server`))} />
 
             <div style={{
               fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.5,

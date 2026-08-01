@@ -4322,14 +4322,27 @@ def _tiny_wav_bytes(seconds: float = 1.0, freq: float = 440.0, rate: int = 16000
     return buf.getvalue()
 
 
-async def _verify_remote_whisper_transcribe(base: str, key: str, model: str) -> dict:
+async def _verify_remote_whisper_transcribe(base: str, key: str, model: str,
+                                            budget_s: float = 75.0) -> dict:
     """REAL round-trip: POST a tiny WAV to {base}/v1/audio/transcriptions and
     confirm the remote server actually transcribes it. A /v1/health 200 only
     proves the proxy answers — the sidecar starts on demand, so this is the only
-    check that proves transcription will run on the remote GPU. Returns
-    {reachable, transcribed, detail, error}."""
+    check that proves transcription will run on the remote GPU.
+
+    The Companion serializes GPU transcription: a concurrent decode gets an
+    honest 503 + ``Retry-After: 20`` — an INVITATION to retry, not a failure.
+    A measured test clicked right after "Force end all jobs" (which stops the
+    whisper sidecar) raced the restart, took the first 503 as terminal and
+    reported "Whisper: failed — runs on this server" for a perfectly healthy
+    Companion. So 503 (busy) and transient transport errors are retried
+    within ``budget_s``, honoring Retry-After; a 502 (sidecar mid-restart)
+    gets the same patience. Definitive answers (200/401/403/404) return
+    immediately. Returns {reachable, transcribed, busy, detail, error}."""
+    import asyncio as _asyncio
+    import time as _time
     import httpx as _httpx
-    out = {"reachable": False, "transcribed": False, "detail": "", "error": ""}
+    out = {"reachable": False, "transcribed": False, "busy": False,
+           "detail": "", "error": ""}
     base = (base or "").rstrip("/")
     if not base:
         out["error"] = "no remote Whisper URL"
@@ -4340,7 +4353,6 @@ async def _verify_remote_whisper_transcribe(base: str, key: str, model: str) -> 
         base = base[:-3]
     headers = {"Authorization": f"Bearer {key}"} if key else {}
     url = f"{base}/v1/audio/transcriptions"
-    files = {"file": ("verify.wav", _tiny_wav_bytes(), "audio/wav")}
     data = {"response_format": "json"}
     if model:
         data["model"] = model
@@ -4349,25 +4361,65 @@ async def _verify_remote_whisper_transcribe(base: str, key: str, model: str) -> 
     # Short connect (unreachable → fail fast); long read — a cold sidecar may
     # take tens of seconds to load its model on the first request.
     timeout = _httpx.Timeout(120.0, connect=5.0)
-    try:
-        async with _httpx.AsyncClient(timeout=timeout) as client:
-            r = await client.post(url, headers=headers, files=files, data=data)
-        out["reachable"] = True
-        if r.status_code == 200:
-            out["transcribed"] = True
-            out["detail"] = "transcribed a test clip on the remote GPU"
-        elif r.status_code in (401, 403):
-            out["error"] = "auth rejected — check the host access token"
-        elif r.status_code == 404:
-            out["error"] = "server has no /v1/audio/transcriptions (no Whisper backend)"
-        elif r.status_code == 503:
-            out["error"] = "Whisper backend busy/unavailable (503)"
-        else:
-            body = (r.text or "")[:160]
-            out["error"] = f"HTTP {r.status_code}{': ' + body if body else ''}"
-    except Exception as e:
-        out["error"] = f"{type(e).__name__}: {str(e)[:140]}"
-    return out
+    deadline = _time.monotonic() + max(0.0, budget_s)
+    attempt = 0
+    while True:
+        attempt += 1
+        retry_after = 4.0
+        try:
+            # Fresh file tuple per attempt — the previous attempt consumed it.
+            files = {"file": ("verify.wav", _tiny_wav_bytes(), "audio/wav")}
+            async with _httpx.AsyncClient(timeout=timeout) as client:
+                r = await client.post(url, headers=headers, files=files, data=data)
+            out["reachable"] = True
+            if r.status_code == 200:
+                out["transcribed"] = True
+                out["busy"] = False
+                out["error"] = ""
+                out["detail"] = (
+                    "transcribed a test clip on the remote GPU"
+                    + (f" (after waiting out a busy GPU, attempt {attempt})"
+                       if attempt > 1 else ""))
+                return out
+            if r.status_code in (401, 403):
+                out["error"] = "auth rejected — check the host access token"
+                return out
+            if r.status_code == 404:
+                out["error"] = ("server has no /v1/audio/transcriptions "
+                                "(no Whisper backend)")
+                return out
+            if r.status_code == 503:
+                out["busy"] = True
+                out["error"] = ("GPU busy with another transcription for the "
+                                f"whole {budget_s:.0f}s test window — a job is "
+                                "likely mid-decode; re-test when it finishes")
+                try:
+                    retry_after = min(20.0, max(
+                        3.0, float(r.headers.get("Retry-After", 4))))
+                except (TypeError, ValueError):
+                    retry_after = 4.0
+            elif r.status_code == 502:
+                # Companion answers 502 while the sidecar restarts (e.g. right
+                # after "Force end all jobs" stops it) — retry through it.
+                out["error"] = ("Whisper sidecar was restarting for the whole "
+                                f"{budget_s:.0f}s test window — re-test, and check "
+                                "the Companion log if it persists")
+            else:
+                body = (r.text or "")[:160]
+                out["error"] = f"HTTP {r.status_code}{': ' + body if body else ''}"
+                return out
+        except (_httpx.ConnectError, _httpx.ConnectTimeout) as e:
+            # Nothing listening / host unroutable — retrying cannot help and
+            # would hold the Settings dialog for the whole budget. Fail fast
+            # (old behavior). Only BUSY (503) and mid-restart (502) answers
+            # from a live Companion earn the retry patience.
+            out["error"] = f"{type(e).__name__}: {str(e)[:140]}"
+            return out
+        except Exception as e:
+            out["error"] = f"{type(e).__name__}: {str(e)[:140]}"
+        if _time.monotonic() + retry_after > deadline:
+            return out
+        await _asyncio.sleep(retry_after)
 
 
 @router.post("/settings/companion-register")

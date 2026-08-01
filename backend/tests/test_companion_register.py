@@ -198,3 +198,91 @@ def test_pairing_requires_url(client):
         headers={"Authorization": "Bearer clipai-key-123"},
     )
     assert resp.status_code == 400
+
+
+# ── Whisper verify: 503-busy is an invitation to retry, not a failure ──────
+
+def _scripted_whisper_server(codes):
+    """A local HTTP server that answers POSTs with the scripted status codes
+    (last code repeats). Returns (base_url, server, calls)."""
+    import http.server
+    import threading
+    calls = {"n": 0}
+
+    class _H(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", 0) or 0))
+            code = codes[min(calls["n"], len(codes) - 1)]
+            calls["n"] += 1
+            body = b'{"text": "ok"}' if code == 200 else b"busy"
+            self.send_response(code)
+            if code == 503:
+                self.send_header("Retry-After", "1")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return f"http://127.0.0.1:{srv.server_address[1]}", srv, calls
+
+
+def test_verify_whisper_retries_through_a_busy_503():
+    # The Companion serializes GPU decodes: 503 + Retry-After means "another
+    # transcription is running", and the measured failure was the test taking
+    # the FIRST 503 as terminal (clicked right after Force-end restarted the
+    # sidecar) and reporting a healthy Companion as broken.
+    import asyncio
+    base, srv, calls = _scripted_whisper_server([503, 200])
+    try:
+        out = asyncio.run(S._verify_remote_whisper_transcribe(
+            base, "tok", "large-v3-turbo", budget_s=20.0))
+    finally:
+        srv.shutdown()
+    assert out["transcribed"] is True
+    assert out["busy"] is False and out["error"] == ""
+    assert calls["n"] == 2
+    assert "attempt 2" in out["detail"]
+
+
+def test_verify_whisper_reports_busy_after_the_budget():
+    import asyncio
+    base, srv, calls = _scripted_whisper_server([503])
+    try:
+        out = asyncio.run(S._verify_remote_whisper_transcribe(
+            base, "tok", "large-v3-turbo", budget_s=4.0))
+    finally:
+        srv.shutdown()
+    assert out["transcribed"] is False
+    assert out["busy"] is True
+    assert "busy" in out["error"].lower()
+    assert calls["n"] >= 2, "must have retried at least once"
+
+
+def test_verify_whisper_rides_out_a_sidecar_restart_502():
+    import asyncio
+    base, srv, calls = _scripted_whisper_server([502, 200])
+    try:
+        out = asyncio.run(S._verify_remote_whisper_transcribe(
+            base, "tok", "large-v3-turbo", budget_s=20.0))
+    finally:
+        srv.shutdown()
+    assert out["transcribed"] is True and calls["n"] == 2
+
+
+def test_verify_whisper_auth_rejection_is_immediate():
+    import asyncio
+    import time
+    base, srv, calls = _scripted_whisper_server([401])
+    t0 = time.monotonic()
+    try:
+        out = asyncio.run(S._verify_remote_whisper_transcribe(
+            base, "tok", "large-v3-turbo", budget_s=30.0))
+    finally:
+        srv.shutdown()
+    assert out["transcribed"] is False and calls["n"] == 1
+    assert "auth" in out["error"]
+    assert time.monotonic() - t0 < 5.0, "definitive answers must not retry"
