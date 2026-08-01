@@ -1472,6 +1472,113 @@ def _glossary_tokens(glossary: list[str]) -> list[str]:
     return toks
 
 
+_GLOSSARY_RESPELL_RATIO = 0.75
+_GLOSSARY_RESPELL_MARGIN = 0.08
+# Mid-sentence capitalised tokens. A word capitalised only because it opens a
+# sentence tells us nothing about whether it is a name, so the lookbehinds
+# exclude that position — the same signal ``_mine_name_candidates`` uses.
+_TEXT_NAME_TOKEN_RE = re.compile(
+    r"(?<![.!?…]\s)(?<!^)\b([A-Z][A-Za-z'’]{2,})\b", re.MULTILINE)
+
+
+def _spelling_variants(token: str) -> set:
+    """``token`` plus its possessive and regular-plural bases.
+
+    A token is only a misspelling if NONE of these is an official name.
+    Without this, "Gundams" and "Marina's" both read as near-misses of
+    "Gundam"/"Marina" and get "corrected" into the singular — measured on the
+    professional reference, where every such hit was a correct plural or
+    possessive, not an error."""
+    out = {token}
+    base = re.sub(r"['’]s$", "", token)
+    out.add(base)
+    low = base.lower()
+    if low.endswith("es"):
+        out.add(base[:-2])
+    if low.endswith("s"):
+        out.add(base[:-1])
+    return out
+
+
+def respell_text_from_glossary(texts: list,
+                               glossary: list[str]) -> tuple[list, int, list]:
+    """Snap misspelled names in the SUBTITLE TEXT onto glossary spellings.
+
+    ``_apply_glossary_spellings`` fixes the roster's mapping VALUES, which
+    only helps when the roster produced a mapping at all. On a measured run it
+    did not — "27 candidate(s) offered, none confidently corrected" — so the
+    glossary sat in memory holding the right spellings while the shipped
+    subtitles said "Dorlian", "Septum" and "Aires". The authority existed and
+    never reached the text. This applies it directly, with no model in the
+    loop, so a run whose roster declines still gets the spellings it already
+    knows.
+
+    Deliberately ORTHOGRAPHIC, not phonetic. A phonetic match against a cast
+    list is not safe: measured on this episode it mapped "Trois" onto "Treize"
+    — one character's name onto another's — because their consonant skeletons
+    are identical. Letters are the conservative evidence, and at ratio
+    ``_GLOSSARY_RESPELL_RATIO`` with a runner-up margin the measured result on
+    the run was three corrections, zero false positives, and zero changes when
+    the same pass was run over the professional reference track.
+
+    The cost of that conservatism is real and worth stating: garbles that
+    differ in spelling but agree in sound ("Jekks", "Xerxes", "Katrou",
+    "U-Phi") are NOT reachable here and need series knowledge this stage does
+    not have. Returns ``(texts, replacements, samples)``."""
+    toks = _glossary_tokens(glossary)
+    if not texts or not toks:
+        return list(texts or []), 0, []
+    tok_lower = {t.lower() for t in toks}
+    single = [t for t in toks if " " not in t and len(t) >= 4]
+    if not single:
+        return list(texts or []), 0, []
+
+    resolved: dict[str, str] = {}
+    rejected: set = set()
+
+    def _target(word: str):
+        if word in resolved:
+            return resolved[word]
+        if word in rejected:
+            return None
+        if any(v.lower() in tok_lower for v in _spelling_variants(word)):
+            rejected.add(word)          # already an official spelling
+            return None
+        base = re.sub(r"['’]s$", "", word)
+        if len(base) < 4 or not base.isalpha():
+            rejected.add(word)
+            return None
+        ranked = sorted(
+            ((difflib.SequenceMatcher(
+                None, base.lower(), t.lower()).ratio(), t) for t in single),
+            reverse=True)
+        best, tok = ranked[0]
+        # A near-tie means two official names are both plausible; identity is
+        # ambiguous and guessing it would put one character's name on another.
+        if best < _GLOSSARY_RESPELL_RATIO or (
+                len(ranked) > 1
+                and best - ranked[1][0] < _GLOSSARY_RESPELL_MARGIN):
+            rejected.add(word)
+            return None
+        resolved[word] = tok
+        return tok
+
+    out, n, samples = [], 0, []
+    for raw in texts:
+        line = str(raw or "")
+        for word in set(_TEXT_NAME_TOKEN_RE.findall(line)):
+            tok = _target(word)
+            if not tok:
+                continue
+            line, k = re.subn(r"\b" + re.escape(word) + r"\b", tok, line)
+            if k:
+                n += k
+                if len(samples) < 8:
+                    samples.append(f"{word}→{tok}")
+        out.append(line)
+    return out, n, samples
+
+
 def _apply_glossary_spellings(
         mapping: dict[str, str], glossary: list[str]) -> tuple[dict[str, str], int]:
     """Snap mapping VALUES onto authoritative glossary spellings.

@@ -3339,6 +3339,29 @@ async def _post_complete_gap_recovery(job_id: str, orchestrator) -> None:
                     logger.info(
                         "[%s] Gap recovery: post-merge cleanup %d → %d cue(s)",
                         job_id, _pre_san, len(_merged_tt))
+                # Condensation LAST, because the passes above change what
+                # needs condensing: the fragment merge lengthens cues and the
+                # run-on split re-cuts them. On a measured run the merge ran
+                # 334 → 311 and the split 311 → 321 with no condensation
+                # afterwards, and the shipped track's reading rate went the
+                # wrong way — cps p90 25.0 against the reference's 19.1, with
+                # sixteen cues over 30 cps where the reference has none.
+                # Condensation at translate time cannot help; it ran nine
+                # minutes before these cues existed in this shape.
+                if bool(getattr(settings, "SUBTITLE_CONDENSE_OVER_CPS", True)):
+                    try:
+                        _merged_tt, _cd_n = await _condense_over_cps_cues(
+                            _merged_tt, orchestrator, job_id=job_id,
+                            model_override=_resolve_polish_model_override(
+                                orchestrator))
+                        if _cd_n:
+                            logger.info(
+                                "[%s] Gap recovery: condensed %d unreadably-"
+                                "fast cue(s) after the merge", job_id, _cd_n)
+                    except Exception as _cd_e:
+                        logger.warning(
+                            "[%s] Post-merge condensation skipped (%s)",
+                            job_id, _cd_e)
                 updates["translated_transcript"] = _merged_tt
 
     await database.update_job_status(job_id, **updates)
@@ -4894,6 +4917,31 @@ async def _background_post_processing(
                             logger.info(
                                 "[%s] Roster corrections applied: %d replacement(s) "
                                 "across %d mapping(s)", job_id, _rc_n, len(_rc_map))
+                    else:
+                        _rc_new = _rc_texts
+                    # The glossary is an AUTHORITY, not an input to the model.
+                    # A measured run's roster declined every candidate ("27
+                    # offered, none confidently corrected") while the series
+                    # glossary sat in memory holding the correct spellings, and
+                    # the subtitles shipped "Dorlian", "Septum" and "Aires"
+                    # anyway. Applying it straight to the text means a run
+                    # whose roster abstains still gets the names it knows.
+                    from backend.services.canonical_names import (
+                        respell_text_from_glossary, series_roster_terms)
+                    _gloss = series_roster_terms()
+                    if _gloss:
+                        _gl_new, _gl_n, _gl_s = respell_text_from_glossary(
+                            _rc_new, _gloss)
+                        if _gl_n:
+                            for _seg, _new_text in zip(translated, _gl_new):
+                                if isinstance(_seg, dict):
+                                    _seg["text"] = _new_text
+                                else:
+                                    _seg.text = _new_text
+                            logger.info(
+                                "[%s] Glossary respelled %d name(s) in the "
+                                "subtitle text: %s",
+                                job_id, _gl_n, "; ".join(_gl_s))
                 except Exception as _rc_err:
                     logger.warning("[%s] Roster correction skipped (%s)",
                                    job_id, _rc_err)

@@ -1061,3 +1061,72 @@ def test_roster_rejects_initials_and_labels_as_names():
         {"Just": "J", "Love": "L2", "Wing": "W1ng",
          "Uing": "Wing", "Dorian": "Dorlian"}, terms)
     assert out == {"Uing": "Wing", "Dorian": "Dorlian"}
+
+
+# ── Glossary as a spelling authority over the subtitle text ────────────────
+
+_GLOSS = ["Heero Yuy", "Relena Darlian", "Zechs Merquise", "Duo Maxwell",
+          "Trowa Barton", "Quatre Winner", "Wufei Chang", "Treize Khushrenada",
+          "Septem", "Marina", "Gundanium", "Gundam", "Deathscythe", "Leo",
+          "Aries", "Cancer"]
+
+
+def test_glossary_respells_misspelled_names_in_the_text():
+    """The roster declined every candidate on a measured run while the
+    glossary held the right spellings. Apply it to the text directly."""
+    from backend.services.canonical_names import respell_text_from_glossary
+    out, n, samples = respell_text_from_glossary(
+        ["I am Relena Dorlian.",
+         "General Septum is waiting.",
+         "Maybe the Aires mobile suit would be better?"], _GLOSS)
+    assert n == 3, samples
+    assert out == ["I am Relena Darlian.",
+                   "General Septem is waiting.",
+                   "Maybe the Aries mobile suit would be better?"]
+
+
+def test_glossary_respell_leaves_correct_names_alone():
+    from backend.services.canonical_names import respell_text_from_glossary
+    lines = ["Lieutenant Zechs, are you all right?",
+             "My name is Relena Darlian.",
+             "So, it WAS a Gundam.",
+             "Five Gundams?!",
+             "The Alliance's Marina is on the way.",
+             "General Septem's expecting you."]
+    out, n, _ = respell_text_from_glossary(list(lines), _GLOSS)
+    assert n == 0 and out == lines
+
+
+def test_glossary_respell_spares_plurals_and_possessives():
+    """Measured on the professional reference, every near-miss hit was a
+    correct plural or possessive — never an error."""
+    from backend.services.canonical_names import respell_text_from_glossary
+    lines = ["Five Gundams?!", "Marina's carrier is coming.",
+             "Relena's birthday is tomorrow.", "Treize's subordinate lost three."]
+    out, n, _ = respell_text_from_glossary(list(lines), _GLOSS)
+    assert n == 0 and out == lines
+
+
+def test_glossary_respell_refuses_an_ambiguous_target():
+    """A near-tie between two official names means identity is unknown, and
+    guessing puts one character's name onto another."""
+    from backend.services.canonical_names import respell_text_from_glossary
+    # "Trois" sits between Trowa and Treize; neither may be chosen.
+    out, n, _ = respell_text_from_glossary(["I'll go by Trois here."], _GLOSS)
+    assert n == 0 and out == ["I'll go by Trois here."]
+
+
+def test_glossary_respell_ignores_sentence_initial_capitals():
+    from backend.services.canonical_names import respell_text_from_glossary
+    lines = ["Ladies and gentlemen.", "True enough.", "Area secured."]
+    out, n, _ = respell_text_from_glossary(list(lines), _GLOSS)
+    assert n == 0 and out == lines
+
+
+def test_glossary_respell_is_idempotent_and_fail_soft():
+    from backend.services.canonical_names import respell_text_from_glossary
+    once, n1, _ = respell_text_from_glossary(["I am Relena Dorlian."], _GLOSS)
+    twice, n2, _ = respell_text_from_glossary(once, _GLOSS)
+    assert n1 == 1 and n2 == 0 and once == twice
+    assert respell_text_from_glossary(["Dorlian here"], [])[1] == 0
+    assert respell_text_from_glossary([], _GLOSS)[1] == 0
