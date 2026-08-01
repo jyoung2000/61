@@ -590,3 +590,129 @@ def test_audio_theme_collapse_needs_enough_cues():
     rows = _sung(2, 30.0)
     out, changed = collapse_theme_by_music_spans(rows, [(26.0, 92.0)])
     assert changed is False
+
+
+# ── Run-14 follow-ups ─────────────────────────────────────────────────────
+
+def test_music_spans_bridge_classifier_fragments_into_a_theme():
+    # The classifier works in ~2s windows (699 events across 1467 s on a
+    # measured run), and a SUNG theme keeps flipping between the music and
+    # speech labels because the vocal is voice. Unbridged, no span could ever
+    # reach a meaningful duration bar and the audio theme pass never fired.
+    from backend.services.audio_analyzer import _bridge_spans
+    fragments = [(26.0 + 2.1 * i, 28.0 + 2.1 * i) for i in range(12)]
+    fragments.append((53.0, 92.0))
+    assert _bridge_spans(fragments, 8.0) == [(26.0, 92.0)]
+
+
+def test_music_span_bridge_will_not_swallow_the_following_narration():
+    # The opening narration begins about 20 s after the theme ends and is
+    # real, captioned content — the bridge must tolerate a sung phrase, not
+    # a scene.
+    from backend.services.audio_analyzer import _bridge_spans
+    theme = [(26.0 + 2.1 * i, 28.0 + 2.1 * i) for i in range(12)]
+    theme.append((53.0, 92.0))
+    out = _bridge_spans(theme + [(112.0, 134.0)], 8.0)
+    assert out == [(26.0, 92.0), (112.0, 134.0)]
+
+
+def test_bridged_spans_feed_the_audio_theme_collapse():
+    # End to end: fragments in, one theme marker out.
+    from backend.services.audio_analyzer import _bridge_spans
+    from backend.services.transcript_sanitize import collapse_theme_by_music_spans
+    spans = _bridge_spans([(26.0 + 2.1 * i, 28.0 + 2.1 * i)
+                           for i in range(30)], 8.0)
+    rows = _sung(8, 30.0) + [{"start": 300.0, "end": 303.0,
+                              "text": "Real dialogue.", "speaker": "S2"}]
+    out, changed = collapse_theme_by_music_spans(rows, spans)
+    assert changed
+    assert "[♪ Opening theme ♪]" in [r["text"] for r in out]
+    assert "Real dialogue." in [r["text"] for r in out]
+
+
+def test_onset_snap_reports_its_reasons_even_when_nothing_moves(monkeypatch, tmp_path, caplog):
+    # Two measured runs logged nothing at all, leaving "found no work" and
+    # "wired wrong" indistinguishable.
+    import logging
+    from backend.services import speech_coverage as SC
+    wav = tmp_path / "audio.wav"
+    wav.write_bytes(b"RIFF" + b"\0" * 64)
+    monkeypatch.setattr(SC, "voice_activity_regions",
+                        lambda p, **k: [(20.0, 25.0)])
+    SC._VAD_CACHE.clear()
+    rows = [{"start": 21.0, "end": 24.0, "text": "already on voice"}]
+    with caplog.at_level(logging.INFO, logger=SC.logger.name):
+        _, shifted = SC.snap_cues_to_voice_onsets(rows, str(wav))
+    assert shifted == []
+    assert "voice-onset snap" in caplog.text
+    assert "1 already on voice" in caplog.text
+
+
+def test_repetition_burst_drops_the_measured_narration_replay():
+    from backend.services.transcript_sanitize import drop_repetition_bursts
+    rows = [
+        {"start": 130.0, "end": 134.0,
+         "text": "With overwhelming military power, they subjugated each colony."},
+        {"start": 134.0, "end": 138.0,
+         "text": "In After Colony 195, the operation name is Operation Meteor."},
+        {"start": 138.0, "end": 142.0,
+         "text": "Colonies rebel against the Union and send weapons as meteorites."},
+        {"start": 210.5, "end": 210.75,
+         "text": "With force, they took each colony In AC195,"},
+        {"start": 210.8, "end": 211.1,
+         "text": "Operation Meteor Residents oppose the Union"},
+        {"start": 211.2, "end": 211.8,
+         "text": "Operation Meteor starts now Overwhelming"},
+        {"start": 211.9, "end": 212.5,
+         "text": "power subjugates colonies. In AC 195"},
+        {"start": 213.0, "end": 216.0,
+         "text": "The surveillance satellites are useless."},
+    ]
+    out, dropped = drop_repetition_bursts(rows)
+    assert len(dropped) == 1 and len(out) == 4
+    texts = [r["text"] for r in out]
+    assert "The surveillance satellites are useless." in texts
+    assert not any("AC195" in t for t in texts)
+
+
+def test_repetition_burst_spares_a_rapid_exchange():
+    # The reference captions every one of these; they are short because the
+    # exchange is fast, not because a decode looped.
+    from backend.services.transcript_sanitize import drop_repetition_bursts
+    rows = [
+        {"start": 100.0, "end": 104.0, "text": "Drop your weapons and surrender."},
+        {"start": 105.0, "end": 105.6, "text": "Yes, sir."},
+        {"start": 105.7, "end": 106.3, "text": "What?!"},
+        {"start": 106.4, "end": 107.0, "text": "Hurry!"},
+        {"start": 107.1, "end": 107.7, "text": "Captain!"},
+    ]
+    out, dropped = drop_repetition_bursts(rows)
+    assert out is rows and dropped == []
+
+
+def test_repetition_burst_spares_short_cues_carrying_new_content():
+    from backend.services.transcript_sanitize import drop_repetition_bursts
+    rows = [
+        {"start": 100.0, "end": 104.0,
+         "text": "The Alliance is monitoring space closely."},
+        {"start": 200.0, "end": 200.5, "text": "Torpedo bay flooded!"},
+        {"start": 200.6, "end": 201.2, "text": "Reactor breach imminent!"},
+        {"start": 201.3, "end": 201.9, "text": "Abandon the bridge!"},
+    ]
+    out, dropped = drop_repetition_bursts(rows)
+    assert out is rows and dropped == []
+
+
+def test_repetition_burst_needs_a_long_enough_run_and_prior_content():
+    from backend.services.transcript_sanitize import drop_repetition_bursts
+    prior = {"start": 10.0, "end": 14.0,
+             "text": "Operation Meteor begins in After Colony 195 with force."}
+    two = [prior,
+           {"start": 100.0, "end": 100.4, "text": "Operation Meteor force"},
+           {"start": 100.5, "end": 100.9, "text": "After Colony 195 begins"}]
+    assert drop_repetition_bursts(two)[1] == [], "two cues is not a burst"
+    # Same burst with no prior content to have copied.
+    orphan = [{"start": 100.0, "end": 100.4, "text": "Operation Meteor force"},
+              {"start": 100.5, "end": 100.9, "text": "After Colony 195 begins"},
+              {"start": 101.0, "end": 101.4, "text": "colonies subjugated now"}]
+    assert drop_repetition_bursts(orphan)[1] == []

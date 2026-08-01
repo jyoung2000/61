@@ -704,13 +704,43 @@ _MUSIC_SPAN_CACHE: dict = {}
 _MUSIC_SPAN_CACHE_MAX = 8
 
 
-async def music_spans_cached(audio_path: str, min_seconds: float = 5.0) -> list:
+def _bridge_spans(spans: list, bridge_s: float) -> list:
+    """Merge spans separated by no more than ``bridge_s`` into one.
+
+    The classifier works in short windows — a measured run produced 699
+    events across 1467 s, about two seconds each — so a minute-long theme
+    arrives as thirty separate fragments, and any "is this span long
+    enough?" test applied to the raw events answers no every time. Worse,
+    a SUNG theme keeps flipping between the music and speech labels
+    because the vocal IS voice, so the fragments are not even contiguous.
+    Bridging across the short gaps is what turns fragments back into the
+    region a human would point at.
+
+    The default tolerance is deliberately modest. On a reference episode the
+    opening theme ends about twenty seconds before the opening narration
+    begins, so a bridge that reached that far would weld a real, captioned
+    narration onto the theme and delete it. Tolerate a sung phrase, not a
+    scene."""
+    out: list = []
+    for a, b in sorted((float(x[0]), float(x[1])) for x in spans if x[1] > x[0]):
+        if out and a - out[-1][1] <= bridge_s:
+            out[-1][1] = max(out[-1][1], b)
+        else:
+            out.append([a, b])
+    return [(a, b) for a, b in out]
+
+
+async def music_spans_cached(audio_path: str, min_seconds: float = 5.0,
+                             bridge_s: float = 8.0) -> list:
     """Sustained music-only ``(start, end)`` spans, cached per audio file.
 
     Dialogue over a score classifies as ``speech``, so a span returned here is
     positive evidence of music WITHOUT speech — which is what makes it usable
-    as ground truth for "these cues are sung". Returns ``[]`` on any failure so
-    every caller degrades to its previous behaviour."""
+    as ground truth for "these cues are sung". Adjacent fragments are bridged
+    (see ``_bridge_spans``) BEFORE the duration filter, because the raw events
+    are seconds long and no theme would ever clear a meaningful bar without
+    that. Returns ``[]`` on any failure so every caller degrades to its
+    previous behaviour."""
     import os as _os
     try:
         st = _os.stat(audio_path)
@@ -718,16 +748,22 @@ async def music_spans_cached(audio_path: str, min_seconds: float = 5.0) -> list:
     except OSError:
         return []
     hit = _MUSIC_SPAN_CACHE.get(key)
-    if hit is not None:
-        return [s for s in hit if (s[1] - s[0]) >= min_seconds]
-    try:
-        events = await classify_audio_events(audio_path)
-    except Exception as e:
-        logger.info("music_spans_cached: classify failed (%s) — no spans", e)
-        return []
-    spans = _music_spans_from_events(events, 0.0)
-    if spans:
-        while len(_MUSIC_SPAN_CACHE) >= _MUSIC_SPAN_CACHE_MAX:
-            _MUSIC_SPAN_CACHE.pop(next(iter(_MUSIC_SPAN_CACHE)))
-        _MUSIC_SPAN_CACHE[key] = list(spans)
-    return [s for s in spans if (s[1] - s[0]) >= min_seconds]
+    if hit is None:
+        try:
+            events = await classify_audio_events(audio_path)
+        except Exception as e:
+            logger.info("music_spans_cached: classify failed (%s) — no spans", e)
+            return []
+        hit = _music_spans_from_events(events, 0.0)
+        if hit:
+            while len(_MUSIC_SPAN_CACHE) >= _MUSIC_SPAN_CACHE_MAX:
+                _MUSIC_SPAN_CACHE.pop(next(iter(_MUSIC_SPAN_CACHE)))
+            _MUSIC_SPAN_CACHE[key] = list(hit)
+    merged = _bridge_spans(hit, bridge_s)
+    out = [s for s in merged if (s[1] - s[0]) >= min_seconds]
+    logger.info(
+        "music spans: %d raw event span(s) → %d bridged → %d over %.0fs%s",
+        len(hit), len(merged), len(out), min_seconds,
+        (" — " + ", ".join(f"{a:.0f}-{b:.0f}s" for a, b in out[:8]))
+        if out else "")
+    return out

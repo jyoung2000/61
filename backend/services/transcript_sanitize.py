@@ -1647,3 +1647,106 @@ def collapse_theme_by_music_spans(segments, music_spans: list,
         return out, True
     except Exception:
         return _as_rows(segments), False
+
+
+# ── Repetition bursts ──────────────────────────────────────────────────────
+
+def drop_repetition_bursts(rows: list, min_run: int = 3,
+                           max_cue_s: float = 0.833,
+                           lookback_s: float = 240.0,
+                           containment: float = 0.5,
+                           ) -> tuple[list, list]:
+    """Delete a packed run of sub-minimum cues that re-states earlier content.
+
+    ``suppress_echo_cues`` compares a cue to its NEIGHBOURS inside a twelve
+    second window, which is the right scope for two decodes of the same
+    moment. It cannot see the other failure shape: a measured run shipped six
+    consecutive cues across seven seconds at 3:30 that re-stated the opening
+    narration from more than a minute earlier, each one a quarter to
+    two-thirds of a second long. Content that already aired, re-emitted in a
+    burst too fast to read, is decode residue however far back the original
+    sits.
+
+    The signature is the conjunction, and every part of it is load-bearing:
+      * at least ``min_run`` CONSECUTIVE cues, each under ``max_cue_s`` — real
+        dialogue is not delivered as a stream of sub-minimum flashes;
+      * the run's content is largely (``containment``) already present in the
+        cues BEFORE it, within ``lookback_s`` — measured on stemmed CONTENT
+        words, so the shared vocabulary of ordinary dialogue does not count;
+      * the run carries at least five distinct content stems, so a rapid
+        exchange of interjections can never be convicted on thin evidence.
+
+    Either half alone is innocent. A few short cues in a row happen in rapid
+    exchanges, and a line can legitimately echo an earlier one ("So it WAS a
+    Gundam"). Only together do they identify the burst. Markers are never
+    part of a run. Returns ``(rows, dropped_samples)``."""
+    def _g(r, k, d=None):
+        return r.get(k, d) if isinstance(r, dict) else getattr(r, k, d)
+
+    n = len(rows or [])
+    if n < min_run + 1:
+        return rows, []
+
+    def _dur(r):
+        try:
+            return float(_g(r, "end", 0.0) or 0.0) - float(_g(r, "start", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _short(i):
+        txt = (_g(rows[i], "text", "") or "").strip()
+        if not txt or txt.startswith("["):
+            return False
+        return 0.0 < _dur(rows[i]) < max_cue_s
+
+    drop, dropped = set(), []
+    i = 0
+    while i < n:
+        if not _short(i):
+            i += 1
+            continue
+        j = i
+        while j + 1 < n and _short(j + 1):
+            j += 1
+        run = list(range(i, j + 1))
+        i = j + 1
+        if len(run) < min_run:
+            continue
+        try:
+            run_start = float(_g(rows[run[0]], "start", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        burst_stems = set()
+        for k in run:
+            burst_stems |= _echo_stems(_g(rows[k], "text", "") or "")
+        if len(burst_stems) < 5:
+            # Too little content to convict on. A three-cue run of
+            # interjections ("Yes, sir." / "What?!" / "Hurry!") is a rapid
+            # exchange, and the reference captions those — the burst has to
+            # carry real content words before its overlap means anything.
+            continue
+        prior_stems = set()
+        for k in range(0, run[0]):
+            try:
+                s0 = float(_g(rows[k], "start", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if run_start - s0 > lookback_s:
+                continue
+            prior_stems |= _echo_stems(_g(rows[k], "text", "") or "")
+        if not prior_stems:
+            continue
+        hits = sum(
+            1 for w in burst_stems
+            if any(w == o or (len(w) >= 4 and len(o) >= 4
+                              and (w.startswith(o) or o.startswith(w)))
+                   for o in prior_stems))
+        if hits / float(len(burst_stems)) < containment:
+            continue
+        drop.update(run)
+        dropped.append(
+            f"{run_start:.1f}s x{len(run)} "
+            f"{(_g(rows[run[0]], 'text', '') or '')[:36]!r}")
+    if not drop:
+        return rows, []
+    return [r for k, r in enumerate(rows) if k not in drop], dropped

@@ -5121,7 +5121,20 @@ async def _background_post_processing(
                 # so a duplicate pair is never welded into one long cue.
                 try:
                     from backend.services.transcript_sanitize import (
-                        drop_junk_cues, suppress_echo_cues)
+                        drop_junk_cues, drop_repetition_bursts,
+                        suppress_echo_cues)
+                    # Bursts FIRST: a packed run of sub-minimum cues restating
+                    # content that already aired sits outside the echo
+                    # suppressor's neighbour window, and clearing it keeps the
+                    # burst's cues from being paired off one at a time below.
+                    _pre_burst = len(_translated_out)
+                    _translated_out, _bursts = drop_repetition_bursts(
+                        _translated_out)
+                    if _bursts:
+                        logger.info(
+                            "[%s] Repetition bursts: %d → %d cue(s), dropped %s",
+                            job_id, _pre_burst, len(_translated_out),
+                            "; ".join(_bursts[:6]))
                     _pre_echo = len(_translated_out)
                     _translated_out, _echoes = suppress_echo_cues(_translated_out)
                     if _echoes:

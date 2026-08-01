@@ -380,6 +380,11 @@ def snap_cues_to_voice_onsets(rows: list, audio_path: str,
     merged = merge_intervals(regions)
     shifted = []
     prev_end = 0.0
+    # Instrumentation. Two measured runs produced no log line at all, which
+    # left "found nothing" and "wired wrong" indistinguishable — the pass
+    # has to say what it looked at even when it changes nothing.
+    n = {"examined": 0, "marker": 0, "measured": 0, "on_voice": 0,
+         "no_onset": 0, "out_of_range": 0, "blocked": 0}
     for r in rows:
         try:
             a = float(_g(r, "start", 0.0) or 0.0)
@@ -388,14 +393,18 @@ def snap_cues_to_voice_onsets(rows: list, audio_path: str,
             continue
         txt = (_g(r, "text", "") or "").strip()
         if b <= a or not txt or is_subtitle_marker(txt):
+            n["marker"] += 1
             prev_end = max(prev_end, b)
             continue
+        n["examined"] += 1
         words = _g(r, "words", None)
         if words and not _g(r, "words_synthetic", None):
+            n["measured"] += 1
             prev_end = max(prev_end, b)      # measured times outrank the VAD
             continue
         # In silence? (inside any voiced region → already anchored)
         if any(vs <= a <= ve for vs, ve in merged):
+            n["on_voice"] += 1
             prev_end = max(prev_end, b)
             continue
         nxt = None
@@ -404,17 +413,28 @@ def snap_cues_to_voice_onsets(rows: list, audio_path: str,
                 nxt = vs
                 break
         if nxt is None:
+            n["no_onset"] += 1
             prev_end = max(prev_end, b)
             continue
         shift = nxt - a
         if shift < min_shift_s or shift > max_shift_s:
+            n["out_of_range"] += 1
             prev_end = max(prev_end, b)
             continue
         new_a = min(nxt, b - 0.2)            # never collapse the cue
         if new_a <= a or new_a < prev_end:
+            n["blocked"] += 1
             prev_end = max(prev_end, b)
             continue
         _set(r, "start", round(new_a, 3))
         shifted.append(f"{a:.2f}->{new_a:.2f}s {txt[:32]!r}")
         prev_end = max(prev_end, b)
+    logger.info(
+        "voice-onset snap: %d speech cue(s) examined against %d voice "
+        "region(s) — %d shifted; skipped %d already on voice, %d "
+        "audio-measured, %d with no onset ahead, %d beyond the %.1fs cap, "
+        "%d blocked by a neighbour",
+        n["examined"], len(merged), len(shifted), n["on_voice"],
+        n["measured"], n["no_onset"], n["out_of_range"], max_shift_s,
+        n["blocked"])
     return rows, shifted
