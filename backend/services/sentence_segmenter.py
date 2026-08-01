@@ -179,6 +179,23 @@ def _split_segment_by_sentence(seg: TranscriptSegment) -> list[TranscriptSegment
         if _text_chars > 0 and _joined_chars < 0.7 * _text_chars:
             words = []
 
+    # STALE word arrays must never re-time a cue: word rows live INSIDE
+    # their own cue's window or they are evidence of a bug upstream, not
+    # timing. A measured run merged recovery cues whose word rows were
+    # still stem-relative (0-13 s) into mid-episode cues — the word-timed
+    # path below then planted those cues at the head of the video, over
+    # the opening theme. Off-window words fall back to the char path,
+    # which stays inside the cue's own window by construction.
+    if words:
+        try:
+            _ws = sorted(float(_w_get(w, "start", 0.0) or 0.0) for w in words)
+            _mid = _ws[len(_ws) // 2]
+            if not (float(seg.start or 0.0) - 5.0 <= _mid
+                    <= float(seg.end or 0.0) + 5.0):
+                words = []
+        except (TypeError, ValueError):
+            words = []
+
     if not words:
         # No word timing — split text and distribute duration by char length.
         sentences = _split_text_sentences(seg.text, is_cjk)

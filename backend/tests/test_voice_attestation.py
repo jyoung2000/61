@@ -310,3 +310,83 @@ def test_restore_windows_handles_model_objects():
     assert out["restored"] == 1
     assert (bad.start, bad.end) == (50.0, 53.0)
     assert bad.words is None and bad.words_synthetic is None
+
+
+# ── Stale-words guard + degenerate-window sweep (run-11 injector) ─────────
+
+def test_resegmenter_ignores_word_rows_outside_the_cue_window():
+    # A recovery cue at 4:11 carried stem-relative words (0-3s) — the
+    # word-timed split path re-timed it to the head of the video. Words
+    # that live outside their own cue are evidence of a bug, not timing.
+    from backend.models import TranscriptSegment, WordTimestamp
+    from backend.services.sentence_segmenter import _split_segment_by_sentence
+    seg = TranscriptSegment(
+        start=251.0, end=258.0, speaker="Speaker 1",
+        text="Got it! All units fine. Roger that!",
+        words=[WordTimestamp(word="Got", start=0.5, end=0.8),
+               WordTimestamp(word="it!", start=0.8, end=1.1),
+               WordTimestamp(word="All", start=1.1, end=1.4),
+               WordTimestamp(word="units", start=1.4, end=1.8),
+               WordTimestamp(word="fine.", start=1.8, end=2.2),
+               WordTimestamp(word="Roger", start=2.2, end=2.6),
+               WordTimestamp(word="that!", start=2.6, end=3.0)])
+    pieces = _split_segment_by_sentence(seg)
+    for p in pieces:
+        assert 251.0 - 1e-6 <= p.start <= p.end <= 258.0 + 1e-6, \
+            f"piece escaped its cue window: {p.start}-{p.end}"
+
+
+def test_resegmenter_still_uses_in_window_words():
+    from backend.models import TranscriptSegment, WordTimestamp
+    from backend.services.sentence_segmenter import _split_segment_by_sentence
+    seg = TranscriptSegment(
+        start=10.0, end=16.0, speaker="Speaker 1",
+        text="First line. Second line.",
+        words=[WordTimestamp(word="First", start=10.0, end=10.5),
+               WordTimestamp(word="line.", start=10.5, end=11.0),
+               WordTimestamp(word="Second", start=14.0, end=14.5),
+               WordTimestamp(word="line.", start=14.5, end=15.0)])
+    pieces = _split_segment_by_sentence(seg)
+    assert len(pieces) == 2
+    assert abs(pieces[1].start - 14.0) < 0.5     # real word-timed boundary
+
+
+def test_degenerate_window_sweep_drops_echoes_and_retimes_unique_text():
+    from backend.services.transcript_sanitize import (
+        repair_degenerate_cue_windows)
+    rows = [
+        {"start": 10.0, "end": 12.0, "text": "Roger that, all units fine."},
+        {"start": 0.0, "end": 0.0, "text": "Roger that all units fine"},  # echo
+        {"start": 0.0, "end": 0.0, "text": "A unique lost line."},        # keep
+        {"start": 30.0, "end": 32.0, "text": "Next scene starts."},
+    ]
+    out, dropped, repaired = repair_degenerate_cue_windows(rows)
+    texts = [r["text"] for r in out]
+    assert "Roger that all units fine" not in texts
+    assert len(dropped) == 1 and "echo:" in dropped[0]
+    assert len(repaired) == 1
+    fixed = next(r for r in out if r["text"] == "A unique lost line.")
+    # Re-timed into the silence between its neighbours, inside (12, 30).
+    assert 12.0 < fixed["start"] < fixed["end"] < 30.0
+
+
+def test_degenerate_window_sweep_leaves_valid_rows_untouched():
+    from backend.services.transcript_sanitize import (
+        repair_degenerate_cue_windows)
+    rows = [{"start": 1.0, "end": 2.0, "text": "fine"},
+            {"start": 3.0, "end": 4.0, "text": "also fine"}]
+    out, dropped, repaired = repair_degenerate_cue_windows(rows)
+    assert out is rows and not dropped and not repaired
+
+
+def test_degenerate_window_sweep_drops_when_no_room():
+    from backend.services.transcript_sanitize import (
+        repair_degenerate_cue_windows)
+    rows = [
+        {"start": 10.0, "end": 12.0, "text": "Before."},
+        {"start": 0.0, "end": 0.0, "text": "Unique but squeezed."},
+        {"start": 12.1, "end": 14.0, "text": "After."},
+    ]
+    out, dropped, repaired = repair_degenerate_cue_windows(rows)
+    assert len(out) == 2 and not repaired
+    assert len(dropped) == 1 and "no-room:" in dropped[0]

@@ -895,17 +895,47 @@ def _transcribe_stem(wav_path: str, source_lang: str,
             if _t.monotonic() >= deadline:
                 return None
             _t.sleep(4.0)
-        segs = (res or {}).get("segments") or []
-        out = []
-        for s in segs:
-            d = dict(s) if isinstance(s, dict) else {
-                "start": getattr(s, "start", 0.0),
-                "end": getattr(s, "end", 0.0),
-                "text": getattr(s, "text", ""),
-                "no_speech_prob": getattr(s, "no_speech_prob", 0.0),
-            }
-            out.append(d)
-        return out
+        return _normalize_stem_segments((res or {}).get("segments") or [])
     except Exception as e:
         logger.info("gap recovery ASR failed (%s)", e)
         return None
+
+
+def _normalize_stem_segments(segs: list) -> list[dict]:
+    """Remote stem decodes → CLEAN ``{start,end,text,no_speech_prob}`` dicts.
+
+    The old ``dict(s)`` copy carried EVERY remote key through the recovery:
+    the remote mapper times segments as ``start_sec``/``end_sec`` (so
+    ``_seg_bounds``, which reads ``start``/``end``, saw nothing and the
+    repair redistributed 100% of real decode times), and the per-word rows
+    stay STEM-RELATIVE forever — the repair and the ``+gap[0]`` shift only
+    rewrite segment times. A measured run merged those cues and the
+    sentence resegmenter's word-timed path then re-timed them to the word
+    rows — 0-13 s of the video — planting the whole recovery at the head
+    of the timeline over the opening theme.
+
+    So: prefer ``start``/``end``, fall back to ``start_sec``/``end_sec``
+    (the real decode times, stem-relative — exactly what the caller
+    shifts), and carry NOTHING else. Word rows die here on purpose:
+    recovered cues get their timing from the repair/clip machinery, and
+    downstream tiers rebuild word timing against real audio."""
+    out = []
+    for s in segs:
+        if isinstance(s, dict):
+            start = s.get("start", s.get("start_sec", 0.0))
+            end = s.get("end", s.get("end_sec", 0.0))
+            text = s.get("text", "")
+            nsp = s.get("no_speech_prob", 0.0)
+        else:
+            start = getattr(s, "start", getattr(s, "start_sec", 0.0))
+            end = getattr(s, "end", getattr(s, "end_sec", 0.0))
+            text = getattr(s, "text", "")
+            nsp = getattr(s, "no_speech_prob", 0.0)
+        try:
+            start = float(start or 0.0)
+            end = float(end or 0.0)
+        except (TypeError, ValueError):
+            start = end = 0.0
+        out.append({"start": start, "end": end, "text": text or "",
+                    "no_speech_prob": nsp})
+    return out

@@ -3943,6 +3943,28 @@ async def _background_post_processing(
             except Exception as _src_seg_err:
                 logger.warning("[%s] Source resegmentation skipped (%s)",
                                job_id, _src_seg_err)
+        # ── (a-win) Degenerate-window sweep — the last net before translation.
+        # No source cue may reach the translator with an unusable window: a
+        # measured run let 20 through (stale stem-relative word rows re-timed
+        # them) and the whole block shipped at 0:00 over the opening theme.
+        # Echoes of validly-timed cues drop; unique text is re-timed between
+        # its list neighbours.
+        if _trans_input:
+            try:
+                from backend.services.transcript_sanitize import (
+                    repair_degenerate_cue_windows)
+                _trans_input, _dw_drop, _dw_fix = (
+                    repair_degenerate_cue_windows(_trans_input))
+                if _dw_drop or _dw_fix:
+                    logger.warning(
+                        "[%s] Degenerate-window sweep: dropped %d echo/unplaceable "
+                        "cue(s), re-timed %d unique cue(s)%s%s",
+                        job_id, len(_dw_drop), len(_dw_fix),
+                        (" — " + "; ".join(_dw_drop[:8])) if _dw_drop else "",
+                        (" — " + "; ".join(_dw_fix[:8])) if _dw_fix else "")
+            except Exception as _dw_e:
+                logger.debug("[%s] Degenerate-window sweep skipped (%s)",
+                             job_id, _dw_e)
         # ── (a-pre) Pre-fetch the Whisper-EN timing reference CONCURRENTLY ──
         # The hybrid word-timing step (c-hybrid below) needs a Whisper-native
         # English pass as its timing reference. On Companion rigs that pass

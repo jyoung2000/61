@@ -569,3 +569,32 @@ def test_repair_stem_times_vad_never_touches_valid_decodes():
     segs = [{"start": 0.5, "end": 2.0, "text": "exact"}]
     out, n = _repair_stem_times(segs, 10.0, pad_s=2.0, voiced=[(5.0, 7.0)])
     assert n == 0 and out is segs
+
+
+def test_stem_segment_normalization_strips_stale_keys_and_reads_both_schemas():
+    # The remote mapper times segments as start_sec/end_sec and attaches
+    # STEM-RELATIVE word rows. dict(s) used to carry both through the
+    # recovery — the words later re-timed merged cues to 0-13s of the
+    # video (the head-of-timeline phantom block). Normalization reads the
+    # real decode times and carries NOTHING else.
+    from backend.services.vocal_gap_recovery import _normalize_stem_segments
+    segs = [
+        {"start_sec": 1.2, "end_sec": 3.4, "text": "了解", "no_speech_prob": 0.1,
+         "words": [{"word": "了解", "start": 1.2, "end": 3.4}],
+         "avg_logprob": -0.3},
+        {"start": 4.0, "end": 5.5, "text": "任務完了", "no_speech_prob": 0.2},
+    ]
+    out = _normalize_stem_segments(segs)
+    assert out[0] == {"start": 1.2, "end": 3.4, "text": "了解",
+                      "no_speech_prob": 0.1}
+    assert out[1] == {"start": 4.0, "end": 5.5, "text": "任務完了",
+                      "no_speech_prob": 0.2}
+    for d in out:
+        assert "words" not in d and "start_sec" not in d
+
+
+def test_stem_segment_normalization_handles_garbage_times():
+    from backend.services.vocal_gap_recovery import _normalize_stem_segments
+    out = _normalize_stem_segments([{"start": "x", "end": None, "text": "a"}])
+    assert out == [{"start": 0.0, "end": 0.0, "text": "a",
+                    "no_speech_prob": 0.0}]

@@ -1195,3 +1195,105 @@ def sanitize_translated_transcript(segments, target_lang: str = "en"):
         return kept, changed
     except Exception:
         return list(segments or []), False
+
+
+# ── Degenerate-window sweep (pre-translation) ───────────────────────────────
+
+def repair_degenerate_cue_windows(rows: list, dup_ratio: float = 0.6,
+                                  ) -> tuple[list, list, list]:
+    """Last net before translation: no source cue may carry an unusable
+    time window.
+
+    A measured run reached translation with 20 source cues whose windows
+    had collapsed; the translated cues inherited them and the formatter
+    packed the block at 0:00 over the opening theme. The upstream causes
+    get fixed where they live, but this sweep guarantees the INVARIANT:
+
+      * a degenerate cue (window < 0.05 s) whose text near-duplicates
+        (``dup_ratio`` similarity) another, validly-timed cue is an ECHO —
+        its content already ships at the right time — so it is dropped;
+      * a degenerate cue with UNIQUE text is real content whose window was
+        lost — it is re-timed into the silence between its list
+        neighbours (position in the list is the one ordering signal a
+        window-less cue still carries), or dropped when the neighbours
+        leave no room.
+
+    Pure stdlib, order-preserving, mutates windows in place. Returns
+    ``(rows, dropped_samples, repaired_samples)``."""
+    from difflib import SequenceMatcher
+
+    def _get(r, k, d=None):
+        return r.get(k, d) if isinstance(r, dict) else getattr(r, k, d)
+
+    def _win(r):
+        try:
+            a = float(_get(r, "start", 0.0) or 0.0)
+            b = float(_get(r, "end", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0, 0.0
+        return a, b
+
+    def _set_win(r, a, b):
+        if isinstance(r, dict):
+            r["start"], r["end"] = a, b
+        else:
+            r.start, r.end = a, b
+
+    valid_idx = []
+    degen_idx = []
+    for i, r in enumerate(rows or []):
+        a, b = _win(r)
+        (valid_idx if b - a >= 0.05 else degen_idx).append(i)
+    if not degen_idx:
+        return rows, [], []
+
+    valid_texts = [
+        ((_get(rows[i], "text", "") or "").strip().lower(), i)
+        for i in valid_idx
+    ]
+    dropped, repaired = [], []
+    drop_set = set()
+    for i in degen_idx:
+        r = rows[i]
+        txt = ((_get(r, "text", "") or "").strip())
+        low = txt.lower()
+        is_echo = False
+        for vt, _vi in valid_texts:
+            if not vt or abs(len(vt) - len(low)) > max(10, len(low)):
+                continue
+            if SequenceMatcher(None, low, vt).ratio() >= dup_ratio:
+                is_echo = True
+                break
+        if is_echo or not txt:
+            drop_set.add(i)
+            dropped.append(f"echo:{txt[:36]!r}")
+            continue
+        # Unique text: re-time into the gap between the nearest validly
+        # timed neighbours on each side.
+        prev_end = 0.0
+        for j in range(i - 1, -1, -1):
+            if j in drop_set:
+                continue
+            a, b = _win(rows[j])
+            if b - a >= 0.05:
+                prev_end = b
+                break
+        next_start = None
+        for j in range(i + 1, len(rows)):
+            a, b = _win(rows[j])
+            if b - a >= 0.05:
+                next_start = a
+                break
+        room = (next_start - prev_end) if next_start is not None else 4.0
+        if room < 0.4:
+            drop_set.add(i)
+            dropped.append(f"no-room:{txt[:36]!r}")
+            continue
+        a = prev_end + min(0.15, room * 0.1)
+        b = min(a + max(0.6, min(3.0, room * 0.6)),
+                (next_start - 0.05) if next_start is not None else a + 3.0)
+        _set_win(r, round(a, 3), round(b, 3))
+        repaired.append(f"{txt[:36]!r} -> {a:.2f}-{b:.2f}s")
+    if drop_set:
+        rows = [r for i, r in enumerate(rows) if i not in drop_set]
+    return rows, dropped, repaired
