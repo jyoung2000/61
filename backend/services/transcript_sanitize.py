@@ -1544,6 +1544,27 @@ _ANNOTATION_VERBS = frozenset({
     "end", "ends", "ended", "ending", "stop", "stops", "resume", "resumes",
     "continue", "continues", "fade", "fades", "playing", "plays", "over",
 })
+# Qualifiers the translator puts in FRONT of a soundtrack noun when it is
+# narrating structure rather than transcribing speech ("More dialogue", "Final
+# line", "Another music cue"). Admitted only alongside a real annotation word,
+# so "more" and "final" on their own convict nothing.
+_ANNOTATION_QUALIFIERS = frozenset({
+    "more", "final", "last", "first", "next", "another", "further",
+    "additional", "the", "a", "an", "some", "no",
+})
+# The same prose welded onto the END of a real line — "…in space colonies
+# Dialogue end." A measured run shipped exactly that, and because the cue also
+# carries genuine dialogue neither the whole-cue test nor the leading-tag strip
+# could touch it. Anchored to the end and requiring the soundtrack noun, so an
+# ordinary sentence that happens to finish on "…the music ends" is not at risk
+# unless it stands alone as a tag (needs the noun AND a structural verb AND no
+# terminal punctuation before it).
+_TRAILING_ANNOTATION_RE = re.compile(
+    r"(?<=[a-z0-9\)\]])\s+"
+    r"(?:more\s+|final\s+|last\s+|another\s+)?"
+    r"(?:dialogue|dialog|music|narration|sound\s+effects?|sfx)\s+"
+    r"(?:start|starts|started|begin|begins|end|ends|ended|over|resumes?)\s*[.!?…]*\s*$",
+    re.IGNORECASE)
 _ANNOTATION_PREFIX_RE = re.compile(
     r"^\s*[\(（]\s*([^)）]{1,24})\s*[\)）]\s*(?=\S)")
 
@@ -1591,7 +1612,23 @@ def looks_like_annotation_artifact(text: str) -> bool:
         return False
     if not any(w in _ANNOTATION_WORDS for w in words):
         return False
-    return all(w in _ANNOTATION_WORDS or w in _ANNOTATION_VERBS for w in words)
+    return all(w in _ANNOTATION_WORDS or w in _ANNOTATION_VERBS
+               or w in _ANNOTATION_QUALIFIERS for w in words)
+
+
+def strip_trailing_annotation(text: str) -> str:
+    """Remove a soundtrack annotation welded onto the END of a real line.
+
+    The translator narrates structure as well as speech, and when it does so
+    mid-cue neither the whole-cue test nor the leading-tag strip can reach it:
+    a measured run shipped a line of genuine narration with "Dialogue end."
+    fused onto its tail. The dialogue is real and stays; only the tag goes.
+    Returns ``text`` unchanged when stripping would empty the cue."""
+    t = (text or "").strip()
+    if not t:
+        return text
+    out = _TRAILING_ANNOTATION_RE.sub("", t).strip()
+    return out if out and out != t else text
 
 
 def strip_annotation_prefix(text: str) -> str:
@@ -1663,8 +1700,8 @@ def drop_junk_cues(rows: list, vocalization_max_dwell_s: float = 2.5,
         if not txt:
             kept.append(r)
             continue
-        # A leading junk tag never costs the cue its dialogue.
-        _stripped = strip_annotation_prefix(txt)
+        # A junk tag at either end never costs the cue its dialogue.
+        _stripped = strip_trailing_annotation(strip_annotation_prefix(txt))
         if _stripped != txt:
             txt = _stripped
             if isinstance(r, dict):

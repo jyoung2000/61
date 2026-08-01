@@ -55,6 +55,11 @@ _DEF_MAX_TERMS = 40
 # Gundam Wing" edge-cases included).
 _MAX_VALUE_WORDS = 4
 _MAX_VALUE_CHARS = 60
+# Consonant-skeleton agreement required of any katakana → English mapping.
+# 0.6 sits in the empty band between the two measured populations: correct
+# romanizations score 0.86-1.00, the junk mapping that motivated the check
+# scores 0.33.
+_SKELETON_FLOOR = 0.6
 
 # Deny-heuristic: never emit a canonical value containing profanity (a
 # hallucinating model must not be able to inject slurs into the translation
@@ -299,6 +304,17 @@ def _sanitize_mapping(raw: dict, terms: list[str]) -> dict[str, str]:
         if val.lower() == src.lower():
             continue  # identity mapping adds nothing
         if _PROFANITY_RE.search(val):
+            continue
+        # A name is not an initial and not a label. A measured run's
+        # second-chance resolver answered "Just" → "J" and "Love" → "L2",
+        # then enforced both across the track. Neither the phonetic gate nor
+        # the ordinary-word gate can see these: "J" is not an English word and
+        # its lead class matches almost anything short.
+        _alpha = [c for c in val if c.isalpha()]
+        if len(_alpha) < 2 or any(c.isdigit() for c in val):
+            logger.info(
+                "canonical names: dropped %r → %r — a canonical name is not "
+                "an initial or a label", src, val)
             continue
         if not _canonical_sounds_plausible(src, val):
             # A canonical mapping is a SPELLING of the same name, so it has to
@@ -969,6 +985,24 @@ def _canonical_sounds_plausible(term: str, value: str) -> bool:
     # against "Relena" and 0.36 against "Peacecraft", which is exactly how a
     # ship became a character in a shipped transcript.
     if _lead_class(romaji) != _lead_class(target):
+        return False
+    # The CONSONANT SKELETON must agree, whatever the full-string ratio says.
+    # It used to be a fallback reached only when the ratio was low, which left
+    # a hole: romaji and an unrelated English word can share plenty of letters
+    # in a different order — オラゴン (oragon) scored 0.46 against "Emotion" and
+    # sailed through, after which a junk mapping put a literal "(Emotion)" tag
+    # into shipped subtitles. Measured over the real roster pairs the two
+    # populations do not overlap: every correct romanization scores ≥0.86 on
+    # the skeleton (hiiro/Heero, katoru/Quatre, earizu/Aries, sekusu/Zechs all
+    # 0.86-1.00) while oragon/Emotion scores 0.33. Vowels drift between
+    # romanization systems; consonants do not.
+    sk_r = _consonant_skeleton(romaji)
+    sk_t = _consonant_skeleton(target)
+    if sk_r and sk_t and difflib.SequenceMatcher(
+            None, sk_r, sk_t).ratio() < _SKELETON_FLOOR:
+        logger.info(
+            "canonical names: dropped %r → %r — consonants disagree "
+            "(%r vs %r)", term, value, sk_r, sk_t)
         return False
     if difflib.SequenceMatcher(None, romaji, target).ratio() >= 0.22:
         return True

@@ -990,3 +990,74 @@ def test_served_model_mismatch_detection():
                         ("Systran/faster-whisper-large-v3", "large-v3"),
                         ("", "large-v3-turbo")):
         assert not _model_differs(served, req), (served, req)
+
+
+# ── Run-17 fixes ───────────────────────────────────────────────────────────
+
+def test_bare_meta_prose_is_convicted():
+    from backend.services.transcript_sanitize import looks_like_annotation_artifact
+    for t in ("More dialogue", "Dialogue end", "Music starts", "Sound effect"):
+        assert looks_like_annotation_artifact(t), t
+
+
+def test_qualifier_alone_convicts_nothing():
+    from backend.services.transcript_sanitize import looks_like_annotation_artifact
+    for t in ("Final line of defence, sir!", "More dialogue is needed",
+              "No more!", "A sound plan.", "The sound of it"):
+        assert not looks_like_annotation_artifact(t), t
+
+
+def test_trailing_annotation_is_stripped_from_real_dialogue():
+    from backend.services.transcript_sanitize import strip_trailing_annotation
+    assert strip_trailing_annotation(
+        "starting new lives in space colonies Dialogue end."
+    ) == "starting new lives in space colonies"
+    assert strip_trailing_annotation(
+        "Get to the shelter now Music ends") == "Get to the shelter now"
+    # An ordinary sentence that merely mentions music keeps every word.
+    for t in ("Get to the shelter now.", "The music ends at dawn, sir."):
+        assert strip_trailing_annotation(t) == t
+
+
+def test_junk_filter_strips_both_ends_and_keeps_the_line():
+    from backend.services.transcript_sanitize import drop_junk_cues
+    rows = [{"start": 1, "end": 2,
+             "text": "starting new lives in space colonies Dialogue end."},
+            {"start": 3, "end": 4, "text": "More dialogue"},
+            {"start": 5, "end": 6, "text": "[♪ music ♪]"},
+            {"start": 7, "end": 8, "text": "Get to the shelter now."}]
+    kept, dropped = drop_junk_cues(rows)
+    assert [r["text"] for r in kept] == [
+        "starting new lives in space colonies", "[♪ music ♪]",
+        "Get to the shelter now."]
+    assert len(dropped) == 1
+
+
+def test_roster_keeps_every_real_romanization():
+    """The consonant skeleton is now mandatory; these must all still pass."""
+    from backend.services.canonical_names import _canonical_sounds_plausible
+    for kana, name in (("セックス", "Zechs"), ("ゼクス", "Zechs"),
+                       ("ヒイロ", "Heero"), ("リリーナ", "Relena"),
+                       ("カトル", "Quatre"), ("トロワ", "Trowa"),
+                       ("ウーフェイ", "Wufei"), ("エアリーズ", "Aries"),
+                       ("トレーズ", "Treize"), ("リーオー", "Leo"),
+                       ("デュオ", "Duo"), ("ガンダニュウム", "Gundanium")):
+        assert _canonical_sounds_plausible(kana, name), (kana, name)
+
+
+def test_roster_rejects_a_name_whose_consonants_disagree():
+    """オラゴン scored 0.46 against "Emotion" on the full-string ratio and
+    shipped a literal "(Emotion)" tag into subtitles. Consonants: 0.33."""
+    from backend.services.canonical_names import _canonical_sounds_plausible
+    for kana, name in (("オラゴン", "Emotion"), ("エアリーズ", "Peacecraft"),
+                       ("レン", "Heero"), ("マリーナ", "Relena")):
+        assert not _canonical_sounds_plausible(kana, name), (kana, name)
+
+
+def test_roster_rejects_initials_and_labels_as_names():
+    from backend.services.canonical_names import _sanitize_mapping
+    terms = ["Just", "Love", "Wing", "Uing", "Dorian"]
+    out = _sanitize_mapping(
+        {"Just": "J", "Love": "L2", "Wing": "W1ng",
+         "Uing": "Wing", "Dorian": "Dorlian"}, terms)
+    assert out == {"Uing": "Wing", "Dorian": "Dorlian"}

@@ -19,7 +19,15 @@ use tokio::process::Child;
 
 pub struct SidecarHandle {
     pub child: Child,
+    /// Composite model+decode cache key ("medium|bs2|mc0|tune:…"), compared on
+    /// every request so a quality change restarts the sidecar. NOT a model
+    /// name — its leading token is a quality TIER. Reporting this to ClipAI as
+    /// the served model produced a mismatch warning on every request of a run
+    /// that was in fact being served exactly what it asked for.
     pub model: String,
+    /// The actual whisper model loaded ("large-v3-turbo"). This is the one to
+    /// show anybody asking what ran.
+    pub model_name: String,
     /// Kept for diagnostics/log correlation (not read on every platform).
     #[allow(dead_code)]
     pub started_ms: u64,
@@ -355,6 +363,7 @@ pub async fn ensure_running(
         // Store the model+decode key so a quality change (beam size / full
         // model) is detected and triggers a restart on the next request.
         model: service_key,
+        model_name: model.to_string(),
         started_ms: crate::state::now_ms(),
     });
     drop(guard);

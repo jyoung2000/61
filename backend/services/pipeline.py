@@ -5201,6 +5201,18 @@ async def _background_post_processing(
                             "[%s] Dropped %d duplicate theme marker(s)",
                             job_id, len(_translated_out) - len(_dd))
                         _translated_out = _dd
+                    # Fold bare ASR "[Music]" tags onto the styled marker and
+                    # drop a marker that merely repeats the one before it. This
+                    # lives on the MAIN path, not only the post-recovery one —
+                    # wiring it there alone left two untranslated-looking
+                    # "[Music]" cues in the shipped file of a measured run.
+                    from backend.services.transcript_sanitize import normalize_markers
+                    _nm, _nm_notes = normalize_markers(_translated_out)
+                    if _nm_notes:
+                        logger.info("[%s] Markers normalized: %d → %d cue(s) — %s",
+                                    job_id, len(_translated_out), len(_nm),
+                                    "; ".join(_nm_notes[:6]))
+                        _translated_out = _nm
                 except Exception:
                     pass
                 # Repair the over-splits the plain merge can't reach — a

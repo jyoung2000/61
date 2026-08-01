@@ -553,7 +553,7 @@ async fn whisper_proxy(State(ctx): State<ProxyCtx>, req: Request<Body>) -> Respo
                 .lock()
                 .await
                 .as_ref()
-                .map(|s| s.model.clone())
+                .map(|s| s.model_name.clone())
                 .unwrap_or_default();
             let mut out = relay(resp);
             if !served.is_empty() {
