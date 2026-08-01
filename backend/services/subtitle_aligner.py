@@ -601,3 +601,64 @@ def project_hybrid_timings(
             n_snapped = 0
     return {"tier_a": n_a, "tier_b": n_b, "tier_c": n_c,
             "ref_anchored": ref_anchored, "cue_snapped": n_snapped, "total": total}
+
+
+def restore_translation_windows(translated: list, source: list,
+                                max_drift_s: float = 15.0) -> dict:
+    """1:1 window attestation at the translation boundary.
+
+    A translated cue's time window is INHERITED from its source cue — no
+    stage between translation and formatting may legally rewrite it. A
+    measured run reached the formatter with ~48 cues whose windows had
+    collapsed; the formatter packed them at 0:00 over silence and the
+    persist-time voice gate then had to kill them, losing the LINES along
+    with the phantoms. Restoring the source window instead keeps each line
+    at its true audio position.
+
+    Mutates ``translated`` in place wherever a cue's window is degenerate
+    (< 0.05 s wide) or drifted more than ``max_drift_s`` from its source
+    cue's window, restoring the source window and clearing any word rows
+    built for the wrong window (tier C keeps the cue whole downstream).
+    Only applies when the lists are 1:1 (equal length) — every other shape
+    is returned untouched.
+
+    Returns ``{"restored": n, "samples": [...], "source_degenerate": m}``;
+    ``source_degenerate`` counts cues whose SOURCE window is itself
+    unusable (nothing to restore from — corruption is upstream of
+    translation, worth its own log line at the call site)."""
+    out = {"restored": 0, "samples": [], "source_degenerate": 0}
+    if not translated or not source or len(translated) != len(source):
+        return out
+    for t, s in zip(translated, source):
+        try:
+            sa = float(_cue_attr(s, "start", 0.0) or 0.0)
+            sb = float(_cue_attr(s, "end", 0.0) or 0.0)
+            ta = float(_cue_attr(t, "start", 0.0) or 0.0)
+            tb = float(_cue_attr(t, "end", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if sb - sa < 0.05:
+            out["source_degenerate"] += 1
+            continue                      # no source truth to restore from
+        degenerate = (tb - ta) < 0.05
+        drifted = (abs(ta - sa) > max_drift_s or abs(tb - sb) > max_drift_s)
+        if not degenerate and not drifted:
+            continue
+        if isinstance(t, dict):
+            t["start"], t["end"] = sa, sb
+            if t.get("words"):
+                t["words"] = None
+            if "words_synthetic" in t:
+                t["words_synthetic"] = None
+        else:
+            t.start, t.end = sa, sb
+            if getattr(t, "words", None):
+                t.words = None
+            if hasattr(t, "words_synthetic"):
+                t.words_synthetic = None
+        out["restored"] += 1
+        if len(out["samples"]) < 6:
+            out["samples"].append(
+                f"{ta:.2f}-{tb:.2f}s -> {sa:.2f}-{sb:.2f}s "
+                f"{_cue_text(t)[:32]!r}")
+    return out

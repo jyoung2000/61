@@ -4432,6 +4432,31 @@ async def _background_post_processing(
             # and the silences between cues. That is the "scrambled timing" the
             # LLM track otherwise showed. Its 1:1 cues are final here; the
             # per-cue readability reflow + dedup below still run.
+            # ── Window attestation (1:1 boundary) ── a translated cue's time
+            # window is inherited from its source cue; nothing may lose it
+            # between here and the formatter. A measured run manufactured 48
+            # mistimed cues the formatter then packed at 0:00 over silence —
+            # the voice gate killed the phantoms but the LINES died with
+            # them. Restoring the source window keeps each line at its true
+            # audio position instead. WARNING level on purpose: this firing
+            # names the defective stage (corruption upstream of this point).
+            try:
+                from backend.services.subtitle_aligner import (
+                    restore_translation_windows)
+                _rw = restore_translation_windows(translated, _trans_input)
+                if _rw["restored"]:
+                    logger.warning(
+                        "[%s] Translation window attestation restored %d "
+                        "cue window(s) from the source track: %s",
+                        job_id, _rw["restored"], "; ".join(_rw["samples"]))
+                if _rw["source_degenerate"]:
+                    logger.warning(
+                        "[%s] Window attestation: %d SOURCE cue(s) carry an "
+                        "unusable window (corruption upstream of translation)",
+                        job_id, _rw["source_degenerate"])
+            except Exception as _rw_e:
+                logger.debug("[%s] Window attestation skipped (%s)", job_id, _rw_e)
+
             if _used_llm:
                 logger.info(
                     "[%s] Translated resegmentation skipped — LLM cues are already "
@@ -4589,6 +4614,24 @@ async def _background_post_processing(
             if _ref_pretask is not None:
                 _ref_pretask.cancel()
                 _ref_pretask = None
+
+            # Window attestation, second application: the hybrid timing +
+            # forced-alignment stages above are the last writers before the
+            # formatter — re-attest so a window they collapsed is restored
+            # (idempotent; a no-op when they behaved). Firing HERE and not at
+            # the 1:1 boundary above pins the corruption to those stages.
+            try:
+                from backend.services.subtitle_aligner import (
+                    restore_translation_windows)
+                _rw2 = restore_translation_windows(translated, _trans_input)
+                if _rw2["restored"]:
+                    logger.warning(
+                        "[%s] Window attestation (post-timing) restored %d "
+                        "cue window(s) collapsed by the timing stages: %s",
+                        job_id, _rw2["restored"], "; ".join(_rw2["samples"]))
+            except Exception as _rw2_e:
+                logger.debug("[%s] Post-timing window attestation skipped (%s)",
+                             job_id, _rw2_e)
 
             # ── (c cont.) Re-enforce readability in the target language ──
             # Translation changes character length dramatically — a CJK →

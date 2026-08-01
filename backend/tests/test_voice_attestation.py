@@ -169,3 +169,144 @@ def test_validate_translation_uses_the_meta_guard():
     assert _validate_translation(_SHIPPED_REFUSAL, "ja", src_text="今回の殺さ") == ""
     assert _validate_translation(
         "Mission accomplished!", "ja", src_text="任務完了") == "Mission accomplished!"
+
+
+# ── Evidence-aware recall (run-10 regression: gate ate real whispers) ──────
+
+def test_attestation_keeps_whispers_with_measured_words(monkeypatch, tmp_path):
+    # "I'll kill you" — whispered, invisible to Silero — but its word rows
+    # were measured against real audio (decode/CTC). Evidence beats the
+    # VAD's opinion of a whisper.
+    from backend.services import speech_coverage as SC
+    wav = tmp_path / "audio.wav"
+    wav.write_bytes(b"RIFF" + b"\0" * 64)
+    monkeypatch.setattr(SC, "voice_activity_regions",
+                        lambda p, **k: [(10.0, 12.0)])
+    rows = [
+        {"start": 1324.0, "end": 1325.4, "text": "I'll kill you.",
+         "speaker": "Speaker 3",
+         "words": [{"word": "I'll", "start": 1324.0, "end": 1324.4},
+                   {"word": "kill", "start": 1324.4, "end": 1324.9},
+                   {"word": "you.", "start": 1324.9, "end": 1325.4}]},
+    ]
+    kept, dropped = attest_cues_to_voice(rows, str(wav))
+    assert kept == rows and not dropped
+
+
+def test_attestation_synthetic_words_are_not_evidence(monkeypatch, tmp_path):
+    # Phantom cues carry SYNTHETIC word rows (char-weight projections built
+    # for whatever window they ended up in) — those prove nothing.
+    from backend.services import speech_coverage as SC
+    wav = tmp_path / "audio.wav"
+    wav.write_bytes(b"RIFF" + b"\0" * 64)
+    monkeypatch.setattr(SC, "voice_activity_regions",
+                        lambda p, **k: [(100.0, 105.0)])
+    rows = [
+        {"start": 0.5, "end": 2.1, "text": "Got it! Normal here.",
+         "speaker": "Speaker 1", "words_synthetic": True,
+         "words": [{"word": "Got", "start": 0.5, "end": 1.0},
+                   {"word": "it!", "start": 1.0, "end": 2.1}]},
+    ]
+    kept, dropped = attest_cues_to_voice(rows, str(wav))
+    assert kept == [] and len(dropped) == 1
+
+
+def test_attestation_margin_tolerates_offset_cue_edges(monkeypatch, tmp_path):
+    # Onset bias / extension legitimately shift a cue slightly off its
+    # voiced audio — the ±0.5s margin keeps such cues.
+    from backend.services import speech_coverage as SC
+    wav = tmp_path / "audio.wav"
+    wav.write_bytes(b"RIFF" + b"\0" * 64)
+    monkeypatch.setattr(SC, "voice_activity_regions",
+                        lambda p, **k: [(9.5, 10.5)])
+    rows = [{"start": 10.8, "end": 11.8, "text": "Slightly late cue.",
+             "speaker": "Speaker 1"}]
+    kept, dropped = attest_cues_to_voice(rows, str(wav))
+    assert kept == rows and not dropped
+
+
+def test_attestation_uses_the_sensitive_vad_threshold(monkeypatch, tmp_path):
+    from backend.services import speech_coverage as SC
+    wav = tmp_path / "audio.wav"
+    wav.write_bytes(b"RIFF" + b"\0" * 64)
+    seen = {}
+
+    def _fake(p, **k):
+        seen.update(k)
+        return [(1.0, 2.0)]
+
+    monkeypatch.setattr(SC, "voice_activity_regions", _fake)
+    SC._VAD_CACHE.clear()
+    attest_cues_to_voice([{"start": 1.0, "end": 2.0, "text": "hi",
+                           "speaker": "Speaker 1"}], str(wav))
+    assert seen.get("threshold") == 0.25, "whisper-sensitive map required"
+
+
+# ── Translation window attestation (restore, don't lose) ──────────────────
+
+def test_restore_windows_repairs_degenerate_and_drifted_cues():
+    from backend.services.subtitle_aligner import restore_translation_windows
+    source = [
+        {"start": 128.0, "end": 130.5, "text": "了解、任務完了だ"},
+        {"start": 200.0, "end": 203.0, "text": "ゼクス、頼む"},
+        {"start": 300.0, "end": 302.0, "text": "はい"},
+    ]
+    translated = [
+        {"start": 0.0, "end": 0.0, "text": "Got it! Mission complete.",
+         "words": [{"word": "Got", "start": 0.0, "end": 0.0}],
+         "words_synthetic": True},                      # degenerate window
+        {"start": 0.56, "end": 2.17, "text": "Zechs, please."},  # drifted
+        {"start": 300.1, "end": 301.9, "text": "Yes."},          # healthy
+    ]
+    out = restore_translation_windows(translated, source)
+    assert out["restored"] == 2 and out["source_degenerate"] == 0
+    assert (translated[0]["start"], translated[0]["end"]) == (128.0, 130.5)
+    assert translated[0]["words"] is None                # wrong-window words die
+    assert (translated[1]["start"], translated[1]["end"]) == (200.0, 203.0)
+    assert (translated[2]["start"], translated[2]["end"]) == (300.1, 301.9)
+    assert len(out["samples"]) == 2
+
+
+def test_restore_windows_leaves_legit_timing_refinement_alone():
+    # CTC tightening moves edges by fractions of a second — never restored.
+    from backend.services.subtitle_aligner import restore_translation_windows
+    source = [{"start": 100.0, "end": 104.0, "text": "ソース"}]
+    translated = [{"start": 100.6, "end": 103.2, "text": "Tightened."}]
+    out = restore_translation_windows(translated, source)
+    assert out["restored"] == 0
+    assert (translated[0]["start"], translated[0]["end"]) == (100.6, 103.2)
+
+
+def test_restore_windows_requires_one_to_one_lists():
+    from backend.services.subtitle_aligner import restore_translation_windows
+    source = [{"start": 1.0, "end": 2.0, "text": "a"}]
+    translated = [{"start": 0.0, "end": 0.0, "text": "x"},
+                  {"start": 0.0, "end": 0.0, "text": "y"}]
+    out = restore_translation_windows(translated, source)
+    assert out["restored"] == 0
+    assert translated[0]["start"] == 0.0                 # untouched
+
+
+def test_restore_windows_counts_source_side_corruption():
+    # A degenerate SOURCE window means the corruption is upstream of
+    # translation — nothing to restore from, but the count names it.
+    from backend.services.subtitle_aligner import restore_translation_windows
+    source = [{"start": 5.0, "end": 5.0, "text": "壊れた"}]
+    translated = [{"start": 0.0, "end": 0.0, "text": "Broken."}]
+    out = restore_translation_windows(translated, source)
+    assert out["restored"] == 0 and out["source_degenerate"] == 1
+
+
+def test_restore_windows_handles_model_objects():
+    from backend.models import TranscriptSegment, WordTimestamp
+    from backend.services.subtitle_aligner import restore_translation_windows
+    src = TranscriptSegment(start=50.0, end=53.0, text="ソース行",
+                            speaker="Speaker 1")
+    bad = TranscriptSegment(
+        start=0.0, end=0.0, text="A line.", speaker="Speaker 1",
+        words=[WordTimestamp(word="A", start=0.0, end=0.0)],
+        words_synthetic=True)
+    out = restore_translation_windows([bad], [src])
+    assert out["restored"] == 1
+    assert (bad.start, bad.end) == (50.0, 53.0)
+    assert bad.words is None and bad.words_synthetic is None

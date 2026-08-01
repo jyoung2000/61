@@ -238,6 +238,7 @@ def voice_activity_regions_cached(audio_path: str, **kwargs) -> List[Interval]:
 
 def attest_cues_to_voice(rows: list, audio_path: str,
                          min_overlap_s: float = 0.15,
+                         margin_s: float = 0.5,
                          ) -> tuple[list, list]:
     """Drop SPEECH cues that overlap no VAD-detected voice at all.
 
@@ -250,19 +251,33 @@ def attest_cues_to_voice(rows: list, audio_path: str,
     property it cannot fake is voiced audio under its window, so that is
     what is attested here.
 
-    Deliberately recall-biased for REAL speech: the bar is a small ABSOLUTE
-    overlap (no fractional requirement — readability extension legitimately
-    stretches a cue well past its voiced audio), and bracketed markers
-    ("[♪ Opening theme ♪]", "[Music]") are exempt because they annotate
-    music on purpose. Zero-width and time-less cues have no audio under
-    them by definition and are dropped. Fail-soft: no VAD map → rows
-    returned unchanged.
+    Deliberately recall-biased for REAL speech — the very next measured run
+    proved a naive gate too eager: it dropped the episode's whispered
+    signature line ("I'll kill you") and battle dialogue under loud BGM,
+    speech Silero cannot hear. Three recall levers:
+
+      * the map is decoded at a LOWER threshold (0.25) than the coverage
+        default, so whispers count as voice;
+      * the cue window is widened by ``margin_s`` before the overlap test
+        (onset bias and readability extension move cue edges off the voice);
+      * a cue carrying MEASURED word rows (``words`` present and not
+        ``words_synthetic``) is kept even with zero VAD overlap — those
+        times came from a decode or CTC alignment against real audio, which
+        is stronger evidence than Silero's opinion of a whisper. Phantom
+        cues never carry measured words: their word rows are synthetic
+        projections, or gone entirely.
+
+    The bar is a small ABSOLUTE overlap (no fractional requirement), and
+    bracketed markers ("[♪ Opening theme ♪]") are exempt because they
+    annotate music on purpose. Zero-width and time-less cues have no audio
+    under them by definition and are dropped regardless of evidence.
+    Fail-soft: no VAD map → rows returned unchanged.
 
     Returns ``(kept_rows, dropped_samples)``.
     """
     if not rows:
         return rows, []
-    regions = voice_activity_regions_cached(audio_path)
+    regions = voice_activity_regions_cached(audio_path, threshold=0.25)
     if not regions:
         return rows, []
     try:
@@ -275,9 +290,13 @@ def attest_cues_to_voice(rows: list, audio_path: str,
         if isinstance(r, dict):
             txt = (r.get("text") or "").strip()
             a, b = r.get("start"), r.get("end")
+            words = r.get("words")
+            synthetic = r.get("words_synthetic")
         else:
             txt = (getattr(r, "text", "") or "").strip()
             a, b = getattr(r, "start", None), getattr(r, "end", None)
+            words = getattr(r, "words", None)
+            synthetic = getattr(r, "words_synthetic", None)
         if not txt or is_subtitle_marker(txt):
             kept.append(r)
             continue
@@ -285,11 +304,15 @@ def attest_cues_to_voice(rows: list, audio_path: str,
             a, b = float(a), float(b)
         except (TypeError, ValueError):
             a, b = 0.0, 0.0
-        if b > a and overlaps_voice(regions, a, b,
-                                    min_overlap_s=min_overlap_s,
-                                    min_overlap_frac=0.0):
-            kept.append(r)
-            continue
+        if b > a:
+            if overlaps_voice(regions, a - margin_s, b + margin_s,
+                              min_overlap_s=min_overlap_s,
+                              min_overlap_frac=0.0):
+                kept.append(r)
+                continue
+            if words and not synthetic:
+                kept.append(r)
+                continue
         dropped.append(f"{a:.2f}-{b:.2f}s {txt[:40]!r}")
     if not dropped:
         return rows, []
