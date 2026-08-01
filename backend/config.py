@@ -1562,6 +1562,26 @@ class Settings(BaseSettings):
     # for now comes from the size-based phrase merge + SUBTITLE_MIN_SPLIT_CHARS,
     # not from tolerating unreadable cues.
     SUBTITLE_SPLIT_CPS_TOLERANCE: float = 1.0
+    # Reading speed at which a cue is split even when no word timing exists
+    # to cut on. The hybrid LLM path normally refuses a char-proportional cut
+    # (``word_timed_split_only``) because a guessed mid-time scrambles a cue's
+    # timing — but a measured run shipped 11 cues above 25 CPS (peaks of 42)
+    # against the professional reference's 2, held whole by exactly that veto.
+    # Past this speed the subtitle cannot be READ, so an approximate cut is
+    # the smaller error. 0 disables the escape (strict word-timed splits only).
+    SUBTITLE_HARD_CPS: float = 25.0
+    # A cue of at most this many words may not sit on screen longer than
+    # ``SUBTITLE_STUB_MAX_DWELL_S``. Stubs parked for seconds ("Ha ha" for
+    # 5.8 s, "Me" for 3.3 s) are what pushed a measured run's median cue
+    # duration to 2.56 s against the reference's 2.12 s — dwell time on
+    # nothing. Trimming the end only widens the gap; text is never touched.
+    SUBTITLE_STUB_MAX_WORDS: int = 3
+    SUBTITLE_STUB_MAX_DWELL_S: float = 2.0
+    # Cross-cue sentence continuation, the professional convention: an
+    # unfinished cue ends with an ellipsis and its continuation starts with
+    # one. The reference marks 45 cues this way; a measured ClipAI run marked
+    # 5, leaving 32%% of cues ending in mid-air with no visual signal.
+    SUBTITLE_ELLIPSIS_CONTINUATION: bool = True
     # COMPLETING an unfinished sentence may overdraw the CPS cap by this factor
     # (20 × 1.15 ≈ 23): a sentence chopped into 0.6-1.0 s flashes is a worse
     # read at any speed than one full cue a shade over cap. The same overdraft

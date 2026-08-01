@@ -662,3 +662,81 @@ def restore_translation_windows(translated: list, source: list,
                 f"{ta:.2f}-{tb:.2f}s -> {sa:.2f}-{sb:.2f}s "
                 f"{_cue_text(t)[:32]!r}")
     return out
+
+
+def _is_anchored(cue) -> bool:
+    """True when a cue's times were MEASURED against audio — a decode or a CTC
+    alignment attached real word rows. Synthetic (char-weight) word arrays are
+    projections, not measurements, and do not anchor anything."""
+    return bool(_cue_attr(cue, "words", None)) and not _cue_attr(
+        cue, "words_synthetic", None)
+
+
+def enforce_anchor_brackets(cues: list, min_room_s: float = 0.4) -> dict:
+    """Pull un-anchored cues back inside the audio-anchored cues around them.
+
+    Timing that came from a projection tier rather than a measurement can
+    drift, and a measured run's drift was one-sided: 20 cues more than a
+    second EARLY against 1 late, gathered into four windows covering 12% of
+    the runtime. Whole RUNS of consecutive cues drifted together — 228 of 311
+    cues had CTC word times and held their place; the other 83 kept projected
+    times and slid, one run leading its audio by nine seconds.
+
+    A cue with measured word rows is an ANCHOR. Any run of un-anchored cues
+    between two anchors must lie inside that bracket: if it starts before the
+    left anchor ends, or ends after the right anchor starts, the run is
+    re-timed across the bracket in proportion to its cues' text lengths — the
+    same char-weight model the projection tiers use, but pinned at both ends
+    so the error cannot accumulate. A run already inside its bracket is left
+    untouched: this repairs violations, it does not re-time the world.
+
+    Runs before the first anchor or after the last have only one side to pin
+    and are left alone. Mutates in place; returns ``{"runs": n, "cues": m,
+    "samples": [...]}``."""
+    out = {"runs": 0, "cues": 0, "samples": []}
+    n = len(cues or [])
+    if n < 3:
+        return out
+    anchors = [i for i in range(n) if _is_anchored(cues[i])]
+    if len(anchors) < 2:
+        return out
+
+    def _num(cue, key, default=0.0):
+        try:
+            return float(_cue_attr(cue, key, default) or default)
+        except (TypeError, ValueError):
+            return default
+
+    for a, b in zip(anchors, anchors[1:]):
+        run = list(range(a + 1, b))
+        if not run:
+            continue
+        lo = _num(cues[a], "end")
+        hi = _num(cues[b], "start")
+        if hi - lo < min_room_s:
+            continue                       # no room to place anything
+        first_s = _num(cues[run[0]], "start")
+        last_e = _num(cues[run[-1]], "end", _num(cues[run[-1]], "start"))
+        if first_s >= lo - 1e-6 and last_e <= hi + 1e-6:
+            continue                       # already inside its bracket
+        weights = [max(1, len(_cue_text(cues[i]).strip())) for i in run]
+        total = float(sum(weights))
+        span = hi - lo
+        cursor = lo
+        for i, w in zip(run, weights):
+            piece = span * (w / total)
+            new_s = round(cursor, 3)
+            new_e = round(min(hi, cursor + piece), 3)
+            if new_e > new_s:
+                if len(out["samples"]) < 6:
+                    out["samples"].append(
+                        f"{_num(cues[i], 'start'):.2f}->{new_s:.2f}s "
+                        f"{_cue_text(cues[i])[:28]!r}")
+                if isinstance(cues[i], dict):
+                    cues[i]["start"], cues[i]["end"] = new_s, new_e
+                else:
+                    cues[i].start, cues[i].end = new_s, new_e
+                out["cues"] += 1
+            cursor = new_e
+        out["runs"] += 1
+    return out

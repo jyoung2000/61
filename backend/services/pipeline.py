@@ -4637,6 +4637,44 @@ async def _background_post_processing(
                 _ref_pretask.cancel()
                 _ref_pretask = None
 
+            # ── Drift repair: pin projected timing to the audio ──
+            # Timing that came from a projection tier can slide, and the slide
+            # is one-sided (a measured run: 20 cues >1s EARLY vs 1 late, in
+            # four windows covering 12% of the runtime). Two independent
+            # corrections, cheapest first: cues whose start sits in silence
+            # are pulled onto the next voice onset (audio truth, from the map
+            # already cached for the attestation gate), then any RUN of
+            # un-anchored cues that escaped the bracket of the CTC-aligned
+            # cues around it is re-timed inside that bracket.
+            try:
+                from backend.services.speech_coverage import (
+                    snap_cues_to_voice_onsets)
+                _snap_wav = os.path.join(database._job_dir(job_id), "audio.wav")
+                if os.path.isfile(_snap_wav) and translated:
+                    translated, _snapped = snap_cues_to_voice_onsets(
+                        translated, _snap_wav)
+                    if _snapped:
+                        logger.info(
+                            "[%s] Voice-onset snap: %d cue(s) starting in "
+                            "silence pulled onto their speech: %s",
+                            job_id, len(_snapped), "; ".join(_snapped[:6]))
+            except Exception as _snap_e:
+                logger.warning("[%s] Voice-onset snap skipped (%s)",
+                               job_id, _snap_e)
+            try:
+                from backend.services.subtitle_aligner import (
+                    enforce_anchor_brackets)
+                _br = enforce_anchor_brackets(translated)
+                if _br["cues"]:
+                    logger.info(
+                        "[%s] Anchor brackets: re-timed %d cue(s) in %d "
+                        "drifted run(s) between audio-aligned neighbours: %s",
+                        job_id, _br["cues"], _br["runs"],
+                        "; ".join(_br["samples"]))
+            except Exception as _br_e:
+                logger.warning("[%s] Anchor-bracket repair skipped (%s)",
+                               job_id, _br_e)
+
             # Window attestation, second application: the hybrid timing +
             # forced-alignment stages above are the last writers before the
             # formatter — re-attest so a window they collapsed is restored
@@ -5039,6 +5077,33 @@ async def _background_post_processing(
                         _translated_out = _rep
                 except Exception:
                     pass
+                # ── Echo suppression + junk filter ──
+                # Independent decodes of the same audio (main pass, second
+                # listen, post-COMPLETE recovery) translate separately, so one
+                # line can ship two to four times; and hole-filling residue
+                # ("*Grunt* *grunt*", a 5.8 s "Ha ha") occupies beats whose
+                # real dialogue is missing. Both run BEFORE the fragment merge
+                # so a duplicate pair is never welded into one long cue.
+                try:
+                    from backend.services.transcript_sanitize import (
+                        drop_junk_cues, suppress_echo_cues)
+                    _pre_echo = len(_translated_out)
+                    _translated_out, _echoes = suppress_echo_cues(_translated_out)
+                    if _echoes:
+                        logger.info(
+                            "[%s] Echo suppression: %d → %d cue(s), dropped %s",
+                            job_id, _pre_echo, len(_translated_out),
+                            "; ".join(_echoes[:6]))
+                    _pre_junk = len(_translated_out)
+                    _translated_out, _junk = drop_junk_cues(_translated_out)
+                    if _junk:
+                        logger.info(
+                            "[%s] Junk-cue filter: %d → %d cue(s), dropped %s",
+                            job_id, _pre_junk, len(_translated_out),
+                            "; ".join(_junk[:6]))
+                except Exception as _echo_e:
+                    logger.warning("[%s] Echo/junk cleanup skipped (%s)",
+                                   job_id, _echo_e)
                 # Fold Whisper's mid-sentence fragment splits ("It's just the" /
                 # "number 21.") back into whole utterances so the translate panel
                 # + SRT read as sentences, not 2-4-word slivers. Idempotent.
@@ -5115,6 +5180,33 @@ async def _background_post_processing(
             except Exception as _att_e:
                 logger.warning("[%s] Voice attestation skipped (%s)",
                                job_id, _att_e)
+
+            # ── Reading-experience passes (text + dwell, no reordering) ──
+            # Both run AFTER every merge/split/marker transform, so they see
+            # the final cue sequence: an ellipsis pair must survive to export,
+            # and a stub's dwell is only knowable once its neighbours are
+            # fixed. Idempotent and fail-soft.
+            try:
+                from backend.services.subtitle_formatter import (
+                    cap_stub_dwell, mark_sentence_continuations)
+                _pre_cont = sum(
+                    1 for _c in _translated_out
+                    if str((_c.get("text") if isinstance(_c, dict)
+                            else getattr(_c, "text", "")) or "").strip().endswith("…"))
+                _translated_out = mark_sentence_continuations(_translated_out)
+                _post_cont = sum(
+                    1 for _c in _translated_out
+                    if str((_c.get("text") if isinstance(_c, dict)
+                            else getattr(_c, "text", "")) or "").strip().endswith("…"))
+                if _post_cont > _pre_cont:
+                    logger.info(
+                        "[%s] Marked %d cross-cue sentence continuation(s) with "
+                        "ellipses (professional convention)",
+                        job_id, _post_cont - _pre_cont)
+                _translated_out = cap_stub_dwell(_translated_out)
+            except Exception as _rd_e:
+                logger.warning("[%s] Reading-experience passes skipped (%s)",
+                               job_id, _rd_e)
 
             try:
                 from backend.services.subtitle_formatter import (

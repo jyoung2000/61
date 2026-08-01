@@ -671,6 +671,14 @@ def _split_segment(
     else:
         _over_box = (max_cue_chars > 0
                      and len(" ".join(text.split())) > max_cue_chars)
+    # Reading speed so far past the cap that holding the cue whole is worse
+    # than an approximate cut — see the word_timed_split_only veto below.
+    try:
+        from backend.config import settings as _cps_s
+        _hard_cps = float(getattr(_cps_s, "SUBTITLE_HARD_CPS", 25.0))
+    except Exception:
+        _hard_cps = 25.0
+    _over_cps_hard = _hard_cps > 0 and _cps(text, duration) > _hard_cps
     if _cps(text, duration) <= target_cps and not _over_box:
         return [seg]
     # Guard against over-fragmentation: never split a segment that's
@@ -685,7 +693,7 @@ def _split_segment(
     # repairable downstream (Pass 2 extends, Pass 2.5 re-merges when it fits);
     # text running off the screen is not. Halve the floor rather than drop it,
     # so the cascade guard still bites once the pieces do fit.
-    if duration < 2 * min_piece_duration and not _over_box:
+    if duration < 2 * min_piece_duration and not _over_box and not _over_cps_hard:
         return [seg]
     if duration < 2 * min_piece_duration:
         # Halve the FLOOR (not "set it to half the duration": duration/2 left a
@@ -789,7 +797,14 @@ def _split_segment(
         # box. An approximate mid-time is a smaller error than text running off
         # the screen, so an over-budget cue falls through to the proportional
         # cut below. Pieces that fit the box are once again subject to the veto.
-        if word_timed_split_only and not _over_box:
+        # A cue far over the READING-SPEED cap gets the same exemption as one
+        # over the box. A measured run shipped 11 cues above 25 CPS (peaks of
+        # 42) against the reference's 2, because this veto held them whole for
+        # want of a word time — but a subtitle that flashes past unread is a
+        # failure just as surely as one that overflows the screen, and an
+        # approximate mid-time is the smaller error. Word-timed cuts are still
+        # strictly preferred; this only stops the veto from being absolute.
+        if word_timed_split_only and not _over_box and not _over_cps_hard:
             continue
         # Otherwise remember the first usable proportional cut and keep looking
         # for a word-timed one, which is strictly better.
@@ -1805,12 +1820,33 @@ def clamp_cue_durations(
     except Exception:
         max_dur_s, marker_max_s = max_dur_s or 7.0, marker_max_s or 4.0
         min_dur_s, max_cps, _linger = min_dur_s or 0.833, max_cps or 17.0, 2.5
-    for seg in (segments or []):
+    _rows = list(segments or [])
+    for _i, seg in enumerate(_rows):
         if seg is None:
             continue
         start = float(_seg_get(seg, "start", 0.0))
         end = float(_seg_get(seg, "end", 0.0))
         if end - start <= max_dur_s:
+            # ── Minimum-duration FLOOR ──
+            # This helper only ever pulled an over-long end EARLIER, so a cue
+            # that arrived under the floor stayed under it: a measured run
+            # shipped three cues of 0.709 s (17 frames against a 20-frame
+            # minimum) where the professional reference never goes below
+            # 0.916 s. They survive because a 1-frame gap boxes them in on
+            # both sides, so no earlier pass could grow them. Borrow from the
+            # gap AFTER the cue — pushing the end later can only shrink that
+            # gap, never touch the next cue or reorder anything.
+            if min_dur_s > 0 and 0 < end - start < min_dur_s:
+                _room_end = start + min_dur_s
+                _nxt = _rows[_i + 1] if _i + 1 < len(_rows) else None
+                if _nxt is not None:
+                    try:
+                        _limit = float(_seg_get(_nxt, "start", 0.0)) - 0.042
+                        _room_end = min(_room_end, _limit)
+                    except (TypeError, ValueError):
+                        pass
+                if _room_end > end:
+                    _seg_set(seg, "end", round(_room_end, 3))
             continue
         text = str(_seg_get(seg, "text", "") or "").strip()
         if _is_bracket_marker(text) and marker_max_s > 0:
@@ -2350,3 +2386,120 @@ def compute_readability_report(
         },
     }
 
+
+
+# ── Cross-cue sentence continuation (the professional convention) ──────────
+
+_CONTINUATION_STOP = ("…", "...", ".", "!", "?", "！", "？", "。", ":", "—", "-")
+# Words no sentence can end on: seeing one at a cue's tail proves the thought
+# continues into the next cue even when that cue opens with a capital.
+_BINDING_TAIL_WORDS = frozenset("""
+a an the and or but nor for so yet of to in on at by with from into onto over
+under about across through during before after between among against is are
+was were be been being am has have had do does did will would shall should
+can could may might must that which who whom whose this these those my your
+his her its our their as than if when while because although though since
+""".split())
+
+
+def mark_sentence_continuations(segments, enabled: Optional[bool] = None):
+    """Signal sentences that run across a cue boundary, the way the reference
+    track does: the unfinished cue ends with an ellipsis, its continuation
+    begins with one.
+
+    A measured run left 101 of 320 cues (32%) ending with no terminal
+    punctuation at all — against 5 of 326 in the professional reference —
+    and 37 cues beginning lowercase mid-sentence against 1. Every one of
+    those is a real sentence split across two cues; the reference marks 45
+    such joins with ellipses, ClipAI marked 5. The text is identical either
+    way, but the reader gets no signal that a thought continues, which is
+    the single most consistent "this is automated" tell in the track.
+
+    A join is marked only when the evidence is unambiguous: the left cue
+    ends WITHOUT sentence-final punctuation and the right cue starts
+    lowercase (or with a conjunction/pronoun that cannot open a sentence).
+    Markers, speaker-dashed cues and already-elided joins are skipped.
+    Text-only and idempotent — timings are never touched."""
+    try:
+        from backend.config import settings as _s
+        if enabled is None:
+            enabled = bool(getattr(_s, "SUBTITLE_ELLIPSIS_CONTINUATION", True))
+    except Exception:
+        enabled = True if enabled is None else enabled
+    if not enabled or not segments:
+        return segments
+    n = len(segments)
+    for i in range(n - 1):
+        a, b = segments[i], segments[i + 1]
+        ta = str(_seg_get(a, "text", "") or "").strip()
+        tb = str(_seg_get(b, "text", "") or "").strip()
+        if not ta or not tb:
+            continue
+        if _is_bracket_marker(ta) or _is_bracket_marker(tb):
+            continue
+        if ta.startswith("-") or tb.startswith("-"):
+            continue                      # dual-speaker cue: not a continuation
+        if ta.endswith(_CONTINUATION_STOP) or ta.endswith(('"', "'", ")", "”")):
+            continue
+        # The right cue must READ as a continuation: a lowercase opener is
+        # the strong signal. An uppercase opener may be a new sentence the
+        # translator simply failed to punctuate — leave it alone rather than
+        # weld two independent thoughts together with an ellipsis.
+        first = tb.split()[0] if tb.split() else ""
+        # A lowercase opener is the strong signal. An uppercase one is
+        # usually a new sentence the translator failed to punctuate — EXCEPT
+        # when the left cue ends on a word that cannot end a sentence at all
+        # (an article, preposition or conjunction), which proves the thought
+        # runs on no matter how the next cue is capitalized.
+        _last = re.sub(r"[^\w']", "", ta.split()[-1]).lower() if ta.split() else ""
+        _binding = _last in _BINDING_TAIL_WORDS
+        if not first or (not first[0].islower() and not _binding):
+            continue
+        _seg_set(a, "text", ta + "…")
+        _seg_set(b, "text", "…" + tb)
+    return segments
+
+
+def cap_stub_dwell(segments, max_words: Optional[int] = None,
+                   max_dwell_s: Optional[float] = None):
+    """Stop two- and three-word cues from being parked on screen for seconds.
+
+    A measured run held 29 cues of three words or fewer for 2.5 s or more
+    (a 5.8 s "Ha ha", a 5.0 s "Come on", a 4.8 s "Ah") against exactly one
+    in the professional reference. That dwell time is what pushed the run's
+    median cue duration to 2.56 s versus the reference's 2.12 s: the track
+    is not slower to read, it simply sits on nothing for longer.
+
+    Pulls the END in only — never the start, never the text — so it can only
+    widen the gap to the next cue and can never create an overlap. Bracketed
+    markers keep their own (separate) ceiling. Idempotent."""
+    try:
+        from backend.config import settings as _s
+        max_words = max_words if max_words is not None else int(
+            getattr(_s, "SUBTITLE_STUB_MAX_WORDS", 3))
+        max_dwell_s = max_dwell_s if max_dwell_s is not None else float(
+            getattr(_s, "SUBTITLE_STUB_MAX_DWELL_S", 2.0))
+        _floor = float(getattr(_s, "SUBTITLE_MIN_DURATION_MS", 833)) / 1000.0
+    except Exception:
+        max_words = max_words or 3
+        max_dwell_s = max_dwell_s or 2.0
+        _floor = 0.833
+    if max_words <= 0 or max_dwell_s <= 0:
+        return segments
+    for seg in (segments or []):
+        if seg is None:
+            continue
+        text = str(_seg_get(seg, "text", "") or "").strip()
+        if not text or _is_bracket_marker(text):
+            continue
+        if len(text.split()) > max_words:
+            continue
+        try:
+            start = float(_seg_get(seg, "start", 0.0))
+            end = float(_seg_get(seg, "end", 0.0))
+        except (TypeError, ValueError):
+            continue
+        target = max(max_dwell_s, _floor)
+        if end - start > target:
+            _seg_set(seg, "end", round(start + target, 3))
+    return segments

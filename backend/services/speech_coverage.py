@@ -317,3 +317,94 @@ def attest_cues_to_voice(rows: list, audio_path: str,
     if not dropped:
         return rows, []
     return kept, dropped
+
+
+def snap_cues_to_voice_onsets(rows: list, audio_path: str,
+                              max_shift_s: float = 2.0,
+                              min_shift_s: float = 0.15,
+                              ) -> tuple[list, list]:
+    """Pull a cue that starts in SILENCE forward onto the next voice onset.
+
+    Measured against a professional reference, ClipAI's timing error was
+    almost perfectly one-sided: of the cues off by more than a second, 20
+    were EARLY and 1 was late, clustered into four windows totalling 12% of
+    the runtime (one line landed 26 seconds before its audio). Random jitter
+    is symmetric; a one-sided error is a systematic offset, and an offset is
+    correctable against the one signal that cannot drift — where the voice
+    actually starts.
+
+    Conservative by construction, because a wrong snap is worse than a small
+    lead:
+      * only cues whose start lies in SILENCE are candidates — a cue already
+        sitting on voice is left exactly where it is;
+      * cues carrying MEASURED word rows are skipped: their times came from
+        a decode or CTC alignment against this same audio and outrank a VAD
+        region boundary;
+      * the shift is capped at ``max_shift_s`` and never crosses into the
+        previous cue's window or past the cue's own end;
+      * shifts under ``min_shift_s`` are not worth the churn.
+
+    Only the START moves; the end is left alone, so a snapped cue simply
+    gets shorter and can never overlap its neighbour. Fail-soft: no VAD map
+    → rows returned unchanged. Returns ``(rows, shifted_samples)``."""
+    if not rows:
+        return rows, []
+    regions = voice_activity_regions_cached(audio_path, threshold=0.25)
+    if not regions:
+        return rows, []
+    try:
+        from backend.services.audio_analyzer import is_subtitle_marker
+    except Exception:
+        def is_subtitle_marker(_t: str) -> bool:
+            return False
+
+    def _g(r, k, d=None):
+        return r.get(k, d) if isinstance(r, dict) else getattr(r, k, d)
+
+    def _set(r, k, v):
+        if isinstance(r, dict):
+            r[k] = v
+        else:
+            setattr(r, k, v)
+
+    merged = merge_intervals(regions)
+    shifted = []
+    prev_end = 0.0
+    for r in rows:
+        try:
+            a = float(_g(r, "start", 0.0) or 0.0)
+            b = float(_g(r, "end", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        txt = (_g(r, "text", "") or "").strip()
+        if b <= a or not txt or is_subtitle_marker(txt):
+            prev_end = max(prev_end, b)
+            continue
+        words = _g(r, "words", None)
+        if words and not _g(r, "words_synthetic", None):
+            prev_end = max(prev_end, b)      # measured times outrank the VAD
+            continue
+        # In silence? (inside any voiced region → already anchored)
+        if any(vs <= a <= ve for vs, ve in merged):
+            prev_end = max(prev_end, b)
+            continue
+        nxt = None
+        for vs, _ve in merged:
+            if vs > a:
+                nxt = vs
+                break
+        if nxt is None:
+            prev_end = max(prev_end, b)
+            continue
+        shift = nxt - a
+        if shift < min_shift_s or shift > max_shift_s:
+            prev_end = max(prev_end, b)
+            continue
+        new_a = min(nxt, b - 0.2)            # never collapse the cue
+        if new_a <= a or new_a < prev_end:
+            prev_end = max(prev_end, b)
+            continue
+        _set(r, "start", round(new_a, 3))
+        shifted.append(f"{a:.2f}->{new_a:.2f}s {txt[:32]!r}")
+        prev_end = max(prev_end, b)
+    return rows, shifted

@@ -197,6 +197,81 @@ def _under_transcribed_spans(
     return out
 
 
+
+def _micro_voice_gaps(segments, voice: list, *, pad_s: float,
+                      existing: list, min_voice_s: float = 0.4,
+                      max_take: int = 24) -> list[tuple[float, float]]:
+    """Voiced moments with NO cue over them at all, however short.
+
+    Every other selector in this module is keyed on the size of the HOLE in
+    the transcript, so a line has to be long enough — or surrounded by
+    enough silence — to open a hole worth chasing. That is exactly wrong for
+    the lines that actually go missing. Measured against a professional
+    reference, the 25 dialogue lines ClipAI dropped were nearly all short
+    ("A body!", "Yes, sir.", "Down there!", "One more to go."): each lasts
+    about a second between two well-transcribed cues, so it never opens the
+    8-second hole the main selector needs and was never once considered.
+
+    This tier asks the only question that matters for them: is there voiced
+    audio here that NO cue covers? Candidates are padded into decodable
+    slices and capped, because they are individually tiny and the concatenated
+    decode pays per second. Returns [] without a VAD map."""
+    if not voice:
+        return []
+    covered = []
+    for s in (segments or []):
+        b = _seg_bounds(s)
+        if b is not None:
+            covered.append(b)
+    covered = _merge(covered)
+    have = _merge(list(existing or []))
+    out: list[tuple[float, float]] = []
+    for v in _merge([(float(a), float(b)) for a, b in
+                     ((x[0], x[1]) for x in voice if len(x) >= 2)]):
+        for lo, hi in _subtract_spans(v, covered):
+            if hi - lo < min_voice_s:
+                continue
+            # Skip anything an earlier tier already queued.
+            if any(hi > a and lo < b for a, b in have):
+                continue
+            out.append((max(0.0, lo - pad_s), hi + pad_s))
+    # Longest first: more voiced audio uncovered = more likely a real line.
+    out.sort(key=lambda g: g[0] - g[1])
+    return out[:max_take]
+
+
+def _merge(spans: list) -> list[tuple[float, float]]:
+    """Sort + merge overlapping spans (empty/degenerate dropped)."""
+    cleaned = sorted((float(a), float(b)) for a, b in spans if float(b) > float(a))
+    if not cleaned:
+        return []
+    out = [list(cleaned[0])]
+    for a, b in cleaned[1:]:
+        if a <= out[-1][1]:
+            out[-1][1] = max(out[-1][1], b)
+        else:
+            out.append([a, b])
+    return [(a, b) for a, b in out]
+
+
+def _subtract_spans(region: tuple, covered: list) -> list[tuple[float, float]]:
+    """Parts of ``region`` no span in ``covered`` (merged, sorted) overlaps."""
+    a, b = region
+    parts, cur = [], a
+    for cs, ce in covered:
+        if ce <= cur:
+            continue
+        if cs >= b:
+            break
+        if cs > cur:
+            parts.append((cur, min(cs, b)))
+        cur = max(cur, ce)
+        if cur >= b:
+            break
+    if cur < b:
+        parts.append((cur, b))
+    return parts
+
 def find_coverage_gaps(
     segments,
     *,
@@ -244,6 +319,8 @@ def find_coverage_gaps(
         gaps.extend(_under_transcribed_spans(
             gaps, segments, voice_regions, pad_s=pad_s, min_gap_s=min_gap_s,
             max_span_s=max_span_s, density_ratio=density_ratio))
+        gaps.extend(_micro_voice_gaps(
+            segments, voice_regions, pad_s=pad_s, existing=gaps))
         gaps.sort()
     # SMALLEST first. Largest-first contradicted this module's own premise —
     # music-buried dialogue arrives as SHORT holes, so the big spans it

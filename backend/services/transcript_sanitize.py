@@ -1297,3 +1297,247 @@ def repair_degenerate_cue_windows(rows: list, dup_ratio: float = 0.6,
     if drop_set:
         rows = [r for i, r in enumerate(rows) if i not in drop_set]
     return rows, dropped, repaired
+
+
+# ── Echo suppression (translated track) ────────────────────────────────────
+
+def _echo_norm(text: str) -> str:
+    """Comparison form: lowercase, punctuation-free, whitespace-collapsed."""
+    t = re.sub(r"[^\w\s]", " ", (text or "").lower())
+    return " ".join(t.split())
+
+
+_ECHO_STOPWORDS = frozenset("""
+a an and are as at be been being but by can do does for from had has have he
+her him his how i if in is it its me my not of on or our out she so than that
+the their them then there they this to too us was we were what when which who
+will with would you your
+""".split())
+
+
+def _echo_stems(text: str) -> set:
+    """Content words, lightly stemmed. Two independent translations of one
+    line share their CONTENT, not their surface form ("Reporting meteor
+    strikes." vs "Reported as falling meteorites"), so the comparison has to
+    see through inflection and function words."""
+    out = set()
+    for w in _echo_norm(text).split():
+        if w in _ECHO_STOPWORDS or len(w) < 3:
+            continue
+        for suf in ("ings", "ing", "ies", "ied", "es", "ed", "s"):
+            if len(w) - len(suf) >= 3 and w.endswith(suf):
+                w = w[: -len(suf)]
+                break
+        out.add(w)
+    return out
+
+
+def _echo_similarity(a: str, b: str) -> float:
+    """How much two cues say the same thing: the better of surface
+    similarity and stemmed content-word containment."""
+    from difflib import SequenceMatcher
+    surface = SequenceMatcher(None, _echo_norm(a), _echo_norm(b)).ratio()
+    sa, sb = _echo_stems(a), _echo_stems(b)
+    if not sa or not sb:
+        return surface
+    # Prefix-tolerant match: crude suffix stripping still leaves related forms
+    # apart ("meteor" vs "meteorit"), and those pairs are exactly the ones two
+    # independent translations of one line produce.
+    # Containment on a ONE-word set is meaningless: "Father, what's that?"
+    # reduces to {father} and then scores 1.0 against every other line
+    # mentioning a father. Two content words minimum before containment may
+    # override the surface measure.
+    if min(len(sa), len(sb)) < 2:
+        return surface
+    small, large = (sa, sb) if len(sa) <= len(sb) else (sb, sa)
+    hits = 0
+    for w in small:
+        if any(w == o or (len(w) >= 4 and len(o) >= 4
+                          and (w.startswith(o[:4]) and (w.startswith(o) or o.startswith(w))))
+               for o in large):
+            hits += 1
+    containment = hits / float(len(small))
+    return max(surface, containment)
+
+
+
+def _unique_proper_nouns(loser: str, keeper: str) -> bool:
+    """True when ``loser`` carries a capitalized word ``keeper`` does not —
+    a name, place or designation that would be lost by dropping it."""
+    def _caps(t):
+        # MID-SENTENCE capitals only. A sentence-initial capital is grammar,
+        # not a name — counting it made every ordinary line look like it
+        # carried a proper noun and disarmed the suppressor completely.
+        out = set()
+        for m in re.finditer(r"\b[A-Z][a-zA-Z'\-]{2,}", t or ""):
+            k = m.start() - 1
+            while k >= 0 and (t[k].isspace() or t[k] in "\"'("):
+                k -= 1
+            if k < 0 or t[k] in ".!?…:;":
+                continue                  # opens a sentence — not evidence
+            out.add(m.group(0).lower())
+        return out
+    return bool(_caps(loser) - _caps(keeper))
+
+
+# Shortest cue that may be judged an echo. The professional reference ships
+# "Good morning!" twice in one exchange and "Fire! Fire!!" back to back — at
+# this length a repeat is dialogue, not duplication.
+_ECHO_MIN_CHARS = 16
+
+
+def suppress_echo_cues(rows: list, window_s: float = 12.0,
+                       ratio: float = 0.66) -> tuple[list, list]:
+    """Drop cues that re-say a nearby cue's content in different words.
+
+    Independent decodes of the same audio (the main pass, the second listen,
+    and the post-COMPLETE recovery) each translate separately, so one line of
+    dialogue can ship two to four times. A measured run emitted the same
+    meteor report four times across 3:22-3:34 where the professional
+    reference has ONE line, and parked two cues repeating "Please leave it
+    to me!" across eleven seconds that hold no dialogue at all.
+
+    Semantic, not exact: the duplicates never match character-for-character
+    because each was translated independently. Cues are compared to their
+    neighbours inside ``window_s`` on a punctuation-free similarity ratio.
+
+    Guards, each protecting a real subtitle pattern:
+      * SHORT cues (< 12 chars normalized) are never echoes — professional
+        tracks legitimately repeat exclamations ("Fire! Fire!!", "Enemy
+        attack! Enemy attack!");
+      * a cue is never compared across a SPEAKER change (two characters
+        saying the same thing is drama, not duplication);
+      * markers are exempt.
+
+    The survivor is the cue with MEASURED word rows (audio-anchored) or,
+    failing that, the longest text — the most complete rendering. Windows
+    are left alone: the dropped cue's span belongs to the silence the
+    reference also leaves empty. Returns ``(rows, dropped_samples)``."""
+    def _g(r, k, d=None):
+        return r.get(k, d) if isinstance(r, dict) else getattr(r, k, d)
+
+    n = len(rows or [])
+    if n < 2:
+        return rows, []
+    norm, drop = [], set()
+    for r in rows:
+        norm.append(_echo_norm(_g(r, "text", "") or ""))
+    for i in range(n):
+        if i in drop or len(norm[i]) < _ECHO_MIN_CHARS:
+            continue
+        ti = (_g(rows[i], "text", "") or "").strip()
+        if not ti or ti.startswith("["):
+            continue
+        try:
+            ei = float(_g(rows[i], "end", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        for j in range(i + 1, n):
+            if j in drop or len(norm[j]) < _ECHO_MIN_CHARS:
+                continue
+            tj = (_g(rows[j], "text", "") or "").strip()
+            if not tj or tj.startswith("["):
+                continue
+            try:
+                sj = float(_g(rows[j], "start", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if sj - ei > window_s:
+                break                     # rows are time-ordered; done with i
+            if (_g(rows[i], "speaker", "") or "") != (_g(rows[j], "speaker", "") or ""):
+                continue
+            if _echo_similarity(_g(rows[i], "text", "") or "",
+                                _g(rows[j], "text", "") or "") < ratio:
+                continue
+            # Same line twice. Keep the audio-anchored copy, else the fuller.
+            wi = bool(_g(rows[i], "words", None)) and not _g(rows[i], "words_synthetic", None)
+            wj = bool(_g(rows[j], "words", None)) and not _g(rows[j], "words_synthetic", None)
+            if wj and not wi:
+                loser, keeper = i, j
+            elif wi and not wj:
+                loser, keeper = j, i
+            else:
+                loser, keeper = (j, i) if len(norm[i]) >= len(norm[j]) else (i, j)
+            # A cue that carries a NAME the survivor does not is not a
+            # duplicate — it elaborates. The professional reference uses
+            # exactly this beat ("My name..." then "My name is Relena
+            # Darlian."), and an early build of this pass deleted the
+            # heroine's surname because the fragment before it scored as a
+            # match. Information the survivor lacks is never redundant.
+            if _unique_proper_nouns(_g(rows[loser], "text", "") or "",
+                                    _g(rows[keeper], "text", "") or ""):
+                continue
+            drop.add(loser)
+            if loser == i:
+                break                     # i is gone; move on
+    if not drop:
+        return rows, []
+    samples = []
+    for i in sorted(drop):
+        try:
+            a = float(_g(rows[i], "start", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            a = 0.0
+        samples.append(f"{a:.2f}s {(_g(rows[i], 'text', '') or '')[:40]!r}")
+    return [r for i, r in enumerate(rows) if i not in drop], samples
+
+
+# ── Junk-cue filter ────────────────────────────────────────────────────────
+
+# Roleplay stage-direction markup ("*Grunt* *grunt*"). Never valid subtitle
+# text — a professional track writes "[grunts]" or nothing at all.
+_ASTERISK_MARKUP_RE = re.compile(r"^\s*(?:\*[^*]+\*\s*)+$")
+# Laughter, which professional tracks annotate ("[laughs]") rather than
+# transcribe, and pure vocalizations. Matched against the normalized form.
+_LAUGH_TOKEN_RE = re.compile(r"^(?:h+[ae]+)+h*$|^lol$")
+_VOCALIZATION = {
+    "uh", "um", "umm", "er", "err", "mm", "mmm", "hmm", "hm", "ah", "aah",
+    "ahh", "oh", "ooh", "eh", "ehh", "gah", "guh", "ugh", "argh", "agh",
+    "wah", "hmph", "tsk", "grunt", "groan", "sigh",
+}
+
+
+def drop_junk_cues(rows: list, vocalization_max_dwell_s: float = 2.5,
+                   ) -> tuple[list, list]:
+    """Remove cues that carry no information a viewer could use.
+
+    Deliberately NARROW. A measured run's stray cues included "*Grunt*
+    *grunt*" held 4.5 s and "Ha ha" held 5.8 s over a battle beat whose
+    three real lines were missing — but the same run also shipped "Hey!",
+    "Huh?" and "What?", every one of which the professional reference
+    ALSO captions. Dropping by shortness would have thrown away real
+    dialogue, so only two classes go:
+
+      * asterisk roleplay markup, which is never subtitle text; and
+      * laughter / bare vocalizations ("Ah", "Hmph") that sit on screen
+        longer than ``vocalization_max_dwell_s`` — a real interjection is
+        brief, so a multi-second one is decode residue filling a hole.
+
+    Real words keep their place regardless of length. Returns
+    ``(rows, dropped_samples)``."""
+    def _g(r, k, d=None):
+        return r.get(k, d) if isinstance(r, dict) else getattr(r, k, d)
+
+    kept, dropped = [], []
+    for r in rows or []:
+        txt = (_g(r, "text", "") or "").strip()
+        if not txt or txt.startswith("["):
+            kept.append(r)
+            continue
+        try:
+            dur = float(_g(r, "end", 0.0) or 0.0) - float(_g(r, "start", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            dur = 0.0
+        if _ASTERISK_MARKUP_RE.match(txt):
+            dropped.append(f"markup:{txt[:32]!r}")
+            continue
+        norm = _echo_norm(txt)
+        if norm and dur > vocalization_max_dwell_s:
+            words = norm.split()
+            _laugh = words and all(_LAUGH_TOKEN_RE.match(w) for w in words)
+            if _laugh or (len(words) <= 2
+                          and all(w in _VOCALIZATION for w in words)):
+                dropped.append(f"vocalization:{txt[:32]!r} ({dur:.1f}s)")
+                continue
+        kept.append(r)
+    return (kept, dropped) if dropped else (rows, [])
