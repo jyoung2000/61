@@ -693,3 +693,41 @@ def build_non_speech_subtitle_events(
             continue
         out.append({"start": start, "end": end, "text": label})
     return out
+
+
+# One spectral classification per audio file per process. ``classify_audio_events``
+# decodes and analyses the whole track, and by the time the translated transcript
+# is finalized the source path has already paid for it — so the theme collapse
+# gets its music spans free. Keyed on (path, mtime, size) so a re-extracted file
+# re-classifies; failures are never cached.
+_MUSIC_SPAN_CACHE: dict = {}
+_MUSIC_SPAN_CACHE_MAX = 8
+
+
+async def music_spans_cached(audio_path: str, min_seconds: float = 5.0) -> list:
+    """Sustained music-only ``(start, end)`` spans, cached per audio file.
+
+    Dialogue over a score classifies as ``speech``, so a span returned here is
+    positive evidence of music WITHOUT speech — which is what makes it usable
+    as ground truth for "these cues are sung". Returns ``[]`` on any failure so
+    every caller degrades to its previous behaviour."""
+    import os as _os
+    try:
+        st = _os.stat(audio_path)
+        key = (_os.path.abspath(audio_path), st.st_mtime_ns, st.st_size)
+    except OSError:
+        return []
+    hit = _MUSIC_SPAN_CACHE.get(key)
+    if hit is not None:
+        return [s for s in hit if (s[1] - s[0]) >= min_seconds]
+    try:
+        events = await classify_audio_events(audio_path)
+    except Exception as e:
+        logger.info("music_spans_cached: classify failed (%s) — no spans", e)
+        return []
+    spans = _music_spans_from_events(events, 0.0)
+    if spans:
+        while len(_MUSIC_SPAN_CACHE) >= _MUSIC_SPAN_CACHE_MAX:
+            _MUSIC_SPAN_CACHE.pop(next(iter(_MUSIC_SPAN_CACHE)))
+        _MUSIC_SPAN_CACHE[key] = list(spans)
+    return [s for s in spans if (s[1] - s[0]) >= min_seconds]

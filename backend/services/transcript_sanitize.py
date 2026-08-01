@@ -1541,3 +1541,109 @@ def drop_junk_cues(rows: list, vocalization_max_dwell_s: float = 2.5,
                 continue
         kept.append(r)
     return (kept, dropped) if dropped else (rows, [])
+
+
+# ── Audio-keyed theme collapse ─────────────────────────────────────────────
+
+def collapse_theme_by_music_spans(segments, music_spans: list,
+                                  target_lang: str = "en",
+                                  head_s: float = 180.0,
+                                  tail_s: float = 240.0,
+                                  min_span_s: float = 20.0,
+                                  min_cues: int = 3):
+    """Collapse a sung theme using the AUDIO, not the translation's wording.
+
+    ``collapse_song_choruses`` infers a theme from the text: chorus repetition
+    plus punctuation and capitalization heuristics. That inference depends on
+    how the LLM happened to render the lyrics on a given run, and it is not
+    stable — across measured runs the same episode's opening theme collapsed
+    correctly three times and shipped as dialogue three times, with nothing
+    changed but the translation's phrasing. Text is the wrong evidence for a
+    question the audio already answers.
+
+    The spectral classifier labels sustained MUSIC-ONLY regions; dialogue over
+    a score is classified speech, not music, so a long music span is positive
+    evidence that whatever cues sit inside it are sung, not spoken. Any run of
+    at least ``min_cues`` cues lying inside such a span, in the opening or
+    closing window, becomes one ``[♪ … theme ♪]`` marker regardless of what
+    the words say.
+
+    Preview narration over the ending theme is preserved: a preview cue splits
+    the run rather than being swallowed by it. Deterministic and fail-soft —
+    no spans (classifier unavailable, no sustained music) returns the rows
+    untouched, and the text-based pass still gets its turn afterwards.
+    Returns ``(rows, changed)``."""
+    try:
+        tgt = (target_lang or "").strip().lower().split("-")[0]
+        rows = _as_rows(segments)
+        if tgt in _CJK_TARGETS or not music_spans or len(rows) < 4:
+            return rows, False
+        try:
+            from backend.config import settings as _s
+            if not getattr(_s, "TRANSCRIPT_MARK_THEME_SONGS", True):
+                return rows, False
+        except Exception:
+            pass
+
+        def _st(r):
+            return float(r.get("start") or 0.0)
+
+        def _en(r):
+            return float(r.get("end") or 0.0)
+
+        track_end = max((_en(r) for r in rows), default=0.0)
+        spans = []
+        for sp in music_spans:
+            try:
+                a, b = float(sp[0]), float(sp[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if b - a < min_span_s:
+                continue
+            # Only the opening and closing windows. A sustained music cue in
+            # the middle of an episode is score under a scene, not a theme.
+            if a <= head_s or a >= max(0.0, track_end - tail_s):
+                spans.append((a, b))
+        if not spans:
+            return rows, False
+
+        drop, markers = set(), []
+        for a, b in sorted(spans):
+            inside = []
+            for i, r in enumerate(rows):
+                if i in drop:
+                    continue
+                txt = (r.get("text") or "").strip()
+                if not txt or txt.startswith("["):
+                    continue
+                mid = (_st(r) + _en(r)) / 2.0
+                if a - 0.5 <= mid <= b + 0.5:
+                    inside.append(i)
+            if len(inside) < min_cues:
+                continue
+            # A next-episode preview narrated over the ending theme is real
+            # content — cut the run at it instead of swallowing it.
+            run = []
+            for i in inside:
+                if _PREVIEW_RE.search((rows[i].get("text") or "")):
+                    break
+                run.append(i)
+            if len(run) < min_cues:
+                continue
+            m_start = min(_st(rows[i]) for i in run)
+            m_end = max(_en(rows[i]) for i in run)
+            if m_end - m_start < _THEME_MIN_SPAN_S:
+                continue
+            label = (_THEME_OPEN_LABEL if m_start <= head_s
+                     else _THEME_END_LABEL)
+            drop.update(run)
+            markers.append({"start": round(m_start, 3), "end": round(m_end, 3),
+                            "text": label, "speaker": ""})
+        if not markers:
+            return rows, False
+        out = [r for i, r in enumerate(rows) if i not in drop] + markers
+        out.sort(key=lambda r: (float(r.get("start") or 0.0),
+                                float(r.get("end") or 0.0)))
+        return out, True
+    except Exception:
+        return _as_rows(segments), False

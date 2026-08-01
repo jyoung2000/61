@@ -322,6 +322,7 @@ def attest_cues_to_voice(rows: list, audio_path: str,
 def snap_cues_to_voice_onsets(rows: list, audio_path: str,
                               max_shift_s: float = 2.0,
                               min_shift_s: float = 0.15,
+                              threshold: float = 0.5,
                               ) -> tuple[list, list]:
     """Pull a cue that starts in SILENCE forward onto the next voice onset.
 
@@ -349,7 +350,16 @@ def snap_cues_to_voice_onsets(rows: list, audio_path: str,
     → rows returned unchanged. Returns ``(rows, shifted_samples)``."""
     if not rows:
         return rows, []
-    regions = voice_activity_regions_cached(audio_path, threshold=0.25)
+    # A CONFIDENT map, not the recall-biased one the attestation gate uses.
+    # The two passes ask opposite questions. The gate asks "could there be a
+    # voice here?" and must say yes to a whisper, so it decodes at 0.25 — and
+    # at that sensitivity nearly the whole track reads as voiced. Feeding the
+    # same map to this pass made it inert: a measured run found ZERO cues
+    # starting in silence and logged nothing at all. This pass asks "is this
+    # definitely silence?", which needs the strict default. Risk stays bounded
+    # by the guards below: measured word rows always win, and the shift is
+    # capped.
+    regions = voice_activity_regions_cached(audio_path, threshold=threshold)
     if not regions:
         return rows, []
     try:

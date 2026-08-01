@@ -5053,6 +5053,41 @@ async def _background_post_processing(
                 # marker — the way official subs do — keyed on chorus repetition
                 # so it never eats spoken lines and a next-episode preview is kept.
                 try:
+                    # AUDIO-KEYED first: the spectral classifier already told
+                    # us which regions are sustained music with no speech in
+                    # them, and that answer does not change with how the LLM
+                    # phrased the lyrics this run. The text-based pass below
+                    # then handles whatever the audio could not (classifier
+                    # unavailable, a theme mixed under dialogue).
+                    try:
+                        from backend.services.audio_analyzer import (
+                            music_spans_cached)
+                        from backend.services.transcript_sanitize import (
+                            collapse_theme_by_music_spans)
+                        _thm_wav = os.path.join(
+                            database._job_dir(job_id), "audio.wav")
+                        if os.path.isfile(_thm_wav):
+                            _mspans = await music_spans_cached(_thm_wav)
+                            _amt, _amt_changed = collapse_theme_by_music_spans(
+                                _translated_out, _mspans, target_lang)
+                            if _amt_changed:
+                                logger.info(
+                                    "[%s] Theme collapsed from AUDIO music "
+                                    "spans: %d → %d cue(s) (%d music span(s) "
+                                    "classified)", job_id,
+                                    len(_translated_out), len(_amt),
+                                    len(_mspans))
+                                _translated_out = _amt
+                            elif _mspans:
+                                logger.info(
+                                    "[%s] Audio theme collapse: %d music "
+                                    "span(s) found, none qualified — falling "
+                                    "back to the text pass",
+                                    job_id, len(_mspans))
+                    except Exception as _amt_e:
+                        logger.warning(
+                            "[%s] Audio-keyed theme collapse skipped (%s)",
+                            job_id, _amt_e)
                     from backend.services.transcript_sanitize import collapse_song_choruses
                     _thm, _thm_changed = collapse_song_choruses(_translated_out, target_lang)
                     if _thm_changed:
@@ -5188,7 +5223,12 @@ async def _background_post_processing(
             # fixed. Idempotent and fail-soft.
             try:
                 from backend.services.subtitle_formatter import (
-                    cap_stub_dwell, mark_sentence_continuations)
+                    cap_stub_dwell, heal_split_ellipsis,
+                    mark_sentence_continuations)
+                # Heal FIRST: a previous run of this pass plus the readability
+                # merges can already have welded a marked pair into one cue,
+                # and marking on top of that would compound it.
+                heal_split_ellipsis(_translated_out)
                 _pre_cont = sum(
                     1 for _c in _translated_out
                     if str((_c.get("text") if isinstance(_c, dict)

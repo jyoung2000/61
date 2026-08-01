@@ -320,16 +320,24 @@ def test_min_duration_floor_respects_a_tight_neighbour():
 
 def test_hard_cps_escape_splits_an_unreadable_wordless_cue():
     # word_timed_split_only normally holds a word-less cue whole; above the
-    # hard CPS ceiling an approximate cut is the smaller error.
+    # hard CPS ceiling an approximate cut is the smaller error — PROVIDED
+    # both halves still clear the display minimum. (A shipped run proved the
+    # unconditional version harmful: it cut a 0.96 s cue into two flashes of
+    # 0.539 s and 0.421 s. The too-short case is covered separately by
+    # test_cps_split_will_not_manufacture_unreadable_flashes.)
     from backend.services.subtitle_formatter import _split_segment
     seg = TranscriptSegment(
-        start=482.44, end=483.40, speaker="Speaker 1",
+        start=482.44, end=484.44, speaker="Speaker 1",
         text="which is faster than O, would that be more suitable for this")
+    # 60 chars in 2.0 s = 30 CPS, past the 25 ceiling, and long enough that
+    # both halves clear the 0.833 s display floor.
     pieces = _split_segment(
         seg, target_cps=20.0, max_chars_per_line=34,
         word_timed_split_only=True)
     assert len(pieces) > 1, "an unreadable cue must be cut even without words"
     assert " ".join(p.text for p in pieces).split() == seg.text.split()
+    for p in pieces:
+        assert p.end - p.start >= 0.833 - 1e-6, "halves must stay readable"
 
 
 def test_hard_cps_escape_leaves_readable_wordless_cues_whole():
@@ -428,3 +436,157 @@ def test_continuation_still_refuses_two_independent_sentences():
             {"start": 2.1, "end": 4.0, "text": "Mission changed"}]
     mark_sentence_continuations(rows)
     assert rows[0]["text"] == "Understood"
+
+
+# ── Run-13 follow-ups: four regressions found in the shipped output ────────
+
+def test_cps_split_will_not_manufacture_unreadable_flashes():
+    # The escape cut a 0.96s over-CPS cue into 0.539s + 0.421s — both under
+    # the display minimum. Two flashes nobody can read is not an improvement
+    # on one cue that reads fast.
+    from backend.services.subtitle_formatter import _split_segment
+    seg = TranscriptSegment(start=100.0, end=100.96, speaker="S1",
+                            text="which is faster than O, be more suitable?")
+    pieces = _split_segment(seg, target_cps=20.0, max_chars_per_line=34,
+                            word_timed_split_only=True)
+    assert len(pieces) == 1, "too short to split readably — keep it whole"
+    for p in pieces:
+        assert p.end - p.start >= 0.833 - 1e-6
+
+
+def test_cps_split_still_fires_when_both_halves_stay_readable():
+    from backend.services.subtitle_formatter import _split_segment
+    seg = TranscriptSegment(
+        start=100.0, end=102.4, speaker="S1",
+        text="which is faster than O, would that be more suitable for this mission")
+    pieces = _split_segment(seg, target_cps=20.0, max_chars_per_line=34,
+                            word_timed_split_only=True)
+    assert len(pieces) == 2
+    for p in pieces:
+        assert p.end - p.start >= 0.833 - 1e-6
+
+
+def test_over_box_split_keeps_its_exemption():
+    # Text running off the screen is still worse than an approximate cut, so
+    # an over-BOX cue may still produce short pieces.
+    from backend.services.subtitle_formatter import _split_segment
+    seg = TranscriptSegment(
+        start=1150.0, end=1150.67, speaker="S1",
+        text="It looks similar to the Suits we fought before and now there are two")
+    pieces = _split_segment(seg, target_cps=20.0, max_chars_per_line=34,
+                            word_timed_split_only=True)
+    assert len(pieces) > 1
+
+
+def test_heal_split_ellipsis_collapses_a_welded_marker_pair():
+    from backend.services.subtitle_formatter import heal_split_ellipsis
+    rows = [
+        {"text": "The capsule has changed course,… …does it want to commit suicide?"},
+        {"text": "even more,... ...trying to escape?"},
+        {"text": "A cue that legitimately trails off…"},
+        {"text": "…and its separate continuation."},
+        {"text": "Wait... what?"},
+    ]
+    heal_split_ellipsis(rows)
+    assert rows[0]["text"] == "The capsule has changed course, does it want to commit suicide?"
+    assert rows[1]["text"] == "even more, trying to escape?"
+    assert rows[2]["text"] == "A cue that legitimately trails off…"
+    assert rows[3]["text"] == "…and its separate continuation."
+    assert rows[4]["text"] == "Wait... what?"
+    before = [r["text"] for r in rows]
+    heal_split_ellipsis(rows)
+    assert [r["text"] for r in rows] == before, "must be idempotent"
+
+
+def test_readability_pass_heals_the_pairs_it_welds():
+    # enforce_readability is what merges a marked pair back together, so the
+    # heal has to be part of what it RETURNS.
+    from backend.services.subtitle_formatter import enforce_readability
+    segs = [
+        TranscriptSegment(start=10.0, end=11.2, speaker="S1",
+                          text="The capsule has changed course,…"),
+        TranscriptSegment(start=11.3, end=13.0, speaker="S1",
+                          text="…does it want to commit suicide?"),
+    ]
+    out = enforce_readability(segs, max_cps=20.0, max_chars_per_line=34)
+    for cue in out:
+        assert "… …" not in cue.text and "... ..." not in cue.text
+
+
+def test_onset_snap_uses_a_confident_threshold_not_the_gate_s(monkeypatch, tmp_path):
+    # The attestation gate decodes at 0.25 to protect whispers; at that
+    # sensitivity almost nothing reads as silence and this pass found zero
+    # work on a real run.
+    from backend.services import speech_coverage as SC
+    wav = tmp_path / "audio.wav"
+    wav.write_bytes(b"RIFF" + b"\0" * 64)
+    seen = {}
+
+    def _fake(p, **k):
+        seen.update(k)
+        return [(10.0, 12.0)]
+
+    monkeypatch.setattr(SC, "voice_activity_regions", _fake)
+    SC._VAD_CACHE.clear()
+    SC.snap_cues_to_voice_onsets(
+        [{"start": 8.0, "end": 12.0, "text": "x"}], str(wav))
+    assert seen.get("threshold") == 0.5
+
+
+# ── Audio-keyed theme collapse ─────────────────────────────────────────────
+
+def _sung(n, t0, step=4.0):
+    return [{"start": t0 + step * i, "end": t0 + step * i + step,
+             "text": f"sung line {i}", "speaker": "S1"} for i in range(n)]
+
+
+def test_audio_theme_collapse_marks_both_themes_without_reading_the_words():
+    from backend.services.transcript_sanitize import collapse_theme_by_music_spans
+    rows = (_sung(8, 30.0)
+            + [{"start": 300.0, "end": 303.0, "text": "Real dialogue.",
+                "speaker": "S2"}]
+            + _sung(6, 1360.0, 5.0)
+            + [{"start": 1450.0, "end": 1455.0, "text": "Closing line.",
+                "speaker": "S2"}])
+    out, changed = collapse_theme_by_music_spans(
+        rows, [(26.0, 92.0), (1358.0, 1415.0)])
+    assert changed
+    texts = [r["text"] for r in out]
+    assert "[♪ Opening theme ♪]" in texts and "[♪ Ending theme ♪]" in texts
+    assert "Real dialogue." in texts and "Closing line." in texts
+    assert not any(t.startswith("sung line") for t in texts)
+
+
+def test_audio_theme_collapse_ignores_mid_episode_score():
+    # A sustained music cue under a battle scene is not a theme.
+    from backend.services.transcript_sanitize import collapse_theme_by_music_spans
+    rows = _sung(6, 600.0) + [{"start": 1450.0, "end": 1452.0,
+                               "text": "End.", "speaker": "S2"}]
+    out, changed = collapse_theme_by_music_spans(rows, [(595.0, 640.0)])
+    assert changed is False and out == rows
+
+
+def test_audio_theme_collapse_preserves_preview_narration():
+    from backend.services.transcript_sanitize import collapse_theme_by_music_spans
+    rows = (_sung(4, 1360.0, 5.0)
+            + [{"start": 1382.0, "end": 1387.0,
+                "text": "Next episode: the Gundam appears.", "speaker": "S3"}]
+            + _sung(3, 1390.0, 5.0))
+    out, changed = collapse_theme_by_music_spans(rows, [(1358.0, 1410.0)])
+    assert changed
+    assert "Next episode: the Gundam appears." in [r["text"] for r in out]
+
+
+def test_audio_theme_collapse_is_a_noop_without_spans():
+    from backend.services.transcript_sanitize import collapse_theme_by_music_spans
+    rows = _sung(8, 30.0)
+    for spans in ([], None, [(26.0, 30.0)]):     # last: span too short
+        out, changed = collapse_theme_by_music_spans(rows, spans)
+        assert changed is False
+
+
+def test_audio_theme_collapse_needs_enough_cues():
+    from backend.services.transcript_sanitize import collapse_theme_by_music_spans
+    rows = _sung(2, 30.0)
+    out, changed = collapse_theme_by_music_spans(rows, [(26.0, 92.0)])
+    assert changed is False

@@ -693,6 +693,25 @@ def _split_segment(
     # repairable downstream (Pass 2 extends, Pass 2.5 re-merges when it fits);
     # text running off the screen is not. Halve the floor rather than drop it,
     # so the cascade guard still bites once the pieces do fit.
+    # A CPS-only split (the cue FITS the box, it is just fast) must leave two
+    # READABLE pieces or it is no improvement at all. A measured run proved
+    # the point: a 0.96 s cue over the ceiling was cut into 0.539 s + 0.421 s,
+    # both under the minimum display duration — "too fast to read" traded for
+    # two flashes too brief to read, plus a sub-minimum cue the structural
+    # metrics then counted against us. So the CPS escape gets the DISPLAY
+    # floor, not the fragmentation floor, and never relaxes it. An over-box
+    # cue keeps its exemption: text running off the screen is still worse
+    # than an approximate cut.
+    if _over_cps_hard and not _over_box:
+        try:
+            from backend.config import settings as _md_s
+            _min_display = float(
+                getattr(_md_s, "SUBTITLE_MIN_DURATION_MS", 833)) / 1000.0
+        except Exception:
+            _min_display = 0.833
+        min_piece_duration = max(min_piece_duration, _min_display)
+        if duration < 2 * min_piece_duration:
+            return [seg]              # cannot yield two readable halves
     if duration < 2 * min_piece_duration and not _over_box and not _over_cps_hard:
         return [seg]
     if duration < 2 * min_piece_duration:
@@ -1770,6 +1789,12 @@ def enforce_readability(
     # preserved wherever the count already agrees.
     resync_cue_words(out3)
 
+    # The merges above can weld a marked continuation pair back into one cue,
+    # which would then carry both halves of the marker. Heal it here, at the
+    # END of the pass that creates it, so every caller (persist AND the export
+    # re-run) gets the same clean text.
+    heal_split_ellipsis(out3)
+
     return out3
 
 
@@ -2502,4 +2527,34 @@ def cap_stub_dwell(segments, max_words: Optional[int] = None,
         target = max(max_dwell_s, _floor)
         if end - start > target:
             _seg_set(seg, "end", round(start + target, 3))
+    return segments
+
+
+# An ellipsis PAIR that ended up inside one cue: the continuation marker was
+# written across a cue boundary, then a later merge welded the two cues back
+# together and kept both halves of the marker.
+_SPLIT_ELLIPSIS_RE = re.compile(r"(?:\.\.\.|…)\s*(?:\.\.\.|…)")
+
+
+def heal_split_ellipsis(segments):
+    """Collapse a continuation marker that a merge pulled into one cue.
+
+    ``mark_sentence_continuations`` writes the professional convention — an
+    unfinished cue ends with an ellipsis, its continuation opens with one —
+    at persist time. The export then re-runs the readability merge, and a
+    pair that fits one cue is welded back together carrying BOTH markers: a
+    measured run shipped eight cues reading like "changed course,… …does it
+    want to commit suicide?". Once the two halves share a cue the marker has
+    nothing left to signal, so it comes out.
+
+    Text-only, idempotent, safe on a track that was never marked."""
+    for seg in (segments or []):
+        if seg is None:
+            continue
+        text = str(_seg_get(seg, "text", "") or "")
+        if not text:
+            continue
+        healed = _SPLIT_ELLIPSIS_RE.sub(" ", text)
+        if healed != text:
+            _seg_set(seg, "text", " ".join(healed.split()))
     return segments
