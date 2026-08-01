@@ -269,6 +269,17 @@ export default function CompanionDownloadCard({ isMobile = false }) {
         showToast(data.message || 'Could not start the Companion update', data.status === 'busy' ? 'info' : 'error');
         return;
       }
+      // Updating ends running work by design — say so, rather than leaving the
+      // user to discover their job vanished.
+      const n = (data.jobs_cancelled || []).length;
+      if (n || data.companion_ended_job) {
+        showToast(
+          n
+            ? `Ended ${n} running job${n === 1 ? '' : 's'} to update the Companion`
+            : 'Ended the Companion’s in-flight work to update it',
+          'info',
+        );
+      }
       pushStarted.current = Date.now();
       setPush({ phase: 'downloading', pct: 0 });
       pushTimer.current = setInterval(pollPush, 2500);

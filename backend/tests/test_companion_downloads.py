@@ -448,3 +448,80 @@ def test_fresh_baked_beats_stale_cache(dirs, no_github):
     assert out["platforms"]["windows"]["source"] == "baked"
     resp = asyncio.run(D.companion_download("windows"))
     assert resp.path.endswith("Companion_0.2.0.exe")
+
+
+# ── Updating is never blocked by running work ──────────────────────────────
+
+def _async_return(value):
+    async def _f(*a, **k):
+        return value
+    return _f
+
+class _SeqClient(_FakeClient):
+    """Like _FakeClient but records calls and can vary a route's answer per
+    call, so a "409 then retry" sequence is observable."""
+
+    def __init__(self, routes, seq=None):
+        super().__init__(routes)
+        self.calls = []
+        self._seq = dict(seq or {})
+
+    async def _dispatch(self, url):
+        self.calls.append(url)
+        for suffix, answers in self._seq.items():
+            if url.endswith(suffix):
+                return answers.pop(0) if len(answers) > 1 else answers[0]
+        return await super()._dispatch(url)
+
+
+def test_push_update_cancels_local_jobs_first(paired_reg, monkeypatch):
+    """A running job must not stop the update — it is ended, and reported."""
+    monkeypatch.setattr(
+        D, "_cancel_jobs_for_companion_update",
+        _async_return(["job-a", "job-b"]))
+    _fake_httpx(monkeypatch, {
+        "/v1/update/install": _FakeResp(200, {"started": True,
+                                              "ended_job": "Ep 1"})})
+    out = asyncio.run(D.companion_push_update())
+    assert out["status"] == "started"
+    assert out["jobs_cancelled"] == ["job-a", "job-b"]
+    assert out["companion_ended_job"] == "Ep 1"
+
+
+def test_push_update_retries_once_past_an_old_companions_409(paired_reg,
+                                                             monkeypatch):
+    """An older Companion still answers 409 while busy. Force-end its side and
+    ask again rather than making the user click twice."""
+    client = _SeqClient({}, seq={
+        "/v1/update/install": [_FakeResp(409, {"error": "a job is running"}),
+                               _FakeResp(200, {"started": True})],
+        "/v1/jobs/force-end": [_FakeResp(200, {"ended_job": "Ep 1"})],
+    })
+    monkeypatch.setattr(D.httpx, "AsyncClient", lambda timeout=None: client)
+    monkeypatch.setattr(D, "_cancel_jobs_for_companion_update",
+                        _async_return([]))
+    out = asyncio.run(D.companion_push_update())
+    assert out["status"] == "started"
+    assert any(u.endswith("/v1/jobs/force-end") for u in client.calls)
+    assert sum(u.endswith("/v1/update/install") for u in client.calls) == 2
+
+
+def test_push_update_survives_an_uncancellable_job_store(paired_reg,
+                                                         monkeypatch):
+    """Cancellation failing is not a reason to refuse the update."""
+    async def _boom():
+        raise RuntimeError("job store down")
+    monkeypatch.setattr(D, "_cancel_jobs_for_companion_update", _boom)
+    _fake_httpx(monkeypatch, {
+        "/v1/update/install": _FakeResp(200, {"started": True})})
+    out = asyncio.run(D.companion_push_update())
+    assert out["status"] == "started", "a cancel failure must not block updating"
+
+
+def test_cancel_helper_is_fail_soft_without_a_job_store(monkeypatch):
+    import backend.database as _db
+
+    async def _boom(**kw):
+        raise RuntimeError("no db")
+    monkeypatch.setattr(_db, "list_jobs", _boom)
+    assert asyncio.run(D._cancel_jobs_for_companion_update()) == []

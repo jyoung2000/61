@@ -487,11 +487,63 @@ async def companion_refresh():
 
 # ── Remote Companion update (push from this web UI, no one at the GPU PC) ───
 
+async def _cancel_jobs_for_companion_update() -> list:
+    """Cancel every non-terminal job before the Companion goes down.
+
+    The Companion is about to force-end its side and exit for the installer,
+    so any job still running here would sit waiting on a host that no longer
+    answers until it times out with a confusing error. Cancelling first makes
+    the outcome legible: the user asked for an update, the jobs ended because
+    of it, and the pipeline records exactly that. Fail-soft per job — a job
+    that will not cancel must never stop the update, and neither must a failure
+    to LOAD the machinery that cancels — importing the pipeline drags in the
+    whole provider stack, and any one of those imports blowing up would
+    otherwise take the update down with it. Returns the ids ended."""
+    cancelled = []
+    try:
+        from backend import database as _db
+        from backend.models import JobStatus as _JS
+    except Exception as e:
+        logger.warning("Companion update: cannot reach the job store (%s) — "
+                       "updating anyway", e)
+        return cancelled
+    try:
+        from backend.services.pipeline import request_cancel as _rc
+    except Exception as e:
+        logger.warning("Companion update: cancel signal unavailable (%s) — "
+                       "jobs will still be marked cancelled", e)
+
+        def _rc(_job_id):
+            return None
+
+    terminal = {_JS.COMPLETE, _JS.FAILED, _JS.CANCELLED}
+    try:
+        jobs = await _db.list_jobs(light=True)
+    except Exception:
+        return cancelled
+    for j in jobs:
+        try:
+            if j.status in terminal:
+                continue
+            await _db.update_job_status(
+                j.job_id, status=_JS.CANCELLED,
+                progress_message="Ended to update the GPU Companion")
+            _rc(j.job_id)
+            cancelled.append(j.job_id)
+        except Exception:
+            continue
+    return cancelled
+
+
 @router.post("/companion/push-update")
 async def companion_push_update():
     """Tell the paired Companion to self-update NOW: it downloads the installer
     this server hosts, sha256-verifies it, installs silently and relaunches.
-    Progress is polled via GET /companion/push-update/status."""
+    Progress is polled via GET /companion/push-update/status.
+
+    Running work never blocks this. Jobs on this side are cancelled first, then
+    the Companion ends its own in-flight work and installs."""
+    cancelled = []
     try:
         from backend.services import ollama_registry as reg
         comp = reg.companion_host()
@@ -500,11 +552,34 @@ async def companion_push_update():
                     "message": "No paired GPU Companion — pair one first."}
         base = reg.companion_base(comp)
         headers = dict(reg.auth_headers(comp) or {})
+        # Guarded on its own: cancelling is a courtesy to the jobs, not a
+        # precondition for the update. If it throws, the update still goes.
+        try:
+            cancelled = await _cancel_jobs_for_companion_update()
+            if cancelled:
+                logger.info("Companion update: cancelled %d running job(s) first",
+                            len(cancelled))
+        except Exception as e:
+            logger.warning("Companion update: could not cancel local jobs (%s) "
+                           "— updating anyway", e)
         async with httpx.AsyncClient(timeout=10.0) as client:
             r = await client.post(f"{base}/v1/update/install", headers=headers)
+            if r.status_code == 409:
+                # An older Companion still refuses mid-job. Ours are cancelled
+                # now, so clear ITS active-job display and ask once more — an
+                # update must not need a second click from the user.
+                logger.info("Companion refused the update as busy — "
+                            "force-ending its side and retrying once")
+                try:
+                    await client.post(f"{base}/v1/jobs/force-end", headers=headers)
+                    r = await client.post(f"{base}/v1/update/install",
+                                          headers=headers)
+                except Exception:
+                    pass
     except Exception as e:
         return {"status": "error",
-                "message": f"Couldn't reach the Companion to start the update: {e}"}
+                "message": f"Couldn't reach the Companion to start the update: {e}",
+                "jobs_cancelled": cancelled}
     if r.status_code == 404:
         # Old build — the /v1/update routes don't exist yet. One manual hop.
         return {"status": "unsupported",
@@ -514,18 +589,29 @@ async def companion_push_update():
                            "Update — and every update after that can be "
                            "pushed from here."}
     if r.status_code == 409:
+        # Only reachable on an old Companion whose force-end also failed.
         detail = ""
         try:
             detail = (r.json() or {}).get("error", "")
         except Exception:
             pass
         return {"status": "busy",
-                "message": detail or "The Companion GPU is mid-job — retry "
-                                     "when it finishes."}
+                "message": (detail or "The Companion GPU reports a job running")
+                           + " — this Companion is too old to end it for an "
+                             "update. Click \"Force end all jobs\" on this "
+                             "card, then update again.",
+                "jobs_cancelled": cancelled}
     if r.status_code != 200:
         return {"status": "error",
-                "message": f"Companion answered HTTP {r.status_code}."}
-    return {"status": "started"}
+                "message": f"Companion answered HTTP {r.status_code}.",
+                "jobs_cancelled": cancelled}
+    ended = ""
+    try:
+        ended = (r.json() or {}).get("ended_job") or ""
+    except Exception:
+        pass
+    return {"status": "started", "jobs_cancelled": cancelled,
+            "companion_ended_job": ended}
 
 
 @router.get("/companion/push-update/status")

@@ -876,6 +876,24 @@ static UPDATE_STATUS: std::sync::Mutex<Option<UpdateStatus>> =
 static UPDATE_RUNNING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// After this long, an "in progress" update is presumed dead and a new attempt
+/// takes the lock. The happy path never reaches it — a successful update exits
+/// the process within seconds of reaching "launching" — but several unhappy
+/// paths leave the flag set forever in a still-live app: the installer's UAC
+/// prompt is dismissed, the launch succeeds but the swap does not, or a
+/// download stalls under a timeout longer than a user will wait. Without an
+/// escape those states brick updating until someone restarts the app by hand,
+/// which on a headless GPU box means walking to it. Ten minutes is longer than
+/// any real download on a LAN and shorter than anyone's patience.
+const UPDATE_STALE_MS: u64 = 600_000;
+
+/// Whether a new update attempt may take a lock another attempt still holds.
+/// `prev_started_ms == 0` means we hold the flag but never recorded a start —
+/// nothing to defer to, so take it.
+pub(crate) fn update_lock_is_stale(prev_started_ms: u64, now_ms: u64) -> bool {
+    prev_started_ms == 0 || now_ms.saturating_sub(prev_started_ms) >= UPDATE_STALE_MS
+}
+
 fn update_status_set(f: impl FnOnce(&mut UpdateStatus)) {
     if let Ok(mut g) = UPDATE_STATUS.lock() {
         let mut s = g.take().unwrap_or_default();
@@ -917,10 +935,24 @@ pub(crate) async fn perform_self_update(
                     needs a user at the machine; use the Companion app's own \
                     Update button".into());
     }
-    if UPDATE_RUNNING.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        return Err("an update is already in progress".into());
-    }
     let started = state::now_ms();
+    if UPDATE_RUNNING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        // Held. Concede only to an attempt that is still plausibly alive; a
+        // stale flag must never be the reason an update cannot be started.
+        let prev = UPDATE_STATUS
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|s| s.started_ms))
+            .unwrap_or(0);
+        if !update_lock_is_stale(prev, started) {
+            return Err("an update is already in progress".into());
+        }
+        log::warn!(
+            "self-update: taking over a stale in-progress update (started {} ms \
+             ago) — an update is never blocked by a previous attempt",
+            started.saturating_sub(prev)
+        );
+    }
     update_status_set(|s| {
         *s = UpdateStatus {
             state: "downloading".into(), progress_pct: 0.0,
@@ -1150,6 +1182,18 @@ async fn install_app_update(
     state: tauri::State<'_, SharedState>,
 ) -> Result<String, String> {
     let shared = state.inner().clone();
+    // Same rule as the remote path: clicking Update ends whatever this GPU is
+    // doing rather than the click doing nothing. The app is seconds from being
+    // replaced under any in-flight work, so cancel it cleanly and hand the
+    // installer a quiet machine — a whisper sidecar still holding a file is a
+    // file the installer cannot swap.
+    if let Some(job) = shared.current_job() {
+        log::warn!(
+            "self-update: ending in-flight job {} before installing",
+            job.job_title
+        );
+    }
+    proxy::force_end_everything(&shared, "self-update (app Update button)").await;
     let path = perform_self_update(&shared, false).await?;
     // Give the GUI a moment to render the "installer started" state, then
     // exit — the RunEvent::Exit handler stops Ollama/whisper children so the
@@ -1602,4 +1646,39 @@ pub fn run() {
         }
     }
     log::info!("app exited");
+}
+
+#[cfg(test)]
+mod update_lock_tests {
+    use super::{update_lock_is_stale, UPDATE_STALE_MS};
+
+    #[test]
+    fn a_live_attempt_still_holds_the_lock() {
+        let now = 1_000_000u64;
+        assert!(!update_lock_is_stale(now - 1_000, now));
+        assert!(!update_lock_is_stale(now - (UPDATE_STALE_MS - 1), now));
+    }
+
+    #[test]
+    fn a_dead_attempt_never_blocks_a_new_one() {
+        // The failure that stranded a user: the installer launched, the swap
+        // never happened, the app stayed alive with the flag set. Without this
+        // escape, updating is bricked until someone restarts the app by hand.
+        let now = 10_000_000u64;
+        assert!(update_lock_is_stale(now - UPDATE_STALE_MS, now));
+        assert!(update_lock_is_stale(now - UPDATE_STALE_MS * 10, now));
+    }
+
+    #[test]
+    fn a_flag_with_no_recorded_start_is_stale() {
+        assert!(update_lock_is_stale(0, 1_000_000));
+        assert!(update_lock_is_stale(0, 0));
+    }
+
+    #[test]
+    fn a_clock_that_went_backwards_does_not_wedge_the_lock() {
+        // saturating_sub yields 0, which reads as "just started" — the one
+        // case where we defer. It self-heals once the clock passes the mark.
+        assert!(!update_lock_is_stale(2_000_000, 1_000_000));
+    }
 }

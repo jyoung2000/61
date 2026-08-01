@@ -668,24 +668,39 @@ async fn jobs_force_end(State(ctx): State<ProxyCtx>, req: Request<Body>) -> Resp
     if !authorized(&ctx, req.headers()) {
         return unauthorized();
     }
-    let ended = ctx.state.force_end_job();
-    ctx.state.job_progress.store(0, Ordering::Relaxed);
-    // Whisper first, unconditionally: free_gpu skips it while a decode holds
-    // the slot, but a force-end exists precisely to stop that decode.
-    let whisper_was_running = ctx.state.sidecar.lock().await.is_some();
-    crate::sidecar::shutdown(&ctx.state, "ClipAI /v1/jobs/force-end").await;
-    let (_stopped, unloaded) =
-        crate::sidecar::free_gpu(&ctx.state, "ClipAI /v1/jobs/force-end").await;
-    log::info!(
-        "jobs_force_end: ended {} on ClipAI's request — whisper_stopped={whisper_was_running}, ollama_unloaded={unloaded}",
-        ended.as_deref().unwrap_or("(no active job)")
-    );
+    let (ended, whisper_was_running, unloaded) =
+        force_end_everything(&ctx.state, "ClipAI /v1/jobs/force-end").await;
     Json(serde_json::json!({
         "ended_job": ended,
         "whisper_stopped": whisper_was_running,
         "ollama_unloaded": unloaded,
     }))
     .into_response()
+}
+
+/// End every piece of work this Companion is doing and free the GPU.
+///
+/// Clears + suppresses the active-job display, kills the whisper sidecar EVEN
+/// MID-DECODE, and evicts every resident Ollama model. Shared by
+/// ``/v1/jobs/force-end`` and by both update paths, which call it instead of
+/// refusing: an update that waits for the GPU to go quiet is an update that
+/// never happens on a busy machine. Returns
+/// ``(ended_job, whisper_was_running, ollama_unloaded)``.
+pub(crate) async fn force_end_everything(
+    state: &crate::SharedState, reason: &str,
+) -> (Option<String>, bool, usize) {
+    let ended = state.force_end_job();
+    state.job_progress.store(0, Ordering::Relaxed);
+    // Whisper first, unconditionally: free_gpu skips it while a decode holds
+    // the slot, but a force-end exists precisely to stop that decode.
+    let whisper_was_running = state.sidecar.lock().await.is_some();
+    crate::sidecar::shutdown(state, reason).await;
+    let (_stopped, unloaded) = crate::sidecar::free_gpu(state, reason).await;
+    log::info!(
+        "force_end_everything ({reason}): ended {} — whisper_stopped={whisper_was_running}, ollama_unloaded={unloaded}",
+        ended.as_deref().unwrap_or("(no active job)")
+    );
+    (ended, whisper_was_running, unloaded)
 }
 
 /// /v1/progress → a lightweight job-progress heartbeat from ClipAI (same
@@ -991,20 +1006,24 @@ async fn update_install(
     // Learn/refresh the ClipAI origin so paired_base() resolves even on
     // manually-paired setups (mirrors the health handler).
     note_clipai_origin(&ctx.state, &headers, peer.map(|ci| ci.0));
-    // Refuse mid-job: killing the app under an active transcription/inference
-    // fails that job confusingly. The caller shows this and retries when idle.
-    if let Some(job) = ctx.state.current_job() {
-        return (
-            StatusCode::CONFLICT,
-            axum::Json(serde_json::json!({
-                "started": false,
-                "error": format!(
-                    "a job is running on this GPU ({}) — retry when it finishes",
-                    job.job_title),
-            })),
-        )
-            .into_response();
+    // An update is never refused. This used to answer 409 while a job was in
+    // flight, on the theory that killing the app mid-transcription fails that
+    // job confusingly — but the GPU PC is busy most of the time it is on, so
+    // "retry when idle" meant the Companion drifted versions behind and the
+    // user had to walk to the machine. Ending the job is the lesser cost, and
+    // it is the honest one: the app is about to be replaced underneath any
+    // work anyway, so the choice is between a clean cancel and a confusing
+    // mid-flight death. ClipAI cancels its side before calling, so anything
+    // that errors back lands in an already-cancelled pipeline.
+    let ended_job = ctx.state.current_job().map(|j| j.job_title);
+    if ended_job.is_some() {
+        log::warn!(
+            "remote self-update: ending in-flight job {} — an update is never \
+             blocked by running work",
+            ended_job.as_deref().unwrap_or("")
+        );
     }
+    force_end_everything(&ctx.state, "self-update (remote)").await;
     let state = ctx.state.clone();
     tauri::async_runtime::spawn(async move {
         match crate::perform_self_update(&state, true).await {
@@ -1023,7 +1042,8 @@ async fn update_install(
             Err(e) => log::error!("remote self-update failed: {e}"),
         }
     });
-    axum::Json(serde_json::json!({"started": true})).into_response()
+    axum::Json(serde_json::json!({"started": true, "ended_job": ended_job}))
+        .into_response()
 }
 
 /// GET /v1/update/status → progress of a remote-triggered (or GUI) update.
