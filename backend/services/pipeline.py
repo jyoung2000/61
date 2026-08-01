@@ -3141,6 +3141,79 @@ async def _polish_transcript_loop(
     return best_models, best_report
 
 
+def _resanitize_after_merge(rows: list, target_lang: str, job_id: str) -> list:
+    """Re-run the cue-level cleanup chain over a track that gained cues after
+    the main pipeline already sanitized it.
+
+    The post-COMPLETE gap recovery merges into the SHIPPED translated track
+    roughly nine minutes after those passes ran and four minutes before the SRT
+    is written, so every cue it adds reached the viewer having been screened
+    only for voiced audio. A measured run added 27 cues that way and paid for
+    it across the board: +28 cues over the professional reference (the track
+    was at 351 against the reference's 347 before the merge), +28 of the
+    over-fast cues, 9 of 15 sub-minimum cues, and duplicate restatements of
+    dialogue already captioned seconds earlier.
+
+    Runs the passes whose judgement is per-cue and therefore still correct on a
+    changed track. Deliberately NOT re-run: the theme collapse, which makes one
+    whole-track decision about where the songs are — re-deciding that against a
+    mutated track is the exact shape of the regression that deleted a minute of
+    narration two runs ago, and the recovery cannot move a theme boundary
+    anyway. Fail-soft: any pass that raises leaves the track as it was."""
+    from backend.services.transcript_sanitize import (
+        drop_junk_cues, drop_repetition_bursts, drop_restatement_cues,
+        merge_transcript_fragments, normalize_markers, sanitize_translated_transcript,
+        split_run_on_cues, suppress_echo_cues)
+
+    out = rows
+    try:
+        out, _notes = normalize_markers(out)
+        if _notes:
+            logger.info("[%s] Post-merge markers: %s", job_id, "; ".join(_notes[:6]))
+        # Recovered-only: a cue added to fill a hole that instead re-states its
+        # neighbours is residue by construction. The same test applied to the
+        # whole track deletes real dialogue, so it is scoped by provenance.
+        _n0 = len(out)
+        out, _rest = drop_restatement_cues(out)
+        if _rest:
+            logger.info("[%s] Post-merge restatements: %d → %d cue(s), dropped %s",
+                        job_id, _n0, len(out), "; ".join(_rest[:6]))
+        _n0 = len(out)
+        out, _b = drop_repetition_bursts(out)
+        if _b:
+            logger.info("[%s] Post-merge repetition bursts: %d → %d cue(s), dropped %s",
+                        job_id, _n0, len(out), "; ".join(_b[:6]))
+        _n0 = len(out)
+        out, _e = suppress_echo_cues(out)
+        if _e:
+            logger.info("[%s] Post-merge echo suppression: %d → %d cue(s), dropped %s",
+                        job_id, _n0, len(out), "; ".join(_e[:6]))
+        _n0 = len(out)
+        out, _j = drop_junk_cues(out)
+        if _j:
+            logger.info("[%s] Post-merge junk filter: %d → %d cue(s), dropped %s",
+                        job_id, _n0, len(out), "; ".join(_j[:6]))
+        _san, _ch = sanitize_translated_transcript(out, target_lang)
+        if _ch:
+            out = _san
+        _m, _ch = merge_transcript_fragments(out, target_lang)
+        if _ch:
+            logger.info("[%s] Post-merge fragment merge: %d → %d cue(s)",
+                        job_id, len(out), len(_m))
+            out = _m
+        if bool(getattr(settings, "TRANSCRIPT_SPLIT_RUNON_CUES", True)):
+            _s, _ch = split_run_on_cues(out, target_lang)
+            if _ch:
+                logger.info("[%s] Post-merge run-on split: %d → %d cue(s)",
+                            job_id, len(out), len(_s))
+                out = _s
+    except Exception as _e:
+        logger.warning("[%s] Post-merge re-sanitize skipped (%s) — shipping the "
+                       "merged track unfiltered", job_id, _e)
+        return rows
+    return out
+
+
 async def _post_complete_gap_recovery(job_id: str, orchestrator) -> None:
     """Fill music-buried transcript holes AFTER the job completes.
 
@@ -3192,6 +3265,7 @@ async def _post_complete_gap_recovery(job_id: str, orchestrator) -> None:
     # job's roster consolidations re-applied for name consistency.
     _tt = [s.model_dump() if hasattr(s, "model_dump") else dict(s)
            for s in (getattr(job, "translated_transcript", None) or [])]
+    _added_tt = 0
     if _tt and orchestrator is not None:
         from backend.services.canonical_names import (
             apply_roster_corrections, roster_corrections_for_job)
@@ -3234,6 +3308,14 @@ async def _post_complete_gap_recovery(job_id: str, orchestrator) -> None:
                 for t, txt in zip(translated_new, _texts):
                     t["text"] = txt
             _merged_tt, _added_tt = merge_recovered(_tt, translated_new)
+            # The two tracks do NOT accept the same number of cues and never
+            # will. merge_recovered dedups on a 0.7 similarity ratio; on the
+            # source track both sides are Whisper Japanese and most recoveries
+            # dedup away, while on the translated track the incumbents came
+            # from one translator and the recoveries from another, so the same
+            # line renders differently enough to score below the gate and land
+            # twice. A measured run merged 21 into the source and 27 into the
+            # shipped English, and reported "22" for both.
             if _added_tt:
                 try:
                     from backend.services.speech_coverage import (
@@ -3246,16 +3328,32 @@ async def _post_complete_gap_recovery(job_id: str, orchestrator) -> None:
                             job_id, len(_tv), "; ".join(_tv[:6]))
                 except Exception:
                     pass
+                # The merged track is what ships. Put it through the same
+                # cue-level cleanup the main path applies at persist — without
+                # this the recovered cues reach the viewer screened only for
+                # voiced audio.
+                _pre_san = len(_merged_tt)
+                _merged_tt = _resanitize_after_merge(
+                    _merged_tt, _tgt, job_id)
+                if len(_merged_tt) != _pre_san:
+                    logger.info(
+                        "[%s] Gap recovery: post-merge cleanup %d → %d cue(s)",
+                        job_id, _pre_san, len(_merged_tt))
                 updates["translated_transcript"] = _merged_tt
 
     await database.update_job_status(job_id, **updates)
+    # Report BOTH counts. The user reads the shipped subtitle file, so the
+    # translated count is the honest headline; the source count is kept for
+    # the log because a divergence between them is the signal that the dedup
+    # gate is behaving differently on the two tracks.
+    _shipped = _added_tt if _tt else _added
     logger.info(
-        "[%s] Gap recovery merged %d recovered cue(s) into the transcript",
-        job_id, _added)
+        "[%s] Gap recovery merged %d cue(s) into the source track and %d into "
+        "the translated track", job_id, _added, _added_tt)
     await broadcast_ws(job_id, {
         "type": "background_task", "task": "vocal_recovery",
         "status": "complete",
-        "message": (f"Recovered {_added} line(s) from music-buried scenes"
+        "message": (f"Recovered {_shipped} line(s) from music-buried scenes"
                     " (vocal separation)"),
     })
 

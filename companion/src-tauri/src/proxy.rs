@@ -540,7 +540,28 @@ async fn whisper_proxy(State(ctx): State<ProxyCtx>, req: Request<Body>) -> Respo
     match result {
         Ok(resp) => {
             ctx.state.end_activity(activity, resp.status().as_u16());
-            relay(resp)
+            // Tell ClipAI which model ACTUALLY ran. The sidecar's own quality
+            // selector caps the requested model against the VRAM budget, and
+            // that budget is read at start-up — so a Companion that restarted
+            // for a self-update while its GPU was still occupied silently ran
+            // a smaller model for a whole job while ClipAI went on logging the
+            // name it had asked for. Without this header the substitution is
+            // invisible from the ClipAI side; the transcript just gets worse.
+            let served = ctx
+                .state
+                .sidecar
+                .lock()
+                .await
+                .as_ref()
+                .map(|s| s.model.clone())
+                .unwrap_or_default();
+            let mut out = relay(resp);
+            if !served.is_empty() {
+                if let Ok(v) = axum::http::HeaderValue::from_str(&served) {
+                    out.headers_mut().insert("x-clipai-served-whisper-model", v);
+                }
+            }
+            out
         }
         Err(e) => {
             ctx.state.end_activity(activity, 502);

@@ -1529,6 +1529,87 @@ _VOCALIZATION = {
 }
 
 
+# Stage-direction prose the ASR/LLM emits when it narrates the soundtrack
+# instead of transcribing it. Whisper writes non-speech events as parenthesized
+# annotations ("(音楽)", "(効果音)"); those use FULL-WIDTH parentheses, so
+# ``is_subtitle_marker`` — which requires square brackets — never held them out
+# of translation, and they came back as English prose and shipped as dialogue.
+_ANNOTATION_PARENS = (("(", ")"), ("（", "）"), ("〈", "〉"), ("《", "》"))
+_ANNOTATION_WORDS = frozenset({
+    "dialogue", "dialog", "music", "sound", "effect", "effects", "sfx",
+    "silence", "noise", "audio", "bgm", "narration", "subtitle", "subtitles",
+})
+_ANNOTATION_VERBS = frozenset({
+    "start", "starts", "started", "starting", "begin", "begins", "beginning",
+    "end", "ends", "ended", "ending", "stop", "stops", "resume", "resumes",
+    "continue", "continues", "fade", "fades", "playing", "plays", "over",
+})
+_ANNOTATION_PREFIX_RE = re.compile(
+    r"^\s*[\(（]\s*([^)）]{1,24})\s*[\)）]\s*(?=\S)")
+
+
+def _paren_wrapped(t: str):
+    for lo, hi in _ANNOTATION_PARENS:
+        if t.startswith(lo) and t.endswith(hi) and len(t) > 2:
+            return t[1:-1].strip()
+    return None
+
+
+def looks_like_annotation_artifact(text: str) -> bool:
+    """True when the WHOLE cue is a soundtrack annotation, not speech.
+
+    Two shapes, both measured on a real run: a fully parenthesized tag
+    ("(Alarm sound)", "(音楽)"), and bare stage-direction prose the translator
+    produced from one ("Dialogue end", "Music starts", "Sound effect"). The
+    prose form is why a text-only filter is needed at all — by the time it
+    reaches the subtitle track it has no punctuation, no brackets and no other
+    tell, and ``looks_like_asr_boilerplate`` correctly declines to convict it.
+
+    Deliberately narrow: the prose branch fires only when EVERY word comes from
+    a closed two-part vocabulary (a soundtrack noun plus an optional
+    start/stop verb) and the cue is at most three words. "Music to my ears" and
+    "The sound of it" both survive, because ``to``/``my``/``ears``/``the``/``of``
+    are in neither set. Pure and deterministic."""
+    t = (text or "").strip()
+    if not t or t.startswith("["):
+        # Square brackets are the caption-marker namespace, and "[♪ music ♪]"
+        # would otherwise convict on the word test. Markers are normalized and
+        # deduped by their own pass; this one must not reach into them.
+        return False
+    inner = _paren_wrapped(t)
+    if inner is not None and "(" not in inner:
+        # Short tags only. Parentheses are also a legitimate subtitle
+        # convention for whispered or aside speech, and a whispered SENTENCE
+        # is real dialogue — "(He whispers something and leaves)" must not go
+        # the same way as "(Alarm sound)". CJK annotations are exempt from the
+        # cap: "(音楽)" has no spaces to count and is never whispered speech.
+        _w = [w for w in re.split(r"\s+", inner) if w]
+        if len(_w) <= 4 or not any(ch.isascii() and ch.isalpha() for ch in inner):
+            return True
+    words = [w for w in re.split(r"[\s\W_]+", t.lower()) if w]
+    if not words or len(words) > 3:
+        return False
+    if not any(w in _ANNOTATION_WORDS for w in words):
+        return False
+    return all(w in _ANNOTATION_WORDS or w in _ANNOTATION_VERBS for w in words)
+
+
+def strip_annotation_prefix(text: str) -> str:
+    """Remove a leading ``(tag)`` from a cue that also carries real dialogue.
+
+    The roster resolver can mint junk mappings — one run turned a katakana
+    token into the word "Emotion" — after which cues shipped as
+    "(Emotion) Come on! Hurry up!". The dialogue is real and must be kept; only
+    the tag goes. A cue that is NOTHING but a tag is left alone here and
+    convicted by :func:`looks_like_annotation_artifact` instead, so the two
+    never fight over the same cue."""
+    t = (text or "").strip()
+    if not t or _paren_wrapped(t) is not None:
+        return text
+    out = _ANNOTATION_PREFIX_RE.sub("", t, count=1)
+    return out.strip() if out.strip() else text
+
+
 def looks_like_asr_boilerplate(text: str) -> bool:
     """True when ``text`` is subtitle-file metadata the ASR hallucinated.
 
@@ -1579,7 +1660,24 @@ def drop_junk_cues(rows: list, vocalization_max_dwell_s: float = 2.5,
     kept, dropped = [], []
     for r in rows or []:
         txt = (_g(r, "text", "") or "").strip()
-        if not txt or txt.startswith("["):
+        if not txt:
+            kept.append(r)
+            continue
+        # A leading junk tag never costs the cue its dialogue.
+        _stripped = strip_annotation_prefix(txt)
+        if _stripped != txt:
+            txt = _stripped
+            if isinstance(r, dict):
+                r["text"] = txt
+            else:
+                setattr(r, "text", txt)
+        if looks_like_annotation_artifact(txt):
+            dropped.append(f"annotation:{txt[:32]!r}")
+            continue
+        # Bracketed markers are caption furniture, exempt from every test
+        # below. They are checked for annotation prose FIRST, though: the
+        # bracket is what let "[Music]" through every filter in the chain.
+        if txt.startswith("["):
             kept.append(r)
             continue
         try:
@@ -1716,6 +1814,63 @@ def collapse_theme_by_music_spans(segments, music_spans: list,
         return _as_rows(segments), False
 
 
+def normalize_markers(rows: list, adjacent_window_s: float = 20.0) -> tuple:
+    """Fold bare ASR music tags onto the styled marker, then drop a marker that
+    merely repeats the one before it.
+
+    Whisper writes ``[Music]`` on its own. Because it is bracketed it satisfies
+    ``is_subtitle_marker``, is held out of translation, and is re-inserted
+    verbatim — so a measured run shipped a cue reading ``[Music]`` 2.3 seconds
+    after a cue reading ``[♪ music ♪]``, two spellings of the same fact, one of
+    them untranslated-looking. Folding first is what makes the dedup possible:
+    before normalization the two strings share no useful similarity, and no
+    ratio threshold that catches them is safe on real dialogue.
+
+    The adjacency test is deliberate — two music markers far apart in an
+    episode are two different musical passages and both belong. Returns
+    ``(rows, notes)``."""
+    try:
+        from backend.services.audio_analyzer import normalize_music_marker
+    except Exception:
+        return rows, []
+
+    def _g(r, k, d=None):
+        return r.get(k, d) if isinstance(r, dict) else getattr(r, k, d)
+
+    def _set(r, k, v):
+        if isinstance(r, dict):
+            r[k] = v
+        else:
+            setattr(r, k, v)
+
+    kept, notes, last_label, last_end = [], [], None, None
+    for r in rows or []:
+        txt = (_g(r, "text", "") or "").strip()
+        norm = normalize_music_marker(txt)
+        if norm != txt:
+            notes.append(f"folded:{txt[:24]!r}")
+            _set(r, "text", norm)
+            txt = norm
+        if not txt.startswith("["):
+            last_label = None
+            kept.append(r)
+            continue
+        try:
+            st = float(_g(r, "start", 0.0) or 0.0)
+            en = float(_g(r, "end", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            kept.append(r)
+            continue
+        if (txt == last_label and last_end is not None
+                and st - last_end <= adjacent_window_s):
+            notes.append(f"adjacent:{txt[:24]!r}@{st:.2f}s")
+            last_end = max(last_end, en)
+            continue
+        last_label, last_end = txt, en
+        kept.append(r)
+    return (kept, notes) if notes else (rows, [])
+
+
 def dedupe_theme_markers(rows: list) -> list:
     """Keep only the FIRST marker of each theme label.
 
@@ -1840,6 +1995,107 @@ def drop_repetition_bursts(rows: list, min_run: int = 3,
         dropped.append(
             f"{run_start:.1f}s x{len(run)} "
             f"{(_g(rows[run[0]], 'text', '') or '')[:36]!r}")
+    if not drop:
+        return rows, []
+    return [r for k, r in enumerate(rows) if k not in drop], dropped
+
+
+def drop_restatement_cues(rows: list, window_cues: int = 5,
+                          window_s: float = 30.0,
+                          containment: float = 0.6,
+                          min_stems: int = 3,
+                          recovered_only: bool = True) -> tuple[list, list]:
+    """Drop a RECOVERED cue whose content the surrounding cues already carry.
+
+    The third repetition shape, and the one both existing passes miss.
+    ``suppress_echo_cues`` needs surface similarity above 0.66 between a PAIR of
+    cues; ``drop_repetition_bursts`` needs three consecutive cues under 833 ms.
+    A measured run closed on ten cues across seventeen seconds where the
+    professional reference has six, four of them restating one idea in four
+    different phrasings — durations from 0.334 s to 2.293 s, so no run of three
+    short cues existed, and each pairwise similarity sat below the echo gate
+    because the translator had reworded rather than repeated.
+
+    Content containment sees it: the cue's stemmed content words are compared
+    against the UNION of the preceding ``window_cues`` cues, so four
+    reformulations convict where no two of them would.
+
+    ``recovered_only`` is what makes this safe, and it is on by default. Run
+    against a whole track the test does not discriminate: on the professional
+    reference it deletes 4 genuine lines while catching 4 restatements on the
+    measured run — a one-to-one trade against the very track we are trying to
+    match, and no threshold tested moves it (at zero-tolerance it catches 0 and
+    still costs 1). Restricted to cues stamped by ``merge_recovered``, the same
+    test is principled rather than statistical: gap recovery exists to fill
+    holes, so a recovered cue that says only what the track already said is
+    residue by construction. Reference-style tracks carry no recovered cues and
+    are therefore untouchable by this pass.
+
+    Guards, each protecting a real subtitle pattern:
+      * a cue needs ``min_stems`` distinct content stems, so "Fire! Fire!!"
+        (one stem) and every short exclamation are exempt by construction;
+      * a speaker change blocks the comparison — two characters landing on the
+        same point is drama;
+      * a cue carrying a proper noun the window lacks is elaborating, not
+        restating;
+      * markers are never touched.
+
+    Returns ``(rows, dropped_samples)``."""
+    def _g(r, k, d=None):
+        return r.get(k, d) if isinstance(r, dict) else getattr(r, k, d)
+
+    n = len(rows or [])
+    if n < 2:
+        return rows, []
+    stems = [_echo_stems(_g(r, "text", "") or "") for r in rows]
+    drop, dropped = set(), []
+    for i in range(1, n):
+        txt = (_g(rows[i], "text", "") or "").strip()
+        if not txt or txt.startswith("[") or len(stems[i]) < min_stems:
+            continue
+        if recovered_only and not _g(rows[i], "recovered", False):
+            continue
+        try:
+            si = float(_g(rows[i], "start", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        window: set = set()
+        seen = 0
+        for j in range(i - 1, -1, -1):
+            if j in drop:
+                continue
+            tj = (_g(rows[j], "text", "") or "").strip()
+            if not tj or tj.startswith("["):
+                continue
+            try:
+                ej = float(_g(rows[j], "end", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if si - ej > window_s:
+                break
+            if (_g(rows[j], "speaker", "") or "") != (_g(rows[i], "speaker", "") or ""):
+                continue
+            window |= stems[j]
+            seen += 1
+            if seen >= window_cues:
+                break
+        if not window:
+            continue
+        hits = sum(
+            1 for w in stems[i]
+            if any(w == o or (len(w) >= 4 and len(o) >= 4
+                              and (w.startswith(o) or o.startswith(w)))
+                   for o in window))
+        if hits / float(len(stems[i])) < containment:
+            continue
+        # Information the window does not already have is never redundant.
+        prior_txt = " ".join(
+            (_g(rows[j], "text", "") or "")
+            for j in range(max(0, i - window_cues * 2), i) if j not in drop)
+        if _unique_proper_nouns(txt, prior_txt):
+            continue
+        drop.add(i)
+        dropped.append(f"{si:.1f}s {txt[:40]!r}")
     if not drop:
         return rows, []
     return [r for k, r in enumerate(rows) if k not in drop], dropped

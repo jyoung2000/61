@@ -169,9 +169,14 @@ def test_post_complete_recovery_merges_and_translates(monkeypatch, tmp_path):
     src_texts = [s["text"] for s in saved["transcript"]]
     tt_texts = [s["text"] for s in saved["translated_transcript"]]
     assert "埋もれた台詞" in src_texts
-    assert "The buried line." in tt_texts
+    # The TRANSLATED track now goes through the same cue-level cleanup the main
+    # path applies at persist, so the recovered line is not guaranteed to ship
+    # as its own cue — here the fragment merge folds it onto the unpunctuated
+    # cue it overlaps. What must hold is that the content reaches the viewer.
+    assert any("The buried line." in t for t in tt_texts), tt_texts
     assert len(saved["transcript"]) == 7
-    # Existing cues untouched, order preserved by start time.
+    # The SOURCE track is still additive-only: existing cues untouched, order
+    # preserved by start time. Only the shipped translated track is re-cleaned.
     assert src_texts[0] == "セリフ0" and src_texts[-1] == "セリフ5"
     assert any(e.get("task") == "vocal_recovery"
                and e.get("status") == "complete" for e in events)

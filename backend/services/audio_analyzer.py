@@ -396,6 +396,23 @@ async def classify_audio_events(
 MUSIC_MARKER = "[♪ music ♪]"
 
 
+# Bare ASR music tags. Whisper emits "[Music]" / "[music]" / "[MUSIC]" of its
+# own accord, and because they are bracketed they satisfy is_subtitle_marker,
+# get held out of translation, and are re-inserted verbatim — which is exactly
+# why a measured run shipped two cues reading "[Music]" as if they were
+# dialogue, one of them 2.3s after a legitimate marker saying the same thing.
+# They carry no information the styled marker does not.
+_BARE_MUSIC_TAG_RE = re.compile(r"^\[\s*music\s*\]$", re.IGNORECASE)
+
+
+def normalize_music_marker(text: str) -> str:
+    """Fold a bare ASR ``[Music]`` tag onto :data:`MUSIC_MARKER`.
+
+    Returns ``text`` unchanged for everything else, including markers that
+    already carry the note. Pure; safe to apply to any cue."""
+    return MUSIC_MARKER if _BARE_MUSIC_TAG_RE.match((text or "").strip()) else text
+
+
 def is_subtitle_marker(text: str) -> bool:
     """True when ``text`` is a bracketed non-speech caption marker (music /
     applause / laughter) rather than translatable dialogue. Used to keep

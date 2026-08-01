@@ -1924,7 +1924,8 @@ def enforce_min_gap(segments, min_gap_s: float = 0.08):
     return segs
 
 
-def quantize_to_frames(segments, fps: float, min_gap_frames: int = 1):
+def quantize_to_frames(segments, fps: float, min_gap_frames: int = 1,
+                       min_duration_s: float = 0.0):
     """Snap every cue in/out point to the video's FRAME GRID, guaranteeing a
     ``min_gap_frames`` gap — the single behaviour that most distinguishes a
     professionally-authored subtitle track from a machine-generated one.
@@ -1948,6 +1949,17 @@ def quantize_to_frames(segments, fps: float, min_gap_frames: int = 1):
     unmodified, so callers that don't know the frame rate degrade to the
     millisecond-based :func:`enforce_min_gap` instead.
 
+    ``min_duration_s`` is the readable floor, and it OUTRANKS trimming. Enforcing
+    the gap by shortening the earlier cue is right until the earlier cue has no
+    room left to give: a measured run shipped a 39-character line for 0.042 s —
+    one single frame, 929 cps — because ``enforce_readability`` had extended it to
+    the floor, that extension overlapped the next cue, and this function resolved
+    the overlap the only way it knew, by cutting the extension back off. Trimming
+    now stops at the floor and the FOLLOWING cue is pushed later instead, which
+    cascades forward through packed runs and dies out at the first cue with slack.
+    A cue is never pushed further than the floor itself, so the tail cannot drift.
+    ``0.0`` disables the floor and restores the pure trim-only behaviour.
+
     Accepts ``TranscriptSegment`` models OR plain dict rows, like
     :func:`enforce_min_gap`. Attribute-only access here was a live hazard: a dict
     row read every start as 0.0 and then raised on assignment, and the caller's
@@ -1969,12 +1981,50 @@ def quantize_to_frames(segments, fps: float, min_gap_frames: int = 1):
         if ef <= sf:
             ef = sf + 1
         grid.append([sf, ef])
-    # 2. Enforce the inter-cue gap in FRAME space (exact — no rounding can undo it).
+    # 2. Enforce the inter-cue gap in FRAME space (exact — no rounding can undo
+    #    it), with the readable floor outranking the trim.
+    min_f = max(1, int(round(float(min_duration_s or 0.0) * fps)))
     for i in range(len(grid) - 1):
         cur, nxt = grid[i], grid[i + 1]
+        # (a) The end this cue wants: its own, or the floor, whichever is later.
+        want = max(cur[1], cur[0] + min_f)
+        limit = nxt[0] - gap
+        if want <= limit:
+            cur[1] = want                       # fits with the gap intact
+            continue
+        # (b) Trim to the gap — allowed only while the floor survives it.
+        if limit - cur[0] >= min_f:
+            cur[1] = max(limit, cur[0] + 1)
+            continue
+        # (c) Trimming would crush the cue. Hold it at the floor and push the
+        #     NEXT cue instead. Bounded by the floor so a packed run drifts by
+        #     at most one cue-length per cue, and only until a cue with slack
+        #     absorbs it; where the run is too dense for any timing to help,
+        #     the shortfall is left visible rather than smeared down the track.
+        cur[1] = max(cur[0] + min_f, cur[0] + 1)
+        # Only a cue with SURPLUS over the floor can be pushed. Without that
+        # test the push re-fires on every pass — a run too packed for any cue
+        # to reach the floor would walk further down the track each time this
+        # function ran, and it is documented as idempotent. Refusing to rob a
+        # cue that is itself at the floor makes a fully-packed run a fixed
+        # point: the shortfall stays where the merge passes can still see it.
+        surplus = (nxt[1] - nxt[0]) - min_f
+        shift = min(cur[1] + gap - nxt[0], min_f, max(0, surplus))
+        if shift > 0:
+            nxt[0] += shift
+            if nxt[1] < nxt[0] + 1:
+                nxt[1] = nxt[0] + 1
+        # Whatever the push could not buy, give back. This runs even when the
+        # push bought nothing: an overlap is never an acceptable outcome, and
+        # zero overlaps is the one invariant this track already holds against
+        # the professional reference. A cue left under the floor here is a run
+        # too dense for any timing to fix — that is a merge problem, and it
+        # stays visible to the passes that can actually merge it.
         if nxt[0] < cur[1] + gap:
-            target = nxt[0] - gap
-            cur[1] = target if target > cur[0] else cur[0] + 1
+            cur[1] = max(nxt[0] - gap, cur[0] + 1)
+    # The last cue has open road ahead of it; give it the floor unconditionally.
+    if grid and grid[-1][1] - grid[-1][0] < min_f:
+        grid[-1][1] = grid[-1][0] + min_f
     # 3. Frames → seconds, at millisecond precision (same as the SRT/VTT writers).
     for s, (sf, ef) in zip(segs, grid):
         _seg_set(s, "start", round(sf / fps, 3))

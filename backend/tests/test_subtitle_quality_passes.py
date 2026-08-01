@@ -820,3 +820,173 @@ def test_wide_echo_window_is_confined_to_the_tail():
             {"start": 1400.0, "end": 1405.0, "speaker": "", "text": "Fin."}]
     kept, dropped = suppress_echo_cues(rows)
     assert len(kept) == 3 and dropped == []
+
+
+# ── Run-16 fixes ───────────────────────────────────────────────────────────
+
+def _q(rows, floor=0.833, fps=23.98):
+    from backend.services.subtitle_formatter import quantize_to_frames
+    return quantize_to_frames([dict(r) for r in rows], fps, 1, floor)
+
+
+def _invariants(rows, floor=0.833):
+    gaps = [round(rows[i + 1]["start"] - rows[i]["end"], 4)
+            for i in range(len(rows) - 1)]
+    return {
+        "overlaps": sum(1 for g in gaps if g < 0),
+        "ordered": all(rows[i]["start"] <= rows[i + 1]["start"]
+                       for i in range(len(rows) - 1)),
+        "under": sum(1 for r in rows if r["end"] - r["start"] < floor - 1e-6),
+    }
+
+
+def test_frame_quantize_no_longer_mints_one_frame_cues():
+    """The run-16 defect: enforce_readability extended a cue to the floor, the
+    extension overlapped its neighbour, and quantizing cut it back to 0.042s —
+    one frame, holding 39 characters at 929 cps."""
+    rows = [{"start": 468.5, "end": 469.349},
+            {"start": 469.391, "end": 470.224},
+            {"start": 469.475, "end": 472.0}]
+    legacy = _q(rows, floor=0.0)
+    assert round(legacy[1]["end"] - legacy[1]["start"], 3) == 0.042
+    out = _q(rows)
+    assert out[1]["end"] - out[1]["start"] >= 0.833
+    assert _invariants(out) == {"overlaps": 0, "ordered": True, "under": 0}
+
+
+def test_frame_quantize_never_trades_the_floor_for_an_overlap():
+    """A run too packed for any cue to reach the floor leaves cues short —
+    never overlapping. Zero overlaps is the invariant that already matches the
+    professional reference and must survive this pass."""
+    packed = [{"start": 100.0 + i * 0.30, "end": 100.0 + i * 0.30 + 0.25}
+              for i in range(8)]
+    out = _q(packed)
+    inv = _invariants(out)
+    assert inv["overlaps"] == 0 and inv["ordered"]
+    assert inv["under"] > 0, "this run is too dense to fix by timing alone"
+
+
+def test_frame_quantize_stays_idempotent_with_the_floor_on():
+    packed = [{"start": 100.0 + i * 0.30, "end": 100.0 + i * 0.30 + 0.25}
+              for i in range(8)]
+    once = _q(packed)
+    twice = _q(once)
+    assert [(r["start"], r["end"]) for r in once] == \
+           [(r["start"], r["end"]) for r in twice]
+
+
+def test_frame_quantize_floor_off_is_the_legacy_behaviour():
+    rows = [{"start": 100.0 + i * 0.30, "end": 100.0 + i * 0.30 + 0.25}
+            for i in range(6)]
+    from backend.services.subtitle_formatter import quantize_to_frames
+    a = quantize_to_frames([dict(r) for r in rows], 23.98, 1)
+    b = _q(rows, floor=0.0)
+    assert [(r["start"], r["end"]) for r in a] == [(r["start"], r["end"]) for r in b]
+
+
+def test_annotation_artifacts_are_convicted():
+    from backend.services.transcript_sanitize import looks_like_annotation_artifact
+    for t in ("(Alarm sound)", "(音楽)", "（効果音）", "Dialogue end",
+              "Music starts", "Sound effect", "Music ends"):
+        assert looks_like_annotation_artifact(t), t
+
+
+def test_annotation_filter_spares_dialogue_and_markers():
+    from backend.services.transcript_sanitize import looks_like_annotation_artifact
+    for t in ("[♪ music ♪]", "[♪ Opening theme ♪]", "Music to my ears",
+              "The sound of it", "Sound the alarm!", "Effect confirmed, sir.",
+              "(He whispers something and then leaves the room)", ""):
+        assert not looks_like_annotation_artifact(t), t
+
+
+def test_annotation_prefix_is_stripped_without_losing_the_line():
+    from backend.services.transcript_sanitize import strip_annotation_prefix
+    assert strip_annotation_prefix("(Emotion) Come on! Hurry up!") == "Come on! Hurry up!"
+    assert strip_annotation_prefix("(Ren) T-, t-,") == "T-, t-,"
+    # A cue that is ONLY a tag is left for the artifact test, not gutted here.
+    assert strip_annotation_prefix("(Alarm sound)") == "(Alarm sound)"
+    assert strip_annotation_prefix("Come on!") == "Come on!"
+
+
+def test_bare_music_tag_folds_onto_the_styled_marker():
+    from backend.services.transcript_sanitize import normalize_markers
+    rows = [{"start": 401.2, "end": 405.2, "text": "[Music]"},
+            {"start": 684.9, "end": 689.9, "text": "[♪ music ♪]"},
+            {"start": 692.2, "end": 696.2, "text": "[Music]"}]
+    out, notes = normalize_markers(rows)
+    assert [r["text"] for r in out] == ["[♪ music ♪]", "[♪ music ♪]"]
+    assert any("adjacent" in n for n in notes)
+
+
+def test_distant_music_markers_both_survive():
+    from backend.services.transcript_sanitize import normalize_markers
+    rows = [{"start": 100.0, "end": 104.0, "text": "[♪ music ♪]"},
+            {"start": 900.0, "end": 904.0, "text": "[♪ music ♪]"}]
+    out, _ = normalize_markers(rows)
+    assert len(out) == 2
+
+
+def test_junk_filter_drops_annotations_and_keeps_their_dialogue():
+    from backend.services.transcript_sanitize import drop_junk_cues
+    rows = [{"start": 1, "end": 2, "text": "(Alarm sound)"},
+            {"start": 3, "end": 4, "text": "(Emotion) Come on! Hurry up!"},
+            {"start": 5, "end": 6, "text": "Dialogue end"},
+            {"start": 7, "end": 8, "text": "[♪ music ♪]"},
+            {"start": 9, "end": 10, "text": "It is a real line of dialogue."}]
+    kept, dropped = drop_junk_cues(rows)
+    assert [r["text"] for r in kept] == [
+        "Come on! Hurry up!", "[♪ music ♪]", "It is a real line of dialogue."]
+    assert len(dropped) == 2
+
+
+def test_restatement_gate_only_touches_recovered_cues():
+    """Scoped by provenance, not by threshold. Measured: run whole-track, this
+    test deletes 4 genuine lines from the professional reference while catching
+    4 restatements — a one-to-one trade against the track we are matching."""
+    from backend.services.transcript_sanitize import drop_restatement_cues
+    rows = [
+        {"start": 1400.0, "end": 1404.0, "speaker": "",
+         "text": "Another shadow emerges from the depths."},
+        {"start": 1404.5, "end": 1408.0, "speaker": "",
+         "text": "in the darkness of the deep sea."},
+        {"start": 1408.5, "end": 1410.0, "speaker": "", "recovered": True,
+         "text": "Another shadow emerges from depths"},
+    ]
+    kept, dropped = drop_restatement_cues([dict(r) for r in rows])
+    assert len(kept) == 2 and len(dropped) == 1
+    # The identical cue WITHOUT the recovered stamp is untouchable.
+    unstamped = [dict(r) for r in rows]
+    unstamped[2].pop("recovered")
+    assert drop_restatement_cues(unstamped)[1] == []
+
+
+def test_restatement_gate_spares_a_recovered_cue_that_adds_content():
+    from backend.services.transcript_sanitize import drop_restatement_cues
+    rows = [
+        {"start": 100.0, "end": 103.0, "speaker": "",
+         "text": "The Alliance is watching the colonies closely."},
+        {"start": 104.0, "end": 107.0, "speaker": "", "recovered": True,
+         "text": "Their carrier reached the eastern seaboard at dawn."},
+    ]
+    assert drop_restatement_cues([dict(r) for r in rows])[1] == []
+
+
+def test_merge_recovered_stamps_provenance():
+    from backend.services.vocal_gap_recovery import merge_recovered
+    existing = [{"start": 0.0, "end": 2.0, "text": "An existing line."}]
+    rec = [{"start": 10.0, "end": 12.0, "text": "A recovered line."}]
+    out, added = merge_recovered(existing, rec)
+    assert added == 1
+    assert [r.get("recovered", False) for r in out] == [False, True]
+
+
+def test_served_model_mismatch_detection():
+    from backend.services.reframer_audio import _model_differs
+    assert _model_differs("medium", "large-v3-turbo")
+    assert _model_differs("small", "medium")
+    for served, req in (("large-v3-turbo", "large-v3-turbo"),
+                        ("ggml-large-v3-turbo.bin", "large-v3-turbo"),
+                        ("whisper-large-v3-turbo", "large-v3-turbo"),
+                        ("Systran/faster-whisper-large-v3", "large-v3"),
+                        ("", "large-v3-turbo")):
+        assert not _model_differs(served, req), (served, req)

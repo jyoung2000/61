@@ -584,6 +584,26 @@ def _drop_repetition_loops(segments: list) -> list:
     return out
 
 
+def _model_differs(served: str, requested: str) -> bool:
+    """True when a server's reported model is a DIFFERENT model, not just a
+    differently-spelled one.
+
+    Servers echo names loosely — ``whisper-large-v3-turbo``, ``large-v3-turbo``
+    and ``ggml-large-v3-turbo.bin`` are one model — so a raw string compare
+    would cry wolf on every request. Compare the alphanumeric core with the
+    common vendor/format decoration stripped, and only report a difference when
+    neither name contains the other."""
+    def _core(s: str) -> str:
+        s = re.sub(r"\.(bin|gguf|pt|safetensors)$", "", (s or "").strip().lower())
+        s = re.sub(r"^(ggml|openai|systran|whisper)[-_/]+", "", s)
+        s = re.sub(r"[-_/.]+", "", s)
+        return re.sub(r"(faster|distil)whisper", "", s)
+    a, b = _core(served), _core(requested)
+    if not a or not b:
+        return False
+    return not (a in b or b in a)
+
+
 # ── Remote Whisper (OpenAI-compatible server, e.g. the GPU Companion) ──────
 
 _REMOTE_HEALTH_CACHE = {"checked_at": 0.0, "healthy": False, "url": ""}
@@ -958,7 +978,16 @@ class RemoteWhisperEngine:
             return (False, None, True, f"{type(e).__name__}: {str(e)[:120]}", 0.0)
         if resp.status_code == 200:
             try:
-                return (True, resp.json(), False, "", 0.0)
+                _body = resp.json()
+                # The Companion reports the model it ACTUALLY loaded in a
+                # response header, because the OpenAI-compatible body echoes
+                # whatever was requested. Fold it into the payload so the one
+                # place that compares them can see both.
+                _served = (resp.headers.get("x-clipai-served-whisper-model")
+                           or "").strip()
+                if _served and isinstance(_body, dict):
+                    _body["model"] = _served
+                return (True, _body, False, "", 0.0)
             except Exception as e:
                 return (False, None, True, f"bad JSON: {str(e)[:80]}", 0.0)
         if resp.status_code == 503:  # busy / paused — honor Retry-After
@@ -1005,7 +1034,11 @@ class RemoteWhisperEngine:
                                 if isinstance(w.get(k), (int, float)):
                                     w[k] = w[k] + offset_s
                 return {"segments": segs,
-                        "language": payload.get("language", language or "unknown")}
+                        "language": payload.get("language", language or "unknown"),
+                        # What the server says it ACTUALLY ran, when it says
+                        # anything. Never defaulted to the requested name —
+                        # the whole point is to be able to tell them apart.
+                        "served_model": str(payload.get("model") or "").strip()}
             last = detail
             if not retryable:
                 break
@@ -1195,13 +1228,31 @@ class RemoteWhisperEngine:
             return None
         for entry in segments:
             entry["source"] = "remote"
-        logger.info("Remote Whisper (%s): %d segments, language=%s, model=%s",
-                    self.base, len(segments), result.get("language", "auto"), model)
+        # REQUESTED is not SERVED. A Companion that self-updated mid-job came
+        # back with its VRAM baseline wiped, its auto-quality selector picked
+        # the largest model that fit the reduced budget, and every line here
+        # went on printing the name we asked for — so a silent downgrade from
+        # large-v3-turbo/float16/beam=5 to medium/int8_float16/beam=2 left no
+        # trace in this log at all. It cost 2.8x the decode time and a visibly
+        # worse transcript, and the only way it surfaced was reading the
+        # Companion's own log side by side with this one.
+        served = str(result.get("served_model") or "").strip()
+        if served and _model_differs(served, model):
+            logger.warning(
+                "Remote Whisper (%s): SERVED '%s' but we asked for '%s' — the "
+                "transcript came from a different model than configured. Check "
+                "the Companion's VRAM budget and whether it restarted mid-job.",
+                self.base, served, model)
+        logger.info(
+            "Remote Whisper (%s): %d segments, language=%s, model=%s (served=%s)",
+            self.base, len(segments), result.get("language", "auto"), model,
+            served or "unreported")
         return {
             "segments": segments,
             "language": result.get("language", language or "unknown"),
             "provider": "remote",
             "model": model,
+            "served_model": served,
         }
 
 

@@ -42,8 +42,14 @@ def _apply_min_gap(segments: list, fps: Optional[float] = None) -> list:
             # Rounded (not ceiled): the default 42 ms is one frame at 24 fps, and
             # 0.042 × 23.976 = 1.007 must read as 1 frame, not 2.
             gap_frames = max(1, int(round(min_gap_s * float(fps))))
+            # The readable floor travels with the gap. This is the LAST mutation
+            # before serialization, so a floor enforced anywhere upstream can be
+            # undone here; passing it in is what makes it stick.
+            min_dur_s = float(
+                getattr(settings, "SUBTITLE_MIN_DURATION_MS", 833)) / 1000.0
             return quantize_to_frames(segments, float(fps),
-                                      min_gap_frames=gap_frames)
+                                      min_gap_frames=gap_frames,
+                                      min_duration_s=min_dur_s)
         return enforce_min_gap(segments, min_gap_s=min_gap_s)
     except Exception:
         return segments

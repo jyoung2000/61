@@ -509,7 +509,15 @@ def merge_recovered(existing: list, recovered: list[dict]) -> tuple[list, int]:
 
     Additive only: existing cues are untouched. A recovered cue is dropped
     when it text-matches (≥0.7) a temporal neighbor — Whisper re-hearing the
-    padded boundary — or another recovered cue already accepted."""
+    padded boundary — or another recovered cue already accepted.
+
+    Every accepted cue is stamped ``recovered=True``. That provenance is what
+    lets a downstream pass hold recovered cues to a stricter standard than the
+    main track: this pass exists to fill HOLES, so a recovered cue that merely
+    re-states what the track already says is residue by definition, where the
+    identical judgement applied to a main-track cue would delete real dialogue
+    (measured: a containment test that catches 4 restatements on a real run
+    also deletes 4 genuine lines from the professional reference)."""
     out = list(existing or [])
     added = 0
     accepted: list[dict] = []
@@ -535,6 +543,13 @@ def merge_recovered(existing: list, recovered: list[dict]) -> tuple[list, int]:
                     break
         if dup:
             continue
+        if isinstance(r, dict):
+            r["recovered"] = True
+        else:
+            try:
+                setattr(r, "recovered", True)
+            except Exception:
+                pass
         accepted.append(r)
         added += 1
     out.extend(accepted)
