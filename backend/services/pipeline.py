@@ -5088,12 +5088,21 @@ async def _background_post_processing(
                         logger.warning(
                             "[%s] Audio-keyed theme collapse skipped (%s)",
                             job_id, _amt_e)
-                    from backend.services.transcript_sanitize import collapse_song_choruses
+                    from backend.services.transcript_sanitize import (
+                        collapse_song_choruses, dedupe_theme_markers)
                     _thm, _thm_changed = collapse_song_choruses(_translated_out, target_lang)
                     if _thm_changed:
                         logger.info("[%s] Collapsed sung theme chorus to marker: %d → %d cue(s)",
                                     job_id, len(_translated_out), len(_thm))
                         _translated_out = _thm
+                    # Both passes mint markers and they do not agree on where
+                    # the theme is; an episode has one of each.
+                    _dd = dedupe_theme_markers(_translated_out)
+                    if len(_dd) != len(_translated_out):
+                        logger.info(
+                            "[%s] Dropped %d duplicate theme marker(s)",
+                            job_id, len(_translated_out) - len(_dd))
+                        _translated_out = _dd
                 except Exception:
                     pass
                 # Repair the over-splits the plain merge can't reach — a

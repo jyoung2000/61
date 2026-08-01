@@ -716,3 +716,107 @@ def test_repetition_burst_needs_a_long_enough_run_and_prior_content():
               {"start": 100.5, "end": 100.9, "text": "After Colony 195 begins"},
               {"start": 101.0, "end": 101.4, "text": "colonies subjugated now"}]
     assert drop_repetition_bursts(orphan)[1] == []
+
+
+# ── Run-15 regressions ─────────────────────────────────────────────────────
+
+def test_bridge_does_not_weld_score_fragments_across_narration():
+    """The run-15 defect: 2 s score fragments under the opening narration
+    bridged into one 142-209 s "music" span, and the theme collapse then
+    deleted sixty-five seconds of captioned dialogue."""
+    from backend.services.audio_analyzer import _bridge_spans
+    music = [(142 + 6 * i, 142 + 6 * i + 2) for i in range(11)]
+    speech = [(142 + 6 * i + 2, 142 + 6 * i + 6) for i in range(11)]
+    assert len(_bridge_spans(music, 8.0)) == 1, "unblocked, they weld"
+    assert len(_bridge_spans(music, 8.0, blockers=speech)) == 11
+
+
+def test_bridge_still_assembles_an_instrumental_bed():
+    from backend.services.audio_analyzer import _bridge_spans, _covered_seconds
+    bed = [(26 + 2 * i, 26 + 2 * i + 2) for i in range(33)]
+    out = _bridge_spans(bed, 8.0, blockers=[])
+    assert len(out) == 1 and out[0] == (26.0, 92.0)
+    a, b = out[0]
+    assert _covered_seconds(bed, a, b) == b - a
+
+
+def test_covered_seconds_handles_overlap_and_clipping():
+    from backend.services.audio_analyzer import _covered_seconds
+    assert _covered_seconds([(0, 10), (5, 15)], 0, 20) == 15.0
+    assert _covered_seconds([(0, 10)], 5, 20) == 5.0
+    assert _covered_seconds([], 0, 10) == 0.0
+    assert _covered_seconds([(30, 40)], 0, 10) == 0.0
+
+
+def test_asr_boilerplate_catches_the_leaked_header():
+    from backend.services.transcript_sanitize import looks_like_asr_boilerplate
+    assert looks_like_asr_boilerplate("] sync:20 plain:no-commentary The")
+    assert looks_like_asr_boilerplate("Subtitles by the Amara.org community")
+    assert looks_like_asr_boilerplate("Synced and corrected by someone")
+
+
+def test_asr_boilerplate_spares_ordinary_dialogue():
+    from backend.services.transcript_sanitize import looks_like_asr_boilerplate
+    for line in ("Zechs is in the atmosphere; let him know.",
+                 "It's 10:30 already.",
+                 "Relena: what's your name?",
+                 "The odds are 3:1 against us.",
+                 "Mr. Darlian!",
+                 ""):
+        assert not looks_like_asr_boilerplate(line), line
+
+
+def test_junk_filter_drops_boilerplate_cue():
+    from backend.services.transcript_sanitize import drop_junk_cues
+    rows = [{"start": 210.9, "end": 214.1,
+             "text": "] sync:20 plain:no-commentary The"},
+            {"start": 214.1, "end": 217.6,
+             "text": "The surveillance satellites are useless."}]
+    kept, dropped = drop_junk_cues(rows)
+    assert len(kept) == 1 and "boilerplate" in dropped[0]
+
+
+def test_duplicate_theme_markers_collapse_to_the_first():
+    from backend.services.transcript_sanitize import dedupe_theme_markers
+    rows = [{"start": 30.4, "end": 34.4, "text": "[♪ Opening theme ♪]"},
+            {"start": 112.2, "end": 114.0, "text": "But the Alliance..."},
+            {"start": 142.2, "end": 146.1, "text": "[♪ Opening theme ♪]"},
+            {"start": 1350.2, "end": 1354.2, "text": "[♪ Ending theme ♪]"}]
+    out = dedupe_theme_markers(rows)
+    assert [r["start"] for r in out] == [30.4, 112.2, 1350.2]
+
+
+def test_dedupe_theme_markers_leaves_other_markers_alone():
+    from backend.services.transcript_sanitize import dedupe_theme_markers
+    rows = [{"start": 685.0, "end": 690.0, "text": "[♪ music ♪]"},
+            {"start": 1272.0, "end": 1279.0, "text": "[♪ music ♪]"}]
+    assert len(dedupe_theme_markers(rows)) == 2
+
+
+def test_tail_echo_window_catches_the_repeated_preview():
+    from backend.services.transcript_sanitize import suppress_echo_cues
+    rows = [{"start": 1379.7, "end": 1385.2, "speaker": "",
+             "text": "The Gundam sank to the ocean floor and they have "
+                     "started recovering it now"},
+            {"start": 1445.2, "end": 1451.4, "speaker": "",
+             "text": "Mobile Suit Gundam Wing Episode 2"},
+            {"start": 1451.5, "end": 1458.3, "speaker": "",
+             "text": "The Gundam sank to the ocean floor, and they've "
+                     "started recovering it now"}]
+    kept, dropped = suppress_echo_cues(rows)
+    assert len(kept) == 2 and len(dropped) == 1
+    assert "1451.50s" in dropped[0]
+
+
+def test_wide_echo_window_is_confined_to_the_tail():
+    """Mid-episode, a line 70 s later is a callback, not decode residue."""
+    from backend.services.transcript_sanitize import suppress_echo_cues
+    rows = [{"start": 300.0, "end": 305.0, "speaker": "",
+             "text": "The Gundam sank to the ocean floor and they have "
+                     "started recovering it now"},
+            {"start": 375.0, "end": 380.0, "speaker": "",
+             "text": "The Gundam sank to the ocean floor, and they've "
+                     "started recovering it now"},
+            {"start": 1400.0, "end": 1405.0, "speaker": "", "text": "Fin."}]
+    kept, dropped = suppress_echo_cues(rows)
+    assert len(kept) == 3 and dropped == []

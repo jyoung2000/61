@@ -1387,7 +1387,9 @@ _ECHO_MIN_CHARS = 16
 
 
 def suppress_echo_cues(rows: list, window_s: float = 12.0,
-                       ratio: float = 0.66) -> tuple[list, list]:
+                       ratio: float = 0.66,
+                       tail_window_s: float = 120.0,
+                       tail_s: float = 150.0) -> tuple[list, list]:
     """Drop cues that re-say a nearby cue's content in different words.
 
     Independent decodes of the same audio (the main pass, the second listen,
@@ -1412,7 +1414,17 @@ def suppress_echo_cues(rows: list, window_s: float = 12.0,
     The survivor is the cue with MEASURED word rows (audio-anchored) or,
     failing that, the longest text — the most complete rendering. Windows
     are left alone: the dropped cue's span belongs to the silence the
-    reference also leaves empty. Returns ``(rows, dropped_samples)``."""
+    reference also leaves empty.
+
+    The last ``tail_s`` of an episode gets ``tail_window_s`` instead. The
+    next-episode preview is read once over the ending theme, but the theme
+    collapse and the recovery passes each leave their own copy behind and
+    those copies land a minute or more apart — a measured run shipped the
+    preview twice, at 22:59 and again at 24:11, with the episode title card
+    between them. Twelve seconds cannot see that far. The wide window is
+    confined to the tail because only there is a distant near-repeat more
+    likely to be residue than drama; mid-episode, a callback line is real.
+    Returns ``(rows, dropped_samples)``."""
     def _g(r, k, d=None):
         return r.get(k, d) if isinstance(r, dict) else getattr(r, k, d)
 
@@ -1422,6 +1434,13 @@ def suppress_echo_cues(rows: list, window_s: float = 12.0,
     norm, drop = [], set()
     for r in rows:
         norm.append(_echo_norm(_g(r, "text", "") or ""))
+    track_end = 0.0
+    for r in rows:
+        try:
+            track_end = max(track_end, float(_g(r, "end", 0.0) or 0.0))
+        except (TypeError, ValueError):
+            pass
+    tail_from = max(0.0, track_end - tail_s)
     for i in range(n):
         if i in drop or len(norm[i]) < _ECHO_MIN_CHARS:
             continue
@@ -1430,8 +1449,10 @@ def suppress_echo_cues(rows: list, window_s: float = 12.0,
             continue
         try:
             ei = float(_g(rows[i], "end", 0.0) or 0.0)
+            si = float(_g(rows[i], "start", 0.0) or 0.0)
         except (TypeError, ValueError):
             continue
+        win = max(window_s, tail_window_s) if si >= tail_from else window_s
         for j in range(i + 1, n):
             if j in drop or len(norm[j]) < _ECHO_MIN_CHARS:
                 continue
@@ -1442,7 +1463,7 @@ def suppress_echo_cues(rows: list, window_s: float = 12.0,
                 sj = float(_g(rows[j], "start", 0.0) or 0.0)
             except (TypeError, ValueError):
                 continue
-            if sj - ei > window_s:
+            if sj - ei > win:
                 break                     # rows are time-ordered; done with i
             if (_g(rows[i], "speaker", "") or "") != (_g(rows[j], "speaker", "") or ""):
                 continue
@@ -1487,6 +1508,17 @@ def suppress_echo_cues(rows: list, window_s: float = 12.0,
 # Roleplay stage-direction markup ("*Grunt* *grunt*"). Never valid subtitle
 # text — a professional track writes "[grunts]" or nothing at all.
 _ASTERISK_MARKUP_RE = re.compile(r"^\s*(?:\*[^*]+\*\s*)+$")
+
+# ``key:value`` tokens — subtitle-file metadata, never spoken English. The
+# right side must start alphanumeric and carry no further colon, so a clock
+# time ("10:30") and a ratio ("3:1") are both excluded by the left side
+# needing to be a word.
+_KV_TOKEN_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*:[A-Za-z0-9][A-Za-z0-9_.\-]*$")
+_BOILERPLATE_RE = re.compile(
+    r"https?://|www\.|\bamara\.org\b|\bopensubtitles\b|\bsubtitles?\s+by\b"
+    r"|\bsync(?:ed|hronized)?\s+(?:and\s+corrected\s+)?by\b"
+    r"|\btranscri(?:bed|ption)\s+by\b|\bcorrected\s+by\b",
+    re.IGNORECASE)
 # Laughter, which professional tracks annotate ("[laughs]") rather than
 # transcribe, and pure vocalizations. Matched against the normalized form.
 _LAUGH_TOKEN_RE = re.compile(r"^(?:h+[ae]+)+h*$|^lol$")
@@ -1495,6 +1527,32 @@ _VOCALIZATION = {
     "ahh", "oh", "ooh", "eh", "ehh", "gah", "guh", "ugh", "argh", "agh",
     "wah", "hmph", "tsk", "grunt", "groan", "sigh",
 }
+
+
+def looks_like_asr_boilerplate(text: str) -> bool:
+    """True when ``text`` is subtitle-file metadata the ASR hallucinated.
+
+    Whisper trained on scraped subtitle corpora and it reproduces their
+    headers and credits when the audio underneath is thin. A measured run
+    shipped ``] sync:20 plain:no-commentary The`` as a visible subtitle at
+    3:30 — a string that appears nowhere in this codebase or its logs and
+    that no character says.
+
+    Two independent signatures, either sufficient:
+      * a credit line or a URL — ``subtitles by``, ``synced and corrected
+        by``, ``amara.org``, any ``http``;
+      * two or more ``word:value`` tokens. English dialogue does not carry
+        two colon-joined tokens in one cue; a subtitle header always does.
+        One is not enough, because a single one can survive a mis-split.
+
+    Pure and deterministic. Narrow on purpose: a cue that merely contains a
+    colon, a clock time, or one stray bracket is left alone."""
+    t = (text or "").strip()
+    if not t:
+        return False
+    if _BOILERPLATE_RE.search(t):
+        return True
+    return sum(1 for w in t.split() if _KV_TOKEN_RE.match(w)) >= 2
 
 
 def drop_junk_cues(rows: list, vocalization_max_dwell_s: float = 2.5,
@@ -1531,6 +1589,9 @@ def drop_junk_cues(rows: list, vocalization_max_dwell_s: float = 2.5,
         if _ASTERISK_MARKUP_RE.match(txt):
             dropped.append(f"markup:{txt[:32]!r}")
             continue
+        if looks_like_asr_boilerplate(txt):
+            dropped.append(f"boilerplate:{txt[:40]!r}")
+            continue
         norm = _echo_norm(txt)
         if norm and dur > vocalization_max_dwell_s:
             words = norm.split()
@@ -1547,7 +1608,7 @@ def drop_junk_cues(rows: list, vocalization_max_dwell_s: float = 2.5,
 
 def collapse_theme_by_music_spans(segments, music_spans: list,
                                   target_lang: str = "en",
-                                  head_s: float = 180.0,
+                                  head_s: float = 120.0,
                                   tail_s: float = 240.0,
                                   min_span_s: float = 20.0,
                                   min_cues: int = 3):
@@ -1602,6 +1663,12 @@ def collapse_theme_by_music_spans(segments, music_spans: list,
                 continue
             # Only the opening and closing windows. A sustained music cue in
             # the middle of an episode is score under a scene, not a theme.
+            # ``head_s`` is two minutes, not three: on the reference episode
+            # the opening theme is done by 1:32 and the narration that follows
+            # is captioned dialogue. A span that STARTS after two minutes is
+            # score under a scene however long it runs, and a measured run
+            # deleted sixty-five seconds of that narration when this window
+            # reached far enough to admit it.
             if a <= head_s or a >= max(0.0, track_end - tail_s):
                 spans.append((a, b))
         if not spans:
@@ -1644,9 +1711,35 @@ def collapse_theme_by_music_spans(segments, music_spans: list,
         out = [r for i, r in enumerate(rows) if i not in drop] + markers
         out.sort(key=lambda r: (float(r.get("start") or 0.0),
                                 float(r.get("end") or 0.0)))
-        return out, True
+        return dedupe_theme_markers(out), True
     except Exception:
         return _as_rows(segments), False
+
+
+def dedupe_theme_markers(rows: list) -> list:
+    """Keep only the FIRST marker of each theme label.
+
+    The audio-keyed collapse and the text-keyed one both emit theme markers,
+    and they do not agree on where the theme is. A measured run shipped
+    ``[♪ Opening theme ♪]`` twice — once at 0:30 from the text pass, which had
+    it right, and again at 2:22 from the audio pass, which did not. An episode
+    has one opening theme and one ending theme, so a second marker carrying
+    the same label is by construction the wrong one.
+
+    Earliest wins for both labels: the opening theme is the first music in the
+    episode, and the ending theme's marker is placed at the run's start, so a
+    later duplicate is always a stray. Pure; order-preserving."""
+    seen, out = set(), []
+    for r in rows or []:
+        txt = (r.get("text") if isinstance(r, dict)
+               else getattr(r, "text", "") or "")
+        label = (txt or "").strip()
+        if label in (_THEME_OPEN_LABEL, _THEME_END_LABEL):
+            if label in seen:
+                continue
+            seen.add(label)
+        out.append(r)
+    return out
 
 
 # ── Repetition bursts ──────────────────────────────────────────────────────

@@ -704,7 +704,37 @@ _MUSIC_SPAN_CACHE: dict = {}
 _MUSIC_SPAN_CACHE_MAX = 8
 
 
-def _bridge_spans(spans: list, bridge_s: float) -> list:
+def _spans_of_type(events: list, kind: str) -> list:
+    """Absolute ``(start, end)`` spans for every event of ``kind``."""
+    out = []
+    for e in events or []:
+        if e.get("type") != kind:
+            continue
+        start = float(e.get("timestamp", e.get("start", 0)) or 0)
+        out.append((start, start + float(e.get("duration", 0) or 0)))
+    return out
+
+
+def _covered_seconds(spans: list, a: float, b: float) -> float:
+    """Seconds of ``[a, b)`` covered by ``spans`` (which may overlap)."""
+    total, cur_a, cur_b = 0.0, None, None
+    for s, e in sorted(spans):
+        s, e = max(s, a), min(e, b)
+        if e <= s:
+            continue
+        if cur_b is not None and s <= cur_b:
+            cur_b = max(cur_b, e)
+        else:
+            if cur_b is not None:
+                total += cur_b - cur_a
+            cur_a, cur_b = s, e
+    if cur_b is not None:
+        total += cur_b - cur_a
+    return total
+
+
+def _bridge_spans(spans: list, bridge_s: float, blockers: list = (),
+                  blocker_tol_s: float = 2.0) -> list:
     """Merge spans separated by no more than ``bridge_s`` into one.
 
     The classifier works in short windows — a measured run produced 699
@@ -720,10 +750,29 @@ def _bridge_spans(spans: list, bridge_s: float) -> list:
     opening theme ends about twenty seconds before the opening narration
     begins, so a bridge that reached that far would weld a real, captioned
     narration onto the theme and delete it. Tolerate a sung phrase, not a
-    scene."""
+    scene.
+
+    ``blockers`` closes the hole that tolerance alone leaves. A measured run
+    bridged fragments of BACKGROUND SCORE playing under the opening narration
+    into a single 142-209 s "music" span, and the theme collapse then deleted
+    sixty-five seconds of real, professionally-captioned dialogue. Duration is
+    not evidence of a theme when the gaps between the fragments are full of
+    speech. A gap holding more than ``blocker_tol_s`` seconds of blocker is
+    not bridged.
+
+    This is deliberately strict, and the cost is understood: a SUNG theme
+    flips to the speech label on every vocal phrase, and phrases run longer
+    than the tolerance, so a sung theme will usually fail to assemble here.
+    That is the correct trade. Across every measured run the audio pass has
+    never once located a sung theme — the spans it produced sat under
+    dialogue — while it has destroyed a narration scene. What survives this
+    gate is an instrumental bed, which is unambiguous; a sung theme falls
+    through to the text pass, which finds it reliably."""
     out: list = []
     for a, b in sorted((float(x[0]), float(x[1])) for x in spans if x[1] > x[0]):
-        if out and a - out[-1][1] <= bridge_s:
+        if out and a - out[-1][1] <= bridge_s and (
+                not blockers
+                or _covered_seconds(blockers, out[-1][1], a) <= blocker_tol_s):
             out[-1][1] = max(out[-1][1], b)
         else:
             out.append([a, b])
@@ -731,7 +780,8 @@ def _bridge_spans(spans: list, bridge_s: float) -> list:
 
 
 async def music_spans_cached(audio_path: str, min_seconds: float = 5.0,
-                             bridge_s: float = 8.0) -> list:
+                             bridge_s: float = 8.0,
+                             min_music_frac: float = 0.6) -> list:
     """Sustained music-only ``(start, end)`` spans, cached per audio file.
 
     Dialogue over a score classifies as ``speech``, so a span returned here is
@@ -739,8 +789,15 @@ async def music_spans_cached(audio_path: str, min_seconds: float = 5.0,
     as ground truth for "these cues are sung". Adjacent fragments are bridged
     (see ``_bridge_spans``) BEFORE the duration filter, because the raw events
     are seconds long and no theme would ever clear a meaningful bar without
-    that. Returns ``[]`` on any failure so every caller degrades to its
-    previous behaviour."""
+    that.
+
+    Two tests must both pass, because bridging alone proved far too generous.
+    Speech events BLOCK a bridge, so score under a scene cannot be welded into
+    one long span; and the bridged result must still be ``min_music_frac``
+    actual music by coverage, so a span assembled out of thin fragments spread
+    across a dialogue scene is rejected even when no single gap was wide
+    enough to block it. Returns ``[]`` on any failure so every caller degrades
+    to its previous behaviour."""
     import os as _os
     try:
         st = _os.stat(audio_path)
@@ -754,16 +811,22 @@ async def music_spans_cached(audio_path: str, min_seconds: float = 5.0,
         except Exception as e:
             logger.info("music_spans_cached: classify failed (%s) — no spans", e)
             return []
-        hit = _music_spans_from_events(events, 0.0)
-        if hit:
+        hit = (_music_spans_from_events(events, 0.0),
+               _spans_of_type(events, "speech"))
+        if hit[0]:
             while len(_MUSIC_SPAN_CACHE) >= _MUSIC_SPAN_CACHE_MAX:
                 _MUSIC_SPAN_CACHE.pop(next(iter(_MUSIC_SPAN_CACHE)))
-            _MUSIC_SPAN_CACHE[key] = list(hit)
-    merged = _bridge_spans(hit, bridge_s)
-    out = [s for s in merged if (s[1] - s[0]) >= min_seconds]
+            _MUSIC_SPAN_CACHE[key] = (list(hit[0]), list(hit[1]))
+    music, speech = hit
+    merged = _bridge_spans(music, bridge_s, blockers=speech)
+    long_enough = [s for s in merged if (s[1] - s[0]) >= min_seconds]
+    out = [s for s in long_enough
+           if _covered_seconds(music, s[0], s[1]) >= min_music_frac * (s[1] - s[0])]
     logger.info(
-        "music spans: %d raw event span(s) → %d bridged → %d over %.0fs%s",
-        len(hit), len(merged), len(out), min_seconds,
+        "music spans: %d raw event span(s) → %d bridged (%d speech blocker(s)) "
+        "→ %d over %.0fs → %d at least %.0f%% music%s",
+        len(music), len(merged), len(speech), len(long_enough), min_seconds,
+        len(out), min_music_frac * 100.0,
         (" — " + ", ".join(f"{a:.0f}-{b:.0f}s" for a, b in out[:8]))
         if out else "")
     return out
