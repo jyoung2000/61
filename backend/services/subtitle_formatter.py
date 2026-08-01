@@ -1755,6 +1755,19 @@ def enforce_readability(
         seg.end = round(seg.end, 3)
         out3.append(seg)
 
+    # The merges above can weld a marked continuation pair back into one cue,
+    # which would then carry both halves of the marker. Heal it BEFORE the
+    # guaranteed wrap below, never after: ``_SPLIT_ELLIPSIS_RE`` matches the
+    # two ellipses with ``\s*`` between them, that ``\s*`` matches the NEWLINE
+    # of a correctly wrapped cue, and the ``" ".join(...split())`` that follows
+    # then destroys the break. Running it last therefore un-wrapped every cue
+    # it healed with nothing to re-wrap them — on a measured run that was the
+    # sole cause of all four lines over the 34-character budget, the worst of
+    # them 61 characters against a reference whose 503 lines never exceed 34.
+    # The wrapper was never at fault: fed the same text it returns a legal
+    # split every time.
+    heal_split_ellipsis(out3)
+
     # ── Pass 5: guaranteed line wrap (must run LAST) ────────────────────
     # Pass 3 wrapped every cue, but the merge branch in Pass 4 above joins two
     # cues' text with a space AFTER that — and Pass 2.5 can do the same — so a
@@ -1788,12 +1801,6 @@ def enforce_readability(
     # rather than of whichever pass touched the text last. Real audio times are
     # preserved wherever the count already agrees.
     resync_cue_words(out3)
-
-    # The merges above can weld a marked continuation pair back into one cue,
-    # which would then carry both halves of the marker. Heal it here, at the
-    # END of the pass that creates it, so every caller (persist AND the export
-    # re-run) gets the same clean text.
-    heal_split_ellipsis(out3)
 
     return out3
 
@@ -1924,6 +1931,11 @@ def enforce_min_gap(segments, min_gap_s: float = 0.08):
     return segs
 
 
+# How far ahead the floor may look for slack to borrow. Bounded so a long
+# packed run stays a fixed point rather than walking down the track.
+_RUN_LOOKAHEAD = 8
+
+
 def quantize_to_frames(segments, fps: float, min_gap_frames: int = 1,
                        min_duration_s: float = 0.0):
     """Snap every cue in/out point to the video's FRAME GRID, guaranteeing a
@@ -2008,8 +2020,29 @@ def quantize_to_frames(segments, fps: float, min_gap_frames: int = 1,
         # function ran, and it is documented as idempotent. Refusing to rob a
         # cue that is itself at the floor makes a fully-packed run a fixed
         # point: the shortfall stays where the merge passes can still see it.
-        surplus = (nxt[1] - nxt[0]) - min_f
-        shift = min(cur[1] + gap - nxt[0], min_f, max(0, surplus))
+        # Surplus is pooled across the FOLLOWING RUN, not read off the very
+        # next cue. A measured run shipped a 0.625 s cue because its immediate
+        # neighbour was itself at the floor (surplus 0) while the cue after
+        # that carried thirteen frames of slack — five of which were all the
+        # shortfall needed. Looking one cue ahead made the code's own verdict
+        # ("a run too dense for any timing to fix") wrong. The pool is still
+        # bounded by min_f, so the run can absorb one cue-length in total and
+        # no more; where the pool genuinely cannot cover the shortfall nothing
+        # moves, which keeps a fully-packed run a fixed point.
+        need = cur[1] + gap - nxt[0]
+        surplus = 0
+        for k in range(i + 1, min(len(grid), i + 1 + _RUN_LOOKAHEAD)):
+            # A cue already AT the floor contributes nothing, but it does not
+            # end the search either — it can be carried forward whole. The
+            # slack that rescues a cue is often two or three cues away, and
+            # stopping at the first floor-height neighbour is what made the
+            # code conclude a run was unfixable when it was not.
+            room = (grid[k][1] - grid[k][0]) - min_f
+            if room > 0:
+                surplus += room
+                if surplus >= need:
+                    break
+        shift = min(need, min_f, max(0, surplus))
         if shift > 0:
             nxt[0] += shift
             if nxt[1] < nxt[0] + 1:

@@ -1130,3 +1130,115 @@ def test_glossary_respell_is_idempotent_and_fail_soft():
     assert n1 == 1 and n2 == 0 and once == twice
     assert respell_text_from_glossary(["Dorlian here"], [])[1] == 0
     assert respell_text_from_glossary([], _GLOSS)[1] == 0
+
+
+# ── Run-18 parity fixes ────────────────────────────────────────────────────
+
+def test_ellipsis_heal_no_longer_unwraps_a_correctly_wrapped_cue():
+    """heal_split_ellipsis ran AFTER the guaranteed wrap; its `\\s*` matched
+    the newline and the join destroyed the break, with nothing to re-wrap
+    after. That was the sole cause of every over-width line in a measured
+    run — 61 chars against a reference whose 503 lines never exceed 34."""
+    from backend.services.subtitle_formatter import heal_split_ellipsis
+
+    class _S:
+        def __init__(self, t):
+            self.text, self.start, self.end, self.words = t, 0.0, 4.0, None
+
+    # A doubled marker split across the wrap is healed, and the result is flat
+    # (single line) so the wrap that follows can re-break it legally.
+    seg = _S("Of course, that\n… …goes without saying.")
+    heal_split_ellipsis([seg])
+    assert "\n" not in seg.text
+    assert seg.text == "Of course, that goes without saying."
+    # A legitimately wrapped continuation pair keeps its break untouched.
+    keep = _S("…and had already captured\nthe Gundam securely Heero…")
+    heal_split_ellipsis([keep])
+    assert keep.text == "…and had already captured\nthe Gundam securely Heero…"
+
+
+def test_quantize_pools_slack_across_a_short_run():
+    """Cue 208 shipped at 0.625s because its immediate neighbour was itself at
+    the floor, while the cue after that held 13 frames of slack."""
+    from backend.services.subtitle_formatter import quantize_to_frames
+    rows = [{"start": 902.5, "end": 903.125}, {"start": 903.167, "end": 903.999},
+            {"start": 904.041, "end": 904.874}, {"start": 904.916, "end": 906.292}]
+    legacy = quantize_to_frames([dict(r) for r in rows], 23.98, 1, 0.0)
+    assert round(legacy[0]["end"] - legacy[0]["start"], 3) == 0.626
+    out = quantize_to_frames([dict(r) for r in rows], 23.98, 1, 0.833)
+    assert all(r["end"] - r["start"] >= 0.833 for r in out)
+    gaps = [round(out[i + 1]["start"] - out[i]["end"], 4)
+            for i in range(len(out) - 1)]
+    assert all(g > 0 for g in gaps) and min(gaps) == 0.041
+    again = quantize_to_frames([dict(r) for r in out], 23.98, 1, 0.833)
+    assert [(r["start"], r["end"]) for r in out] == \
+           [(r["start"], r["end"]) for r in again]
+
+
+def test_quantize_leaves_an_unfixable_run_alone():
+    """A run with no slack anywhere stays a fixed point rather than walking."""
+    from backend.services.subtitle_formatter import quantize_to_frames
+    packed = [{"start": 100.0 + i * 0.30, "end": 100.0 + i * 0.30 + 0.25}
+              for i in range(8)]
+    out = quantize_to_frames([dict(r) for r in packed], 23.98, 1, 0.833)
+    gaps = [round(out[i + 1]["start"] - out[i]["end"], 4)
+            for i in range(len(out) - 1)]
+    assert all(g > 0 for g in gaps)
+    assert sum(1 for r in out if r["end"] - r["start"] < 0.833) > 0
+    again = quantize_to_frames([dict(r) for r in out], 23.98, 1, 0.833)
+    assert [(r["start"], r["end"]) for r in out] == \
+           [(r["start"], r["end"]) for r in again]
+
+
+def test_trailing_paren_tag_is_stripped_but_a_whispered_aside_survives():
+    from backend.services.transcript_sanitize import strip_trailing_annotation
+    assert strip_trailing_annotation("Brrr (sound effect)") == "Brrr"
+    assert strip_trailing_annotation("Captain! (alarm)") == "Captain!"
+    long_aside = "He nods (he whispers something and then leaves the room)"
+    assert strip_trailing_annotation(long_aside) == long_aside
+    assert strip_trailing_annotation("Get to the shelter now.") == \
+        "Get to the shelter now."
+
+
+def test_echo_surface_floor_spares_dialogue_but_keeps_the_collapse():
+    """Shared vocabulary alone must not convict: on the professional
+    reference that deleted eight real cues. Two translations of ONE line
+    share wording as well, so the surface floor separates them."""
+    from backend.services.transcript_sanitize import suppress_echo_cues
+    # Genuine four-rendering duplicate cluster — must collapse to one.
+    dup = [{"start": 202.9, "end": 205.2, "speaker": "S1",
+            "text": "Reporting meteor strikes."},
+           {"start": 205.2, "end": 208.7, "speaker": "S1",
+            "text": "Meteors falling, they say It's being reported as a meteor strike"},
+           {"start": 208.7, "end": 211.2, "speaker": "S1",
+            "text": "The meteorites are being reported."},
+           {"start": 211.2, "end": 214.2, "speaker": "S1",
+            "text": "Reported as falling meteorites"}]
+    kept, dropped = suppress_echo_cues([dict(r) for r in dup])
+    assert len(dropped) >= 2
+    assert sum(1 for r in kept if "meteor" in r["text"].lower()) == 1
+    # Two lines sharing vocabulary but not WORDING are no longer convicted on
+    # containment alone — that combination is ordinary dialogue.
+    real = [{"start": 100.0, "end": 104.0, "speaker": "",
+             "text": "The colonies are demanding their independence now."},
+            {"start": 104.5, "end": 107.5, "speaker": "",
+             "text": "Independence for the colonies? Never."}]
+    assert suppress_echo_cues([dict(r) for r in real])[1] == []
+    # Honest bound: the floor REDUCES reference damage, it does not remove it.
+    # A short reply whose wording is literally contained in the line before it
+    # still scores above the floor and is still dropped.
+    still = [{"start": 200.0, "end": 204.0, "speaker": "",
+              "text": "You're wasting the military's valuable combat resources!"},
+             {"start": 204.5, "end": 206.5, "speaker": "",
+              "text": "Valuable combat resources?"}]
+    assert len(suppress_echo_cues([dict(r) for r in still])[1]) == 1
+
+
+def test_series_glossary_falls_back_when_no_hint_is_configured():
+    """series_roster_terms() returns [] without TRANSLATION_SERIES_HINT, which
+    made the text respeller dead code on every run that had no hint."""
+    from backend.services import canonical_names as cn
+    cn._cache_put("glossary:job-x", {"a": "Heero Yuy", "b": "Relena Darlian"})
+    got = cn.series_glossary_for_job("job-x")
+    assert sorted(got) == ["Heero Yuy", "Relena Darlian"]
+    assert cn.series_glossary_for_job("no-such-job") == cn.series_roster_terms()

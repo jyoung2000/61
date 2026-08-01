@@ -3193,6 +3193,32 @@ def _resanitize_after_merge(rows: list, target_lang: str, job_id: str) -> list:
         if _j:
             logger.info("[%s] Post-merge junk filter: %d → %d cue(s), dropped %s",
                         job_id, _n0, len(out), "; ".join(_j[:6]))
+        # Source-script residue. The garble net that catches this runs inside
+        # the untranslated-cleanup pass, which last spoke eight minutes before
+        # the merge and truthfully reported "0% source-script remaining" about
+        # the track as it then stood. The merge then added a cue reading
+        # "Zexu S特殊 Acknowledged Zechs…" — only 4% CJK by character, so the
+        # 30%-ratio test in sanitize_translated_transcript declines it too.
+        # Only the remnant check is used here, never the full garble_reason:
+        # its word-salad and romaji-leak arms are far broader, and this track
+        # is already short of the reference on coverage.
+        try:
+            from backend.services.translator import _cjk_remnant_reason
+            _kept, _cjk = [], []
+            for _r in out:
+                _t = (_r.get("text") if isinstance(_r, dict)
+                      else getattr(_r, "text", "")) or ""
+                if _t.strip() and _cjk_remnant_reason(_t):
+                    _cjk.append(f"{_t[:40]!r}")
+                    continue
+                _kept.append(_r)
+            if _cjk:
+                logger.info(
+                    "[%s] Post-merge CJK remnants: %d → %d cue(s), dropped %s",
+                    job_id, len(out), len(_kept), "; ".join(_cjk[:4]))
+                out = _kept
+        except Exception:
+            pass
         _san, _ch = sanitize_translated_transcript(out, target_lang)
         if _ch:
             out = _san
@@ -3544,7 +3570,15 @@ async def _condense_over_cps_cues(
     ``(translated, cues_condensed)``."""
     try:
         threshold = float(getattr(settings, "SUBTITLE_CONDENSE_CPS", 28.0) or 28.0)
-        max_cps = float(getattr(settings, "SUBTITLE_MAX_CPS", 17.0) or 17.0)
+        # The TARGET this pass writes to, deliberately not SUBTITLE_MAX_CPS.
+        # That setting is 20.0 and is read by the fragment merge for its own
+        # reasons; borrowing it here put every rewrite in the 17-20 band, and
+        # the over-17 count then held at 97 for every threshold from 28 down
+        # to 19 — the pass could not move its own metric no matter how many
+        # cues it touched. The broadcast cap is 17 and that is what a
+        # condensed line has to fit.
+        max_cps = float(getattr(settings, "SUBTITLE_CONDENSE_TARGET_CPS", 17.0)
+                        or 17.0)
 
         def _get(seg, key, default=None):
             if isinstance(seg, dict):
@@ -3624,16 +3658,34 @@ async def _condense_over_cps_cues(
             return translated, 0
 
         changed = 0
+        changed_over = 0
         for (i, orig, _budget), new in zip(offenders, arr):
             new_txt = str(new or "").strip()
             if not new_txt or len(new_txt) >= len(orig):
                 continue  # must actually shrink; else keep the original
+            # ``_budget`` was computed per cue and then never consulted, so a
+            # rewrite that shed one character counted as a success. Consult it
+            # now — but only to COUNT, never to cut. Trimming an over-long
+            # rewrite at a word boundary was tried and rejected: it turns
+            # "The narration, condensed." into "The narration", which is not a
+            # condensation but a fragment, and a slightly-fast readable line
+            # beats broken English on screen every time. A rewrite that
+            # shrank is kept; one that missed its budget is reported.
+            if len(new_txt) > _budget:
+                changed_over += 1
             seg = translated[i]
             if isinstance(seg, dict):
                 seg["text"] = new_txt
             else:
                 seg.text = new_txt
             changed += 1
+        if changed_over:
+            # Under-delivery must be visible. A silent partial result reads as
+            # a working pass and is how the reading-rate metric stayed flat
+            # across three runs while the log said cues had been condensed.
+            logger.info(
+                "[%s] Condensation: %d of %d rewritten cue(s) still exceed "
+                "their display budget", job_id or "-", changed_over, changed)
         return translated, changed
     except Exception as _cd_err:
         logger.debug("[%s] over-cps condensation skipped: %s", job_id or "-", _cd_err)
@@ -4927,8 +4979,8 @@ async def _background_post_processing(
                     # anyway. Applying it straight to the text means a run
                     # whose roster abstains still gets the names it knows.
                     from backend.services.canonical_names import (
-                        respell_text_from_glossary, series_roster_terms)
-                    _gloss = series_roster_terms()
+                        respell_text_from_glossary, series_glossary_for_job)
+                    _gloss = series_glossary_for_job(job_id)
                     if _gloss:
                         _gl_new, _gl_n, _gl_s = respell_text_from_glossary(
                             _rc_new, _gloss)

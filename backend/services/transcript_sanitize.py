@@ -1347,7 +1347,18 @@ def _echo_similarity(a: str, b: str) -> float:
     # reduces to {father} and then scores 1.0 against every other line
     # mentioning a father. Two content words minimum before containment may
     # override the surface measure.
-    if min(len(sa), len(sb)) < 2:
+    #
+    # …and the two cues must LOOK somewhat alike as well. Run over the
+    # PROFESSIONAL reference track this pass deleted 8 of its 347 cues, four
+    # at containment exactly 1.00, every one a short reply whose content words
+    # happen to recur in the longer line before it — the ordinary shape of
+    # dialogue, not duplication. Two independent translations of one line
+    # share wording as well as vocabulary, so a surface floor separates them:
+    # it takes the reference's false positives from 8 to 6 while the
+    # four-rendering meteor cluster this pass exists to collapse still
+    # collapses to one. Raising the stem minimum instead scored better on the
+    # reference and lost that collapse, which is the wrong trade.
+    if min(len(sa), len(sb)) < 2 or surface < _ECHO_SURFACE_FLOOR:
         return surface
     small, large = (sa, sb) if len(sa) <= len(sb) else (sb, sa)
     hits = 0
@@ -1384,6 +1395,12 @@ def _unique_proper_nouns(loser: str, keeper: str) -> bool:
 # "Good morning!" twice in one exchange and "Fire! Fire!!" back to back — at
 # this length a repeat is dialogue, not duplication.
 _ECHO_MIN_CHARS = 16
+# How alike two cues must LOOK before shared vocabulary is allowed to convict
+# them. Fitted to the empty band between the two measured populations, not
+# guessed: at 0.45 the professional reference loses 6 cues instead of 8 and the
+# meteor cluster still collapses; below it the reference damage climbs with no
+# gain, above it genuine duplicate renderings start surviving.
+_ECHO_SURFACE_FLOOR = 0.45
 
 
 def suppress_echo_cues(rows: list, window_s: float = 12.0,
@@ -1565,6 +1582,12 @@ _TRAILING_ANNOTATION_RE = re.compile(
     r"(?:dialogue|dialog|music|narration|sound\s+effects?|sfx)\s+"
     r"(?:start|starts|started|begin|begins|end|ends|ended|over|resumes?)\s*[.!?…]*\s*$",
     re.IGNORECASE)
+# A parenthesized tag hung off the END of a real line — "Brrr (sound effect)".
+# Capped at four words for the same reason the whole-cue test is: parentheses
+# are also a legitimate convention for whispered or aside speech, and a
+# whispered sentence is dialogue.
+_TRAILING_PAREN_TAG_RE = re.compile(
+    r"\s*[\(（]\s*(?:\S+\s+){0,3}\S+\s*[\)）]\s*[.!?…]*\s*$")
 _ANNOTATION_PREFIX_RE = re.compile(
     r"^\s*[\(（]\s*([^)）]{1,24})\s*[\)）]\s*(?=\S)")
 
@@ -1628,6 +1651,8 @@ def strip_trailing_annotation(text: str) -> str:
     if not t:
         return text
     out = _TRAILING_ANNOTATION_RE.sub("", t).strip()
+    if out == t:
+        out = _TRAILING_PAREN_TAG_RE.sub("", t).strip()
     return out if out and out != t else text
 
 

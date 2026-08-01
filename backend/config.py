@@ -669,7 +669,14 @@ class Settings(BaseSettings):
     # extend into). Only cues over SUBTITLE_CONDENSE_CPS are touched — well
     # past the 17-cps broadcast cap, so normal prose never is.
     SUBTITLE_CONDENSE_OVER_CPS: bool = True
-    SUBTITLE_CONDENSE_CPS: float = 28.0
+    SUBTITLE_CONDENSE_CPS: float = 20.0
+    # What a condensed line must FIT, as opposed to what triggers the rewrite.
+    # Kept separate from SUBTITLE_MAX_CPS (20.0), which the fragment merge
+    # reads for its own purpose: writing to that number put every rewrite in
+    # the 17-20 band, so the over-17 count could not move however many cues
+    # the pass touched. 17 is the broadcast reading-rate cap the reference
+    # track sits under.
+    SUBTITLE_CONDENSE_TARGET_CPS: float = 17.0
     # Cap how far the readability pass may extend an over-fast cue PAST its own
     # end into the following silence. The extension makes a cue readable, but
     # with a long gap after it a cue could otherwise linger several seconds into

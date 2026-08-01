@@ -1397,6 +1397,11 @@ async def _get_series_glossary(series: str, job_id: str = "") -> list[str]:
     key = (series or "").strip().lower()
     if not key:
         return []
+    # Remember which series this process resolved. The text-side respeller runs
+    # much later, in a scope that never learns the series name, and without
+    # this it can only fall back to the configured hint — unset by default.
+    global _LAST_SERIES_KEY
+    _LAST_SERIES_KEY = key
     try:
         from backend.config import settings as _gset
         if not bool(getattr(_gset, "TRANSLATION_SERIES_GLOSSARY", True)):
@@ -1472,6 +1477,7 @@ def _glossary_tokens(glossary: list[str]) -> list[str]:
     return toks
 
 
+_LAST_SERIES_KEY = ""
 _GLOSSARY_RESPELL_RATIO = 0.75
 _GLOSSARY_RESPELL_MARGIN = 0.08
 # Mid-sentence capitalised tokens. A word capitalised only because it opens a
@@ -1693,6 +1699,35 @@ def _publish_series_evidence(job_id: str, mapping: dict) -> None:
 def roster_corrections_for_job(job_id: str) -> dict[str, str]:
     """The roster mapping resolved for this job (empty when none ran)."""
     return dict(_CACHE.get(f"roster:{job_id}") or {}) if job_id else {}
+
+
+def series_glossary_for_job(job_id: str = "",
+                            series: str = "") -> list[str]:
+    """The authoritative name list actually available to THIS job.
+
+    ``series_roster_terms`` reads a cache only ``expand_series_hint_to_names``
+    fills, and that function is gated on ``TRANSLATION_SERIES_HINT`` — unset by
+    default. So on a run with no hint it returns [] even when the glossary
+    demonstrably exists: a measured run logged "glossary respelled 'ヒーロ' →
+    'Heero'" and identified the series, then handed the text pass an empty
+    list. The authority was in memory and the subtitles shipped misspelled.
+
+    Three sources, most specific first: the per-job cache written when this
+    job's own terms were resolved; the durable store keyed on the identified
+    series; and finally the configured hint. Read-only and side-effect free."""
+    try:
+        if job_id:
+            hit = _CACHE.get(f"glossary:{job_id}")
+            if hit:
+                return [str(v) for v in hit.values() if v]
+        key = (series or "").strip().lower() or _LAST_SERIES_KEY
+        if key:
+            names = _glossary_store_load().get(key)
+            if isinstance(names, list) and names:
+                return [str(n) for n in names if n]
+    except Exception:
+        pass
+    return series_roster_terms()
 
 
 def apply_roster_corrections(texts: list, mapping: dict[str, str]) -> tuple[list, int]:
