@@ -557,6 +557,68 @@ def test_audio_theme_collapse_marks_both_themes_without_reading_the_words():
     assert not any(t.startswith("sung line") for t in texts)
 
 
+def test_theme_collapse_logs_the_anchor_drift_it_introduces(caplog):
+    """The theme marker's placement has oscillated between runs — a correct
+    ~30s on some, 0:00 on others — and the mechanism was only ever reproduced
+    synthetically. The backwards walk over absorbable cues is what moves the
+    anchor off its chorus, so the run must say by how much and on account of
+    which cues, in ROW coordinates. (The walk indexes the contiguous GROUP;
+    reporting a group offset as a row offset would name an unrelated cue two
+    thousand seconds away and send the next investigation to the wrong place.)
+    """
+    import logging
+    from backend.services.transcript_sanitize import collapse_song_choruses
+    rows = [{"start": 200.0 + 20.0 * i, "end": 203.0 + 20.0 * i,
+             "speaker": "S1",
+             "text": f"Heero warns Relena about the Alliance, part {i}."}
+            for i in range(10)]
+    rows += [{"start": 1360.0 + 4.0 * i, "end": 1363.5 + 4.0 * i,
+              "speaker": "S2", "text": t}
+             for i, t in enumerate([
+                 "a soft night wind",           # absorbed head
+                 "the refrain returns again",   # chorus A
+                 "and echoes far away",         # chorus B
+                 "the refrain returns again",   # chorus A reprise
+                 "and echoes far away",         # chorus B reprise
+                 "trailing soft line",          # absorbed tail
+             ])]
+    with caplog.at_level(logging.INFO,
+                         logger="backend.services.transcript_sanitize"):
+        out, changed = collapse_song_choruses([dict(r) for r in rows])
+    assert changed
+    line = next(m for m in caplog.messages if m.startswith("theme collapse:"))
+    assert "4→6 cue(s)" in line
+    # Anchor 1360.0 vs a chorus that starts at 1364.0 — the four seconds the
+    # walk gave away, not a row index picked out of the wrong list.
+    assert "anchor 1360.000s (chorus starts 1364.000s, drift -4.000s)" in line
+    assert "a soft night wind" in line and "trailing soft line" in line
+    assert "Heero warns Relena" not in line
+
+
+def test_theme_collapse_is_quiet_when_it_does_not_extend_the_run(caplog):
+    import logging
+    from backend.services.transcript_sanitize import collapse_song_choruses
+    rows = [{"start": 200.0 + 20.0 * i, "end": 203.0 + 20.0 * i,
+             "speaker": "S1",
+             "text": f"Heero warns Relena about the Alliance, part {i}."}
+            for i in range(10)]
+    # Same song, but bounded by dialogue on both sides instead of by lyrics:
+    # nothing is absorbable, so the anchor IS the chorus and there is no drift
+    # to report.
+    rows += [{"start": 1360.0 + 4.0 * i, "end": 1363.5 + 4.0 * i,
+              "speaker": "S2", "text": t}
+             for i, t in enumerate([
+                 "the refrain returns again",
+                 "and echoes far away",
+                 "the refrain returns again",
+                 "and echoes far away",
+             ])]
+    with caplog.at_level(logging.INFO,
+                         logger="backend.services.transcript_sanitize"):
+        collapse_song_choruses([dict(r) for r in rows])
+    assert not [m for m in caplog.messages if m.startswith("theme collapse:")]
+
+
 def test_audio_theme_collapse_ignores_mid_episode_score():
     # A sustained music cue under a battle scene is not a theme.
     from backend.services.transcript_sanitize import collapse_theme_by_music_spans
@@ -1242,3 +1304,64 @@ def test_series_glossary_falls_back_when_no_hint_is_configured():
     got = cn.series_glossary_for_job("job-x")
     assert sorted(got) == ["Heero Yuy", "Relena Darlian"]
     assert cn.series_glossary_for_job("no-such-job") == cn.series_roster_terms()
+
+
+def test_series_glossary_survives_a_restart_via_the_durable_store(tmp_path,
+                                                                  monkeypatch):
+    """The cast list must be reachable BEFORE the series is identified.
+
+    Identification runs after transcription, so within one run the names are
+    already mangled by the time we know whose they are. The durable pointer is
+    what lets the next run bias Whisper's decoder — process-local state cannot,
+    because it is empty at the moment transcription starts.
+    """
+    from backend.services import canonical_names as cn
+    store = tmp_path / "glossary.json"
+    monkeypatch.setattr(cn, "_GLOSSARY_STORE_PATH", str(store))
+    monkeypatch.setattr(cn, "_LAST_SERIES_KEY", "")   # simulate a fresh process
+    cn._glossary_store_save({"mobile suit gundam wing":
+                             ["Heero Yuy", "Relena Darlian", "Zechs Merquise"]})
+    # No pointer yet → nothing to bias with, exactly as on a first-ever run.
+    assert cn.series_glossary_for_job() == cn.series_roster_terms()
+    # A resolved series writes the pointer, and it is written only once.
+    cn._remember_series(cn._glossary_store_load(), "mobile suit gundam wing")
+    assert cn._glossary_store_load()["__last_series__"] == \
+        "mobile suit gundam wing"
+    assert sorted(cn.series_glossary_for_job()) == \
+        ["Heero Yuy", "Relena Darlian", "Zechs Merquise"]
+    # An explicit series argument still wins over the remembered one.
+    cn._glossary_store_save({**cn._glossary_store_load(),
+                             "other show": ["Amuro Ray"]})
+    assert cn.series_glossary_for_job(series="Other Show") == ["Amuro Ray"]
+
+
+def test_asr_vocabulary_bias_reads_the_resolved_glossary():
+    """The decoder bias must read the resolved chain, not the configured hint.
+
+    ``series_roster_terms()`` is empty without TRANSLATION_SERIES_HINT, which is
+    unset by default — so on every un-hand-configured run this biasing was off,
+    and names like Quatre came back as "Kato". No downstream spelling test can
+    undo that: the two share 40% of their letters, and correcting on sound
+    alone maps one character's name onto another's.
+    """
+    import inspect
+    from backend.services import reframer_audio, cloud_transcription
+    for fn in (reframer_audio._vocab_bias_kwargs,
+               cloud_transcription._vocab_prompt):
+        src = inspect.getsource(fn)
+        assert "series_glossary_for_job" in src
+        assert "series_roster_terms" not in src
+
+
+def test_condense_threshold_leaves_merely_brisk_cues_alone():
+    """At 20 cps the condenser rewrote cues that were readable, taking total
+    text 656 characters below the professional reference and reflowing shortened
+    two-line cues to one line. The trigger must sit well clear of the target the
+    rewrite is asked to hit, or the pass eats prose it was never meant to see.
+    """
+    from backend.config import settings
+    assert settings.SUBTITLE_CONDENSE_CPS == 24.0
+    assert settings.SUBTITLE_CONDENSE_CPS > settings.SUBTITLE_CONDENSE_TARGET_CPS
+    # A 21-cps cue — brisk, still under the trigger.
+    brisk = "Colonies do not surrender to Alliance threats."   # 45 chars
+    assert len(brisk) / 2.1 < settings.SUBTITLE_CONDENSE_CPS

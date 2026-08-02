@@ -33,9 +33,12 @@ caused. Space-joining is wrong for CJK, so CJK targets are returned untouched.
 """
 from __future__ import annotations
 
+import logging
 import re
 
-_CJK_TARGETS = {"ja", "ko", "zh", "zh-cn", "zh-tw", "yue"}
+logger = logging.getLogger(__name__)
+
+_CJK_TARGETS ={"ja", "ko", "zh", "zh-cn", "zh-tw", "yue"}
 # A whole cue that is only a repeated grunt letter + trailing dots ("Nn...",
 # "Nnn...", "Mmm") is non-lexical mumble filler Whisper emits and the 1:1
 # translation carries through — YouTube omits these. ≥2 of the same letter so
@@ -1057,6 +1060,8 @@ def collapse_song_choruses(segments, target_lang: str = "en"):
                 # shipped as dialogue. Proper nouns / previews still stop the
                 # walk, so the next-episode narration over the outro survives.
                 g_lo, g_hi = grp.index(min(run)), grp.index(max(run))
+                _chorus_lo, _chorus_hi = grp[g_lo], grp[g_hi]
+                _chorus_n = len(run)
                 j = g_lo - 1
                 while j >= 0 and _absorbable(grp[j]):
                     run.append(grp[j])
@@ -1069,6 +1074,27 @@ def collapse_song_choruses(segments, target_lang: str = "en"):
                 m_end = max(_en(rows[i]) for i in run)
                 if m_end - m_start < _THEME_MIN_SPAN_S:
                     continue
+                # Where the marker lands has oscillated between runs — 0.000s
+                # on some, a correct ~30s on others — and the mechanism has
+                # only ever been reproduced on synthetic input, never observed.
+                # The walk below extends the chorus run backwards through
+                # ``_absorbable`` cues, so the marker inherits the START of
+                # whatever it absorbed. Log the extension and the cues that
+                # caused it: an anchor 25s adrift of its chorus is the
+                # signature, and until this line exists the evidence to fix it
+                # does not survive the run.
+                _absorbed = sorted(i for i in run
+                                   if i < _chorus_lo or i > _chorus_hi)
+                if _absorbed:
+                    _chorus_start = _st(rows[_chorus_lo])
+                    logger.info(
+                        "theme collapse: %s run extended %d→%d cue(s), anchor "
+                        "%.3fs (chorus starts %.3fs, drift %+.3fs) — absorbed %s",
+                        label, _chorus_n, len(run), m_start,
+                        _chorus_start, m_start - _chorus_start,
+                        "; ".join(
+                            f"{_st(rows[i]):.2f}s {(rows[i].get('text') or '')[:28]!r}"
+                            for i in _absorbed[:4]))
                 drop.update(run)
                 marker_at[min(run)] = (m_start, m_end, label)
                 _w_markers.append(min(run))
@@ -1120,7 +1146,14 @@ def collapse_song_choruses(segments, target_lang: str = "en"):
                 continue
             out.append(dict(r))
         return out, True
-    except Exception:
+    except Exception as e:
+        # Fail-soft, but never silently: a bug in here disables the WHOLE
+        # theme collapse and the transcript simply ships the sung lyrics as
+        # dialogue — a failure mode indistinguishable, from the outside, from
+        # "no theme was detected". A bare NameError hid behind this handler
+        # once already.
+        logger.warning("theme collapse failed (%s: %s) — themes stay as cues",
+                       type(e).__name__, e)
         return _as_rows(segments), False
 
 

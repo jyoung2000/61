@@ -57,11 +57,13 @@ def _vocab_prompt(language: str) -> Optional[str]:
         if not bool(getattr(settings, "CUSTOM_VOCABULARY_ENABLED", True)):
             return None
         terms = list(load_vocabulary())
-        # Series-hint roster biases mis-heard names at the source (same as the
-        # local Whisper path).
+        # The cast list biases mis-heard names at the source (same as the local
+        # Whisper path). Read from the resolved-glossary chain, not the
+        # configured hint alone — the hint is unset by default, which left this
+        # biasing off on every run that had not been hand-configured.
         try:
-            from backend.services.canonical_names import series_roster_terms
-            for t in series_roster_terms():
+            from backend.services.canonical_names import series_glossary_for_job
+            for t in series_glossary_for_job():
                 if t not in terms:
                     terms.append(t)
         except Exception:

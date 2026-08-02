@@ -1362,6 +1362,25 @@ def _glossary_store_save(store: dict) -> None:
         logger.debug("glossary store save failed: %s", e)
 
 
+def _remember_series(store: dict, key: str) -> None:
+    """Persist ``key`` as the series this machine most recently resolved.
+
+    Only ever called with a key the store already holds names for, so the
+    pointer can never dangle. This is what lets the NEXT run bias Whisper's
+    decoder with the right cast list: identification runs AFTER transcription,
+    so within a single run the names are already mangled by the time we learn
+    whose they are. Written only on change — one disk write per new series,
+    not one per job.
+    """
+    try:
+        if store.get(_LAST_SERIES_STORE_KEY) == key:
+            return
+        store[_LAST_SERIES_STORE_KEY] = key
+        _glossary_store_save(store)
+    except Exception as e:
+        logger.debug("glossary store series pointer failed: %s", e)
+
+
 def _mine_glossary_names(text: str, cap: int = 80) -> list[str]:
     """TitleCase runs that read as proper names, most-frequent first.
 
@@ -1410,6 +1429,7 @@ async def _get_series_glossary(series: str, job_id: str = "") -> list[str]:
         pass
     store = _glossary_store_load()
     if isinstance(store.get(key), list) and store[key]:
+        _remember_series(store, key)
         return list(store[key])
     # Never reach the network from a unit test: an order-dependent pass/fail
     # keyed on whether some earlier test populated the durable store (or on
@@ -1452,6 +1472,7 @@ async def _get_series_glossary(series: str, job_id: str = "") -> list[str]:
     names = _mine_glossary_names("\n".join(texts)) if texts else []
     if names:
         store[key] = names
+        store[_LAST_SERIES_STORE_KEY] = key
         _glossary_store_save(store)
         logger.info(
             "[%s] series glossary: %d authoritative name(s) for %r cached "
@@ -1478,6 +1499,9 @@ def _glossary_tokens(glossary: list[str]) -> list[str]:
 
 
 _LAST_SERIES_KEY = ""
+# Reserved key in the durable glossary store naming the series this machine
+# most recently resolved. Prefixed so it can never collide with a real series.
+_LAST_SERIES_STORE_KEY = "__last_series__"
 _GLOSSARY_RESPELL_RATIO = 0.75
 _GLOSSARY_RESPELL_MARGIN = 0.08
 # Mid-sentence capitalised tokens. A word capitalised only because it opens a
@@ -1720,9 +1744,11 @@ def series_glossary_for_job(job_id: str = "",
             hit = _CACHE.get(f"glossary:{job_id}")
             if hit:
                 return [str(v) for v in hit.values() if v]
-        key = (series or "").strip().lower() or _LAST_SERIES_KEY
+        store = _glossary_store_load()
+        key = ((series or "").strip().lower() or _LAST_SERIES_KEY
+               or str(store.get(_LAST_SERIES_STORE_KEY) or ""))
         if key:
-            names = _glossary_store_load().get(key)
+            names = store.get(key)
             if isinstance(names, list) and names:
                 return [str(n) for n in names if n]
     except Exception:

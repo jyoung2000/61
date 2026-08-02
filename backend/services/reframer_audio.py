@@ -156,8 +156,16 @@ def _vocab_bias_kwargs(transcribe_callable, language: str) -> dict:
         # glossary; supplying the union keeps both.
         terms = list(load_vocabulary())
         try:
-            from backend.services.canonical_names import series_roster_terms
-            for t in series_roster_terms():
+            # The cast list this machine last resolved, not just the one a
+            # configured hint names. Biasing the DECODER is the only place a
+            # misheard name can actually be fixed: by the time the roster and
+            # the glossary see it, "Quatre" has already become "Kato" and no
+            # spelling test can safely undo that — the two share 40% of their
+            # letters and correcting on sound alone maps one character's name
+            # onto another's. This costs nothing on a first run and self-heals
+            # from the second onward, because the store survives restarts.
+            from backend.services.canonical_names import series_glossary_for_job
+            for t in series_glossary_for_job():
                 if t not in terms:
                     terms.append(t)
         except Exception:
