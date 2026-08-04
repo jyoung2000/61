@@ -1547,6 +1547,64 @@ pub fn run() {
                     }
                 });
             }
+
+            // Address-change self-healing: this Companion's IP is a DHCP
+            // lease, and every renewal used to strand ClipAI on the dead
+            // address until the user deleted and re-added the pairing by
+            // hand. ClipAI rebinds registrations by our persistent pairing
+            // token, so re-announcing from the new address heals the
+            // registry, Whisper routing, and the GPU metadata in place.
+            // Re-announce IMMEDIATELY when the LAN IP changes, and as a
+            // low-cost heartbeat every 15 minutes so a ClipAI-side restart
+            // that lost its settings also re-learns us.
+            {
+                let state = state.clone();
+                tauri::async_runtime::spawn(async move {
+                    let mut last_ip = pairing::detect_lan_ip().unwrap_or_default();
+                    let mut last_announce = std::time::Instant::now()
+                        - std::time::Duration::from_secs(3600);
+                    let mut last_fail_log = std::time::Instant::now()
+                        - std::time::Duration::from_secs(3600);
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                        let ip = pairing::detect_lan_ip().unwrap_or_default();
+                        let ip_changed = !ip.is_empty() && ip != last_ip;
+                        let heartbeat_due =
+                            last_announce.elapsed().as_secs() >= 900;
+                        if !ip_changed && !heartbeat_due {
+                            continue;
+                        }
+                        match pairing::reannounce(&state).await {
+                            Ok(true) => {
+                                if ip_changed {
+                                    log::info!(
+                                        "re-announced to ClipAI after LAN IP \
+                                         change {last_ip} → {ip}"
+                                    );
+                                }
+                                last_ip = ip;
+                                last_announce = std::time::Instant::now();
+                            }
+                            Ok(false) => {
+                                // Never paired (or paired before the key was
+                                // stored) — nothing to heal.
+                                last_ip = ip;
+                                last_announce = std::time::Instant::now();
+                            }
+                            Err(e) => {
+                                // ClipAI may simply be off; don't spam.
+                                if last_fail_log.elapsed().as_secs() >= 3600 {
+                                    log::warn!(
+                                        "re-announce to ClipAI failed \
+                                         (will keep retrying): {e}"
+                                    );
+                                    last_fail_log = std::time::Instant::now();
+                                }
+                            }
+                        }
+                    }
+                });
+            }
             {
                 let client = match reqwest::Client::builder()
                     .timeout(std::time::Duration::from_secs(3600))

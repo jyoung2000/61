@@ -854,7 +854,11 @@ class AIOrchestrator:
         is_ollama = chain and chain[0].provider_name == "ollama"
         max_segs = 20 if is_ollama else 50
         chunk_timeout = 90 if is_ollama else 60
-        max_chunk_tokens = 300 if is_ollama else 500
+        # 450, not 300: the chunk summaries are the ONLY memory the reduce has,
+        # and the 300-token cap is what made the shipped overview a single
+        # thin sentence — named characters and mid-chunk events never survived
+        # the map phase to be available to it.
+        max_chunk_tokens = 450 if is_ollama else 500
 
         # Companion-aware model upgrade (mirror of the clip-judge upgrade): on
         # a rig whose remote card holds the big translation model, run the
@@ -924,9 +928,13 @@ class AIOrchestrator:
                 )
                 prompt = (
                     _lang_dir +
-                    f"Summarize this {time_label} segment in 2-3 sentences. "
-                    f"Include: main topic, key content, notable moments. "
-                    f"Do not reference or speculate about speakers.\n\n"
+                    f"Summarize this {time_label} segment in 3-5 sentences. "
+                    f"Include: main topic, key events IN ORDER, and the "
+                    f"specific names of people, places, groups, and terms the "
+                    f"transcript uses — the final overview is assembled from "
+                    f"these summaries, and a name dropped here is lost to it. "
+                    f"Do not reference or speculate about speakers beyond "
+                    f"names explicitly said.\n\n"
                     f"TRANSCRIPT:\n{text}\n\nSCENES:\n{scene_text}\n\n"
                     f"Return a plain text summary (no JSON)."
                 )
@@ -959,7 +967,11 @@ class AIOrchestrator:
 
         # Reduce phase
         combined = "\n".join(mini_summaries)
-        if is_ollama and len(combined) > 2500:
+        # The 14B upgrade model (Companion card) affords a bigger reduce
+        # context than the 3B's 2500-char squeeze — keep more of the map
+        # phase's detail when the model that reads it can hold it.
+        _reduce_cap = 4500 if _big_override else 2500
+        if is_ollama and len(combined) > _reduce_cap:
             # Even coverage instead of head-truncation: head-truncating at 2500
             # chars silently dropped the back half of long videos from the
             # reduce. Keep mini-summaries evenly strided across the WHOLE list
@@ -972,12 +984,12 @@ class AIOrchestrator:
                 _idxs = sorted({min(int(k * _stride), len(mini_summaries) - 1)
                                 for k in range(_keep)})
                 _cand = "\n".join(mini_summaries[i] for i in _idxs)
-                if len(_cand) <= 2500:
+                if len(_cand) <= _reduce_cap:
                     combined = _cand
                     break
             else:
                 # Even a single mini-summary exceeds the cap — hard-truncate it.
-                combined = combined[:2500]
+                combined = combined[:_reduce_cap]
 
         reduce_prompt = (
             _lang_dir +
@@ -987,7 +999,10 @@ class AIOrchestrator:
             f"Focus on what is discussed, shown, and the key moments.\n\n"
             f"SEGMENT SUMMARIES:\n{combined}\n\n"
             "Return ONLY valid JSON:\n"
-            '{"overview": "<2-4 sentence paragraph about the video content>", '
+            '{"overview": "<5-8 sentence overview: the setting/premise, the '
+            'main people or groups and what each wants, the key events in '
+            'order, and what is at stake going forward — use the SPECIFIC '
+            'names of people, places, and terms the summaries mention>", '
             '"key_topics": ["topic1", "topic2", "topic3"], '
             '"tone": "<1-2 words>", "estimated_audience": "<who would watch>", '
             '"content_category": "<specific category>"}\n'
@@ -1027,7 +1042,7 @@ class AIOrchestrator:
                     provider._editorial_model = _big_override
                 try:
                     raw = await asyncio.wait_for(
-                        provider.text_complete(reduce_prompt, max_tokens=1000 if is_ollama else 2000, **_kw),
+                        provider.text_complete(reduce_prompt, max_tokens=1600 if is_ollama else 2000, **_kw),
                         timeout=(240 if _big_override else 120) if is_ollama else 90,
                     )
                 finally:

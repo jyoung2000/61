@@ -619,6 +619,90 @@ def test_theme_collapse_is_quiet_when_it_does_not_extend_the_run(caplog):
     assert not [m for m in caplog.messages if m.startswith("theme collapse:")]
 
 
+def test_source_chorus_spans_survive_translation_phrasing_variance():
+    """The same episode's ED collapsed on runs whose translation left lyrics
+    unpunctuated and shipped as dialogue on runs that punctuated them — with
+    an identical Whisper-JA track under both. The source repetition is the
+    phrasing-independent evidence, and its span must collapse the punctuated
+    TRANSLATED lyrics the text pass refuses."""
+    from backend.services.transcript_sanitize import (
+        collapse_theme_by_music_spans, source_chorus_spans)
+    src = [{"start": 200.0 + 30.0 * i, "end": 204.0 + 30.0 * i,
+            "text": f"作戦の状況を報告する、その{i}。"} for i in range(10)]
+    ed = ["ただ愛のせいで眠れない", "君を呼ぶ声が響く",
+          "ただ愛のせいで眠れない", "夜の風が頬を撫でる",
+          "君を呼ぶ声が響く", "ただ愛のせいで眠れない"]
+    src += [{"start": 1360.0 + 5.0 * i, "end": 1364.0 + 5.0 * i, "text": t}
+            for i, t in enumerate(ed)]
+    spans = source_chorus_spans(src)
+    assert len(spans) == 1 and 1355.0 < spans[0][0] <= 1360.5
+    # A Whisper hallucination LOOP repeats ONE line — never a chorus.
+    loop = [{"start": 1360.0 + 5.0 * i, "end": 1364.0 + 5.0 * i,
+             "text": "ご視聴ありがとうございました"} for i in range(6)]
+    assert source_chorus_spans(
+        src[:10] + loop) == []
+    # The span collapses the PUNCTUATED translated lyrics (run-21/23 shape,
+    # which the chorus/soft text passes measurably refused).
+    translated = [{"start": 200.0 + 30.0 * i, "end": 204.0 + 30.0 * i,
+                   "speaker": "S1", "text": f"Reporting operation status {i}."}
+                  for i in range(10)]
+    translated += [{"start": 1360.0 + 5.0 * i, "end": 1364.0 + 5.0 * i,
+                    "speaker": "S2", "text": t}
+                   for i, t in enumerate([
+                       "I really don't like it when you act this way.",
+                       "You're so full of yourself.",
+                       "Why are you making me wait?",
+                       "I know you ran over here.",
+                       "That's just how things work around here.",
+                       "It irritates me.",
+                   ])]
+    out, changed = collapse_theme_by_music_spans(translated, spans)
+    assert changed
+    texts = [r["text"] for r in out]
+    assert "[♪ Ending theme ♪]" in texts
+    assert not any("full of yourself" in t for t in texts)
+    assert f"Reporting operation status 3." in texts
+
+
+def test_theme_anchor_ignores_an_isolated_zero_hallucination():
+    from backend.services.transcript_sanitize import _theme_anchor_start
+    # The 0:00 phantom is temporally ISOLATED from the real song.
+    assert _theme_anchor_start([0.0, 30.4, 35.2, 40.0]) == 30.4
+    # A theme that genuinely opens the video keeps its first cue.
+    assert _theme_anchor_start([0.4, 4.2, 8.9]) == 0.4
+    assert _theme_anchor_start([26.0, 30.0]) == 26.0
+
+
+def test_marker_clamp_never_moves_a_sane_marker_later(caplog):
+    """Measured failure: the text pass anchored the opening theme at 30.342s
+    (correct) and the classifier's first onset was 61.0s (its silence floor
+    slept through the song's quiet intro) — the unrestricted clamp shoved a
+    right answer half a minute late. Only a ~0:00 marker may be clamped."""
+    from backend.services.transcript_sanitize import clamp_theme_marker_starts
+    rows = [{"start": 30.342, "end": 34.342, "speaker": "",
+             "text": "[♪ Opening theme ♪]"}]
+    out, notes = clamp_theme_marker_starts([dict(r) for r in rows], 61.0)
+    assert notes == [] and out[0]["start"] == 30.342
+    # The one pathology it exists for still heals.
+    z, n = clamp_theme_marker_starts(
+        [{"start": 0.0, "end": 4.0, "speaker": "",
+          "text": "[♪ Opening theme ♪]"}], 61.0)
+    assert len(n) == 1 and z[0]["start"] == 61.0
+
+
+def test_glossary_miner_rejects_acronyms():
+    """A measured run's glossary shipped 'DVD' as a cast name (the franchise
+    page mentions the format constantly, mid-sentence, TitleCase-shaped by
+    the regex's lights). Cast names are Xxxx-shaped; ALL-CAPS is a format."""
+    from backend.services.canonical_names import _mine_glossary_names
+    text = ("The series was released on DVD in 2000. Critics praised the DVD "
+            "release. The pilot Heero Yuy flies the machine, and later "
+            "the same Heero Yuy returns. Fans bought the DVD again.")
+    mined = _mine_glossary_names(text)
+    assert "DVD" not in mined
+    assert "Heero Yuy" in mined
+
+
 def test_audio_theme_collapse_ignores_mid_episode_score():
     # A sustained music cue under a battle scene is not a theme.
     from backend.services.transcript_sanitize import collapse_theme_by_music_spans

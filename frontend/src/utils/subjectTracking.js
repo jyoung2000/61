@@ -1627,10 +1627,16 @@ function smoothDamp(current, target, vel, smoothTime, maxSpeed, dt) {
  */
 export function humanizeKeyframes(kfs) {
   if (!Array.isArray(kfs) || kfs.length < 2) return kfs;
-  const SMOOTH_TIME = 0.55;   // s — deliberate operator settle time
-  const MAX_SPEED = 42;       // %/s — hard velocity cap (no whip is possible)
+  // 0.65/38/4.5 (was 0.55/42/3.5): a measured episode still graded
+  // stability 78.6 — the camera answered every small target twitch with a
+  // small eased move, which reads as nervousness, not operation. A longer
+  // settle time, a slightly lower speed ceiling, and a wider dead band make
+  // the camera commit to positions and ignore sub-perceptual wobble; real
+  // pans (subject actually moved) still complete in well under a second.
+  const SMOOTH_TIME = 0.65;   // s — deliberate operator settle time
+  const MAX_SPEED = 38;       // %/s — hard velocity cap (no whip is possible)
   const DT = 0.1;             // s — trajectory sampling step (~10 Hz)
-  const DEAD_BAND = 3.5;      // %  — ignore sub-perceptual target wobble
+  const DEAD_BAND = 4.5;      // %  — ignore sub-perceptual target wobble
   const CUT_PAIR_GAP = 0.02;  // s  — a snap this close to its neighbor = real cut
 
   const src = kfs.map((k) => ({ ...k })).sort((a, b) => a.t - b.t);

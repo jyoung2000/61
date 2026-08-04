@@ -5279,9 +5279,28 @@ async def _background_post_processing(
                             # fragments plus lyric-shaped text agreeing is
                             # the signal that survives that.
                             _rawm = await raw_music_spans_cached(_thm_wav)
+                            # SOURCE-side chorus repetition — the phrasing-
+                            # independent theme evidence. The translated-side
+                            # detection shipped the same episode's ED as 10-14
+                            # dialogue cues on runs where the LLM punctuated
+                            # the lyrics as sentences, while the Whisper-JA
+                            # text underneath repeated its chorus identically
+                            # on every one of those runs.
+                            try:
+                                from backend.services.transcript_sanitize import (
+                                    source_chorus_spans)
+                                _sspans = source_chorus_spans(_trans_input)
+                            except Exception:
+                                _sspans = []
+                            if _sspans:
+                                logger.info(
+                                    "[%s] Source-track chorus spans: %s",
+                                    job_id, ", ".join(
+                                        f"{a:.0f}-{b:.0f}s"
+                                        for a, b in _sspans))
                             _amt, _amt_changed = collapse_theme_by_music_spans(
-                                _translated_out, _mspans, target_lang,
-                                raw_music=_rawm)
+                                _translated_out, list(_mspans) + _sspans,
+                                target_lang, raw_music=_rawm)
                             if _amt_changed:
                                 logger.info(
                                     "[%s] Theme collapsed from AUDIO music "

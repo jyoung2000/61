@@ -54,6 +54,14 @@ pub struct Config {
     pub paused: bool,
     /// The ClipAI server this Companion is paired with (display only).
     pub paired_clipai_url: String,
+    /// The ClipAI API key used at pairing, kept so this Companion can
+    /// RE-ANNOUNCE itself when its DHCP address changes. Without it the
+    /// pairing was one-shot: an IP renewal left ClipAI pointing at a dead
+    /// address until the user deleted and re-added the Companion by hand.
+    /// Stored beside `token` in companion.json (same local-config trust
+    /// boundary), never logged, never echoed to the GUI.
+    #[serde(default)]
+    pub paired_clipai_api_key: String,
     /// Friendly name announced to ClipAI when pairing.
     pub name: String,
     /// Whether the first-run wizard has completed.
@@ -159,6 +167,7 @@ impl Default for Config {
             gpu_idle_free_sec: 300,
             paused: false,
             paired_clipai_url: String::new(),
+            paired_clipai_api_key: String::new(),
             name: default_name(),
             setup_complete: false,
             vram_auto: false,

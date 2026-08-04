@@ -80,7 +80,28 @@ pub async fn pair(
     {
         let mut cfg = state.config.lock().unwrap();
         cfg.paired_clipai_url = clipai_url;
+        // Keep the key so the re-announce loop can rebind this Companion
+        // after a DHCP change without the user re-pairing by hand.
+        cfg.paired_clipai_api_key = api_key.trim().to_string();
     }
     state.save();
     Ok(payload)
+}
+
+/// Re-announce this Companion to its paired ClipAI server.
+///
+/// ClipAI matches the registration by this Companion's persistent `token`,
+/// so calling this from a NEW address rebinds the existing host entry in
+/// place — Whisper routing, the Ollama registry, and the GPU metadata all
+/// follow the move with nothing to re-add. A no-op (Ok(false)) when the
+/// Companion has never been paired or the pairing predates the stored key.
+pub async fn reannounce(state: &Arc<AppState>) -> Result<bool, String> {
+    let (url, key) = {
+        let cfg = state.config.lock().unwrap();
+        (cfg.paired_clipai_url.clone(), cfg.paired_clipai_api_key.clone())
+    };
+    if url.is_empty() || key.is_empty() {
+        return Ok(false);
+    }
+    pair(state, &url, &key).await.map(|_| true)
 }

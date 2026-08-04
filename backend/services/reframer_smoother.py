@@ -150,7 +150,7 @@ class Smoother:
 
             dejittered.append(smoothed[i])
 
-        # Pass 2.5: Hold enforcement — after a cut, suppress movement for 800ms.
+        # Pass 2.5: Hold enforcement — after a cut, suppress movement for 1200ms.
         # This prevents the "snap then immediately drift" pattern that looks jumpy.
         held = [dejittered[0]]
         hold_enforced = 0
@@ -170,7 +170,7 @@ class Smoother:
                 # UNLESS this is a centering correction. The merge,
                 # consolidation and drift-suppress passes already honor
                 # _centering; hold_enforce was the last gap that was
-                # silently eating centering nudges placed in the 800ms
+                # silently eating centering nudges placed in the 1200ms
                 # window after a cut (a frequent need when the speaker
                 # appears off-centre on the post-cut frame).
                 if kf.get('_centering'):
@@ -189,7 +189,7 @@ class Smoother:
                                   t_ms=kf['time_ms'], x=kf['x'],
                                   last_cut_t_ms=last_cut_t,
                                   delta_from_cut_ms=kf['time_ms'] - last_cut_t,
-                                  reason='within_800ms_post_cut')
+                                  reason='within_1200ms_post_cut')
                 hold_enforced += 1
                 continue
 

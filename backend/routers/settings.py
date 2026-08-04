@@ -4130,7 +4130,7 @@ async def put_ollama_hosts(req: SaveOllamaHostsRequest):
     """
     import uuid as _uuid
     from backend.services import ollama_registry
-    existing_tokens = {h.id: h.token for h in ollama_registry.get_hosts()}
+    _prev = {h.id: h for h in ollama_registry.get_hosts()}
     hosts = []
     for entry in req.hosts:
         url = (entry.url or "").strip()
@@ -4139,13 +4139,22 @@ async def put_ollama_hosts(req: SaveOllamaHostsRequest):
         host_id = (entry.id or "").strip() or _uuid.uuid4().hex[:8]
         token = entry.token
         if token is None:
-            token = existing_tokens.get(host_id, "")
+            token = _prev[host_id].token if host_id in _prev else ""
+        # Server-owned metadata SURVIVES a UI save. The request model has no
+        # is_companion/gpu fields, so rebuilding hosts from it alone silently
+        # stripped the companion flag and its advertised GPU on every
+        # drag-reorder — after which only a URL heuristic kept pairing,
+        # Whisper routing, and the eviction exemption working.
+        _old = _prev.get(host_id)
         hosts.append(ollama_registry.OllamaHost(
             id=host_id,
             name=(entry.name or "").strip() or url,
             url=url,
             token=token,
             enabled=bool(entry.enabled),
+            gpu_name=_old.gpu_name if _old else "",
+            vram_total_mb=_old.vram_total_mb if _old else 0,
+            is_companion=_old.is_companion if _old else False,
         ))
     ollama_registry.save_hosts(hosts)
     _invalidate_status_cache()
@@ -4441,9 +4450,33 @@ async def companion_register(req: CompanionRegisterRequest,
     ollama_url = f"{base}/ollama"
 
     hosts = ollama_registry.get_hosts()
-    existing = next((h for h in hosts if h.url == ollama_url), None)
+    # Identity is the Companion's own persistent token, NOT the URL. The URL
+    # is a DHCP lease: when the Windows box renews to a new address, the
+    # URL-keyed lookup missed, a SECOND host entry was created, and the stale
+    # ghost kept the token/GPU info while transcription pointed at a dead IP —
+    # the user had to delete and re-add the Companion by hand every time.
+    # The token survives reboots and IP changes (companion.json), so a
+    # token match is the same machine announcing a new address: REBIND it.
+    existing = None
+    if req.token:
+        existing = next(
+            (h for h in hosts
+             if h.is_companion and h.token and h.token == req.token), None)
+    if existing is None:
+        existing = next((h for h in hosts if h.url == ollama_url), None)
     if existing is not None:
         hosts.remove(existing)
+        if existing.url != ollama_url:
+            logger.info(
+                "GPU Companion '%s' moved: %s → %s — rebinding the existing "
+                "host entry (same pairing token)",
+                existing.name, existing.url, ollama_url)
+            existing.url = ollama_url
+        # Same token under ANOTHER entry too = ghost from a pre-rebind
+        # double-pair; absorb it instead of racing it for primary.
+        if req.token:
+            hosts = [h for h in hosts
+                     if not (h.token == req.token and h.id != existing.id)]
         existing.name = (req.name or existing.name).strip() or existing.name
         if req.token:
             existing.token = req.token

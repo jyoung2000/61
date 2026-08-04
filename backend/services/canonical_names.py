@@ -1557,6 +1557,11 @@ def _mine_glossary_names(text: str, cap: int = 80) -> list[str]:
     counts: dict[str, int] = {}
     for m in _GLOSSARY_NAME_RE.finditer(text or ""):
         s = m.group(1).strip()
+        # An ALL-CAPS token is an acronym, not a person: a measured run's
+        # glossary shipped "DVD" as a cast name, which then sat in the
+        # respeller's authority list. Cast names are Xxxx-shaped.
+        if any(w.isupper() and len(w) >= 2 for w in s.split()):
+            continue
         words = [w.lower() for w in s.split()]
         if all(w in _ROSTER_SAFE_WORDS or w in _ROSTER_COMMON_WORDS
                or w in _WIKI_STOP for w in words):
@@ -1611,29 +1616,57 @@ async def _get_series_glossary(series: str, job_id: str = "") -> list[str]:
     texts: list[str] = []
     try:
         import httpx
+        _api = "https://en.wikipedia.org/w/api.php"
         async with httpx.AsyncClient(
                 timeout=8.0,
                 headers={"User-Agent": "ClipAI/1.0 (subtitle glossary)"}) as cl:
-            for q in (f"List of {series} characters", series):
-                r = await cl.get(
-                    "https://en.wikipedia.org/w/api.php",
-                    params={"action": "opensearch", "search": q,
-                            "limit": "1", "format": "json"})
-                if r.status_code != 200:
-                    continue
-                titles = (r.json() or [None, []])[1] or []
-                if not titles:
-                    continue
+
+            async def _page_extract(title: str) -> str:
                 r2 = await cl.get(
-                    "https://en.wikipedia.org/w/api.php",
-                    params={"action": "query", "prop": "extracts",
-                            "explaintext": "1", "redirects": "1",
-                            "format": "json", "titles": titles[0]})
+                    _api, params={"action": "query", "prop": "extracts",
+                                  "explaintext": "1", "redirects": "1",
+                                  "format": "json", "titles": title})
                 if r2.status_code != 200:
-                    continue
+                    return ""
                 pages = ((r2.json().get("query") or {}).get("pages") or {})
                 for p in pages.values():
                     ex = (p.get("extract") or "")[:80000]
+                    if ex:
+                        return ex
+                return ""
+
+            # The character LIST page first, found by FULL-TEXT search.
+            # opensearch is a title-prefix matcher: "List of Gundam Wing
+            # characters" does not prefix-match "List of Mobile Suit Gundam
+            # Wing characters", so a measured run fell through to the
+            # franchise page and "mined" DVD, Endless Waltz and Frozen
+            # Teardrop as cast names — while the real cast (and the katakana
+            # readings the name repair runs on) sat on the list page it
+            # never fetched.
+            _char_title = ""
+            r = await cl.get(
+                _api, params={"action": "query", "list": "search",
+                              "srsearch": f"List of {series} characters",
+                              "srlimit": "5", "format": "json"})
+            if r.status_code == 200:
+                _hits = [(h.get("title") or "")
+                         for h in ((r.json().get("query") or {})
+                                   .get("search") or [])]
+                _char_title = next(
+                    (t for t in _hits if "character" in t.lower()), "")
+            if _char_title:
+                ex = await _page_extract(_char_title)
+                if ex:
+                    texts.append(ex)
+            # The series page second — context terms (mecha, factions) the
+            # list page may not carry.
+            r = await cl.get(
+                _api, params={"action": "opensearch", "search": series,
+                              "limit": "1", "format": "json"})
+            if r.status_code == 200:
+                titles = (r.json() or [None, []])[1] or []
+                if titles and titles[0] != _char_title:
+                    ex = await _page_extract(titles[0])
                     if ex:
                         texts.append(ex)
     except Exception as e:

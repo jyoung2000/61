@@ -831,6 +831,85 @@ def _longest_theme_run(rows, idxs, is_preview, pn_fn=None, soft=False):
     return best
 
 
+def _theme_anchor_start(starts: list) -> float:
+    """The time a theme marker should claim, given its run's cue starts.
+
+    A run whose earliest member sits at ~0:00 while its NEXT member starts
+    several seconds later is anchored by a hallucination: Whisper emits
+    phantom lyric repeats at exactly 0.000, they legitimately join the run
+    (they ARE chorus text), and the marker inherits the zero. The second
+    cue's start is the run's real onset in that shape. A genuinely-early
+    theme (first two cues adjacent) keeps its first start."""
+    ss = sorted(float(s) for s in starts)
+    if len(ss) >= 2 and ss[0] < 1.0 and ss[1] - ss[0] > 8.0:
+        return ss[1]
+    return ss[0] if ss else 0.0
+
+
+def source_chorus_spans(source_rows, head_s: float = 120.0,
+                        tail_s: float = 240.0,
+                        min_span_s: float = 20.0) -> list:
+    """Theme time-spans detected on the SOURCE track. ``[(start, end), …]``.
+
+    The translated-side chorus detection is at the mercy of how the LLM
+    phrased the lyrics THAT run: the same episode's ending theme collapsed
+    on runs whose translation left lyrics unpunctuated and shipped 10-14
+    lyric cues as dialogue on runs where it punctuated them as sentences —
+    with an identical source track underneath both. The Whisper-JA text is
+    the phrasing-independent evidence: a sung theme repeats its chorus in
+    the SOURCE, so repeated normalized source lines inside the opening/
+    closing window mark the song no matter what the translation did.
+    Whisper's own JA hallucination loops also repeat, so a span needs TWO
+    distinct repeated lines (a loop repeats one) plus a real duration.
+    Returned spans feed ``collapse_theme_by_music_spans`` alongside music
+    spans. Empty on any failure or when the source shows no repetition."""
+    try:
+        rows = _as_rows(source_rows)
+        if len(rows) < 6:
+            return []
+
+        def _st(r):
+            return float(r.get("start") or 0.0)
+
+        def _en(r):
+            return float(r.get("end") or _st(r))
+
+        first_t = min(_st(r) for r in rows)
+        last_t = max(_en(r) for r in rows)
+        out = []
+        for w0, w1 in ((first_t, first_t + head_s),
+                       (max(0.0, last_t - tail_s), last_t)):
+            idxs = [i for i, r in enumerate(rows)
+                    if (r.get("text") or "").strip()
+                    and not _is_marker((r.get("text") or "").strip())
+                    and w0 - 0.01 <= _st(r) <= w1 + 0.01]
+            if len(idxs) < 4:
+                continue
+            counts: dict = {}
+            for i in idxs:
+                # CJK has no inter-sentence whitespace for _sent_split to
+                # cut on — the whole cue is the repetition unit, and CJK is
+                # dense enough that a shorter floor than the Latin chorus
+                # minimum still excludes grunts/particles.
+                ns = _song_norm((rows[i].get("text") or "").strip())
+                if len(ns) >= 6:
+                    counts[ns] = counts.get(ns, 0) + 1
+            chorus = {ns for ns, c in counts.items() if c >= 2}
+            if len(chorus) < 2:
+                continue
+            hits = [i for i in idxs
+                    if _song_norm((rows[i].get("text") or "").strip()) in chorus]
+            if len(hits) < 3:
+                continue
+            a = min(_st(rows[i]) for i in hits)
+            b = max(_en(rows[i]) for i in hits)
+            if b - a >= min_span_s:
+                out.append((round(a, 3), round(b, 3)))
+        return out
+    except Exception:
+        return []
+
+
 def collapse_song_choruses(segments, target_lang: str = "en"):
     """Collapse a sung OPENING/ENDING theme — mis-transcribed as duplicated,
     garbled dialogue — into a single ``[♪ … theme ♪]`` marker, the way official
@@ -1017,7 +1096,8 @@ def collapse_song_choruses(segments, target_lang: str = "en"):
                     trun = _longest_theme_run(rows, grp, _is_preview,
                                               pn_fn=_pn, soft=True)
                     if len(trun) >= _THEME_RUN_MIN_CUES and _vet_soft_run(trun):
-                        tm_start = min(_st(rows[i]) for i in trun)
+                        tm_start = _theme_anchor_start(
+                            [_st(rows[i]) for i in trun])
                         tm_end = max(_en(rows[i]) for i in trun)
                         if tm_end - tm_start >= _THEME_RUN_MIN_SPAN_S:
                             drop.update(trun)
@@ -1070,7 +1150,7 @@ def collapse_song_choruses(segments, target_lang: str = "en"):
                 while j < len(grp) and _absorbable(grp[j]):
                     run.append(grp[j])
                     j += 1
-                m_start = min(_st(rows[i]) for i in run)
+                m_start = _theme_anchor_start([_st(rows[i]) for i in run])
                 m_end = max(_en(rows[i]) for i in run)
                 if m_end - m_start < _THEME_MIN_SPAN_S:
                     continue
@@ -2002,19 +2082,23 @@ def collapse_theme_by_music_spans(segments, music_spans: list,
         return _as_rows(segments), False
 
 
-def clamp_theme_marker_starts(segments, first_onset) -> tuple:
-    """Pin theme markers to the first REAL audio onset. ``(rows, notes)``.
+def clamp_theme_marker_starts(segments, first_onset,
+                              max_start_s: float = 1.0) -> tuple:
+    """Pin a ZERO-ANCHORED theme marker to the first real audio onset.
 
-    The opening marker's placement has flipped between runs — 0:00.000 on
-    one, a correct ~0:30 on the next — because the collapse anchors on cue
-    times, and Whisper sometimes hallucinates a lyric line at exactly 0:00
-    which then becomes the run's earliest member. Text logic cannot rule
-    that cue out; the audio can. A hallucinated cue cannot conjure sound: if
-    the classifier heard nothing before ``first_onset``, no theme started
-    before it, and any marker that claims otherwise is moved up to the
-    onset (duration preserved up to its original length). Cues that are not
-    markers are never touched — this pass places labels, it does not judge
-    content. No onset (classifier unavailable) is a no-op."""
+    Backstop for exactly one pathology: Whisper hallucinating a lyric line
+    at 0:00.000, which then becomes the collapse run's earliest member and
+    drags the marker to zero. A hallucinated cue cannot conjure sound, so a
+    marker at ~0:00 moves up to the classifier's first onset.
+
+    Deliberately restricted to markers starting under ``max_start_s`` — on
+    its first production outing an unrestricted version MOVED A CORRECT
+    MARKER: the text pass had anchored the opening theme at 30.342s (right)
+    and the classifier's first onset was 61.0s (its silence floor slept
+    through the song's quiet intro), so the clamp shoved the marker half a
+    minute late. The cue evidence is MORE accurate than the onset whenever
+    the cue evidence is sane; the onset only outranks a cue that claims the
+    impossible. ``(rows, notes)``; no onset is a no-op."""
     rows = _as_rows(segments)
     notes: list = []
     try:
@@ -2033,7 +2117,7 @@ def clamp_theme_marker_starts(segments, first_onset) -> tuple:
             e = float(r.get("end") or s)
         except (TypeError, ValueError):
             continue
-        if s >= onset - 1.0:
+        if s >= max_start_s or s >= onset - 1.0:
             continue
         dur = max(e - s, 1.5)
         r["start"] = round(onset, 3)

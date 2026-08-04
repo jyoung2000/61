@@ -920,7 +920,14 @@ class Settings(BaseSettings):
     # Drift suppression: eased moves smaller than this fraction of crop width
     # (15px floor) are dropped — sub-threshold wobble reads as jitter, never as
     # intentional re-framing. Centering-tagged keyframes are always exempt.
-    REFRAMER_DRIFT_SUPPRESS_PCT: float = 0.08
+    # 0.10, not 0.08: the measured run graded stability 78.6 with a mean
+    # per-second crop movement of ~3.4% of crop width — a stream of eased
+    # micro-nudges in the 8-10% band that the suppressor let through. A human
+    # operator does not chase a subject by tenths of a frame; moves below a
+    # tenth of the crop are wobble, never re-framing. Centering-tagged
+    # keyframes stay exempt, so faces that genuinely leave the center third
+    # are still corrected.
+    REFRAMER_DRIFT_SUPPRESS_PCT: float = 0.10
     # Pan consolidation: same-direction eased steps within this window collapse
     # into ONE cinematic pan (stuttery 3-step pans were surviving at 1.5s).
     REFRAMER_PAN_CONSOLIDATE_WINDOW_S: float = 2.5

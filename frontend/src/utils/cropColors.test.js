@@ -13,20 +13,21 @@ describe('cropColorAt — crop % → colour', () => {
     expect(b).toBe(c);
   });
 
-  it('spans the full hue range across 0–100 %', () => {
-    expect(hueOf(cropColorAt(0))).toBe(0);              // left  → red
-    expect(hueOf(cropColorAt(100))).toBe(CROP_HUE_SPAN); // right → violet-blue
-    expect(hueOf(cropColorAt(50))).toBe(Math.round(0.5 * CROP_HUE_SPAN)); // centre → green
+  it('anchors the spectrum: 0 % is red, 100 % is blue', () => {
+    expect(CROP_HUE_SPAN).toBe(240);                     // ends AT blue, not violet
+    expect(hueOf(cropColorAt(0))).toBe(0);               // 0 %   → red
+    expect(hueOf(cropColorAt(100))).toBe(240);           // 100 % → blue
+    expect(hueOf(cropColorAt(50))).toBe(120);            // 50 %  → the exact midpoint
   });
 
-  it('is monotonic in % (a smooth sweep, no wrap back to red)', () => {
+  it('is monotonic in % (a smooth red→blue ramp, no wrap back to red)', () => {
     let prev = -1;
     for (let p = 0; p <= 100; p += 5) {
       const h = hueOf(cropColorAt(p));
       expect(h).toBeGreaterThanOrEqual(prev);
       prev = h;
     }
-    expect(prev).toBeLessThanOrEqual(360); // never wraps past a full circle
+    expect(prev).toBeLessThanOrEqual(240); // never runs past blue into violet/red
   });
 
   it('rounds identical labels to one hue: any % that shows "34%" is one colour', () => {
@@ -43,7 +44,7 @@ describe('cropColorAt — crop % → colour', () => {
   });
 
   it('honours the alpha argument', () => {
-    expect(cropColorAt(34, 0.75)).toBe('hsla(95, 60%, 38%, 0.75)');
-    expect(cropColorAt(34)).toBe('hsla(95, 60%, 38%, 1)');
+    expect(cropColorAt(34, 0.75)).toBe('hsla(82, 60%, 38%, 0.75)');
+    expect(cropColorAt(34)).toBe('hsla(82, 60%, 38%, 1)');
   });
 });
