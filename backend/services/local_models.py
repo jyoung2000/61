@@ -193,6 +193,28 @@ def translation_plan(model_name, n_cues, *, is_ollama=True, companion_parallel=1
     }
 
 
+def deterministic_text_options(model_name: str) -> dict:
+    """Sampling options that make a transcript-shaping LLM call reproducible.
+
+    The pinned seed is the real lever — with the same seed, prompt, and
+    options, Ollama's sampler is deterministic even at temperature > 0.
+    Greedy decoding (temperature 0) is added only for non-Qwen3 models:
+    Qwen3's model card warns that near-greedy decoding sends it into endless
+    repetition (measured on this pipeline too — the old temp=0.2 caused the
+    repeating subtitle lines), so the Qwen3 family keeps its tuned
+    anti-repetition profile and relies on the seed alone.
+
+    Apply LAST when building an options dict so the temperature/top_p here
+    win over generic defaults for non-Qwen3 models, while the empty
+    non-seed part leaves ``qwen3_translation_options`` untouched.
+    """
+    opts = {"seed": int(getattr(settings, "LLM_TRANSCRIPT_SEED", 42))}
+    if "qwen3" not in (model_name or "").lower():
+        opts["temperature"] = float(getattr(settings, "TRANSLATION_TEMPERATURE", 0.0))
+        opts["top_p"] = 1.0
+    return opts
+
+
 def qwen3_translation_options(model_name: str) -> dict:
     """Qwen3-family sampling options for the dedicated translation path.
 

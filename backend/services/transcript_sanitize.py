@@ -1804,7 +1804,8 @@ def collapse_theme_by_music_spans(segments, music_spans: list,
                                   head_s: float = 120.0,
                                   tail_s: float = 240.0,
                                   min_span_s: float = 20.0,
-                                  min_cues: int = 3):
+                                  min_cues: int = 3,
+                                  raw_music: list = None):
     """Collapse a sung theme using the AUDIO, not the translation's wording.
 
     ``collapse_song_choruses`` infers a theme from the text: chorus repetition
@@ -1826,12 +1827,30 @@ def collapse_theme_by_music_spans(segments, music_spans: list,
     the run rather than being swallowed by it. Deterministic and fail-soft —
     no spans (classifier unavailable, no sustained music) returns the rows
     untouched, and the text-based pass still gets its turn afterwards.
+
+    ``raw_music`` (unbridged classifier fragments, from
+    ``raw_music_spans_cached``) enables the TWO-SIGNAL tier. A sung theme
+    defeats the strong tier structurally — the classifier reads sung vocals
+    as speech, so the theme's own voice blocks its bridge and no OP/ED span
+    ever qualifies (measured: 205 speech blockers; the only qualified spans
+    were mid-episode instrumentals). The weak tier collapses a run only when
+    two independently-unreliable signals AGREE: a dense, contiguous run of
+    lyric-shaped cues in the opening/closing window (text — which alone
+    flip-flops with the LLM's punctuation habits: the same ED collapsed on
+    one run and shipped 14 lyric cues as dialogue on the next), whose span
+    the raw music fragments still cover ≥30% (audio — which alone would weld
+    score under dialogue, the measured 142-209s failure). Dialogue survives
+    both ways: a scene's proper nouns and pauses fail the run test, and
+    score under speech classifies as speech so its coverage stays low.
     Returns ``(rows, changed)``."""
     try:
         tgt = (target_lang or "").strip().lower().split("-")[0]
         rows = _as_rows(segments)
-        if tgt in _CJK_TARGETS or not music_spans or len(rows) < 4:
+        if tgt in _CJK_TARGETS or len(rows) < 4:
             return rows, False
+        if not music_spans and not raw_music:
+            return rows, False
+        music_spans = music_spans or []
         try:
             from backend.config import settings as _s
             if not getattr(_s, "TRANSCRIPT_MARK_THEME_SONGS", True):
@@ -1864,7 +1883,7 @@ def collapse_theme_by_music_spans(segments, music_spans: list,
             # reached far enough to admit it.
             if a <= head_s or a >= max(0.0, track_end - tail_s):
                 spans.append((a, b))
-        if not spans:
+        if not spans and not raw_music:
             return rows, False
 
         drop, markers = set(), []
@@ -1899,6 +1918,80 @@ def collapse_theme_by_music_spans(segments, music_spans: list,
             drop.update(run)
             markers.append({"start": round(m_start, 3), "end": round(m_end, 3),
                             "text": label, "speaker": ""})
+
+        # ── Two-signal tier ──────────────────────────────────────────────
+        raw = []
+        for sp in (raw_music or []):
+            try:
+                raw.append((float(sp[0]), float(sp[1])))
+            except (TypeError, ValueError, IndexError):
+                continue
+
+        def _raw_cover(a: float, b: float) -> float:
+            got = 0.0
+            for x, y in raw:
+                got += max(0.0, min(b, y) - max(a, x))
+            return got / (b - a) if b > a else 0.0
+
+        if raw:
+            first_t = min((_st(r) for r in rows), default=0.0)
+            for w0, w1, label in ((first_t, first_t + head_s,
+                                   _THEME_OPEN_LABEL),
+                                  (max(0.0, track_end - tail_s), track_end,
+                                   _THEME_END_LABEL)):
+                cand = []
+                for i, r in enumerate(rows):
+                    if i in drop:
+                        continue
+                    txt = (r.get("text") or "").strip()
+                    if (not txt or txt.startswith("[")
+                            or _PREVIEW_RE.search(txt)
+                            or _proper_noun_count(txt) > 2
+                            or len(txt) > 60):
+                        continue
+                    mid = (_st(r) + _en(r)) / 2.0
+                    if w0 - 0.01 <= mid <= w1 + 0.01:
+                        cand.append(i)
+                groups, cur = [], []
+                for i in cand:
+                    if cur and _st(rows[i]) - _en(rows[cur[-1]]) > 10.0:
+                        groups.append(cur)
+                        cur = []
+                    cur.append(i)
+                if cur:
+                    groups.append(cur)
+                for grp in groups:
+                    # Stricter than the strong tier on every text axis,
+                    # because the audio here is only fragments: at least 5
+                    # cues, a continuous span, a proper-noun-free majority
+                    # (a dialogue scene names people; a song does not), and
+                    # ≥30% of the span still classified music despite the
+                    # vocals. Punctuation is deliberately NOT consulted —
+                    # the LLM's habit of punctuating lyrics as sentences is
+                    # exactly the instability this tier exists to survive.
+                    if len(grp) < max(min_cues, 5):
+                        continue
+                    g_start = min(_st(rows[i]) for i in grp)
+                    g_end = max(_en(rows[i]) for i in grp)
+                    if g_end - g_start < min_span_s:
+                        continue
+                    _pn0 = sum(
+                        1 for i in grp
+                        if _proper_noun_count(
+                            (rows[i].get("text") or "").strip()) == 0)
+                    if _pn0 < 0.6 * len(grp):
+                        continue
+                    cover = _raw_cover(g_start, g_end)
+                    if cover < 0.30:
+                        continue
+                    logger.info(
+                        "theme collapse (two-signal): %s — %d lyric-shaped "
+                        "cue(s) %.1f-%.1fs, music fragments cover %.0f%%",
+                        label, len(grp), g_start, g_end, cover * 100.0)
+                    drop.update(grp)
+                    markers.append({"start": round(g_start, 3),
+                                    "end": round(g_end, 3),
+                                    "text": label, "speaker": ""})
         if not markers:
             return rows, False
         out = [r for i, r in enumerate(rows) if i not in drop] + markers
@@ -1907,6 +2000,50 @@ def collapse_theme_by_music_spans(segments, music_spans: list,
         return dedupe_theme_markers(out), True
     except Exception:
         return _as_rows(segments), False
+
+
+def clamp_theme_marker_starts(segments, first_onset) -> tuple:
+    """Pin theme markers to the first REAL audio onset. ``(rows, notes)``.
+
+    The opening marker's placement has flipped between runs — 0:00.000 on
+    one, a correct ~0:30 on the next — because the collapse anchors on cue
+    times, and Whisper sometimes hallucinates a lyric line at exactly 0:00
+    which then becomes the run's earliest member. Text logic cannot rule
+    that cue out; the audio can. A hallucinated cue cannot conjure sound: if
+    the classifier heard nothing before ``first_onset``, no theme started
+    before it, and any marker that claims otherwise is moved up to the
+    onset (duration preserved up to its original length). Cues that are not
+    markers are never touched — this pass places labels, it does not judge
+    content. No onset (classifier unavailable) is a no-op."""
+    rows = _as_rows(segments)
+    notes: list = []
+    try:
+        onset = float(first_onset) if first_onset is not None else None
+    except (TypeError, ValueError):
+        onset = None
+    if onset is None or onset <= 1.0:
+        return rows, notes
+    changed = False
+    for r in rows:
+        txt = (r.get("text") or "").strip()
+        if not (_is_marker(txt) and "♪" in txt):
+            continue
+        try:
+            s = float(r.get("start") or 0.0)
+            e = float(r.get("end") or s)
+        except (TypeError, ValueError):
+            continue
+        if s >= onset - 1.0:
+            continue
+        dur = max(e - s, 1.5)
+        r["start"] = round(onset, 3)
+        r["end"] = round(max(e, onset + min(dur, 4.0)), 3)
+        notes.append(f"{txt} {s:.3f}s → {onset:.3f}s (first audio onset)")
+        changed = True
+    if changed:
+        rows.sort(key=lambda r: (float(r.get("start") or 0.0),
+                                 float(r.get("end") or 0.0)))
+    return rows, notes
 
 
 def normalize_markers(rows: list, adjacent_window_s: float = 20.0) -> tuple:

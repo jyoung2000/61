@@ -3306,7 +3306,7 @@ async def _post_complete_gap_recovery(job_id: str, orchestrator) -> None:
                     f"Translate this subtitle line to {_tgt_name}. "
                     f"Reply with ONLY the translation, no quotes.\n\n{r['text']}",
                     max_tokens=200, timeout=60, job_id=job_id,
-                    skip_circuit_breaker=True)
+                    skip_circuit_breaker=True, deterministic=True)
                 # Full validation, not just non-empty: this surface shipped a
                 # 12-cue refusal paragraph ("This sentence appears to be in
                 # Japanese and seems to contain…") as subtitles because any
@@ -4979,11 +4979,17 @@ async def _background_post_processing(
                     # anyway. Applying it straight to the text means a run
                     # whose roster abstains still gets the names it knows.
                     from backend.services.canonical_names import (
-                        respell_text_from_glossary, series_glossary_for_job)
+                        kana_aliases_for_job, respell_text_from_glossary,
+                        series_glossary_for_job)
                     _gloss = series_glossary_for_job(job_id)
                     if _gloss:
+                        # Kana-derived aliases reach the garbles letter
+                        # distance can't: "Kato" is カトル's clipped romaji —
+                        # an exact dictionary hit — while against "Quatre"
+                        # it scores 0.40 and no safe threshold reaches it.
                         _gl_new, _gl_n, _gl_s = respell_text_from_glossary(
-                            _rc_new, _gloss)
+                            _rc_new, _gloss,
+                            aliases=kana_aliases_for_job(job_id))
                         if _gl_n:
                             for _seg, _new_text in zip(translated, _gl_new):
                                 if isinstance(_seg, dict):
@@ -5257,31 +5263,39 @@ async def _background_post_processing(
                     # phrased the lyrics this run. The text-based pass below
                     # then handles whatever the audio could not (classifier
                     # unavailable, a theme mixed under dialogue).
+                    _thm_wav = os.path.join(
+                        database._job_dir(job_id), "audio.wav")
                     try:
                         from backend.services.audio_analyzer import (
-                            music_spans_cached)
+                            music_spans_cached, raw_music_spans_cached)
                         from backend.services.transcript_sanitize import (
                             collapse_theme_by_music_spans)
-                        _thm_wav = os.path.join(
-                            database._job_dir(job_id), "audio.wav")
                         if os.path.isfile(_thm_wav):
                             _mspans = await music_spans_cached(_thm_wav)
+                            # The weak tier: a sung theme's vocals classify
+                            # as speech, so no OP/ED span EVER qualifies
+                            # above (measured — the only qualified spans
+                            # were mid-episode instrumentals). The raw
+                            # fragments plus lyric-shaped text agreeing is
+                            # the signal that survives that.
+                            _rawm = await raw_music_spans_cached(_thm_wav)
                             _amt, _amt_changed = collapse_theme_by_music_spans(
-                                _translated_out, _mspans, target_lang)
+                                _translated_out, _mspans, target_lang,
+                                raw_music=_rawm)
                             if _amt_changed:
                                 logger.info(
                                     "[%s] Theme collapsed from AUDIO music "
-                                    "spans: %d → %d cue(s) (%d music span(s) "
-                                    "classified)", job_id,
+                                    "spans: %d → %d cue(s) (%d strong span(s), "
+                                    "%d raw fragment(s))", job_id,
                                     len(_translated_out), len(_amt),
-                                    len(_mspans))
+                                    len(_mspans), len(_rawm))
                                 _translated_out = _amt
-                            elif _mspans:
+                            elif _mspans or _rawm:
                                 logger.info(
-                                    "[%s] Audio theme collapse: %d music "
-                                    "span(s) found, none qualified — falling "
-                                    "back to the text pass",
-                                    job_id, len(_mspans))
+                                    "[%s] Audio theme collapse: %d strong "
+                                    "span(s) / %d raw fragment(s), none "
+                                    "qualified — falling back to the text "
+                                    "pass", job_id, len(_mspans), len(_rawm))
                     except Exception as _amt_e:
                         logger.warning(
                             "[%s] Audio-keyed theme collapse skipped (%s)",
@@ -5293,6 +5307,30 @@ async def _background_post_processing(
                         logger.info("[%s] Collapsed sung theme chorus to marker: %d → %d cue(s)",
                                     job_id, len(_translated_out), len(_thm))
                         _translated_out = _thm
+                    # Whichever pass minted the marker, its START answers to
+                    # the audio: a cue hallucinated at 0:00.000 can anchor a
+                    # chorus run, but it cannot conjure sound — if the
+                    # classifier heard nothing before ~25s, no theme started
+                    # before that. This is what ends the 0:00-vs-0:30
+                    # oscillation of the opening marker between runs.
+                    try:
+                        from backend.services.audio_analyzer import (
+                            first_audio_onset_cached)
+                        from backend.services.transcript_sanitize import (
+                            clamp_theme_marker_starts)
+                        if os.path.isfile(_thm_wav):
+                            _onset = await first_audio_onset_cached(_thm_wav)
+                            _cl, _cl_notes = clamp_theme_marker_starts(
+                                _translated_out, _onset)
+                            if _cl_notes:
+                                logger.info(
+                                    "[%s] Theme marker anchor clamped to "
+                                    "audio: %s", job_id,
+                                    "; ".join(_cl_notes))
+                                _translated_out = _cl
+                    except Exception as _cl_e:
+                        logger.debug("[%s] Marker onset clamp skipped (%s)",
+                                     job_id, _cl_e)
                     # Both passes mint markers and they do not agree on where
                     # the theme is; an episode has one of each.
                     _dd = dedupe_theme_markers(_translated_out)

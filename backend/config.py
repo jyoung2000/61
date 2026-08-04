@@ -142,6 +142,22 @@ class Settings(BaseSettings):
     QWEN3_TRANSLATION_PRESENCE_PENALTY: float = 1.2  # was 0.5 — card allows up to 1.5
     QWEN3_TRANSLATION_FREQUENCY_PENALTY: float = 0.3  # token-level loop suppression
 
+    # ── Reproducible transcript output ──────────────────────────────────────
+    # Two identical runs of the same episode on the same build produced
+    # materially different subtitle tracks (334 vs 352 cues; one shipped the
+    # ending theme's lyrics as dialogue, the other collapsed them correctly).
+    # The variance enters through sampled LLM decoding, then every downstream
+    # heuristic amplifies it. All transcript-SHAPING calls (translation, MTPE,
+    # polish, gap-recovery translation) therefore pin a seed, and non-Qwen3
+    # models decode greedily. Qwen3 keeps its tuned anti-repetition profile —
+    # its model card warns that near-greedy decoding causes endless repetition
+    # (measured here too, see QWEN3_TRANSLATION_TEMPERATURE above) — and the
+    # pinned seed alone makes its sampling reproducible.
+    # Editorial/SEO/summary sampling is deliberately NOT touched: those calls
+    # never alter the subtitle track and keep their diversity.
+    TRANSLATION_TEMPERATURE: float = 0.0    # non-Qwen3 transcript calls decode greedily
+    LLM_TRANSCRIPT_SEED: int = 42           # pinned sampler seed for transcript calls
+
     # ── Partial GPU offload for the 4B translation model on a small card ──
     # A 4B-q4 model's weights are ~2.5 GB — most of its layers DO fit a 4 GB
     # GTX 1650, only a few don't. The old behavior forced ALL layers onto the

@@ -796,6 +796,65 @@ def _bridge_spans(spans: list, bridge_s: float, blockers: list = (),
     return [(a, b) for a, b in out]
 
 
+async def _cached_event_spans(audio_path: str) -> tuple:
+    """``(music_spans, speech_spans)`` from the classifier, cached per file.
+
+    The shared fill for :func:`music_spans_cached`,
+    :func:`raw_music_spans_cached` and :func:`first_audio_onset_cached` —
+    one classify pass per audio file however many views of it are read.
+    ``([], [])`` on any failure."""
+    import os as _os
+    try:
+        st = _os.stat(audio_path)
+        key = (_os.path.abspath(audio_path), st.st_mtime_ns, st.st_size)
+    except OSError:
+        return [], []
+    hit = _MUSIC_SPAN_CACHE.get(key)
+    if hit is None:
+        try:
+            events = await classify_audio_events(audio_path)
+        except Exception as e:
+            logger.info("music_spans_cached: classify failed (%s) — no spans", e)
+            return [], []
+        hit = (_music_spans_from_events(events, 0.0),
+               _spans_of_type(events, "speech"))
+        if hit[0]:
+            while len(_MUSIC_SPAN_CACHE) >= _MUSIC_SPAN_CACHE_MAX:
+                _MUSIC_SPAN_CACHE.pop(next(iter(_MUSIC_SPAN_CACHE)))
+            _MUSIC_SPAN_CACHE[key] = (list(hit[0]), list(hit[1]))
+    return hit
+
+
+async def raw_music_spans_cached(audio_path: str) -> list:
+    """UNBRIDGED, UNGATED music event spans — the weak evidence tier.
+
+    A sung theme defeats :func:`music_spans_cached` structurally: the
+    classifier reads sung vocals as speech, so the theme's own voice blocks
+    the bridge and the 60%-dominance gate can never pass (measured: 205
+    speech blockers, and the only spans that qualified were mid-episode
+    instrumentals). The raw fragments are still there, threaded BETWEEN the
+    vocal windows. Alone they prove nothing — under a dialogue scene the
+    score fragments the same way — which is why this tier is only ever used
+    AGREEING WITH lyric-shaped text (see
+    ``collapse_theme_by_music_spans``): two weak signals, either of which
+    alone has a measured failure mode, in place of one strong signal the
+    rule-based classifier cannot produce for vocal music."""
+    music, _speech = await _cached_event_spans(audio_path)
+    return list(music)
+
+
+async def first_audio_onset_cached(audio_path: str) -> Optional[float]:
+    """Earliest non-silence onset (music or speech), or None when unknown.
+
+    The theme markers' anchor authority: a cue Whisper hallucinated at
+    0:00.000 can drag a theme marker to zero, but it cannot conjure audio —
+    if the classifier says the first real sound is at 25s, no theme started
+    before that."""
+    music, speech = await _cached_event_spans(audio_path)
+    starts = [s[0] for s in music] + [s[0] for s in speech]
+    return min(starts) if starts else None
+
+
 async def music_spans_cached(audio_path: str, min_seconds: float = 5.0,
                              bridge_s: float = 8.0,
                              min_music_frac: float = 0.6) -> list:
@@ -815,26 +874,9 @@ async def music_spans_cached(audio_path: str, min_seconds: float = 5.0,
     across a dialogue scene is rejected even when no single gap was wide
     enough to block it. Returns ``[]`` on any failure so every caller degrades
     to its previous behaviour."""
-    import os as _os
-    try:
-        st = _os.stat(audio_path)
-        key = (_os.path.abspath(audio_path), st.st_mtime_ns, st.st_size)
-    except OSError:
+    music, speech = await _cached_event_spans(audio_path)
+    if not music and not speech:
         return []
-    hit = _MUSIC_SPAN_CACHE.get(key)
-    if hit is None:
-        try:
-            events = await classify_audio_events(audio_path)
-        except Exception as e:
-            logger.info("music_spans_cached: classify failed (%s) — no spans", e)
-            return []
-        hit = (_music_spans_from_events(events, 0.0),
-               _spans_of_type(events, "speech"))
-        if hit[0]:
-            while len(_MUSIC_SPAN_CACHE) >= _MUSIC_SPAN_CACHE_MAX:
-                _MUSIC_SPAN_CACHE.pop(next(iter(_MUSIC_SPAN_CACHE)))
-            _MUSIC_SPAN_CACHE[key] = (list(hit[0]), list(hit[1]))
-    music, speech = hit
     merged = _bridge_spans(music, bridge_s, blockers=speech)
     long_enough = [s for s in merged if (s[1] - s[0]) >= min_seconds]
     out = [s for s in long_enough

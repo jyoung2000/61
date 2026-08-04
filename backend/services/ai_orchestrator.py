@@ -1450,7 +1450,7 @@ class AIOrchestrator:
             except Exception:
                 continue
 
-    async def text_completion(self, prompt: str, max_tokens: int = 4096, timeout: float = 60, job_id: str = "", skip_circuit_breaker: bool = False, model_override: str | None = None, local_only: bool = False, json_mode: bool = False, json_schema: dict | None = None) -> str:
+    async def text_completion(self, prompt: str, max_tokens: int = 4096, timeout: float = 60, job_id: str = "", skip_circuit_breaker: bool = False, model_override: str | None = None, local_only: bool = False, json_mode: bool = False, json_schema: dict | None = None, deterministic: bool = False) -> str:
         """Generic text completion using the configured provider chain.
 
         Used by transcript correction, translation, and other text-only tasks.
@@ -1664,6 +1664,12 @@ class AIOrchestrator:
                         _tc_kw["json_schema"] = json_schema
                     elif json_mode:
                         _tc_kw["json_mode"] = True
+                # Transcript-shaping callers (polish, gap-recovery translation)
+                # ask for reproducible decoding: pinned seed + greedy for
+                # non-Qwen3. Ollama-only — cloud providers have their own
+                # parameter shapes and the transcript passes run local_only.
+                if deterministic and pname == "ollama":
+                    _tc_kw["deterministic"] = True
                 t0 = time.monotonic()
                 result = await asyncio.wait_for(
                     provider.text_complete(prompt, max_tokens=max_tokens, timeout=int(_call_timeout), **_tc_kw),

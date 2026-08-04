@@ -1641,7 +1641,8 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
     async def _call_text(self, prompt: str, system: str = "", max_tokens: int = 4096,
                          timeout: float = 90.0, json_mode: bool = False,
                          json_schema: dict | None = None,
-                         generation_progress=None) -> str:
+                         generation_progress=None,
+                         deterministic: bool = False) -> str:
         """Text completion with streaming to prevent HTTP timeout death spiral.
 
         Instead of waiting for the full response (which can take 5+ minutes on
@@ -1736,6 +1737,18 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                 payload["options"].update(_q3)
         except Exception:
             pass
+        # Transcript-shaping callers (subtitle polish, gap-recovery
+        # translation) request reproducible decoding: pinned seed for every
+        # model, greedy for non-Qwen3 (Qwen3 loops near-greedy — its tuned
+        # profile above stays, made reproducible by the seed). Editorial /
+        # SEO / summary calls never set this and keep their diversity.
+        if deterministic:
+            try:
+                from backend.services.local_models import deterministic_text_options
+                payload["options"].update(
+                    deterministic_text_options(text_model))
+            except Exception:
+                pass
         if json_schema is not None:
             # Structured outputs: a full JSON Schema constrains shape, not just
             # validity. Older Ollama servers reject a dict format with a 400 —
@@ -2013,7 +2026,8 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
 
     async def text_complete(self, prompt: str, max_tokens: int = 4096, timeout: int | None = None,
                             json_mode: bool = False,
-                            json_schema: dict | None = None) -> str:
+                            json_schema: dict | None = None,
+                            deterministic: bool = False) -> str:
         # ``json_mode`` routes to Ollama's grammar-constrained ``format: "json"``
         # output. Small local models (qwen2.5:3b) routinely ignore a "return
         # ONLY JSON" instruction in free-form mode and emit prose, which made
@@ -2025,7 +2039,8 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
         # strict count on ~1/3 of batches and paid a split-and-retry cascade
         # each time. Grammar-level enforcement makes the miss rate ~0.
         return await self._call_text(prompt, max_tokens=max_tokens,
-                                     json_mode=json_mode, json_schema=json_schema)
+                                     json_mode=json_mode, json_schema=json_schema,
+                                     deterministic=deterministic)
 
     async def analyze_frames(
         self, frames: list[FrameData], custom_prompt: Optional[str] = None,

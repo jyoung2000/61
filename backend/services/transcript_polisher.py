@@ -1028,7 +1028,11 @@ async def _polish_batch(
         try:
             response = await orchestrator.text_completion(
                 full_prompt, timeout=timeout, model_override=model_override,
-                skip_circuit_breaker=True, local_only=local_only)
+                skip_circuit_breaker=True, local_only=local_only,
+                # Polish shapes the shipped subtitle track — decode
+                # reproducibly (pinned seed; greedy for non-Qwen3) so two
+                # runs of the same episode polish to the same text.
+                deterministic=True)
         except Exception as e:
             logger.warning("transcript polishing: LLM call failed: %s", e)
             if local_only:

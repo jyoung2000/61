@@ -820,9 +820,39 @@ async def translate_via_llm(
                             "; ".join(f"{k}→{v}" for k, v in list(_canon_map.items())[:8]))
                 except Exception as _cn_e:
                     logger.debug("canonical-name resolution skipped: %s", _cn_e)
+            # Wiki-authoritative katakana overlay. The LLM resolver above is a
+            # guess anchored on the title; the wiki pairs are the series' own
+            # published readings, so they win on any kana both know — and a
+            # kana form the resolver never saw (a name said ONCE, like カトル)
+            # is still pinned when it appears anywhere in the source. This is
+            # the only point in the pipeline where "Quatre" is an exact
+            # dictionary hit rather than a similarity gamble against "Kato".
+            _wiki_extra: list = []
+            try:
+                from backend.services.canonical_names import kana_pairs_for_job
+                _pairs = kana_pairs_for_job(job_id)
+                if _pairs:
+                    _src_all = "\n".join(_seg_text(s) for s in segments)
+                    _canon_map = dict(_canon_map or {})
+                    _n_overlay = 0
+                    for _kana, _en in _pairs.items():
+                        if _kana and _kana in _src_all:
+                            if _canon_map.get(_kana) != _en:
+                                _canon_map[_kana] = _en
+                                _n_overlay += 1
+                            _wiki_extra.append(_kana)
+                    if _n_overlay:
+                        logger.info(
+                            "LLM translate: %d katakana reading(s) pinned from "
+                            "the series glossary (e.g. %s)", _n_overlay,
+                            "; ".join(f"{k}→{_canon_map[k]}"
+                                      for k in _wiki_extra[:5]))
+            except Exception as _kp_e:
+                logger.debug("kana overlay skipped: %s", _kp_e)
             _auto_terms = build_translation_glossary_block(
                 segments if _use_auto else [], source_language, tgt_name,
-                user_terms=_user_vocab, canonical_map=_canon_map)
+                user_terms=_user_vocab, canonical_map=_canon_map,
+                extra_terms=_wiki_extra)
             if _auto_terms:
                 logger.info("LLM translate: attached names glossary (%d term chars, "
                             "%d user term(s)) for consistency",
@@ -1730,6 +1760,15 @@ async def _translate_batch_via_ollama(
     try:
         from backend.services.local_models import qwen3_translation_options
         base_options.update(qwen3_translation_options(model))
+    except Exception:
+        pass
+    # Reproducibility LAST, so it wins: pinned seed for every model, greedy
+    # decoding for non-Qwen3. Two identical runs diverged into materially
+    # different subtitle tracks purely through sampled decoding; a subtitle
+    # translation has no use for creative variety.
+    try:
+        from backend.services.local_models import deterministic_text_options
+        base_options.update(deterministic_text_options(model))
     except Exception:
         pass
 

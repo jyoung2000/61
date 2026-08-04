@@ -654,6 +654,89 @@ def test_audio_theme_collapse_needs_enough_cues():
     assert changed is False
 
 
+def test_two_signal_tier_collapses_a_sung_theme_the_strong_tier_cannot_see():
+    """The classifier reads sung vocals as speech, so a vocal theme NEVER
+    yields a strong music span (measured: 205 speech blockers, only
+    mid-episode instrumentals qualified). What survives are raw fragments
+    threaded between the vocal windows — enough only when the text agrees."""
+    from backend.services.transcript_sanitize import collapse_theme_by_music_spans
+    rows = ([{"start": 200.0, "end": 203.0, "speaker": "S1",
+              "text": "Heero warns Relena about the Alliance."}]
+            + [{"start": 1360.0 + 5.0 * i, "end": 1364.0 + 5.0 * i,
+                "speaker": "S2", "text": t}
+               for i, t in enumerate([
+                   "even before i call out your name",
+                   "you seem to have a lot of energy",
+                   "why are you making me wait for you?",
+                   "i know you ran over here.",
+                   "that's just how things are.",
+                   "i hate it when you do that.",
+               ])])
+    frags = [(1361.0, 1364.0), (1370.0, 1373.0), (1378.0, 1381.0),
+             (1386.0, 1388.0)]   # 11s of music over a 29s run — ~38%
+    out, changed = collapse_theme_by_music_spans(
+        rows, [], raw_music=frags)
+    assert changed
+    texts = [r["text"] for r in out]
+    assert "[♪ Ending theme ♪]" in texts
+    assert not any("call out your name" in t for t in texts)
+    assert "Heero warns Relena about the Alliance." in texts
+
+
+def test_two_signal_tier_never_eats_a_dialogue_scene():
+    """Same music fragments, but the cues are a SCENE: proper-noun-rich and
+    gapped the way conversation is. Score under dialogue must survive even
+    when the classifier fragments exactly like a theme."""
+    from backend.services.transcript_sanitize import collapse_theme_by_music_spans
+    rows = [{"start": 1360.0 + 5.0 * i, "end": 1364.0 + 5.0 * i,
+             "speaker": "S2", "text": t}
+            for i, t in enumerate([
+                "Zechs is in the atmosphere; let him know.",
+                "Lieutenant Zechs, are you all right?",
+                "The Marina Mother Ship is offering to salvage it.",
+                "Tell Treize it sank near the JAP point.",
+                "Heero must destroy the Gundam first.",
+                "Relena just returned from space yesterday.",
+            ])]
+    frags = [(1361.0, 1364.0), (1370.0, 1373.0), (1378.0, 1381.0),
+             (1386.0, 1388.0)]
+    out, changed = collapse_theme_by_music_spans(rows, [], raw_music=frags)
+    assert changed is False
+    # And lyric-shaped cues with almost NO music under them stay too — the
+    # audio signal is required, not decorative.
+    lyric_rows = [{"start": 1360.0 + 5.0 * i, "end": 1364.0 + 5.0 * i,
+                   "speaker": "S2", "text": f"soft line number {i}"}
+                  for i in range(6)]
+    out2, changed2 = collapse_theme_by_music_spans(
+        lyric_rows, [], raw_music=[(1361.0, 1363.0)])   # ~7% coverage
+    assert changed2 is False
+
+
+def test_theme_marker_start_clamps_to_the_first_audio_onset():
+    """A cue hallucinated at 0:00.000 can anchor the chorus run, but it
+    cannot conjure sound: with the first classified onset at 25.4s, the
+    opening marker moves there. Legitimate placements and dialogue cues are
+    untouched, and no onset means no-op."""
+    from backend.services.transcript_sanitize import clamp_theme_marker_starts
+    rows = [
+        {"start": 0.0, "end": 4.003, "speaker": "", "text": "[♪ Opening theme ♪]"},
+        {"start": 87.9, "end": 92.7, "speaker": "S1", "text": "First real line."},
+        {"start": 1377.1, "end": 1381.1, "speaker": "", "text": "[♪ Ending theme ♪]"},
+    ]
+    out, notes = clamp_theme_marker_starts([dict(r) for r in rows], 25.4)
+    assert len(notes) == 1 and "0.000s → 25.400s" in notes[0]
+    assert out[0]["text"] == "[♪ Opening theme ♪]" and out[0]["start"] == 25.4
+    assert out[0]["end"] >= 25.4 + 1.5
+    assert out[1]["start"] == 87.9                      # dialogue untouched
+    assert out[2]["start"] == 1377.1                    # already after onset
+    # Marker already at/after the onset → untouched; unknown onset → no-op.
+    ok, n2 = clamp_theme_marker_starts(
+        [{"start": 30.0, "end": 34.0, "speaker": "", "text": "[♪ Opening theme ♪]"}], 25.4)
+    assert n2 == [] and ok[0]["start"] == 30.0
+    same, n3 = clamp_theme_marker_starts([dict(r) for r in rows], None)
+    assert n3 == [] and same[0]["start"] == 0.0
+
+
 # ── Run-14 follow-ups ─────────────────────────────────────────────────────
 
 def test_music_spans_bridge_classifier_fragments_into_a_theme():
@@ -1351,6 +1434,100 @@ def test_asr_vocabulary_bias_reads_the_resolved_glossary():
         src = inspect.getsource(fn)
         assert "series_glossary_for_job" in src
         assert "series_roster_terms" not in src
+
+
+def test_deterministic_text_options_pin_a_seed_and_respect_qwen3():
+    """Two identical runs produced materially different subtitle tracks (334
+    vs 352 cues; the ED collapsed on one and shipped as dialogue on the
+    other) — sampled decoding was the entry point. Non-Qwen3 models decode
+    greedily; Qwen3 keeps its anti-repetition profile (its card warns that
+    near-greedy decoding loops — measured here too) and relies on the pinned
+    seed alone for reproducibility."""
+    from backend.services.local_models import deterministic_text_options
+    o = deterministic_text_options("qwen2.5:14b")
+    assert o["seed"] == 42 and o["temperature"] == 0.0 and o["top_p"] == 1.0
+    q3 = deterministic_text_options("qwen3:4b-instruct-2507-q4_K_M")
+    assert q3["seed"] == 42
+    assert "temperature" not in q3 and "top_p" not in q3
+
+
+def test_transcript_shaping_callers_request_deterministic_decoding():
+    """The seed only helps where it is actually sent: the translator's chat
+    options, the polish batch, and the gap-recovery per-cue translation are
+    the three passes whose output ships as subtitles."""
+    import inspect
+    from backend.services import translator, transcript_polisher
+    assert "deterministic_text_options" in inspect.getsource(
+        translator._translate_batch_via_ollama)
+    assert "deterministic=True" in inspect.getsource(
+        transcript_polisher._polish_batch)
+    from backend.services.providers import ollama_provider
+    src = inspect.getsource(ollama_provider.OllamaProvider._call_text)
+    assert "deterministic_text_options" in src
+
+
+def test_kana_mining_and_romaji_aliases_reach_the_unreachable_garbles():
+    """カトル→"Kato" shares 40% of its letters with "Quatre" — no orthographic
+    threshold reaches it, and phonetic matching mapped Trois onto Treize.
+    The kana reading is the evidence both of those lacked: mined from the
+    same wiki text as the names, romanized the way Whisper's translate head
+    actually writes it."""
+    from backend.services import canonical_names as cn
+    text = ("Quatre Raberba Winner (カトル・ラバーバ・ウィナー, Katoru) pilots "
+            "Sandrock. Relena Darlian (リリーナ・ドーリアン, Rirīna) appears. "
+            "Trowa Barton (トロワ・バートン, Torowa) and the Aries (エアリーズ) suit. "
+            "Duo Maxwell (デュオ・マックスウェル, Dyuo).")
+    pairs = cn._mine_kana_pairs(text)
+    assert pairs["カトル"] == "Quatre"
+    assert pairs["ドーリアン"] == "Darlian"
+    assert pairs["エアリーズ"] == "Aries"          # leading article stripped
+    assert cn._kana_reading_romaji("カトル") == "katoru"
+    assert cn._kana_reading_romaji("ダーリアン") == "darian"
+    assert cn._kana_reading_romaji("デュオ") == "dyuo"
+    aliases = cn._alias_map_from_pairs(pairs)
+    assert aliases["kato"] == "Quatre"
+    assert aliases["dorian"] == "Darlian"
+    # A kana form claimed by two different names is ambiguous — dropped.
+    two = cn._mine_kana_pairs(
+        "Alpha One (アルファ) fights. Alpha Prime (アルファ) returns.")
+    assert "アルファ" not in two
+
+
+def test_respeller_alias_path_fixes_kato_and_dorian_but_not_trois():
+    from backend.services.canonical_names import respell_text_from_glossary
+    glossary = ["Quatre Raberba Winner", "Relena Darlian", "Trowa Barton",
+                "Treize Khushrenada", "Zechs Merquise"]
+    aliases = {"katoru": "Quatre", "kato": "Quatre", "darian": "Darlian",
+               "dorian": "Darlian", "torowa": "Trowa", "torezu": "Treize"}
+    texts = ["This is Kato.",
+             "Mr. Dorian, sir, I’ve been waiting for you.",
+             "But Trois wouldn't have acted so irresponsibly.",
+             "Calm down, Trowa."]
+    out, n, samples = respell_text_from_glossary(texts, glossary, aliases)
+    assert out[0] == "This is Quatre."
+    assert out[1].startswith("Mr. Darlian")
+    # "Trois" reaches no alias at 0.8 with a first-letter guard — mapping it
+    # onto Treize was the exact phonetic failure this path must not repeat.
+    assert out[2] == texts[2]
+    assert out[3] == texts[3]                       # already official
+
+
+def test_kana_pairs_survive_a_restart_via_the_durable_store(tmp_path,
+                                                            monkeypatch):
+    from backend.services import canonical_names as cn
+    store = tmp_path / "glossary.json"
+    monkeypatch.setattr(cn, "_GLOSSARY_STORE_PATH", str(store))
+    monkeypatch.setattr(cn, "_LAST_SERIES_KEY", "")
+    cn._glossary_store_save({
+        "mobile suit gundam wing": ["Quatre Raberba Winner"],
+        "__last_series__": "mobile suit gundam wing",
+        cn._KANA_STORE_PREFIX + "mobile suit gundam wing": {"カトル": "Quatre"},
+    })
+    assert cn.kana_pairs_for_job() == {"カトル": "Quatre"}
+    assert cn.kana_aliases_for_job()["kato"] == "Quatre"
+    # No pointer and no explicit series → nothing to answer with.
+    cn._glossary_store_save({"other": ["X"]})
+    assert cn.kana_pairs_for_job() == {}
 
 
 def test_condense_threshold_leaves_merely_brisk_cues_alone():

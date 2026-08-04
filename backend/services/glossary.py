@@ -179,6 +179,7 @@ def build_translation_glossary_block(
     segments, source_lang: str = "", target_lang: str = "the target language",
     max_terms: int = 40, user_terms: Optional[list] = None,
     canonical_map: Optional[dict] = None,
+    extra_terms: Optional[list] = None,
 ) -> str:
     """Extract + format the recurring-terms glossary in one call (empty string
     when there is nothing to pin).
@@ -197,10 +198,19 @@ def build_translation_glossary_block(
     entries in the block. User terms are passed through as the protected set,
     so a spelling the user typed is never overridden by the LLM's canonical
     guess. The cap is unchanged: the map only re-renders entries already in
-    the merged, capped list — it never adds terms."""
+    the merged, capped list — it never adds terms.
+
+    ``extra_terms`` are the exception to "never adds": terms with AUTHORITATIVE
+    canonical mappings (wiki-mined katakana readings) that the recurrence miner
+    can't see because they appear only once — which is exactly the case that
+    needs pinning most (a name said once has no in-transcript consistency to
+    fall back on; the model just guesses a romanization). They rank after the
+    auto terms and stay under the same cap."""
     if user_terms is None:
         user_terms = load_custom_vocabulary_terms()
     auto = extract_recurring_terms(segments, source_lang, max_terms=max_terms)
+    if extra_terms:
+        auto = list(auto) + [t for t in extra_terms if t]
     merged = merge_glossary_terms(user_terms, auto, cap=max_terms)
     return build_recurring_terms_block(
         merged, target_lang, canonical_map=canonical_map,

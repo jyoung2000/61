@@ -1381,6 +1381,172 @@ def _remember_series(store: dict, key: str) -> None:
         logger.debug("glossary store series pointer failed: %s", e)
 
 
+# Reserved store-key prefix: per-series katakana→official-name pairs mined
+# from the same wiki text as the names list. Prefixed so it can never collide
+# with a real series key.
+_KANA_STORE_PREFIX = "__kana__:"
+
+# "Heero Yuy (ヒイロ・ユイ, Hīro Yui)" — the character-list convention on the
+# English wiki. Captures the Latin name and the katakana run that opens the
+# parenthetical (the romaji after the comma is not captured).
+_KANA_PAIR_RE = re.compile(
+    r"([A-Z][A-Za-z'’\-]+(?:\s+[A-Z][A-Za-z'’\-]+){0,3})\s*"
+    r"[（(]\s*([゠-ヿ＝\s]{2,}?)\s*[,、，)）]")
+
+
+def _mine_kana_pairs(text: str) -> dict:
+    """``{katakana: official-English-name}`` pairs from wiki plaintext.
+
+    This is the series knowledge the English-side respeller can never have:
+    on the JAPANESE side a mangled name is an exact dictionary hit (カトル →
+    Quatre), while on the English side the same repair is a 0.40-similarity
+    gamble that maps one character's name onto another's. Component pairs are
+    mined too (ヒイロ・ユイ = Heero Yuy → ヒイロ→Heero, ユイ→Yuy) because
+    dialogue uses given names alone far more often than full names.
+    First mention wins; a kana form claimed by two different names is dropped
+    as ambiguous rather than guessed."""
+    pairs: dict = {}
+    contested: set = set()
+
+    def _claim(kana: str, en: str) -> None:
+        prev = pairs.get(kana)
+        if prev is not None and prev != en:
+            contested.add(kana)
+            return
+        pairs[kana] = en
+
+    for m in _KANA_PAIR_RE.finditer(text or ""):
+        en = " ".join(m.group(1).split())
+        # A sentence-initial "The Aries (エアリーズ)" captures the article —
+        # the mapping target is the name, not the noun phrase around it.
+        en = re.sub(r"^(?:The|A|An)\s+", "", en)
+        kana = m.group(2).strip("・＝ 　")
+        if len(kana) < 2 or len(en) < 3:
+            continue
+        _claim(kana, en)
+        kparts = [p for p in re.split(r"[・＝\s]+", kana) if p]
+        eparts = en.split()
+        if len(kparts) == len(eparts) and len(kparts) > 1:
+            for kp, ep in zip(kparts, eparts):
+                if len(kp) >= 2 and len(ep) >= 3:
+                    _claim(kp, ep)
+    return {k: v for k, v in pairs.items() if k not in contested}
+
+
+# Katakana → Hepburn-ish romaji. Digraphs (two-codepoint sequences) first so
+# キャ reads "kya" and not "kiya"; the small-vowel forms cover loanword
+# spellings (ティ, ファ, ヴァ) common in anime names.
+_KANA_DIGRAPHS = {
+    "キャ": "kya", "キュ": "kyu", "キョ": "kyo",
+    "シャ": "sha", "シュ": "shu", "ショ": "sho", "シェ": "she",
+    "チャ": "cha", "チュ": "chu", "チョ": "cho", "チェ": "che",
+    "ニャ": "nya", "ニュ": "nyu", "ニョ": "nyo",
+    "ヒャ": "hya", "ヒュ": "hyu", "ヒョ": "hyo",
+    "ミャ": "mya", "ミュ": "myu", "ミョ": "myo",
+    "リャ": "rya", "リュ": "ryu", "リョ": "ryo",
+    "ギャ": "gya", "ギュ": "gyu", "ギョ": "gyo",
+    "ジャ": "ja", "ジュ": "ju", "ジョ": "jo", "ジェ": "je",
+    "ビャ": "bya", "ビュ": "byu", "ビョ": "byo",
+    "ピャ": "pya", "ピュ": "pyu", "ピョ": "pyo",
+    "ファ": "fa", "フィ": "fi", "フェ": "fe", "フォ": "fo",
+    "ヴァ": "va", "ヴィ": "vi", "ヴェ": "ve", "ヴォ": "vo",
+    "ティ": "ti", "トゥ": "tu", "ディ": "di", "ドゥ": "du",
+    "デュ": "dyu", "テュ": "tyu", "フュ": "fyu", "ヴュ": "vyu",
+    "ウィ": "wi", "ウェ": "we", "ウォ": "wo",
+    "ツァ": "tsa", "ツィ": "tsi", "ツェ": "tse", "ツォ": "tso",
+    "イェ": "ye",
+}
+_KANA_SINGLE = {
+    "ア": "a", "イ": "i", "ウ": "u", "エ": "e", "オ": "o",
+    "カ": "ka", "キ": "ki", "ク": "ku", "ケ": "ke", "コ": "ko",
+    "ガ": "ga", "ギ": "gi", "グ": "gu", "ゲ": "ge", "ゴ": "go",
+    "サ": "sa", "シ": "shi", "ス": "su", "セ": "se", "ソ": "so",
+    "ザ": "za", "ジ": "ji", "ズ": "zu", "ゼ": "ze", "ゾ": "zo",
+    "タ": "ta", "チ": "chi", "ツ": "tsu", "テ": "te", "ト": "to",
+    "ダ": "da", "ヂ": "ji", "ヅ": "zu", "デ": "de", "ド": "do",
+    "ナ": "na", "ニ": "ni", "ヌ": "nu", "ネ": "ne", "ノ": "no",
+    "ハ": "ha", "ヒ": "hi", "フ": "fu", "ヘ": "he", "ホ": "ho",
+    "バ": "ba", "ビ": "bi", "ブ": "bu", "ベ": "be", "ボ": "bo",
+    "パ": "pa", "ピ": "pi", "プ": "pu", "ペ": "pe", "ポ": "po",
+    "マ": "ma", "ミ": "mi", "ム": "mu", "メ": "me", "モ": "mo",
+    "ヤ": "ya", "ユ": "yu", "ヨ": "yo",
+    "ラ": "ra", "リ": "ri", "ル": "ru", "レ": "re", "ロ": "ro",
+    "ワ": "wa", "ヲ": "o", "ン": "n", "ヴ": "vu",
+    "ァ": "a", "ィ": "i", "ゥ": "u", "ェ": "e", "ォ": "o",
+}
+
+
+def _kana_reading_romaji(kana: str) -> str:
+    """Katakana → lowercase romaji, tuned for ALIAS GENERATION.
+
+    Distinct from :func:`_kana_to_romaji` above by design, not by accident:
+    that one passes non-kana through (its consumers feed it mixed-script
+    terms and compare against Latin values — a converter that drops Latin
+    would gut the plausibility gate; a shadowing redefinition did exactly
+    that once and "Justlove"→"Justice" sailed through). This one is the
+    opposite trade: kana-only input, long-vowel marks dropped (Whisper's
+    English output writes "Kato", not "Katoo"), ッ doubles the next
+    consonant, and anything that is not kana is skipped."""
+    out: list = []
+    geminate = False
+    i = 0
+    s = kana or ""
+    while i < len(s):
+        pair = s[i:i + 2]
+        if pair in _KANA_DIGRAPHS:
+            syl = _KANA_DIGRAPHS[pair]
+            i += 2
+        else:
+            ch = s[i]
+            i += 1
+            if ch == "ッ":
+                geminate = True
+                continue
+            if ch == "ー":
+                continue  # long vowel — macron dropped
+            syl = _KANA_SINGLE.get(ch, "")
+            if not syl:
+                continue
+        if geminate and syl:
+            out.append(syl[0])
+            geminate = False
+        out.append(syl)
+    return "".join(out)
+
+
+def _alias_map_from_pairs(pairs: dict) -> dict:
+    """``{lowercase-romaji-variant: official}`` from kana pairs.
+
+    The variants cover how Whisper's translate head actually romanizes:
+    the full Hepburn form, the final-``u`` clip ("katoru" → "kator"), and
+    the final-syllable clip ("katoru" → "kato"). Variants that are ordinary
+    English words, that collide across two different officials, or that ARE
+    an official spelling already are dropped — an alias exists to catch
+    garble, never to re-answer identity."""
+    aliases: dict = {}
+    contested: set = set()
+    officials = {str(v).strip().lower() for v in (pairs or {}).values()}
+    for kana, en in (pairs or {}).items():
+        r = _kana_reading_romaji(kana)
+        if len(r) < 3 or not r.isalpha():
+            continue
+        variants = {r}
+        if r.endswith("u") and len(r) >= 4:
+            variants.add(r[:-1])
+        if r[-2:] in ("ru", "su", "tu") and len(r) >= 5:
+            variants.add(r[:-2])
+        for a in variants:
+            if (len(a) < 3 or a in _ROSTER_COMMON_WORDS
+                    or a in _ROSTER_SAFE_WORDS or a in officials):
+                continue
+            prev = aliases.get(a)
+            if prev is not None and prev != en:
+                contested.add(a)
+                continue
+            aliases[a] = en
+    return {a: v for a, v in aliases.items() if a not in contested}
+
+
 def _mine_glossary_names(text: str, cap: int = 80) -> list[str]:
     """TitleCase runs that read as proper names, most-frequent first.
 
@@ -1428,9 +1594,14 @@ async def _get_series_glossary(series: str, job_id: str = "") -> list[str]:
     except Exception:
         pass
     store = _glossary_store_load()
-    if isinstance(store.get(key), list) and store[key]:
+    _cached = store.get(key) if isinstance(store.get(key), list) else None
+    _have_kana = isinstance(store.get(_KANA_STORE_PREFIX + key), dict)
+    if _cached and (_have_kana or os.environ.get("PYTEST_CURRENT_TEST")):
+        # A names-only entry from before kana mining existed falls through to
+        # ONE backfill fetch (outside tests) so the katakana pairs get mined;
+        # the cached names are kept either way.
         _remember_series(store, key)
-        return list(store[key])
+        return list(_cached)
     # Never reach the network from a unit test: an order-dependent pass/fail
     # keyed on whether some earlier test populated the durable store (or on
     # the CI runner's connectivity) is exactly what this module's persist
@@ -1468,16 +1639,27 @@ async def _get_series_glossary(series: str, job_id: str = "") -> list[str]:
     except Exception as e:
         logger.info("[%s] series glossary fetch failed (%s) — names stay "
                     "model-resolved", job_id or "-", e)
-        return []
-    names = _mine_glossary_names("\n".join(texts)) if texts else []
+        return list(_cached) if _cached else []
+    _joined = "\n".join(texts)
+    names = _mine_glossary_names(_joined) if texts else []
+    kana = _mine_kana_pairs(_joined) if texts else {}
+    if not names and _cached:
+        names = list(_cached)   # backfill fetch mined nothing new — keep cache
+    if kana:
+        store[_KANA_STORE_PREFIX + key] = kana
+        logger.info(
+            "[%s] series glossary: %d katakana reading(s) for %r cached "
+            "(e.g. %s)", job_id or "-", len(kana), series,
+            "; ".join(f"{k}→{v}" for k, v in list(kana.items())[:4]))
     if names:
         store[key] = names
         store[_LAST_SERIES_STORE_KEY] = key
-        _glossary_store_save(store)
         logger.info(
             "[%s] series glossary: %d authoritative name(s) for %r cached "
             "(e.g. %s)", job_id or "-", len(names), series,
             ", ".join(names[:6]))
+    if names or kana:
+        _glossary_store_save(store)
     return names
 
 
@@ -1504,6 +1686,11 @@ _LAST_SERIES_KEY = ""
 _LAST_SERIES_STORE_KEY = "__last_series__"
 _GLOSSARY_RESPELL_RATIO = 0.75
 _GLOSSARY_RESPELL_MARGIN = 0.08
+# Loose-match floor for kana-derived romaji aliases. Higher than the
+# orthographic ratio would need to be, because an alias is already the
+# expected garble shape — "dorian" vs "darian" scores 0.83; anything below
+# 0.8 against a romaji reading is a different word, not a mishearing of it.
+_KANA_ALIAS_RATIO = 0.8
 # Mid-sentence capitalised tokens. A word capitalised only because it opens a
 # sentence tells us nothing about whether it is a name, so the lookbehinds
 # exclude that position — the same signal ``_mine_name_candidates`` uses.
@@ -1531,7 +1718,8 @@ def _spelling_variants(token: str) -> set:
 
 
 def respell_text_from_glossary(texts: list,
-                               glossary: list[str]) -> tuple[list, int, list]:
+                               glossary: list[str],
+                               aliases: dict | None = None) -> tuple[list, int, list]:
     """Snap misspelled names in the SUBTITLE TEXT onto glossary spellings.
 
     ``_apply_glossary_spellings`` fixes the roster's mapping VALUES, which
@@ -1553,9 +1741,18 @@ def respell_text_from_glossary(texts: list,
 
     The cost of that conservatism is real and worth stating: garbles that
     differ in spelling but agree in sound ("Jekks", "Xerxes", "Katrou",
-    "U-Phi") are NOT reachable here and need series knowledge this stage does
-    not have. Returns ``(texts, replacements, samples)``."""
+    "U-Phi") are NOT reachable here on letters alone. ``aliases``
+    (romaji variants of the series' official katakana readings, from
+    :func:`kana_aliases_for_job`) supplies exactly that series knowledge:
+    "Kato" is an exact hit on カトル's clipped romaji, and "Dorian" sits at
+    0.83 against ダーリアン's "darian" — evidence from the sound the garble
+    came FROM, not a phonetic guess between two English spellings. Alias
+    matches are exact, or ≥ ``_KANA_ALIAS_RATIO`` with the same first letter,
+    length within 2, and the margin rule against aliases of OTHER names.
+    Returns ``(texts, replacements, samples)``."""
     toks = _glossary_tokens(glossary)
+    aliases = {str(k).lower(): str(v) for k, v in (aliases or {}).items()
+               if k and v}
     if not texts or not toks:
         return list(texts or []), 0, []
     tok_lower = {t.lower() for t in toks}
@@ -1578,9 +1775,32 @@ def respell_text_from_glossary(texts: list,
         if len(base) < 4 or not base.isalpha():
             rejected.add(word)
             return None
+        bl = base.lower()
+        # Kana-derived aliases first — they carry the series' own readings,
+        # which is stronger evidence than letter distance to an English
+        # spelling. Exact hit, or a close hit vetted against aliases of
+        # OTHER names (the Trois/Treize failure mode, restated for aliases).
+        if aliases:
+            hit = aliases.get(bl)
+            if hit is None:
+                ranked_a = sorted(
+                    ((difflib.SequenceMatcher(None, bl, a).ratio(), a)
+                     for a in aliases
+                     if a[:1] == bl[:1] and abs(len(a) - len(bl)) <= 2),
+                    reverse=True)
+                if ranked_a and ranked_a[0][0] >= _KANA_ALIAS_RATIO:
+                    _top = aliases[ranked_a[0][1]]
+                    _rival = next(
+                        (r for r, a in ranked_a[1:] if aliases[a] != _top),
+                        0.0)
+                    if ranked_a[0][0] - _rival >= _GLOSSARY_RESPELL_MARGIN:
+                        hit = _top
+            if hit and hit.lower() != bl:
+                resolved[word] = hit
+                return hit
         ranked = sorted(
             ((difflib.SequenceMatcher(
-                None, base.lower(), t.lower()).ratio(), t) for t in single),
+                None, bl, t.lower()).ratio(), t) for t in single),
             reverse=True)
         best, tok = ranked[0]
         # A near-tie means two official names are both plausible; identity is
@@ -1592,6 +1812,23 @@ def respell_text_from_glossary(texts: list,
             return None
         resolved[word] = tok
         return tok
+
+    def _alias_exact(word: str):
+        """EXACT alias hit for a token the positional regex refused.
+
+        ``_TEXT_NAME_TOKEN_RE`` skips sentence-initial tokens because a
+        capital there proves nothing — but the real data says "Mr. Dorian,
+        sir…", and after the abbreviation's period the guard hides the one
+        token that needs fixing. An exact dictionary hit does not rest on
+        the capitalization at all, so position is irrelevant for it; only
+        the LOOSE ratio match keeps the positional guard."""
+        base = re.sub(r"['’]s$", "", word)
+        if len(base) < 4 or not base.isalpha():
+            return None
+        if any(v.lower() in tok_lower for v in _spelling_variants(word)):
+            return None                 # already an official spelling
+        hit = aliases.get(base.lower())
+        return hit if hit and hit.lower() != base.lower() else None
 
     out, n, samples = [], 0, []
     for raw in texts:
@@ -1605,6 +1842,16 @@ def respell_text_from_glossary(texts: list,
                 n += k
                 if len(samples) < 8:
                     samples.append(f"{word}→{tok}")
+        if aliases:
+            for word in set(re.findall(r"\b[A-Z][A-Za-z'’]{2,}\b", line)):
+                tok = _alias_exact(word)
+                if not tok:
+                    continue
+                line, k = re.subn(r"\b" + re.escape(word) + r"\b", tok, line)
+                if k:
+                    n += k
+                    if len(samples) < 8:
+                        samples.append(f"{word}→{tok}")
         out.append(line)
     return out, n, samples
 
@@ -1754,6 +2001,38 @@ def series_glossary_for_job(job_id: str = "",
     except Exception:
         pass
     return series_roster_terms()
+
+
+def kana_pairs_for_job(job_id: str = "", series: str = "") -> dict:
+    """``{katakana: official-English-name}`` for the job's series, or {}.
+
+    Same resolution chain as :func:`series_glossary_for_job` (explicit series
+    → this process's last-identified series → the durable store's pointer).
+    This is what lets the translator pin カトル → Quatre BEFORE the LLM ever
+    guesses a romanization — the point where the name is still recoverable
+    as an exact dictionary hit. Read-only and fail-soft."""
+    try:
+        store = _glossary_store_load()
+        key = ((series or "").strip().lower() or _LAST_SERIES_KEY
+               or str(store.get(_LAST_SERIES_STORE_KEY) or ""))
+        if key:
+            pairs = store.get(_KANA_STORE_PREFIX + key)
+            if isinstance(pairs, dict) and pairs:
+                return {str(k): str(v) for k, v in pairs.items() if k and v}
+    except Exception:
+        pass
+    return {}
+
+
+def kana_aliases_for_job(job_id: str = "", series: str = "") -> dict:
+    """``{lowercase-romaji-variant: official}`` for the job's series, or {}.
+
+    The English-side companion to :func:`kana_pairs_for_job`: Whisper's
+    translate head romanizes the kana it heard ("Kato" from カトル), and the
+    orthographic respeller can never bridge that to "Quatre" — 0.40
+    similarity, below any safe threshold. The alias table makes those forms
+    dictionary hits derived from the series' own katakana readings."""
+    return _alias_map_from_pairs(kana_pairs_for_job(job_id, series))
 
 
 def apply_roster_corrections(texts: list, mapping: dict[str, str]) -> tuple[list, int]:
