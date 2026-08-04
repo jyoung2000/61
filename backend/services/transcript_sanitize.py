@@ -895,15 +895,40 @@ def source_chorus_spans(source_rows, head_s: float = 120.0,
                 if len(ns) >= 6:
                     counts[ns] = counts.get(ns, 0) + 1
             chorus = {ns for ns, c in counts.items() if c >= 2}
-            if len(chorus) < 2:
+            if not chorus:
+                logger.debug("source chorus: window %.0f-%.0fs — no repeated "
+                             "line among %d cue(s)", w0, w1, len(idxs))
                 continue
+            if len(chorus) < 2:
+                # ONE repeated line can be the song's hook — or a Whisper
+                # loop. A loop repeats its one line MANY times over a run of
+                # nothing else; a hook recurs 2-3 times among DISTINCT verse
+                # lines. The first cut of this gate demanded two distinct
+                # repeats and matched nothing on a real ED whose verses each
+                # transcribe slightly differently on every pass — only the
+                # hook is stable enough to repeat verbatim.
+                only = next(iter(chorus))
+                if (counts[only] > 3 or len(idxs) < 5
+                        or len(counts) < max(4, int(0.6 * len(idxs)))):
+                    logger.debug(
+                        "source chorus: window %.0f-%.0fs — single repeated "
+                        "line rejected (%d occurrence(s), %d distinct of %d)",
+                        w0, w1, counts[only], len(counts), len(idxs))
+                    continue
             hits = [i for i in idxs
                     if _song_norm((rows[i].get("text") or "").strip()) in chorus]
-            if len(hits) < 3:
+            if len(hits) < (3 if len(chorus) >= 2 else 2):
                 continue
             a = min(_st(rows[i]) for i in hits)
             b = max(_en(rows[i]) for i in hits)
-            if b - a >= min_span_s:
+            # A single hook's occurrences bound a NARROWER span than a full
+            # two-line chorus — accept the theme-minimum instead of the
+            # chorus minimum, and let the collapse eat only what lies inside.
+            if b - a >= (min_span_s if len(chorus) >= 2 else 12.0):
+                logger.info(
+                    "source chorus: window %.0f-%.0fs — %d repeated line(s), "
+                    "%d hit cue(s) spanning %.0f-%.0fs",
+                    w0, w1, len(chorus), len(hits), a, b)
                 out.append((round(a, 3), round(b, 3)))
         return out
     except Exception:
@@ -1650,6 +1675,24 @@ _META_NOTE_RE = re.compile(
 # after it and falls through.
 _TITLE_STUB_RE = re.compile(
     r"(?i)^(?:title|episode)(?:\s+(?:\w{1,12}|\d+))?\s*[.!?…]?$")
+# A whole cue that is the model INTRODUCING its answer rather than the
+# answer ("Here's the translated subtitle line in English:") — a measured
+# run shipped exactly that as cue text, with the actual translation in the
+# next cue. Anchored to the announcement shape; dialogue never says this.
+_PREAMBLE_CUE_RE = re.compile(
+    r"(?i)^here'?s (?:the|your)[^.!?]{0,60}"
+    r"(?:translat|subtitle|english)[^.!?]{0,20}:?\s*$")
+# OP/ED credit-card readouts Whisper lifts off the screen and the
+# translator dutifully renders ("Lyrics by…", "…Composition and…",
+# "…arrangement by Initial composition Miku" — all shipped on a measured
+# run). Nobody SAYS these; they are 作詞/作曲/編曲 cards under the song.
+_CREDITS_RE = re.compile(
+    r"(?i)\b(?:lyrics|music|vocals|arrangement|screenplay|storyboard)\s+by\b"
+    r"|\bcomposition\s+and\b|\bcomposed\s+and\s+arranged\b"
+    r"|\binitial\s+composition\b")
+# Structured-output crumbs glued to a cue's tail ("…now. }`[") — the words
+# are real, the brackets are the batch reply's JSON leaking through.
+_CRUMB_TAIL_RE = re.compile(r"[\s{}\[\]`]*[{}\[\]`]+\s*$")
 
 # ``key:value`` tokens — subtitle-file metadata, never spoken English. The
 # right side must start alphanumeric and carry no further colon, so a clock
@@ -1867,6 +1910,19 @@ def drop_junk_cues(rows: list, vocalization_max_dwell_s: float = 2.5,
         if txt.startswith("["):
             kept.append(r)
             continue
+        # Crumb strip AFTER the marker exemption, so a marker's closing "]"
+        # can never be eaten; a non-marker cue ending in stray JSON/fence
+        # characters keeps its words and loses the crumbs.
+        _decrumbed = _CRUMB_TAIL_RE.sub("", txt).strip()
+        if _decrumbed != txt:
+            if not _decrumbed:
+                dropped.append(f"crumb:{txt[:32]!r}")
+                continue
+            txt = _decrumbed
+            if isinstance(r, dict):
+                r["text"] = txt
+            else:
+                setattr(r, "text", txt)
         try:
             dur = float(_g(r, "end", 0.0) or 0.0) - float(_g(r, "start", 0.0) or 0.0)
         except (TypeError, ValueError):
@@ -1886,6 +1942,12 @@ def drop_junk_cues(rows: list, vocalization_max_dwell_s: float = 2.5,
         # and survive; a cue that IS only a title stub does not.
         if _META_NOTE_RE.search(txt):
             dropped.append(f"meta:{txt[:40]!r}")
+            continue
+        if _PREAMBLE_CUE_RE.match(txt):
+            dropped.append(f"preamble:{txt[:40]!r}")
+            continue
+        if _CREDITS_RE.search(txt):
+            dropped.append(f"credits:{txt[:40]!r}")
             continue
         if _TITLE_STUB_RE.match(txt):
             dropped.append(f"title-stub:{txt[:32]!r}")
@@ -2105,6 +2167,60 @@ def collapse_theme_by_music_spans(segments, music_spans: list,
         return dedupe_theme_markers(out), True
     except Exception:
         return _as_rows(segments), False
+
+
+def drop_recovered_near_theme_markers(rows: list, before_s: float = 45.0,
+                                      after_s: float = 90.0) -> tuple:
+    """Drop RECOVERED cues that land inside a collapsed song's region.
+
+    The post-COMPLETE recovery merges into the shipped track AFTER the theme
+    collapse made its one whole-track decision — so a cue it recovers inside
+    the opening/ending song walks past every lyric guard and ships. A
+    measured run shipped the ED's credit-card readouts and a stray lyric
+    fragment exactly this way. The theme marker is the collapse's surviving
+    testimony of WHERE the song is; a recovered cue within its window is
+    lyric/credit residue by construction — with one exception: preview-shaped
+    cues (next-episode narration is genuinely spoken over the ending theme
+    and the reference captions it). Scoped by provenance: only rows the
+    recovery stamped ``recovered`` are touched. ``(rows, dropped_samples)``."""
+    try:
+        markers = []
+        for r in rows or []:
+            txt = ((r.get("text") if isinstance(r, dict)
+                    else getattr(r, "text", "")) or "").strip()
+            if _is_marker(txt) and "♪" in txt:
+                try:
+                    markers.append(float(
+                        (r.get("start") if isinstance(r, dict)
+                         else getattr(r, "start", 0.0)) or 0.0))
+                except (TypeError, ValueError):
+                    continue
+        if not markers:
+            return list(rows or []), []
+        kept, dropped = [], []
+        for r in rows or []:
+            is_rec = bool(r.get("recovered") if isinstance(r, dict)
+                          else getattr(r, "recovered", False))
+            txt = ((r.get("text") if isinstance(r, dict)
+                    else getattr(r, "text", "")) or "").strip()
+            if not is_rec or _is_marker(txt):
+                kept.append(r)
+                continue
+            try:
+                s = float((r.get("start") if isinstance(r, dict)
+                           else getattr(r, "start", 0.0)) or 0.0)
+            except (TypeError, ValueError):
+                kept.append(r)
+                continue
+            in_window = any(m - before_s <= s <= m + after_s for m in markers)
+            if in_window and not (_PREVIEW_RE.search(txt)
+                                  or _proper_noun_count(txt) >= 2):
+                dropped.append(f"{s:.1f}s {txt[:36]!r}")
+                continue
+            kept.append(r)
+        return (kept, dropped) if dropped else (list(rows or []), [])
+    except Exception:
+        return list(rows or []), []
 
 
 def clamp_theme_marker_starts(segments, first_onset,

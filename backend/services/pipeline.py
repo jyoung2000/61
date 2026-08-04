@@ -3161,7 +3161,8 @@ def _resanitize_after_merge(rows: list, target_lang: str, job_id: str) -> list:
     narration two runs ago, and the recovery cannot move a theme boundary
     anyway. Fail-soft: any pass that raises leaves the track as it was."""
     from backend.services.transcript_sanitize import (
-        drop_junk_cues, drop_repetition_bursts, drop_restatement_cues,
+        drop_junk_cues, drop_recovered_near_theme_markers,
+        drop_repetition_bursts, drop_restatement_cues,
         merge_transcript_fragments, normalize_markers, sanitize_translated_transcript,
         split_run_on_cues, suppress_echo_cues)
 
@@ -3170,6 +3171,17 @@ def _resanitize_after_merge(rows: list, target_lang: str, job_id: str) -> list:
         out, _notes = normalize_markers(out)
         if _notes:
             logger.info("[%s] Post-merge markers: %s", job_id, "; ".join(_notes[:6]))
+        # A recovered cue inside a collapsed song's region is lyric/credit
+        # residue by construction — the collapse already decided where the
+        # song is, and this merge runs AFTER that decision. A measured run
+        # shipped the ED's credit-card readouts ("Lyrics by…") exactly this
+        # way. Preview-shaped cues survive (next-episode narration is real).
+        _n0 = len(out)
+        out, _tm = drop_recovered_near_theme_markers(out)
+        if _tm:
+            logger.info(
+                "[%s] Post-merge theme-window guard: %d → %d cue(s), "
+                "dropped %s", job_id, _n0, len(out), "; ".join(_tm[:6]))
         # Recovered-only: a cue added to fill a hole that instead re-states its
         # neighbours is residue by construction. The same test applied to the
         # whole track deletes real dialogue, so it is scoped by provenance.
@@ -3233,6 +3245,33 @@ def _resanitize_after_merge(rows: list, target_lang: str, job_id: str) -> list:
                 logger.info("[%s] Post-merge run-on split: %d → %d cue(s)",
                             job_id, len(out), len(_s))
                 out = _s
+        # Glossary respell LAST, over the merged text. The main-track respell
+        # ran eight minutes before this merge and never saw the cues it
+        # added: a measured run's "Mr. Dorlian" ×4 were all recovery-merged
+        # AFTER that pass, so the alias table that fixes them ("dorian" →
+        # Darlian, 0.92) sat unused while they shipped. Same authority, same
+        # guards, applied to the track as it will actually be written.
+        try:
+            from backend.services.canonical_names import (
+                kana_aliases_for_job, respell_text_from_glossary,
+                series_glossary_for_job)
+            _gloss = series_glossary_for_job(job_id)
+            if _gloss:
+                _texts = [((r.get("text") if isinstance(r, dict)
+                            else getattr(r, "text", "")) or "") for r in out]
+                _new, _n, _samples = respell_text_from_glossary(
+                    _texts, _gloss, aliases=kana_aliases_for_job(job_id))
+                if _n:
+                    for _r, _t in zip(out, _new):
+                        if isinstance(_r, dict):
+                            _r["text"] = _t
+                        else:
+                            setattr(_r, "text", _t)
+                    logger.info(
+                        "[%s] Post-merge glossary respell: %d name(s): %s",
+                        job_id, _n, "; ".join(_samples))
+        except Exception as _gr_e:
+            logger.debug("[%s] Post-merge respell skipped (%s)", job_id, _gr_e)
     except Exception as _e:
         logger.warning("[%s] Post-merge re-sanitize skipped (%s) — shipping the "
                        "merged track unfiltered", job_id, _e)
@@ -5339,6 +5378,31 @@ async def _background_post_processing(
                             clamp_theme_marker_starts)
                         if os.path.isfile(_thm_wav):
                             _onset = await first_audio_onset_cached(_thm_wav)
+                            # The classifier's onset is a CEILING, not the
+                            # truth: on the measured episode it heard nothing
+                            # before 61s while the song starts at ~26s (its
+                            # silence floor sleeps through the quiet intro),
+                            # and clamping a 0:00 marker to it lands half a
+                            # minute late. Whisper's own first source cue is
+                            # the earlier, more trustworthy witness — it
+                            # decoded actual singing. Use whichever heard
+                            # sound FIRST, ignoring near-zero phantoms.
+                            try:
+                                _src_first = min(
+                                    (float(getattr(s, "start", None)
+                                           if not isinstance(s, dict)
+                                           else s.get("start")) or 0.0
+                                     for s in (_trans_input or [])
+                                     if (float(getattr(s, "start", None)
+                                               if not isinstance(s, dict)
+                                               else s.get("start")) or 0.0)
+                                     > 1.5),
+                                    default=None)
+                            except Exception:
+                                _src_first = None
+                            if _src_first is not None:
+                                _onset = (min(_onset, _src_first)
+                                          if _onset is not None else _src_first)
                             _cl, _cl_notes = clamp_theme_marker_starts(
                                 _translated_out, _onset)
                             if _cl_notes:

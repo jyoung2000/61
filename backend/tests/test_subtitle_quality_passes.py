@@ -767,6 +767,88 @@ def test_junk_filter_drops_meta_leaks_but_not_reference_shapes():
     assert not any("check translation" in t for t in kept_texts)
 
 
+def test_junk_filter_drops_credit_cards_preambles_and_crumbs():
+    """Run-24 leaks, verbatim: the ED's credit-card readouts ("Lyrics by…"),
+    the model announcing its answer instead of giving it, and a batch
+    reply's JSON crumbs glued to real words. All measured at ZERO drops on
+    the full professional reference."""
+    from backend.services.transcript_sanitize import drop_junk_cues
+    rows = [{"start": float(i), "end": float(i) + 2.0, "text": t}
+            for i, t in enumerate([
+                "Lyrics by…",
+                "…Composition and…",
+                "…arrangement by Initial composition Miku",
+                "Here's the translated subtitle line in English:",
+                "Gundams in total now. }`[",
+                "The Gundam Deathscythe",
+            ])]
+    kept, dropped = drop_junk_cues(rows)
+    kept_texts = [r["text"] for r in kept]
+    assert len(dropped) == 4
+    assert "Gundams in total now." in kept_texts          # crumbs stripped
+    assert "The Gundam Deathscythe" in kept_texts
+
+
+def test_recovered_cues_inside_a_song_window_are_dropped():
+    """The post-COMPLETE merge runs AFTER the theme collapse decided where
+    the songs are, so a recovered lyric/credit fragment walks past every
+    guard — run 24 shipped the ED credits 25s BEFORE the marker's own start
+    (the marker anchors on the chorus; credits ride the intro). Scoped by
+    provenance and preview-exempt: next-episode narration is real."""
+    from backend.services.transcript_sanitize import (
+        drop_recovered_near_theme_markers)
+    rows = [
+        {"start": 1371.0, "end": 1375.0, "text": "[♪ Ending theme ♪]"},
+        {"start": 1346.0, "end": 1350.0, "text": "Sorry, Jagdster",
+         "recovered": True},
+        {"start": 1425.0, "end": 1429.0, "recovered": True,
+         "text": "The Alliance sends troops to find the sunken Gundam."},
+        {"start": 1350.0, "end": 1354.0, "text": "That is terrible."},
+    ]
+    kept, dropped = drop_recovered_near_theme_markers(rows)
+    kept_texts = [r["text"] for r in kept]
+    assert len(dropped) == 1 and "Jagdster" in dropped[0]
+    # Preview-shaped recovered cue survives; NON-recovered cue in the window
+    # is never touched (the collapse already ruled on it).
+    assert any("sunken Gundam" in t for t in kept_texts)
+    assert "That is terrible." in kept_texts
+    # No markers → pure no-op.
+    same, none = drop_recovered_near_theme_markers(rows[1:])
+    assert none == [] and len(same) == 3
+
+
+def test_source_chorus_accepts_a_single_stable_hook():
+    """Real EDs defeat the two-distinct-repeats gate: every verse transcribes
+    slightly differently on every Whisper pass, and only the HOOK is stable
+    enough to repeat verbatim. One line repeating 2-3 times among distinct
+    verses is a song; one line repeating six times over nothing else is a
+    Whisper loop and still yields nothing."""
+    from backend.services.transcript_sanitize import source_chorus_spans
+    src = [{"start": 200.0 + 30.0 * i, "end": 204.0 + 30.0 * i,
+            "text": f"作戦の状況を報告する、その{i}。"} for i in range(10)]
+    ed = ["ただ愛だけが", "夜風が頬を撫でていく", "君を呼ぶ声がどこかで",
+          "ただ愛だけが", "遠い空の下で歌う", "誰もいない街角で"]
+    src_hook = src + [{"start": 1360.0 + 5.0 * i, "end": 1364.0 + 5.0 * i,
+                       "text": t} for i, t in enumerate(ed)]
+    spans = source_chorus_spans(src_hook)
+    assert len(spans) == 1 and spans[0][0] == 1360.0
+    loop = src + [{"start": 1360.0 + 5.0 * i, "end": 1364.0 + 5.0 * i,
+                   "text": "ご視聴ありがとうございました"} for i in range(6)]
+    assert source_chorus_spans(loop) == []
+
+
+def test_post_merge_resanitize_now_covers_the_late_leaks():
+    """Run 24's 'Mr. Dorlian' ×4 were recovery-merged AFTER the main-track
+    respell ran — the alias that fixes them sat unused. The re-sanitize must
+    carry the theme-window guard and the glossary respell."""
+    import inspect
+    from backend.services import pipeline
+    src = inspect.getsource(pipeline._resanitize_after_merge)
+    assert "drop_recovered_near_theme_markers" in src
+    assert "respell_text_from_glossary" in src
+    assert "kana_aliases_for_job" in src
+
+
 def test_glossary_miner_rejects_acronyms():
     """A measured run's glossary shipped 'DVD' as a cast name (the franchise
     page mentions the format constantly, mid-sentence, TitleCase-shaped by
