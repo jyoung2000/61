@@ -1638,6 +1638,18 @@ def suppress_echo_cues(rows: list, window_s: float = 12.0,
 # Roleplay stage-direction markup ("*Grunt* *grunt*"). Never valid subtitle
 # text — a professional track writes "[grunts]" or nothing at all.
 _ASTERISK_MARKUP_RE = re.compile(r"^\s*(?:\*[^*]+\*\s*)+$")
+# Translation-note prose the model emits ABOUT its work instead of doing it.
+# Substring-anchored on the note phrases themselves, so real dialogue that
+# merely contains the word "translation" is untouched.
+_META_NOTE_RE = re.compile(
+    r"(?i)\bcheck(?:\s+the)?\s+translation\b|\btranslation\s+note\b"
+    r"|^\(?\s*TN\s*:|^\s*note\s*:\s")
+# A cue that IS a bare title/episode card readout and nothing else. At most
+# one short word or a number may follow ("Title Strange.", "Episode 1",
+# "Episode") — a sentence that merely STARTS near these words has more
+# after it and falls through.
+_TITLE_STUB_RE = re.compile(
+    r"(?i)^(?:title|episode)(?:\s+(?:\w{1,12}|\d+))?\s*[.!?…]?$")
 
 # ``key:value`` tokens — subtitle-file metadata, never spoken English. The
 # right side must start alphanumeric and carry no further colon, so a clock
@@ -1864,6 +1876,19 @@ def drop_junk_cues(rows: list, vocalization_max_dwell_s: float = 2.5,
             continue
         if looks_like_asr_boilerplate(txt):
             dropped.append(f"boilerplate:{txt[:40]!r}")
+            continue
+        # Meta leaks: translation-note prose the LLM emitted ABOUT its work
+        # ("Mrs. Ifc, check translation.") and bare title/episode stubs the
+        # ASR reads off an on-screen card ("Title Strange.", "Episode 1") —
+        # a measured run shipped all three as subtitles. Both patterns are
+        # anchored tightly: "Next Episode" and "Next, on Gundam Wing,
+        # Episode 2." in the professional reference start with real words
+        # and survive; a cue that IS only a title stub does not.
+        if _META_NOTE_RE.search(txt):
+            dropped.append(f"meta:{txt[:40]!r}")
+            continue
+        if _TITLE_STUB_RE.match(txt):
+            dropped.append(f"title-stub:{txt[:32]!r}")
             continue
         norm = _echo_norm(txt)
         if norm and dur > vocalization_max_dwell_s:

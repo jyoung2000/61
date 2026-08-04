@@ -1362,6 +1362,52 @@ def _glossary_store_save(store: dict) -> None:
         logger.debug("glossary store save failed: %s", e)
 
 
+# Japanese military ranks / forms of address → the renderings professional
+# anime localizations use. This is a CLOSED vocabulary — unlike names, ranks
+# are ordinary dictionary words with one accepted translation each — so a
+# static map is the right tool: no model, no similarity threshold, no
+# network. Its absence is why a measured run shipped "Zechs Unique" three
+# times (ゼクス中尉, "Lieutenant Zechs") and "Mr. Dorian" where the
+# reference says "Vice Foreign Minister Darlian": the glossary pinned the
+# NAME and left the model to guess the title attached to it.
+JA_RANK_TITLES = {
+    "少尉": "Second Lieutenant",
+    "中尉": "Lieutenant",
+    "大尉": "Captain",
+    "少佐": "Major",
+    "中佐": "Lieutenant Colonel",
+    "大佐": "Colonel",
+    "准将": "Brigadier General",
+    "少将": "Major General",
+    "中将": "Lieutenant General",
+    "大将": "General",
+    "元帥": "Marshal",
+    "曹長": "Sergeant Major",
+    "軍曹": "Sergeant",
+    "伍長": "Corporal",
+    "司令官": "Commander",
+    "総帥": "Commander-in-Chief",
+    "提督": "Admiral",
+    "閣下": "Excellency",
+    "外務次官": "Vice Foreign Minister",
+    # OZ's invented rank — no dictionary reading exists, and the official
+    # localization renders its holder as "Lieutenant".
+    "特佐": "Lieutenant",
+}
+
+
+def rank_title_pairs_in(text: str) -> dict:
+    """The rank/title tokens from :data:`JA_RANK_TITLES` present in ``text``.
+
+    Longest keys win when nested (外務次官 also contains no shorter key, but
+    e.g. 司令官/司令 would): a token is only reported when no LONGER mapped
+    token containing it is also present, so the glossary never pins both
+    "Commander" and a fragment of it for the same surface."""
+    hits = {k: v for k, v in JA_RANK_TITLES.items() if k and k in (text or "")}
+    return {k: v for k, v in hits.items()
+            if not any(k != o and k in o for o in hits)}
+
+
 def _remember_series(store: dict, key: str) -> None:
     """Persist ``key`` as the series this machine most recently resolved.
 

@@ -369,6 +369,16 @@ def find_coverage_gaps(
     return picked
 
 
+# Near-gap rescue bounds for _clip_to_gap. Tolerance: how far outside the
+# requested span a decode may land and still count as the same audio at a
+# re-clocked time (Whisper's short-line drift is 1-2 s, never tens).
+# Duration cap: only SHORT lines qualify — a long decode outside the hole is
+# the recognizer re-hearing neighbouring captioned dialogue, and admitting it
+# would double-caption a whole sentence to rescue nothing.
+_NEAR_GAP_TOL_S = 2.0
+_NEAR_GAP_MAX_DUR_S = 3.0
+
+
 def _clip_to_gap(seg: dict, gap: tuple[float, float], pad_s: float,
                  existing: Optional[list] = None) -> Optional[dict]:
     """Keep a recovered cue where it lands inside the gap.
@@ -390,7 +400,31 @@ def _clip_to_gap(seg: dict, gap: tuple[float, float], pad_s: float,
         out["start"], out["end"] = max(b[0], lo), min(b[1], hi)
         return out if out["end"] - out["start"] >= 0.3 else None
     if b[1] <= gap[0] or b[0] >= gap[1]:
-        return None                     # outside even the padded window
+        # Fully outside the requested span — but not necessarily wrong.
+        # Whisper re-clocks a short line by a second or two routinely, and
+        # the unconditional cull here was throwing away the recovery's own
+        # findings: a measured run decoded 36 cue(s) and culled 34 as
+        # "outside-gap", among them exactly the short interjections
+        # ("Roger!", "It moved!") the reference captions and our track
+        # lacks. A SHORT decode that lands within ``_NEAR_GAP_TOL_S`` of
+        # the span, over audio no existing cue covers, is a find at a
+        # slightly different clock — keep it AT ITS DECODED TIME (the
+        # decode's own timestamps are the only evidence of where it
+        # belongs; clipping it into the span would move it). Long decodes
+        # far from the hole stay culled: those are boundary re-hearings.
+        _near = ((gap[0] - b[1]) if b[1] <= gap[0]
+                 else (b[0] - gap[1])) <= _NEAR_GAP_TOL_S
+        if not _near or (b[1] - b[0]) > _NEAR_GAP_MAX_DUR_S:
+            return None
+        for e in (existing or []):
+            eb = _seg_bounds(e)
+            if eb is None:
+                continue
+            if min(eb[1], b[1]) - max(eb[0], b[0]) > 0.2:
+                return None             # audio already captioned
+        out = dict(seg)
+        out["start"], out["end"] = b[0], b[1]
+        return out if out["end"] - out["start"] >= 0.3 else None
     # Pad-only decode: keep it unless an existing cue already covers that
     # audio (≥ 0.2 s overlap) — then it is a boundary re-hearing, not a find.
     for e in (existing or []):

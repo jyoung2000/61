@@ -266,6 +266,12 @@ async def transcribe(
     log_prob_threshold: Optional[float] = Form(None),
     compression_ratio_threshold: Optional[float] = Form(None),
     hallucination_silence_threshold: Optional[float] = Form(None),
+    # Pinned sampler seed for reproducible decodes. Greedy decoding is
+    # already deterministic — the run-to-run segment variance ClipAI
+    # measured (277 vs 283 on identical input) enters when the temperature
+    # FALLBACK re-decodes a shaky segment with sampling. Optional like every
+    # tuning field: clients that never send it keep today's behavior.
+    seed: Optional[float] = Form(None),
 ):
     """OpenAI-compatible transcription. The ``model`` form field is
     accepted for schema compatibility but the loaded model serves every
@@ -282,6 +288,15 @@ async def transcribe(
         audio_path = tmp.name
 
     try:
+        if seed is not None:
+            # Global CTranslate2 sampler state — reseeded per request so a
+            # temperature-fallback re-decode samples the same tokens every
+            # run. Fail-soft on builds without the hook.
+            try:
+                import ctranslate2
+                ctranslate2.set_random_seed(int(seed))
+            except Exception:
+                pass
         task = ("translate" if str(translate or "").strip().lower()
                 in ("1", "true", "yes", "on") else "transcribe")
         base_kwargs = {

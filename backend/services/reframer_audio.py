@@ -473,10 +473,34 @@ def _remote_tuning_fields() -> dict:
         }
         if "threshold" in vad:
             fields["vad_threshold"] = str(float(vad["threshold"]))
+        # Pinned sampler seed. Greedy decoding is already deterministic; the
+        # variance enters when the temperature FALLBACK re-decodes a shaky
+        # segment hot (sampled) — two identical runs of the same episode came
+        # back 277 vs 283 segments, and every downstream heuristic amplified
+        # the difference. The sidecar (a faster-whisper server) seeds
+        # CTranslate2's RNG with this before decoding; servers that don't
+        # know the field ignore it.
+        fields["seed"] = str(int(getattr(settings, "LLM_TRANSCRIPT_SEED", 42)))
         return fields
     except Exception as e:
         logger.warning("Remote tuning fields skipped (%s)", e)
         return {}
+
+
+def _seed_ct2_sampling() -> None:
+    """Pin CTranslate2's sampler RNG for the LOCAL whisper path.
+
+    Same rationale as the remote ``seed`` field: temperature-fallback
+    re-decodes SAMPLE, and unseeded sampling is the last nondeterministic
+    stage in the transcript chain now that translation/polish decode with a
+    pinned seed. Fail-soft — an older ctranslate2 without the hook changes
+    nothing."""
+    try:
+        import ctranslate2
+        ctranslate2.set_random_seed(
+            int(getattr(settings, "LLM_TRANSCRIPT_SEED", 42)))
+    except Exception:
+        pass
 
 
 def _words_degenerate(words: list, start_sec: float, end_sec: float) -> bool:
@@ -2089,6 +2113,7 @@ class AudioIntelligence:
             #   word_timestamps=True (per-word timing for subtitle + reframing)
             _ns_threshold = float(getattr(
                 settings, "WHISPER_NO_SPEECH_THRESHOLD", 0.4))
+            _seed_ct2_sampling()
             try:
                 from faster_whisper import BatchedInferencePipeline
                 batched = BatchedInferencePipeline(model=self.engine)

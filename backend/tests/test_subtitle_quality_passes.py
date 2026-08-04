@@ -690,6 +690,83 @@ def test_marker_clamp_never_moves_a_sane_marker_later(caplog):
     assert len(n) == 1 and z[0]["start"] == 61.0
 
 
+def test_near_gap_rescue_keeps_reclocked_short_lines():
+    """A measured run decoded 36 recovered cue(s) and culled 34 as
+    "outside-gap" — among them the short interjections the reference
+    captions ("Roger!", "It moved!"). A short decode within 2s of the span
+    over uncaptioned audio is a find at a re-clocked time; a long decode far
+    away is a boundary re-hearing and stays culled."""
+    from backend.services.vocal_gap_recovery import _clip_to_gap
+    gap, pad = (100.0, 104.0), 0.4
+    # 1.4s past the span end, 1.1s long, nothing existing there → kept AT
+    # ITS DECODED TIME (the decode's own clock is the only evidence).
+    got = _clip_to_gap({"start": 105.4, "end": 106.5, "text": "Roger!"},
+                       gap, pad, existing=[])
+    assert got is not None and got["start"] == 105.4 and got["end"] == 106.5
+    # Same shape but an existing cue already covers that audio → cull.
+    assert _clip_to_gap({"start": 105.4, "end": 106.5, "text": "Roger!"},
+                        gap, pad,
+                        existing=[{"start": 105.0, "end": 107.0}]) is None
+    # Too far outside → cull; too long even when near → cull.
+    assert _clip_to_gap({"start": 108.5, "end": 109.4, "text": "x"},
+                        gap, pad, existing=[]) is None
+    assert _clip_to_gap({"start": 104.5, "end": 109.0, "text": "long line"},
+                        gap, pad, existing=[]) is None
+
+
+def test_asr_decode_is_seeded_on_both_paths():
+    """Greedy decoding is deterministic; the 277-vs-283-segment variance
+    between identical runs enters when the temperature FALLBACK samples.
+    The remote request carries the pinned seed as a tuning field and the
+    local path seeds CTranslate2 directly."""
+    from backend.services import reframer_audio as ra
+    fields = ra._remote_tuning_fields()
+    assert fields.get("seed") == "42"
+    ra._seed_ct2_sampling()   # must never raise, with or without ct2
+    import inspect
+    # The helper is only worth anything if the local decode actually calls
+    # it before transcribing.
+    assert inspect.getsource(ra).count("_seed_ct2_sampling()") >= 2
+
+
+def test_rank_titles_pin_the_renderings_localizations_use():
+    """ゼクス中尉 shipped as "Zechs Unique" three times on a measured run —
+    the glossary pinned the name and left the model to guess the title.
+    Ranks are a closed vocabulary with one accepted rendering each."""
+    from backend.services.canonical_names import rank_title_pairs_in
+    got = rank_title_pairs_in("ゼクス中尉、報告します。外務次官ドーリアン閣下が到着。")
+    assert got["中尉"] == "Lieutenant"
+    assert got["外務次官"] == "Vice Foreign Minister"
+    assert got["閣下"] == "Excellency"
+    assert rank_title_pairs_in("こんにちは、元気ですか。") == {}
+
+
+def test_junk_filter_drops_meta_leaks_but_not_reference_shapes():
+    """"Mrs. Ifc, check translation.", "Title Strange." and bare "Episode 1"
+    all shipped as subtitles on a measured run. The professional reference's
+    own "Next Episode" and "Next, on Gundam Wing, Episode 2." must survive —
+    zero reference damage was measured across the full track."""
+    from backend.services.transcript_sanitize import drop_junk_cues
+    rows = [{"start": float(i), "end": float(i) + 2.0, "text": t}
+            for i, t in enumerate([
+                "Mrs. Ifc, check translation.",
+                "Title Strange.",
+                "Episode 1",
+                "Episode",
+                "(TN: this is a pun)",
+                "Next Episode",
+                "Next, on Gundam Wing, Episode 2.",
+                "The Gundam Deathscythe",
+            ])]
+    kept, dropped = drop_junk_cues(rows)
+    kept_texts = [r["text"] for r in kept]
+    assert len(dropped) == 5
+    assert "Next Episode" in kept_texts
+    assert "Next, on Gundam Wing, Episode 2." in kept_texts
+    assert "The Gundam Deathscythe" in kept_texts
+    assert not any("check translation" in t for t in kept_texts)
+
+
 def test_glossary_miner_rejects_acronyms():
     """A measured run's glossary shipped 'DVD' as a cast name (the franchise
     page mentions the format constantly, mid-sentence, TitleCase-shaped by

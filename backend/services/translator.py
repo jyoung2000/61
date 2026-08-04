@@ -829,10 +829,17 @@ async def translate_via_llm(
             # dictionary hit rather than a similarity gamble against "Kato".
             _wiki_extra: list = []
             try:
-                from backend.services.canonical_names import kana_pairs_for_job
-                _pairs = kana_pairs_for_job(job_id)
+                from backend.services.canonical_names import (
+                    kana_pairs_for_job, rank_title_pairs_in)
+                _src_all = "\n".join(_seg_text(s) for s in segments)
+                _pairs = dict(kana_pairs_for_job(job_id))
+                # Ranks/titles ride the same overlay: ゼクス中尉 must render
+                # "Lieutenant Zechs", and pinning only the name left the
+                # model to guess the title ("Zechs Unique", three times on a
+                # measured run). Ranks are a closed vocabulary with one
+                # accepted rendering each — exactly what a glossary is for.
+                _pairs.update(rank_title_pairs_in(_src_all))
                 if _pairs:
-                    _src_all = "\n".join(_seg_text(s) for s in segments)
                     _canon_map = dict(_canon_map or {})
                     _n_overlay = 0
                     for _kana, _en in _pairs.items():
@@ -843,8 +850,9 @@ async def translate_via_llm(
                             _wiki_extra.append(_kana)
                     if _n_overlay:
                         logger.info(
-                            "LLM translate: %d katakana reading(s) pinned from "
-                            "the series glossary (e.g. %s)", _n_overlay,
+                            "LLM translate: %d katakana/rank reading(s) "
+                            "pinned from the series glossary (e.g. %s)",
+                            _n_overlay,
                             "; ".join(f"{k}→{_canon_map[k]}"
                                       for k in _wiki_extra[:5]))
             except Exception as _kp_e:
