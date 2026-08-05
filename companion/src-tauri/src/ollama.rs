@@ -429,6 +429,28 @@ fn gpu_overhead_bytes(state: &AppState) -> u64 {
     (total_mb.saturating_sub(budget_mb)) * 1024 * 1024
 }
 
+/// Windows error 1455 ("The paging file is too small for this operation to
+/// complete") means the OS refused the process the virtual-memory COMMIT it
+/// asked for — system RAM + page file, NOT GPU memory. Measured on a real
+/// run: Ollama failed to start under it, and later died mid-job (502s to
+/// every /api/chat) while a 14B was resident. The fix is user-side, so the
+/// error must say it in words the user can act on.
+fn commit_pressure_hint(err: &str) -> Option<String> {
+    let e = err.to_lowercase();
+    if e.contains("paging file") || e.contains("os error 1455") {
+        Some(format!(
+            "{err} — Windows is out of COMMIT memory (RAM + page file), not \
+             GPU memory. Fix: Windows Settings → System → About → Advanced \
+             system settings → Performance Settings → Advanced → Virtual \
+             memory → let Windows manage the page file (or set a larger one), \
+             then reboot; closing memory-heavy apps also helps. The Companion \
+             keeps retrying Ollama automatically."
+        ))
+    } else {
+        None
+    }
+}
+
 /// Start a managed `ollama serve` bound to 127.0.0.1 with the Companion's
 /// resource policy. No-op when a daemon is already answering (external
 /// install, e.g. the Ollama tray app) — we use it as-is.
@@ -495,9 +517,10 @@ async fn ensure_running_inner(state: &Arc<AppState>) -> Result<bool, String> {
     if overhead > 0 {
         cmd.env("OLLAMA_GPU_OVERHEAD", overhead.to_string());
     }
-    let child = cmd
-        .spawn()
-        .map_err(|e| format!("could not start ollama serve: {e}"))?;
+    let child = cmd.spawn().map_err(|e| {
+        let base = format!("could not start ollama serve: {e}");
+        commit_pressure_hint(&base).unwrap_or(base)
+    })?;
     // Die with the Companion — no orphaned daemon after quit/kill.
     crate::state::bind_child_to_lifetime(&child);
     *state.ollama_child.lock().await = Some(child);

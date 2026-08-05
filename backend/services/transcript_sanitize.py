@@ -1213,6 +1213,13 @@ def collapse_song_choruses(segments, target_lang: str = "en"):
                             f"{_st(rows[i]):.2f}s {(rows[i].get('text') or '')[:28]!r}"
                             for i in _absorbed[:4]))
                 drop.update(run)
+                # A second window re-collapsing the same run must never
+                # SHRINK a marker the first window's chain already extended
+                # (head and tail windows overlap on short inputs).
+                _prev = marker_at.get(min(run))
+                if _prev:
+                    m_start = min(m_start, _prev[0])
+                    m_end = max(m_end, _prev[1])
                 marker_at[min(run)] = (m_start, m_end, label)
                 _w_markers.append(min(run))
 
@@ -1225,6 +1232,27 @@ def collapse_song_choruses(segments, target_lang: str = "en"):
             # marker extended; previews and dialogue still break the run, and
             # the soft-run vetting (strict majority + unpunctuated majority)
             # applies in full.
+            def _vet_tiny_tail(trun: list) -> bool:
+                """A TWO-cue trailing block may still be the song's last
+                verse: a measured run kept its "[♪ Ending theme ♪]" marker
+                and shipped exactly two lyric cues 24s later ("I don't think
+                I should say…", "Jump Suits") — under the 3-cue chain
+                minimum. Two cues carry less evidence, so every one must
+                look sung: NO terminal punctuation anywhere (dialogue closes
+                its sentences), at most one stray capital per cue, and ≥4s
+                of combined dwell. Only ever consulted for blocks that open
+                within the chain's 60s window after a theme marker."""
+                if len(trun) != 2:
+                    return False
+                texts = [(rows[i].get("text") or "").strip() for i in trun]
+                if any(_ends_terminal(t) for t in texts):
+                    return False
+                if any(_pn(t) > 1 for t in texts):
+                    return False
+                span = (max(_en(rows[i]) for i in trun)
+                        - min(_st(rows[i]) for i in trun))
+                return span >= 4.0
+
             for mk in list(_w_markers):
                 _more = True
                 while _more:
@@ -1239,10 +1267,34 @@ def collapse_song_choruses(segments, target_lang: str = "en"):
                             continue
                         trun = _longest_theme_run(rows, g_live, _is_preview,
                                                   pn_fn=_pn, soft=True)
-                        if (len(trun) >= 3 and trun[0] == g_live[0]
-                                and _vet_soft_run(trun)
-                                and (max(_en(rows[i]) for i in trun)
-                                     - min(_st(rows[i]) for i in trun)) >= 6.0):
+                        if not (trun and trun[0] == g_live[0]
+                                and len(trun) >= 3):
+                            # Soft (one-stray-capital) cues may CONTINUE a
+                            # run but never open one, so a two-cue tail
+                            # whose cues are both pn==1 lyric garble yields
+                            # an empty run — or the longest run lands on an
+                            # unrelated clean cue DEEPER in the group (a
+                            # preview sentence), which is just as useless
+                            # here: the chain only ever absorbs from the
+                            # group's front. Either way, collect the leading
+                            # lyric-tolerable cues directly; the tiny-tail
+                            # vet holds the bar.
+                            _lead: list = []
+                            for i in g_live:
+                                _t = (rows[i].get("text") or "").strip()
+                                if (not _t or _is_preview(_t) or _pn(_t) > 1
+                                        or len(_t) > max(_LYRIC_MAX_CHARS, 60)):
+                                    break
+                                _lead.append(i)
+                                if len(_lead) > 2:
+                                    break
+                            if len(_lead) == 2:
+                                trun = _lead
+                        _ok = (len(trun) >= 3 and _vet_soft_run(trun)
+                               and (max(_en(rows[i]) for i in trun)
+                                    - min(_st(rows[i]) for i in trun)) >= 6.0
+                               ) or _vet_tiny_tail(trun)
+                        if _ok and trun and trun[0] == g_live[0]:
                             drop.update(trun)
                             marker_at[mk] = (
                                 m_s, max(_en(rows[i]) for i in trun), lab)

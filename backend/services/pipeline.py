@@ -2834,13 +2834,35 @@ async def _auto_generate_clip_seo(
         )
         async with _sem:
             try:
-                seo, provider = await platform_orch.generate_seo(
-                    clip_title=clip_dict.get("title", ""),
-                    clip_transcript=clip_transcript,
-                    video_summary=video_summary,
-                    platform=platform,
-                    job_id=job_id,
-                )
+                # Bounded retry over TRANSIENT provider outages. Measured: a
+                # mid-stage Ollama death (Windows paging-file exhaustion)
+                # returned 502s for ~10 seconds while the Companion's
+                # supervisor restarted the daemon — and 4 of 12 clips shipped
+                # without SEO for want of one retry. Backoff spans the
+                # restart window; a genuinely down provider still fails after
+                # the last attempt and the deterministic fallback title
+                # sweep below covers the clip.
+                _attempts = max(1, int(getattr(settings, "SEO_RETRY_ATTEMPTS", 3)))
+                for _try in range(_attempts):
+                    try:
+                        seo, provider = await platform_orch.generate_seo(
+                            clip_title=clip_dict.get("title", ""),
+                            clip_transcript=clip_transcript,
+                            video_summary=video_summary,
+                            platform=platform,
+                            job_id=job_id,
+                        )
+                        break
+                    except Exception as _seo_e:
+                        if _try + 1 >= _attempts:
+                            raise
+                        _delay = 5.0 * (2 ** _try)
+                        logger.info(
+                            "[%s] SEO for clip %s (%s) failed (%s) — provider "
+                            "may be restarting; retrying in %.0fs (%d/%d)",
+                            job_id, clip_dict.get("id"), platform, _seo_e,
+                            _delay, _try + 1, _attempts - 1)
+                        await asyncio.sleep(_delay)
                 _brief_tags = []
                 try:
                     from backend.services.trend_brief import _requested_platform_keys

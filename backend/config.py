@@ -685,13 +685,15 @@ class Settings(BaseSettings):
     # extend into). Only cues over SUBTITLE_CONDENSE_CPS are touched — well
     # past the 17-cps broadcast cap, so normal prose never is.
     SUBTITLE_CONDENSE_OVER_CPS: bool = True
-    # 24, not 20. At 20 the pass condensed 74 cues on a measured run and drove
-    # reading rate to reference parity (cps p90 19.3 vs 19.1) — but it took
-    # total text 656 characters BELOW the reference, and shortened two-line
-    # cues reflowed to one line, moving the 1-line/2-line split from 191/156
-    # to 222/125. Both overshoots come from condensing cues that were merely
-    # brisk rather than unreadable. 24 leaves the 17-24 band alone.
-    SUBTITLE_CONDENSE_CPS: float = 24.0
+    # 22 — bisected from two measured endpoints. At 20 the pass condensed 74
+    # cues and drove reading rate to reference parity (cps p90 19.3 vs 19.1)
+    # but took total text 656 characters BELOW the reference and reflowed the
+    # 1-line/2-line split (191/156 → 222/125). At 24 the overshoot vanished
+    # (chars −166) but the fastest band went untouched: cps p90 20.9 vs the
+    # reference's 19.1, with 87 cues over 17 cps vs its 67. 22 condenses only
+    # the genuinely hard-to-read tail while leaving the merely-brisk 17-22
+    # band alone.
+    SUBTITLE_CONDENSE_CPS: float = 22.0
     # What a condensed line must FIT, as opposed to what triggers the rewrite.
     # Kept separate from SUBTITLE_MAX_CPS (20.0), which the fragment merge
     # reads for its own purpose: writing to that number put every rewrite in
@@ -826,6 +828,12 @@ class Settings(BaseSettings):
     # trivially; a local Ollama queues requests server-side (never slower
     # than serial). 1 = legacy serial order.
     SEO_PARALLEL_MAX: int = 4
+    # Attempts per clip before its SEO call is declared failed. Measured: a
+    # mid-stage Ollama death (Windows paging-file exhaustion) 502'd for ~10s
+    # while the Companion supervisor restarted it, and 4/12 clips lost their
+    # SEO for want of one retry. Backoff between attempts is 5s then 10s —
+    # sized to that restart window. 1 = legacy fail-fast.
+    SEO_RETRY_ATTEMPTS: int = 3
     FRAME_SAMPLE_RATE: int = 10        # seconds between frames (lower=more detail, slower)
     MAX_CLIP_CANDIDATES: int = 12
 

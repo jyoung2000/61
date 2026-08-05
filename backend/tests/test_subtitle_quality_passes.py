@@ -1368,6 +1368,63 @@ def test_fused_annotation_pair_is_convicted_before_the_splitter_minted_it():
     assert not looks_like_annotation_artifact("No sound came from the room")
 
 
+def test_two_cue_lyric_tail_joins_the_ending_theme_marker():
+    """Run-26 kept its "[♪ Ending theme ♪]" marker and shipped exactly TWO
+    lyric cues 24s later ("I don't think I should say…", "Jump Suits") —
+    under the trailing-verse chain's 3-cue minimum, and both pn==1 so the
+    soft run-builder couldn't even OPEN a run on them. The tiny-tail vet
+    (all unpunctuated, ≤1 stray capital each, ≥4s dwell) absorbs them and
+    extends the marker; the next-episode preview after them survives."""
+    from backend.services.transcript_sanitize import collapse_song_choruses
+    rows = [
+        {"start": 10.0, "end": 12.0, "text": "The year is After Colony 195."},
+        {"start": 700.0, "end": 702.0, "text": "So it WAS a Gundam."},
+        {"start": 1360.0, "end": 1364.0, "text": "Just love He gets on my nerves"},
+        {"start": 1364.5, "end": 1368.5, "text": "I only tease him because I like him"},
+        {"start": 1369.0, "end": 1373.0, "text": "Just love He gets on my nerves"},
+        {"start": 1373.5, "end": 1377.0, "text": "Sorry I push things a little too far"},
+        {"start": 1377.1, "end": 1381.1, "text": "I only tease him because I like him"},
+        {"start": 1405.13, "end": 1411.72,
+         "text": "I don't think I should say something like that Please face"},
+        {"start": 1412.55, "end": 1415.22, "text": "Jump Suits"},
+        {"start": 1425.19, "end": 1428.77,
+         "text": "The Union Marine forces have sent a He got the Gundam already"},
+        {"start": 1428.77, "end": 1430.90, "text": "that sank to the bottom of the sea."},
+        {"start": 1446.25, "end": 1451.67,
+         "text": "Mobile Suit Gundam Wing, Episode 2: The Deathscythe Gundam."},
+    ]
+    out, changed = collapse_song_choruses(rows, "en")
+    assert changed
+    mk = [r for r in out if r["text"] == "[♪ Ending theme ♪]"]
+    assert len(mk) == 1 and abs(mk[0]["end"] - 1415.22) < 0.01
+    joined = " | ".join(r["text"] for r in out)
+    assert "Jump Suits" not in joined and "Please face" not in joined
+    assert "Union Marine" in joined and "Episode 2" in joined
+
+
+def test_tiny_tail_never_eats_dialogue_after_the_opening_theme():
+    """Turn-taking dialogue right after an OP marker closes its sentences
+    and names people — the tiny-tail vet (no terminal punctuation anywhere)
+    must leave it alone."""
+    from backend.services.transcript_sanitize import collapse_song_choruses
+    rows = [
+        {"start": 26.0, "end": 30.0, "text": "Just wild beat communication"},
+        {"start": 30.5, "end": 34.0, "text": "Standing in the lashing rain"},
+        {"start": 34.5, "end": 38.0, "text": "Just wild beat communication"},
+        {"start": 38.5, "end": 42.0, "text": "Standing in the lashing rain"},
+        {"start": 42.1, "end": 46.0, "text": "With my entire body tonight"},
+        {"start": 60.0, "end": 61.5, "text": "What's the matter Relena?"},
+        {"start": 61.9, "end": 63.4, "text": "Aren't you glad to be coming home to Earth?"},
+        {"start": 63.8, "end": 65.2, "text": "No, not a bit."},
+        {"start": 700.0, "end": 702.0, "text": "So it WAS a Gundam."},
+        {"start": 1400.0, "end": 1402.0, "text": "I'll kill you."},
+    ]
+    out, _ = collapse_song_choruses(rows, "en")
+    texts = [r["text"] for r in out]
+    assert "What's the matter Relena?" in texts
+    assert "No, not a bit." in texts
+
+
 def test_meta_editing_note_cue_is_dropped():
     """Run-26 shipped "Misspelled: 'Capturing' corrected." as a subtitle —
     the model narrating its own copy-editing. Dropped by the meta-note net;
@@ -1875,14 +1932,16 @@ def test_kana_pairs_survive_a_restart_via_the_durable_store(tmp_path,
 
 
 def test_condense_threshold_leaves_merely_brisk_cues_alone():
-    """At 20 cps the condenser rewrote cues that were readable, taking total
-    text 656 characters below the professional reference and reflowing shortened
-    two-line cues to one line. The trigger must sit well clear of the target the
-    rewrite is asked to hit, or the pass eats prose it was never meant to see.
-    """
+    """Bisected between two measured endpoints: at 20 cps the condenser
+    rewrote readable cues (text 656 chars below the professional reference,
+    two-line cues reflowed to one line); at 24 the fastest band shipped
+    untouched (cps p90 20.9 vs the reference's 19.1). 22 condenses only the
+    genuinely hard-to-read tail. The trigger must still sit well clear of
+    the target the rewrite is asked to hit, or the pass eats prose it was
+    never meant to see."""
     from backend.config import settings
-    assert settings.SUBTITLE_CONDENSE_CPS == 24.0
+    assert settings.SUBTITLE_CONDENSE_CPS == 22.0
     assert settings.SUBTITLE_CONDENSE_CPS > settings.SUBTITLE_CONDENSE_TARGET_CPS
-    # A 21-cps cue — brisk, still under the trigger.
+    # A ~21-cps cue — brisk, still under the trigger.
     brisk = "Colonies do not surrender to Alliance threats."   # 45 chars
     assert len(brisk) / 2.1 < settings.SUBTITLE_CONDENSE_CPS
