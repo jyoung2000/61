@@ -13,21 +13,31 @@ describe('cropColorAt — crop % → colour', () => {
     expect(b).toBe(c);
   });
 
-  it('anchors the spectrum: 0 % is red, 100 % is blue', () => {
-    expect(CROP_HUE_SPAN).toBe(240);                     // ends AT blue, not violet
+  it('anchors the spectrum: 0 % is red, 100 % is blue, 50 % is magenta', () => {
+    expect(CROP_HUE_SPAN).toBe(120);                     // the SHORT way round the wheel
     expect(hueOf(cropColorAt(0))).toBe(0);               // 0 %   → red
     expect(hueOf(cropColorAt(100))).toBe(240);           // 100 % → blue
-    expect(hueOf(cropColorAt(50))).toBe(120);            // 50 %  → the exact midpoint
+    expect(hueOf(cropColorAt(50))).toBe(300);            // 50 %  → magenta (red+blue), not green
   });
 
-  it('is monotonic in % (a smooth red→blue ramp, no wrap back to red)', () => {
-    let prev = -1;
-    for (let p = 0; p <= 100; p += 5) {
+  it('never passes through yellow/green/cyan (the regression: 35 % olive, 62 % green)', () => {
+    // Every hue must live on the red↔blue side of the wheel: 240°–360° or 0°.
+    for (let p = 0; p <= 100; p += 1) {
       const h = hueOf(cropColorAt(p));
-      expect(h).toBeGreaterThanOrEqual(prev);
+      expect(h === 0 || (h >= 240 && h <= 360)).toBe(true);
+    }
+  });
+
+  it('is monotonic in % (bluer is always higher %, no wrap past blue)', () => {
+    // Hue DESCENDS 360°→240° as % rises (0 % renders as 0°, the same red).
+    let prev = 361;
+    for (let p = 1; p <= 100; p += 1) {
+      const h = hueOf(cropColorAt(p));
+      expect(h).toBeLessThanOrEqual(prev);
+      expect(h).toBeGreaterThanOrEqual(240); // never runs past blue into cyan
       prev = h;
     }
-    expect(prev).toBeLessThanOrEqual(240); // never runs past blue into violet/red
+    expect(prev).toBe(240);
   });
 
   it('rounds identical labels to one hue: any % that shows "34%" is one colour', () => {
@@ -38,13 +48,13 @@ describe('cropColorAt — crop % → colour', () => {
   });
 
   it('clamps out-of-range and non-finite input to the valid band', () => {
-    expect(hueOf(cropColorAt(-20))).toBe(0);
-    expect(hueOf(cropColorAt(140))).toBe(CROP_HUE_SPAN);
-    expect(cropColorAt(NaN)).toBe(cropColorAt(50)); // NaN → centre default
+    expect(hueOf(cropColorAt(-20))).toBe(0);             // ≤0 % → red
+    expect(hueOf(cropColorAt(140))).toBe(240);           // ≥100 % → blue
+    expect(cropColorAt(NaN)).toBe(cropColorAt(50));      // NaN → centre default
   });
 
   it('honours the alpha argument', () => {
-    expect(cropColorAt(34, 0.75)).toBe('hsla(82, 60%, 38%, 0.75)');
-    expect(cropColorAt(34)).toBe('hsla(82, 60%, 38%, 1)');
+    expect(cropColorAt(34, 0.75)).toBe('hsla(319, 60%, 38%, 0.75)');
+    expect(cropColorAt(34)).toBe('hsla(319, 60%, 38%, 1)');
   });
 });
