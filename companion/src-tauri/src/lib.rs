@@ -1487,10 +1487,14 @@ pub fn run() {
                             // 503 while the daemon came back.
                             let sidecar_alive = state.sidecar.lock().await.is_some();
                             // Baseline (non-companion VRAM) is only meaningful
-                            // when Ollama holds no model — else "used" includes
-                            // our own model. Measured here so it reflects games.
+                            // when Ollama ANSWERED and holds no model — else
+                            // "used" includes our own model. Fail-closed: an
+                            // unreachable daemon (mid-restart) still holds its
+                            // VRAM, and sampling that moment as "other apps"
+                            // is how a 14B got counted against the whisper
+                            // budget. Measured here so it reflects games.
                             if !sidecar_alive
-                                && ollama::loaded_model_count().await == 0 {
+                                && ollama::resident_model_count().await == Some(0) {
                                 let baseline =
                                     snap.vram_total_mb.saturating_sub(snap.vram_free_mb);
                                 state.gpu_baseline_used_mb.store(baseline, Ordering::Relaxed);

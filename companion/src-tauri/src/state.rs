@@ -971,7 +971,7 @@ pub fn whisper_tier_for_budget(budget_gb: f32) -> (&'static str, &'static str) {
 /// 1=small/base/tiny. Full large-v3 and large-v3-turbo are DIFFERENT tiers —
 /// the old shared rank made a user's explicit large-v3 pick silently coerce
 /// back to turbo, so the model change never "went through".
-fn whisper_rank(name: &str) -> u8 {
+pub fn whisper_rank(name: &str) -> u8 {
     let n = name.to_lowercase();
     if n.contains("turbo") {
         3

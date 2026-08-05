@@ -79,22 +79,29 @@ pub async fn daemon_running() -> bool {
         .is_ok()
 }
 
-/// Number of models currently resident in VRAM (via /api/ps). 0 means Ollama
-/// holds no GPU memory, so free VRAM reflects only other apps — the moment to
-/// measure the auto-VRAM baseline. Fail-open to 0.
-pub async fn loaded_model_count() -> usize {
-    let Ok(resp) = reqwest::Client::new()
+/// Number of models currently resident in VRAM (via /api/ps), or None when
+/// Ollama did not answer. The distinction is load-bearing for the auto-VRAM
+/// baseline: an unreachable daemon (mid-restart) still HOLDS its VRAM while
+/// its dying process winds down, and the old fail-open-to-0 let that moment
+/// read as "Ollama holds nothing" — a measured run took the baseline with a
+/// 14B still resident (9.8 GB counted as "other apps"), sized the whisper
+/// budget at 1.2 GB, and transcribed a whole episode on `small`/beam-1.
+pub async fn resident_model_count() -> Option<usize> {
+    let resp = reqwest::Client::new()
         .get(format!("http://{OLLAMA_LOCAL}/api/ps"))
         .timeout(std::time::Duration::from_secs(2))
         .send()
         .await
-    else {
-        return 0;
-    };
-    let Ok(json) = resp.json::<serde_json::Value>().await else {
-        return 0;
-    };
-    json["models"].as_array().map(|a| a.len()).unwrap_or(0)
+        .ok()?;
+    let json = resp.json::<serde_json::Value>().await.ok()?;
+    Some(json["models"].as_array().map(|a| a.len()).unwrap_or(0))
+}
+
+/// Fail-open convenience for callers where "unknown" and "none" act the same
+/// (e.g. deciding whether an unload sweep has anything to do). NEVER use for
+/// the auto-VRAM baseline — see `resident_model_count`.
+pub async fn loaded_model_count() -> usize {
+    resident_model_count().await.unwrap_or(0)
 }
 
 /// VRAM (bytes) held by resident Ollama models right now — the ClipAI portion

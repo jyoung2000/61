@@ -636,6 +636,22 @@ def _model_differs(served: str, requested: str) -> bool:
     return not (a in b or b in a)
 
 
+def _whisper_rank(name: str) -> int:
+    """Quality rank of a whisper model family (mirrors the Companion's own
+    ladder): 4=full large, 3=turbo, 2=medium, 1=small/base/tiny, 0=unknown.
+    Used to tell a cosmetic serve-name difference from an actual DOWNGRADE."""
+    n = (name or "").strip().lower()
+    if not n:
+        return 0
+    if "turbo" in n:
+        return 3
+    if "large" in n:
+        return 4
+    if "medium" in n:
+        return 2
+    return 1
+
+
 # ── Remote Whisper (OpenAI-compatible server, e.g. the GPU Companion) ──────
 
 _REMOTE_HEALTH_CACHE = {"checked_at": 0.0, "healthy": False, "url": ""}
@@ -1253,6 +1269,36 @@ class RemoteWhisperEngine:
             result = self._transcribe_chunked(audio_path, data, headers, language, model)
         if result is None:
             return None
+
+        # A serve-DOWNGRADE gets exactly one do-over. Measured: a stale VRAM
+        # budget made the Companion decode a whole episode on `small` against
+        # a large-v3-turbo request, and every downstream stage (translation,
+        # theme detection, names) built on the garbled transcript. The
+        # Companion now frees squatting Ollama models and re-sizes when a
+        # request would be tier-capped — so a second request lands on the
+        # full model. The retry is kept only if the served tier actually
+        # improved; a Companion too old to report (or genuinely too small)
+        # costs one extra decode, once, on this one path.
+        _served0 = str(result.get("served_model") or "").strip()
+        if (_served0 and _model_differs(_served0, model)
+                and 0 < _whisper_rank(_served0) < _whisper_rank(model)):
+            logger.warning(
+                "Remote Whisper served '%s' for a '%s' request — a LOWER tier "
+                "(VRAM was likely held by LLM models at sizing time). Retrying "
+                "the decode once now that the Companion can free that VRAM.",
+                _served0, model)
+            import time as _t
+            _t.sleep(3.0)
+            _r2 = self._transcribe_payload(
+                wav_bytes, os.path.basename(audio_path), data, headers,
+                language, model)
+            _s2 = str((_r2 or {}).get("served_model") or "").strip()
+            if (_r2 and _r2.get("segments")
+                    and _whisper_rank(_s2) > _whisper_rank(_served0)):
+                logger.info(
+                    "Remote Whisper retry served '%s' — using the higher-tier "
+                    "transcript", _s2)
+                result = _r2
 
         segments = result["segments"]
         if not segments:

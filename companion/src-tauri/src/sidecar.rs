@@ -222,10 +222,55 @@ pub async fn ensure_running(
     data_dir: PathBuf,
     requested_model: &str,
 ) -> Result<String, String> {
-    let budget = state.effective_budget_gb();
+    let mut budget = state.effective_budget_gb();
     // Honor the model ClipAI selected (synced per request) but cap by budget so
     // it always fits on the GPU. Empty request ⇒ the budget-default tier.
-    let (mut model, compute) = crate::state::whisper_tier_for_request(requested_model, budget);
+    let (mut model, mut compute) =
+        crate::state::whisper_tier_for_request(requested_model, budget);
+    // The budget cap must not FINALIZE while Ollama is squatting on VRAM the
+    // transcription is entitled to. Measured: a connection test left a 14B
+    // resident (10-min keep_alive), the budget read 1.2 GB, and a whole
+    // episode was decoded on `small`/beam-1 against a large-v3-turbo request
+    // — every downstream stage (translation, theme detection, names) built
+    // on that garbage. ClipAI already frees whisper for the LLM phase; this
+    // is the same courtesy in the other direction: evict the models, take a
+    // FRESH baseline (the stale one may embed the very VRAM being freed),
+    // and re-derive the tier before conceding a downgrade.
+    if !requested_model.trim().is_empty()
+        && crate::state::whisper_rank(requested_model) > crate::state::whisper_rank(model)
+        && crate::ollama::loaded_vram_bytes().await > 0
+    {
+        let (n, names) = crate::ollama::unload_all().await;
+        log::info!(
+            "whisper request '{requested_model}' would be capped to '{model}' by a \
+             {budget:.1} GB budget — unloaded {n} Ollama model(s) ({}) to make room",
+            names.join(", ")
+        );
+        // Give the driver a moment to reclaim the freed allocations.
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let snap = tokio::task::spawn_blocking(crate::gpu::snapshot)
+            .await
+            .unwrap_or_default();
+        if snap.vram_total_mb > 0 {
+            *state.gpu.lock().unwrap() = snap.clone();
+            if crate::ollama::resident_model_count().await == Some(0) {
+                let baseline = snap.vram_total_mb.saturating_sub(snap.vram_free_mb);
+                state
+                    .gpu_baseline_used_mb
+                    .store(baseline, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        budget = state.effective_budget_gb();
+        let (m2, c2) = crate::state::whisper_tier_for_request(requested_model, budget);
+        if m2 != model {
+            log::info!(
+                "whisper tier recovered after freeing Ollama VRAM: '{model}' → '{m2}' \
+                 (budget now {budget:.1} GB)"
+            );
+        }
+        model = m2;
+        compute = c2;
+    }
     // Transcription quality: beam search (accuracy) + optionally the full
     // large-v3 model, scaled to the VRAM budget. This is where the extra VRAM
     // buys Netflix/YouTube-grade captions.
