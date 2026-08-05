@@ -1902,6 +1902,7 @@ def respell_text_from_glossary(texts: list,
         # OTHER names (the Trois/Treize failure mode, restated for aliases).
         if aliases:
             hit = aliases.get(bl)
+            _hit_score = 1.0 if hit is not None else 0.0
             if hit is None:
                 # Short words demand more: at five letters the 0.80 floor
                 # admitted "aries"→"aresa" (0.80 exactly) and CORRECT text
@@ -1921,6 +1922,28 @@ def respell_text_from_glossary(texts: list,
                         0.0)
                     if ranked_a[0][0] - _rival >= _GLOSSARY_RESPELL_MARGIN:
                         hit = _top
+                        _hit_score = ranked_a[0][0]
+            if hit is not None and _hit_score < 1.0:
+                # The romaji reading is not the only letter evidence — the
+                # official ENGLISH spellings compete too. Measured failure:
+                # "Relina" sat 0.80 from レイア's "reia" and only 0.67 from
+                # リリーナ's "ririna", so the alias path renamed Relena to
+                # "Leia" — while the official spelling "Relena" itself was
+                # 0.83 from the token, closer than the winning alias. When
+                # some official's own letters beat the alias hit, the token
+                # is that official's misspelling.
+                _best_off, _best_r = None, 0.0
+                for w in _official_words:
+                    if len(w) < 4:
+                        continue
+                    _r = difflib.SequenceMatcher(None, bl, w.lower()).ratio()
+                    if _r > _best_r:
+                        _best_off, _best_r = w, _r
+                if (_best_off and _best_r > _hit_score
+                        and _best_off.lower() != hit.lower()
+                        and _best_off.lower() not in
+                        {p.lower() for p in hit.split()}):
+                    hit = _best_off
             if hit and hit.lower() != bl and not _is_inflection_of(bl, hit):
                 resolved[word] = hit
                 return hit

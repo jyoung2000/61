@@ -5506,13 +5506,24 @@ async def _background_post_processing(
                 # NO sentence-final punctuation; split only cues with ≥2
                 # complete sentences), so they never fight.
                 if bool(getattr(settings, "TRANSCRIPT_SPLIT_RUNON_CUES", True)):
-                    from backend.services.transcript_sanitize import split_run_on_cues
+                    from backend.services.transcript_sanitize import (
+                        drop_junk_cues, split_run_on_cues)
                     _split, _split_changed = split_run_on_cues(_translated_out, target_lang)
                     if _split_changed:
                         logger.info("[%s] Split run-on translated cues: %d → %d cue(s) "
                                     "(one thought per cue)",
                                     job_id, len(_translated_out), len(_split))
                         _translated_out = _split
+                        # Splitting can MINT junk: a measured run carried
+                        # "Dialogue end. Sound effect" as one cue past the
+                        # junk filter (too many words to convict), and the
+                        # split above cut it into two annotation cues that
+                        # shipped. Anything the split creates gets re-vetted.
+                        _translated_out, _post_junk = drop_junk_cues(_translated_out)
+                        if _post_junk:
+                            logger.info(
+                                "[%s] Junk-cue filter (post-split): dropped %s",
+                                job_id, "; ".join(_post_junk[:6]))
             except Exception:
                 pass
 

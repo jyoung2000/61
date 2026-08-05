@@ -913,3 +913,23 @@ def test_glossary_miner_ignores_paragraph_initial_words():
     names = _mine_glossary_names(text)
     assert "Meanwhile" not in names     # paragraph-initial never counts
     assert "Heero" in names             # two mid-sentence uses qualify it
+
+
+def test_alias_hit_yields_to_a_closer_official_english_spelling():
+    """Run-26: "Relina" sat 0.80 from レイア's romaji "reia" and only 0.67
+    from リリーナ's "ririna", so the alias path renamed Relena to "Leia" —
+    while the official spelling "Relena" itself was 0.83 from the token.
+    The official whose LETTERS sit closest to the token owns the fix."""
+    from backend.services.canonical_names import respell_text_from_glossary
+    aliases = {"reia": "Leia", "ririna": "Relena", "darian": "Darlian"}
+    glossary = ["Relena Darlian", "Leia Barton"]
+    out, n, samples = respell_text_from_glossary(
+        ["So Relina came too"], glossary, aliases=aliases)
+    assert out == ["So Relena came too"]
+    assert samples == ["Relina→Relena"]
+    # …but an alias hit that IS the closest evidence keeps winning:
+    # "dorian"→"darian" (0.83) beats the official "darlian" (0.77).
+    out2, _, s2 = respell_text_from_glossary(
+        ["I heard that Dorian will attend"], glossary, aliases=aliases)
+    assert out2 == ["I heard that Darlian will attend"]
+    assert s2 == ["Dorian→Darlian"]

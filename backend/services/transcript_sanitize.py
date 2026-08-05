@@ -1680,7 +1680,12 @@ _ASTERISK_MARKUP_RE = re.compile(r"^\s*(?:\*[^*]+\*\s*)+$")
 # merely contains the word "translation" is untouched.
 _META_NOTE_RE = re.compile(
     r"(?i)\bcheck(?:\s+the)?\s+translation\b|\btranslation\s+note\b"
-    r"|^\(?\s*TN\s*:|^\s*note\s*:\s")
+    r"|^\(?\s*TN\s*:|^\s*note\s*:\s"
+    # The model narrating its own copy-editing as if it were dialogue — a
+    # measured run shipped "Misspelled: 'Capturing' corrected." as a cue.
+    # Anchored to the leading "Misspell…" so a character SAYING the word
+    # mid-sentence ("You misspelled my name!") is untouched.
+    r"|^\s*misspell\w*\b")
 # A cue that IS a bare title/episode card readout and nothing else. At most
 # one short word or a number may follow ("Title Strange.", "Episode 1",
 # "Episode") — a sentence that merely STARTS near these words has more
@@ -1797,9 +1802,14 @@ def looks_like_annotation_artifact(text: str) -> bool:
 
     Deliberately narrow: the prose branch fires only when EVERY word comes from
     a closed two-part vocabulary (a soundtrack noun plus an optional
-    start/stop verb) and the cue is at most three words. "Music to my ears" and
+    start/stop verb) and the cue is at most six words. "Music to my ears" and
     "The sound of it" both survive, because ``to``/``my``/``ears``/``the``/``of``
-    are in neither set. Pure and deterministic."""
+    are in neither set. The cap is six, not three, because a measured run fused
+    TWO annotations into one cue — "Dialogue end. Sound effect" — which sat
+    over the 3-word cap here, survived the junk filter, and was then cut into
+    two separate junk cues by the run-on splitter downstream. All-words-in-
+    vocabulary is the load-bearing test; the cap only bounds the scan. Pure
+    and deterministic."""
     t = (text or "").strip()
     if not t or t.startswith("["):
         # Square brackets are the caption-marker namespace, and "[♪ music ♪]"
@@ -1817,7 +1827,7 @@ def looks_like_annotation_artifact(text: str) -> bool:
         if len(_w) <= 4 or not any(ch.isascii() and ch.isalpha() for ch in inner):
             return True
     words = [w for w in re.split(r"[\s\W_]+", t.lower()) if w]
-    if not words or len(words) > 3:
+    if not words or len(words) > 6:
         return False
     if not any(w in _ANNOTATION_WORDS for w in words):
         return False

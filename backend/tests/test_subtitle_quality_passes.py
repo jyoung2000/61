@@ -1355,6 +1355,31 @@ def test_annotation_artifacts_are_convicted():
         assert looks_like_annotation_artifact(t), t
 
 
+def test_fused_annotation_pair_is_convicted_before_the_splitter_minted_it():
+    """Run-26: "Dialogue end. Sound effect" travelled as ONE cue — four
+    words, over the old 3-word cap — survived the junk filter, and the
+    run-on splitter then cut it into two junk cues that SHIPPED. All-words-
+    in-vocabulary is the conviction test; the cap only bounds the scan."""
+    from backend.services.transcript_sanitize import looks_like_annotation_artifact
+    assert looks_like_annotation_artifact("Dialogue end. Sound effect")
+    assert looks_like_annotation_artifact("Music starts. Dialogue begins.")
+    # Six words of pure vocabulary still convicts; one real word acquits.
+    assert looks_like_annotation_artifact("More dialogue music sound effects end")
+    assert not looks_like_annotation_artifact("No sound came from the room")
+
+
+def test_meta_editing_note_cue_is_dropped():
+    """Run-26 shipped "Misspelled: 'Capturing' corrected." as a subtitle —
+    the model narrating its own copy-editing. Dropped by the meta-note net;
+    a character SAYING the word mid-sentence is untouched."""
+    from backend.services.transcript_sanitize import drop_junk_cues
+    rows = [{"start": 1, "end": 2, "text": "Misspelled: 'Capturing' corrected."},
+            {"start": 3, "end": 4, "text": "You misspelled my name!"}]
+    kept, dropped = drop_junk_cues(rows)
+    assert [r["text"] for r in kept] == ["You misspelled my name!"]
+    assert len(dropped) == 1
+
+
 def test_annotation_filter_spares_dialogue_and_markers():
     from backend.services.transcript_sanitize import looks_like_annotation_artifact
     for t in ("[♪ music ♪]", "[♪ Opening theme ♪]", "Music to my ears",
