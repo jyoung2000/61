@@ -1945,3 +1945,21 @@ def test_condense_threshold_leaves_merely_brisk_cues_alone():
     # A ~21-cps cue — brisk, still under the trigger.
     brisk = "Colonies do not surrender to Alliance threats."   # 45 chars
     assert len(brisk) / 2.1 < settings.SUBTITLE_CONDENSE_CPS
+
+
+def test_single_letter_and_elongated_scream_cues_are_dropped():
+    """Run-27 shipped a bare "S" for 2.5s (music-sting residue) and "AAAH"/
+    "AAAHH" for ~4s each — elongated vocalizations past the exact-match set.
+    "I", brief interjections, and real words (even stretched, like "Nooo")
+    all stay."""
+    from backend.services.transcript_sanitize import drop_junk_cues
+    rows = [{"start": 401, "end": 403.5, "text": "S"},
+            {"start": 10, "end": 13.8, "text": "AAAH"},
+            {"start": 20, "end": 23.9, "text": "AAAHH"},
+            {"start": 30, "end": 31.0, "text": "Ah"},
+            {"start": 40, "end": 41.5, "text": "I"},
+            {"start": 50, "end": 52.0, "text": "No!"},
+            {"start": 60, "end": 66.0, "text": "Nooo"}]
+    kept, dropped = drop_junk_cues(rows)
+    assert [r["text"] for r in kept] == ["Ah", "I", "No!", "Nooo"]
+    assert len(dropped) == 3

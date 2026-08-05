@@ -933,3 +933,32 @@ def test_alias_hit_yields_to_a_closer_official_english_spelling():
         ["I heard that Dorian will attend"], glossary, aliases=aliases)
     assert out2 == ["I heard that Darlian will attend"]
     assert s2 == ["Dorian→Darlian"]
+
+
+def test_common_word_time_is_never_respelled_and_short_alias_keys_cannot_win_loosely():
+    """Run-27 shipped "Escaping in Tiel" for "escaping in time": the 3-letter
+    romaji clip "tie" (ティエル) sat 0.857 from the ordinary word "time".
+    Two independent guards now block it — "time" is a common word, and keys
+    under 4 letters are exact-hit-only."""
+    from backend.services.canonical_names import respell_text_from_glossary
+    aliases = {"tie": "Tiel", "tieru": "Tiel", "darian": "Darlian"}
+    out, n, s = respell_text_from_glossary(
+        ["We are escaping in Time", "Arrive in time for the party"],
+        ["Tiel Noembreux", "Relena Darlian"], aliases=aliases)
+    assert out[0] == "We are escaping in Time" and out[1].endswith("party")
+    assert n == 0
+
+
+def test_honorific_preceded_token_reaches_the_loose_matcher():
+    """Run-27 shipped "Mr. Dorian" four times: the positional guard reads the
+    honorific's period as a sentence boundary, and the exact-alias pass only
+    fixes exact keys. An honorific IN FRONT of a token is affirmative
+    evidence of a name, so it earns the full loose-match path."""
+    from backend.services.canonical_names import respell_text_from_glossary
+    aliases = {"darian": "Darlian"}
+    out, n, s = respell_text_from_glossary(
+        ["I've been waiting for Mr. Dorian!", "Please answer, Mr. Dorian."],
+        ["Relena Darlian"], aliases=aliases)
+    assert out == ["I've been waiting for Mr. Darlian!",
+                   "Please answer, Mr. Darlian."]
+    assert s and all("Dorian→Darlian" == x for x in s)

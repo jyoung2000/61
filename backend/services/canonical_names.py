@@ -807,6 +807,8 @@ meteorite atmosphere spaceport airport spaceship area zone sector region part
 parts log logs wing area everyone everything something anything nothing
 someone anyone perhaps maybe suddenly finally probably already almost
 morning evening tonight today tomorrow yesterday minister government official
+time times moment moments minute minutes second seconds hour hours week weeks
+month months year years birthday party school class semester student students
 """.split())
 
 # TitleCase run: 1-3 capitalized words (Latin incl. extended chars like ō),
@@ -1776,6 +1778,17 @@ _KANA_ALIAS_RATIO = 0.8
 _TEXT_NAME_TOKEN_RE = re.compile(
     r"(?<![.!?…]\s)(?<!^)\b([A-Z][A-Za-z'’]{2,})\b", re.MULTILINE)
 
+# A token right after an honorific/rank. The positional regex above reads
+# "Mr. Dorian" as sentence-initial (the abbreviation's period) and skips it,
+# and the exact-alias pass can only fix exact dictionary keys — so a measured
+# run shipped "Mr. Dorian" four times while the loose matcher that knows
+# darian→Darlian never saw it. An honorific in FRONT of a token is
+# affirmative evidence it names a person — stronger than mid-sentence
+# capitalization — so these tokens earn the full loose-match path.
+_HONORIFIC_TOKEN_RE = re.compile(
+    r"\b(?:Mr|Mrs|Ms|Dr|Miss|Lady|Sir|Captain|Colonel|Lieutenant|General|"
+    r"Professor|Master)\.?\s+([A-Z][A-Za-z'’]{2,})\b")
+
 
 def _spelling_variants(token: str) -> set:
     """``token`` plus its possessive and regular-plural bases.
@@ -1910,10 +1923,16 @@ def respell_text_from_glossary(texts: list,
                 # that "dorlian"→"dorian" (0.92) and "dorian"→"darian"
                 # (0.83) both need.
                 _floor = _KANA_ALIAS_RATIO if len(bl) >= 6 else 0.85
+                # Keys under 4 letters carry too little signal for a LOOSE
+                # match: the 3-letter clip "tie" (ティエル) sat 0.857 from the
+                # ordinary word "time", and a measured run shipped "Escaping
+                # in Tiel" for "escaping in time". Short keys still work as
+                # EXACT hits above; they just can't win on ratio.
                 ranked_a = sorted(
                     ((difflib.SequenceMatcher(None, bl, a).ratio(), a)
                      for a in aliases
-                     if a[:1] == bl[:1] and abs(len(a) - len(bl)) <= 2),
+                     if len(a) >= 4
+                     and a[:1] == bl[:1] and abs(len(a) - len(bl)) <= 2),
                     reverse=True)
                 if ranked_a and ranked_a[0][0] >= _floor:
                     _top = aliases[ranked_a[0][1]]
@@ -1995,7 +2014,11 @@ def respell_text_from_glossary(texts: list,
     out, n, samples = [], 0, []
     for raw in texts:
         line = str(raw or "")
-        for word in set(_TEXT_NAME_TOKEN_RE.findall(line)):
+        # Position-vetted tokens plus honorific-preceded tokens ("Mr. X"),
+        # which the positional guard misreads as sentence-initial.
+        _cands = set(_TEXT_NAME_TOKEN_RE.findall(line))
+        _cands |= set(_HONORIFIC_TOKEN_RE.findall(line))
+        for word in _cands:
             tok = _target(word)
             if not tok:
                 continue

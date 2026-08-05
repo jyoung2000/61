@@ -2035,12 +2035,30 @@ def drop_junk_cues(rows: list, vocalization_max_dwell_s: float = 2.5,
         if _PREVIEW_STUB_RE.search(txt):
             dropped.append(f"preview-stub:{txt[:40]!r}")
             continue
+        # A single Latin letter is never a subtitle (except "I"): a measured
+        # run held a bare "S" on screen for 2.5 seconds — decode residue from
+        # a music sting. CJK is exempt (one character is a real word there).
+        if (len(txt.rstrip(".!?…")) == 1 and txt[0].isascii()
+                and txt[0].isalpha() and txt[0].upper() != "I"):
+            dropped.append(f"letter:{txt!r}")
+            continue
         norm = _echo_norm(txt)
         if norm and dur > vocalization_max_dwell_s:
             words = norm.split()
+
+            def _is_vocal(w: str) -> bool:
+                if w in _VOCALIZATION:
+                    return True
+                # Elongated screams: "aaah", "aaahh", "nooo" are the same
+                # vocalizations stretched — collapse letter runs both ways
+                # before giving up (a measured run shipped "AAAH" for 3.8s
+                # and "AAAHH" for 3.9s past the exact-match set).
+                w2 = re.sub(r"(.)\1{2,}", r"\1\1", w)   # 3+ → 2
+                w1 = re.sub(r"(.)\1+", r"\1", w)        # 2+ → 1
+                return w2 in _VOCALIZATION or w1 in _VOCALIZATION
+
             _laugh = words and all(_LAUGH_TOKEN_RE.match(w) for w in words)
-            if _laugh or (len(words) <= 2
-                          and all(w in _VOCALIZATION for w in words)):
+            if _laugh or (len(words) <= 2 and all(_is_vocal(w) for w in words)):
                 dropped.append(f"vocalization:{txt[:32]!r} ({dur:.1f}s)")
                 continue
         kept.append(r)
@@ -2230,9 +2248,33 @@ def collapse_theme_by_music_spans(segments, music_spans: list,
                         if _proper_noun_count(
                             (rows[i].get("text") or "").strip()) == 0)
                     if _pn0 < 0.6 * len(grp):
+                        logger.info(
+                            "theme collapse (two-signal): %s group %.1f-%.1fs "
+                            "rejected — %d/%d cues carry proper nouns",
+                            label, g_start, g_end,
+                            len(grp) - _pn0, len(grp))
                         continue
                     cover = _raw_cover(g_start, g_end)
-                    if cover < 0.30:
+                    # A LONG lyric-shaped run earns a lower coverage floor
+                    # in the CLOSING window: a vocal-dense ED classifies as
+                    # speech nearly wall-to-wall (the vocals ARE the song),
+                    # so its instrumental intro/bridges may be all the music
+                    # the classifier ever sees — a measured run shipped a
+                    # 14-cue, 55-second ED as dialogue with every text test
+                    # passing and only the 30% floor in the way. Dialogue
+                    # scenes don't produce 8+ contiguous pn-free cues over
+                    # 40+ seconds with ANY music coverage in the tail.
+                    _floor = (0.15 if (label == _THEME_END_LABEL
+                                       and len(grp) >= 8
+                                       and g_end - g_start >= 40.0)
+                              else 0.30)
+                    if cover < _floor:
+                        logger.info(
+                            "theme collapse (two-signal): %s group %.1f-%.1fs "
+                            "rejected — %d cue(s), music fragments cover "
+                            "%.0f%% (< %.0f%% floor)",
+                            label, g_start, g_end, len(grp),
+                            cover * 100.0, _floor * 100.0)
                         continue
                     logger.info(
                         "theme collapse (two-signal): %s — %d lyric-shaped "
