@@ -155,6 +155,70 @@ pub async fn resident_models() -> Vec<serde_json::Value> {
         .unwrap_or_default()
 }
 
+/// Running models that spilled to system RAM even though the card could hold
+/// them right now: `size_vram` is less than half the model's footprint while
+/// `free VRAM + what it already holds` covers the full footprint. These are
+/// eviction candidates — Ollama pins a model to whatever placement it chose at
+/// LOAD time for as long as keep_alive lasts, so a model scheduled onto the
+/// CPU during a moment of VRAM pressure (e.g. whisper transcribing) stays on
+/// the CPU long after the pressure clears. Unloading it lets the scheduler
+/// re-place the next request on the GPU. Fail-open to an empty list.
+pub async fn cpu_spilled_models(free_vram_mb: u64) -> Vec<String> {
+    let Ok(resp) = reqwest::Client::new()
+        .get(format!("http://{OLLAMA_LOCAL}/api/ps"))
+        .timeout(std::time::Duration::from_secs(2))
+        .send()
+        .await
+    else {
+        return Vec::new();
+    };
+    let Ok(json) = resp.json::<serde_json::Value>().await else {
+        return Vec::new();
+    };
+    json["models"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|m| {
+                    let name = m.get("name")?.as_str()?;
+                    let size_mb = m.get("size")?.as_u64()? / (1024 * 1024);
+                    let vram_mb = m
+                        .get("size_vram")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0)
+                        / (1024 * 1024);
+                    if size_mb == 0 {
+                        return None;
+                    }
+                    let mostly_cpu = vram_mb * 2 < size_mb;
+                    // Evicting frees its current VRAM share too, so the
+                    // budget for a full-GPU reload is free + already-held.
+                    let would_fit = free_vram_mb + vram_mb >= size_mb;
+                    if mostly_cpu && would_fit {
+                        Some(name.to_string())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Unload ONE resident model immediately (POST /api/generate keep_alive=0).
+/// The next request for it reloads from scratch — with placement re-decided
+/// against CURRENT free VRAM. Returns whether Ollama accepted the request.
+pub async fn unload_model(name: &str) -> bool {
+    reqwest::Client::new()
+        .post(format!("http://{OLLAMA_LOCAL}/api/generate"))
+        .json(&serde_json::json!({ "model": name, "keep_alive": 0 }))
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false)
+}
+
 /// Unload every resident model (POST /api/generate keep_alive=0 per model) to
 /// free VRAM immediately — for the "Free GPU memory" button and idle auto-free.
 /// Returns (models_unloaded, names). Works whether Ollama is managed or external.

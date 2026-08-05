@@ -1692,7 +1692,19 @@ _OLLAMA_OOM_PATTERNS = (
 # Remembers the GPU layer count that last loaded successfully for a model, so
 # every subsequent batch starts at the known-good rung instead of re-OOMing at
 # num_gpu=99 and reloading the model each time (each reload costs ~10-15s).
-_GPU_LAYERS_GOOD: dict[str, int] = {}
+#
+# Two hard rules, both from a measured failure where a whole translation ran
+# on the CPU beside 10.3 GB of FREE VRAM:
+#   * the CPU rung (0) is NEVER remembered — it is the ladder's last resort,
+#     not a placement preference, and memoizing it once (whisper still held
+#     the card during batch 0) pinned every later batch to the CPU for the
+#     LIFE OF THE PROCESS, jobs later, long after the VRAM freed;
+#   * a remembered rung EXPIRES (``_GPU_LAYERS_GOOD_TTL_S``), so a partial
+#     offload probed under temporary pressure re-probes the full ladder once
+#     the pressure is gone instead of paying the partial rung forever.
+# Values are ``(rung, time.monotonic() when recorded)``.
+_GPU_LAYERS_GOOD: dict[str, tuple] = {}
+_GPU_LAYERS_GOOD_TTL_S = 600.0
 
 
 def _is_ollama_oom(text: str) -> bool:
@@ -1715,11 +1727,18 @@ def _translation_gpu_ladder(model: str, total_vram_gb: float = 0.0) -> list[int]
     except Exception:
         return [99, 0]
     good = None
+    import time as _t
     for k, v in _GPU_LAYERS_GOOD.items():
         try:
-            if _ollama_names_match(k, model):
-                good = v
-                break
+            if not _ollama_names_match(k, model):
+                continue
+            _rung, _at = v if isinstance(v, tuple) else (v, 0.0)
+            if _rung <= 0:
+                continue                # CPU is never a remembered preference
+            if _t.monotonic() - _at > _GPU_LAYERS_GOOD_TTL_S:
+                continue                # stale — re-probe the full ladder
+            good = _rung
+            break
         except Exception:
             pass
     if good is not None:
@@ -1869,11 +1888,20 @@ async def _translate_batch_via_ollama(
                     continue
                 resp.raise_for_status()
                 data = resp.json()
-                # Remember the rung that worked so later batches skip the OOM dance.
-                _GPU_LAYERS_GOOD[model] = int(n_gpu)
+                # Remember the rung that worked so later batches skip the OOM
+                # dance — GPU rungs ONLY. Recording the CPU rung here is what
+                # pinned a 14B to the CPU beside 10 GB of free VRAM: whisper
+                # held the card during batch 0, the ladder correctly fell to
+                # 0, and the memo then made 0 the STARTING rung of every
+                # later call in the process.
+                if int(n_gpu) > 0:
+                    import time as _t
+                    _GPU_LAYERS_GOOD[model] = (int(n_gpu), _t.monotonic())
                 if n_gpu == 0:
                     logger.info("Ollama translation ran on CPU (model=%s) — GPU "
-                                "offload exhausted; expect slower throughput", model)
+                                "offload exhausted; expect slower throughput. "
+                                "The next call re-probes the GPU ladder "
+                                "(CPU is never remembered as a preference)", model)
                 else:
                     logger.debug("Ollama translation ran with num_gpu=%s (model=%s)",
                                  n_gpu, model)

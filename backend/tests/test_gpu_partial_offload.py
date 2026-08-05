@@ -160,14 +160,15 @@ def test_translation_steps_down_to_partial_gpu(monkeypatch):
     # It tried all-GPU first, OOM'd, then ran on a PARTIAL-GPU rung (not CPU).
     assert fake.num_gpus[0] == 99
     assert fake.num_gpus[-1] == 32 and fake.num_gpus[-1] > 0
-    # The working rung is cached for next time.
-    assert T._GPU_LAYERS_GOOD.get(XLATE) == 32
+    # The working rung is cached for next time (with its timestamp).
+    assert T._GPU_LAYERS_GOOD.get(XLATE)[0] == 32
 
 
 def test_translation_cache_skips_oom_dance(monkeypatch):
     monkeypatch.setattr(settings, "OLLAMA_SMALL_GPU_PARTIAL_OFFLOAD", True, raising=False)
     monkeypatch.setattr(settings, "OLLAMA_HOST", "http://x", raising=False)
-    T._GPU_LAYERS_GOOD[XLATE] = 32          # a prior batch already found 32 works
+    import time as _time
+    T._GPU_LAYERS_GOOD[XLATE] = (32, _time.monotonic())  # prior batch found 32
     fake = _FakeClient(succeed_at=32)
     monkeypatch.setattr(T.httpx, "AsyncClient", lambda *a, **k: fake)
 
@@ -199,6 +200,40 @@ def test_gpu_attempts_cap_context_cpu_keeps_full(monkeypatch):
     assert fake.options[-1]["num_ctx"] == 8192
 
 
+def test_cpu_rung_is_never_remembered_as_a_preference(monkeypatch):
+    """Measured failure: whisper held the card during batch 0, the ladder
+    correctly fell to CPU — and the memo then made CPU the STARTING rung of
+    every later call in the process. A 14B translated beside 10.3 GB of
+    free VRAM. The CPU rung is the last resort, never the preference."""
+    monkeypatch.setattr(settings, "OLLAMA_SMALL_GPU_PARTIAL_OFFLOAD", True, raising=False)
+    monkeypatch.setattr(settings, "OLLAMA_HOST", "http://x", raising=False)
+    fake = _FakeClient(succeed_at=0)        # every GPU rung OOMs this time
+    monkeypatch.setattr(T.httpx, "AsyncClient", lambda *a, **k: fake)
+    import asyncio
+    asyncio.run(T._translate_batch_via_ollama("p", XLATE, num_ctx=4096))
+    assert XLATE not in T._GPU_LAYERS_GOOD  # CPU run left NO memo
+    # Next call starts from the top of the ladder again — the GPU gets its
+    # chance back the moment the pressure clears.
+    fake2 = _FakeClient(succeed_at=99)
+    monkeypatch.setattr(T.httpx, "AsyncClient", lambda *a, **k: fake2)
+    asyncio.run(T._translate_batch_via_ollama("p", XLATE, num_ctx=4096))
+    assert fake2.num_gpus[0] > 0
+
+
+def test_stale_gpu_rung_memo_reprobes_the_full_ladder(monkeypatch):
+    """A partial rung probed under TEMPORARY pressure must not be paid
+    forever: past the TTL the ladder starts from the top again."""
+    monkeypatch.setattr(settings, "OLLAMA_SMALL_GPU_PARTIAL_OFFLOAD", True, raising=False)
+    monkeypatch.setattr(settings, "OLLAMA_HOST", "http://x", raising=False)
+    import time as _time
+    T._GPU_LAYERS_GOOD[XLATE] = (32, _time.monotonic() - T._GPU_LAYERS_GOOD_TTL_S - 1)
+    fake = _FakeClient(succeed_at=99)
+    monkeypatch.setattr(T.httpx, "AsyncClient", lambda *a, **k: fake)
+    import asyncio
+    asyncio.run(T._translate_batch_via_ollama("p", XLATE, num_ctx=4096))
+    assert fake.num_gpus[0] == 99           # not the stale 32
+
+
 def test_translation_falls_to_cpu_when_no_gpu_rung_fits(monkeypatch):
     monkeypatch.setattr(settings, "OLLAMA_SMALL_GPU_PARTIAL_OFFLOAD", True, raising=False)
     monkeypatch.setattr(settings, "OLLAMA_HOST", "http://x", raising=False)
@@ -210,4 +245,6 @@ def test_translation_falls_to_cpu_when_no_gpu_rung_fits(monkeypatch):
     out = asyncio.run(T._translate_batch_via_ollama("p", XLATE, num_ctx=4096))
     assert out == "translated"
     assert fake.num_gpus[-1] == 0            # last resort = CPU
-    assert T._GPU_LAYERS_GOOD.get(XLATE) == 0
+    # …but the CPU rung is never memoized as a preference (see the sticky-CPU
+    # failure documented on test_cpu_rung_is_never_remembered_as_a_preference).
+    assert XLATE not in T._GPU_LAYERS_GOOD

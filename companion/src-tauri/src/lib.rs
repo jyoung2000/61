@@ -1462,6 +1462,13 @@ pub fn run() {
                 let state = state.clone();
                 let app_handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
+                    // GPU-residency watchdog state: consecutive ticks a model
+                    // has been seen spilled to CPU, and when it was last
+                    // evicted (per-model cooldown against eviction storms).
+                    let mut spill_ticks: std::collections::HashMap<String, u32> =
+                        std::collections::HashMap::new();
+                    let mut spill_last_evict_ms: std::collections::HashMap<String, u64> =
+                        std::collections::HashMap::new();
                     loop {
                         let snap = tokio::task::spawn_blocking(gpu::snapshot)
                             .await
@@ -1503,6 +1510,43 @@ pub fn run() {
                                 }
                             }
                         }
+
+                        // ── GPU-residency watchdog: a model that Ollama
+                        // scheduled onto the CPU during a moment of VRAM
+                        // pressure stays there for its whole keep_alive, even
+                        // after the pressure clears (measured: qwen2.5:14b
+                        // translating on CPU beside 10.3 GB of free VRAM).
+                        // Evict it so the next request reloads ON the GPU.
+                        if snap.vram_total_mb > 0 {
+                            let spilled =
+                                ollama::cpu_spilled_models(snap.vram_free_mb).await;
+                            // A model no longer spilled (or gone) resets its streak.
+                            spill_ticks.retain(|k, _| spilled.contains(k));
+                            for name in spilled {
+                                let ticks = spill_ticks.entry(name.clone()).or_insert(0);
+                                *ticks += 1;
+                                if *ticks < 2 {
+                                    continue; // could be a load in flight — confirm next tick
+                                }
+                                let now = state::now_ms();
+                                let last =
+                                    spill_last_evict_ms.get(&name).copied().unwrap_or(0);
+                                if now.saturating_sub(last) < 180_000 {
+                                    continue; // per-model cooldown
+                                }
+                                log::info!(
+                                    "gpu watchdog: '{name}' is running on the CPU while \
+                                     {} MB of VRAM is free — unloading it so the next \
+                                     request reloads on the GPU",
+                                    snap.vram_free_mb
+                                );
+                                if ollama::unload_model(&name).await {
+                                    spill_last_evict_ms.insert(name.clone(), now);
+                                    spill_ticks.remove(&name);
+                                }
+                            }
+                        }
+
                         if let Some(tray) = app_handle.tray_by_id("main-tray") {
                             let busy = state.whisper_busy.load(Ordering::Relaxed)
                                 || state.current_job().is_some();
