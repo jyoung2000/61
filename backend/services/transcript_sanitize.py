@@ -888,16 +888,22 @@ def source_chorus_spans(source_rows, head_s: float = 120.0,
             counts: dict = {}
             for i in idxs:
                 # CJK has no inter-sentence whitespace for _sent_split to
-                # cut on — the whole cue is the repetition unit, and CJK is
-                # dense enough that a shorter floor than the Latin chorus
-                # minimum still excludes grunts/particles.
-                ns = _song_norm((rows[i].get("text") or "").strip())
-                if len(ns) >= 6:
-                    counts[ns] = counts.get(ns, 0) + 1
+                # cut on — count the whole cue AND its punctuation-split
+                # pieces (Whisper glues the hook onto different verse text
+                # each repeat, so the full-cue key never matches twice; the
+                # PIECE does). Each cue contributes a key at most once.
+                txt = (rows[i].get("text") or "").strip()
+                keys = {_song_norm(txt)}
+                for piece in re.split(r"[。！？!?…♪、]+", txt):
+                    keys.add(_song_norm(piece.strip()))
+                for ns in keys:
+                    if len(ns) >= 6:
+                        counts[ns] = counts.get(ns, 0) + 1
+                # (the hits pass below rebuilds the same keys per cue)
             chorus = {ns for ns, c in counts.items() if c >= 2}
             if not chorus:
-                logger.debug("source chorus: window %.0f-%.0fs — no repeated "
-                             "line among %d cue(s)", w0, w1, len(idxs))
+                logger.info("source chorus: window %.0f-%.0fs — no repeated "
+                            "line among %d cue(s)", w0, w1, len(idxs))
                 continue
             if len(chorus) < 2:
                 # ONE repeated line can be the song's hook — or a Whisper
@@ -910,13 +916,19 @@ def source_chorus_spans(source_rows, head_s: float = 120.0,
                 only = next(iter(chorus))
                 if (counts[only] > 3 or len(idxs) < 5
                         or len(counts) < max(4, int(0.6 * len(idxs)))):
-                    logger.debug(
+                    logger.info(
                         "source chorus: window %.0f-%.0fs — single repeated "
                         "line rejected (%d occurrence(s), %d distinct of %d)",
                         w0, w1, counts[only], len(counts), len(idxs))
                     continue
-            hits = [i for i in idxs
-                    if _song_norm((rows[i].get("text") or "").strip()) in chorus]
+            def _cue_keys(i: int) -> set:
+                txt = (rows[i].get("text") or "").strip()
+                ks = {_song_norm(txt)}
+                for piece in re.split(r"[。！？!?…♪、]+", txt):
+                    ks.add(_song_norm(piece.strip()))
+                return ks
+
+            hits = [i for i in idxs if _cue_keys(i) & chorus]
             if len(hits) < (3 if len(chorus) >= 2 else 2):
                 continue
             a = min(_st(rows[i]) for i in hits)
@@ -1693,6 +1705,12 @@ _CREDITS_RE = re.compile(
 # Structured-output crumbs glued to a cue's tail ("…now. }`[") — the words
 # are real, the brackets are the batch reply's JSON leaking through.
 _CRUMB_TAIL_RE = re.compile(r"[\s{}\[\]`]*[{}\[\]`]+\s*$")
+# The 次回予告 card readout and its stutter: "Next time preview Part 1
+# Part 2 Part 2 Part 2" shipped as a cue. The reference's own "Next
+# Episode" / "Next, on Gundam Wing, Episode 2." carry no "preview" and no
+# Part-run, and survive.
+_PREVIEW_STUB_RE = re.compile(
+    r"(?i)^next\s+(?:time|episode)\s+preview\b|(?:\bpart\s+\d+\s*){3,}$")
 
 # ``key:value`` tokens — subtitle-file metadata, never spoken English. The
 # right side must start alphanumeric and carry no further colon, so a clock
@@ -1952,6 +1970,9 @@ def drop_junk_cues(rows: list, vocalization_max_dwell_s: float = 2.5,
         if _TITLE_STUB_RE.match(txt):
             dropped.append(f"title-stub:{txt[:32]!r}")
             continue
+        if _PREVIEW_STUB_RE.search(txt):
+            dropped.append(f"preview-stub:{txt[:40]!r}")
+            continue
         norm = _echo_norm(txt)
         if norm and dur > vocalization_max_dwell_s:
             words = norm.split()
@@ -2188,7 +2209,12 @@ def drop_recovered_near_theme_markers(rows: list, before_s: float = 45.0,
         for r in rows or []:
             txt = ((r.get("text") if isinstance(r, dict)
                     else getattr(r, "text", "")) or "").strip()
-            if _is_marker(txt) and "♪" in txt:
+            # THEME markers only. A bare mid-episode "[♪ music ♪]" marks
+            # score under a scene — real dialogue lives right beside it, and
+            # a measured run's guard around one dropped a recovered line at
+            # 682s that was plausibly genuine dialogue. Only the opening/
+            # ending labels testify to a SONG region.
+            if _is_marker(txt) and "♪" in txt and "theme" in txt.lower():
                 try:
                     markers.append(float(
                         (r.get("start") if isinstance(r, dict)

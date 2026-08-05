@@ -1834,10 +1834,43 @@ def respell_text_from_glossary(texts: list,
                if k and v}
     if not texts or not toks:
         return list(texts or []), 0, []
-    tok_lower = {t.lower() for t in toks}
-    single = [t for t in toks if " " not in t and len(t) >= 4]
-    if not single:
+    # Kana-backed officials: the alias VALUES are exactly the names the
+    # series' own published readings vouch for. They are both PROTECTED (a
+    # word already spelled as one is never a misspelling) and, when kana
+    # data exists, the ONLY permitted respell TARGETS: the mined names list
+    # demonstrably carries junk ("Report", "Aretha"-class entries survived
+    # every miner filter), and a measured run REWROTE CORRECT TEXT with it —
+    # "Aries"→"Aretha" three times. An authority that can damage right
+    # answers is worse than no authority; the kana-vouched subset cannot,
+    # because every entry was printed beside its reading on the wiki page.
+    _official_words = set()
+    for v in aliases.values():
+        for w in str(v).split():
+            _official_words.add(w)
+    tok_lower = ({t.lower() for t in toks}
+                 | {w.lower() for w in _official_words}
+                 | {str(v).lower() for v in aliases.values()})
+    if aliases:
+        _allowed_lower = {w.lower() for w in _official_words if len(w) >= 4}
+        single = [t for t in toks
+                  if " " not in t and len(t) >= 4
+                  and t.lower() in _allowed_lower]
+    else:
+        single = [t for t in toks if " " not in t and len(t) >= 4]
+    if not single and not aliases:
         return list(texts or []), 0, []
+
+    def _stem(word_l: str) -> str:
+        for suf in ("ing", "ed", "es", "er", "s"):
+            if word_l.endswith(suf) and len(word_l) - len(suf) >= 4:
+                return word_l[: -len(suf)]
+        return word_l
+
+    def _is_inflection_of(word_l: str, target: str) -> bool:
+        """"Reporting" is not a misspelling of "Report" — it is the same
+        word inflected, and "correcting" it destroys grammar. Measured."""
+        tl = target.lower()
+        return word_l != tl and (_stem(word_l) == tl or _stem(tl) == word_l)
 
     resolved: dict[str, str] = {}
     rejected: set = set()
@@ -1855,6 +1888,14 @@ def respell_text_from_glossary(texts: list,
             rejected.add(word)
             return None
         bl = base.lower()
+        # Ordinary English never gets "corrected" into a name — including by
+        # its STEM: "Reporting" strips to "report", a common word, and a
+        # measured run rewrote it to the junk glossary name "Report".
+        if (bl in _ROSTER_COMMON_WORDS or bl in _ROSTER_SAFE_WORDS
+                or _stem(bl) in _ROSTER_COMMON_WORDS
+                or _stem(bl) in _ROSTER_SAFE_WORDS):
+            rejected.add(word)
+            return None
         # Kana-derived aliases first — they carry the series' own readings,
         # which is stronger evidence than letter distance to an English
         # spelling. Exact hit, or a close hit vetted against aliases of
@@ -1862,21 +1903,30 @@ def respell_text_from_glossary(texts: list,
         if aliases:
             hit = aliases.get(bl)
             if hit is None:
+                # Short words demand more: at five letters the 0.80 floor
+                # admitted "aries"→"aresa" (0.80 exactly) and CORRECT text
+                # became "Aretha". Six-plus letters keep the measured floor
+                # that "dorlian"→"dorian" (0.92) and "dorian"→"darian"
+                # (0.83) both need.
+                _floor = _KANA_ALIAS_RATIO if len(bl) >= 6 else 0.85
                 ranked_a = sorted(
                     ((difflib.SequenceMatcher(None, bl, a).ratio(), a)
                      for a in aliases
                      if a[:1] == bl[:1] and abs(len(a) - len(bl)) <= 2),
                     reverse=True)
-                if ranked_a and ranked_a[0][0] >= _KANA_ALIAS_RATIO:
+                if ranked_a and ranked_a[0][0] >= _floor:
                     _top = aliases[ranked_a[0][1]]
                     _rival = next(
                         (r for r, a in ranked_a[1:] if aliases[a] != _top),
                         0.0)
                     if ranked_a[0][0] - _rival >= _GLOSSARY_RESPELL_MARGIN:
                         hit = _top
-            if hit and hit.lower() != bl:
+            if hit and hit.lower() != bl and not _is_inflection_of(bl, hit):
                 resolved[word] = hit
                 return hit
+        if not single:
+            rejected.add(word)
+            return None
         ranked = sorted(
             ((difflib.SequenceMatcher(
                 None, bl, t.lower()).ratio(), t) for t in single),
@@ -1887,6 +1937,9 @@ def respell_text_from_glossary(texts: list,
         if best < _GLOSSARY_RESPELL_RATIO or (
                 len(ranked) > 1
                 and best - ranked[1][0] < _GLOSSARY_RESPELL_MARGIN):
+            rejected.add(word)
+            return None
+        if _is_inflection_of(bl, tok):
             rejected.add(word)
             return None
         resolved[word] = tok
@@ -1906,8 +1959,15 @@ def respell_text_from_glossary(texts: list,
             return None
         if any(v.lower() in tok_lower for v in _spelling_variants(word)):
             return None                 # already an official spelling
-        hit = aliases.get(base.lower())
-        return hit if hit and hit.lower() != base.lower() else None
+        bl = base.lower()
+        if (bl in _ROSTER_COMMON_WORDS or bl in _ROSTER_SAFE_WORDS
+                or _stem(bl) in _ROSTER_COMMON_WORDS
+                or _stem(bl) in _ROSTER_SAFE_WORDS):
+            return None                 # ordinary English, never a garble
+        hit = aliases.get(bl)
+        if hit and _is_inflection_of(bl, hit):
+            return None
+        return hit if hit and hit.lower() != bl else None
 
     out, n, samples = [], 0, []
     for raw in texts:

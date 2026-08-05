@@ -849,6 +849,82 @@ def test_post_merge_resanitize_now_covers_the_late_leaks():
     assert "kana_aliases_for_job" in src
 
 
+def test_respeller_never_corrupts_correct_text():
+    """Run-25 regression, verbatim: the mined-names list carried junk
+    ("Report", "Aretha") and the respeller REWROTE CORRECT TEXT with it —
+    "Reporting"→"Report" and "Aries"→"Aretha" ×3. Three guards now hold:
+    ordinary English (including by stem) is never a garble; when kana data
+    exists, only kana-backed names may be orthographic targets; and short
+    words need ≥0.85 on the alias loose-match ("aries"→"aresa" was 0.80
+    exactly). The real fixes still fire."""
+    from backend.services.canonical_names import respell_text_from_glossary
+    gloss = ["Report", "Aretha", "Quatre Raberba Winner", "Relena Darlian"]
+    aliases = {"katoru": "Quatre", "kato": "Quatre", "darian": "Darlian",
+               "dorian": "Darlian", "aresa": "Aretha"}
+    texts = ["Reporting strikes to Agent Zechs.",
+             "Then wouldn't the Aries mobile suit be better?",
+             "This is Kato.",
+             "Mr. Dorian, sir.",
+             "I trust Dorlian completely."]
+    out, n, _ = respell_text_from_glossary(texts, gloss, aliases)
+    assert "Reporting" in out[0]              # inflection of junk 'Report'
+    assert "Aries" in out[1]                  # 0.80 alias match, word too short
+    assert out[2] == "This is Quatre."        # exact alias still fires
+    assert out[3].startswith("Mr. Darlian")   # position-exempt exact alias
+    assert "Darlian" in out[4]                # 0.92 loose alias still fires
+    # A junk mined name is never an orthographic AUTHORITY once kana exists.
+    out2, _, _ = respell_text_from_glossary(
+        ["He said Repord filed it."], gloss, aliases)
+    assert "Repord" in out2[0]
+
+
+def test_theme_window_guard_ignores_bare_music_markers():
+    """Run-25 regression: the guard around a mid-episode "[♪ music ♪]"
+    marker dropped a recovered line at 682s that was plausibly real
+    dialogue — score under a scene has dialogue right beside it. Only the
+    opening/ending THEME labels testify to a song region."""
+    from backend.services.transcript_sanitize import (
+        drop_recovered_near_theme_markers)
+    rows = [{"start": 684.0, "end": 689.0, "text": "[♪ music ♪]"},
+            {"start": 682.4, "end": 686.0, "recovered": True,
+             "text": "There is absolutely no absolute good"}]
+    kept, dropped = drop_recovered_near_theme_markers(rows)
+    assert dropped == [] and len(kept) == 2
+
+
+def test_junk_filter_drops_preview_stub_readouts():
+    from backend.services.transcript_sanitize import drop_junk_cues
+    rows = [{"start": float(i), "end": float(i) + 2.0, "text": t}
+            for i, t in enumerate([
+                "Next time preview Part 1 Part 2 Part 2 Part 2",
+                "Next episode preview",
+                "Next Episode",
+                "Next, on Gundam Wing, Episode 2.",
+            ])]
+    kept, dropped = drop_junk_cues(rows)
+    assert len(dropped) == 2
+    assert all("preview-stub" in d for d in dropped)
+    kept_texts = [r["text"] for r in kept]
+    assert "Next Episode" in kept_texts
+    assert "Next, on Gundam Wing, Episode 2." in kept_texts
+
+
+def test_source_chorus_finds_a_hook_glued_onto_different_verses():
+    """Whisper attaches the hook to different verse text on each repeat, so
+    the full-cue key never matches twice — the punctuation-split PIECE does.
+    This is why the detector stayed silent on two real EDs."""
+    from backend.services.transcript_sanitize import source_chorus_spans
+    src = [{"start": 200.0 + 30.0 * i, "end": 204.0 + 30.0 * i,
+            "text": f"作戦の状況を報告する、その{i}。"} for i in range(10)]
+    ed = ["ジャストラブ、君の名前を呼ぶ", "夜風が頬を撫でていく",
+          "君を呼ぶ声がどこかで", "ジャストラブ、待たせないでよ",
+          "遠い空の下で歌う", "誰もいない街角で待つ"]
+    src += [{"start": 1360.0 + 5.0 * i, "end": 1364.0 + 5.0 * i, "text": t}
+            for i, t in enumerate(ed)]
+    spans = source_chorus_spans(src)
+    assert len(spans) == 1 and spans[0][0] == 1360.0
+
+
 def test_glossary_miner_rejects_acronyms():
     """A measured run's glossary shipped 'DVD' as a cast name (the franchise
     page mentions the format constantly, mid-sentence, TitleCase-shaped by
