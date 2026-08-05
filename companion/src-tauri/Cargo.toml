@@ -1,6 +1,6 @@
 [package]
 name = "clipai-companion"
-version = "0.11.1"
+version = "0.11.2"
 description = "ClipAI GPU Companion — share a desktop GPU (Ollama + Whisper) with a ClipAI server over the LAN"
 authors = ["ClipAI"]
 license = "MIT"

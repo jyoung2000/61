@@ -1477,29 +1477,53 @@ pub fn run() {
 
                         // ── Auto-VRAM: track what other apps use and re-share ──
                         if snap.vram_total_mb > 0 {
+                            // Whether OUR whisper sidecar process is resident.
+                            // Its ~1.7 GB is Companion memory, not "other
+                            // apps" — and counting it poisoned the baseline:
+                            // every sidecar start/stop swung the measurement
+                            // past the 1 GB drift gate and RESTARTED Ollama.
+                            // Measured: four managed restarts in three
+                            // minutes, each answering ClipAI's requests with
+                            // 503 while the daemon came back.
+                            let sidecar_alive = state.sidecar.lock().await.is_some();
                             // Baseline (non-companion VRAM) is only meaningful
                             // when Ollama holds no model — else "used" includes
                             // our own model. Measured here so it reflects games.
-                            if ollama::loaded_model_count().await == 0 {
+                            if !sidecar_alive
+                                && ollama::loaded_model_count().await == 0 {
                                 let baseline =
                                     snap.vram_total_mb.saturating_sub(snap.vram_free_mb);
                                 state.gpu_baseline_used_mb.store(baseline, Ordering::Relaxed);
                             }
                             let auto = state.config.lock().unwrap().vram_auto;
                             if auto {
-                                let busy = state.whisper_busy.load(Ordering::Relaxed)
-                                    || state.current_job().is_some();
-                                let managed = state.ollama_child.lock().await.is_some();
+                                let (_inflight, _last_real) = state.real_work_snapshot();
                                 let now = state::now_ms();
+                                // A restart is cheap for a GAME that took the
+                                // card an hour ago; it is fatal for a request
+                                // arriving right now. Hold off while whisper
+                                // is resident, while any real request is in
+                                // flight, and for 2 minutes after the last
+                                // real work — pipeline stages hand off
+                                // whisper→LLM inside that window.
+                                let busy = state.whisper_busy.load(Ordering::Relaxed)
+                                    || state.current_job().is_some()
+                                    || sidecar_alive
+                                    || _inflight
+                                    || now.saturating_sub(_last_real) < 120_000;
+                                let managed = state.ollama_child.lock().await.is_some();
                                 let since = now.saturating_sub(
                                     state.last_auto_apply_ms.load(Ordering::Relaxed));
                                 let baseline =
                                     state.gpu_baseline_used_mb.load(Ordering::Relaxed);
                                 let last = state.last_auto_baseline_mb.load(Ordering::Relaxed);
                                 // Re-apply only when idle and free VRAM has
-                                // drifted >1 GB since we last set the budget, at
-                                // most every 30 s (a restart briefly unloads).
-                                if managed && !busy && since > 30_000 && baseline.abs_diff(last) > 1024 {
+                                // drifted >1 GB since we last set the budget,
+                                // at most every 5 minutes: the re-share exists
+                                // to track slow pressure (a game launching or
+                                // quitting), and every apply is a full daemon
+                                // restart that 503s anything in flight.
+                                if managed && !busy && since > 300_000 && baseline.abs_diff(last) > 1024 {
                                     log::info!(
                                         "auto-vram: free VRAM changed (baseline {last}→{baseline} MB) — re-sharing"
                                     );

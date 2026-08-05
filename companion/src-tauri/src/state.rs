@@ -516,13 +516,13 @@ impl AppState {
         // Every proxy route calls this only after the bearer check passes, so
         // it's a reliable "a ClipAI server is talking to us" signal.
         self.last_clipai_contact.store(now_ms(), Ordering::Relaxed);
-        // Real work vs. a liveness probe: /api/tags, /api/ps and /v1/health are
-        // polled constantly and shouldn't read as "serving jobs".
-        let is_probe = kind == "health"
-            || path.ends_with("/api/tags")
-            || path.ends_with("/api/ps")
-            || path.ends_with("/api/version");
-        if !is_probe {
+        // Real work vs. a read-only lookup: the SAME classifier the idle
+        // reaper and the GUI activity card use. This list used to be a
+        // narrower copy (health/tags/ps/version only), so /api/show and the
+        // log/file-browser polls stamped the "real job" clock here while
+        // ``real_work_snapshot`` correctly ignored them — the two halves of
+        // the same machine disagreeing about what a job is.
+        if !Self::is_probe_traffic(kind, path) {
             self.last_job_ms.store(now_ms(), Ordering::Relaxed);
         }
         let id = self.next_activity_id.fetch_add(1, Ordering::Relaxed);
@@ -553,10 +553,14 @@ impl AppState {
         self.last_request_ms.store(now_ms(), Ordering::Relaxed);
     }
 
-    /// The most recent still-running non-health request, for /v1/health's
+    /// The most recent still-running REAL-work request, for /v1/health's
     /// `current_job` field and the dashboard headline. A Force-ended job id is
     /// skipped so a request still in flight when the user ended it can't keep
-    /// headlining the (now-ended) job.
+    /// headlining the (now-ended) job. Probes are excluded with the same
+    /// classifier the idle reaper uses: ClipAI polls /api/version, /api/tags
+    /// and /api/ps every few seconds, and with only `kind != "health"`
+    /// filtering, every in-flight poll flashed the GUI's "AI inference" card —
+    /// measured as the card "randomly popping up" on an idle rig.
     pub fn current_job(&self) -> Option<ActivityEntry> {
         let suppressed = self.suppressed_jobs.lock().unwrap();
         self.activity
@@ -565,10 +569,32 @@ impl AppState {
             .iter()
             .find(|e| {
                 e.finished_at_ms.is_none()
-                    && e.kind != "health"
+                    && !Self::is_probe_entry(e)
                     && !suppressed.contains_key(&e.job_id)
             })
             .cloned()
+    }
+
+    /// Read-only lookup traffic that must never read as GPU work: health
+    /// checks, model listings, log/status/file-browser polls. The ONE
+    /// classifier shared by ``begin_activity`` (serving-jobs clock),
+    /// ``current_job`` (GUI activity card) and ``real_work_snapshot`` (idle
+    /// reaper) so no two can disagree about what counts as a job.
+    fn is_probe_traffic(kind: &str, path: &str) -> bool {
+        kind == "health"
+            || path.ends_with("/api/tags")
+            || path.ends_with("/api/ps")
+            || path.ends_with("/api/version")
+            || path.ends_with("/api/show")
+            || path.ends_with("/v1/logs")
+            || path.ends_with("/v1/update/status")
+            || path.ends_with("/v1/files/roots")
+            || path.ends_with("/v1/files/list")
+            || path.ends_with("/v1/files/thumb")
+    }
+
+    fn is_probe_entry(e: &ActivityEntry) -> bool {
+        Self::is_probe_traffic(&e.kind, &e.path)
     }
 
     /// Record a progress heartbeat from ClipAI (POST /v1/progress). Also counts
@@ -710,17 +736,7 @@ impl AppState {
             // idle-free window fired 9 minutes late on a real rig (and never,
             // with a browser tab open). Real work = generation, transcription,
             // vision, pulls, and file DOWNLOADS (/v1/files/read) only.
-            let probe = e.kind == "health"
-                || e.path.ends_with("/api/tags")
-                || e.path.ends_with("/api/ps")
-                || e.path.ends_with("/api/version")
-                || e.path.ends_with("/api/show")
-                || e.path.ends_with("/v1/logs")
-                || e.path.ends_with("/v1/update/status")
-                || e.path.ends_with("/v1/files/roots")
-                || e.path.ends_with("/v1/files/list")
-                || e.path.ends_with("/v1/files/thumb");
-            if probe {
+            if Self::is_probe_entry(e) {
                 continue;
             }
             match e.finished_at_ms {
@@ -1090,6 +1106,23 @@ mod tests {
         let (inflight, last_real) = st.real_work_snapshot();
         assert!(!inflight);
         assert_eq!(last_real, 0, "probes must leave the idle clock untouched");
+    }
+
+    /// The "AI inference keeps randomly popping up" bug: ClipAI polls
+    /// /api/version, /api/tags and /api/ps every few seconds, and each
+    /// in-flight poll used to headline the GUI's activity card because
+    /// current_job filtered only `kind == "health"`. A probe in flight is
+    /// not a job; a real generation in flight is.
+    #[test]
+    fn inflight_probes_never_headline_the_activity_card() {
+        let st = test_state();
+        let _a = st.begin_activity("ollama", "/api/version", "", "", "");
+        let _b = st.begin_activity("ollama", "/api/tags", "", "", "");
+        let _c = st.begin_activity("ollama", "/api/ps", "", "", "");
+        assert!(st.current_job().is_none(),
+                "in-flight liveness probes must not read as a job");
+        let _d = st.begin_activity("ollama", "/api/chat", "job9", "Ep 1", "translate");
+        assert_eq!(st.current_job().expect("real work headlines").job_id, "job9");
     }
 
     #[test]
