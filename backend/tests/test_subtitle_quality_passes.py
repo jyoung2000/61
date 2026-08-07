@@ -789,6 +789,30 @@ def test_junk_filter_drops_credit_cards_preambles_and_crumbs():
     assert "The Gundam Deathscythe" in kept_texts
 
 
+def test_junk_filter_drops_eyecatch_stubs_and_bare_digits():
+    """Run-30 shipped the "Part 1" eyecatch card as TWO dialogue cues —
+    "Part" (1.8s) and "1" (0.9s). Both classes go; real dialogue that merely
+    contains a number ("600 seconds until atmospheric entry") and the
+    legitimate imperative "Part ways." stay."""
+    from backend.services.transcript_sanitize import drop_junk_cues
+    rows = [{"start": float(i), "end": float(i) + 2.0, "text": t}
+            for i, t in enumerate([
+                "Part",
+                "1",
+                "Part 1",
+                "Part ways.",
+                "600 seconds until atmospheric entry",
+                "I",
+            ])]
+    kept, dropped = drop_junk_cues(rows)
+    kept_texts = [r["text"] for r in kept]
+    assert len(dropped) == 3
+    assert "Part ways." in kept_texts
+    assert "600 seconds until atmospheric entry" in kept_texts
+    assert "I" in kept_texts
+    assert "Part" not in kept_texts and "1" not in kept_texts
+
+
 def test_recovered_cues_inside_a_song_window_are_dropped():
     """The post-COMPLETE merge runs AFTER the theme collapse decided where
     the songs are, so a recovered lyric/credit fragment walks past every

@@ -132,3 +132,22 @@ def test_numeric_snippet_placeholder_still_unwrapped():
 def test_bare_numeric_literal_left_alone():
     # A "${5}" price/variable literal is NOT a name placeholder — leave it.
     assert tidy_punctuation_artifacts("It costs ${5} today.") == "It costs ${5} today."
+
+
+# ── unmatched bracket artifacts ──────────────────────────────────────────────
+
+def test_leading_unmatched_closer_stripped():
+    # Run-30 shipped "] I'm not going to put up with you!" as a cue.
+    assert (tidy_punctuation_artifacts("] I'm not going to put up with you!")
+            == "I'm not going to put up with you!")
+    assert tidy_punctuation_artifacts(") Yes, sir.") == "Yes, sir."
+
+
+def test_trailing_unmatched_opener_stripped():
+    assert tidy_punctuation_artifacts("We move at dawn. [") == "We move at dawn."
+
+
+def test_balanced_brackets_untouched():
+    assert tidy_punctuation_artifacts("[♪ music ♪]") == "[♪ music ♪]"
+    assert (tidy_punctuation_artifacts("He said [sic] it was fine.")
+            == "He said [sic] it was fine.")

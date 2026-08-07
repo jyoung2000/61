@@ -2195,6 +2195,27 @@ _KATAKANA_RUN_RE = re.compile(r"[ァ-ヴー]{2,}")
 _KATAKANA_FULL_RE = re.compile(r"[ァ-ヴー・]{2,}")
 
 
+# Near-miss acceptance floor. See the calibration table inside
+# kana_name_near_misses: the measured true positive sits at 0.833, the
+# eight measured false positives at 0.667-0.800.
+_NEAR_MISS_RATIO = 0.82
+
+# Ordinary katakana loanwords that appear constantly in anime/military
+# dialogue and must NEVER be treated as a garbled character name, whatever
+# their romaji happens to resemble on the roster. Belt-and-braces beside the
+# ratio floor: シャトル→Quatre (0.769) and レーダー→Lady Une (0.800) both
+# shipped on a measured run before this guard existed.
+_KANA_COMMON_WORDS = frozenset({
+    "シャトル", "レーダー", "モニター", "ミサイル", "システム", "エンジン",
+    "データ", "コロニー", "スーツ", "モビルスーツ", "ポイント", "ビーム",
+    "ライフル", "リーダー", "キャプテン", "チーム", "ベース", "センター",
+    "スクリーン", "レベル", "エネルギー", "カプセル", "メテオ",
+    "オペレーション", "ドクター", "ロボット", "コンピューター", "メンバー",
+    "パイロット", "アンテナ", "カメラ", "ゲート", "タンク", "スピード",
+    "パワー", "ターゲット", "ロック", "メイン", "チャンネル", "ニュース",
+})
+
+
 def kana_name_near_misses(source_texts: list, translated_texts: list,
                           job_id: str = "", max_hits: int = 12) -> list:
     """Cues whose SOURCE carries a (possibly garbled) character-name reading
@@ -2244,20 +2265,54 @@ def kana_name_near_misses(source_texts: list, translated_texts: list,
                     best = (tok, pairs[tok])
                     break               # exact pin ignored — strongest case
                 continue
+            # Ordinary katakana loanwords are the measured false-positive
+            # class: a run's second vote rewrote シャトル (shuttle) into
+            # "Quatre" three times and レーダー (radar) into "Lady Une".
+            if tok in _KANA_COMMON_WORDS:
+                continue
             tr = _kana_reading_romaji(tok)
             if len(tr) < 3 or not tr.isalpha():
                 continue
-            for kana, r, en in readings:
-                if abs(len(tr) - len(r)) > 2:
-                    continue
-                ratio = difflib.SequenceMatcher(None, tr, r).ratio()
-                # 0.66 floor: low enough for the measured s/z garble
-                # (sekusu~zekusu 0.83) with headroom for worse ones, high
-                # enough that unrelated words never pair up.
-                if ratio >= 0.66 and ratio < 1.0 \
-                        and not _has_official(translated_texts[i], en):
-                    if best is None:
-                        best = (tok, en)
+            # BEST match across the whole roster — never first-over-floor.
+            # A measured run flagged リリーナ (Relena herself, not in that
+            # run's pairs) as "Iria Winner" because the loop took the first
+            # reading over the floor instead of asking what explains the
+            # token best.
+            cands = sorted(
+                ((difflib.SequenceMatcher(None, tr, r).ratio(), r, en)
+                 for _kana, r, en in readings),
+                reverse=True)
+            if not cands:
+                continue
+            top_ratio, top_r, top_en = cands[0]
+            # The token IS some official reading verbatim → it is not a
+            # garble of a different name; leave it alone.
+            if top_ratio >= 1.0:
+                continue
+            # 0.82 floor + length-1 gate, both calibrated on a measured
+            # misfire: the one TRUE positive (セクス~ゼクス, an s/z voicing
+            # garble) reads 0.833/len-diff 0, while every false positive
+            # read 0.667-0.800 — シャトル~カトル 0.769 (shuttle→Quatre),
+            # レーダー~レディ・アン 0.800/len-diff 2 (radar→Lady Une),
+            # リリーナ~イリア 0.800 (Relena→Iria), ユラシア~ラシード 0.667
+            # (Eurasia→Rashid), アフターコロニー~カタロニア 0.700
+            # (After Colony→Catalonia), モニター~アルモニア 0.714/len-diff
+            # 2, オズ~ロウ 0.667. Precision beats recall here: a wrong
+            # rewrite injects a wrong NAME into otherwise-correct dialogue.
+            if top_ratio < _NEAR_MISS_RATIO:
+                continue
+            if abs(len(tr) - len(top_r)) > 1:
+                continue
+            # Ambiguous between two DIFFERENT roster names → no single best
+            # explanation → not actionable. (A second reading variant of the
+            # same character never vetoes its own name.)
+            _rival = next((c for c in cands[1:] if c[2] != top_en), None)
+            if _rival is not None and top_ratio - _rival[0] < 0.10:
+                continue
+            if _has_official(translated_texts[i], top_en):
+                continue
+            if best is None:
+                best = (tok, top_en)
         if best:
             out.append((i, best[0], best[1]))
             if len(out) >= max_hits:

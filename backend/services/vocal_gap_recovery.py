@@ -1216,6 +1216,29 @@ async def redecode_quiet_segments(
         cap = int(getattr(settings, "WHISPER_QUIET_REDECODE_MAX", 12))
         idxs = _quiet_candidates(segments, floor, cap)
         if not idxs:
+            # Zero work must be diagnosable from the log alone: "no suspects
+            # because the whole decode was confident" and "no suspects
+            # because the ASR never reported confidence" (avg_logprob absent
+            # or a flat 0.0 on every cue) are opposite verdicts.
+            _lps = []
+            for s in segments or []:
+                _lp = (s.get("avg_logprob") if isinstance(s, dict)
+                       else getattr(s, "avg_logprob", None))
+                try:
+                    if _lp is not None:
+                        _lps.append(float(_lp))
+                except (TypeError, ValueError):
+                    pass
+            _informative = [v for v in _lps if v != 0.0]
+            logger.info(
+                "[%s] quiet redecode: no suspects below %.2f — %d/%d cue(s) "
+                "carry avg_logprob, %d non-zero (min %.2f)%s",
+                job_id, floor, len(_lps), len(segments or []),
+                len(_informative),
+                min(_lps) if _lps else 0.0,
+                "" if _informative else
+                " — the ASR reported no confidence, this pass and the "
+                "[UNRELIABLE ASR] marks are inert on this decode")
             return 0
         os.makedirs(work_dir, exist_ok=True)
         logger.info(

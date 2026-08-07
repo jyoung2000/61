@@ -353,6 +353,13 @@ def tidy_punctuation_artifacts(text: str) -> str:
     # text while repairing the glossary/template leak.
     s = re.sub(r"\$\{([A-Za-z][^{}]*)\}", r"\1", s)
     s = re.sub(r"^[\s。、・]+", "", s)     # leading 。 、 ・
+    # An unmatched CLOSING bracket at the head (a shipped cue read
+    # "] I'm not going to put up with you!") or an unmatched OPENING
+    # bracket at the tail is always an artifact: no legitimate subtitle
+    # starts with a closer or ends with an opener. Balanced markers like
+    # "[♪ music ♪]" start with an opener and are untouched.
+    s = re.sub(r"^[\]\)\}]+\s*", "", s)
+    s = re.sub(r"\s*[\[\(\{]+$", "", s)
     # A SINGLE stray leading period + space ("[.] And you?" → "And you?").
     # Requiring whitespace right after the dot excludes an ellipsis on its
     # own ("... word" has no space after the first dot, so no match).
@@ -804,7 +811,9 @@ async def coherence_audit_and_fix(segments, out_segs, orchestrator,
         + "List the numbers of lines that are INCONSISTENT with their "
         "surrounding lines: a flipped negation or outcome, the wrong "
         "speaker/subject acting, a reply that does not fit the question "
-        "before it, or nonsense inside an otherwise coherent scene.\n"
+        "before it, nonsense inside an otherwise coherent scene, or a line "
+        "that is visibly corrupted (two utterances fused into one, a "
+        "sentence that stops or starts mid-thought, stray fragments).\n"
         "Do NOT flag style, brevity, or lines that are merely abrupt — "
         "only lines a viewer would find contradictory or senseless in "
         f"context. At most {max_fixes} numbers.\n"
@@ -1645,24 +1654,39 @@ async def translate_via_llm(
                         _src_texts, _cur_texts, job_id=job_id,
                         max_hits=_max_sv)
                     if _max_sv and len(_src_texts) == len(_cur_texts) else [])
-            _roster = sorted({v for v in (kana_pairs_for_job(job_id) or {})
-                              .values()})[:12]
+            _all_pairs = kana_pairs_for_job(job_id) or {}
+            _roster = sorted(set(_all_pairs.values()))[:12]
+            # Word-boundary matcher over every roster name: a draft that
+            # ALREADY renders some roster name has committed to an identity,
+            # and a fuzzy source-side reading must never overrule it (the
+            # measured failure: "What's wrong, Relena?" re-voted into
+            # "What's wrong, Iria?").
+            _roster_words = sorted({w for v in _all_pairs.values()
+                                    for w in v.split() if len(w) >= 3})
+            _roster_re = (re.compile(
+                r"\b(?:" + "|".join(re.escape(w) for w in _roster_words)
+                + r")\b", re.IGNORECASE) if _roster_words else None)
             _fixed_n = 0
             for _i, _kana, _official in _sus:
                 _cur = _cur_texts[_i].strip()
                 if not _cur:
                     continue
+                if _roster_re is not None and _roster_re.search(_cur):
+                    continue
                 _p = (
                     "This English subtitle line was translated from the "
-                    "Japanese speech-recognition line below, which contains "
-                    f"a (possibly garbled) character name: {_kana}\n"
+                    "Japanese speech-recognition line below, which may "
+                    f"contain a garbled character name: {_kana}\n"
                     f"Japanese: {_src_texts[_i]}\n"
                     f"English draft: {_cur}\n"
-                    f"That name almost certainly refers to: {_official}"
+                    f"If that Japanese word is this character's name, it "
+                    f"refers to: {_official}"
                     + (f" (cast: {', '.join(_roster)})" if _roster else "")
-                    + ".\nRewrite the English line so it uses the correct "
-                    "name, changing NOTHING else. Output only the rewritten "
-                    "line.")
+                    + ".\nIf it IS the name: rewrite the English line to use "
+                    "the correct name, changing NOTHING else. If it is "
+                    "actually an ordinary word (like 'shuttle', 'radar' or "
+                    "'colony') and not a person's name, output the English "
+                    "draft exactly as it is. Output only the line.")
                 try:
                     _resp = await orchestrator.text_completion(
                         _p, max_tokens=120, timeout=45, job_id=job_id,

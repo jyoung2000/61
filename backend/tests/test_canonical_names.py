@@ -1007,3 +1007,48 @@ def test_kana_near_miss_detector_is_empty_without_a_kana_store(
     monkeypatch.setattr(cn, "_LAST_SERIES_KEY", "")
     cn._glossary_store_save({"other": ["X"]})
     assert cn.kana_name_near_misses(["ゼクスだ"], ["It is him"]) == []
+
+
+# The full roster a measured run resolved for Gundam Wing Ep-1. The
+# second-vote pass "fixed" 10 cues against it and at least 8 were WRONG —
+# ordinary loanwords and correct non-roster words rewritten into roster
+# names. Every one of those pairings must now be rejected by the detector.
+_RUN30_ROSTER = {
+    "ユイ": "Yuy", "デュオ": "Duo", "トロワ": "Trowa", "カトル": "Quatre",
+    "ゼクス": "Zechs", "レディ・アン": "Lady Une", "ラシード": "Rashid",
+    "イリア": "Iria Winner", "カタロニア": "Catalonia", "ロウ": "Lowe",
+    "アルモニア": "Armonia",
+}
+
+
+def test_kana_near_miss_rejects_every_run30_false_positive(
+        tmp_path, monkeypatch):
+    from backend.services.canonical_names import kana_name_near_misses
+    _seed_kana_store(tmp_path, monkeypatch, _RUN30_ROSTER)
+    # (source line, the wrong pairing the run made) — none may fire now
+    false_positives = [
+        "シャトルが接近中",             # shuttle → Quatre (0.769)
+        "レーダーに反応が5つ",          # radar → Lady Une (0.800, len-diff 2)
+        "オズの本部だ",                 # OZ → Lowe (0.667)
+        "東ユラシアに落ちる",           # Eurasia → Rashid (0.667)
+        "アフターコロニー195年",        # After Colony → Catalonia (0.700)
+        "モニターに映せ",               # monitor → Armonia (0.714)
+        "どうしたの、リリーナ",          # Relena → Iria Winner (0.800)
+    ]
+    en = ["The shuttle is approaching", "Five radar contacts",
+          "It's OZ headquarters", "It falls in eastern Eurasia",
+          "After Colony 195", "Put it on the monitor",
+          "What's wrong, Relena?"]
+    hits = kana_name_near_misses(false_positives, en, job_id="")
+    assert hits == [], hits
+
+
+def test_kana_near_miss_still_finds_the_measured_voicing_garble(
+        tmp_path, monkeypatch):
+    # The tightened gates must keep the one TRUE positive: セクス~ゼクス
+    # (0.833, len-diff 0) — the s/z voicing garble that shipped "Sex Unique".
+    from backend.services.canonical_names import kana_name_near_misses
+    _seed_kana_store(tmp_path, monkeypatch, _RUN30_ROSTER)
+    hits = kana_name_near_misses(
+        ["セクス・ユニークが行く"], ["Sex Unique is going"], job_id="")
+    assert (0, "セクス", "Zechs") in hits

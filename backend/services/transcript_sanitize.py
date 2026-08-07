@@ -1823,7 +1823,11 @@ _META_NOTE_RE = re.compile(
 # "Episode") — a sentence that merely STARTS near these words has more
 # after it and falls through.
 _TITLE_STUB_RE = re.compile(
-    r"(?i)^(?:title|episode)(?:\s+(?:\w{1,12}|\d+))?\s*[.!?…]?$")
+    r"(?i)^(?:(?:title|episode)(?:\s+(?:\w{1,12}|\d+))?"
+    # Eyecatch card readouts ("Part 1" — a measured run shipped "Part" and
+    # "1" as two dialogue cues). Only number-ish continuations, so a real
+    # imperative like "Part ways." is never touched.
+    r"|part(?:\s+(?:\d+|one|two|three|i{1,3}))?)\s*[.!?…]?$")
 # A whole cue that is the model INTRODUCING its answer rather than the
 # answer ("Here's the translated subtitle line in English:") — a measured
 # run shipped exactly that as cue text, with the actual translation in the
@@ -2118,8 +2122,13 @@ def drop_junk_cues(rows: list, vocalization_max_dwell_s: float = 2.5,
         # A single Latin letter is never a subtitle (except "I"): a measured
         # run held a bare "S" on screen for 2.5 seconds — decode residue from
         # a music sting. CJK is exempt (one character is a real word there).
-        if (len(txt.rstrip(".!?…")) == 1 and txt[0].isascii()
-                and txt[0].isalpha() and txt[0].upper() != "I"):
+        _bare = txt.rstrip(".!?…")
+        if (len(_bare) == 1 and _bare[0].isascii()
+                and (_bare[0].isdigit()
+                     or (_bare[0].isalpha() and _bare[0].upper() != "I"))):
+            # A single Latin letter or digit is never a subtitle (except
+            # "I"): measured runs held a bare "S" for 2.5s and a bare "1"
+            # (the second half of a "Part 1" eyecatch) as dialogue cues.
             dropped.append(f"letter:{txt!r}")
             continue
         norm = _echo_norm(txt)
