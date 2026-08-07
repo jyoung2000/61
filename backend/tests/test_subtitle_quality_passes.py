@@ -1963,3 +1963,52 @@ def test_single_letter_and_elongated_scream_cues_are_dropped():
     kept, dropped = drop_junk_cues(rows)
     assert [r["text"] for r in kept] == ["Ah", "I", "No!", "Nooo"]
     assert len(dropped) == 3
+
+
+def test_end_soft_run_cannot_collapse_a_scene_that_precedes_the_lyrics():
+    """Run-28: the tail window's SOFT (no-repetition) pass collapsed the
+    birthday scene — 13 quiet, mostly-unpunctuated dialogue cues including
+    "I'll kill you." — as the "ending theme", then chained the real lyrics
+    on, shipping one 124-second marker over 33 cues. Structure is the
+    tiebreak: the ED is the LAST content before the next-episode preview,
+    so an END soft run followed by more non-preview content is a scene."""
+    from backend.services.transcript_sanitize import collapse_song_choruses
+    rows = [
+        {"start": 10.0, "end": 12.0, "text": "The year is After Colony 195."},
+        {"start": 700.0, "end": 702.0, "text": "So it WAS a Gundam."},
+        {"start": 1290.5, "end": 1293.0, "text": "Here you go"},
+        {"start": 1295.0, "end": 1298.5, "text": "It's my birthday tomorrow"},
+        {"start": 1299.0, "end": 1302.5, "text": "I hope you can come to the party"},
+        {"start": 1310.0, "end": 1312.0, "text": "That's terrible"},
+        {"start": 1316.0, "end": 1318.0, "text": "But why"},
+        {"start": 1324.0, "end": 1326.0, "text": "I'll kill you"},
+        {"start": 1341.0, "end": 1347.4, "text": "What kind of person is he"},
+        {"start": 1359.4, "end": 1365.0, "text": "Calling him out of nowhere"},
+        {"start": 1366.0, "end": 1372.0, "text": "He makes me wait how dare he"},
+        {"start": 1373.0, "end": 1379.0, "text": "Out of breath from running here"},
+        {"start": 1380.0, "end": 1386.0, "text": "Just love he gets on my nerves"},
+        {"start": 1387.0, "end": 1393.0, "text": "I only tease him because I like him"},
+        {"start": 1394.0, "end": 1400.0, "text": "Always thinking about him"},
+        {"start": 1401.0, "end": 1407.0, "text": "Sorry I push things a little far"},
+        {"start": 1408.0, "end": 1414.4, "text": "Just love"},
+        {"start": 1425.3, "end": 1430.6,
+         "text": "Marina from the Allied Forces sent a big team to salvage the sunk Gundam."},
+        {"start": 1431.0, "end": 1436.0,
+         "text": "But Zechs from OZ was using the Mobile Suit Cancer."},
+        {"start": 1445.0, "end": 1451.7,
+         "text": "Mobile Suit Gundam Wing Episode 2 The Deathscythe Gundam"},
+    ]
+    out, changed = collapse_song_choruses(rows, "en")
+    texts = [r["text"] for r in out]
+    assert "I'll kill you" in texts and "It's my birthday tomorrow" in texts
+    mk = [r for r in out if r["text"] == "[♪ Ending theme ♪]"]
+    assert len(mk) == 1 and mk[0]["start"] >= 1355
+    assert not any("Just love" in t for t in texts)
+
+
+def test_theme_marker_span_cap_vetoes_scene_swallowing_markers():
+    """Belt-and-braces behind the structural veto: any minted marker whose
+    span exceeds the 110s cap (reference lyric blocks are 56-66s) is refused
+    at materialization and its absorbed cues are restored."""
+    import backend.services.transcript_sanitize as TS
+    assert TS._THEME_MARKER_MAX_SPAN_S == 110.0

@@ -719,6 +719,13 @@ _PREVIEW_RE = re.compile(
 _CHORUS_MIN_CHARS = 12
 _LYRIC_MAX_CHARS = 48
 _THEME_MIN_SPAN_S = 12.0
+# Hard ceiling on ONE theme marker's span. The reference episode's whole OP
+# lyric block is 66s and its ED block 56s; a measured failure minted a
+# 124-second "ending theme" that had swallowed a full dialogue scene before
+# chaining the real lyrics on. A marker this long is out of distribution —
+# refuse it and ship the cues instead: a leaked lyric line is recoverable,
+# deleted dialogue is not.
+_THEME_MARKER_MAX_SPAN_S = 110.0
 # Through-composed OP/ED themes (verses all distinct → no repeated chorus) are
 # caught by a repetition-INDEPENDENT signal instead: a long, contiguous,
 # single-speaker, proper-noun-free run in the head/tail window. Real dialogue
@@ -1017,6 +1024,7 @@ def collapse_song_choruses(segments, target_lang: str = "en"):
 
         drop = set()
         marker_at = {}
+        runs_at: dict = {}   # marker key -> indices its runs dropped (for veto)
         for w0, w1, label in windows:
             idxs = [i for i, r in enumerate(rows)
                     if (r.get("text") or "").strip()
@@ -1133,13 +1141,53 @@ def collapse_song_choruses(segments, target_lang: str = "en"):
                     trun = _longest_theme_run(rows, grp, _is_preview,
                                               pn_fn=_pn, soft=True)
                     if len(trun) >= _THEME_RUN_MIN_CUES and _vet_soft_run(trun):
+                        # A SOFT run carries no repetition evidence — only
+                        # shape — and in the CLOSING window that shape also
+                        # fits a quiet dialogue scene: a measured run
+                        # collapsed the birthday scene (13 mostly-
+                        # unpunctuated cues, "I'll kill you." included)
+                        # as the "ending theme", then chained the real
+                        # lyrics onto it — a 124-second marker over 33
+                        # cues. Structure disambiguates: the ED is the
+                        # LAST content before the next-episode preview, so
+                        # a soft run followed by more NON-preview content
+                        # in the window is a scene, not the song.
+                        if label == _THEME_END_LABEL:
+                            _after = [
+                                j for j in idxs
+                                if j > max(trun) and j not in drop
+                                and not (rows[j].get("text") or "")
+                                .strip().startswith("[")]
+                            _blockers = [
+                                j for j in _after
+                                if not _is_preview(
+                                    (rows[j].get("text") or "").strip())]
+                            if _blockers:
+                                logger.info(
+                                    "theme collapse: END soft run %.1f-%.1fs "
+                                    "(%d cues) vetoed — %d non-preview cue(s) "
+                                    "follow it (e.g. %r); the ending theme is "
+                                    "the last content before the preview",
+                                    min(_st(rows[i]) for i in trun),
+                                    max(_en(rows[i]) for i in trun),
+                                    len(trun), len(_blockers),
+                                    (rows[_blockers[0]].get("text") or "")[:40])
+                                continue
                         tm_start = _theme_anchor_start(
                             [_st(rows[i]) for i in trun])
                         tm_end = max(_en(rows[i]) for i in trun)
                         if tm_end - tm_start >= _THEME_RUN_MIN_SPAN_S:
                             drop.update(trun)
                             marker_at[min(trun)] = (tm_start, tm_end, label)
+                            runs_at.setdefault(min(trun), set()).update(trun)
                             _w_markers.append(min(trun))
+                            logger.info(
+                                "theme collapse: %s soft run collapsed "
+                                "%.1f-%.1fs (%d cues) — absorbed e.g. %s",
+                                label, tm_start, tm_end, len(trun),
+                                "; ".join(
+                                    repr((rows[i].get("text") or "")[:28])
+                                    for i in trun[:4]))
             else:
               for grp in _groups(idxs):
                 g_hits = [i for i in grp
@@ -1221,6 +1269,7 @@ def collapse_song_choruses(segments, target_lang: str = "en"):
                     m_start = min(m_start, _prev[0])
                     m_end = max(m_end, _prev[1])
                 marker_at[min(run)] = (m_start, m_end, label)
+                runs_at.setdefault(min(run), set()).update(run)
                 _w_markers.append(min(run))
 
             # ── Markers-only policy: chain trailing VERSE blocks into the
@@ -1295,13 +1344,44 @@ def collapse_song_choruses(segments, target_lang: str = "en"):
                                     - min(_st(rows[i]) for i in trun)) >= 6.0
                                ) or _vet_tiny_tail(trun)
                         if _ok and trun and trun[0] == g_live[0]:
+                            _new_end = max(_en(rows[i]) for i in trun)
+                            if _new_end - m_s > _THEME_MARKER_MAX_SPAN_S:
+                                logger.info(
+                                    "theme collapse: chain stopped — extending "
+                                    "%s to %.1fs would span %.0fs (cap %.0fs)",
+                                    lab, _new_end, _new_end - m_s,
+                                    _THEME_MARKER_MAX_SPAN_S)
+                                continue
+                            logger.info(
+                                "theme collapse: chain absorbed %d cue(s) "
+                                "%.1f-%.1fs into %s — e.g. %s",
+                                len(trun), _st(rows[trun[0]]), _new_end, lab,
+                                "; ".join(
+                                    repr((rows[i].get("text") or "")[:28])
+                                    for i in trun[:4]))
                             drop.update(trun)
-                            marker_at[mk] = (
-                                m_s, max(_en(rows[i]) for i in trun), lab)
+                            marker_at[mk] = (m_s, _new_end, lab)
+                            runs_at.setdefault(mk, set()).update(trun)
                             _more = True
                             break
 
-        if not drop:
+        # Refuse out-of-distribution markers at the door: restore their cues
+        # instead of shipping a marker that plainly swallowed a scene. The
+        # reference episode's longest lyric block is 66s; the measured failure
+        # was a 124-second "ending theme" holding a whole dialogue scene
+        # ("I'll kill you." included) plus the chained real lyrics.
+        for _k in list(marker_at):
+            _s0, _e0, _lab = marker_at[_k]
+            if _e0 - _s0 > _THEME_MARKER_MAX_SPAN_S:
+                _restore = runs_at.get(_k, set())
+                logger.warning(
+                    "theme collapse: VETO %s %.1f-%.1fs — %.0fs span exceeds "
+                    "the %.0fs cap; restoring %d absorbed cue(s)",
+                    _lab, _s0, _e0, _e0 - _s0, _THEME_MARKER_MAX_SPAN_S,
+                    len(_restore))
+                drop.difference_update(_restore)
+                del marker_at[_k]
+        if not drop and not marker_at:
             return rows, False
         out = []
         for i, r in enumerate(rows):
