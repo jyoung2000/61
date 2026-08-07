@@ -141,7 +141,6 @@ function Wizard({ status, refresh, onDone }: {
   const [pulling, setPulling] = useState<Record<string, 'pulling' | 'done' | 'error'>>({});
   const [pullProg, setPullProg] = useState<Record<string, { percent: number; status: string }>>({});
   const [clipaiUrl, setClipaiUrl] = useState('');
-  const [apiKey, setApiKey] = useState('');
   const [pairBusy, setPairBusy] = useState(false);
   const [pairError, setPairError] = useState('');
   const [pairDone, setPairDone] = useState(false);
@@ -198,7 +197,7 @@ function Wizard({ status, refresh, onDone }: {
     setPairBusy(true);
     setPairError('');
     try {
-      await pairClipai(clipaiUrl, apiKey);
+      await pairClipai(clipaiUrl);
       setPairDone(true);
       refresh();
     } catch (e) {
@@ -367,16 +366,14 @@ function Wizard({ status, refresh, onDone }: {
         <div className="panel">
           <h2>Connect to ClipAI</h2>
           <p className="muted">
-            Paste your ClipAI server address and its API key (ClipAI Settings → API).
-            ClipAI will add this machine as its primary AI host and use it for Whisper.
+            Paste your ClipAI server address — no key needed. ClipAI will add
+            this machine as its primary AI host and use it for Whisper.
           </p>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
             <input type="text" placeholder="http://tower.local:8000"
               value={clipaiUrl} onChange={(e) => setClipaiUrl(e.target.value)} />
-            <input type="password" placeholder="ClipAI API key"
-              value={apiKey} onChange={(e) => setApiKey(e.target.value)} />
             <div className="row">
-              <button onClick={doPair} disabled={pairBusy || !clipaiUrl.trim() || !apiKey.trim()}>
+              <button onClick={doPair} disabled={pairBusy || !clipaiUrl.trim()}>
                 {pairBusy ? 'Pairing…' : pairDone ? 'Paired ✓' : 'Pair'}
               </button>
               <button className="secondary" onClick={() => setStep(5)}>
@@ -429,7 +426,6 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
   const [autostart, setAutostart] = useState<boolean | null>(null);
   const [pairOpen, setPairOpen] = useState(false);
   const [clipaiUrl, setClipaiUrl] = useState(status.config.paired_clipai_url);
-  const [apiKey, setApiKey] = useState('');
   const [pairMsg, setPairMsg] = useState('');
   const [models, setModels] = useState<InstalledModel[]>([]);
   const [confirmDel, setConfirmDel] = useState('');
@@ -677,9 +673,8 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
   const doPair = async () => {
     setPairMsg('');
     try {
-      await pairClipai(clipaiUrl, apiKey);
+      await pairClipai(clipaiUrl);
       setPairMsg('Paired ✓');
-      setApiKey('');
       refresh();
     } catch (e) {
       setPairMsg(String(e));
@@ -1297,10 +1292,8 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
             <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 8 }}>
               <input type="text" placeholder="http://tower.local:8000" value={clipaiUrl}
                 onChange={(e) => setClipaiUrl(e.target.value)} />
-              <input type="password" placeholder="ClipAI API key" value={apiKey}
-                onChange={(e) => setApiKey(e.target.value)} />
               <div className="row">
-                <button onClick={doPair} disabled={!clipaiUrl.trim() || !apiKey.trim()}>Pair</button>
+                <button onClick={doPair} disabled={!clipaiUrl.trim()}>Pair</button>
                 {pairMsg && <span className="small muted">{pairMsg}</span>}
               </div>
             </div>

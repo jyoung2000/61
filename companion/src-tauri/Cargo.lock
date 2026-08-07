@@ -608,7 +608,7 @@ dependencies = [
 
 [[package]]
 name = "clipai-companion"
-version = "0.11.4"
+version = "0.11.5"
 dependencies = [
  "axum",
  "chrono",

@@ -132,7 +132,10 @@ export const freeVram = () =>
   invoke<{ unloaded: number; whisper_stopped: boolean }>('free_vram');
 export const endActiveJob = () =>
   invoke<{ unloaded: number; whisper_stopped: boolean; ended_job: string | null }>('end_active_job');
-export const pairClipai = (clipaiUrl: string, apiKey: string) =>
+// No API key: ClipAI's register endpoint is LAN-trust (same model as the
+// rest of its settings API). The empty string keeps the Rust command's
+// signature, which still forwards a key if one is ever configured.
+export const pairClipai = (clipaiUrl: string, apiKey: string = '') =>
   invoke('pair_clipai', { clipaiUrl, apiKey });
 
 /** Self-update: what installer the paired ClipAI container is serving. */

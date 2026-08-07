@@ -55,14 +55,21 @@ def _pair(client, token="tok-abc", **overrides):
     )
 
 
-def test_pairing_requires_api_key(client):
+def test_pairing_needs_no_api_key(client):
+    """Pairing is LAN-trust like the rest of /api/settings/*: the identical
+    action was always available keyless via PUT /settings/ollama-hosts, so
+    the old bearer requirement protected nothing and only sent first-run
+    users hunting for a key the setup flow never showed them. No header,
+    or a stale/wrong header from an older Companion, both pair fine."""
     resp = client.post("/api/settings/companion-register",
-                       json={"url": "http://192.168.1.50:11500"})
-    assert resp.status_code == 401
+                       json={"url": "http://192.168.1.50:11500",
+                             "name": "4070", "token": "tok-nokey"})
+    assert resp.status_code == 200
     resp = client.post("/api/settings/companion-register",
-                       json={"url": "http://192.168.1.50:11500"},
+                       json={"url": "http://192.168.1.50:11500",
+                             "name": "4070", "token": "tok-nokey"},
                        headers={"Authorization": "Bearer wrong-key"})
-    assert resp.status_code == 403
+    assert resp.status_code == 200
 
 
 def test_pairing_registers_primary_and_whisper(client):

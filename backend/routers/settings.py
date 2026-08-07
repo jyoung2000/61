@@ -4269,8 +4269,6 @@ class CompanionRegisterRequest(BaseModel):
     register_whisper: bool = True
 
 
-from fastapi import Depends as _Depends  # noqa: E402
-from backend.auth import verify_api_key as _verify_api_key  # noqa: E402
 
 
 # ── Remote-Whisper resolution ─────────────────────────────────────────────
@@ -4432,11 +4430,17 @@ async def _verify_remote_whisper_transcribe(base: str, key: str, model: str,
 
 
 @router.post("/settings/companion-register")
-async def companion_register(req: CompanionRegisterRequest,
-                             _key: str = _Depends(_verify_api_key)):
+async def companion_register(req: CompanionRegisterRequest):
     """Pair a GPU Companion: add its Ollama proxy to the registry AS PRIMARY
-    and point remote Whisper at it. Authenticated with the ClipAI API key
-    (the same key /api/v1/* uses) — the user pastes it into the Companion.
+    and point remote Whisper at it.
+
+    Deliberately UNAUTHENTICATED, like the rest of /api/settings/*: the
+    identical action has always been available with no key one endpoint over
+    (PUT /api/settings/ollama-hosts adds/reorders hosts), so the bearer
+    requirement here protected nothing — it only sent first-run users hunting
+    for an API key the setup flow never showed them. LAN-trust is the
+    existing settings security model; a Bearer header, if sent by an older
+    Companion, is simply ignored.
 
     Idempotent: re-pairing the same URL updates the existing entry (and
     re-promotes it to primary) instead of duplicating it.
