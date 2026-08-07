@@ -739,6 +739,139 @@ def clamp_runaway_translation(text: str, source: str) -> str:
     return out
 
 
+# ── Full-track coherence audit ───────────────────────────────────────────
+def _parse_int_array(resp: str, n_max: int) -> list[int]:
+    """1-based cue numbers from an audit reply. Tolerates a bare JSON array,
+    fenced JSON, or loose "3, 17, 42" text; silently drops junk. Empty on
+    anything unusable — the audit is an upgrade, never a dependency."""
+    import json as _json
+    txt = (resp or "").strip()
+    m = re.search(r"\[[\d\s,]*\]", txt)
+    if m:
+        try:
+            vals = _json.loads(m.group(0))
+            return sorted({int(v) for v in vals
+                           if isinstance(v, (int, float))
+                           and 1 <= int(v) <= n_max})
+        except Exception:
+            pass
+    return sorted({int(v) for v in re.findall(r"\b(\d{1,4})\b", txt)
+                   if 1 <= int(v) <= n_max})[:24]
+
+
+async def coherence_audit_and_fix(segments, out_segs, orchestrator,
+                                  src_name: str, tgt_name: str,
+                                  job_id: str = "",
+                                  model_override=None,
+                                  brief: str = "") -> int:
+    """One GLOBAL read of the translated track, then targeted repairs.
+
+    Every existing guard is local — a mistranslation that is fluent English
+    ships because nothing ever reads the scene around it. This pass numbers
+    the whole English track (an episode is a few thousand tokens), asks the
+    model for the cue numbers that CONTRADICT their context — flipped
+    negation or outcome, wrong speaker/subject, a reply that doesn't fit the
+    question before it, nonsense inside a coherent scene — and re-translates
+    only those cues with the source line and six neighbours in view.
+
+    Acceptance is strict per fix: a single line, not source-language, not
+    2× longer than the draft, and actually different. The worst case is a
+    flagged cue keeps its draft — the audit can never make a line worse.
+    Mutates ``out_segs`` in place; returns the number of cues repaired."""
+    if not out_segs or len(out_segs) < 8 or orchestrator is None:
+        return 0
+    max_fixes = max(0, int(getattr(
+        settings, "TRANSLATION_COHERENCE_MAX_FIXES", 15)))
+    if not max_fixes:
+        return 0
+
+    def _t(i):
+        return (out_segs[i].text or "").strip()
+
+    numbered, idx_map = [], []
+    for i in range(len(out_segs)):
+        t = _t(i)
+        if not t or t.startswith("["):
+            continue
+        idx_map.append(i)
+        numbered.append(f"{len(idx_map)}. {t}")
+    if len(numbered) < 8:
+        return 0
+    audit_prompt = (
+        "Below is a numbered English subtitle track for one video episode, "
+        "in order.\n"
+        + (f"Episode context: {brief}\n" if brief else "")
+        + "List the numbers of lines that are INCONSISTENT with their "
+        "surrounding lines: a flipped negation or outcome, the wrong "
+        "speaker/subject acting, a reply that does not fit the question "
+        "before it, or nonsense inside an otherwise coherent scene.\n"
+        "Do NOT flag style, brevity, or lines that are merely abrupt — "
+        "only lines a viewer would find contradictory or senseless in "
+        f"context. At most {max_fixes} numbers.\n"
+        "Output ONLY a JSON array of integers (e.g. [12, 87]). If none, "
+        "output [].\n\n" + "\n".join(numbered))
+    try:
+        resp = await orchestrator.text_completion(
+            audit_prompt, max_tokens=200, timeout=240, job_id=job_id,
+            model_override=model_override, skip_circuit_breaker=True,
+            deterministic=True,
+            json_schema={"type": "array", "items": {"type": "integer"},
+                         "maxItems": max_fixes})
+    except Exception as e:
+        logger.info("coherence audit skipped (%s)", e)
+        return 0
+    flags = _parse_int_array(resp, len(idx_map))[:max_fixes]
+    if not flags:
+        logger.info("coherence audit: no contradictory cues flagged "
+                    "(%d cues read)", len(idx_map))
+        return 0
+    logger.info("coherence audit: %d cue(s) flagged of %d — %s",
+                len(flags), len(idx_map), flags[:15])
+
+    fixed = 0
+    for num in flags:
+        i = idx_map[num - 1]
+        cur = _t(i)
+        src = (_seg_text(segments[i]) or "").strip() if i < len(segments) else ""
+        if not cur or not src:
+            continue
+        lo, hi = max(0, i - 3), min(len(out_segs), i + 4)
+        ctx = "\n".join(
+            f"  {'>> ' if j == i else '   '}{_t(j)}"
+            for j in range(lo, hi) if _t(j))
+        fix_prompt = (
+            f"You are fixing ONE {tgt_name} subtitle line that contradicts "
+            "its scene.\n"
+            + (f"Episode context: {brief}\n" if brief else "")
+            + f"Scene (the line marked >> is the broken one):\n{ctx}\n\n"
+            f"The {src_name} source of the broken line is:\n{src}\n\n"
+            f"Re-translate that source line into {tgt_name} so it fits the "
+            "scene — resolve who acts on whom from the surrounding lines "
+            "and never flip a negation or outcome. Keep it subtitle-short. "
+            "Output ONLY the corrected line.")
+        try:
+            r = await orchestrator.text_completion(
+                fix_prompt, max_tokens=120, timeout=60, job_id=job_id,
+                model_override=model_override, skip_circuit_breaker=True,
+                deterministic=True)
+        except Exception:
+            continue
+        new = ((r or "").strip().splitlines() or [""])[0].strip().strip('"')
+        if (not new or new == cur
+                or len(new) > max(2 * len(cur), len(cur) + 60)
+                or _is_untranslated(new, "")
+                or new.startswith(("I ", "Sure", "Here"))
+                and ("translat" in new.lower() or "line" in new.lower())):
+            continue
+        seg0 = out_segs[i]
+        out_segs[i] = TranscriptSegment(
+            text=new, start=seg0.start, end=seg0.end, speaker=seg0.speaker)
+        fixed += 1
+        logger.info("coherence audit: cue %d repaired — %r → %r",
+                    i, cur[:48], new[:48])
+    return fixed
+
+
 # ── Episode context brief ────────────────────────────────────────────────
 # One deterministic LLM call over the SOURCE transcript produces a short
 # English brief (plot, who speaks to whom, ranks/relationships, tone) that
@@ -985,29 +1118,81 @@ async def translate_via_llm(
     _ctx_before_n = max(0, int(getattr(settings, "TRANSLATION_LLM_CONTEXT_BEFORE", 2)))
     _ctx_after_n = max(0, int(getattr(settings, "TRANSLATION_LLM_CONTEXT_AFTER", 1)))
 
-    def _context_block(before, after) -> str:
+    def _seg_time(s, key):
+        try:
+            return float((s.get(key) if isinstance(s, dict)
+                          else getattr(s, key, 0.0)) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    _SCENE_GAP_S = 6.0
+
+    def _context_block(before, after, prev_tail=None,
+                       batch_start_s=None) -> str:
         if not _ctx_on:
             return ""
-        b = [(_txt(s) or "").strip() for s in (before or [])]
-        a = [(_txt(s) or "").strip() for s in (after or [])]
-        b = [x for x in b if x]
-        a = [x for x in a if x]
-        if not b and not a:
+        tail = [x.strip() for x in (prev_tail or []) if (x or "").strip()]
+        b = [s for s in (before or []) if (_txt(s) or "").strip()]
+        a = [s for s in (after or []) if (_txt(s) or "").strip()]
+        if not b and not a and not tail:
             return ""
         parts = [
             "Surrounding dialogue for CONTINUITY (pronouns, gender, formality, "
             "tense). Reference only — do NOT translate or output these:\n"
         ]
-        for x in b:
-            parts.append(f"(before) {x}\n")
-        for x in a:
-            parts.append(f"(after) {x}\n")
+        # Target-side continuity: the tail of the PREVIOUS batch's OUTPUT, so
+        # pronouns/register chain across batch boundaries instead of resetting
+        # every 20 lines. Only present when that batch already finished.
+        for x in tail[-2:]:
+            parts.append(f"(already translated) {x}\n")
+        # A long silence between lines is a hard cut — say so, so continuity
+        # never bleeds across scenes ("he" pointing at the wrong character).
+        prev_end = None
+        for s in b:
+            st = _seg_time(s, "start")
+            if prev_end is not None and st - prev_end > _SCENE_GAP_S:
+                parts.append("(scene break)\n")
+            prev_end = _seg_time(s, "end")
+            parts.append(f"(before) {(_txt(s) or '').strip()}\n")
+        if (prev_end is not None and batch_start_s is not None
+                and batch_start_s - prev_end > _SCENE_GAP_S):
+            parts.append("(scene break — the numbered lines start a new scene)\n")
+        for s in a:
+            parts.append(f"(after) {(_txt(s) or '').strip()}\n")
         parts.append("\n")
         return "".join(parts)
 
-    async def _call(batch, ctx_before=None, ctx_after=None) -> Optional[list[str]]:
+    _LP_UNRELIABLE = float(getattr(settings, "WHISPER_REDECODE_LOGPROB", -0.8))
+
+    def _line_mark(s) -> str:
+        """[UNRELIABLE ASR] tag for a low-confidence source line — tells the
+        translator to render what the scene implies instead of faithfully
+        translating a garble. The tag never reaches the output (stripped
+        defensively below)."""
+        try:
+            _lp = (s.get("avg_logprob") if isinstance(s, dict)
+                   else getattr(s, "avg_logprob", None))
+            if _lp is not None and float(_lp) < _LP_UNRELIABLE:
+                return "[UNRELIABLE ASR] "
+        except (TypeError, ValueError):
+            pass
+        return ""
+
+    async def _call(batch, ctx_before=None, ctx_after=None,
+                    prev_tail=None) -> Optional[list[str]]:
         lines = [_txt(s) for s in batch]
-        numbered = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(lines))
+        marks = [_line_mark(s) for s in batch]
+        numbered = "\n".join(f"{i + 1}. {m}{t}"
+                              for i, (m, t) in enumerate(zip(marks, lines)))
+        _unrel_rule = (
+            "- Lines marked [UNRELIABLE ASR] are unreliable speech "
+            "recognition: the words may be garbled, so translate what the "
+            "scene and surrounding lines imply was said, staying plausible "
+            "and brief. NEVER output the marker itself.\n"
+            if any(marks) else "")
+        _ctx_txt = _context_block(
+            ctx_before, ctx_after, prev_tail=prev_tail,
+            batch_start_s=_seg_time(batch[0], "start") if batch else None)
         prompt = (
             f"You are a professional {src_name}->{tgt_name} subtitle translator.\n"
             f"Translate EVERY one of the {len(lines)} numbered subtitle lines below into "
@@ -1058,6 +1243,7 @@ async def translate_via_llm(
             "reading is absurd for the scene, translate the contextually "
             "plausible homophone instead (e.g. a battlefield 登校 'go to "
             "school' is almost certainly 投降 'surrender').\n"
+            f"{_unrel_rule}"
             "- The source language may drop subjects: use the surrounding "
             "lines to resolve WHO acts on WHOM, and never flip a negation or "
             "an outcome — a line must not state the opposite of what its "
@@ -1072,7 +1258,7 @@ async def translate_via_llm(
             "No commentary, no numbering.\n\n"
             f"{_brief_block}"
             f"{_auto_terms}"
-            f"{_context_block(ctx_before, ctx_after)}"
+            f"{_ctx_txt}"
             f"Lines:\n{numbered}"
         )
         try:
@@ -1102,6 +1288,9 @@ async def translate_via_llm(
             logger.warning("LLM translate: call failed (%s)", e)
             return None
         parsed = _parse_json_array(resp, expected=len(batch))
+        if parsed is not None:
+            parsed = [p.replace("[UNRELIABLE ASR]", "").strip()
+                      if isinstance(p, str) else p for p in parsed]
         # Per-batch wall time makes the dominant XLATE cost measurable from the
         # log alone (e.g. "batches are 85s ⇒ the Companion Ollama runs without
         # flash-attn" vs "batch 0 alone was slow ⇒ cold load + lyric retry").
@@ -1294,10 +1483,22 @@ async def translate_via_llm(
         return cb, ca
 
     # Non-first batch: direct call, else split-and-recurse (never bails).
+    def _prev_tail_for(start) -> list:
+        """Last two TRANSLATED lines of the preceding batch, when that batch
+        has already finished (always true sequentially; a concurrent
+        neighbour still in flight just yields no tail)."""
+        idx = start // BATCH
+        if idx <= 0 or idx - 1 >= len(results):
+            return []
+        prev = results[idx - 1]
+        if not prev:
+            return []
+        return [(g.text or "") for g in prev[-2:]]
+
     async def _process_one(start) -> list:
         batch = segments[start: start + BATCH]
         cb, ca = _ctx_for(start, len(batch))
-        direct = await _call(batch, cb, ca)
+        direct = await _call(batch, cb, ca, prev_tail=_prev_tail_for(start))
         translations = direct if direct is not None else await _translate_batch(batch)
         return _build_segs(batch, translations)
 
@@ -1498,6 +1699,19 @@ async def translate_via_llm(
                     "rewrite accepted (guards held)", len(_sus))
         except Exception as _sv_e:
             logger.debug("second-vote name resolution skipped: %s", _sv_e)
+
+    # ── Full-track coherence audit: the only GLOBAL read of the result ──
+    if bool(getattr(settings, "TRANSLATION_COHERENCE_AUDIT", True)) and out_segs:
+        try:
+            _n_coh = await coherence_audit_and_fix(
+                segments, out_segs, orchestrator, src_name, tgt_name,
+                job_id=job_id, model_override=model_override,
+                brief=episode_brief_for_job(job_id))
+            if _n_coh:
+                logger.info(
+                    "LLM translate: coherence audit repaired %d cue(s)", _n_coh)
+        except Exception as _co_e:
+            logger.debug("coherence audit skipped: %s", _co_e)
 
     logger.info("LLM translation: %d/%d segments → %s (%.0f%% still source-language)",
                 len(out_segs), total, target_language,

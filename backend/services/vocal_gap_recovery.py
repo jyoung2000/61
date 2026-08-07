@@ -617,6 +617,28 @@ def _slice_wav(audio_path: str, out_path: str, start: float, end: float) -> bool
         return False
 
 
+def _slice_wav_boosted(audio_path: str, out_path: str, start: float,
+                       end: float) -> bool:
+    """Like ``_slice_wav`` but with dynamic loudness normalization.
+
+    Quiet / off-mic lines decode badly not because the words are unclear but
+    because they sit 20-30 dB under the rest of the mix — Whisper's log-mel
+    front end starves. ``dynaudnorm`` lifts each frame toward full scale
+    (fast 150 ms frames: the slices are seconds long, the default 500 ms
+    window barely adapts inside them), which is exactly the boost a human
+    applies by turning the volume up for a whispered line."""
+    try:
+        rc = subprocess.run(
+            ["ffmpeg", "-y", "-ss", f"{start:.2f}", "-to", f"{end:.2f}",
+             "-i", audio_path, "-af", "dynaudnorm=f=150:g=15",
+             "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", out_path],
+            capture_output=True, timeout=120,
+        ).returncode
+        return rc == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 1024
+    except Exception:
+        return False
+
+
 def _wav_duration(path: str) -> float:
     """Seconds of audio in a WAV (ffprobe); 0.0 on any failure."""
     try:
@@ -1062,6 +1084,208 @@ def _normalize_stem_segments(segs: list) -> list[dict]:
             end = float(end or 0.0)
         except (TypeError, ValueError):
             start = end = 0.0
-        out.append({"start": start, "end": end, "text": text or "",
-                    "no_speech_prob": nsp})
+        if isinstance(s, dict):
+            alp = s.get("avg_logprob")
+        else:
+            alp = getattr(s, "avg_logprob", None)
+        try:
+            alp = float(alp) if alp is not None else None
+        except (TypeError, ValueError):
+            alp = None
+        row = {"start": start, "end": end, "text": text or "",
+               "no_speech_prob": nsp}
+        # The quiet-cue redecode accepts a replacement ONLY on a measurable
+        # confidence win, so the decode's own avg_logprob must survive
+        # normalization (None when the server didn't report one — the
+        # acceptance gate then fails soft and keeps the original text).
+        if alp is not None:
+            row["avg_logprob"] = alp
+        out.append(row)
     return out
+
+
+# ── Quiet-cue redecode ──────────────────────────────────────────────────────
+# Whisper's worst decodes cluster on QUIET speech: whispered lines, off-mic
+# asides, dialogue under a music bed. The transcript keeps the cue (so no gap
+# opens) but the text is a low-confidence guess — exactly the single-wrong-
+# subtitle failure that derails a scene. This pass re-decodes just those cues
+# from a loudness-normalized slice and swaps the text in place only when the
+# boosted decode is measurably more confident. Timing is never touched.
+
+
+def _quiet_candidates(segments: list, floor: float, max_n: int,
+                      min_dur: float = 0.4, max_dur: float = 8.0) -> list[int]:
+    """Indices of quiet-redecode suspects, worst (lowest avg_logprob) first.
+
+    Suspect = a real dialogue cue (not a music/theme marker) whose decode
+    confidence sits below ``floor`` and whose window is short enough that a
+    single boosted slice re-decode is meaningful (long cues span multiple
+    utterances — a whole-cue text swap there risks more than it fixes)."""
+    try:
+        from backend.services.audio_analyzer import is_subtitle_marker
+    except Exception:
+        def is_subtitle_marker(_t):  # noqa: ANN001 - fail-soft stub
+            return False
+    scored: list[tuple[float, int]] = []
+    for i, s in enumerate(segments or []):
+        lp = (s.get("avg_logprob") if isinstance(s, dict)
+              else getattr(s, "avg_logprob", None))
+        try:
+            lp = float(lp) if lp is not None else None
+        except (TypeError, ValueError):
+            lp = None
+        if lp is None or lp >= floor:
+            continue
+        b = _seg_bounds(s)
+        if b is None:
+            continue
+        dur = b[1] - b[0]
+        if dur < min_dur or dur > max_dur:
+            continue
+        txt = _seg_text(s)
+        if not txt or is_subtitle_marker(txt):
+            continue
+        scored.append((lp, i))
+    scored.sort()
+    return [i for _, i in scored[:max(0, int(max_n))]]
+
+
+def _accept_quiet_redecode(old_lp: float, decoded: list,
+                           margin: float) -> tuple[bool, str, float]:
+    """Gate a boosted re-decode against the original low-confidence text.
+
+    Returns ``(accept, new_text, new_lp)``. FAIL-SOFT by design: any doubt —
+    empty decode, hallucination staple, missing confidence, high
+    no_speech_prob, or a win smaller than ``margin`` — keeps the original.
+    A wrong replacement here is strictly worse than the wrong original,
+    because the original at least came from the un-normalized audio the
+    rest of the transcript agrees with."""
+    if not decoded:
+        return (False, "", 0.0)
+    text = " ".join((_seg_text(d) or "") for d in decoded)
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text or _JUNK_RE.match(text):
+        return (False, "", 0.0)
+    lps: list[float] = []
+    for d in decoded:
+        lp = d.get("avg_logprob") if isinstance(d, dict) else None
+        if lp is None:
+            return (False, "", 0.0)   # can't prove a win → keep the original
+        try:
+            lps.append(float(lp))
+        except (TypeError, ValueError):
+            return (False, "", 0.0)
+        nsp = float((d.get("no_speech_prob") if isinstance(d, dict)
+                     else 0.0) or 0.0)
+        if nsp > 0.85:
+            return (False, "", 0.0)
+    new_lp = min(lps)
+    try:
+        old = float(old_lp)
+    except (TypeError, ValueError):
+        return (False, "", 0.0)
+    if new_lp <= old + float(margin):
+        return (False, "", 0.0)
+    return (True, text, new_lp)
+
+
+async def redecode_quiet_segments(
+    job_id: str,
+    audio_path: str,
+    segments: list,
+    source_lang: str,
+    work_dir: str,
+) -> int:
+    """Gain-boosted second decode for quiet low-confidence cues.
+
+    Mutates ``segments`` (dict rows) IN PLACE — text and avg_logprob only,
+    never timing — and returns the number of cues whose text changed.
+    Confidence-confirmed cues (same reading, better logprob) also get their
+    avg_logprob lifted so downstream [UNRELIABLE ASR] marking and polisher
+    flags stop firing on audio a boosted listen has since vouched for.
+    Never raises."""
+    try:
+        from backend.config import settings
+
+        if not bool(getattr(settings, "WHISPER_QUIET_REDECODE", True)):
+            return 0
+        if not audio_path or not os.path.exists(audio_path):
+            return 0
+        floor = float(getattr(settings, "WHISPER_REDECODE_LOGPROB", -0.8))
+        margin = float(getattr(settings, "WHISPER_QUIET_REDECODE_MARGIN", 0.3))
+        cap = int(getattr(settings, "WHISPER_QUIET_REDECODE_MAX", 12))
+        idxs = _quiet_candidates(segments, floor, cap)
+        if not idxs:
+            return 0
+        os.makedirs(work_dir, exist_ok=True)
+        logger.info(
+            "[%s] quiet redecode: %d cue(s) below logprob %.2f — re-decoding "
+            "loudness-normalized slices", job_id, len(idxs), floor)
+        replaced = confirmed = 0
+        _patience = float(getattr(
+            settings, "VOCAL_GAP_ASR_WARMUP_PATIENCE_S", 90.0))
+        for i in idxs:
+            s = segments[i]
+            b = _seg_bounds(s)
+            if b is None:
+                continue
+            wav = os.path.join(work_dir, f"quiet_{i}.wav")
+            if not await asyncio.to_thread(
+                    _slice_wav_boosted, audio_path, wav,
+                    max(0.0, b[0] - 0.25), b[1] + 0.25):
+                continue
+            decoded = await asyncio.to_thread(
+                _transcribe_stem, wav, source_lang, _patience)
+            _patience = 20.0
+            try:
+                os.remove(wav)
+            except Exception:
+                pass
+            if decoded is None:
+                # Transport down (no remote whisper / sidecar dead) — every
+                # later slice fails the same way, so stop paying for it.
+                logger.info("[%s] quiet redecode: ASR transport unavailable "
+                            "— stopping after %d/%d slice(s)",
+                            job_id, replaced + confirmed, len(idxs))
+                break
+            old_lp = (s.get("avg_logprob") if isinstance(s, dict)
+                      else getattr(s, "avg_logprob", None))
+            ok, text, new_lp = _accept_quiet_redecode(old_lp, decoded, margin)
+            if not ok:
+                continue
+            old_txt = _seg_text(s)
+            same = _similar(text, old_txt) >= 0.95
+            if isinstance(s, dict):
+                s["avg_logprob"] = round(new_lp, 3)
+                s["quiet_redecoded"] = True
+                if not same:
+                    s["text"] = text
+            else:
+                try:
+                    setattr(s, "avg_logprob", round(new_lp, 3))
+                    if not same:
+                        setattr(s, "text", text)
+                except Exception:
+                    continue
+            if same:
+                confirmed += 1
+                logger.info(
+                    "[%s] quiet redecode: CONFIRMED %.1f-%.1fs (logprob "
+                    "%.2f → %.2f, text unchanged)",
+                    job_id, b[0], b[1], float(old_lp), new_lp)
+            else:
+                replaced += 1
+                logger.info(
+                    "[%s] quiet redecode: REPLACED %.1f-%.1fs (logprob "
+                    "%.2f → %.2f): %r → %r",
+                    job_id, b[0], b[1], float(old_lp), new_lp,
+                    old_txt[:60], text[:60])
+        if replaced or confirmed:
+            logger.info(
+                "[%s] quiet redecode: %d text replacement(s), %d confidence "
+                "confirmation(s) across %d suspect(s)",
+                job_id, replaced, confirmed, len(idxs))
+        return replaced
+    except Exception as e:
+        logger.warning("[%s] quiet redecode skipped (%s)", job_id, e)
+        return 0

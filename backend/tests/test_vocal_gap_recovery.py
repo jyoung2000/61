@@ -590,8 +590,11 @@ def test_stem_segment_normalization_strips_stale_keys_and_reads_both_schemas():
         {"start": 4.0, "end": 5.5, "text": "任務完了", "no_speech_prob": 0.2},
     ]
     out = _normalize_stem_segments(segs)
+    # avg_logprob is the ONE extra key that survives — it's a scalar (no
+    # stem-relative timing to go stale) and the quiet-cue redecode's
+    # acceptance gate can't prove a confidence win without it.
     assert out[0] == {"start": 1.2, "end": 3.4, "text": "了解",
-                      "no_speech_prob": 0.1}
+                      "no_speech_prob": 0.1, "avg_logprob": -0.3}
     assert out[1] == {"start": 4.0, "end": 5.5, "text": "任務完了",
                       "no_speech_prob": 0.2}
     for d in out:

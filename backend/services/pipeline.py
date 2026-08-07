@@ -4161,6 +4161,42 @@ async def _background_post_processing(
             except Exception as _rl_e:
                 logger.warning("[%s] Second-listen recovery skipped (%s)", job_id, _rl_e)
 
+        # ── (a-quiet) Boosted re-decode of quiet low-confidence cues ──
+        # The relisten above recovers dialogue Whisper DROPPED; this pass
+        # repairs dialogue Whisper KEPT but guessed at — whispered/off-mic
+        # lines whose avg_logprob is deep underwater. Each suspect's window
+        # is re-decoded from a loudness-normalized slice and the text swaps
+        # in place only on a clear confidence win, BEFORE translation, so a
+        # bad guess never reaches the subtitle file. Timing never changes.
+        if (_trans_input
+                and bool(getattr(settings, "WHISPER_QUIET_REDECODE", True))):
+            try:
+                from backend.models import TranscriptSegment as _TSqr
+                from backend.services.vocal_gap_recovery import (
+                    redecode_quiet_segments)
+                _qr_audio = os.path.join(database._job_dir(job_id), "audio.wav")
+                if os.path.isfile(_qr_audio):
+                    _qr_rows = [s.model_dump() if hasattr(s, "model_dump") else dict(s)
+                                for s in _trans_input]
+                    _qr_n = await redecode_quiet_segments(
+                        job_id, _qr_audio, _qr_rows, source_lang,
+                        os.path.join(database._job_dir(job_id), "quiet_redecode"))
+                    # Rebuild even on 0 replacements: confidence-confirmed
+                    # cues carry lifted avg_logprob values that downstream
+                    # [UNRELIABLE ASR] marking must see.
+                    if any(r.get("quiet_redecoded") for r in _qr_rows):
+                        for r in _qr_rows:
+                            r.pop("quiet_redecoded", None)
+                        _trans_input = [
+                            _TSqr(**r) if isinstance(r, dict) else r
+                            for r in _qr_rows]
+                        if _qr_n:
+                            logger.info(
+                                "[%s] Quiet redecode repaired %d low-confidence "
+                                "cue(s) before translation", job_id, _qr_n)
+            except Exception as _qr_e:
+                logger.warning("[%s] Quiet redecode skipped (%s)", job_id, _qr_e)
+
         # ── (a0) Resegment the SOURCE into one-utterance-per-cue units before
         # translating (Task 5). NMT translates cleaner sentence units far more
         # reliably than run-on blocks, and it keeps source↔target cue counts

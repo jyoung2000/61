@@ -569,6 +569,18 @@ class Settings(BaseSettings):
     WHISPER_REDECODE_LOGPROB: float = -0.8
     WHISPER_REDECODE_MAX_FRAC: float = 0.10
     WHISPER_REDECODE_BEAM: int = 8
+    # ── Quiet-cue redecode (remote path) ──
+    # The local difficult-segment redecode above only runs when the LOCAL
+    # faster-whisper engine decoded the track; Companion/remote decodes get
+    # this pass instead. Cues whose avg_logprob sits below
+    # WHISPER_REDECODE_LOGPROB are re-decoded from a loudness-normalized
+    # (dynaudnorm) slice — quiet/off-mic lines decode badly because they sit
+    # far under the mix, not because the words are unclear — and the text is
+    # swapped in place ONLY when the boosted decode beats the original
+    # confidence by MARGIN. Timing is never touched; ties keep the original.
+    WHISPER_QUIET_REDECODE: bool = True
+    WHISPER_QUIET_REDECODE_MAX: int = 12
+    WHISPER_QUIET_REDECODE_MARGIN: float = 0.3
     # ── Filter/coverage tension: VAD-confirmed phantom rescue ──
     # The TACT phantom gate (below) fires on overwhelmingly low-confidence
     # cues — but real soft/off-mic speech looks exactly like that. Before a
@@ -1934,8 +1946,21 @@ class Settings(BaseSettings):
     # natural-not-literal output. Kept small on purpose: local Ollama models
     # often run at ctx=2048, so a large window risks prompt truncation.
     TRANSLATION_LLM_CONTEXT: bool = True
-    TRANSLATION_LLM_CONTEXT_BEFORE: int = 2   # preceding source lines shown
-    TRANSLATION_LLM_CONTEXT_AFTER: int = 1    # following source lines shown
+    # 4/2, up from 2/1: the wider window is what lets pronouns, register and
+    # running topics chain across batch boundaries (the 14B on a Companion
+    # GPU has ample context for it). The block also marks >6s silences as
+    # scene breaks so continuity never bleeds across a hard cut, and shows
+    # the previous batch's last TRANSLATED lines when that batch finished.
+    TRANSLATION_LLM_CONTEXT_BEFORE: int = 4   # preceding source lines shown
+    TRANSLATION_LLM_CONTEXT_AFTER: int = 2    # following source lines shown
+    # Full-track coherence audit: one LLM read of the ENTIRE translated track
+    # flags cues that contradict their scene (flipped negation/outcome, wrong
+    # subject, a reply that doesn't fit the question, nonsense in a coherent
+    # scene); each flagged cue is re-translated alone with the source line
+    # and six neighbours in view. Every other guard is local — this is the
+    # only pass that can catch the ONE wrong line that breaks a scene.
+    TRANSLATION_COHERENCE_AUDIT: bool = True
+    TRANSLATION_COHERENCE_MAX_FIXES: int = 15
     # After the offline NMT (FuguMT/NLLB) runs, any cue it left in the source
     # language is re-translated ONE AT A TIME with a plain-text LLM call (robust
     # where the batched JSON path fails on small local models). Cap the number of
