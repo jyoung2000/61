@@ -88,6 +88,30 @@ function TokenBox({ token, onRegenerate }: { token: string; onRegenerate?: () =>
   );
 }
 
+// Percent from an installer transcript line, when one is present. winget /
+// brew print progress two ways — an explicit "45%" or a byte fraction
+// ("12.5 MB / 205 MB") — and the first-run Ollama install used to render as
+// an indeterminate shimmer for its whole multi-minute download because
+// neither form was parsed. Returns null for lines with no usable number.
+const _UNIT: Record<string, number> = { KB: 1e3, MB: 1e6, GB: 1e9 };
+function parseInstallPercent(msg: string): number | null {
+  // Installers overwrite their progress with carriage returns, so one
+  // buffered line can hold several stale updates — the LAST number wins.
+  const pcts = [...msg.matchAll(/(\d{1,3}(?:\.\d+)?)\s*%/g)];
+  if (pcts.length) {
+    const v = parseFloat(pcts[pcts.length - 1][1]);
+    if (v >= 0 && v <= 100) return v;
+  }
+  const fracs = [...msg.matchAll(/([\d.]+)\s*(KB|MB|GB)\s*\/\s*([\d.]+)\s*(KB|MB|GB)/gi)];
+  if (fracs.length) {
+    const f = fracs[fracs.length - 1];
+    const done = parseFloat(f[1]) * _UNIT[f[2].toUpperCase()];
+    const total = parseFloat(f[3]) * _UNIT[f[4].toUpperCase()];
+    if (total > 0 && done >= 0 && done <= total) return (done / total) * 100;
+  }
+  return null;
+}
+
 // Determinate or indeterminate progress bar (reuses the .meter styles).
 function ProgressBar({ percent, label, indeterminate }: {
   percent?: number; label?: string; indeterminate?: boolean;
@@ -113,6 +137,7 @@ function Wizard({ status, refresh, onDone }: {
   const [installing, setInstalling] = useState(false);
   const [installError, setInstallError] = useState('');
   const [installMsg, setInstallMsg] = useState('');
+  const [installPct, setInstallPct] = useState<number | null>(null);
   const [pulling, setPulling] = useState<Record<string, 'pulling' | 'done' | 'error'>>({});
   const [pullProg, setPullProg] = useState<Record<string, { percent: number; status: string }>>({});
   const [clipaiUrl, setClipaiUrl] = useState('');
@@ -127,7 +152,14 @@ function Wizard({ status, refresh, onDone }: {
   // Live progress from the backend (install transcript + model-pull bytes).
   useEffect(() => {
     const unInstall = listen<{ stage: string; message: string }>(
-      'install-progress', (e) => setInstallMsg(e.payload.message || ''));
+      'install-progress', (e) => {
+        const msg = e.payload.message || '';
+        setInstallMsg(msg);
+        // Progress lines and status lines interleave; a line without a
+        // number keeps the last known percentage instead of resetting the
+        // bar to indeterminate.
+        setInstallPct((prev) => parseInstallPercent(msg) ?? prev);
+      });
     const unPull = listen<{ model: string; status: string; percent: number }>(
       'pull-progress', (e) => {
         const { model, status: st, percent } = e.payload;
@@ -139,6 +171,7 @@ function Wizard({ status, refresh, onDone }: {
   const doInstall = async () => {
     setInstalling(true);
     setInstallError('');
+    setInstallPct(null);
     try {
       await installOllama();
       await startOllama();
@@ -230,14 +263,21 @@ function Wizard({ status, refresh, onDone }: {
                 Ollama runs the vision/text models locally. Installing it automatically —
                 this can take a couple of minutes. No action needed.
               </p>
-              {installing && (
+              {installing && (installPct != null ? (
+                <ProgressBar
+                  percent={installPct}
+                  label={`${installMsg || 'Installing Ollama…'} — ${Math.round(installPct)}%`}
+                />
+              ) : (
                 <ProgressBar indeterminate label={installMsg || 'Installing Ollama…'} />
-              )}
+              ))}
               <div className="row">
                 <button onClick={doInstall} disabled={installing}>
                   {installing ? 'Installing…' : installError ? 'Retry install' : 'Install Ollama'}
                 </button>
-                <button className="secondary" onClick={() => openUrl('https://ollama.com/download')}>
+                <button className="secondary"
+                  onClick={() => openUrl('https://ollama.com/download')
+                    .catch((e) => setInstallError(String(e)))}>
                   Open ollama.com/download
                 </button>
                 <button className="secondary" onClick={() => startOllama().then(refresh).catch(() => {})}>
