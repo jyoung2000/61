@@ -435,6 +435,7 @@ def _build_user_prompt(
     glossary_terms: Optional[list[str]] = None,
     source_texts: Optional[list[str]] = None,
     mode: str = "asr",
+    context_brief: str = "",
 ) -> str:
     """Assemble the per-batch user message with surrounding context.
 
@@ -449,6 +450,14 @@ def _build_user_prompt(
         if language and language not in ("", "auto", "unknown")
         else ""
     )
+    # Episode context brief (translation MTPE): the same one-call synopsis
+    # the translation batches read, so the post-edit fixes register with the
+    # SAME understanding of who speaks to whom instead of guessing per batch.
+    brief_block = ""
+    if context_brief:
+        brief_block = (
+            "Episode context (for register and pronoun choices ONLY — never "
+            "output, quote or translate it):\n" + context_brief + "\n\n")
 
     preserve = getattr(settings, "TRANSCRIPT_PRESERVE_WORDS", True)
     rules: list[str] = []
@@ -639,6 +648,7 @@ def _build_user_prompt(
 
     prompt = (
         f"{lang_hint}"
+        f"{brief_block}"
         f"{_ctx_block('PREVIOUS CONTEXT', context_before)}"
         f"{_ctx_block('FOLLOWING CONTEXT', context_after)}"
         f"OPERATIONS TO APPLY:\n{rules_block}\n\n"
@@ -994,6 +1004,7 @@ async def _polish_batch(
     model_override: Optional[str] = None,
     cloud_direct: bool = False,
     local_only: bool = False,
+    context_brief: str = "",
 ) -> Optional[list[Optional[str]]]:
     """Polish a single batch via the polish LLM.
 
@@ -1013,7 +1024,7 @@ async def _polish_batch(
     caller keeps the original for just those indices)."""
     user_prompt = _build_user_prompt(
         batch, context_before, context_after, language, glossary_terms,
-        source_texts=source_texts, mode=mode)
+        source_texts=source_texts, mode=mode, context_brief=context_brief)
     system_prompt = _SYSTEM_PROMPT_TRANSLATION if mode == "translation" else _SYSTEM_PROMPT
     full_prompt = f"[SYSTEM]\n{system_prompt}\n\n[USER]\n{user_prompt}"
     response = None
@@ -1361,6 +1372,18 @@ async def correct_transcript(
     if not seg_list:
         return seg_list
 
+    # Episode context brief for the translation post-edit: the SAME one-call
+    # synopsis the translation batches read (built and cached by
+    # translate_via_llm), so register fixes are made with the same picture of
+    # who speaks to whom. Imported lazily — translator imports this module.
+    _context_brief = ""
+    if mode == "translation" and job_id:
+        try:
+            from backend.services.translator import episode_brief_for_job
+            _context_brief = episode_brief_for_job(job_id)
+        except Exception:
+            _context_brief = ""
+
     # Strictly-local polish by default: keep the polish LLM on the local /
     # companion GPU and never fall back to a paid cloud provider for what the
     # user runs as a local job.
@@ -1540,7 +1563,7 @@ async def correct_transcript(
             language=language, timeout=timeout_s,
             glossary_terms=glossary_terms, source_texts=batch_src, mode=mode,
             model_override=_state["model"], cloud_direct=cloud_direct,
-            local_only=local_only,
+            local_only=local_only, context_brief=_context_brief,
         )
         if (result is None and len(batch) >= 4 and not _state["aborted"]
                 and (_deadline is None or time.monotonic() < _deadline)):
@@ -1566,6 +1589,7 @@ async def correct_transcript(
                     glossary_terms=glossary_terms, source_texts=sub_src,
                     mode=mode, model_override=_state["model"],
                     cloud_direct=cloud_direct, local_only=local_only,
+                    context_brief=_context_brief,
                 )
                 halves.append(half if half is not None
                               else [None] * (hi - lo))

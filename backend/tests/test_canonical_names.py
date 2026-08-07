@@ -962,3 +962,48 @@ def test_honorific_preceded_token_reaches_the_loose_matcher():
     assert out == ["I've been waiting for Mr. Darlian!",
                    "Please answer, Mr. Darlian."]
     assert s and all("Dorian→Darlian" == x for x in s)
+
+
+def _seed_kana_store(tmp_path, monkeypatch, pairs):
+    from backend.services import canonical_names as cn
+    store = tmp_path / "glossary.json"
+    monkeypatch.setattr(cn, "_GLOSSARY_STORE_PATH", str(store))
+    monkeypatch.setattr(cn, "_LAST_SERIES_KEY", "")
+    cn._glossary_store_save({
+        "mobile suit gundam wing": sorted(set(pairs.values())),
+        "__last_series__": "mobile suit gundam wing",
+        cn._KANA_STORE_PREFIX + "mobile suit gundam wing": dict(pairs),
+    })
+
+
+def test_kana_near_miss_detector_finds_garbled_and_ignored_readings(
+        tmp_path, monkeypatch):
+    """Run-28 shipped "Sex Unique" for Zechs: Whisper wrote セクス for ゼクス,
+    so the ENGLISH text carried nothing the letter-distance respeller could
+    fix. The evidence is source-side — a kana token near an official reading
+    whose official name is absent from the translated cue."""
+    from backend.services.canonical_names import kana_name_near_misses
+    _seed_kana_store(tmp_path, monkeypatch,
+                     {"ゼクス": "Zechs", "カトル": "Quatre"})
+    src = ["セクス・ユニークが行く",        # garbled reading → near miss
+           "ゼクスは強い",                  # exact pin, name missing in EN
+           "ゼクスは強い",                  # exact pin, name PRESENT in EN
+           "コーヒーを飲む"]                # unrelated katakana
+    en = ["Sex Unique is going",
+          "He is strong",
+          "Zechs is strong",
+          "I drink coffee"]
+    hits = kana_name_near_misses(src, en, job_id="")
+    assert (0, "セクス", "Zechs") in hits
+    assert (1, "ゼクス", "Zechs") in hits
+    assert all(i not in (2, 3) for i, _, _ in hits)
+
+
+def test_kana_near_miss_detector_is_empty_without_a_kana_store(
+        tmp_path, monkeypatch):
+    from backend.services import canonical_names as cn
+    store = tmp_path / "glossary.json"
+    monkeypatch.setattr(cn, "_GLOSSARY_STORE_PATH", str(store))
+    monkeypatch.setattr(cn, "_LAST_SERIES_KEY", "")
+    cn._glossary_store_save({"other": ["X"]})
+    assert cn.kana_name_near_misses(["ゼクスだ"], ["It is him"]) == []

@@ -1879,6 +1879,22 @@ class Settings(BaseSettings):
     # run). Old Ollama servers that reject a schema downgrade to format=json
     # automatically. Applies to the Ollama path only.
     TRANSLATION_STRUCTURED_OUTPUTS: bool = True
+    # Episode context brief: ONE deterministic LLM call over the source
+    # transcript builds a 3-5 sentence translator's brief (plot, who speaks
+    # to whom, ranks, tone) that every translation batch and the MTPE
+    # post-edit then read. Register errors — formal officers rendered
+    # chatty, family members addressed like strangers — come from batches
+    # that can't see the episode; this is that context, computed once.
+    TRANSLATION_CONTEXT_BRIEF: bool = True
+    # Second-vote name resolution: cues whose JAPANESE source carries a kana
+    # token near an official reading (e.g. Whisper's セクス for ゼクス) but
+    # whose translation lacks the official name get one targeted re-ask with
+    # the cast as candidates. Reaches the garbles the letter-distance
+    # respeller can't ("Sex Unique" shipped for Zechs on a measured run —
+    # no English token there is fixable). Strict guards: the rewrite must
+    # keep the draft's shape and actually contain the official name.
+    TRANSLATION_NAME_SECOND_VOTE: bool = True
+    TRANSLATION_NAME_SECOND_VOTE_MAX: int = 10
     # Reject a "translation" that is really a comma-joined echo of the names
     # glossary (the model's response to hallucinated music-section source):
     # if ≥ this fraction of a cue's comma-separated parts are glossary terms,

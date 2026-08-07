@@ -739,6 +739,63 @@ def clamp_runaway_translation(text: str, source: str) -> str:
     return out
 
 
+# ── Episode context brief ────────────────────────────────────────────────
+# One deterministic LLM call over the SOURCE transcript produces a short
+# English brief (plot, who speaks to whom, ranks/relationships, tone) that
+# every translation batch and the MTPE polish then read. Register errors —
+# formal officers suddenly chatty, a daughter addressing her father like a
+# stranger — come from batches that can't see the episode; this is the
+# missing context, computed once. Cached per job so the polish pass (which
+# runs later, in a different scope) reads the same brief.
+_EPISODE_BRIEFS: dict[str, str] = {}
+
+
+def episode_brief_for_job(job_id: str) -> str:
+    """The episode context brief built for ``job_id`` this process, or ''."""
+    return _EPISODE_BRIEFS.get((job_id or "").strip(), "")
+
+
+async def _build_episode_brief(segments, src_name: str, orchestrator,
+                               job_id: str, model_override) -> str:
+    """3-5 sentence translator's brief from the source transcript. Empty on
+    any failure or refusal — the brief is an upgrade, never a dependency."""
+    texts: list[str] = []
+    total = 0
+    for s in segments or []:
+        t = ((s.get("text", "") if isinstance(s, dict)
+              else getattr(s, "text", "")) or "").strip()
+        if not t:
+            continue
+        texts.append(t)
+        total += len(t)
+        if total > 6000:          # plenty for a synopsis; caps prompt cost
+            break
+    if len(texts) < 12:
+        return ""
+    prompt = (
+        f"Below is the {src_name} dialogue transcript of one video episode "
+        "(speech-recognition output; some lines are garbled).\n"
+        "Write a translator's brief IN ENGLISH: 3-5 plain sentences covering "
+        "(1) what happens, (2) the key speakers and how they relate "
+        "(ranks, family, formality between them), and (3) the overall tone. "
+        "No preamble, no list markers, no quotes — just the sentences.\n\n"
+        + "\n".join(texts))
+    resp = await orchestrator.text_completion(
+        prompt, max_tokens=350, timeout=120, job_id=job_id,
+        model_override=model_override, skip_circuit_breaker=True,
+        deterministic=True)
+    brief = " ".join((resp or "").split()).strip()
+    # A usable brief is a paragraph, not a fragment, an apology, or leaked
+    # structure. Reject rather than inject noise into every batch.
+    if not (60 <= len(brief) <= 900) or any(c in brief for c in "{}[]"):
+        return ""
+    if job_id:
+        _EPISODE_BRIEFS[(job_id or "").strip()] = brief
+        if len(_EPISODE_BRIEFS) > 16:
+            _EPISODE_BRIEFS.pop(next(iter(_EPISODE_BRIEFS)))
+    return brief
+
+
 async def translate_via_llm(
     segments: list,
     source_language: str,
@@ -904,6 +961,23 @@ async def translate_via_llm(
         return (hits / len(parts)) >= float(getattr(
             settings, "TRANSLATION_GLOSSARY_ECHO_RATIO", 0.6))
 
+    # ── Episode context brief: one deterministic call, read by every batch ──
+    _brief_block = ""
+    if bool(getattr(settings, "TRANSLATION_CONTEXT_BRIEF", True)):
+        try:
+            _brief = await _build_episode_brief(
+                segments, src_name, orchestrator, job_id, model_override)
+            if _brief:
+                _brief_block = (
+                    "Episode context (for register and pronoun choices ONLY — "
+                    "who speaks to whom, ranks, tone. Never output, quote or "
+                    "translate it):\n" + _brief + "\n\n")
+                logger.info(
+                    "LLM translate: episode context brief attached (%d chars): %s",
+                    len(_brief), _brief[:140])
+        except Exception as _br_e:
+            logger.debug("episode brief skipped: %s", _br_e)
+
     # Surrounding SOURCE lines shown to the model for continuity — reference
     # only, never re-translated or emitted. Kept short so local models at
     # ctx=2048 don't truncate the batch itself.
@@ -996,6 +1070,7 @@ async def translate_via_llm(
             "- Exactly one output per input line; never merge, split, add or drop lines.\n"
             f"- Output ONLY a JSON array of exactly {len(lines)} {tgt_name} strings, in order. "
             "No commentary, no numbering.\n\n"
+            f"{_brief_block}"
             f"{_auto_terms}"
             f"{_context_block(ctx_before, ctx_after)}"
             f"Lines:\n{numbered}"
@@ -1348,6 +1423,82 @@ async def translate_via_llm(
                     out_segs[i] = TranscriptSegment(
                         text=t, start=cur.start, end=cur.end, speaker=cur.speaker)
 
+    # ── Second-vote name resolution ─────────────────────────────────────
+    # The letter-distance respeller can only fix English tokens that LOOK
+    # like a name; when Whisper garbles the READING itself (セクス for ゼクス)
+    # the translation carries nothing fixable ("Sex Unique" shipped on a
+    # measured run). The evidence lives on the SOURCE side: a kana token
+    # near an official reading whose official name is absent from the
+    # translated cue. Those few cues get ONE targeted re-ask each, with the
+    # roster as candidates and strict acceptance guards.
+    if (bool(getattr(settings, "TRANSLATION_NAME_SECOND_VOTE", True))
+            and out_segs and job_id):
+        try:
+            from backend.services.canonical_names import (
+                kana_name_near_misses, kana_pairs_for_job)
+            _max_sv = max(0, int(getattr(
+                settings, "TRANSLATION_NAME_SECOND_VOTE_MAX", 10)))
+            _src_texts = [_txt(s) for s in segments]
+            _cur_texts = [(s.text or "") for s in out_segs]
+            _sus = (kana_name_near_misses(
+                        _src_texts, _cur_texts, job_id=job_id,
+                        max_hits=_max_sv)
+                    if _max_sv and len(_src_texts) == len(_cur_texts) else [])
+            _roster = sorted({v for v in (kana_pairs_for_job(job_id) or {})
+                              .values()})[:12]
+            _fixed_n = 0
+            for _i, _kana, _official in _sus:
+                _cur = _cur_texts[_i].strip()
+                if not _cur:
+                    continue
+                _p = (
+                    "This English subtitle line was translated from the "
+                    "Japanese speech-recognition line below, which contains "
+                    f"a (possibly garbled) character name: {_kana}\n"
+                    f"Japanese: {_src_texts[_i]}\n"
+                    f"English draft: {_cur}\n"
+                    f"That name almost certainly refers to: {_official}"
+                    + (f" (cast: {', '.join(_roster)})" if _roster else "")
+                    + ".\nRewrite the English line so it uses the correct "
+                    "name, changing NOTHING else. Output only the rewritten "
+                    "line.")
+                try:
+                    _resp = await orchestrator.text_completion(
+                        _p, max_tokens=120, timeout=45, job_id=job_id,
+                        model_override=model_override,
+                        skip_circuit_breaker=True, deterministic=True)
+                except Exception:
+                    continue
+                _new = ((_resp or "").strip().splitlines() or [""])[0]
+                _new = _new.strip().strip('"').strip()
+                # Acceptance guards: one plausible line, the official name
+                # actually present, and a REWRITE of the draft — not a fresh
+                # answer (garble in, hallucination out is the failure mode
+                # this must never introduce).
+                if not _new or len(_new) > max(2 * len(_cur), len(_cur) + 40):
+                    continue
+                if not any(w and w.lower() in _new.lower()
+                           for w in _official.split()):
+                    continue
+                import difflib as _dl
+                if _dl.SequenceMatcher(
+                        None, _cur.lower(), _new.lower()).ratio() < 0.4:
+                    continue
+                _seg0 = out_segs[_i]
+                out_segs[_i] = TranscriptSegment(
+                    text=_new, start=_seg0.start, end=_seg0.end,
+                    speaker=_seg0.speaker)
+                _fixed_n += 1
+                logger.info(
+                    "LLM translate: second vote fixed cue %d — %s (%s) → %r",
+                    _i, _kana, _official, _new[:60])
+            if _sus and not _fixed_n:
+                logger.info(
+                    "LLM translate: second vote — %d suspect cue(s), no "
+                    "rewrite accepted (guards held)", len(_sus))
+        except Exception as _sv_e:
+            logger.debug("second-vote name resolution skipped: %s", _sv_e)
+
     logger.info("LLM translation: %d/%d segments → %s (%.0f%% still source-language)",
                 len(out_segs), total, target_language,
                 100 * fraction_untranslated(out_segs, target_language, source_language))
@@ -1372,7 +1523,7 @@ async def translate_via_llm(
                 except Exception:
                     pass
             refined = await correct_transcript(
-                out_segs, orchestrator,
+                out_segs, orchestrator, job_id=job_id,
                 language=target_language, source_texts=src_texts,
                 source_language=source_language, mode="translation",
                 model_override=model_override,

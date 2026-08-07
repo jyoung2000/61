@@ -2188,6 +2188,83 @@ def series_glossary_for_job(job_id: str = "",
     return series_roster_terms()
 
 
+# Detection tokens split at ・ (a full name like セクス・ユニーク must match
+# its PIECES against single-name readings); the full run including ・ is
+# still tried for exact multi-part dictionary pins.
+_KATAKANA_RUN_RE = re.compile(r"[ァ-ヴー]{2,}")
+_KATAKANA_FULL_RE = re.compile(r"[ァ-ヴー・]{2,}")
+
+
+def kana_name_near_misses(source_texts: list, translated_texts: list,
+                          job_id: str = "", max_hits: int = 12) -> list:
+    """Cues whose SOURCE carries a (possibly garbled) character-name reading
+    that the TRANSLATION failed to render as the official name.
+
+    Two classes, both measured:
+      * an EXACT official kana in the source ("ゼクス") whose official
+        English ("Zechs") is absent from the translated cue — the model
+        ignored a pinned reading; and
+      * a NEAR-MISS kana ("セクス", Whisper's s/z garble of ゼクス, romaji
+        ratio 0.83) — unreachable by the letter-distance respeller because
+        the ENGLISH text carries no fixable token ("Sex Unique"), and
+        dropped by the plausibility gate precisely because the reading is
+        off. The evidence lives on the source side; this surfaces it.
+
+    Returns ``[(index, kana_token, official_name)]``, deduped per cue,
+    ordered by cue index, capped at ``max_hits``. Pure and deterministic —
+    the caller decides what to do (e.g. one targeted re-ask per cue)."""
+    pairs = {k: v for k, v in (kana_pairs_for_job(job_id) or {}).items()
+             if k and v}
+    if not pairs or not source_texts or not translated_texts:
+        return []
+    readings = []
+    for kana, en in pairs.items():
+        r = _kana_reading_romaji(kana)
+        if len(r) >= 3 and r.isalpha():
+            readings.append((kana, r, en))
+    if not readings:
+        return []
+
+    def _has_official(text: str, en: str) -> bool:
+        tl = (text or "").lower()
+        return any(w and w.lower() in tl for w in en.split())
+
+    out = []
+    n = min(len(source_texts), len(translated_texts))
+    for i in range(n):
+        src = str(source_texts[i] or "")
+        if not src:
+            continue
+        best = None   # (kana_token, official) for this cue
+        _toks = (set(_KATAKANA_FULL_RE.findall(src))
+                 | set(_KATAKANA_RUN_RE.findall(src)))
+        for tok in sorted(_toks):
+            if tok in pairs:
+                if not _has_official(translated_texts[i], pairs[tok]):
+                    best = (tok, pairs[tok])
+                    break               # exact pin ignored — strongest case
+                continue
+            tr = _kana_reading_romaji(tok)
+            if len(tr) < 3 or not tr.isalpha():
+                continue
+            for kana, r, en in readings:
+                if abs(len(tr) - len(r)) > 2:
+                    continue
+                ratio = difflib.SequenceMatcher(None, tr, r).ratio()
+                # 0.66 floor: low enough for the measured s/z garble
+                # (sekusu~zekusu 0.83) with headroom for worse ones, high
+                # enough that unrelated words never pair up.
+                if ratio >= 0.66 and ratio < 1.0 \
+                        and not _has_official(translated_texts[i], en):
+                    if best is None:
+                        best = (tok, en)
+        if best:
+            out.append((i, best[0], best[1]))
+            if len(out) >= max_hits:
+                break
+    return out
+
+
 def kana_pairs_for_job(job_id: str = "", series: str = "") -> dict:
     """``{katakana: official-English-name}`` for the job's series, or {}.
 
