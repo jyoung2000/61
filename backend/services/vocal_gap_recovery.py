@@ -1236,7 +1236,9 @@ async def redecode_quiet_segments(
             return 0
         if not audio_path or not os.path.exists(audio_path):
             return 0
-        floor = float(getattr(settings, "WHISPER_REDECODE_LOGPROB", -0.8))
+        floor = float(getattr(settings, "WHISPER_QUIET_REDECODE_LOGPROB",
+                              getattr(settings, "WHISPER_REDECODE_LOGPROB",
+                                      -0.8)))
         margin = float(getattr(settings, "WHISPER_QUIET_REDECODE_MARGIN", 0.3))
         cap = int(getattr(settings, "WHISPER_QUIET_REDECODE_MAX", 12))
         idxs = _quiet_candidates(segments, floor, cap)
@@ -1254,13 +1256,21 @@ async def redecode_quiet_segments(
                         _lps.append(float(_lp))
                 except (TypeError, ValueError):
                     pass
-            _informative = [v for v in _lps if v != 0.0]
+            _informative = sorted(v for v in _lps if v != 0.0)
+            # Percentiles make the NEXT floor calibration evidence-based —
+            # the -0.8 → -0.65 move was only possible because the log
+            # carried the distribution's minimum.
+            _p10 = (_informative[max(0, len(_informative) // 10 - 1)]
+                    if _informative else 0.0)
+            _p50 = (_informative[len(_informative) // 2]
+                    if _informative else 0.0)
             logger.info(
                 "[%s] quiet redecode: no suspects below %.2f — %d/%d cue(s) "
-                "carry avg_logprob, %d non-zero (min %.2f)%s",
+                "carry avg_logprob, %d non-zero (min %.2f, p10 %.2f, "
+                "p50 %.2f)%s",
                 job_id, floor, len(_lps), len(segments or []),
                 len(_informative),
-                min(_lps) if _lps else 0.0,
+                min(_lps) if _lps else 0.0, _p10, _p50,
                 "" if _informative else
                 " — the ASR reported no confidence, this pass and the "
                 "[UNRELIABLE ASR] marks are inert on this decode")

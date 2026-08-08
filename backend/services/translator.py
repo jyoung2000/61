@@ -1187,7 +1187,12 @@ async def translate_via_llm(
         parts.append("\n")
         return "".join(parts)
 
-    _LP_UNRELIABLE = float(getattr(settings, "WHISPER_REDECODE_LOGPROB", -0.8))
+    # Own floor (-0.65 default), NOT the local-redecode -0.8: a measured
+    # remote decode's worst cue read -0.78, so at -0.8 no line was ever
+    # marked while visible garble shipped untagged.
+    _LP_UNRELIABLE = float(getattr(
+        settings, "TRANSLATION_UNRELIABLE_LOGPROB",
+        getattr(settings, "WHISPER_REDECODE_LOGPROB", -0.8)))
 
     def _line_mark(s) -> str:
         """[UNRELIABLE ASR] tag for a low-confidence source line — tells the

@@ -581,6 +581,15 @@ class Settings(BaseSettings):
     WHISPER_QUIET_REDECODE: bool = True
     WHISPER_QUIET_REDECODE_MAX: int = 12
     WHISPER_QUIET_REDECODE_MARGIN: float = 0.3
+    # Candidate floor for the quiet redecode and the [UNRELIABLE ASR]
+    # translation marks — SEPARATE from WHISPER_REDECODE_LOGPROB (-0.8) on
+    # measured evidence: a full remote decode's worst cue read -0.78, so at
+    # -0.8 both features were permanently inert while visibly-garbled cues
+    # ("Miss Lowry", "Buzz buzz") shipped. -0.65 catches the garble band;
+    # the redecode's clear-win acceptance gate and the 12-cue cap bound any
+    # cost, and a mark merely cautions the translator.
+    WHISPER_QUIET_REDECODE_LOGPROB: float = -0.65
+    TRANSLATION_UNRELIABLE_LOGPROB: float = -0.65
     # ── Filter/coverage tension: VAD-confirmed phantom rescue ──
     # The TACT phantom gate (below) fires on overwhelmingly low-confidence
     # cues — but real soft/off-mic speech looks exactly like that. Before a
