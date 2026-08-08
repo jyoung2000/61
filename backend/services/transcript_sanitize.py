@@ -1107,6 +1107,32 @@ def collapse_song_choruses(segments, target_lang: str = "en"):
                 only here (5/7 cues ended in .!?)."""
                 if not trun:
                     return False
+                # Songs don't name the cast: a run whose cues collectively
+                # carry 3+ proper nouns is narration, whatever its shape.
+                # The soft path tolerates pn≤1 PER CUE, so a 10-cue run
+                # could smuggle 10 names through — a measured run's chain
+                # absorbed the PROLOGUE ("who opposed Alliance", "sent
+                # disguised weapons to Earth"…) and its ED soft run ate the
+                # next-episode preview ("The Gundam sank to the ocean",
+                # "Union sent Marley…"); the two-signal tier had ALREADY
+                # rejected the same window for exactly this signal ("4/9
+                # cues carry proper nouns") but the text pass never read
+                # it. Measured true lyric runs carry 0-1 total.
+                total_pn = sum(
+                    _pn((rows[i].get("text") or "").strip()) for i in trun)
+                # Longer runs get the stricter bar: measured true lyric runs
+                # carry 0 total, and a wrongly-vetoed song merely leaks
+                # lyrics (the lesser evil) while a wrongly-passed run
+                # deletes narration.
+                if total_pn >= (2 if len(trun) >= 5 else 3):
+                    logger.info(
+                        "theme collapse: soft run %.1f-%.1fs (%d cues) "
+                        "rejected — %d proper noun(s) across the run; "
+                        "songs don't name the cast",
+                        min(_st(rows[i]) for i in trun),
+                        max(_en(rows[i]) for i in trun),
+                        len(trun), total_pn)
+                    return False
                 strict = sum(
                     1 for i in trun
                     if _pn((rows[i].get("text") or "").strip()) == 0)

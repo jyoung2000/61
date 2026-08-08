@@ -632,9 +632,21 @@ def _whisper_native_translate_segments(video_path: str, source_lang: str,
         # long, multi-sentence cues; the downstream sentence resegmentation uses
         # these word times to split them at ACCURATE boundaries (instead of the
         # char-length proportional guess it falls back to with no word timing).
+        # Carry the decode's confidence too: avg_logprob drives the quiet-cue
+        # redecode and the [UNRELIABLE ASR] translation marks. A measured run's
+        # diagnostic showed only 19/293 cues carrying it — every main-decode
+        # cue lost its confidence RIGHT HERE, leaving both passes inert.
+        def _f(key):
+            try:
+                v = seg.get(key)
+                return round(float(v), 3) if v is not None else None
+            except (TypeError, ValueError):
+                return None
         out.append(TranscriptSegment(
             text=txt, start=start, end=end, speaker=_speaker_for(start, end),
-            words=seg.get("words") or None))
+            words=seg.get("words") or None,
+            avg_logprob=_f("avg_logprob"),
+            no_speech_prob=_f("no_speech_prob")))
     return out
 
 

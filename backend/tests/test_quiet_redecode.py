@@ -191,3 +191,20 @@ def test_redecode_disabled_by_flag(tmp_path, monkeypatch):
     n = asyncio.run(V.redecode_quiet_segments(
         "job-q", str(audio), segs, "ja", str(tmp_path / "w")))
     assert n == 0 and called["n"] == 0 and segs[0]["text"] == "セリフ0"
+
+
+# ── the confidence signal must survive the bridge ───────────────────────────
+
+def test_bridge_carries_avg_logprob_into_transcript_rows():
+    """Run-31's zero-work diagnostic showed 19/293 cues carrying
+    avg_logprob — every main-decode cue lost its confidence in
+    to_fez_transcript, leaving the quiet redecode AND the
+    [UNRELIABLE ASR] marks inert on the main track."""
+    from backend.services.reframer_bridge import to_fez_transcript
+    rows = to_fez_transcript([
+        {"start_sec": 1.0, "end_sec": 3.0, "text": "静かなセリフ",
+         "avg_logprob": -1.23, "no_speech_prob": 0.2},
+        {"start_sec": 4.0, "end_sec": 6.0, "text": "普通のセリフ"},
+    ])
+    assert rows[0]["avg_logprob"] == -1.23
+    assert rows[1]["avg_logprob"] is None

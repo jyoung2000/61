@@ -570,9 +570,34 @@ def merge_recovered(existing: list, recovered: list[dict]) -> tuple[list, int]:
             if _similar(rt, _seg_text(e)) >= 0.7:
                 dup = True
                 break
+            # TIME-overlap dedup, language-agnostic. The text test above is
+            # blind across a translation boundary: the post-COMPLETE
+            # separation pass recovers JAPANESE cues against an already-
+            # ENGLISH transcript (similarity ~0 by construction), so the
+            # same line shipped twice as two different renders — a measured
+            # run captioned one report three ways ("As expected from OZ's
+            # intelligence" / "Indeed, just as predicted by OZ
+            # headquarters" / "Matches info from OZ base"). A recovery
+            # exists to fill HOLES: a recovered cue whose span is ≥60%
+            # covered by an existing dialogue cue has no hole to fill.
+            et = _seg_text(e)
+            if et and not et.strip().startswith("["):
+                _ov = min(eb[1], rb[1]) - max(eb[0], rb[0])
+                if _ov > 0 and (rb[1] - rb[0]) > 0 \
+                        and _ov / (rb[1] - rb[0]) >= 0.6:
+                    dup = True
+                    break
         if not dup:
             for a in accepted:
                 if _similar(rt, _seg_text(a)) >= 0.8:
+                    dup = True
+                    break
+                ab = _seg_bounds(a)
+                _ov = (min(ab[1], rb[1]) - max(ab[0], rb[0])) if ab else 0.0
+                if (ab and _ov > 0 and (rb[1] - rb[0]) > 0
+                        and _ov / (rb[1] - rb[0]) >= 0.6):
+                    # Overlapping recovery SPANS re-hear the same audio; the
+                    # earlier-accepted cue keeps the slot.
                     dup = True
                     break
         if dup:

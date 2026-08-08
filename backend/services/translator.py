@@ -328,6 +328,22 @@ def is_garbled_translation(text, source_language="", glossary_terms=frozenset())
     return garble_reason(text, source_language, glossary_terms) is not None
 
 
+def has_name_shaped_token(t: str) -> bool:
+    """A capitalized token that is NOT sentence-initial — i.e. something in a
+    translated draft that could BE a rendered (possibly garbled) name.
+
+    The second-vote name pass exists to repair drafts like "Sex Unique is
+    going"; a draft with no name-shaped token has nothing to repair, and
+    rewriting it injects a name into a sentence about something else
+    (measured: "Satellites are indeed useless." re-voted into "Zechs is
+    useless, isn't he?")."""
+    for _m in re.finditer(r"\b[A-Z][A-Za-z'\-]+\b", t or ""):
+        _head = (t or "")[:_m.start()].rstrip()
+        if _head and _head[-1] not in ".!?…\"'“”‘’":
+            return True
+    return False
+
+
 def tidy_punctuation_artifacts(text: str) -> str:
     """Deterministic cleanup of the small punctuation artifacts LLM
     translation leaves behind: a stray leading CJK period ("。 And you?"),
@@ -1671,7 +1687,14 @@ async def translate_via_llm(
                 _cur = _cur_texts[_i].strip()
                 if not _cur:
                     continue
+                # 2-kana tokens (マリ, ロウ, オズ) are too often FRAGMENTS of
+                # longer words to re-vote on — a measured run turned マリ
+                # (the head of マリーナ, the Marina carrier) into "Marley".
+                if len(_kana.replace("・", "")) < 3:
+                    continue
                 if _roster_re is not None and _roster_re.search(_cur):
+                    continue
+                if not has_name_shaped_token(_cur):
                     continue
                 _p = (
                     "This English subtitle line was translated from the "

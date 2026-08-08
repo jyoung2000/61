@@ -671,6 +671,12 @@ def to_fez_transcript(reframer_segments: list, speaker_timeline: dict = None) ->
             "words": words or None,
             "confidence": round(_clamp01(confidence), 3),
             "no_speech_prob": seg.get("no_speech_prob"),
+            # The decode's raw confidence must survive this conversion: it
+            # drives the quiet-cue redecode and the [UNRELIABLE ASR]
+            # translation marks, and a measured run's diagnostic showed the
+            # whole main track arriving without it (19/293 cues carried it —
+            # all from the relisten, none from here).
+            "avg_logprob": seg.get("avg_logprob"),
         })
     return out
 

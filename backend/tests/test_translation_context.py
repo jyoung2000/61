@@ -181,6 +181,25 @@ def test_coherence_audit_skips_tiny_tracks_without_a_call():
     assert n == 0
 
 
+# ── second-vote draft gate ──────────────────────────────────────────────────
+
+def test_name_shaped_token_detector():
+    """The second vote may only rewrite drafts that contain something
+    name-shaped to fix. Run-31 measured both failure modes: a nameless
+    draft re-voted into "Zechs is useless" and マリ (a fragment of the
+    Marina carrier) rendered as "Marley"."""
+    # the class the vote exists for: a garbled rendered name
+    assert T.has_name_shaped_token("Sex Unique is going")
+    assert T.has_name_shaped_token("What's wrong, Relena?")
+    assert T.has_name_shaped_token("Tell Lady Une up there.")
+    # nothing name-shaped → nothing to repair
+    assert not T.has_name_shaped_token("Satellites are indeed useless.")
+    assert not T.has_name_shaped_token("He is strong")
+    # sentence-initial capitals are ordinary words, not names
+    assert not T.has_name_shaped_token("Understood. Fine then.")
+    assert not T.has_name_shaped_token("")
+
+
 # ── items 5+6: batch prompt shape (marks, scene breaks, translated tail) ────
 
 class _BatchOrch:

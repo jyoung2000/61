@@ -2030,6 +2030,35 @@ def test_end_soft_run_cannot_collapse_a_scene_that_precedes_the_lyrics():
     assert not any("Just love" in t for t in texts)
 
 
+def test_soft_run_with_proper_nouns_is_narration_not_a_song():
+    """Run-31: the END soft run collapsed 1411.6-1440.6s — the ED's lyric
+    tail PLUS the next-episode preview narration ("The Gundam sank to the
+    ocean", "Union sent Marley…") — because the structural veto passed
+    (only preview-shaped cues followed) and the per-cue pn tolerance let a
+    name-bearing cue join the run. Songs don't name the cast: a run
+    carrying 2+ proper nouns across 5+ cues is narration and must survive.
+    The same fixture shape with clean lyrics still collapses (see the
+    run-28 test above)."""
+    from backend.services.transcript_sanitize import collapse_song_choruses
+    rows = [
+        {"start": 10.0, "end": 12.0, "text": "The year is After Colony 195."},
+        {"start": 700.0, "end": 702.0, "text": "So it WAS a Gundam."},
+        {"start": 1411.6, "end": 1414.0, "text": "Jackstar"},
+        {"start": 1415.0, "end": 1418.0, "text": "The Gundam sank to the ocean"},
+        {"start": 1419.0, "end": 1421.0, "text": "To salvage"},
+        {"start": 1422.0, "end": 1426.0, "text": "Union sent Marley in response"},
+        {"start": 1427.0, "end": 1430.0, "text": "waiting in the deep"},
+        {"start": 1431.0, "end": 1434.0, "text": "another appears from the dark"},
+        {"start": 1445.0, "end": 1451.7,
+         "text": "Mobile Suit Gundam Wing Episode 2 The Deathscythe Gundam"},
+    ]
+    out, _changed = collapse_song_choruses(rows, "en")
+    texts = [r["text"] for r in out]
+    assert "The Gundam sank to the ocean" in texts
+    assert "Union sent Marley in response" in texts
+    assert not any("♪" in t for t in texts)
+
+
 def test_theme_marker_span_cap_vetoes_scene_swallowing_markers():
     """Belt-and-braces behind the structural veto: any minted marker whose
     span exceeds the 110s cap (reference lyric blocks are 56-66s) is refused

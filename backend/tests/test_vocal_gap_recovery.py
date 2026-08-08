@@ -115,6 +115,45 @@ def test_merge_is_additive_and_drops_boundary_echoes():
     ]
 
 
+def test_merge_drops_recovered_cues_that_overlap_existing_dialogue():
+    """Run-31: the post-COMPLETE separation pass recovers JAPANESE cues
+    against an already-ENGLISH transcript — the text-similarity dedup is
+    blind across that language boundary, so the same report shipped three
+    ways ("As expected from OZ's intelligence" / "Indeed, just as predicted
+    by OZ headquarters" / "Matches info from OZ base"). A recovered cue
+    whose span is ≥60% covered by an existing dialogue cue has no hole to
+    fill and must be dropped, whatever its text says."""
+    existing = _track((100.0, 104.0, "As expected from OZ's intelligence."))
+    merged, added = merge_recovered(existing, [
+        # 100% inside the existing English cue, Japanese text → 0 similarity
+        {"start": 100.5, "end": 103.5, "text": "さすがオズの情報部だ"},
+        # a real hole → kept
+        {"start": 200.0, "end": 203.0, "text": "新しいセリフ"},
+    ])
+    assert added == 1
+    texts = [m["text"] for m in merged]
+    assert "新しいセリフ" in texts and "さすがオズの情報部だ" not in texts
+
+
+def test_merge_overlap_rule_exempts_markers_and_dedups_overlapping_spans():
+    # A recovered line under a music MARKER is not "already covered" —
+    # markers are not dialogue (the song-window pass judges those later).
+    existing = _track((300.0, 310.0, "[♪ music ♪]"))
+    merged, added = merge_recovered(existing, [
+        {"start": 302.0, "end": 305.0, "text": "埋もれたセリフ"},
+    ])
+    assert added == 1
+    # Two overlapping recovery SPANS re-hear the same audio: the second
+    # recovered cue lands on the first's slot and must be dropped even
+    # when the decode wording differs.
+    merged, added = merge_recovered([], [
+        {"start": 400.0, "end": 404.0, "text": "五個の金属反応があります"},
+        {"start": 400.5, "end": 403.5, "text": "5個の金属反応がある"},
+    ])
+    assert added == 1
+    assert len(merged) == 1
+
+
 def test_junk_hallucinations_regex():
     assert _JUNK_RE.match("Thank you for watching.")
     assert _JUNK_RE.match("ご視聴ありがとうございました")
@@ -144,7 +183,10 @@ def test_post_complete_recovery_merges_and_translates(monkeypatch, tmp_path):
     (d / "job.json").write_text(job.model_dump_json())
 
     async def _fake_recover(job_id, audio, segments, lang, work_dir):
-        return [{"start": 21.0, "end": 24.0, "text": "埋もれた台詞",
+        # In a real HOLE (cue 2 ends at 24, cue 3 starts at 30) — a recovered
+        # cue overlapping existing dialogue is now dropped by design (the
+        # run-31 cross-language duplicate fix).
+        return [{"start": 25.0, "end": 28.0, "text": "埋もれた台詞",
                  "speaker": "Speaker 1"}]
 
     monkeypatch.setattr(
