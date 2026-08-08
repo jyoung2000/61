@@ -1176,15 +1176,20 @@ def _quiet_candidates(segments: list, floor: float, max_n: int,
 
 
 def _accept_quiet_redecode(old_lp: float, decoded: list,
-                           margin: float) -> tuple[bool, str, float]:
+                           margin: float,
+                           old_text: str = "") -> tuple[bool, str, float]:
     """Gate a boosted re-decode against the original low-confidence text.
 
     Returns ``(accept, new_text, new_lp)``. FAIL-SOFT by design: any doubt —
     empty decode, hallucination staple, missing confidence, high
-    no_speech_prob, or a win smaller than ``margin`` — keeps the original.
-    A wrong replacement here is strictly worse than the wrong original,
-    because the original at least came from the un-normalized audio the
-    rest of the transcript agrees with."""
+    no_speech_prob, a win smaller than ``margin``, or a decode that LOSES
+    most of the original's content — keeps the original. A wrong
+    replacement here is strictly worse than the wrong original, because
+    the original at least came from the un-normalized audio the rest of
+    the transcript agrees with. The content guard is measured: the first
+    live pass replaced an 18-char line ("what kind of knight is that?")
+    with 6 chars of confident garble off a 0.7-second boosted slice —
+    confidence alone cannot veto a hallucination that short."""
     if not decoded:
         return (False, "", 0.0)
     text = " ".join((_seg_text(d) or "") for d in decoded)
@@ -1210,6 +1215,12 @@ def _accept_quiet_redecode(old_lp: float, decoded: list,
     except (TypeError, ValueError):
         return (False, "", 0.0)
     if new_lp <= old + float(margin):
+        return (False, "", 0.0)
+    # Content preservation: the same audio re-heard cannot legitimately
+    # shrink to under half the original's characters — that is the boosted
+    # slice hallucinating a fragment, however confident it sounds.
+    _old = (old_text or "").strip()
+    if _old and len(text) * 2 < len(_old):
         return (False, "", 0.0)
     return (True, text, new_lp)
 
@@ -1308,7 +1319,8 @@ async def redecode_quiet_segments(
                 break
             old_lp = (s.get("avg_logprob") if isinstance(s, dict)
                       else getattr(s, "avg_logprob", None))
-            ok, text, new_lp = _accept_quiet_redecode(old_lp, decoded, margin)
+            ok, text, new_lp = _accept_quiet_redecode(
+                old_lp, decoded, margin, old_text=_seg_text(s))
             if not ok:
                 continue
             old_txt = _seg_text(s)

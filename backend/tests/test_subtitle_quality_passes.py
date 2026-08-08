@@ -2059,6 +2059,37 @@ def test_soft_run_with_proper_nouns_is_narration_not_a_song():
     assert not any("♪" in t for t in texts)
 
 
+def test_opening_theme_chain_never_absorbs_the_prologue():
+    """Run-31 AND run-33: after correctly collapsing the OP (30-93s), the
+    chain absorbed the prologue narration starting 19s later ("Humanity
+    sought new hope…") as a 'verse block', slipping under the proper-noun
+    veto at ~1 counted noun. An OP ends hard and cuts to the episode —
+    the chain's one measured legitimate case is the ENDING theme's last
+    verse, so it now runs in the END window only."""
+    from backend.services.transcript_sanitize import collapse_song_choruses
+    rows = [
+        {"start": 30.3, "end": 35.0, "text": "The rain doesn't heal this"},
+        {"start": 36.0, "end": 41.0, "text": "I convey my feelings in the air"},
+        {"start": 42.0, "end": 47.0, "text": "holding your soaked shoulder"},
+        {"start": 48.0, "end": 53.0, "text": "your trembling fingertips search"},
+        {"start": 55.0, "end": 60.0, "text": "letting my heated breath flow"},
+        {"start": 62.0, "end": 67.0, "text": "believing love turns sorrow strong"},
+        {"start": 68.0, "end": 92.7, "text": "tonight"},
+        # the prologue, 19s after the song ends — narration, unpunctuated
+        {"start": 112.1, "end": 116.0, "text": "raised from Earth"},
+        {"start": 117.0, "end": 122.0, "text": "Humanity sought new hope in space"},
+        {"start": 123.0, "end": 128.0, "text": "However, under the guise of justice"},
+        {"start": 129.0, "end": 134.6, "text": "they subdued each colony"},
+        {"start": 700.0, "end": 702.0, "text": "So it WAS a Gundam."},
+    ]
+    out, _changed = collapse_song_choruses(rows, "en")
+    texts = [r["text"] for r in out]
+    assert any("♪" in t for t in texts)                      # OP collapsed
+    assert "Humanity sought new hope in space" in texts      # prologue kept
+    assert "they subdued each colony" in texts
+    assert "raised from Earth" in texts
+
+
 def test_theme_marker_span_cap_vetoes_scene_swallowing_markers():
     """Belt-and-braces behind the structural veto: any minted marker whose
     span exceeds the 110s cap (reference lyric blocks are 56-66s) is refused

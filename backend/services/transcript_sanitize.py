@@ -1329,6 +1329,15 @@ def collapse_song_choruses(segments, target_lang: str = "en"):
                 return span >= 4.0
 
             for mk in list(_w_markers):
+                # ENDING themes only. The chain exists for one measured case:
+                # the ED's last verse after an instrumental bridge. In the
+                # OPENING window it has now eaten the prologue narration on
+                # two measured runs ("Humanity sought new hope…", 1:52-2:14,
+                # absorbed as "verse blocks" 19s after the song actually
+                # ended) — an OP ends hard and cuts to the episode; there is
+                # no post-bridge verse to chain.
+                if marker_at[mk][2] != _THEME_END_LABEL:
+                    continue
                 _more = True
                 while _more:
                     _more = False

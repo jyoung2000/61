@@ -208,3 +208,23 @@ def test_bridge_carries_avg_logprob_into_transcript_rows():
     ])
     assert rows[0]["avg_logprob"] == -1.23
     assert rows[1]["avg_logprob"] is None
+
+
+# ── content-preservation guard (measured on the first live pass) ────────────
+
+def test_accept_rejects_fragment_hallucinations():
+    """Run-33, first live firing: a 0.7s boosted slice replaced the 18-char
+    'あくい、あれはなんていう騎士ですが?' with 6 chars of confident garble
+    ('フロー 若干', logprob -0.15). A re-hearing of the same audio cannot
+    legitimately lose over half the original's characters."""
+    dec = [{"text": "フロー 若干", "avg_logprob": -0.15, "no_speech_prob": 0.1}]
+    ok, _, _ = V._accept_quiet_redecode(
+        -0.76, dec, 0.3, old_text="あくい、あれはなんていう騎士ですが?")
+    assert not ok
+    # the run's GOOD replacement survives: 敵衝 (2 chars) → どこだ! (4)
+    dec = [{"text": "どこだ!", "avg_logprob": -0.13, "no_speech_prob": 0.1}]
+    ok, text, _ = V._accept_quiet_redecode(-0.71, dec, 0.3, old_text="敵衝")
+    assert ok and text == "どこだ!"
+    # no old text → guard inert (fail-open on the guard, gate still holds)
+    ok, _, _ = V._accept_quiet_redecode(-1.2, dec, 0.3, old_text="")
+    assert ok
