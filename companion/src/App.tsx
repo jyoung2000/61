@@ -715,15 +715,30 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
   // (beam search + model), because both draw on the same VRAM/compute budget.
   // The two underlying config fields still exist (and the container reads
   // whisper quality back for sync) — the UI just sets them together.
+  // Hover hints lead with CAPTION QUALITY — what the transcript will look
+  // like is the thing users pick a level for; speed is the secondary trade.
   const PERF_LEVELS = [
     { key: 'auto', speed: 'auto', whisper: 'auto',
-      hint: 'Recommended — automatically balances pipeline speed and transcription accuracy for your card + allocated VRAM.' },
+      hint: 'Caption accuracy ★★★☆ (adaptive) — picks the most accurate ' +
+        'Whisper decode your allocated VRAM affords (usually large-v3-turbo ' +
+        'with beam search: near-broadcast accuracy, occasional slips on names ' +
+        'and whispered lines). Speed also auto-tunes. Recommended default.' },
     { key: 'eco', speed: 'eco', whisper: 'fast',
-      hint: 'Light touch — one AI job at a time and fast greedy captions. Leaves the card free for games/other apps.' },
+      hint: 'Caption accuracy ★★☆☆ (fastest, roughest) — small greedy decode: ' +
+        'expect more misheard words, wrong names, and missed quiet lines. ' +
+        'One AI job at a time; leaves the card free for games/other apps. ' +
+        'Pick this when the PC is in use, not when subtitles matter.' },
     { key: 'balanced', speed: 'balanced', whisper: 'balanced',
-      hint: 'Moderate parallelism + beam-search captions. Good speed and accuracy.' },
+      hint: 'Caption accuracy ★★★☆ (solid) — large-v3-turbo with beam search: ' +
+        'accurate on clear dialogue, occasional slips on names and quiet or ' +
+        'overlapped speech. Moderate parallelism for a steady pipeline.' },
     { key: 'turbo', speed: 'turbo', whisper: 'max',
-      hint: 'Full send — maximum parallelism and best "Netflix-grade" captions (large-v3 + beam search). Fastest pipeline and highest accuracy your VRAM allows.' },
+      hint: 'Caption accuracy ★★★★ (best possible) — FULL large-v3 with beam ' +
+        'search, the "Netflix-grade" tier: fewest mishearings and the best ' +
+        'pickup of quiet/whispered lines. Needs ~8 GB allocated to engage ' +
+        '(below that it safely falls back to the Balanced decode — the ' +
+        '"Whisper tier" line below shows which engaged). Maximum pipeline ' +
+        'parallelism; slowest to share the card with other apps.' },
   ] as const;
   // Which level is active. We always set both fields together, so the speed
   // profile identifies the level (they align 1:1). Falls back to 'auto' if a
