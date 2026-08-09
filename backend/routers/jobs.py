@@ -149,6 +149,10 @@ async def list_jobs(user: User = Depends(get_current_user)):
             "provider_used": j.provider_used,
             "file_size_mb": j.file_size_mb,
             "estimated_cost_usd": j.estimated_cost_usd,
+            # Wall-clock analysis time stamped at COMPLETE — the dashboard
+            # cards show "how long did this take" without loading the full job.
+            "analysis_duration_seconds": getattr(
+                j, "analysis_duration_seconds", None),
             "owner_user_id": getattr(j, "owner_user_id", "") or "",
         }
         for j in jobs

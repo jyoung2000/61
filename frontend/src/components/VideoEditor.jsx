@@ -2028,6 +2028,18 @@ export default function VideoEditor({
     // visible player actually is.
     let lastReportedT = -1;
 
+    // Throttle React-visible time propagation to ~30 Hz during playback.
+    // Every ``syncTime`` call re-renders this whole editor AND the hosting
+    // page (``onTimeUpdate`` → e.g. Analysis' ``videoCurrentTime`` state,
+    // which re-renders the full transcript panel). At 60 Hz that render
+    // work competes with the browser's video decoder for main-thread time
+    // and the preview visibly stutters on 1080p sources. 33 ms sampling is
+    // indistinguishable for playhead motion / subtitle cues / word
+    // highlight (words last 150 ms+), and pause/seek still snap instantly
+    // through the native ``timeupdate``/``seeked`` listeners below.
+    const UI_SYNC_MIN_MS = 33;
+    let lastUiSyncAt = 0;
+
     // Simple hash of segment settings to detect property changes
     const segHash = (seg) => seg ? `${seg.id}_${seg.muted}_${seg.volume}_${seg.speed}` : null;
 
@@ -2051,8 +2063,12 @@ export default function VideoEditor({
         rafId = requestAnimationFrame(tick);
         return;
       }
-      lastReportedT = t;
-      syncTime(t);
+      const nowMs = performance.now();
+      if (nowMs - lastUiSyncAt >= UI_SYNC_MIN_MS) {
+        lastUiSyncAt = nowMs;
+        lastReportedT = t;
+        syncTime(t);
+      }
       // Auto-stop at trimmed end
       if (trimmedEnd && t >= trimmedEnd) {
         video.pause();

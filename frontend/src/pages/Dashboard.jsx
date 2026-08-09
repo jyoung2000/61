@@ -10,6 +10,16 @@ function formatDuration(seconds) {
   return `${m}:${s.toString().padStart(2, '0')}`;
 }
 
+/* "9m 44s" / "1h 03m" — analysis wall-clock, distinct from the video's
+   m:ss duration so the two numbers on a card never read as the same thing. */
+function formatAnalysisTime(seconds) {
+  if (!seconds || seconds <= 0) return '';
+  const s = Math.round(seconds);
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, '0')}s`;
+  return `${Math.floor(s / 3600)}h ${String(Math.floor((s % 3600) / 60)).padStart(2, '0')}m`;
+}
+
 function formatDate(iso) {
   if (!iso) return '';
   try {
@@ -52,6 +62,11 @@ export default function Dashboard() {
   // Power-user multi-select for bulk deleting projects.
   const [selectMode, setSelectMode] = useState(false);
   const [selected, setSelected] = useState(() => new Set());
+  // Card the pointer is over — drives the thumbnail peek. The <img> is only
+  // mounted on first hover (and remembered in hoveredEver) so the grid never
+  // fetches thumbnails for cards nobody looks at.
+  const [hoverId, setHoverId] = useState(null);
+  const hoveredEver = useRef(new Set());
   const [bulkBusy, setBulkBusy] = useState(false);
   const navigate = useNavigate();
   const { isMobile } = useResponsive();
@@ -646,6 +661,8 @@ export default function Dashboard() {
                 key={job.job_id}
                 className="card-hover slide-in"
                 onClick={() => (selectMode ? toggleSelect(job.job_id) : navigate(`/analysis/${job.job_id}`))}
+                onMouseEnter={() => { hoveredEver.current.add(job.job_id); setHoverId(job.job_id); }}
+                onMouseLeave={() => setHoverId((h) => (h === job.job_id ? null : h))}
                 style={{
                   background: 'var(--bg-panel)',
                   border: `1px solid ${isSel ? 'var(--accent-cyan)' : 'var(--border)'}`,
@@ -653,9 +670,28 @@ export default function Dashboard() {
                   borderRadius: 'var(--radius-md)',
                   cursor: 'pointer',
                   position: 'relative',
+                  overflow: 'hidden',
                   animationDelay: `${i * 50}ms`,
                 }}
               >
+                {/* Thumbnail peek: hovering a card fades in the video's frame
+                    over the whole card (pointer-events none, so clicks still
+                    open the project). Mounted lazily on first hover; a card
+                    with no thumbnail simply never shows one (onError latch). */}
+                {hoveredEver.current.has(job.job_id) && (
+                  <img
+                    src={`/thumbnails/${job.job_id}.jpg`}
+                    alt=""
+                    aria-hidden="true"
+                    onError={(e) => { e.currentTarget.style.display = 'none'; }}
+                    style={{
+                      position: 'absolute', inset: 0, width: '100%', height: '100%',
+                      objectFit: 'cover', pointerEvents: 'none', zIndex: 1,
+                      opacity: hoverId === job.job_id ? 1 : 0,
+                      transition: 'opacity 0.18s ease',
+                    }}
+                  />
+                )}
                 {selectMode && (
                   <div style={{
                     position: 'absolute', top: 10, right: 10, zIndex: 2,
@@ -688,12 +724,12 @@ export default function Dashboard() {
                         {formatDate(job.created_at)}
                       </span>
                     </div>
-                    <span className={`badge ${statusInfo.className}`}>
+                    <span className={`badge ${statusInfo.className}`} style={{ position: 'relative', zIndex: 2 }}>
                       {statusInfo.label}
                     </span>
                   </div>
 
-                  <div style={{ display: 'flex', gap: 16, fontSize: 12, color: 'var(--text-secondary)' }}>
+                  <div style={{ display: 'flex', gap: 16, fontSize: 12, color: 'var(--text-secondary)', flexWrap: 'wrap' }}>
                     <span style={{ fontFamily: 'var(--font-mono)' }}>
                       {formatDuration(job.duration)}
                     </span>
@@ -707,6 +743,14 @@ export default function Dashboard() {
                         {job.clips_count} clips
                       </span>
                     )}
+                    {job.status === 'complete' && formatAnalysisTime(job.analysis_duration_seconds) && (
+                      <span
+                        style={{ color: 'var(--accent-cyan)', fontFamily: 'var(--font-mono)' }}
+                        title="Total analysis time (upload to complete)"
+                      >
+                        ⏱ {formatAnalysisTime(job.analysis_duration_seconds)}
+                      </span>
+                    )}
                   </div>
 
                   {job.progress_message && job.status !== 'complete' && (
@@ -716,7 +760,9 @@ export default function Dashboard() {
                   )}
 
                   {/* Action buttons */}
-                  <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
+                  {/* zIndex 2: the action row stays visible + clickable above
+                      the hover thumbnail peek. */}
+                  <div style={{ display: 'flex', gap: 8, marginTop: 10, position: 'relative', zIndex: 2 }}>
                     {!CANCELLABLE.includes(job.status) && (
                       <button
                         onClick={(e) => handleExport(e, job.job_id)}

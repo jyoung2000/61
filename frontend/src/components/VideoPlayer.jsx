@@ -78,9 +78,23 @@ export default function VideoPlayer({ src, clipStart, clipEnd, onTimeUpdate, asp
       onTimeUpdateRef.current?.(t);
     };
 
+    // Throttle parent-visible reports to ~30 Hz during playback. The
+    // parent stores this in React state (e.g. Analysis' ``videoCurrentTime``)
+    // and re-renders its whole tree per report — at 60 Hz that render work
+    // competes with video decode on the main thread and playback stutters.
+    // 33 ms sampling is imperceptible for transcript highlight / subtitle
+    // sync; seeks and pauses still report immediately via ``onSeeked`` /
+    // ``stopRaf`` below.
+    const REPORT_MIN_MS = 33;
+    let lastReportAt = 0;
+
     const tick = () => {
       const t = video.currentTime;
-      report(t);
+      const nowTs = performance.now();
+      if (nowTs - lastReportAt >= REPORT_MIN_MS) {
+        lastReportAt = nowTs;
+        report(t);
+      }
       // Auto-stop at clip end in preview mode
       if (clipEnd && t >= clipEnd) {
         video.pause();
