@@ -23,6 +23,29 @@ use tauri::{Emitter, Manager, WindowEvent};
 
 type SharedState = Arc<AppState>;
 
+/// The flag the login-autostart registration passes so a boot/login launch
+/// goes straight to the tray instead of opening the dashboard.
+pub const HIDDEN_LAUNCH_FLAG: &str = "--hidden";
+
+/// True when this launch should stay in the tray with no window.
+///
+/// Pure over the argument list so it is unit-testable. Accepts the common
+/// spellings a user or a hand-edited Run key might carry (`--hidden`,
+/// `-hidden`, `/hidden`, `--silent`, `--minimized`) — getting this wrong in
+/// the permissive direction only means the dashboard opens, while getting it
+/// wrong in the strict direction means a window in the user's face at every
+/// single login.
+pub fn launched_hidden<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    args.into_iter().skip(1).any(|a| {
+        let a = a.as_ref().trim().trim_start_matches(['-', '/']).to_ascii_lowercase();
+        matches!(a.as_str(), "hidden" | "silent" | "minimized" | "background")
+    })
+}
+
 /// Bring the main window to the foreground — recreating it if it was somehow
 /// destroyed (a WebView crash, or a close path that bypassed prevent_close),
 /// so the GUI can never end up permanently invisible with the process alive.
@@ -1349,7 +1372,16 @@ pub fn run() {
     let builder = tauri::Builder::default()
         // Single instance MUST be the first plugin: a second launch focuses
         // the running window and exits instead of starting a duplicate.
-        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            // A second launch normally means the user clicked the app while it
+            // was already sharing from the tray — show them the dashboard. But
+            // a login autostart firing against an already-running instance
+            // (fast user switching, an installer relaunch) carries --hidden and
+            // must NOT steal focus.
+            if launched_hidden(argv.iter().map(String::as_str)) {
+                log::info!("second instance launched with {HIDDEN_LAUNCH_FLAG} — staying in the tray");
+                return;
+            }
             log::info!("second instance launched — focusing the existing window");
             show_or_create_main(app);
         }))
@@ -1357,25 +1389,28 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-            None,
+            // Login launches go straight to the tray: the Companion is a
+            // background GPU service, and a dashboard window appearing on
+            // every boot is exactly the "I have to close it" friction this
+            // flag removes.
+            Some(vec![HIDDEN_LAUNCH_FLAG]),
         ))
         .setup(|app| {
             log::info!("setup: begin");
-            // Reboot backstop for unattended updates: register the app to run
-            // at login so that even if a self-update's relaunch fails, or the
-            // GPU box simply reboots, the Companion comes back online without
-            // anyone at the desk. Idempotent; best-effort (a locked-down
-            // machine may refuse the registration — never fatal).
-            {
-                use tauri_plugin_autostart::ManagerExt;
-                let al = app.autolaunch();
-                match al.is_enabled() {
-                    Ok(true) => log::info!("autostart: already enabled"),
-                    _ => match al.enable() {
-                        Ok(()) => log::info!("autostart: enabled (login relaunch backstop)"),
-                        Err(e) => log::warn!("autostart: could not enable ({e})"),
-                    },
-                }
+            // Window visibility is decided FIRST, before any of the setup work
+            // below (config load, sidecar probe, autostart registration, proxy
+            // bind). The window is created hidden (tauri.conf.json
+            // visible:false) so a login launch never flashes a frame — which
+            // means a user-initiated launch must be shown promptly or the app
+            // looks like it didn't start.
+            let hidden_launch = launched_hidden(std::env::args());
+            if hidden_launch {
+                log::info!(
+                    "setup: launched with {HIDDEN_LAUNCH_FLAG} — sharing from the tray, \
+                     no window (open it from the tray icon)"
+                );
+            } else {
+                show_or_create_main(&app.handle().clone());
             }
             let config_dir = app
                 .path()
@@ -1401,6 +1436,57 @@ pub fn run() {
                 Ordering::Relaxed,
             );
             app.manage(state.clone());
+
+            // ── Run at login, straight to the tray ──────────────────────
+            // The Companion is a background GPU service: the GPU box should
+            // come back online after a reboot with nobody at the desk, and
+            // without a dashboard window appearing on the screen. Registration
+            // is idempotent and best-effort (a locked-down machine may refuse
+            // it — never fatal).
+            //
+            // The one-shot migration exists because installs registered by an
+            // older build carry a bare command line with no --hidden: they
+            // would keep opening the window at every login until the Run key
+            // is rewritten. Re-register exactly once, then latch it.
+            {
+                use tauri_plugin_autostart::ManagerExt;
+                let al = app.autolaunch();
+                let migrated = state.config.lock().unwrap().autostart_hidden_migrated;
+                match al.is_enabled() {
+                    Ok(true) if migrated => {
+                        log::info!("autostart: already enabled (hidden launch)")
+                    }
+                    Ok(true) => {
+                        // Registered by an older build — rewrite the command
+                        // line so the login launch carries --hidden.
+                        let _ = al.disable();
+                        match al.enable() {
+                            Ok(()) => {
+                                state.config.lock().unwrap().autostart_hidden_migrated = true;
+                                state.save();
+                                log::info!(
+                                    "autostart: re-registered with {HIDDEN_LAUNCH_FLAG} \
+                                     (login launches now go straight to the tray)"
+                                );
+                            }
+                            // Left disabled by the failed re-enable: log loudly
+                            // and retry on the next launch (latch NOT set).
+                            Err(e) => log::warn!(
+                                "autostart: re-registration failed ({e}) — \
+                                 login autostart may be off until the next launch"
+                            ),
+                        }
+                    }
+                    _ => match al.enable() {
+                        Ok(()) => {
+                            state.config.lock().unwrap().autostart_hidden_migrated = true;
+                            state.save();
+                            log::info!("autostart: enabled (hidden launch at login)");
+                        }
+                        Err(e) => log::warn!("autostart: could not enable ({e})"),
+                    },
+                }
+            }
             log::info!(
                 "setup: state loaded (sidecar_available={})",
                 state.sidecar_available.load(Ordering::Relaxed)
@@ -1705,9 +1791,17 @@ pub fn run() {
             if let Err(e) = build_tray(app, state) {
                 log::error!("tray build failed (continuing without tray): {e}");
             }
-            // Guarantee the window is visible on launch regardless of config
-            // defaults — a hidden-but-alive window reads as "GUI unreachable".
-            show_or_create_main(&app.handle().clone());
+            // Safety net for the visible path: if the early show above lost a
+            // race with window creation, the window would be alive but
+            // invisible — which reads as "the app didn't start".
+            if !hidden_launch {
+                if let Some(w) = app.get_webview_window("main") {
+                    if !w.is_visible().unwrap_or(true) {
+                        log::warn!("main window still hidden after setup — showing it");
+                        show_or_create_main(&app.handle().clone());
+                    }
+                }
+            }
             log::info!("setup: complete");
             Ok(())
         })
@@ -1746,6 +1840,26 @@ pub fn run() {
     // and other platforms.
     match builder.build(tauri::generate_context!()) {
         Ok(app) => app.run(|handle, event| {
+            // Losing the WINDOW must never stop the GPU sharing. Tauri asks to
+            // exit whenever the last window goes away, which includes paths
+            // prevent_close can't intercept: a WebView crash, "End task" on the
+            // window, a macOS Cmd-Q, or the window being destroyed rather than
+            // closed. Refuse those and stay in the tray — a mid-job Companion
+            // that vanishes because a webview died takes the whole ClipAI run
+            // down with it.
+            //
+            // `code` distinguishes them: an explicit app.exit(n) — the tray's
+            // Quit — carries Some(n) and is honoured.
+            if let tauri::RunEvent::ExitRequested { api, code, .. } = &event {
+                if code.is_none() {
+                    api.prevent_exit();
+                    log::info!(
+                        "exit request without an explicit code (window closed/destroyed) \
+                         — staying alive in the tray; use tray → Quit to stop sharing"
+                    );
+                    return;
+                }
+            }
             if let tauri::RunEvent::Exit = event {
                 if let Some(state) = handle.try_state::<SharedState>() {
                     let state = state.inner().clone();
@@ -1776,6 +1890,33 @@ pub fn run() {
         }
     }
     log::info!("app exited");
+}
+
+#[cfg(test)]
+mod hidden_launch_tests {
+    use super::{launched_hidden, HIDDEN_LAUNCH_FLAG};
+
+    #[test]
+    fn a_bare_launch_opens_the_dashboard() {
+        assert!(!launched_hidden(["app.exe"]));
+        assert!(!launched_hidden(["app.exe", "--verbose"]));
+        // argv[0] is the program path and is never a flag, even if the app
+        // were installed into a folder literally named "hidden".
+        assert!(!launched_hidden(["C:/hidden/app.exe"]));
+    }
+
+    #[test]
+    fn the_autostart_flag_keeps_the_window_closed() {
+        assert!(launched_hidden(["app.exe", HIDDEN_LAUNCH_FLAG]));
+        assert!(launched_hidden(["app.exe", "--hidden"]));
+        // Spellings a hand-edited Run key / LaunchAgent might carry.
+        assert!(launched_hidden(["app.exe", "-hidden"]));
+        assert!(launched_hidden(["app.exe", "/hidden"]));
+        assert!(launched_hidden(["app.exe", "--silent"]));
+        assert!(launched_hidden(["app.exe", "--minimized"]));
+        assert!(launched_hidden(["app.exe", "--background"]));
+        assert!(launched_hidden(["app.exe", "--other", " --Hidden "]));
+    }
 }
 
 #[cfg(test)]

@@ -394,9 +394,12 @@ function Wizard({ status, refresh, onDone }: {
         <div className="panel">
           <h2>All set</h2>
           <p className="muted">
-            The Companion lives in your tray. Closing this window keeps it running;
-            use the tray menu to pause sharing or quit. Allow inbound TCP&nbsp;
-            {status.config.port} on Private networks if your firewall asks.
+            The Companion lives in your tray and needs no terminal. Closing this
+            window keeps it sharing in the background; use the tray menu to open
+            it again, pause sharing, or quit. It also starts automatically at
+            login — straight to the tray, no window — so the GPU is available
+            after a reboot without anyone touching this machine. Allow inbound
+            TCP&nbsp;{status.config.port} on Private networks if your firewall asks.
           </p>
           <button onClick={onDone}>Open dashboard</button>
         </div>

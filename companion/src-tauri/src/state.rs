@@ -98,6 +98,12 @@ pub struct Config {
     /// and can reach any path. Opt-in and off by default; a deliberate, powerful
     /// choice for a trusted LAN.
     pub share_all: bool,
+    /// One-shot latch: this install's login-autostart registration has been
+    /// rewritten to pass ``--hidden``. Installs registered by an older build
+    /// carry a bare command line, so they would keep popping the dashboard in
+    /// the user's face at every login; the migration re-registers exactly once
+    /// and records it here.
+    pub autostart_hidden_migrated: bool,
 }
 
 /// Resolve transcription quality + VRAM budget to whisper.cpp decode settings:
@@ -177,6 +183,7 @@ impl Default for Config {
             whisper_quality: "auto".into(),
             shared_paths: Vec::new(),
             share_all: false,
+            autostart_hidden_migrated: false,
         }
     }
 }

@@ -47,9 +47,26 @@ The setup wizard walks through everything:
    `http://<this-machine>:11500/ollama` (+ token) in ClipAI's *Ollama Hosts*
    card and `http://<this-machine>:11500` under *Remote Whisper*.
 
-The app lives in the tray/menu bar. Closing the window keeps it running;
-the tray menu has **Open**, **Pause sharing**, and **Quit**. "Launch at
-login" is a checkbox on the dashboard.
+## Running in the background (no terminal, no window)
+
+The Companion is a background GPU service, not a program you keep open:
+
+* **No terminal, ever.** It is a normal desktop app — double-click it, or let
+  it start at login. The release build has no console, and every child process
+  it launches (Ollama, whisper.cpp, `nvidia-smi`, `winget`) is spawned with
+  `CREATE_NO_WINDOW` so nothing flashes a console window either.
+* **Closing the window keeps it sharing.** The X button hides the dashboard to
+  the tray/menu bar; the proxy, Ollama and the whisper sidecar keep serving.
+  Losing the window some other way — a WebView crash, "End task" on the window,
+  Cmd-Q — is refused the same way, so a mid-job Companion can't vanish and take
+  a running ClipAI job down with it. **Quit** in the tray menu is the only way
+  to stop sharing (it also stops the managed Ollama/whisper children).
+* **Starts at login, straight to the tray.** Registration is automatic and
+  passes `--hidden`, so after a reboot the GPU is back online with no window on
+  screen and nobody at the desk. Launching it yourself always opens the
+  dashboard.
+
+The tray menu has **Open Dashboard**, **Pause sharing**, and **Quit**.
 
 ## VRAM budget
 
