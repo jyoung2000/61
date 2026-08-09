@@ -1852,7 +1852,17 @@ _META_NOTE_RE = re.compile(
     # measured run shipped "Misspelled: 'Capturing' corrected." as a cue.
     # Anchored to the leading "Misspell…" so a character SAYING the word
     # mid-sentence ("You misspelled my name!") is untouched.
-    r"|^\s*misspell\w*\b")
+    r"|^\s*misspell\w*\b"
+    # The model talking ABOUT its translation task instead of translating —
+    # a measured run shipped "(No translation needed as it's just an
+    # interjection)" and "…all translations are accurate and follow the
+    # rules provided." as subtitle cues. No character ever says these; the
+    # word "translation(s)" beside accuracy/rules/needed vocabulary is the
+    # model's contract language leaking through a batch reply.
+    r"|\bno\s+translation\s+(?:needed|necessary|required)\b"
+    r"|\btranslations?\s+(?:are|is)\s+accurate\b"
+    r"|\bfollow\s+the\s+rules\s+provided\b"
+    r"|\bas\s+it'?s\s+just\s+an\s+interjection\b")
 # A cue that IS a bare title/episode card readout and nothing else. At most
 # one short word or a number may follow ("Title Strange.", "Episode 1",
 # "Episode") — a sentence that merely STARTS near these words has more

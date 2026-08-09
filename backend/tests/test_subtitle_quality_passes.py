@@ -789,6 +789,25 @@ def test_junk_filter_drops_credit_cards_preambles_and_crumbs():
     assert "The Gundam Deathscythe" in kept_texts
 
 
+def test_junk_filter_drops_translator_contract_leaks():
+    """Run-34, verbatim: the model's task language shipped as subtitles —
+    "(No translation needed as it's just an interjection)" held 3s of
+    screen, and "…all translations are accurate and follow the rules
+    provided." closed a battle scene. No character ever says these."""
+    from backend.services.transcript_sanitize import drop_junk_cues
+    rows = [{"start": float(i * 4), "end": float(i * 4) + 2.0, "text": t}
+            for i, t in enumerate([
+                "(No translation needed as it's just an interjection)",
+                "all translations are accurate and follow the rules provided.",
+                "No translation needed, we all speak the same language.",
+                "The Gundam sank to the ocean floor",
+            ])]
+    kept, dropped = drop_junk_cues(rows)
+    kept_texts = [r["text"] for r in kept]
+    assert len(dropped) == 3
+    assert kept_texts == ["The Gundam sank to the ocean floor"]
+
+
 def test_junk_filter_drops_eyecatch_stubs_and_bare_digits():
     """Run-30 shipped the "Part 1" eyecatch card as TWO dialogue cues —
     "Part" (1.8s) and "1" (0.9s). Both classes go; real dialogue that merely
