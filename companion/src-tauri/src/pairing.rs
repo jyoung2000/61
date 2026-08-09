@@ -13,9 +13,71 @@ use std::sync::Arc;
 /// Best-effort LAN IP: the address a UDP socket would source from.
 /// No packets are sent.
 pub fn detect_lan_ip() -> Option<String> {
+    detect_lan_ip_toward(None)
+}
+
+/// LAN IP as seen on the route TOWARD a specific host (the ClipAI server).
+///
+/// On a machine with several 192.168.x adapters (Ethernet + Wi-Fi both up,
+/// Hyper-V/WSL switches, a VPN), the generic probe below lets Windows pick
+/// whichever interface it likes for a broadcast-ish target — and that pick
+/// can flip between boots, so the advertised endpoint "changes" with no
+/// config change at all. Anchoring the probe at the ClipAI server's own
+/// address selects the source IP of the actual route to that server, i.e.
+/// the one address the server is guaranteed to be able to reach back.
+pub fn detect_lan_ip_toward(clipai_host: Option<&str>) -> Option<String> {
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    if let Some(h) = clipai_host.filter(|h| !h.is_empty()) {
+        // Port is irrelevant for route selection; 80 avoids resolving the
+        // proxy port. A hostname here resolves via DNS but sends nothing.
+        if socket.connect((h, 80)).is_ok() {
+            if let Ok(addr) = socket.local_addr() {
+                let ip = addr.ip();
+                if !ip.is_loopback() && !ip.is_unspecified() {
+                    return Some(ip.to_string());
+                }
+            }
+        }
+    }
     socket.connect("192.168.255.255:80").ok().or_else(|| socket.connect("8.8.8.8:80").ok())?;
     Some(socket.local_addr().ok()?.ip().to_string())
+}
+
+/// LAN IP anchored at whatever ClipAI server this Companion knows about:
+/// the paired URL first, else the server address learned from inbound
+/// proxy traffic (covers manual, ClipAI-side pairing), else the generic
+/// default-route probe.
+pub fn detect_lan_ip_for(state: &AppState) -> Option<String> {
+    let anchor = {
+        let cfg = state.config.lock().unwrap();
+        cfg.paired_clipai_url.clone()
+    };
+    let anchor = if anchor.is_empty() { state.seen_clipai_url() } else { anchor };
+    detect_lan_ip_toward(url_host(&anchor).as_deref())
+}
+
+/// Extract the bare host out of a URL-ish string ("http://192.168.8.14:3000/x"
+/// → "192.168.8.14"). No external deps; LAN URLs only (no IPv6 brackets).
+pub fn url_host(url: &str) -> Option<String> {
+    let u = url.trim();
+    if u.is_empty() {
+        return None;
+    }
+    let u = u
+        .strip_prefix("http://")
+        .or_else(|| u.strip_prefix("https://"))
+        .unwrap_or(u);
+    let host_port = u.split(['/', '?', '#']).next().unwrap_or("");
+    let host = match host_port.rsplit_once(':') {
+        Some((h, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => h,
+        _ => host_port,
+    };
+    let host = host.trim();
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
+    }
 }
 
 #[derive(Serialize)]
@@ -38,8 +100,10 @@ pub async fn pair(
     if clipai_url.is_empty() {
         return Err("ClipAI URL is required".into());
     }
-    let lan_ip =
-        detect_lan_ip().ok_or_else(|| "could not detect this machine's LAN IP".to_string())?;
+    // Anchor detection at the server we're pairing WITH so multi-adapter
+    // machines always advertise the address that server can route back to.
+    let lan_ip = detect_lan_ip_toward(url_host(&clipai_url).as_deref())
+        .ok_or_else(|| "could not detect this machine's LAN IP".to_string())?;
     let (name, token, port) = {
         let cfg = state.config.lock().unwrap();
         (cfg.name.clone(), cfg.token.clone(), cfg.port)
@@ -110,4 +174,26 @@ pub async fn reannounce(state: &Arc<AppState>) -> Result<bool, String> {
         return Ok(false);
     }
     pair(state, &url, &key).await.map(|_| true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::url_host;
+
+    #[test]
+    fn url_host_strips_scheme_port_and_path() {
+        assert_eq!(url_host("http://192.168.8.14:3000/api"), Some("192.168.8.14".into()));
+        assert_eq!(url_host("https://tower.local/"), Some("tower.local".into()));
+        assert_eq!(url_host("192.168.8.14:8043"), Some("192.168.8.14".into()));
+        assert_eq!(url_host("http://192.168.8.14"), Some("192.168.8.14".into()));
+        assert_eq!(url_host("tower"), Some("tower".into()));
+        assert_eq!(url_host("http://192.168.8.14:3000?x=1"), Some("192.168.8.14".into()));
+    }
+
+    #[test]
+    fn url_host_rejects_empty() {
+        assert_eq!(url_host(""), None);
+        assert_eq!(url_host("   "), None);
+        assert_eq!(url_host("http://"), None);
+    }
 }

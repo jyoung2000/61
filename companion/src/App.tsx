@@ -1288,6 +1288,18 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
             and the token below into ClipAI → Settings → Ollama Hosts, and allow inbound
             TCP&nbsp;{status.config.port} in the Windows firewall.
           </div>
+          <div className="small muted" style={{ marginBottom: 8 }}>
+            {status.config.paired_clipai_url
+              ? <>ℹ️ The IP above is a DHCP lease and can change after a reboot or
+                  router restart — that's fine: this Companion is paired, so it
+                  re-announces its new address to ClipAI automatically within a
+                  minute.</>
+              : <>⚠️ The IP above is a DHCP lease — it can change after a reboot or
+                  router restart, which breaks a manually pasted URL. Use
+                  “Pair&nbsp;now” below and the Companion re-announces address
+                  changes to ClipAI automatically; to pin the address itself,
+                  give this PC a DHCP reservation (fixed IP) in your router.</>}
+          </div>
           <TokenBox token={status.config.token}
             onRegenerate={() => { regenerateToken().then(refresh); }} />
           <div className="small muted" style={{ marginTop: 8 }}>

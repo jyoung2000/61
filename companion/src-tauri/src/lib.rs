@@ -285,7 +285,7 @@ async fn get_status(
         "incoming_pulls": state.incoming_pulls_snapshot().into_iter()
             .map(|(m, p)| serde_json::json!({"model": m, "percent": p}))
             .collect::<Vec<_>>(),
-        "lan_ip": pairing::detect_lan_ip(),
+        "lan_ip": pairing::detect_lan_ip_for(state.inner().as_ref()),
         "recommended_models": ollama::recommended_models(budget)
             .into_iter()
             .map(|(m, why)| serde_json::json!({"model": m, "why": why}))
@@ -571,7 +571,7 @@ pub(crate) async fn build_diagnostics_report(state: &AppState, whisper_build: &s
         else { cfg.paired_clipai_url.clone() });
 
     let _ = writeln!(r, "\n---- Connection ----");
-    let _ = writeln!(r, "LAN IP:               {}", pairing::detect_lan_ip().unwrap_or_else(|| "(unknown)".into()));
+    let _ = writeln!(r, "LAN IP:               {}", pairing::detect_lan_ip_for(state).unwrap_or_else(|| "(unknown)".into()));
     let last = state.last_clipai_contact_ms();
     let _ = writeln!(r, "ClipAI connected:     {} (last contact {}{})",
         state.clipai_connected(), fmt_ms(last),
@@ -733,7 +733,7 @@ async fn test_clipai(state: tauri::State<'_, SharedState>) -> Result<serde_json:
         "paired_url": url,
         "probe": probe,
         "port": cfg.port,
-        "lan_ip": pairing::detect_lan_ip(),
+        "lan_ip": pairing::detect_lan_ip_for(state.inner().as_ref()),
     }))
 }
 
@@ -1718,14 +1718,14 @@ pub fn run() {
             {
                 let state = state.clone();
                 tauri::async_runtime::spawn(async move {
-                    let mut last_ip = pairing::detect_lan_ip().unwrap_or_default();
+                    let mut last_ip = pairing::detect_lan_ip_for(state.as_ref()).unwrap_or_default();
                     let mut last_announce = std::time::Instant::now()
                         - std::time::Duration::from_secs(3600);
                     let mut last_fail_log = std::time::Instant::now()
                         - std::time::Duration::from_secs(3600);
                     loop {
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                        let ip = pairing::detect_lan_ip().unwrap_or_default();
+                        let ip = pairing::detect_lan_ip_for(state.as_ref()).unwrap_or_default();
                         let ip_changed = !ip.is_empty() && ip != last_ip;
                         let heartbeat_due =
                             last_announce.elapsed().as_secs() >= 900;

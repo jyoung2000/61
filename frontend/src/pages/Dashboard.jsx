@@ -62,11 +62,8 @@ export default function Dashboard() {
   // Power-user multi-select for bulk deleting projects.
   const [selectMode, setSelectMode] = useState(false);
   const [selected, setSelected] = useState(() => new Set());
-  // Card the pointer is over — drives the thumbnail peek. The <img> is only
-  // mounted on first hover (and remembered in hoveredEver) so the grid never
-  // fetches thumbnails for cards nobody looks at.
+  // Card the pointer is over — drives the accent highlight ring.
   const [hoverId, setHoverId] = useState(null);
-  const hoveredEver = useRef(new Set());
   const [bulkBusy, setBulkBusy] = useState(false);
   const navigate = useNavigate();
   const { isMobile } = useResponsive();
@@ -661,37 +658,23 @@ export default function Dashboard() {
                 key={job.job_id}
                 className="card-hover slide-in"
                 onClick={() => (selectMode ? toggleSelect(job.job_id) : navigate(`/analysis/${job.job_id}`))}
-                onMouseEnter={() => { hoveredEver.current.add(job.job_id); setHoverId(job.job_id); }}
+                onMouseEnter={() => setHoverId(job.job_id)}
                 onMouseLeave={() => setHoverId((h) => (h === job.job_id ? null : h))}
                 style={{
                   background: 'var(--bg-panel)',
-                  border: `1px solid ${isSel ? 'var(--accent-cyan)' : 'var(--border)'}`,
-                  boxShadow: isSel ? '0 0 0 2px var(--accent-cyan-dim)' : 'var(--shadow-sm)',
+                  // Hovering highlights the card with the same accent ring the
+                  // multi-select checkmark uses, so "this card is live" reads
+                  // identically everywhere.
+                  border: `1px solid ${isSel || hoverId === job.job_id
+                    ? 'var(--accent-cyan)' : 'var(--border)'}`,
+                  boxShadow: isSel || hoverId === job.job_id
+                    ? '0 0 0 2px var(--accent-cyan-dim)' : 'var(--shadow-sm)',
                   borderRadius: 'var(--radius-md)',
                   cursor: 'pointer',
                   position: 'relative',
-                  overflow: 'hidden',
                   animationDelay: `${i * 50}ms`,
                 }}
               >
-                {/* Thumbnail peek: hovering a card fades in the video's frame
-                    over the whole card (pointer-events none, so clicks still
-                    open the project). Mounted lazily on first hover; a card
-                    with no thumbnail simply never shows one (onError latch). */}
-                {hoveredEver.current.has(job.job_id) && (
-                  <img
-                    src={`/thumbnails/${job.job_id}.jpg`}
-                    alt=""
-                    aria-hidden="true"
-                    onError={(e) => { e.currentTarget.style.display = 'none'; }}
-                    style={{
-                      position: 'absolute', inset: 0, width: '100%', height: '100%',
-                      objectFit: 'cover', pointerEvents: 'none', zIndex: 1,
-                      opacity: hoverId === job.job_id ? 1 : 0,
-                      transition: 'opacity 0.18s ease',
-                    }}
-                  />
-                )}
                 {selectMode && (
                   <div style={{
                     position: 'absolute', top: 10, right: 10, zIndex: 2,
@@ -724,7 +707,7 @@ export default function Dashboard() {
                         {formatDate(job.created_at)}
                       </span>
                     </div>
-                    <span className={`badge ${statusInfo.className}`} style={{ position: 'relative', zIndex: 2 }}>
+                    <span className={`badge ${statusInfo.className}`}>
                       {statusInfo.label}
                     </span>
                   </div>
@@ -760,9 +743,7 @@ export default function Dashboard() {
                   )}
 
                   {/* Action buttons */}
-                  {/* zIndex 2: the action row stays visible + clickable above
-                      the hover thumbnail peek. */}
-                  <div style={{ display: 'flex', gap: 8, marginTop: 10, position: 'relative', zIndex: 2 }}>
+                  <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
                     {!CANCELLABLE.includes(job.status) && (
                       <button
                         onClick={(e) => handleExport(e, job.job_id)}
