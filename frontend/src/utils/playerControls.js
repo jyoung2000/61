@@ -68,17 +68,34 @@ export function canSeekNow(video, t) {
  *
  * ``tolerance`` (default 0.5s) treats a seek that landed close enough as
  * satisfied — browsers snap to keyframes, so an exact match never happens.
- * ``maxWaitMs`` (default 15s) is a safety valve: a source that never becomes
+ * ``maxWaitMs`` (default 5s) is a safety valve: a source that never becomes
  * seekable at the target (load error, truncated file) must not wedge the
- * playhead forever.
+ * playhead forever. 5s covers opening the media on a slow mobile link — the
+ * ``playing`` event, which is the real backstop, fires well inside it — while
+ * bounding how long a pathological source can hold time-reporting silent.
  */
-export function pendingSeekAction(video, pending, now, { tolerance = 0.5, maxWaitMs = 15000 } = {}) {
+export function pendingSeekAction(
+  video, pending, now,
+  { tolerance = 0.5, maxWaitMs = 5000, retryMs = 300 } = {},
+) {
   if (!pending || !video) return 'idle';
   if (Math.abs((video.currentTime || 0) - pending.t) <= tolerance) return 'done';
   if (Number.isFinite(pending.at) && Number.isFinite(now) && now - pending.at > maxWaitMs) {
     return 'done';
   }
-  return canSeekNow(video, pending.t) ? 'apply' : 'wait';
+  if (!canSeekNow(video, pending.t)) return 'wait';
+  // ``canSeekNow`` is a heuristic, not a guarantee — iOS Safari can report a
+  // seekable range it won't actually honor yet. So a re-issued seek is kept
+  // latched until the element demonstrably lands on it (the tolerance branch
+  // above), and re-attempted at most every ``retryMs``. Without the throttle
+  // the rAF loop would rewrite ``currentTime`` 60×/s against an element that
+  // keeps refusing; without the retry a single dropped re-issue would strand
+  // the seek with nothing left to re-apply it.
+  if (Number.isFinite(pending.lastApply) && Number.isFinite(now)
+      && now - pending.lastApply < retryMs) {
+    return 'wait';
+  }
+  return 'apply';
 }
 
 /**

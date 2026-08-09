@@ -2230,9 +2230,16 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
 
     window.addEventListener('pointermove', onMove);
     window.addEventListener('pointerup', onUp);
+    // ``pointercancel`` matters on touch: the OS steals the pointer for a
+    // system gesture (edge swipe, notification pull, a second finger
+    // starting a pinch) and NO pointerup ever arrives. Without this the
+    // drag state stays latched forever — the playhead keeps following the
+    // finger after release and the timeline appears frozen mid-scrub.
+    window.addEventListener('pointercancel', onUp);
     return () => {
       window.removeEventListener('pointermove', onMove);
       window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onUp);
       // Cancel any outstanding scrub flush so an unmount mid-drag
       // doesn't fire ``setPlayhead`` after the component is gone.
       // NOTE: this intentionally does NOT clear ``_scrubPendingRef`` —

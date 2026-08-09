@@ -12,6 +12,7 @@ import SubtitleOverlay from '../components/SubtitleOverlay';
 import EditorErrorBoundary from '../components/EditorErrorBoundary';
 import useResponsive from '../hooks/useResponsive';
 import useEncodingManager from '../hooks/useEncodingManager';
+import { usePlayer } from '../contexts/PlayerContext';
 import sanitizeJob from '../utils/sanitizeJob';
 import useTimelineStore from '../stores/timelineStore';
 import { buildOverlayPayload, buildVideoEffectsPayload, mapSubtitleSettings } from '../utils/buildExportPayload';
@@ -187,6 +188,16 @@ export default function ClipSEO() {
 
   const videoRef = useRef(null);
   const handleVideoRef = useCallback((el) => { videoRef.current = el; }, []);
+  // This page borrows the VideoEditor's own <video>. Seeks must go through
+  // the editor's registered (latched) seek rather than writing the element
+  // directly — a direct write is silently dropped on touch before the media
+  // has data, which is what left playback stranded at 0:00. See
+  // hooks/useSeekLatch.js.
+  const clipPlayer = usePlayer();
+  const seekPlayer = useCallback((t) => {
+    clipPlayer.seek(t);
+    setCurrentTime(t);
+  }, [clipPlayer]);
   const videoContainerRef = useRef(null);
   const wsRef = useRef(null);
   const [playing, setPlaying] = useState(false);
@@ -686,7 +697,10 @@ export default function ClipSEO() {
     const video = videoRef.current;
     if (!video || startTime === null) return;
 
-    const onLoaded = () => { video.currentTime = startTime; };
+    // Route through the editor's latched seek: 'loadedmetadata' / readyState
+    // 1 does NOT mean the element is seekable yet (the normal touch case), so
+    // a direct write here is silently dropped and the clip starts at 0.
+    const onLoaded = () => { clipPlayer.seek(startTime); };
     const onTimeUpdate = () => {
       setCurrentTime(video.currentTime);
       if (endTime && video.currentTime >= endTime) {
@@ -703,7 +717,8 @@ export default function ClipSEO() {
       video.removeEventListener('loadedmetadata', onLoaded);
       video.removeEventListener('timeupdate', onTimeUpdate);
     };
-  }, [startTime, endTime]);
+    // clipPlayer comes from a memoized context value — stable, no re-bind churn.
+  }, [startTime, endTime, clipPlayer]);
 
   // Dynamic subject tracking: update objectPosition during playback
   const hasDynamicSubject = useMemo(
@@ -1521,13 +1536,7 @@ export default function ClipSEO() {
                       speakerColors={speakerColors}
                       onSpeakerColorChanged={handleSpeakerColorChanged}
                       onSpeakerAdded={handleSpeakerAdded}
-                      onSeek={(time) => {
-                        const video = videoRef.current;
-                        if (video) {
-                          video.currentTime = time;
-                          setCurrentTime(time);
-                        }
-                      }}
+                      onSeek={seekPlayer}
                       jobId={jobId}
                       onSpeakerRenamed={fetchJob}
                       onTranscriptUpdated={fetchJob}
@@ -1593,7 +1602,7 @@ export default function ClipSEO() {
                     if (val !== null && val >= 0 && val < (endTime ?? clip.end_time)) {
                       setStartTime(val);
                       setStartText(formatDuration(val));
-                      if (videoRef.current) videoRef.current.currentTime = val;
+                      seekPlayer(val);
                     } else {
                       setStartText(formatDuration(startTime));
                     }
@@ -1628,7 +1637,7 @@ export default function ClipSEO() {
                     setEndTime(clip.end_time);
                     setStartText(formatDuration(clip.start_time));
                     setEndText(formatDuration(clip.end_time));
-                    if (videoRef.current) videoRef.current.currentTime = clip.start_time;
+                    seekPlayer(clip.start_time);
                   }}
                   title="Reset to original clip times"
                   style={{
@@ -1805,13 +1814,7 @@ export default function ClipSEO() {
                   speakerColors={speakerColors}
                   onSpeakerColorChanged={handleSpeakerColorChanged}
                   onSpeakerAdded={handleSpeakerAdded}
-                  onSeek={(time) => {
-                    const video = videoRef.current;
-                    if (video) {
-                      video.currentTime = time;
-                      setCurrentTime(time);
-                    }
-                  }}
+                  onSeek={seekPlayer}
                   jobId={jobId}
                   onSpeakerRenamed={fetchJob}
                   onTranscriptUpdated={fetchJob}

@@ -164,12 +164,13 @@ describe('pendingSeekAction', () => {
   });
 
   it('gives up after the safety valve so the playhead can never wedge', () => {
-    const pend = { t: 42, at: NOW - 20_000 };
+    const pend = { t: 42, at: NOW - 8_000 };
     expect(pendingSeekAction(fakeVideo(0, []), pend, NOW)).toBe('done');
   });
 
   it('keeps waiting right up to the safety valve', () => {
-    const pend = { t: 42, at: NOW - 14_000 };
+    // Opening the media on a slow mobile link must not trip the valve.
+    const pend = { t: 42, at: NOW - 4_000 };
     expect(pendingSeekAction(fakeVideo(0, []), pend, NOW)).toBe('wait');
   });
 
@@ -177,6 +178,27 @@ describe('pendingSeekAction', () => {
     const pend = { t: 42, at: NOW - 500 };
     expect(pendingSeekAction(fakeVideo(41, [[0, 100]]), pend, NOW, { tolerance: 2 })).toBe('done');
     expect(pendingSeekAction(fakeVideo(0, []), pend, NOW, { maxWaitMs: 100 })).toBe('done');
+  });
+
+  it('throttles re-application so a refusing element is not rewritten every frame', () => {
+    // canSeekNow is a heuristic (iOS can advertise a range it won't honor),
+    // so 'apply' can repeat — but not at 60 Hz.
+    const video = fakeVideo(0, [[0, 100]]);
+    const pend = { t: 42, at: NOW, lastApply: NOW };
+    expect(pendingSeekAction(video, pend, NOW + 50)).toBe('wait');
+    expect(pendingSeekAction(video, pend, NOW + 400)).toBe('apply');
+  });
+
+  it('re-applies a dropped re-issue instead of stranding the seek', () => {
+    // First apply is silently dropped (element still reads 0) — the latch
+    // must survive so a later attempt can land it.
+    const video = fakeVideo(0, [[0, 100]]);
+    const pend = { t: 42, at: NOW };
+    expect(pendingSeekAction(video, pend, NOW)).toBe('apply');
+    pend.lastApply = NOW;                       // caller records the attempt
+    expect(pendingSeekAction(video, pend, NOW + 500)).toBe('apply');
+    video.currentTime = 42;                     // this one landed
+    expect(pendingSeekAction(video, pend, NOW + 900)).toBe('done');
   });
 
   it('end-to-end: scrub while unseekable, then play — target survives', () => {

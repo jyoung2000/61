@@ -1,6 +1,7 @@
 import React, { useRef, useState, useEffect, useMemo } from 'react';
 import { processKeyframes, interpolateSubjectX, isDynamic, subjectXToCenterPct, safeSubjectX } from '../utils/subjectTracking';
 import useResponsive from '../hooks/useResponsive';
+import useSeekLatch from '../hooks/useSeekLatch';
 import { usePlayer } from '../contexts/PlayerContext';
 import { seekPct, clampTime, controlsVisible as computeControlsVisible } from '../utils/playerControls';
 
@@ -36,6 +37,19 @@ export default function VideoPlayer({ src, clipStart, clipEnd, onTimeUpdate, asp
   const [speed, setSpeed] = useState(1);
   const [hovered, setHovered] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
+
+  // Every seek here goes through the latch: on touch the element often has no
+  // seekable range until the first play, and a currentTime write against an
+  // empty range is silently dropped — which is what made a scrub-then-play
+  // start at 0:00. See hooks/useSeekLatch.js.
+  const seekLatch = useSeekLatch(videoRef, src);
+  // The time-reporting effect below is keyed on ``clipEnd`` only — reading
+  // ``settle`` through a ref keeps it from re-binding every media listener
+  // on each render (which would tear down the rAF loop mid-playback).
+  const settleRef = useRef(seekLatch.settle);
+  settleRef.current = seekLatch.settle;
+  const trustedTimeRef = useRef(seekLatch.trustedTime);
+  trustedTimeRef.current = seekLatch.trustedTime;
 
   // Store callback in a ref to avoid re-registering event listeners when
   // the parent passes a new function reference on each render.
@@ -89,9 +103,15 @@ export default function VideoPlayer({ src, clipStart, clipEnd, onTimeUpdate, asp
     let lastReportAt = 0;
 
     const tick = () => {
+      // While a dropped seek is still owed the element reports the WRONG
+      // time (usually 0). That must not be REPORTED (it would overwrite the
+      // UI playhead with the value the latch exists to correct) — but the
+      // clip-end auto-stop below still has to run off the element's real
+      // position, or the preview plays past the clip while the seek is owed.
+      const seekOwed = !settleRef.current();
       const t = video.currentTime;
       const nowTs = performance.now();
-      if (nowTs - lastReportAt >= REPORT_MIN_MS) {
+      if (!seekOwed && nowTs - lastReportAt >= REPORT_MIN_MS) {
         lastReportAt = nowTs;
         report(t);
       }
@@ -105,9 +125,10 @@ export default function VideoPlayer({ src, clipStart, clipEnd, onTimeUpdate, asp
       }
       // Throttled display update (~4 Hz) — the HUD clock doesn't need
       // 60 fps precision and re-rendering VideoPlayer that often is
-      // wasteful.
+      // wasteful. Suppressed while a seek is owed: the HUD must keep showing
+      // the scrubbed position, not the element's stale one.
       const now = performance.now();
-      if (now - lastDisplayUpdateRef.current > 250) {
+      if (!seekOwed && now - lastDisplayUpdateRef.current > 250) {
         lastDisplayUpdateRef.current = now;
         setDisplayTime(t);
       }
@@ -124,8 +145,13 @@ export default function VideoPlayer({ src, clipStart, clipEnd, onTimeUpdate, asp
       }
       // One final sample so consumers land exactly on the paused /
       // ended position instead of whatever the last rAF frame saw.
-      report(video.currentTime);
-      setDisplayTime(video.currentTime);
+      // trustedTime, not the raw clock: pausing while a seek is owed must
+      // not publish the element's stale position and erase the scrub.
+      const finalT = settleRef.current()
+        ? video.currentTime
+        : trustedTimeRef.current(video.currentTime);
+      report(finalT);
+      setDisplayTime(finalT);
     };
 
     // Fallback heartbeat — fires even if rAF is throttled in background
@@ -133,12 +159,17 @@ export default function VideoPlayer({ src, clipStart, clipEnd, onTimeUpdate, asp
     // it's not (paused, or the tab is backgrounded and rAF has been
     // choked), ``timeupdate`` still delivers fresh values.
     const onTime = () => {
+      // Same guard as the rAF tick — don't publish the element's clock while
+      // it still owes us a seek.
+      if (!settleRef.current()) return;
       if (rafId == null) report(video.currentTime);
     };
     const onPlay = () => startRaf();
     const onPause = () => stopRaf();
     const onEnded = () => stopRaf();
-    const onSeeked = () => report(video.currentTime);
+    // Guarded: a 'seeked' fired by an intermediate/dropped seek must not
+    // publish a position the user never asked for.
+    const onSeeked = () => { if (settleRef.current()) report(video.currentTime); };
     const onDur = () => setDuration(video.duration);
     const onError = () => {
       // Retry once on load error (handles transient partial content failures)
@@ -188,12 +219,21 @@ export default function VideoPlayer({ src, clipStart, clipEnd, onTimeUpdate, asp
     const video = videoRef.current;
     if (!video) return;
     if (video.paused) {
-      video.play();
-      setPlaying(true);
+      // Start where the UI playhead is. On touch a scrub issued before the
+      // media opened may have been dropped, leaving the element at 0 while
+      // the HUD shows the scrubbed spot — without this, play() would start
+      // from 0:00 and silently discard the user's scrub.
+      seekLatch.assertBeforePlay(displayTime);
+      // Honor the promise: on iOS a rejected play() (Low Power Mode, lost
+      // user activation) would otherwise leave a lying "playing" icon and a
+      // latch with no 'playing' event coming to flush it.
+      video.play().then(() => setPlaying(true)).catch(() => setPlaying(false));
     } else {
       video.pause();
       setPlaying(false);
-      setDisplayTime(video.currentTime);
+      // trustedTime: pausing mid-owed-seek must not snap the HUD back to the
+      // element's stale position.
+      setDisplayTime(seekLatch.trustedTime(displayTime));
     }
   };
 
@@ -207,7 +247,8 @@ export default function VideoPlayer({ src, clipStart, clipEnd, onTimeUpdate, asp
     const bar = seekBarRef.current;
     if (!video || !bar || !duration) return;
     const t = seekPct(clientX, bar.getBoundingClientRect()) * duration;
-    video.currentTime = t;
+    // fast: keyframe-accurate is the right tradeoff mid-drag.
+    seekLatch.seek(t, { fast: true });
     setDisplayTime(t);
   };
 
@@ -237,15 +278,19 @@ export default function VideoPlayer({ src, clipStart, clipEnd, onTimeUpdate, asp
   const skip = (delta) => {
     const video = videoRef.current;
     if (!video) return;
-    const t = clampTime(video.currentTime + delta, duration || video.duration || 0);
-    video.currentTime = t;
+    // Base the jump on the time the UI believes, not the element's clock:
+    // while a seek is owed the element still reads 0, and a ±10s skip from
+    // there would teleport the user back to the start of the video.
+    const base = seekLatch.trustedTime(displayTime);
+    const t = clampTime(base + delta, duration || video.duration || 0);
+    seekLatch.seek(t);
     setDisplayTime(t);
   };
 
   const seekTo = (time) => {
     const video = videoRef.current;
     if (!video) return;
-    video.currentTime = time;
+    seekLatch.seek(time);
     setDisplayTime(time);
   };
 
@@ -285,19 +330,22 @@ export default function VideoPlayer({ src, clipStart, clipEnd, onTimeUpdate, asp
     const video = videoRef.current;
     if (!video || initialTime == null || initialTimeApplied.current) return;
     initialTimeApplied.current = true;
-    const doSeek = () => {
-      video.currentTime = initialTime;
-      setDisplayTime(initialTime);
-    };
-    if (video.readyState >= 1) doSeek();
-    else video.addEventListener('loadedmetadata', doSeek, { once: true });
+    // readyState >= 1 is NOT enough to seek — metadata can be loaded while
+    // seekable is still empty (the normal touch case). The latch handles
+    // that: it re-issues the seek when the element can actually take it,
+    // so this no longer needs to be a one-shot bet on loadedmetadata.
+    seekLatch.seek(initialTime);
+    setDisplayTime(initialTime);
   }, [initialTime]);
 
   // Auto-seek and auto-play when clip preview changes
   useEffect(() => {
     const video = videoRef.current;
     if (!video || clipStart === undefined || clipStart === null) return;
-    video.currentTime = clipStart;
+    // Deliberate repositioning — any seek owed against the previous clip is
+    // stale and must not be re-applied on top of this one.
+    seekLatch.clear();
+    seekLatch.seek(clipStart);
     setDisplayTime(clipStart);
     video.play().then(() => setPlaying(true)).catch(() => {});
   }, [clipStart, clipEnd]);

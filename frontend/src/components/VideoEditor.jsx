@@ -28,7 +28,7 @@ import InteractiveOverlay from './InteractiveOverlay';
 import MarqueeSelection from './MarqueeSelection';
 import { hexToRgbString } from '../utils/colorUtils';
 import { applyPreservesPitch } from '../utils/preservesPitch';
-import { canSeekNow, pendingSeekAction } from '../utils/playerControls';
+import useSeekLatch from '../hooks/useSeekLatch';
 import { runEditorQA, autoFixTrackCompatibility } from '../utils/editorQA';
 import {
   registerFilmstripSource,
@@ -777,6 +777,15 @@ export default function VideoEditor({
   }, [transcript, timelineStoreItems, clipStart, clipEnd, updateTimelineItem, removeItem, addItem]);
 
   const videoRef = useRef(null);
+  // Every seek goes through the latch: on touch the element usually has no
+  // seekable range until the first play, and a currentTime write against an
+  // empty range is silently dropped — which made a scrub-then-play start at
+  // 0:00. Shared with the other players; see hooks/useSeekLatch.js.
+  const seekLatch = useSeekLatch(videoRef, src);
+  // Read through a ref inside effects keyed on other deps, so adding the
+  // latch doesn't re-bind their media listeners on every render.
+  const seekLatchRef = useRef(seekLatch);
+  seekLatchRef.current = seekLatch;
   const containerRef = useRef(null);
   const viewportRef = useRef(null);
   // Stage = the aspect-ratio-correct visible area inside the viewport. In
@@ -1430,7 +1439,9 @@ export default function VideoEditor({
   }, [segments]);
 
   const addSegment = useCallback(() => {
-    const t = videoRef.current?.currentTime ?? currentTime;
+    // trustedTime, not the raw element clock: while a seek is owed the
+    // element still reads 0 and the segment would land at the wrong spot.
+    const t = seekLatchRef.current.trustedTime(currentTime);
     const halfDur = 2; // +/- 2 seconds around playhead
     const segStart = Math.max(trimmedStart, t - halfDur);
     const segEnd = Math.min(trimmedEnd, t + halfDur);
@@ -1600,9 +1611,12 @@ export default function VideoEditor({
       // Duration + seekable are known now — unlock scrubbing/seek immediately,
       // don't wait for a full playable buffer (which is slow on mobile).
       setVideoInteractive(true);
-      // Seek to clipStart so the first frame is visible immediately
+      // Seek to clipStart so the first frame is visible immediately.
+      // Latched: metadata being loaded does NOT mean the element is
+      // seekable yet (the normal touch case), and an unlatched write here
+      // would be dropped with nothing to re-issue it.
       if (video.currentTime === 0 && clipStart > 0) {
-        video.currentTime = clipStart;
+        seekLatchRef.current.seek(clipStart);
       }
       // Browsers default preservesPitch=true; ClipAI defaults to
       // varispeed so preview pitch matches both export paths. (The
@@ -1682,7 +1696,10 @@ export default function VideoEditor({
   useEffect(() => {
     const video = videoRef.current;
     if (!video || clipStart === undefined || clipStart === null) return;
-    video.currentTime = clipStart;
+    // Deliberate repositioning: drop any seek owed against the PREVIOUS clip
+    // first, or the flush would later yank playback back to a stale target.
+    seekLatchRef.current.clear();
+    seekLatchRef.current.seek(clipStart);
     setCurrentTime(clipStart);
     // Only auto-play if the video is ready AND we're not on a touch device.
     // Auto-playing a long source over a slow link (mobile / powerline) buffers
@@ -1983,45 +2000,9 @@ export default function VideoEditor({
     return () => ro.disconnect();
   }, [drawThumbnails]);
 
-  // ── Pending-seek latch (mobile scrub-then-play fix) ──
-  // On touch the editor loads with ``preload='metadata'``, so until the
-  // first play the element usually has NO seekable range — every scrub /
-  // playhead-drag seek is silently dropped while the UI playhead happily
-  // tracks the finger. Pressing play then started at 0:00 instead of the
-  // scrubbed spot. Any seek the element can't honor yet is remembered
-  // here and re-issued the moment it can (data events, play start).
-  const pendingSeekRef = useRef(null);   // { t, at } or null
-  const latchSeek = useCallback((video, t) => {
-    pendingSeekRef.current = canSeekNow(video, t)
-      ? null                             // element will honor it — nothing owed
-      : { t, at: performance.now() };
-  }, []);
   // Returns true when nothing is owed any more (so callers may trust
   // ``video.currentTime``), false while a seek is still outstanding.
-  const applyPendingSeek = useCallback(() => {
-    const video = videoRef.current;
-    const pend = pendingSeekRef.current;
-    const action = pendingSeekAction(video, pend, performance.now());
-    if (action === 'wait') return false;
-    if (action === 'apply') {
-      pendingSeekRef.current = null;
-      try { video.currentTime = pend.t; } catch { /* noop */ }
-    } else if (action === 'done') {
-      pendingSeekRef.current = null;
-    }
-    return true;
-  }, []);
-  // Flush the owed seek as soon as the element gains data. ``playing`` is
-  // the backstop that always fires: by then the media is seekable, and a
-  // currentTime write mid-play seeks and keeps playing.
-  useEffect(() => {
-    const video = videoRef.current;
-    if (!video) return;
-    const flush = () => applyPendingSeek();
-    const evs = ['loadedmetadata', 'loadeddata', 'canplay', 'playing', 'progress'];
-    evs.forEach((e) => video.addEventListener(e, flush));
-    return () => evs.forEach((e) => video.removeEventListener(e, flush));
-  }, [src, applyPendingSeek]);
+  const applyPendingSeek = seekLatch.settle;
 
   // ── Playback time tracking via rAF + native events ──
   // rAF provides smooth visual updates; native events ensure we never
@@ -2095,12 +2076,13 @@ export default function VideoEditor({
         return;
       }
       // While a dropped seek is still owed (mobile scrub-then-play), the
-      // element briefly reports the WRONG time (usually 0) — don't let
-      // that stomp the UI playhead; keep trying to land the owed seek.
-      if (pendingSeekRef.current && !applyPendingSeek()) {
-        rafId = requestAnimationFrame(tick);
-        return;
-      }
+      // element reports the WRONG time (usually 0). That must not stomp the
+      // UI playhead — but it must NOT suppress the rest of this tick
+      // either: the trim-end auto-stop and the per-segment volume / speed
+      // engine below still have to run off the element's real position, or
+      // the preview would play past the trim end, unmuted and at the wrong
+      // speed, for as long as the seek stays owed.
+      const seekOwed = !applyPendingSeek();
       const t = video.currentTime;
       // Short-circuit when time hasn't advanced: nothing downstream in
       // this tick cares about an unchanged ``t`` (segment lookups,
@@ -2112,7 +2094,7 @@ export default function VideoEditor({
         return;
       }
       const nowMs = performance.now();
-      if (nowMs - lastUiSyncAt >= UI_SYNC_MIN_MS) {
+      if (!seekOwed && nowMs - lastUiSyncAt >= UI_SYNC_MIN_MS) {
         lastUiSyncAt = nowMs;
         lastReportedT = t;
         syncTime(t);
@@ -2201,7 +2183,7 @@ export default function VideoEditor({
     const onNativeTime = () => {
       // Same guard as the rAF tick: a still-owed seek means the element's
       // clock is not where the user put the playhead — don't report it.
-      if (pendingSeekRef.current && !applyPendingSeek()) return;
+      if (!applyPendingSeek()) return;
       const t = video.currentTime;
       if (t === lastReportedT) return;
       lastReportedT = t;
@@ -2572,6 +2554,32 @@ export default function VideoEditor({
   }, [trimStartOffset, trimEndOffset, onTrimChange]);
 
   // ── Player controls ────────────────────────────────
+  /**
+   * Start playback from where the UI playhead IS — the single entry point
+   * for "press play", used by the transport button AND by the release of a
+   * playhead drag that interrupted playback.
+   *
+   * On touch a seek issued before the media opened may have been silently
+   * dropped, leaving the element at 0 while the UI shows the scrubbed spot.
+   * The wrap-to-start test therefore runs against the INTENDED position, not
+   * the element's clock: testing ``video.currentTime`` would both miss a
+   * legitimate wrap (element behind the UI) and blanket-clear the seek that
+   * was just latched.
+   */
+  const startPlaybackAtUiTime = useCallback(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    const uiT = seekLatch.trustedTime(currentTimeRef.current);
+    if (Number.isFinite(uiT) && trimmedEnd && uiT >= trimmedEnd) {
+      seekLatch.clear();               // deliberate wrap — nothing owed
+      seekLatch.seek(trimmedStart);
+      setCurrentTime(trimmedStart);
+    } else {
+      seekLatch.assertBeforePlay(uiT);
+    }
+    video.play().then(() => setPlaying(true)).catch(() => {});
+  }, [trimmedStart, trimmedEnd, seekLatch]);
+
   const togglePlay = useCallback(() => {
     const video = videoRef.current;
     if (!video) return;
@@ -2580,28 +2588,12 @@ export default function VideoEditor({
       audioCtxRef.current.resume().catch(() => {});
     }
     if (video.paused) {
-      // Play must start where the UI playhead IS. On touch, seeks issued
-      // while the element had no data (preload='metadata') were silently
-      // dropped — the playhead showed the scrubbed spot but the element
-      // sat at 0, so play always started at 0:00. Re-assert the UI
-      // position and latch it: even if this write is dropped too, the
-      // ``playing`` flush lands it as soon as the media opens.
-      const uiT = currentTimeRef.current;
-      if (typeof uiT === 'number'
-          && Math.abs((video.currentTime || 0) - uiT) > 0.75) {
-        pendingSeekRef.current = { t: uiT, at: performance.now() };
-        try { video.currentTime = uiT; } catch { /* noop */ }
-      }
-      if (video.currentTime >= trimmedEnd) {
-        video.currentTime = trimmedStart;
-        pendingSeekRef.current = null;   // deliberate wrap — nothing owed
-      }
-      video.play().then(() => setPlaying(true)).catch(() => {});
+      startPlaybackAtUiTime();
     } else {
       video.pause();
       setPlaying(false);
     }
-  }, [trimmedStart, trimmedEnd]);
+  }, [startPlaybackAtUiTime]);
 
   // seekTo clamps to full clip range, NOT trim region.
   // Trim boundaries only constrain playback auto-stop, not manual seeking.
@@ -2609,11 +2601,10 @@ export default function VideoEditor({
     const video = videoRef.current;
     if (!video) return;
     const clamped = Math.max(clipStart, Math.min(effectiveClipEnd, time));
-    latchSeek(video, clamped);          // remember it if the element drops it
-    video.currentTime = clamped;
+    seekLatch.seek(clamped);            // latched: re-issued if dropped
     setCurrentTime(clamped);
     useTimelineStore.getState().setPlayhead(clamped - clipStart);
-  }, [clipStart, effectiveClipEnd, latchSeek]);
+  }, [clipStart, effectiveClipEnd, seekLatch]);
 
   // Register this editor as the active player. PlayerContext also
   // maintains the legacy ``window.__clipai_*`` globals so any caller
@@ -2635,7 +2626,7 @@ export default function VideoEditor({
           video.play().then(() => setPlaying(true)).catch(() => {});
         }
       },
-      getTime: () => videoRef.current?.currentTime ?? 0,
+      getTime: () => seekLatchRef.current.trustedTime(0),
     };
     player.register(api);
     return () => player.unregister();
@@ -2645,8 +2636,11 @@ export default function VideoEditor({
   const skipTime = useCallback((delta) => {
     const video = videoRef.current;
     if (!video) return;
-    seekTo(video.currentTime + delta);
-  }, [seekTo]);
+    // Base a relative jump on the time the UI believes, not the element's
+    // clock: while a seek is owed the element still reads 0, so a ±N-second
+    // skip from there would teleport the user to the start of the video.
+    seekTo(seekLatch.trustedTime(currentTimeRef.current) + delta);
+  }, [seekTo, seekLatch]);
 
   // ── Stable Timeline callbacks ─────────────────────────────
   // These used to be inline arrow functions in the JSX below, which
@@ -2673,21 +2667,14 @@ export default function VideoEditor({
     }
     // Prefer ``fastSeek`` (Firefox + Safari) — it jumps to the nearest
     // keyframe without decoding every intermediate frame, the right
-    // tradeoff during scrub. Chrome/Edge fall through to
-    // ``currentTime`` which is accurate but slower.
-    latchSeek(video, absTime);          // remember it if the element drops it
-    try {
-      if (typeof video.fastSeek === 'function') {
-        video.fastSeek(absTime);
-      } else {
-        video.currentTime = absTime;
-      }
-    } catch {
-      try { video.currentTime = absTime; } catch { /* noop */ }
-    }
+    // tradeoff during scrub. Chrome/Edge fall through to ``currentTime``,
+    // which is accurate but slower. Latched either way: on touch the
+    // element may drop the seek entirely (and Safari's fastSeek clamps a
+    // dropped one to 0), so it has to be re-issued once the media opens.
+    seekLatch.seek(absTime, { fast: true });
     setCurrentTime(absTime);
     onTimeUpdate?.(absTime);
-  }, [clipStart, onTimeUpdate, latchSeek]);
+  }, [clipStart, onTimeUpdate, seekLatch]);
 
   const handleTimelineItemSelect = useCallback(() => {
     setShowProperties(true);
@@ -2844,9 +2831,11 @@ export default function VideoEditor({
       setDraggingHandle(null);
       window.removeEventListener('pointermove', onMove);
       window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onUp);
     };
     window.addEventListener('pointermove', onMove);
     window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onUp);
   }, [clipStart, effectiveClipEnd, clipDur, trimStartOffset, trimEndOffset, getTimeFromPointer]);
 
   // ── Segment drag-to-resize and drag-to-move ────────
@@ -2906,7 +2895,7 @@ export default function VideoEditor({
     const onMove = (ev) => {
       const pxDelta = ev.clientX - state.startPointerX;
       const timeDelta = (pxDelta / state.trackWidth) * clipDur;
-      const playheadTime = videoRef.current?.currentTime ?? currentTime;
+      const playheadTime = seekLatchRef.current.trustedTime(currentTime);
       const playheadPx = ((playheadTime - clipStart) / clipDur) * state.trackWidth;
       const pointerPx = ev.clientX - state.trackLeft;
 
@@ -2942,9 +2931,11 @@ export default function VideoEditor({
       setSegDrag(null);
       window.removeEventListener('pointermove', onMove);
       window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onUp);
     };
     window.addEventListener('pointermove', onMove);
     window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onUp);
   }, [segments, clipStart, clipDur, effectiveClipEnd, currentTime, updateSegment]);
 
   const onTimelinePointerDown = useCallback((e) => {
@@ -3014,8 +3005,10 @@ export default function VideoEditor({
     }
 
     let rafPending = null;
+    let lastDragT = null;
     const onMove = (ev) => {
       const t = getTimeFromPointer(ev.clientX);
+      lastDragT = t;
       // Throttle via rAF for smooth scrubbing — seekTo handles clamping to clip range
       if (rafPending === null) {
         rafPending = requestAnimationFrame(() => {
@@ -3026,17 +3019,28 @@ export default function VideoEditor({
     };
     const onUp = () => {
       setDraggingPlayhead(false);
-      if (rafPending !== null) cancelAnimationFrame(rafPending);
-      // Resume playback if it was playing before scrub
+      // Cancelling the throttle would DISCARD the final drag position when
+      // the release beats the pending frame — apply it explicitly instead,
+      // or the playhead lands a frame behind where the finger let go.
+      if (rafPending !== null) {
+        cancelAnimationFrame(rafPending);
+        rafPending = null;
+        if (lastDragT != null) seekTo(lastDragT);
+      }
+      // Resume through the shared entry point so the release re-asserts the
+      // scrubbed position: a bare play() here would start from the element's
+      // clock, which on touch may still be 0 after a dropped seek.
       if (wasPlaying && videoRef.current) {
-        videoRef.current.play().then(() => setPlaying(true)).catch(() => {});
+        startPlaybackAtUiTime();
       }
       window.removeEventListener('pointermove', onMove);
       window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onUp);
     };
     window.addEventListener('pointermove', onMove);
     window.addEventListener('pointerup', onUp);
-  }, [clipStart, clipDur, trimStartOffset, trimEndOffset, seekTo, getTimeFromPointer, startDragTracking, segments, startSegDrag]);
+    window.addEventListener('pointercancel', onUp);
+  }, [clipStart, clipDur, trimStartOffset, trimEndOffset, seekTo, getTimeFromPointer, startDragTracking, segments, startSegDrag, startPlaybackAtUiTime]);
 
   // Trim handle direct pointer down
   const onTrimHandlePointerDown = useCallback((e, handle) => {
@@ -3184,7 +3188,7 @@ export default function VideoEditor({
         case 'KeyS': {
           if (showMultiTrackRef.current) break;
           e.preventDefault();
-          const splitTime = videoRef.current?.currentTime ?? currentTimeRef.current;
+          const splitTime = seekLatchRef.current.trustedTime(currentTimeRef.current);
           // Split existing segment at playhead, or create a new one
           const existingSeg = segmentsRef.current.find(s => splitTime > s.start + 0.5 && splitTime < s.end - 0.5);
           if (existingSeg) {
@@ -3932,9 +3936,11 @@ export default function VideoEditor({
             const onUp = () => {
               window.removeEventListener('pointermove', onMove);
               window.removeEventListener('pointerup', onUp);
+              window.removeEventListener('pointercancel', onUp);
             };
             window.addEventListener('pointermove', onMove);
             window.addEventListener('pointerup', onUp);
+            window.addEventListener('pointercancel', onUp);
           }}
         >
           {rulerMarks.map((mark, i) => (
@@ -4219,7 +4225,7 @@ export default function VideoEditor({
                 onClick={(e) => {
                   e.stopPropagation();
                   // Simulate S key
-                  const splitTime = videoRef.current?.currentTime ?? currentTime;
+                  const splitTime = seekLatchRef.current.trustedTime(currentTime);
                   const existingSeg = segments.find(s => splitTime > s.start + 0.5 && splitTime < s.end - 0.5);
                   if (existingSeg) {
                     const seg1 = { ...existingSeg, end: splitTime };

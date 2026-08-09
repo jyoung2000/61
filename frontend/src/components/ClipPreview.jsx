@@ -6,6 +6,7 @@ import useTimelineStore from '../stores/timelineStore';
 import { outlineTextShadow } from '../utils/textOutline';
 import { resolveActiveWordColor } from '../utils/subtitleColors';
 import useResponsive from '../hooks/useResponsive';
+import useSeekLatch from '../hooks/useSeekLatch';
 import { SPEED_OPTIONS as SHARED_SPEED_OPTIONS } from '../utils/defaultSettings';
 
 // --- Constants replicated from backend ---
@@ -222,6 +223,14 @@ export default function ClipPreview({
   // consistent with VideoPlayer's preview controls.
   const touch = isMobile || isTablet || isTouch;
   const fgVideoRef = useRef(null);
+  // Seeks go through the latch so one the element drops (touch, before the
+  // media has data) is re-issued instead of silently leaving playback at 0.
+  // Shared with VideoEditor / VideoPlayer; see hooks/useSeekLatch.js.
+  const seekLatch = useSeekLatch(fgVideoRef, src);
+  // Read through a ref inside effects keyed on other deps so the latch
+  // doesn't re-bind their media listeners on every render.
+  const seekLatchRef = useRef(seekLatch);
+  seekLatchRef.current = seekLatch;
   const splitBottomVideoRef = useRef(null);
   const containerRef = useRef(null);
   const fullscreenRef = useRef(null);
@@ -454,15 +463,24 @@ export default function ClipPreview({
     if (!video) return;
 
     const onMetadata = () => {
-      video.currentTime = clipStart;
+      // Latched: metadata loaded does NOT mean the element is seekable yet
+      // (the normal touch case), and an unlatched write here is silently
+      // dropped — leaving the clip playing from 0 instead of clipStart.
+      seekLatchRef.current.seek(clipStart);
     };
 
     const onCanPlay = () => {
       setVideoReady(true);
+      // Make sure the owed start-of-clip seek has landed before playing,
+      // otherwise playback begins at 0 and the clip window is wrong.
+      seekLatchRef.current.settle();
       video.play().then(() => setPlaying(true)).catch(() => {});
     };
 
     const onTimeUpdate = () => {
+      // Don't publish the element's clock while it still owes a seek — that
+      // is what overwrote the scrubbed position with 0.
+      if (!seekLatchRef.current.settle()) return;
       currentTimeRef.current = video.currentTime;
       if (clipEnd && video.currentTime >= clipEnd) {
         video.pause();
@@ -570,6 +588,13 @@ export default function ClipPreview({
     let lastSegIdx = 0;
 
     const tick = () => {
+      // A still-owed seek means the element's clock is not where the user
+      // put the playhead — publishing it here would overwrite the scrubbed
+      // position (and drag the subtitle/word highlight back to 0 with it).
+      if (!seekLatchRef.current.settle()) {
+        animId = requestAnimationFrame(tick);
+        return;
+      }
       const now = video.currentTime;
       currentTimeRef.current = now;
       const relTime = now - clipStart;
@@ -804,9 +829,15 @@ export default function ClipPreview({
     const video = fgVideoRef.current;
     if (!video) return;
     if (video.paused) {
-      if (clipEnd && video.currentTime >= clipEnd) {
-        video.currentTime = clipStart;
+      if (clipEnd && seekLatch.trustedTime(currentTimeRef.current) >= clipEnd) {
+        // Deliberate rewind to the clip start — nothing else is owed.
+        seekLatch.clear();
+        seekLatch.seek(clipStart);
         currentTimeRef.current = clipStart;
+      } else {
+        // Start where the UI says, not where the element's (possibly stale)
+        // clock sits — a dropped scrub would otherwise play from 0:00.
+        seekLatch.assertBeforePlay(currentTimeRef.current);
       }
       video.play().then(() => setPlaying(true)).catch(() => {});
     } else {
@@ -815,7 +846,7 @@ export default function ClipPreview({
       // Update display time immediately on pause so seek bar is accurate
       setDisplayTime(video.currentTime);
     }
-  }, [clipStart, clipEnd]);
+  }, [clipStart, clipEnd, seekLatch]);
 
   const seekBarRef = useRef(null);
   const draggingRef = useRef(false);
@@ -827,10 +858,10 @@ export default function ClipPreview({
     const rect = bar.getBoundingClientRect();
     const pct = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
     const newTime = clipStart + pct * clipDur;
-    video.currentTime = newTime;
+    seekLatch.seek(newTime, { fast: true });   // re-issued if the element drops it
     currentTimeRef.current = newTime;
     setDisplayTime(newTime); // Immediate feedback while scrubbing
-  }, [clipStart, clipDur]);
+  }, [clipStart, clipDur, seekLatch]);
 
   const onSeekPointerDown = useCallback((e) => {
     draggingRef.current = true;
@@ -840,9 +871,11 @@ export default function ClipPreview({
       draggingRef.current = false;
       window.removeEventListener('pointermove', onMove);
       window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onUp);
     };
     window.addEventListener('pointermove', onMove);
     window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onUp);
   }, [seekToX]);
 
   const toggleFullscreen = useCallback(() => {
