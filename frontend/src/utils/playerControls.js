@@ -32,6 +32,56 @@ export function controlsVisible({ hovered = false, touch = false, playing = fals
 }
 
 /**
+ * Whether a media element can honor a seek to ``t`` RIGHT NOW.
+ *
+ * The HTML seek algorithm silently ABORTS a ``currentTime`` write whose
+ * target falls outside every ``video.seekable`` range — no error, no
+ * ``seeking`` event, nothing. That is the normal state on touch, where the
+ * players use ``preload='metadata'`` and no media data is loaded until the
+ * first play. (Safari's ``fastSeek`` is worse: it clamps the target into the
+ * empty range, landing at 0.) Callers latch a seek that fails this check and
+ * re-issue it once the element gains data — see ``pendingSeekAction``.
+ */
+export function canSeekNow(video, t) {
+  if (!video || !Number.isFinite(t)) return false;
+  if ((video.readyState ?? 0) < 1) return false;
+  const s = video.seekable;
+  if (!s || !s.length) return false;
+  for (let i = 0; i < s.length; i++) {
+    // ±0.1s: a range boundary reported at 9.999 must still accept a seek to 10.
+    if (t >= s.start(i) - 0.1 && t <= s.end(i) + 0.1) return true;
+  }
+  return false;
+}
+
+/**
+ * Decide what to do with an owed ("pending") seek — the state machine behind
+ * the mobile scrub-then-play fix. Pure so the fiddly branches are testable
+ * without a real media element.
+ *
+ * ``pending`` is ``null`` or ``{ t, at }`` where ``at`` is a monotonic
+ * timestamp (``performance.now()``). Returns one of:
+ *   'idle'  — nothing owed
+ *   'done'  — already at the target, or the latch expired; clear it
+ *   'apply' — element can seek now; write ``currentTime`` and clear
+ *   'wait'  — still unseekable; keep the latch and try again later
+ *
+ * ``tolerance`` (default 0.5s) treats a seek that landed close enough as
+ * satisfied — browsers snap to keyframes, so an exact match never happens.
+ * ``maxWaitMs`` (default 15s) is a safety valve: a source that never becomes
+ * seekable at the target (load error, truncated file) must not wedge the
+ * playhead forever.
+ */
+export function pendingSeekAction(video, pending, now, { tolerance = 0.5, maxWaitMs = 15000 } = {}) {
+  if (!pending || !video) return 'idle';
+  if (Math.abs((video.currentTime || 0) - pending.t) <= tolerance) return 'done';
+  if (Number.isFinite(pending.at) && Number.isFinite(now) && now - pending.at > maxWaitMs) {
+    return 'done';
+  }
+  return canSeekNow(video, pending.t) ? 'apply' : 'wait';
+}
+
+/**
  * Coarse-pointer / no-hover (touch) capability of a window-like object.
  * Accepts the target ``win`` so it's testable with a stub; falls back to the
  * global ``window`` in the app. Independent of viewport width — a wide tablet

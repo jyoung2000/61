@@ -4,7 +4,10 @@
  * player fix). Pure functions, no <video> render required.
  */
 import { describe, it, expect } from 'vitest';
-import { seekPct, clampTime, controlsVisible, detectTouch } from './playerControls';
+import {
+  seekPct, clampTime, controlsVisible, detectTouch,
+  canSeekNow, pendingSeekAction,
+} from './playerControls';
 
 const rect = { left: 100, width: 200 }; // bar spans clientX 100..300
 
@@ -87,5 +90,108 @@ describe('detectTouch', () => {
 
   it('false with no window', () => {
     expect(detectTouch(undefined)).toBe(false);
+  });
+});
+
+// ── Mobile scrub-then-play regression ──────────────────────────────────────
+// The reported bug: on a phone, scrubbing (or dragging the playhead) and then
+// pressing play started at 0:00 instead of the scrubbed position. Cause — with
+// preload="metadata" the element has an EMPTY seekable range until the first
+// play, so the currentTime write was silently aborted while the UI playhead
+// had already moved. These cover the predicate + the latch state machine.
+
+/** Minimal media-element stub: ``ranges`` is a list of [start, end] pairs. */
+const fakeVideo = (currentTime, ranges, readyState = 1) => ({
+  currentTime,
+  readyState,
+  seekable: {
+    length: ranges.length,
+    start: (i) => ranges[i][0],
+    end: (i) => ranges[i][1],
+  },
+});
+
+describe('canSeekNow', () => {
+  it('false when the element has no seekable range yet (the mobile bug)', () => {
+    expect(canSeekNow(fakeVideo(0, []), 42)).toBe(false);
+  });
+
+  it('false before metadata has loaded, even if a range is reported', () => {
+    expect(canSeekNow(fakeVideo(0, [[0, 100]], 0), 42)).toBe(false);
+  });
+
+  it('true for a target inside a loaded range', () => {
+    expect(canSeekNow(fakeVideo(0, [[0, 100]]), 42)).toBe(true);
+  });
+
+  it('accepts targets on the range boundary within 0.1s slop', () => {
+    expect(canSeekNow(fakeVideo(0, [[10, 20]]), 10)).toBe(true);
+    expect(canSeekNow(fakeVideo(0, [[10, 20]]), 20.05)).toBe(true);
+    expect(canSeekNow(fakeVideo(0, [[10, 20]]), 25)).toBe(false);
+  });
+
+  it('searches every range, not just the first', () => {
+    expect(canSeekNow(fakeVideo(0, [[0, 5], [60, 90]]), 75)).toBe(true);
+  });
+
+  it('false for a missing element or a non-finite target', () => {
+    expect(canSeekNow(null, 10)).toBe(false);
+    expect(canSeekNow(fakeVideo(0, [[0, 100]]), NaN)).toBe(false);
+  });
+});
+
+describe('pendingSeekAction', () => {
+  const NOW = 10_000;
+
+  it('idle when nothing is owed', () => {
+    expect(pendingSeekAction(fakeVideo(0, [[0, 100]]), null, NOW)).toBe('idle');
+  });
+
+  it('waits while the element still cannot honor the seek', () => {
+    const pend = { t: 42, at: NOW - 500 };
+    expect(pendingSeekAction(fakeVideo(0, []), pend, NOW)).toBe('wait');
+  });
+
+  it('applies the owed seek once the element gains a seekable range', () => {
+    const pend = { t: 42, at: NOW - 500 };
+    expect(pendingSeekAction(fakeVideo(0, [[0, 100]]), pend, NOW)).toBe('apply');
+  });
+
+  it('is done when the element already landed near the target', () => {
+    const pend = { t: 42, at: NOW - 500 };
+    // Browsers snap to keyframes, so "close enough" counts as satisfied.
+    expect(pendingSeekAction(fakeVideo(41.8, [[0, 100]]), pend, NOW)).toBe('done');
+  });
+
+  it('gives up after the safety valve so the playhead can never wedge', () => {
+    const pend = { t: 42, at: NOW - 20_000 };
+    expect(pendingSeekAction(fakeVideo(0, []), pend, NOW)).toBe('done');
+  });
+
+  it('keeps waiting right up to the safety valve', () => {
+    const pend = { t: 42, at: NOW - 14_000 };
+    expect(pendingSeekAction(fakeVideo(0, []), pend, NOW)).toBe('wait');
+  });
+
+  it('honors caller-supplied tolerance and timeout', () => {
+    const pend = { t: 42, at: NOW - 500 };
+    expect(pendingSeekAction(fakeVideo(41, [[0, 100]]), pend, NOW, { tolerance: 2 })).toBe('done');
+    expect(pendingSeekAction(fakeVideo(0, []), pend, NOW, { maxWaitMs: 100 })).toBe('done');
+  });
+
+  it('end-to-end: scrub while unseekable, then play — target survives', () => {
+    // 1. User drags the playhead to 42s before any media data exists.
+    const video = fakeVideo(0, []);
+    const pend = { t: 42, at: NOW };
+    expect(pendingSeekAction(video, pend, NOW)).toBe('wait');
+    // 2. Element still at 0 a moment later — the latch must hold, NOT resolve
+    //    to the element's wrong clock (this is what produced "plays from 0:00").
+    expect(pendingSeekAction(video, pend, NOW + 200)).toBe('wait');
+    // 3. play() opens the media: a range appears, the owed seek is applied.
+    video.seekable = fakeVideo(0, [[0, 100]]).seekable;
+    expect(pendingSeekAction(video, pend, NOW + 400)).toBe('apply');
+    // 4. After the write lands, nothing is owed.
+    video.currentTime = 42;
+    expect(pendingSeekAction(video, pend, NOW + 500)).toBe('done');
   });
 });

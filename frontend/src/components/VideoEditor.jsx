@@ -28,6 +28,7 @@ import InteractiveOverlay from './InteractiveOverlay';
 import MarqueeSelection from './MarqueeSelection';
 import { hexToRgbString } from '../utils/colorUtils';
 import { applyPreservesPitch } from '../utils/preservesPitch';
+import { canSeekNow, pendingSeekAction } from '../utils/playerControls';
 import { runEditorQA, autoFixTrackCompatibility } from '../utils/editorQA';
 import {
   registerFilmstripSource,
@@ -1982,6 +1983,46 @@ export default function VideoEditor({
     return () => ro.disconnect();
   }, [drawThumbnails]);
 
+  // ── Pending-seek latch (mobile scrub-then-play fix) ──
+  // On touch the editor loads with ``preload='metadata'``, so until the
+  // first play the element usually has NO seekable range — every scrub /
+  // playhead-drag seek is silently dropped while the UI playhead happily
+  // tracks the finger. Pressing play then started at 0:00 instead of the
+  // scrubbed spot. Any seek the element can't honor yet is remembered
+  // here and re-issued the moment it can (data events, play start).
+  const pendingSeekRef = useRef(null);   // { t, at } or null
+  const latchSeek = useCallback((video, t) => {
+    pendingSeekRef.current = canSeekNow(video, t)
+      ? null                             // element will honor it — nothing owed
+      : { t, at: performance.now() };
+  }, []);
+  // Returns true when nothing is owed any more (so callers may trust
+  // ``video.currentTime``), false while a seek is still outstanding.
+  const applyPendingSeek = useCallback(() => {
+    const video = videoRef.current;
+    const pend = pendingSeekRef.current;
+    const action = pendingSeekAction(video, pend, performance.now());
+    if (action === 'wait') return false;
+    if (action === 'apply') {
+      pendingSeekRef.current = null;
+      try { video.currentTime = pend.t; } catch { /* noop */ }
+    } else if (action === 'done') {
+      pendingSeekRef.current = null;
+    }
+    return true;
+  }, []);
+  // Flush the owed seek as soon as the element gains data. ``playing`` is
+  // the backstop that always fires: by then the media is seekable, and a
+  // currentTime write mid-play seeks and keeps playing.
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    const flush = () => applyPendingSeek();
+    const evs = ['loadedmetadata', 'loadeddata', 'canplay', 'playing', 'progress'];
+    evs.forEach((e) => video.addEventListener(e, flush));
+    return () => evs.forEach((e) => video.removeEventListener(e, flush));
+  }, [src, applyPendingSeek]);
+
   // ── Playback time tracking via rAF + native events ──
   // rAF provides smooth visual updates; native events ensure we never
   // miss a seek or time change on any device (mobile can throttle rAF).
@@ -2051,6 +2092,13 @@ export default function VideoEditor({
       // burning CPU + battery for nothing.
       if (video.paused) {
         rafId = null;
+        return;
+      }
+      // While a dropped seek is still owed (mobile scrub-then-play), the
+      // element briefly reports the WRONG time (usually 0) — don't let
+      // that stomp the UI playhead; keep trying to land the owed seek.
+      if (pendingSeekRef.current && !applyPendingSeek()) {
+        rafId = requestAnimationFrame(tick);
         return;
       }
       const t = video.currentTime;
@@ -2151,6 +2199,9 @@ export default function VideoEditor({
     // Shares ``lastReportedT`` with the rAF tick so both paths dedupe
     // against each other.
     const onNativeTime = () => {
+      // Same guard as the rAF tick: a still-owed seek means the element's
+      // clock is not where the user put the playhead — don't report it.
+      if (pendingSeekRef.current && !applyPendingSeek()) return;
       const t = video.currentTime;
       if (t === lastReportedT) return;
       lastReportedT = t;
@@ -2168,7 +2219,7 @@ export default function VideoEditor({
       video.removeEventListener('timeupdate', onNativeTime);
       video.removeEventListener('seeked', onNativeTime);
     };
-  }, [trimmedEnd, syncTime, segments, volume, isMuted, speed]);
+  }, [trimmedEnd, syncTime, segments, volume, isMuted, speed, applyPendingSeek]);
 
   // ── Dynamic subject tracking via rAF — instant snaps ───────────────
   const lastAppliedPctRef = useRef(null);
@@ -2529,7 +2580,22 @@ export default function VideoEditor({
       audioCtxRef.current.resume().catch(() => {});
     }
     if (video.paused) {
-      if (video.currentTime >= trimmedEnd) video.currentTime = trimmedStart;
+      // Play must start where the UI playhead IS. On touch, seeks issued
+      // while the element had no data (preload='metadata') were silently
+      // dropped — the playhead showed the scrubbed spot but the element
+      // sat at 0, so play always started at 0:00. Re-assert the UI
+      // position and latch it: even if this write is dropped too, the
+      // ``playing`` flush lands it as soon as the media opens.
+      const uiT = currentTimeRef.current;
+      if (typeof uiT === 'number'
+          && Math.abs((video.currentTime || 0) - uiT) > 0.75) {
+        pendingSeekRef.current = { t: uiT, at: performance.now() };
+        try { video.currentTime = uiT; } catch { /* noop */ }
+      }
+      if (video.currentTime >= trimmedEnd) {
+        video.currentTime = trimmedStart;
+        pendingSeekRef.current = null;   // deliberate wrap — nothing owed
+      }
       video.play().then(() => setPlaying(true)).catch(() => {});
     } else {
       video.pause();
@@ -2543,10 +2609,11 @@ export default function VideoEditor({
     const video = videoRef.current;
     if (!video) return;
     const clamped = Math.max(clipStart, Math.min(effectiveClipEnd, time));
+    latchSeek(video, clamped);          // remember it if the element drops it
     video.currentTime = clamped;
     setCurrentTime(clamped);
     useTimelineStore.getState().setPlayhead(clamped - clipStart);
-  }, [clipStart, effectiveClipEnd]);
+  }, [clipStart, effectiveClipEnd, latchSeek]);
 
   // Register this editor as the active player. PlayerContext also
   // maintains the legacy ``window.__clipai_*`` globals so any caller
@@ -2608,6 +2675,7 @@ export default function VideoEditor({
     // keyframe without decoding every intermediate frame, the right
     // tradeoff during scrub. Chrome/Edge fall through to
     // ``currentTime`` which is accurate but slower.
+    latchSeek(video, absTime);          // remember it if the element drops it
     try {
       if (typeof video.fastSeek === 'function') {
         video.fastSeek(absTime);
@@ -2619,7 +2687,7 @@ export default function VideoEditor({
     }
     setCurrentTime(absTime);
     onTimeUpdate?.(absTime);
-  }, [clipStart, onTimeUpdate]);
+  }, [clipStart, onTimeUpdate, latchSeek]);
 
   const handleTimelineItemSelect = useCallback(() => {
     setShowProperties(true);
