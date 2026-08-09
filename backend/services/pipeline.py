@@ -731,7 +731,7 @@ def _adaptive_reframer_sample_cap(base_cap: int, job_id: str = "") -> int:
         return base
 
 
-def _early_translation_overlap_allowed() -> bool:
+def _early_translation_overlap_allowed(polish_only: bool = False) -> bool:
     """Whether to start translation DURING the face loop.
 
     The overlap hides wall-clock ONLY when the CPU has spare capacity. On a weak,
@@ -741,10 +741,19 @@ def _early_translation_overlap_allowed() -> bool:
     zero net total-time gain (the face loop and its GPU feed sit behind the GIL).
     So the overlap AUTO-DISABLES on weak local GPUs; translation then runs right
     after the face loop, which keeps full speed. Config flag force-defers
-    everywhere. Fail-open (allow) when the GPU can't be read."""
+    everywhere. Fail-open (allow) when the GPU can't be read.
+
+    ``polish_only`` (source == target, no translation pass): the chain is a
+    different animal — no resegmentation, no glossary machinery, just polish
+    batches awaiting the REMOTE Companion LLM over HTTP. That's idle await,
+    not GIL pressure, so the weak-GPU deferral is skipped. The measured cost
+    of NOT overlapping: a 10-min en→en job spent 9 min polishing serially
+    AFTER an 8-min face loop it could have hidden behind."""
     try:
         if not bool(getattr(settings, "TRANSLATION_EARLY_OVERLAP", True)):
             return False
+        if polish_only:
+            return True
         name = ""
         total_mb = 0
         try:
@@ -7574,6 +7583,11 @@ async def _run_analysis_inner(job_id: str, resume: bool = False):
                     await _update_progress(
                         job_id, JobStatus.ANALYZING_SCENES, 60,
                         "Polishing transcript (punctuation + proper-noun fixes)...",
+                        # Without this the heartbeat falls back to the STATUS
+                        # label and narrates "scene analysis" for the many
+                        # minutes the polish batches actually run (measured:
+                        # 9 min mislabeled on a 42-batch en job).
+                        heartbeat_label="transcript polish",
                     )
                 # Pass Whisper's detected language so the polisher applies
                 # CJK-specific rules (insert 。/、, smaller batches, no
@@ -7836,7 +7850,17 @@ async def _run_analysis_inner(job_id: str, resume: bool = False):
         # (measured: perceive 5.4→12.6 min on a GTX 1650, total unchanged). Defer
         # translation to the classic post-engine path so the face loop runs at
         # full speed — the fast-analysis behaviour of the early Jul-19 runs.
-        if not _early_translation_overlap_allowed():
+        # Polish-only jobs (source == target) skip the CPU-heavy translation
+        # machinery — their chain is HTTP-await-bound on the remote Companion,
+        # so the weak-GPU face-loop-priority deferral doesn't apply to them.
+        # Mirrors the target/source resolution used by the chain itself.
+        _lang0 = (_payload.get("language") or "").strip().lower()
+        _src0 = (job.language or "").strip().lower() or _lang0
+        _tgt0 = (job.subtitle_language or "").strip().lower()
+        if not _tgt0 and _src0 and _src0 not in ("en", "english"):
+            _tgt0 = "en"
+        _polish_only0 = not (_tgt0 and _tgt0 != _src0)
+        if not _early_translation_overlap_allowed(polish_only=_polish_only0):
             logger.info(
                 "[%s] EARLY translation overlap deferred (face-loop priority on "
                 "this GPU) — translation runs right after the face loop", job_id)

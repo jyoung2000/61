@@ -954,6 +954,21 @@ async def _sync_companion_whisper(comp) -> dict:
         beam = int(h.get("whisper_beam_size", 0) or 0)
         quality = (h.get("whisper_quality") or "").strip()
         out = {"model": model, "beam_size": beam, "quality": quality}
+        # On quality="auto" the Companion's advertised tier is a SNAPSHOT of
+        # this instant's free VRAM, not a user preference — polled right
+        # after the editorial LLM loads, a 12 GB card "serves small beam 1".
+        # The measured run: main decode ran large-v3-turbo beam 5, then the
+        # 14B loaded for polish, the health poll caught that moment, and this
+        # sync PERSISTED beam=1 — silently degrading every later decode
+        # (recovery passes and future jobs) until someone re-saved settings.
+        # Only an EXPLICIT Companion quality choice (fast/balanced/max) is a
+        # preference worth mirroring.
+        if quality.lower() in ("", "auto"):
+            logger.debug(
+                "Companion whisper sync skipped: quality=auto reports the "
+                "moment's VRAM tier (%s beam %s), not a user choice",
+                model or "?", beam or "?")
+            return out
         changed = False
         if model and model != getattr(settings, "WHISPER_MODEL", ""):
             if bool(getattr(settings, "WHISPER_MODEL_USER_SET", False)):

@@ -1505,9 +1505,43 @@ async def correct_transcript(
     if _mp is not None and _mp >= float(
             getattr(settings, "TRANSLATION_LARGE_MODEL_MIN_PARAMS_B", 10.0)):
         _conc = min(_conc, max(1, int(getattr(settings, "TRANSLATION_LARGE_CONCURRENCY", 1))))
-        logger.info("transcript polishing: large model %s → concurrency %d "
-                    "(single slot, avoids parallel-request timeouts)",
-                    model_override, _conc)
+        # Budget-aware slot upgrade — same rule the translation pass uses:
+        # the single-slot pin exists because a 12B can't hold parallel KV
+        # caches in a MODEST budget, but when the Companion's advertised
+        # budget minus estimated weights leaves headroom for a second slot,
+        # two batches in flight ride Ollama's continuous batching on the
+        # same weights (~1.5-1.8× throughput, identical outputs). The
+        # measured run: 42 sequential batches × ~8.4s = ~6 min of the
+        # critical path on an en→en job; two slots roughly halve it.
+        if _conc <= 1:
+            try:
+                _max_par = int(getattr(
+                    settings, "TRANSLATION_LARGE_CONCURRENCY_MAX", 2) or 1)
+                if _max_par > 1:
+                    from backend.services.translator import (
+                        _companion_vram_budget_gb, _translation_batch_concurrency)
+                    from backend.services.local_models import (
+                        estimate_model_weights_gb)
+                    _cpar = await _translation_batch_concurrency()
+                    _budget_gb = await _companion_vram_budget_gb()
+                    _w_gb = estimate_model_weights_gb(model_override or "") or 0.0
+                    _need = float(getattr(
+                        settings, "TRANSLATION_LARGE_PARALLEL_HEADROOM_GB", 2.0))
+                    if (_cpar > 1 and _budget_gb > 0 and _w_gb > 0
+                            and (_budget_gb - _w_gb) >= _need):
+                        _conc = min(_max_par, _cpar)
+                        logger.info(
+                            "transcript polishing: Companion budget %.1f GB − "
+                            "weights %.1f GB ≥ %.1f GB headroom → %d parallel "
+                            "slots for %s", _budget_gb, _w_gb, _need, _conc,
+                            model_override)
+            except Exception as _bp_e:
+                logger.debug("polish parallel-slot budget check skipped (%s)",
+                             _bp_e)
+        if _conc <= 1:
+            logger.info("transcript polishing: large model %s → concurrency %d "
+                        "(single slot, avoids parallel-request timeouts)",
+                        model_override, _conc)
     _budget_s = float(getattr(settings, "SUBTITLE_POLISH_MAX_S", 600.0))
     _t_start = time.monotonic()
     _deadline = (_t_start + _budget_s) if _budget_s > 0 else None
