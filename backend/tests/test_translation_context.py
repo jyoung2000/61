@@ -181,6 +181,53 @@ def test_coherence_audit_skips_tiny_tracks_without_a_call():
     assert n == 0
 
 
+def test_confidence_seeds_are_repaired_even_when_the_audit_flags_nothing():
+    """Measured across five straight runs: the local audit model returned []
+    every time while the low-confidence garble band ("Lord Lowryen",
+    "Yulisia") shipped. Seeds from the ASR's own doubt map must reach the
+    fix stage regardless of the model's (empty) nomination."""
+    out = _track(_EN_TRACK)
+    orch = _AuditOrch([], "Mr. Darlian, please board the shuttle.")
+    n = asyncio.run(T.coherence_audit_and_fix(
+        _SRC_TRACK, out, orch, "Japanese", "English",
+        seed_indices=[4]))
+    assert n == 1
+    assert out[4].text == "Mr. Darlian, please board the shuttle."
+    # the fix prompt carried the seed's source line
+    assert "日本語のセリフ4です。" in orch.fix_prompts[0]
+
+
+def test_confidence_seeds_survive_a_failed_audit_call():
+    out = _track(_EN_TRACK)
+    orch = _AuditOrch([], "He fired the missile after all.")
+
+    _orig = orch.text_completion
+
+    async def _flaky(prompt, **kw):
+        if "JSON array of integers" in prompt:
+            raise RuntimeError("audit model down")
+        return await _orig(prompt, **kw)
+    orch.text_completion = _flaky
+    n = asyncio.run(T.coherence_audit_and_fix(
+        _SRC_TRACK, out, orch, "Japanese", "English", seed_indices=[3]))
+    assert n == 1
+    assert out[3].text == "He fired the missile after all."
+
+
+def test_confidence_seeds_skip_markers_and_dedup_against_flags():
+    out = _track(_EN_TRACK)
+    # seed 0 is the [♪ marker → skipped; audit also flags number 3 (= index
+    # 3 through the marker offset) which duplicates the seed → one repair
+    orch = _AuditOrch([3], "He fired the missile after all.")
+    n = asyncio.run(T.coherence_audit_and_fix(
+        _SRC_TRACK, out, orch, "Japanese", "English",
+        seed_indices=[0, 3]))
+    assert n == 1
+    assert out[3].text == "He fired the missile after all."
+    assert out[0].text == "[♪ Opening theme ♪]"
+    assert len(orch.fix_prompts) == 1
+
+
 # ── second-vote draft gate ──────────────────────────────────────────────────
 
 def test_name_shaped_token_detector():

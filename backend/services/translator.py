@@ -786,7 +786,8 @@ async def coherence_audit_and_fix(segments, out_segs, orchestrator,
                                   src_name: str, tgt_name: str,
                                   job_id: str = "",
                                   model_override=None,
-                                  brief: str = "") -> int:
+                                  brief: str = "",
+                                  seed_indices=None) -> int:
     """One GLOBAL read of the translated track, then targeted repairs.
 
     Every existing guard is local — a mistranslation that is fluent English
@@ -835,6 +836,27 @@ async def coherence_audit_and_fix(segments, out_segs, orchestrator,
         f"context. At most {max_fixes} numbers.\n"
         "Output ONLY a JSON array of integers (e.g. [12, 87]). If none, "
         "output [].\n\n" + "\n".join(numbered))
+    # Confidence SEEDS first: cues whose DECODE confidence is deep underwater
+    # are known suspects — the "Lord Lowryen"/"Yulisia" garble band — and get
+    # a contextual re-translate without waiting for the model to nominate
+    # them. Measured across five straight runs, the audit reply below was []
+    # every time while that band shipped; the local auditor won't volunteer
+    # flags, but it doesn't need to when the ASR already told us where the
+    # doubt lives. Same strict per-fix acceptance as model flags.
+    targets: list[int] = []
+    for i in (seed_indices or []):
+        try:
+            i = int(i)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= i < len(out_segs) and i not in targets:
+            t = _t(i)
+            if t and not t.startswith("["):
+                targets.append(i)
+    n_seeds = len(targets)
+
+    # A failed audit CALL must not cost the seeds their repair pass.
+    resp = None
     try:
         resp = await orchestrator.text_completion(
             audit_prompt, max_tokens=200, timeout=240, job_id=job_id,
@@ -843,19 +865,23 @@ async def coherence_audit_and_fix(segments, out_segs, orchestrator,
             json_schema={"type": "array", "items": {"type": "integer"},
                          "maxItems": max_fixes})
     except Exception as e:
-        logger.info("coherence audit skipped (%s)", e)
-        return 0
-    flags = _parse_int_array(resp, len(idx_map))[:max_fixes]
-    if not flags:
-        logger.info("coherence audit: no contradictory cues flagged "
-                    "(%d cues read)", len(idx_map))
-        return 0
-    logger.info("coherence audit: %d cue(s) flagged of %d — %s",
-                len(flags), len(idx_map), flags[:15])
-
-    fixed = 0
+        logger.info("coherence audit call skipped (%s)", e)
+    flags = _parse_int_array(resp, len(idx_map))[:max_fixes] if resp else []
     for num in flags:
         i = idx_map[num - 1]
+        if i not in targets:
+            targets.append(i)
+    targets = targets[:max_fixes]
+    if not targets:
+        logger.info("coherence audit: no repair targets — 0 model flag(s), "
+                    "0 confidence seed(s) (%d cues read)", len(idx_map))
+        return 0
+    logger.info("coherence audit: %d repair target(s) — %d confidence "
+                "seed(s) + %d model flag(s) of %d cues read",
+                len(targets), n_seeds, len(flags), len(idx_map))
+
+    fixed = 0
+    for i in targets:
         cur = _t(i)
         src = (_seg_text(segments[i]) or "").strip() if i < len(segments) else ""
         if not cur or not src:
@@ -1755,10 +1781,30 @@ async def translate_via_llm(
     # ── Full-track coherence audit: the only GLOBAL read of the result ──
     if bool(getattr(settings, "TRANSLATION_COHERENCE_AUDIT", True)) and out_segs:
         try:
+            # Seed the fix stage with the worst low-confidence decodes —
+            # the ASR's own doubt map, independent of whether the audit
+            # model volunteers any flags (measured: it never has).
+            _seed_cap = max(0, int(getattr(
+                settings, "TRANSLATION_SEED_FIX_MAX", 6)))
+            _lp_floor = float(getattr(
+                settings, "TRANSLATION_UNRELIABLE_LOGPROB", -0.65))
+            _seed_cand = []
+            if _seed_cap:
+                for _i, _s in enumerate(segments[:len(out_segs)]):
+                    _lp = (_s.get("avg_logprob") if isinstance(_s, dict)
+                           else getattr(_s, "avg_logprob", None))
+                    try:
+                        _lp = float(_lp) if _lp is not None else None
+                    except (TypeError, ValueError):
+                        _lp = None
+                    if _lp is not None and _lp < _lp_floor:
+                        _seed_cand.append((_lp, _i))
+            _seed_cand.sort()
             _n_coh = await coherence_audit_and_fix(
                 segments, out_segs, orchestrator, src_name, tgt_name,
                 job_id=job_id, model_override=model_override,
-                brief=episode_brief_for_job(job_id))
+                brief=episode_brief_for_job(job_id),
+                seed_indices=[i for _, i in _seed_cand[:_seed_cap]])
             if _n_coh:
                 logger.info(
                     "LLM translate: coherence audit repaired %d cue(s)", _n_coh)

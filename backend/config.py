@@ -1970,6 +1970,14 @@ class Settings(BaseSettings):
     # only pass that can catch the ONE wrong line that breaks a scene.
     TRANSLATION_COHERENCE_AUDIT: bool = True
     TRANSLATION_COHERENCE_MAX_FIXES: int = 15
+    # Confidence-seeded repair targets: the N worst cues below
+    # TRANSLATION_UNRELIABLE_LOGPROB are fed straight into the coherence
+    # audit's fix stage as known suspects. Measured need: five straight runs
+    # of the audit call returned [] while the low-confidence garble band
+    # ("Lord Lowryen", "Yulisia") shipped — a local model won't volunteer
+    # flags, but the ASR already says where the doubt lives. Each seed costs
+    # one guarded re-translate; the strict acceptance keeps drafts on a miss.
+    TRANSLATION_SEED_FIX_MAX: int = 6
     # After the offline NMT (FuguMT/NLLB) runs, any cue it left in the source
     # language is re-translated ONE AT A TIME with a plain-text LLM call (robust
     # where the batched JSON path fails on small local models). Cap the number of

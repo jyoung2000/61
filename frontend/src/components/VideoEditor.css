@@ -31,7 +31,15 @@
   position: relative;
   background: var(--bg-elevated, #f0f0f4);
   border-radius: var(--radius-md, 12px);
+  /* `clip` (with `hidden` as the legacy fallback) keeps the rounded-corner
+     clipping WITHOUT making this a scroll container. `overflow: hidden`
+     silently disabled every `position: sticky` descendant — the inspector
+     rail's sticky pin (.ve-editor-rail__sticky) never engaged, so editing
+     properties meant scrolling up and down between the controls and the
+     timeline. A clipped (not scrollable) ancestor leaves sticky tracking
+     the page scroll, which is exactly what the rail needs. */
   overflow: hidden;
+  overflow: clip;
   font-family: var(--font-sans);
   user-select: none;
   -webkit-user-select: none;
