@@ -192,6 +192,37 @@ def test_import_folder_creates_state_and_refuses_second_concurrent(_host, monkey
     assert active["bulk_id"] == out["bulk_id"]
 
 
+def test_import_folder_accepts_explicit_file_selection(_host, monkeypatch):
+    """Multi-select mode: the dialog sends the picked files and they run
+    through the SAME sequential queue — the old per-file path fired one
+    analysis per completed download and piled pipelines onto the GPU."""
+    async def _noop(bulk_id):
+        return None
+    monkeypatch.setattr(S, "_run_bulk_import", _noop)
+    out = asyncio.run(_start_bulk(S.CompanionFolderImportRequest(
+        host_id="h1",
+        files=[
+            {"name": "b.mkv", "path": "D:\\m\\b.mkv", "size": 7},
+            {"name": "a.mp4", "path": "D:\\m\\a.mp4", "size": 5},
+            {"name": "notes.txt", "path": "D:\\m\\notes.txt", "size": 1},
+        ],
+        source_language="ja", target_language="en")))
+    st = S._bulk_imports[out["bulk_id"]]
+    assert out["total"] == 2
+    # Selection order preserved; the non-video is dropped.
+    assert [i["name"] for i in st["items"]] == ["b.mkv", "a.mp4"]
+    assert st["folder_name"] == "2 selected videos"
+    assert st["folder"] == "selection"
+    assert st["source_language"] == "ja"
+
+
+def test_import_folder_empty_selection_400(_host):
+    with pytest.raises(HTTPException) as e:
+        asyncio.run(_start_bulk(S.CompanionFolderImportRequest(
+            host_id="h1", files=[{"name": "x.txt", "path": "p", "size": 1}])))
+    assert e.value.status_code == 400
+
+
 def test_active_returns_none_when_nothing_running():
     assert asyncio.run(S.companion_folder_import_active())["bulk_id"] is None
 

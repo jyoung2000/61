@@ -1,3 +1,32 @@
+# ClipAI — Multi-video imports run strictly one pipeline at a time
+
+A dashboard screenshot showed two analyses running side by side (6 % and
+12 %) with two more queued behind them after a multi-select import. Two
+causes, both fixed:
+
+- **`CONCURRENT_ANALYSES` default 2 → 1.** The pipeline semaphore itself
+  allowed two concurrent analyses, which split the same GPU/CPU and finish
+  slower in total than back-to-back. Strictly sequential by default now;
+  raise via env only on hardware with real headroom for two full pipelines.
+- **The dialog's multi-select "Import N" now uses the sequential queue.**
+  It previously imported file-by-file through the SINGLE-file endpoint,
+  which fire-and-forgets `run_analysis` the moment each download lands — a
+  few fast LAN downloads piled several pipelines up at once. Multi-selected
+  VIDEOS now post the selection to `/import-folder` (new `files` mode:
+  explicit `{name, path, size}` list, selection order preserved, non-videos
+  dropped), so they get the same download → full analysis → next sequencing,
+  the same persistence/revive resilience, and the same Dashboard progress
+  panel as "Import all". Media/font multi-select keeps the per-file loop (no
+  pipelines involved).
+- Verified: 2 new endpoint tests (selection mode state/order/labeling, empty
+  selection 400), a new component test proving the footer "Import 2" makes
+  ONE `/import-folder` POST with the picked files and never touches the
+  per-file `/import` endpoint; full suites green (23 bulk/bookmark backend,
+  159 frontend). The 7 `test_flag_defaults_stable` failures are pre-existing
+  missing-module issues, byte-identical on the base commit.
+
+---
+
 # ClipAI — Stalled runs get detected, revived, and finished (the bulk-import "randomly stopped")
 
 Diagnosed from a real bulk import's logs: video 1 of 5 downloaded and

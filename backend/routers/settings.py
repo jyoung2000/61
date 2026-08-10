@@ -1668,7 +1668,12 @@ _bulk_imports: dict = {}           # bulk_id -> state (insertion-ordered)
 
 class CompanionFolderImportRequest(BaseModel):
     host_id: str
-    path: str
+    # Folder mode: import every video directly inside this shared folder.
+    path: str = ""
+    # Selection mode: explicit files ({name, path, size}) from the dialog's
+    # multi-select. Same sequential machinery — the old per-file import fired
+    # an analysis per completed download, piling pipelines onto one GPU.
+    files: list = []
     # Same semantics as the single-file import: empty source = auto-detect,
     # empty target = keep the original language.
     source_language: str = ""
@@ -2014,26 +2019,39 @@ async def _run_bulk_import(bulk_id: str) -> None:
 
 @router.post("/providers/companion-files/import-folder")
 async def companion_folder_import(req: CompanionFolderImportRequest):
-    """Start a sequential bulk import of every video directly inside one
-    Companion shared folder. Returns a ``bulk_id`` to poll; the run continues
-    server-side even if the browser dialog is closed."""
+    """Start a SEQUENTIAL bulk import — either every video inside one shared
+    folder (``path``) or an explicit multi-selection (``files``). One video
+    at a time, download → full analysis → next; returns a ``bulk_id`` to
+    poll; the run continues server-side even if the browser dialog closes."""
     h = _companion_by_id(req.host_id)
     if h is None:
         raise HTTPException(status_code=404, detail="companion not found or not connected")
     if any(s.get("status") == "running" for s in _bulk_imports.values()):
         raise HTTPException(status_code=409,
-                            detail="a folder import is already running — wait for it to finish or cancel it")
-    videos = await _companion_list_videos(h, req.path)
+                            detail="a sequential import is already running — wait for it to finish or cancel it")
+    if req.files:
+        videos = []
+        for f in req.files:
+            name = str((f or {}).get("name") or "")
+            fpath = str((f or {}).get("path") or "")
+            ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+            if fpath and ext in _BULK_VIDEO_EXTS:
+                videos.append({"name": name, "path": fpath,
+                               "size": int((f or {}).get("size") or 0)})
+        folder_name = f"{len(videos)} selected video{'s' if len(videos) != 1 else ''}"
+    else:
+        videos = await _companion_list_videos(h, req.path)
+        _folder = (req.path or "").rstrip("/\\")
+        folder_name = os.path.basename(_folder.replace("\\", "/")) or _folder
     if not videos:
-        raise HTTPException(status_code=400, detail="no videos found in this folder")
+        raise HTTPException(status_code=400, detail="no videos found to import")
 
     bulk_id = uuid.uuid4().hex[:12]
-    folder = (req.path or "").rstrip("/\\")
     st = {
         "bulk_id": bulk_id,
         "host_id": req.host_id,
-        "folder": req.path,
-        "folder_name": os.path.basename(folder.replace("\\", "/")) or folder,
+        "folder": req.path or "selection",
+        "folder_name": folder_name,
         "status": "running",
         "error": "",
         "total": len(videos),
@@ -2057,8 +2075,10 @@ async def companion_folder_import(req: CompanionFolderImportRequest):
     _bulk_imports[bulk_id] = st
     _bulk_persist()
     asyncio.create_task(_run_bulk_import(bulk_id))
-    logger.info("Bulk import %s started: %d video(s) from %s", bulk_id, len(videos), req.path)
-    return {"ok": True, "bulk_id": bulk_id, "total": len(videos), "folder": req.path}
+    logger.info("Bulk import %s started: %d video(s) from %s",
+                bulk_id, len(videos), st["folder"])
+    return {"ok": True, "bulk_id": bulk_id, "total": len(videos),
+            "folder": st["folder"]}
 
 
 @router.get("/providers/companion-files/import-folder/progress")

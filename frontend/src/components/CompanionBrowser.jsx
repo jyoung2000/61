@@ -484,20 +484,46 @@ export default function CompanionBrowser({ kind = 'video', onClose, onImported }
     const picked = shown.filter((e) => selectedPaths.has(e.path) && importable(e));
     if (!picked.length) return;
     setImportMsg('');
-    let ok = 0; let firstJob = null; const mediaResults = [];
+    if (kind === 'video') {
+      // Multi-selected VIDEOS go through the server-side sequential importer
+      // (download → full analysis → next, one at a time). The old per-file
+      // path fired an analysis the moment each download landed, so a few
+      // fast LAN downloads piled several pipelines onto one GPU at once —
+      // slower in total than back-to-back, and heavy on compute.
+      if (bulkRunning) {
+        setImportMsg('A sequential import is already running — wait for it to finish or cancel it.');
+        return;
+      }
+      try {
+        const res = await fetch('/api/providers/companion-files/import-folder', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            host_id: hostId,
+            files: picked.map((e) => ({ name: e.name, path: e.path, size: e.size || 0 })),
+            source_language: sourceLang, target_language: targetLang,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) { setImportMsg(`Import failed: ${data.detail || res.status}`); return; }
+        setSelectedPaths(new Set());
+        setBulkStartId(data.bulk_id);
+      } catch (e) { setImportMsg(`Import failed: ${e}`); }
+      return;
+    }
+    // Media / fonts: no analysis pipeline involved — the per-file sequential
+    // download loop stays.
+    let ok = 0; const mediaResults = [];
     for (let i = 0; i < picked.length; i++) {
       setBatchMsg(`Importing ${i + 1} of ${picked.length}…`);
       const r = await importOne(picked[i]);        // sequential — steady on the LAN
       if (r && !r.error) {
         ok += 1;
-        if (kind === 'video') { if (!firstJob) firstJob = r.job_id; }
-        else mediaResults.push(r);
+        mediaResults.push(r);
       }
     }
     setImportingPath(''); setBatchMsg(''); setSelectedPaths(new Set());
     setImportMsg(`Imported ${ok} of ${picked.length}`);
-    if (kind === 'video' && firstJob) onImported && onImported({ kind: 'video', ok: true, job_id: firstJob });
-    else mediaResults.forEach((r) => onImported && onImported(r));
+    mediaResults.forEach((r) => onImported && onImported(r));
   };
   const busy = !!importingPath || !!batchMsg;
 

@@ -1271,7 +1271,12 @@ class Settings(BaseSettings):
     # Adaptive frame extraction
     MIN_FRAMES: int = 30               # minimum for any video
     FRAMES_PER_MINUTE: float = 6       # target density (first 30 min; diminishes for longer videos)
-    CONCURRENT_ANALYSES: int = 2
+    # STRICTLY one analysis at a time by default. Two concurrent pipelines
+    # split the same GPU/CPU and finish SLOWER in total than back-to-back
+    # (observed: two 846 MB videos at 6 % and 12 % crawling side by side),
+    # and every queued import piles onto the same contention. Raise via env
+    # only on hardware that genuinely has headroom for two full pipelines.
+    CONCURRENT_ANALYSES: int = 1
     AUTO_ANALYZE: bool = True
     SUBJECT_TRACKING_ENABLED: bool = True
     DENSE_FACE_SAMPLE_RATE: float = 0.5  # seconds between dense face detection frames (0.5 = 2fps)

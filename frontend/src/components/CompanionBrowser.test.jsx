@@ -291,6 +291,30 @@ describe('CompanionBrowser bulk folder import', () => {
     expect(byText('Cancel import')).toBeFalsy();
   });
 
+  it('multi-selected videos import through the sequential server queue', async () => {
+    await render(<CompanionBrowser kind="video" onClose={() => {}} onImported={() => {}} />);
+    await click([...document.body.querySelectorAll('button')].find((b) => b.textContent.includes('media')));
+    await flush();
+
+    // Select both video rows via their checkboxes (row click toggles).
+    await click([...document.body.querySelectorAll('[data-fbpath]')].find((r) => r.textContent.includes('ep1.mp4')));
+    await click([...document.body.querySelectorAll('[data-fbpath]')].find((r) => r.textContent.includes('ep2.mkv')));
+    await click(byText('Import 2'));
+    await flush();
+    await flush();
+
+    // ONE POST to the sequential importer with the selection — never the
+    // per-file /import endpoint that used to fire an analysis per download.
+    const post = fetchCalls.find((c) => c.method === 'POST' && c.url.endsWith('/companion-files/import-folder'));
+    expect(post.body.files).toEqual([
+      { name: 'ep1.mp4', path: 'D:\\media\\ep1.mp4', size: 9000 },
+      { name: 'ep2.mkv', path: 'D:\\media\\ep2.mkv', size: 9000 },
+    ]);
+    expect(fetchCalls.some((c) => c.url.endsWith('/companion-files/import'))).toBe(false);
+    // The shared panel takes over with the polled (terminal) state.
+    expect(document.body.textContent).toContain('Folder import done — 2 of 2 videos imported');
+  });
+
   it('does not offer bulk import for media/font browsing', async () => {
     await render(<CompanionBrowser kind="media" onClose={() => {}} onImported={() => {}} />);
     await click([...document.body.querySelectorAll('button')].find((b) => b.textContent.includes('media')));
