@@ -1,3 +1,31 @@
+# ClipAI — Update flow: survive a full Docker vDisk
+
+The very next deploy attempt died before the build even started:
+`write /var/lib/docker/btrfs/subvolumes/…: no space left on device` — on
+Unraid the Docker vDisk (docker.img) is a fixed-size loopback, and the ClipAI
+image + superseded builds + BuildKit caches fill it over time. `update-all.sh`
+now:
+
+- **Preflights Docker's data root** (`docker info -f '{{.DockerRootDir}}'`)
+  before building: below `CLIPAI_MIN_FREE_GB` (default 8) it reclaims in safe
+  escalating steps — dangling images first (untagged layers from previous
+  clipai-app builds), then an LRU BuildKit-cache trim to
+  `CLIPAI_BUILDCACHE_KEEP_GB` (default 6, so the hot companion cross-build
+  caches survive). It never auto-prunes containers, volumes, or other apps'
+  tagged images; if that still isn't enough it ABORTS immediately with the
+  exact Unraid fix (grow the vDisk) instead of failing 20 minutes in.
+- **Detects ENOSPC mid-build** (build output tee'd + grepped): reclaims hard
+  (`docker builder prune -af` + dangling images) and retries the build ONCE,
+  so a marginal disk recovers unattended instead of leaving the box on old
+  code. A second failure aborts with the grow-the-vDisk instruction.
+- The Companion cross-build retry path gets the same preflight (best-effort).
+- Verified with scripted dry-runs over stubbed docker/git/df: low-disk
+  preflight (5 → 8 GB via the two safe prunes), mid-build ENOSPC → hard
+  reclaim → successful retry → normal publish, and the hopeless case (1 GB,
+  prunes reclaim ~nothing) aborting BEFORE any build attempt.
+
+---
+
 # ClipAI — Update flow: stop caching a failed Companion cross-build forever
 
 A real deploy hit "ERROR: no Companion .exe in the image" on a 5-second fully

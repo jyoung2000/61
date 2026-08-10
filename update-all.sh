@@ -50,6 +50,54 @@ export DOCKER_BUILDKIT=1 COMPOSE_DOCKER_CLI_BUILD=1
 # layers on any changed file, so this is only for paranoia / a reported mismatch.
 NOCACHE=""; [ "${CLIPAI_NOCACHE:-0}" = "1" ] && NOCACHE="--no-cache"
 
+# ── Docker disk preflight ────────────────────────────────────────────────────
+# A real update died with "write /var/lib/docker/...: no space left on device"
+# — on Unraid the Docker vDisk (docker.img) is a FIXED-size loopback, and the
+# ClipAI image + superseded builds + BuildKit caches fill it over time. Before
+# burning 20+ minutes on a doomed build, check free space in Docker's data
+# root and reclaim safely, in escalating steps:
+#   1. dangling images  — untagged layers from previous clipai-app builds;
+#      always safe to delete (they're the *old* versions of this same image).
+#   2. BuildKit cache over a keep-budget — LRU trim, so the hot companion
+#      cross-build caches (cargo target, MSVC SDK) survive as long as they fit.
+# NEVER pruned automatically: containers, volumes, or other apps' tagged
+# images. If that still isn't enough, abort with exact instructions instead of
+# failing 20 minutes in.
+MIN_FREE_GB="${CLIPAI_MIN_FREE_GB:-8}"
+KEEP_CACHE_GB="${CLIPAI_BUILDCACHE_KEEP_GB:-6}"
+DOCKER_ROOT="$(docker info -f '{{.DockerRootDir}}' 2>/dev/null)"
+[ -z "$DOCKER_ROOT" ] && DOCKER_ROOT="/var/lib/docker"
+_free_gb(){ df -Pk "$DOCKER_ROOT" 2>/dev/null | awk 'NR==2{printf "%d", $4/1024/1024}'; }
+
+ensure_docker_space(){
+  local free; free="$(_free_gb)"; free="${free:-0}"
+  log "docker storage: ${free}GB free at $DOCKER_ROOT (want ≥ ${MIN_FREE_GB}GB)"
+  [ "$free" -ge "$MIN_FREE_GB" ] && return 0
+  log "low on docker disk — pruning dangling images (superseded clipai builds)…"
+  docker image prune -f 2>&1 | tail -1
+  free="$(_free_gb)"; free="${free:-0}"
+  [ "$free" -ge "$MIN_FREE_GB" ] && { log "…now ${free}GB free ✓"; return 0; }
+  log "still ${free}GB — trimming BuildKit cache to ${KEEP_CACHE_GB}GB (LRU keeps the hot companion caches)…"
+  docker builder prune -f --keep-storage "${KEEP_CACHE_GB}GB" 2>&1 | tail -1
+  free="$(_free_gb)"; free="${free:-0}"
+  [ "$free" -ge "$MIN_FREE_GB" ] && { log "…now ${free}GB free ✓"; return 0; }
+  log "STILL only ${free}GB free after safe pruning. Not deleting anything riskier automatically."
+  log "  Unraid fix: Settings -> Docker -> stop the service -> increase the vDisk size (the ClipAI image alone needs many GB)."
+  log "  Or reclaim harder by hand (understand what each deletes first):"
+  log "    docker builder prune -af          # ALL build cache — next build recompiles everything"
+  log "    docker image prune -af            # ALL images not used by a container, other apps' too"
+  return 1
+}
+
+# Free-space knob for one aggressive retry when a build dies of ENOSPC anyway
+# (the preflight passed but the build itself outgrew the disk).
+reclaim_hard(){
+  log "reclaiming docker disk the hard way (all build cache + dangling images)…"
+  docker builder prune -af 2>&1 | tail -1
+  docker image prune -f 2>&1 | tail -1
+  log "…now $(_free_gb)GB free at $DOCKER_ROOT"
+}
+
 log "pulling latest ($BRANCH)…"
 # Retry the fetch — a transient network blip must not leave you on old code.
 _fetched=""
@@ -71,14 +119,37 @@ EXPECTED="${BASE_V%.*}.${BUILD_NUM}"
 [ "$BUILD_NUM" = "0" ] && EXPECTED="$BASE_V"
 log "commit $BUILD_SHA — building container + Companion v$EXPECTED (from source; needs internet)"
 
+ensure_docker_space || { log "ABORTING before the build — free docker disk first (see above), then re-run: bash update-all.sh"; exit 1; }
+
+# Build with the output tee'd so an ENOSPC failure is detectable: when the
+# disk fills DURING the build (preflight passed but the new layers outgrew
+# it), reclaim hard and retry ONCE instead of leaving the box on old code.
+BUILD_LOG="$(mktemp /tmp/clipai-build.XXXXXX)"
+run_app_build(){
+  $DC build $NOCACHE --build-arg COMPANION_BUILD_FROM_SOURCE=1 \
+      --build-arg COMPANION_BUILD_NUMBER="$BUILD_NUM" app 2>&1 | tee "$BUILD_LOG"
+  return "${PIPESTATUS[0]}"
+}
 ( while :; do sleep 60; log "…still building ($(( ($(date +%s)-START)/60 ))m elapsed)"; done ) & HB=$!
-if ! $DC build $NOCACHE --build-arg COMPANION_BUILD_FROM_SOURCE=1 \
-    --build-arg COMPANION_BUILD_NUMBER="$BUILD_NUM" app; then
-  kill "$HB" 2>/dev/null || true
-  log "BUILD FAILED — error is above (the Companion cross-build needs outbound internet)"
-  exit 1
+if ! run_app_build; then
+  if grep -qi "no space left on device" "$BUILD_LOG"; then
+    log "BUILD FAILED: docker ran OUT OF DISK mid-build."
+    reclaim_hard
+    log "retrying the build once on the freed disk (uncached parts rebuild from scratch)…"
+    if ! run_app_build; then
+      kill "$HB" 2>/dev/null || true; rm -f "$BUILD_LOG"
+      log "BUILD FAILED AGAIN — the Docker vDisk is genuinely too small for the ClipAI image."
+      log "  Unraid: Settings -> Docker -> stop the service -> increase the vDisk size, then re-run: bash update-all.sh"
+      exit 1
+    fi
+  else
+    kill "$HB" 2>/dev/null || true; rm -f "$BUILD_LOG"
+    log "BUILD FAILED — error is above (the Companion cross-build needs outbound internet)"
+    exit 1
+  fi
 fi
 kill "$HB" 2>/dev/null || true
+rm -f "$BUILD_LOG"
 log "build complete."
 
 log "restarting ClipAI (Ollama + models stay up)…"
@@ -138,6 +209,7 @@ if [ -z "$EXE" ] || ! _has_expected; then
   else
     log "image's Companion installer is not v$EXPECTED (builder status: ${ST:-unknown})."
   fi
+  ensure_docker_space || log "…continuing the Companion retry anyway — it may fail on disk space (see above)."
   log "retrying the Companion cross-build directly (cache-busted; streams the real build log; 10-30 min cold, minutes when the caches are warm)…"
   ( while :; do sleep 60; log "…still cross-building the Companion ($(( ($(date +%s)-START)/60 ))m elapsed)"; done ) & HB2=$!
   if DOCKER_BUILDKIT=1 docker build --target companion-artifacts \
