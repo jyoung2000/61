@@ -138,4 +138,52 @@ async fn proxy_auth_routing_and_saturation() {
         .await
         .unwrap();
     assert_eq!(r.status(), 503, "paused Companion refuses work");
+
+    // 7. remote quality config: authed, readable, writable, validated — and a
+    //    CONFIG route, so it must keep working even while sharing is paused.
+    //    (Only whisper_quality is changed here: a speed_profile change would
+    //    restart the managed Ollama, which this harness doesn't run.)
+    let r = c.get(format!("{base}/v1/config/quality")).send().await.unwrap();
+    assert_eq!(r.status(), 401, "quality config without token");
+    let r = c
+        .get(format!("{base}/v1/config/quality"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let q: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(q["speed_profile"], "auto", "fresh config defaults to auto");
+    assert_eq!(q["whisper_quality"], "auto");
+    assert!(q["whisper_effective"]["beam_size"].as_u64().is_some());
+    let r = c
+        .post(format!("{base}/v1/config/quality"))
+        .bearer_auth(token)
+        .json(&serde_json::json!({"whisper_quality": "MAX "}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "write normalizes case/whitespace");
+    let q: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(q["ok"], true);
+    assert_eq!(q["whisper_quality"], "max");
+    assert_eq!(q["ollama_restarted"], false, "whisper-only change must not restart Ollama");
+    assert_eq!(
+        st.config.lock().unwrap().whisper_quality,
+        "max",
+        "remote write landed in the persisted config"
+    );
+    let r = c
+        .post(format!("{base}/v1/config/quality"))
+        .bearer_auth(token)
+        .json(&serde_json::json!({"speed_profile": "ludicrous"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400, "invalid profile is rejected loudly");
+    assert_eq!(
+        st.config.lock().unwrap().speed_profile,
+        "auto",
+        "rejected write must not half-apply"
+    );
 }

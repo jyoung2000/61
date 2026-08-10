@@ -1313,6 +1313,144 @@ async fn set_vram_config(State(ctx): State<ProxyCtx>, req: Request<Body>) -> Res
     (StatusCode::OK, axum::Json(body)).into_response()
 }
 
+/// Shared JSON body for the quality config read + write paths: the two
+/// performance fields (Ollama speed profile + Whisper transcription quality)
+/// plus what they RESOLVE to on this GPU right now, so ClipAI can render the
+/// same "Performance" control the desktop GUI shows — including the honest
+/// "which decode actually engages at this VRAM budget" line.
+fn quality_config_json(ctx: &ProxyCtx) -> serde_json::Value {
+    let cfg = ctx.state.config_snapshot();
+    let budget = ctx.state.effective_budget_gb();
+    let (whisper_model, _) = crate::state::whisper_tier_for_budget(budget);
+    let (beam, prefer_full) = crate::state::whisper_quality_params(&cfg.whisper_quality, budget);
+    let model_eff = if prefer_full && whisper_model == "large-v3-turbo" {
+        "large-v3"
+    } else {
+        whisper_model
+    };
+    let (num_parallel, max_loaded) = ctx.state.resolve_speed_settings();
+    serde_json::json!({
+        "speed_profile": cfg.speed_profile,
+        "whisper_quality": cfg.whisper_quality,
+        "effective_budget_gb": budget,
+        "num_parallel": num_parallel,
+        "max_loaded_models": max_loaded,
+        "whisper_effective": {
+            "model": model_eff,
+            "beam_size": beam,
+            "beam_search": beam > 1,
+        },
+    })
+}
+
+/// GET /v1/config/quality → the current performance/quality settings + their
+/// effective resolution, so ClipAI can seed its remote control to what this
+/// Companion is actually doing.
+async fn quality_config_get(State(ctx): State<ProxyCtx>, headers: HeaderMap) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+    let activity = ctx.state.begin_activity("config", "/v1/config/quality", "", "", "");
+    let body = quality_config_json(&ctx);
+    ctx.state.end_activity(activity, 200);
+    (StatusCode::OK, axum::Json(body)).into_response()
+}
+
+/// POST /v1/config/quality → set the speed profile and/or Whisper quality
+/// REMOTELY (the desktop "Performance" control, mirrored over the LAN). Body
+/// may carry any of {speed_profile, whisper_quality}; values are validated
+/// against the same allow-lists as the local GUI's `set_config`, and invalid
+/// values 400 (instead of silently ignoring like the trusted local path — a
+/// remote typo should be loud). Applies with the same side effects: a speed
+/// change restarts the managed Ollama (new NUM_PARALLEL / MAX_LOADED), a
+/// quality change drops the whisper sidecar so the next transcription starts
+/// with the new beam-search / model settings.
+async fn set_quality_config(State(ctx): State<ProxyCtx>, req: Request<Body>) -> Response {
+    if !authorized(&ctx, req.headers()) {
+        return unauthorized();
+    }
+    let activity = ctx.state.begin_activity("config", "/v1/config/quality", "", "", "");
+    let bytes = match axum::body::to_bytes(req.into_body(), 64 * 1024).await {
+        Ok(b) => b,
+        Err(e) => {
+            ctx.state.end_activity(activity, 400);
+            return (StatusCode::BAD_REQUEST, format!("bad body: {e}")).into_response();
+        }
+    };
+    let patch: serde_json::Value = if bytes.is_empty() {
+        serde_json::json!({})
+    } else {
+        match serde_json::from_slice(&bytes) {
+            Ok(v) => v,
+            Err(e) => {
+                ctx.state.end_activity(activity, 400);
+                return (StatusCode::BAD_REQUEST, format!("bad json: {e}")).into_response();
+            }
+        }
+    };
+    // Validate BEFORE applying anything, so a request with one bad field
+    // doesn't half-apply.
+    let speed = patch
+        .get("speed_profile")
+        .and_then(|x| x.as_str())
+        .map(|s| s.trim().to_lowercase());
+    if let Some(v) = &speed {
+        if !matches!(v.as_str(), "auto" | "eco" | "balanced" | "turbo") {
+            ctx.state.end_activity(activity, 400);
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("invalid speed_profile {v:?} (auto|eco|balanced|turbo)"),
+            )
+                .into_response();
+        }
+    }
+    let quality = patch
+        .get("whisper_quality")
+        .and_then(|x| x.as_str())
+        .map(|s| s.trim().to_lowercase());
+    if let Some(v) = &quality {
+        if !matches!(v.as_str(), "auto" | "fast" | "balanced" | "max") {
+            ctx.state.end_activity(activity, 400);
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("invalid whisper_quality {v:?} (auto|fast|balanced|max)"),
+            )
+                .into_response();
+        }
+    }
+    let mut ollama_restart = false;
+    let mut sidecar_restart = false;
+    {
+        let mut cfg = ctx.state.config.lock().unwrap();
+        if let Some(v) = speed {
+            if v != cfg.speed_profile {
+                cfg.speed_profile = v;
+                ollama_restart = true;
+            }
+        }
+        if let Some(v) = quality {
+            if v != cfg.whisper_quality {
+                cfg.whisper_quality = v;
+                sidecar_restart = true;
+            }
+        }
+    }
+    ctx.state.save();
+    if ollama_restart {
+        let _ = crate::ollama::restart(&ctx.state).await;
+    }
+    if sidecar_restart {
+        crate::sidecar::shutdown(&ctx.state, "quality settings changed remotely").await;
+    }
+    let mut body = quality_config_json(&ctx);
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("ok".into(), serde_json::json!(true));
+        obj.insert("ollama_restarted".into(), serde_json::json!(ollama_restart));
+    }
+    ctx.state.end_activity(activity, 200);
+    (StatusCode::OK, axum::Json(body)).into_response()
+}
+
 fn build_router(ctx: ProxyCtx) -> Router {
     Router::new()
         .route("/v1/health", get(health))
@@ -1327,6 +1465,7 @@ fn build_router(ctx: ProxyCtx) -> Router {
         .route("/v1/update/status", get(update_status))
         .route("/v1/gpu/release", post(gpu_release))
         .route("/v1/config/vram", get(vram_config_get).post(set_vram_config))
+        .route("/v1/config/quality", get(quality_config_get).post(set_quality_config))
         .route("/v1/jobs/force-end", post(jobs_force_end))
         .route("/v1/audio/transcriptions", post(whisper_proxy))
         .route("/ollama", any(ollama_proxy))

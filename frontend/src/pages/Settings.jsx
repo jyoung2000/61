@@ -352,6 +352,163 @@ function CompanionVramCard({ showToast }) {
   );
 }
 
+// Remote performance/quality control for the paired GPU Companion — the same
+// four-level "Performance" control its desktop GUI shows (each level sets the
+// Ollama speed profile + Whisper transcription quality together), driven from
+// ClipAI over the LAN, plus a caption-quality override for unusual pairings.
+// Self-contained like CompanionVramCard; renders nothing when no Companion is
+// paired/reachable.
+const COMPANION_PERF_LEVELS = [
+  { key: 'auto', speed: 'auto', whisper: 'auto', label: 'Auto',
+    hint: 'Caption accuracy ★★★☆ (adaptive) — the most accurate Whisper decode the allocated VRAM affords; speed auto-tunes too. Recommended default.' },
+  { key: 'eco', speed: 'eco', whisper: 'fast', label: 'Eco',
+    hint: 'Caption accuracy ★★☆☆ (fastest, roughest) — small greedy decode, one AI job at a time; leaves the card free for games/other apps.' },
+  { key: 'balanced', speed: 'balanced', whisper: 'balanced', label: 'Balanced',
+    hint: 'Caption accuracy ★★★☆ (solid) — large-v3-turbo with beam search and moderate parallelism for a steady pipeline.' },
+  { key: 'turbo', speed: 'turbo', whisper: 'max', label: 'Turbo',
+    hint: 'Caption accuracy ★★★★ (best possible) — FULL large-v3 with beam search (needs ~8 GB allocated to engage) and maximum parallelism.' },
+];
+const COMPANION_CAPTION_QUALITIES = [
+  { value: 'auto', label: 'Auto (match VRAM)' },
+  { value: 'fast', label: 'Fast (greedy)' },
+  { value: 'balanced', label: 'Balanced (beam search)' },
+  { value: 'max', label: 'Max (full large-v3)' },
+];
+
+function CompanionQualityCard({ showToast }) {
+  const [cfg, setCfg] = useState(null);     // null = loading
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const res = await fetch('/api/providers/companion/quality');
+        const data = res.ok ? await res.json() : null;
+        if (alive) setCfg(data && data.ok ? data : { ok: false });
+      } catch { if (alive) setCfg({ ok: false }); }
+    })();
+    return () => { alive = false; };
+  }, []);
+
+  const post = async (payload, okMsg) => {
+    setSaving(true);
+    try {
+      const res = await fetch('/api/providers/companion/quality', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = res.ok ? await res.json() : null;
+      if (data && data.ok) {
+        showToast(okMsg, 'success');
+        setCfg((prev) => ({ ...prev, ...data }));
+      } else {
+        showToast((data && data.error) || 'Failed to update quality settings', 'error');
+      }
+    } catch {
+      showToast('Failed to reach the Companion', 'error');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (!cfg || cfg.ok === false) return null;  // loading or no companion → hide
+
+  const writable = cfg.writable !== false;
+  const active = COMPANION_PERF_LEVELS.find((l) => l.speed === cfg.speed_profile)?.key ?? null;
+  const we = cfg.whisper_effective || {};
+  const capDesc = we.model
+    ? `${we.model} ${we.beam_search ? `beam ${we.beam_size}` : 'greedy'}`
+    : '';
+
+  return (
+    <div style={{
+      background: 'var(--bg-panel)', border: '1px solid var(--border)',
+      borderRadius: 'var(--radius-md)', padding: '12px 16px', marginTop: 12,
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+        <span style={{ fontSize: 13, fontWeight: 600, flex: 1 }}>Companion performance &amp; caption quality</span>
+        {cfg.num_parallel > 0 && (
+          <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+            {cfg.num_parallel}× parallel{capDesc ? ` · ${capDesc}` : ''}
+          </span>
+        )}
+      </div>
+      <div style={{ fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.5, marginBottom: 8 }}>
+        One knob for how hard ClipAI may push the Companion GPU — sets its pipeline
+        parallelism and Whisper caption quality together, applied on the GPU PC
+        immediately (same control as the Companion app itself).
+      </div>
+      {!writable && (
+        <div style={{ fontSize: 11, color: 'var(--warning, #d97706)', marginBottom: 8 }}>
+          {cfg.note || 'Update the GPU Companion app to change quality remotely.'}
+        </div>
+      )}
+      <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+        {COMPANION_PERF_LEVELS.map((l) => {
+          const on = active === l.key;
+          return (
+            <button
+              key={l.key}
+              type="button"
+              title={l.hint}
+              disabled={!writable || saving}
+              onClick={() => post(
+                { speed_profile: l.speed, whisper_quality: l.whisper },
+                `Companion performance set to ${l.label}`)}
+              style={{
+                flex: '1 1 0', minWidth: 76, padding: '7px 10px', fontSize: 12.5,
+                fontWeight: on ? 700 : 500, borderRadius: 'var(--radius-sm)',
+                border: on ? '1.5px solid var(--accent)' : '1px solid var(--border)',
+                background: on ? 'var(--accent-dim, rgba(10,132,255,0.14))' : 'var(--bg-elevated)',
+                color: on ? 'var(--accent)' : 'var(--text-secondary)',
+                cursor: (!writable || saving) ? 'default' : 'pointer',
+                opacity: (!writable || saving) ? 0.6 : 1,
+              }}
+            >
+              {l.label}
+            </button>
+          );
+        })}
+      </div>
+      {active === null && cfg.speed_profile && (
+        <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 6 }}>
+          Custom pairing active (speed: {cfg.speed_profile}, captions: {cfg.whisper_quality}).
+          Picking a level above resets both together.
+        </div>
+      )}
+      <label style={{
+        display: 'flex', alignItems: 'center', gap: 8, marginTop: 10,
+        fontSize: 12, color: 'var(--text-secondary)',
+        opacity: writable ? 1 : 0.6,
+      }}>
+        <span style={{ whiteSpace: 'nowrap' }}>Caption quality only</span>
+        <select
+          value={cfg.whisper_quality || 'auto'}
+          disabled={!writable || saving}
+          onChange={(e) => post(
+            { whisper_quality: e.target.value },
+            `Caption quality set to ${e.target.value}`)}
+          style={{
+            flex: 1, maxWidth: 240, height: 30, borderRadius: 'var(--radius-sm)',
+            background: 'var(--bg-elevated)', color: 'var(--text-primary)',
+            border: '1px solid var(--border)', fontSize: 12, padding: '0 6px',
+          }}
+        >
+          {COMPANION_CAPTION_QUALITIES.map((q) => (
+            <option key={q.value} value={q.value}>{q.label}</option>
+          ))}
+        </select>
+      </label>
+      <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 6, lineHeight: 1.5 }}>
+        Changes take effect on the next transcription — the Companion restarts its
+        Whisper engine (and Ollama, for speed changes) automatically.
+      </div>
+    </div>
+  );
+}
+
 export default function Settings() {
   const { isMobile } = useResponsive();
   const [searchParams] = useSearchParams();
@@ -2000,6 +2157,7 @@ export default function Settings() {
 
             {/* Remote VRAM control: auto-allocate + manual budget on the Companion */}
             {statuses._active?.companion && <CompanionVramCard showToast={showToast} />}
+            {statuses._active?.companion && <CompanionQualityCard showToast={showToast} />}
 
             {/* Cloud fallback for subtitle polish — none / auto / pinned model */}
             <PolishFallbackCard isMobile={isMobile} />

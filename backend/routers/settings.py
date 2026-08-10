@@ -2753,6 +2753,101 @@ async def set_companion_vram(req: CompanionVramRequest):
         return {"ok": False, "error": f"Couldn't reach the Companion: {e}"}
 
 
+# The paired Companion exposes GET/POST /v1/config/quality (v0.11.9+): the
+# desktop app's "Performance" control — the Ollama speed profile (pipeline
+# parallelism) and the Whisper transcription quality (beam search + model) —
+# mirrored over the LAN so the user can drive it from ClipAI's Settings
+# without walking to the GPU PC.
+
+_COMPANION_SPEED_PROFILES = {"auto", "eco", "balanced", "turbo"}
+_COMPANION_WHISPER_QUALITIES = {"auto", "fast", "balanced", "max"}
+
+
+class CompanionQualityRequest(BaseModel):
+    speed_profile: str | None = None
+    whisper_quality: str | None = None
+
+
+@router.get("/providers/companion/quality")
+async def get_companion_quality():
+    """Current performance/quality settings on the paired Companion (speed
+    profile + whisper quality + what they resolve to on that GPU), for
+    ClipAI's remote control. Falls back to /v1/health (read-only) for an
+    older Companion that lacks the dedicated config route."""
+    from backend.services import ollama_registry as oreg
+    h = oreg.companion_host()
+    if h is None:
+        return {"ok": False, "error": "No GPU Companion is paired."}
+    base = oreg.companion_base(h)
+    try:
+        async with httpx.AsyncClient(timeout=6.0) as c:
+            r = await c.get(oreg.join_url(base, "/v1/config/quality"),
+                            headers=oreg.auth_headers(h))
+            if r.status_code == 200:
+                return {"ok": True, "companion": getattr(h, "name", ""), "writable": True, **r.json()}
+            if r.status_code == 404:
+                rh = await c.get(oreg.join_url(base, "/v1/health"), headers=oreg.auth_headers(h))
+                if rh.status_code == 200:
+                    j = rh.json()
+                    return {
+                        "ok": True, "companion": getattr(h, "name", ""), "writable": False,
+                        "speed_profile": j.get("speed_profile"),
+                        "whisper_quality": j.get("whisper_quality"),
+                        "num_parallel": j.get("num_parallel"),
+                        "max_loaded_models": j.get("max_loaded_models"),
+                        "effective_budget_gb": j.get("vram_budget_gb"),
+                        "whisper_effective": {
+                            "model": j.get("whisper_model_effective"),
+                            "beam_size": j.get("whisper_beam_size"),
+                            "beam_search": (j.get("whisper_beam_size") or 0) > 1,
+                        },
+                        "note": "Update the GPU Companion app to change quality remotely.",
+                    }
+            return {"ok": False, "error": f"Companion returned HTTP {r.status_code}."}
+    except Exception as e:
+        return {"ok": False, "error": f"Couldn't reach the Companion: {e}"}
+
+
+@router.post("/providers/companion/quality")
+async def set_companion_quality(req: CompanionQualityRequest):
+    """Remotely set the Companion's speed profile / transcription quality.
+    The Companion applies them exactly like its local GUI (Ollama restart on
+    a speed change, whisper sidecar drop on a quality change) and returns the
+    fresh effective decode so the UI can show what actually engaged."""
+    from backend.services import ollama_registry as oreg
+    h = oreg.companion_host()
+    if h is None:
+        return {"ok": False, "error": "No GPU Companion is paired."}
+    payload: dict = {}
+    if req.speed_profile is not None:
+        v = req.speed_profile.strip().lower()
+        if v not in _COMPANION_SPEED_PROFILES:
+            return {"ok": False, "error": f"Invalid speed profile {v!r} "
+                    f"(one of: {', '.join(sorted(_COMPANION_SPEED_PROFILES))})."}
+        payload["speed_profile"] = v
+    if req.whisper_quality is not None:
+        v = req.whisper_quality.strip().lower()
+        if v not in _COMPANION_WHISPER_QUALITIES:
+            return {"ok": False, "error": f"Invalid whisper quality {v!r} "
+                    f"(one of: {', '.join(sorted(_COMPANION_WHISPER_QUALITIES))})."}
+        payload["whisper_quality"] = v
+    if not payload:
+        return {"ok": False, "error": "Nothing to change."}
+    base = oreg.companion_base(h)
+    try:
+        async with httpx.AsyncClient(timeout=25.0) as c:
+            r = await c.post(oreg.join_url(base, "/v1/config/quality"),
+                             headers=oreg.auth_headers(h), json=payload)
+            if r.status_code == 200:
+                return {"ok": True, "companion": getattr(h, "name", ""), **r.json()}
+            if r.status_code == 404:
+                return {"ok": False, "error": "This GPU Companion is too old to set "
+                        "quality remotely — update the Companion app."}
+            return {"ok": False, "error": f"Companion returned HTTP {r.status_code}."}
+    except Exception as e:
+        return {"ok": False, "error": f"Couldn't reach the Companion: {e}"}
+
+
 @router.post("/providers/ollama/pull")
 async def pull_ollama_models(req: PullOllamaRequest | None = None):
     """Kick off a background pull of one or more Ollama models.

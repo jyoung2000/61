@@ -1,3 +1,46 @@
+# ClipAI — Companion 0.11.9: remote performance & caption-quality control
+
+The GPU Companion's "Performance" knob — the one control on its desktop GUI
+that sets the Ollama speed profile (pipeline parallelism) AND the Whisper
+transcription quality (beam search + model) together — can now be driven from
+ClipAI's Settings, so the user never has to walk to the GPU PC to change it.
+
+- **Companion (v0.11.9):** new authed `GET/POST /v1/config/quality` proxy
+  route, mirroring `/v1/config/vram`. GET returns the two config fields plus
+  what they RESOLVE to on that GPU right now (effective whisper model, beam
+  size, parallelism, budget). POST validates against the same allow-lists as
+  the local GUI (`auto|eco|balanced|turbo`, `auto|fast|balanced|max`) —
+  invalid remote values 400 loudly instead of the local path's silent ignore,
+  and validation happens before anything applies so a bad field can't
+  half-apply. Side effects match the local GUI exactly: a speed change
+  restarts the managed Ollama (new NUM_PARALLEL / MAX_LOADED), a quality
+  change drops the whisper sidecar so the next transcription starts with the
+  new decode.
+- **ClipAI backend:** `GET/POST /api/providers/companion/quality` proxies it,
+  with value validation before anything leaves the container, a read-only
+  `/v1/health` fallback for pre-0.11.9 Companions ("update the app to change
+  quality remotely"), and the usual paired/unreachable error shapes.
+- **Settings UI:** a "Companion performance & caption quality" card next to
+  the VRAM card in the GPU Companion section — the same four levels as the
+  desktop GUI (Auto / Eco / Balanced / Turbo, with the same caption-accuracy
+  hover hints), a live "2× parallel · large-v3 beam 5" effective line, a
+  caption-quality-only override select, and a custom-pairing notice when the
+  two fields don't match a level. Hidden when no Companion is connected;
+  read-only with an update notice for old Companions.
+- Version discipline: 0.11.9 across Cargo.toml/lock, tauri.conf.json,
+  package.json(+lock), RELEASE (fires the installer release workflow), and
+  `EXPECTED_COMPANION_VERSION` (so ClipAI's version handshake nudges stale
+  installs to update).
+- Verified: `cargo check` clean and the proxy e2e suite green with a new
+  section covering the quality route (401 unauthed, defaults read, normalized
+  write landing in persisted config, whisper-only change not restarting
+  Ollama, invalid profile 400 with no half-apply, works while sharing is
+  paused); 9 new backend proxy tests (passthrough, health fallback,
+  normalization, validation-before-send, 404→update message, no-companion);
+  version-sync suite green on 0.11.9; frontend build + full suite 154 passed.
+
+---
+
 # ClipAI — Update flow: survive a full Docker vDisk
 
 The very next deploy attempt died before the build even started:
