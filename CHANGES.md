@@ -1,3 +1,31 @@
+# ClipAI — Update flow: recover from BuildKit cache corruption
+
+The deploy after the disk-full episode failed differently: `failed to compute
+cache key: failed to calculate checksum of ref …: "/backend": not found` —
+for a directory that plainly exists. That's the classic aftermath of the
+earlier ENOSPC crash: the Docker daemon died mid-write to BuildKit's metadata
+db, leaving a corrupted cached context snapshot that every later build trips
+over. `update-all.sh` now:
+
+- **Classifies recoverable build failures** beyond ENOSPC: "failed to compute
+  cache key", "failed to calculate checksum", containerdmeta.db errors, and
+  missing-snapshot errors all trigger the same self-heal — purge the build
+  cache (`reclaim_hard`) and retry the build ONCE on clean state. The failure
+  headline says which case it was, and the second-failure message gives the
+  matching manual fix (grow the vDisk vs restart the Docker service).
+- **The Companion cross-build retry** gets the same tee + classify + reclaim
+  + one-more-try treatment.
+- **Checkout sanity check** after `git reset`: if backend/, frontend/,
+  companion/, Dockerfile.gpu or docker-compose.yml is missing (a reset
+  interrupted by an earlier disk/FS problem can leave a tree that LOOKS reset
+  but isn't), abort immediately with the repair command instead of letting
+  docker report a baffling `"/backend": not found`.
+- Verified with the stubbed dry-run harness: corrupted-cache signature →
+  headline names corruption → `builder prune -af` → retry → successful
+  deploy; and an incomplete checkout aborting before any build attempt.
+
+---
+
 # ClipAI — Companion 0.11.9: remote performance & caption-quality control
 
 The GPU Companion's "Performance" knob — the one control on its desktop GUI

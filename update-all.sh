@@ -107,6 +107,16 @@ for _i in 1 2 3 4; do
 done
 [ -z "$_fetched" ] && { log "git fetch FAILED after 4 tries — check the network"; exit 1; }
 git reset --hard "origin/$BRANCH"     || { log "git reset FAILED"; exit 1; }
+# Checkout sanity: a reset interrupted by an earlier disk/FS problem can leave
+# a tree that LOOKS reset but is missing directories — and the docker build
+# then dies with a baffling '"/backend": not found'. Catch that here instead.
+for _must in backend frontend companion Dockerfile.gpu docker-compose.yml; do
+  if [ ! -e "$_must" ]; then
+    log "checkout is INCOMPLETE — '$_must' is missing after git reset."
+    log "  Repair with: git status && git reset --hard origin/$BRANCH  — then re-run: bash update-all.sh"
+    exit 1
+  fi
+done
 export BUILD_SHA="$(git rev-parse --short HEAD)"
 export BUILD_SUBJECT="$(git log -1 --pretty=%s)"
 # Monotonic Companion build number: the repo's commit count. The builder
@@ -121,9 +131,18 @@ log "commit $BUILD_SHA — building container + Companion v$EXPECTED (from sourc
 
 ensure_docker_space || { log "ABORTING before the build — free docker disk first (see above), then re-run: bash update-all.sh"; exit 1; }
 
-# Build with the output tee'd so an ENOSPC failure is detectable: when the
-# disk fills DURING the build (preflight passed but the new layers outgrew
-# it), reclaim hard and retry ONCE instead of leaving the box on old code.
+# Build with the output tee'd so RECOVERABLE docker failures are detectable:
+#   - ENOSPC mid-build (preflight passed but the new layers outgrew the disk);
+#   - corrupted BuildKit state, the classic AFTERMATH of an earlier disk-full
+#     crash (the daemon died mid-write to its metadata db). Symptom: the build
+#     dies with "failed to compute cache key: failed to calculate checksum of
+#     ref …: '/backend': not found" for a path that plainly exists — a broken
+#     cached context snapshot, not a missing directory.
+# Both are cured the same way: purge the build cache (reclaim_hard) and retry
+# ONCE, instead of leaving the box on old code.
+_recoverable_build_failure(){  # $1 = build log file
+  grep -qiE "no space left on device|failed to compute cache key|failed to calculate checksum|containerdmeta\.db|snapshot [^ ]+ does not exist" "$1"
+}
 BUILD_LOG="$(mktemp /tmp/clipai-build.XXXXXX)"
 run_app_build(){
   $DC build $NOCACHE --build-arg COMPANION_BUILD_FROM_SOURCE=1 \
@@ -132,14 +151,19 @@ run_app_build(){
 }
 ( while :; do sleep 60; log "…still building ($(( ($(date +%s)-START)/60 ))m elapsed)"; done ) & HB=$!
 if ! run_app_build; then
-  if grep -qi "no space left on device" "$BUILD_LOG"; then
-    log "BUILD FAILED: docker ran OUT OF DISK mid-build."
+  if _recoverable_build_failure "$BUILD_LOG"; then
+    if grep -qi "no space left on device" "$BUILD_LOG"; then
+      log "BUILD FAILED: docker ran OUT OF DISK mid-build."
+    else
+      log "BUILD FAILED: docker's BuildKit state looks CORRUPTED (an earlier disk-full crash damaged its cache — 'failed to compute cache key' on a path that exists)."
+    fi
     reclaim_hard
-    log "retrying the build once on the freed disk (uncached parts rebuild from scratch)…"
+    log "retrying the build once on the cleaned state (uncached parts rebuild from scratch)…"
     if ! run_app_build; then
       kill "$HB" 2>/dev/null || true; rm -f "$BUILD_LOG"
-      log "BUILD FAILED AGAIN — the Docker vDisk is genuinely too small for the ClipAI image."
-      log "  Unraid: Settings -> Docker -> stop the service -> increase the vDisk size, then re-run: bash update-all.sh"
+      log "BUILD FAILED AGAIN."
+      log "  Still 'no space left on device'? The Docker vDisk is genuinely too small — Unraid: Settings -> Docker -> stop the service -> increase the vDisk size."
+      log "  Still 'failed to compute cache key' / checksum errors? Docker's state db is damaged — restart the Docker service (Unraid: Settings -> Docker -> Enable Docker: No, Apply, then Yes) and re-run: bash update-all.sh"
       exit 1
     fi
   else
@@ -211,19 +235,32 @@ if [ -z "$EXE" ] || ! _has_expected; then
   fi
   ensure_docker_space || log "…continuing the Companion retry anyway — it may fail on disk space (see above)."
   log "retrying the Companion cross-build directly (cache-busted; streams the real build log; 10-30 min cold, minutes when the caches are warm)…"
+  COMP_LOG="$(mktemp /tmp/clipai-companion-build.XXXXXX)"
+  run_companion_build(){
+    DOCKER_BUILDKIT=1 docker build --target companion-artifacts \
+        --build-arg COMPANION_BUILD_FROM_SOURCE=1 \
+        --build-arg COMPANION_BUILD_NUMBER="$BUILD_NUM" \
+        --build-arg BUILD_SHA="$BUILD_SHA" \
+        --build-arg COMPANION_REBUILD="$(date +%s)" \
+        -f Dockerfile.gpu -o ./data/companion-cache . 2>&1 | tee "$COMP_LOG"
+    return "${PIPESTATUS[0]}"
+  }
   ( while :; do sleep 60; log "…still cross-building the Companion ($(( ($(date +%s)-START)/60 ))m elapsed)"; done ) & HB2=$!
-  if DOCKER_BUILDKIT=1 docker build --target companion-artifacts \
-      --build-arg COMPANION_BUILD_FROM_SOURCE=1 \
-      --build-arg COMPANION_BUILD_NUMBER="$BUILD_NUM" \
-      --build-arg BUILD_SHA="$BUILD_SHA" \
-      --build-arg COMPANION_REBUILD="$(date +%s)" \
-      -f Dockerfile.gpu -o ./data/companion-cache .; then
-    kill "$HB2" 2>/dev/null || true
+  if run_companion_build; then
     log "companion retry build finished — status: $(cat ./data/companion-cache/BUILD_STATUS 2>/dev/null || echo unknown)"
+  elif _recoverable_build_failure "$COMP_LOG"; then
+    log "companion retry hit a recoverable docker failure (disk / corrupted build cache) — reclaiming and trying once more…"
+    reclaim_hard
+    if run_companion_build; then
+      log "companion retry build finished — status: $(cat ./data/companion-cache/BUILD_STATUS 2>/dev/null || echo unknown)"
+    else
+      log "companion retry build FAILED — the real error is in the log above; if it still says 'failed to compute cache key', restart the Docker service and re-run."
+    fi
   else
-    kill "$HB2" 2>/dev/null || true
     log "companion retry build FAILED — the real error is in the log above (it needs outbound internet for the MSVC SDK on a cold cache)."
   fi
+  kill "$HB2" 2>/dev/null || true
+  rm -f "$COMP_LOG"
 fi
 
 log "===== DONE — container @ $BUILD_SHA ====="
