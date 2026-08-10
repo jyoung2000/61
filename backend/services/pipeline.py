@@ -8174,6 +8174,17 @@ async def _run_analysis_inner(job_id: str, resume: bool = False):
     _pp_early_task = None
     _chain_early = None
     if _early_chain_task is not None:
+        if not _early_chain_task.done():
+            # The overlapped chain outlived the face loop (it can only START
+            # once Whisper delivers, and a max-quality decode lands late) —
+            # without this the heartbeat keeps narrating the PREVIOUS stage
+            # ("reframe repair", which actually took ~1 min) for however many
+            # minutes the polish still needs. Say what is really running.
+            await _update_progress(
+                job_id, JobStatus.ANALYZING_SCENES, 60,
+                "Finishing the overlapped transcript work (polish/translation)...",
+                heartbeat_label="transcript polish",
+            )
         try:
             _chain_early = await _early_chain_task
         except Exception as _ec_err:

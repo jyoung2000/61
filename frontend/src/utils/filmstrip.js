@@ -50,6 +50,36 @@ export const FILMSTRIP_UPDATED_EVENT = 'clipai:filmstrip-updated';
 
 const _MAX_CACHE = 600;           // keep the cache bounded
 
+// Black-tile self-heal: how many consecutive near-black reads of the same
+// tile we re-try (without caching) before accepting the frame really is dark.
+const _BLACK_RETRY = new Map();   // key -> consecutive near-black count
+const _BLACK_RETRY_MAX = 3;
+
+// Reusable probe canvas — sampling a bitmap down to a few pixels is enough
+// to tell "capture failed / undecoded region" (uniform black) from a real
+// frame; done at 8x8 it costs microseconds per tile.
+let _probeCtx = null;
+function _isNearBlack(bitmap, w, h) {
+  try {
+    if (!_probeCtx) {
+      const c = typeof OffscreenCanvas !== 'undefined'
+        ? new OffscreenCanvas(8, 8)
+        : Object.assign(document.createElement('canvas'), { width: 8, height: 8 });
+      _probeCtx = c.getContext('2d', { willReadFrequently: true });
+    }
+    if (!_probeCtx) return false;
+    _probeCtx.drawImage(bitmap, 0, 0, w || bitmap.width, h || bitmap.height, 0, 0, 8, 8);
+    const d = _probeCtx.getImageData(0, 0, 8, 8).data;
+    let sum = 0;
+    for (let i = 0; i < d.length; i += 4) {
+      sum += (d[i] + d[i + 1] + d[i + 2]) / 3;
+    }
+    return (sum / 64) < 10;        // mean luma < 10/255 ≈ pure black
+  } catch {
+    return false;                  // probe failure must never block caching
+  }
+}
+
 function _key(src, t, w, h) {
   return `${src}|${t.toFixed(2)}|${w}x${h}`;
 }
@@ -438,6 +468,23 @@ export function ensureThumbnail(src, t, w, h, opts) {
     })
     .then((bitmap) => {
       _PENDING.delete(key);
+      // Never LATCH a black tile. Captures taken while the editor is open
+      // during analysis can be black through no fault of the frame — the
+      // browser-preview transcode is still being built, a seek landed on an
+      // unbuffered region, or the sprite pass raced the face loop for the
+      // decoder. Caching those permanently painted long black runs on the
+      // timeline that survived the real thumbnails becoming available.
+      // Return the bitmap for THIS draw, but skip the cache so the next
+      // redraw re-captures; after a few consistent black reads accept it —
+      // genuinely dark scenes (fades, night shots) do exist.
+      if (_isNearBlack(bitmap, w, h)) {
+        const misses = (_BLACK_RETRY.get(key) || 0) + 1;
+        if (misses <= _BLACK_RETRY_MAX) {
+          _BLACK_RETRY.set(key, misses);
+          return bitmap;               // shown now, re-tried on a later draw
+        }
+      }
+      _BLACK_RETRY.delete(key);
       _CACHE.set(key, bitmap);
       if (_CACHE.size > _MAX_CACHE) {
         // Evict the oldest entry — Map preserves insertion order.
