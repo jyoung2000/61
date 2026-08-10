@@ -43,6 +43,43 @@ BRANCH="${1:-${CLIPAI_UPDATE_BRANCH:-$DEFAULT_BRANCH}}"
 START=$(date +%s)
 log(){ local t=$(( $(date +%s) - START )); printf '\n[all] %02d:%02d %s\n' $((t/60)) $((t%60)) "$*"; }
 
+# ── Single-instance lock ────────────────────────────────────────────────────
+# Two updates at once DEADLOCK. The companion-builder stage mounts its apt
+# caches with `sharing=locked`, so a second build waiting on that mount blocks
+# FOREVER, silently — and both runs write to the same log, so the output looks
+# like one confused stream. A real box accumulated FOUR concurrent runs (09:06,
+# 08:51, 06:28, 06:19); two of them wedged each other for over two hours while
+# the heartbeat cheerfully printed "still building". Refuse to be the second.
+LOCK_FILE="${CLIPAI_LOCK_FILE:-/tmp/clipai-update.lock}"
+_lock_refused(){                     # $1 = holder pid (may be empty)
+  log "ANOTHER UPDATE IS ALREADY RUNNING (pid ${1:-unknown}) — refusing to start a second one."
+  log "  Concurrent builds deadlock on Docker's 'sharing=locked' cache mounts: the second"
+  log "  one waits forever with no output, and both write to this same log."
+  log "  Watch the running one:  tail -F /mnt/user/appdata/clipai-update.log"
+  log "  Or stop it and re-run:  kill ${1:-<pid>}"
+  exit 1
+}
+if command -v flock >/dev/null 2>&1; then
+  # `9<>` opens read-write WITHOUT truncating. Using `9>` here would blank the
+  # file — destroying the holder's pid before we even read it, so the refusal
+  # message could only say "pid unknown" (which is the one fact you need to
+  # decide what to kill).
+  exec 9<>"$LOCK_FILE" || true
+  if ! flock -n 9; then _lock_refused "$(tr -d '[:space:]' < "$LOCK_FILE" 2>/dev/null)"; fi
+  printf '%s\n' "$$" > "$LOCK_FILE"  # safe to rewrite: we hold the lock
+                                     # (released automatically when this shell exits)
+else
+  # No flock: PID file with a liveness check (a crashed run leaves a stale file,
+  # which must NOT block the next update forever).
+  if [ -f "$LOCK_FILE" ]; then
+    _holder="$(tr -d '[:space:]' < "$LOCK_FILE" 2>/dev/null)"
+    if [ -n "$_holder" ] && kill -0 "$_holder" 2>/dev/null; then _lock_refused "$_holder"; fi
+    log "clearing a stale lock from pid ${_holder:-unknown} (no longer running)"
+  fi
+  printf '%s\n' "$$" > "$LOCK_FILE"
+  trap 'rm -f "$LOCK_FILE"' EXIT
+fi
+
 if docker compose version >/dev/null 2>&1; then DC="docker compose"; else DC="docker-compose"; fi
 export DOCKER_BUILDKIT=1 COMPOSE_DOCKER_CLI_BUILD=1
 # Clean-rebuild escape hatch: CLIPAI_NOCACHE=1 forces --no-cache so a suspected

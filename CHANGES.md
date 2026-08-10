@@ -1,3 +1,36 @@
+# ClipAI — Update flow: refuse concurrent runs (the real cause of the 2h hang)
+
+`ps` on the deployment box showed **four** live `update-all.sh` runs (09:06,
+08:51, 06:28, 06:19). That is the actual root cause of the "two-hour stall"
+previously blamed on a slow CDN: the companion-builder stage mounts its apt
+caches with `sharing=locked`, so a second concurrent build **blocks forever,
+silently**, waiting for a mount the first one holds. All four also wrote to
+the same log file, which is why the output read as one incoherent stream and
+why a stale run's old-format heartbeat appeared inside a fresh run's log.
+
+- **Single-instance lock.** `update-all.sh` now takes an exclusive `flock`
+  (`/tmp/clipai-update.lock`, override with `CLIPAI_LOCK_FILE`) and refuses to
+  start when another update holds it, naming the holder's PID so you know
+  exactly what to kill. The lock is released automatically on exit — including
+  a crash — because it lives on an open fd, not a file that has to be cleaned
+  up. Where `flock` is unavailable it falls back to a PID file with a liveness
+  check, so a crashed run leaves a stale lock that the next update clears
+  instead of being blocked by it forever.
+- Subtle bug caught while testing: opening the lock with `9>` truncates the
+  file, blanking the holder's PID before it can be read — the refusal could
+  only ever say "pid unknown", which is the single fact the operator needs.
+  Now opened `9<>` (no truncate) and rewritten only after the lock is held.
+- The pip timeout change (60 × 5) and the stall watchdog from the previous
+  entry both stand — 300 × 10 was a genuine latent hazard, and the watchdog
+  would have caught this deadlock too (15 min of silence → kill → retry)
+  instead of letting it run for two hours. They were just not the root cause.
+- Verified: a second run while one holds the lock is refused with exit 1 and
+  the holder's real PID; the lock frees once the holder exits; the no-flock
+  fallback clears a dead holder's stale lock but still refuses a live one; and
+  a full end-to-end dry run is unaffected by the lock.
+
+---
+
 # ClipAI — Update flow: detect a stalled build instead of waiting forever
 
 A deploy sat for **two hours** on a hung torch-wheel download while the
