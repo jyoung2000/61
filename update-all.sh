@@ -143,15 +143,101 @@ ensure_docker_space || { log "ABORTING before the build — free docker disk fir
 _recoverable_build_failure(){  # $1 = build log file
   grep -qiE "no space left on device|failed to compute cache key|failed to calculate checksum|containerdmeta\.db|snapshot [^ ]+ does not exist" "$1"
 }
+
+# ── Watched build runner (stall detection) ──────────────────────────────────
+# BuildKit is silent for minutes at a time during big downloads, so "no output"
+# alone doesn't mean stuck. But a build whose log hasn't grown in STALL_MIN
+# minutes IS hung, and the old heartbeat could not tell the difference: a real
+# deploy sat for TWO HOURS on a stalled torch-wheel read while printing
+# "…still building" every minute. (Root cause: PIP_DEFAULT_TIMEOUT=300 ×
+# PIP_RETRIES=10 = up to 50 min of silence per stalled file; now lowered.)
+#
+# run_watched streams the command's output into the update log (so you still
+# see everything live), reports a heartbeat that names the LAST line and how
+# long it's been quiet, and kills a build that goes silent past the threshold.
+# Returns: 0 ok · 1 failed · 2 stalled-and-killed.
+STALL_MIN="${CLIPAI_STALL_MIN:-15}"
 BUILD_LOG="$(mktemp /tmp/clipai-build.XXXXXX)"
-run_app_build(){
-  $DC build $NOCACHE --build-arg COMPANION_BUILD_FROM_SOURCE=1 \
-      --build-arg COMPANION_BUILD_NUMBER="$BUILD_NUM" app 2>&1 | tee "$BUILD_LOG"
-  return "${PIPESTATUS[0]}"
+BUILD_RC="$(mktemp /tmp/clipai-build-rc.XXXXXX)"
+
+# Kill a stalled build AND everything it spawned. Killing only the direct
+# child leaves orphans (the docker client's own children), and an orphaned
+# client can hold a BuildKit session open that then collides with the retry.
+# Walks the descendant tree depth-first via `pgrep -P` and signals children
+# before parents, so nothing is reparented out of reach mid-kill. Deliberately
+# NOT a process-group kill: resolving the group is unreliable here, and
+# getting it wrong kills this very script.
+_kill_descendants(){                 # $1 = pid, $2 = signal
+  local pid="$1" sig="$2" child
+  for child in $(pgrep -P "$pid" 2>/dev/null); do
+    _kill_descendants "$child" "$sig"
+  done
+  kill -"$sig" "$pid" 2>/dev/null || true
 }
-( while :; do sleep 60; log "…still building ($(( ($(date +%s)-START)/60 ))m elapsed)"; done ) & HB=$!
-if ! run_app_build; then
-  if _recoverable_build_failure "$BUILD_LOG"; then
+_kill_tree(){                        # $1 = pid — polite, then final
+  _kill_descendants "$1" TERM
+  sleep 3
+  _kill_descendants "$1" KILL
+}
+
+run_watched(){                       # "$@" = command to run
+  : > "$BUILD_LOG"; : > "$BUILD_RC"
+  ( "$@" > "$BUILD_LOG" 2>&1; echo $? > "$BUILD_RC" ) &
+  local pid=$! tailpid last_size=0 last_change now size quiet hb
+  tail -n +1 -f "$BUILD_LOG" 2>/dev/null & tailpid=$!
+  last_change=$(date +%s); hb=$(date +%s)
+  while kill -0 "$pid" 2>/dev/null; do
+    sleep 15
+    size="$(stat -c %s "$BUILD_LOG" 2>/dev/null || echo 0)"
+    now="$(date +%s)"
+    if [ "$size" != "$last_size" ]; then last_size="$size"; last_change="$now"; fi
+    quiet=$(( (now - last_change) / 60 ))
+    if [ $(( now - hb )) -ge 60 ]; then
+      hb="$now"
+      # Name what it is actually doing — a bare "still building" taught us nothing.
+      local tailline
+      tailline="$(grep -v '^[[:space:]]*$' "$BUILD_LOG" 2>/dev/null | tail -1 | cut -c1-110)"
+      if [ "$quiet" -ge 3 ]; then
+        log "…building ($(( (now-START)/60 ))m elapsed) — NO output for ${quiet}m (kills at ${STALL_MIN}m) — last: ${tailline:-<none>}"
+      else
+        log "…building ($(( (now-START)/60 ))m elapsed) — last: ${tailline:-<none>}"
+      fi
+    fi
+    if [ "$quiet" -ge "$STALL_MIN" ]; then
+      log "STALLED — no build output for ${quiet}m. Killing it (a hung download, not slow progress)."
+      _kill_tree "$pid"
+      kill "$tailpid" 2>/dev/null || true
+      return 2
+    fi
+  done
+  wait "$pid" 2>/dev/null || true
+  sleep 1                              # let tail flush the final lines
+  kill "$tailpid" 2>/dev/null || true
+  return "$(cat "$BUILD_RC" 2>/dev/null || echo 1)"
+}
+
+# Build, retrying ONCE on anything recoverable: a stall (kill + retry with the
+# caches warm, which is what actually clears a wedged CDN connection), an
+# ENOSPC, or corrupted BuildKit state (purge the cache first).
+build_attempt=1
+while :; do
+  rc=0
+  run_watched $DC build $NOCACHE --build-arg COMPANION_BUILD_FROM_SOURCE=1 \
+      --build-arg COMPANION_BUILD_NUMBER="$BUILD_NUM" app || rc=$?
+  [ "$rc" = 0 ] && break
+
+  if [ "$build_attempt" -ge 2 ]; then
+    rm -f "$BUILD_LOG" "$BUILD_RC"
+    log "BUILD FAILED AGAIN (attempt $build_attempt)."
+    log "  Stalled twice? The box can't hold a stable connection to the CDNs (pypi / download.pytorch.org / crates.io). Check the network, then re-run: bash update-all.sh"
+    log "  Still 'no space left on device'? The Docker vDisk is genuinely too small — Unraid: Settings -> Docker -> stop the service -> increase the vDisk size."
+    log "  Still 'failed to compute cache key' / checksum errors? Docker's state db is damaged — restart the Docker service (Unraid: Settings -> Docker -> Enable Docker: No, Apply, then Yes) and re-run."
+    exit 1
+  fi
+
+  if [ "$rc" = 2 ]; then
+    log "retrying the build once — completed layers are cached, so it resumes rather than starting over…"
+  elif _recoverable_build_failure "$BUILD_LOG"; then
     if grep -qi "no space left on device" "$BUILD_LOG"; then
       log "BUILD FAILED: docker ran OUT OF DISK mid-build."
     else
@@ -159,21 +245,14 @@ if ! run_app_build; then
     fi
     reclaim_hard
     log "retrying the build once on the cleaned state (uncached parts rebuild from scratch)…"
-    if ! run_app_build; then
-      kill "$HB" 2>/dev/null || true; rm -f "$BUILD_LOG"
-      log "BUILD FAILED AGAIN."
-      log "  Still 'no space left on device'? The Docker vDisk is genuinely too small — Unraid: Settings -> Docker -> stop the service -> increase the vDisk size."
-      log "  Still 'failed to compute cache key' / checksum errors? Docker's state db is damaged — restart the Docker service (Unraid: Settings -> Docker -> Enable Docker: No, Apply, then Yes) and re-run: bash update-all.sh"
-      exit 1
-    fi
   else
-    kill "$HB" 2>/dev/null || true; rm -f "$BUILD_LOG"
+    rm -f "$BUILD_LOG" "$BUILD_RC"
     log "BUILD FAILED — error is above (the Companion cross-build needs outbound internet)"
     exit 1
   fi
-fi
-kill "$HB" 2>/dev/null || true
-rm -f "$BUILD_LOG"
+  build_attempt=$((build_attempt + 1))
+done
+rm -f "$BUILD_RC"
 log "build complete."
 
 log "restarting ClipAI (Ollama + models stay up)…"
@@ -235,33 +314,34 @@ if [ -z "$EXE" ] || ! _has_expected; then
   fi
   ensure_docker_space || log "…continuing the Companion retry anyway — it may fail on disk space (see above)."
   log "retrying the Companion cross-build directly (cache-busted; streams the real build log; 10-30 min cold, minutes when the caches are warm)…"
-  COMP_LOG="$(mktemp /tmp/clipai-companion-build.XXXXXX)"
-  run_companion_build(){
-    DOCKER_BUILDKIT=1 docker build --target companion-artifacts \
+  run_companion_build(){             # same watchdog: stalls are killed, not waited on
+    run_watched docker build --target companion-artifacts \
         --build-arg COMPANION_BUILD_FROM_SOURCE=1 \
         --build-arg COMPANION_BUILD_NUMBER="$BUILD_NUM" \
         --build-arg BUILD_SHA="$BUILD_SHA" \
         --build-arg COMPANION_REBUILD="$(date +%s)" \
-        -f Dockerfile.gpu -o ./data/companion-cache . 2>&1 | tee "$COMP_LOG"
-    return "${PIPESTATUS[0]}"
+        -f Dockerfile.gpu -o ./data/companion-cache .
   }
-  ( while :; do sleep 60; log "…still cross-building the Companion ($(( ($(date +%s)-START)/60 ))m elapsed)"; done ) & HB2=$!
-  if run_companion_build; then
-    log "companion retry build finished — status: $(cat ./data/companion-cache/BUILD_STATUS 2>/dev/null || echo unknown)"
-  elif _recoverable_build_failure "$COMP_LOG"; then
-    log "companion retry hit a recoverable docker failure (disk / corrupted build cache) — reclaiming and trying once more…"
-    reclaim_hard
-    if run_companion_build; then
-      log "companion retry build finished — status: $(cat ./data/companion-cache/BUILD_STATUS 2>/dev/null || echo unknown)"
+  comp_rc=0; run_companion_build || comp_rc=$?
+  if [ "$comp_rc" != 0 ]; then
+    if [ "$comp_rc" = 2 ]; then
+      log "companion retry STALLED and was killed — trying once more (caches stay warm)…"
+    elif _recoverable_build_failure "$BUILD_LOG"; then
+      log "companion retry hit a recoverable docker failure (disk / corrupted build cache) — reclaiming and trying once more…"
+      reclaim_hard
     else
-      log "companion retry build FAILED — the real error is in the log above; if it still says 'failed to compute cache key', restart the Docker service and re-run."
+      log "companion retry build FAILED — the real error is in the log above (it needs outbound internet for the MSVC SDK on a cold cache)."
+      comp_rc=99                     # unrecoverable: don't burn another 30 min
     fi
-  else
-    log "companion retry build FAILED — the real error is in the log above (it needs outbound internet for the MSVC SDK on a cold cache)."
+    [ "$comp_rc" != 99 ] && { comp_rc=0; run_companion_build || comp_rc=$?; }
   fi
-  kill "$HB2" 2>/dev/null || true
-  rm -f "$COMP_LOG"
+  if [ "$comp_rc" = 0 ]; then
+    log "companion retry build finished — status: $(cat ./data/companion-cache/BUILD_STATUS 2>/dev/null || echo unknown)"
+  else
+    log "companion retry build did not produce an installer — see the log above."
+  fi
 fi
+rm -f "$BUILD_LOG"
 
 log "===== DONE — container @ $BUILD_SHA ====="
 SERVED="$(ls -t ./data/companion-cache/*.exe 2>/dev/null | head -1)"

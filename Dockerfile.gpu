@@ -163,8 +163,15 @@ ENV DEBIAN_FRONTEND=noninteractive
 # multi-hundred-MB nvidia-*-cu12 wheels (e.g. nvidia-cudnn-cu12 ~665 MB); the
 # 15 s default socket timeout turns a slow CDN read into a hard build failure.
 # Applies to every pip call in this image.
-ENV PIP_DEFAULT_TIMEOUT=300 \
-    PIP_RETRIES=10
+#
+# 60 × 5, NOT 300 × 10: those old values meant a single STALLED read could sit
+# silent for up to 50 minutes (300 s × 10 retries) per file — a real deploy
+# hung for two hours here. A stalled socket is not cured by waiting on it; it
+# is cured by giving up and reconnecting, which is exactly what a shorter
+# timeout does. Slow-but-moving downloads are unaffected: the timeout is per
+# read with no data, not a cap on total transfer time.
+ENV PIP_DEFAULT_TIMEOUT=60 \
+    PIP_RETRIES=5
 ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
 # Ensure CUDA libraries are on the library path for ctranslate2/faster-whisper

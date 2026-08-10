@@ -1,3 +1,40 @@
+# ClipAI — Update flow: detect a stalled build instead of waiting forever
+
+A deploy sat for **two hours** on a hung torch-wheel download while the
+heartbeat printed a cheerful "…still building (121m elapsed)" every minute.
+Two defects, both fixed:
+
+- **The hang.** `PIP_DEFAULT_TIMEOUT=300` × `PIP_RETRIES=10` meant a single
+  STALLED read could sit silent for up to 50 minutes *per file*. A stalled
+  socket isn't cured by waiting on it — it's cured by giving up and
+  reconnecting — so both Dockerfiles now use `60` × `5`. Slow-but-moving
+  downloads are unaffected: the timeout is a per-read no-data window, not a
+  cap on transfer time.
+- **The blindness.** `update-all.sh` had no way to tell "silent because
+  BuildKit batches output" from "silent because it's wedged". New
+  `run_watched` runner:
+  * streams build output live (unchanged) while tracking log growth;
+  * the heartbeat now names the **last line** and, once output has been quiet
+    3+ minutes, says how long and when it will kill — so a stall is visible
+    within minutes instead of never;
+  * kills a build with no output for `CLIPAI_STALL_MIN` (default 15) minutes
+    and retries once with the caches warm (which is what actually clears a
+    wedged CDN connection); a second stall exits with the network diagnosis
+    rather than hanging;
+  * the kill walks the descendant tree depth-first (`pgrep -P`, children
+    before parents) so no orphaned docker client survives to collide with the
+    retry. Deliberately not a process-group kill — resolving the group proved
+    unreliable, and getting it wrong kills the update script itself.
+  The Companion cross-build retry uses the same watchdog.
+- Verified with a scripted harness driving the real runner: a 90-second build
+  printing every 3s survives a 1-minute stall threshold (proving it measures
+  SILENCE, not runtime); a build that prints once then hangs is killed at the
+  threshold with its grandchild confirmed dead by exact PID; clean and failing
+  builds still return the right codes; and full-script runs cover
+  stall→kill→retry→successful deploy and stall-twice→exit-with-guidance.
+
+---
+
 # ClipAI — Update flow: recover from BuildKit cache corruption
 
 The deploy after the disk-full episode failed differently: `failed to compute

@@ -137,8 +137,11 @@ FROM python:3.11-slim
 # Make pip tolerant of slow/large wheel downloads (torch + nvidia-*-cu12 wheels
 # can be hundreds of MB; the 15 s default socket timeout turns a slow CDN read
 # into a hard build failure). Applies to every pip call in this image.
-ENV PIP_DEFAULT_TIMEOUT=300 \
-    PIP_RETRIES=10
+# 60 × 5, not 300 × 10 — see Dockerfile.gpu: the old values let ONE stalled
+# read hang silently for up to 50 minutes, and a stalled socket is cured by
+# reconnecting, not by waiting. Slow-but-moving transfers are unaffected.
+ENV PIP_DEFAULT_TIMEOUT=60 \
+    PIP_RETRIES=5
 
 # Make NVIDIA GPUs visible when passed through with --gpus
 ENV NVIDIA_VISIBLE_DEVICES=all
