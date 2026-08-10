@@ -1,3 +1,58 @@
+# ClipAI — Stalled runs get detected, revived, and finished (the bulk-import "randomly stopped")
+
+Diagnosed from a real bulk import's logs: video 1 of 5 downloaded and
+analyzed normally until 18:49:52, then the pipeline went **completely silent
+for 13+ minutes** mid-face-loop — no progress, no error — while the job
+looked alive (`analyzing_scenes`, fresh `updated_at`). Root causes and fixes,
+from specific to systemic:
+
+- **The hang itself: a wedged decoder on a corrupt file.** This video's audio
+  stream was full of "Invalid data found when processing input" (the audio
+  extraction retried around it). The face loop's frame-reader thread calls
+  cv2 `read()`/`grab()`, which can block forever inside FFmpeg on corrupt
+  packets — and the consumer sat in a blocking `q.get()` behind it. The
+  consumer now times out (`REFRAMER_ACQUIRE_STALL_S`, default 120 s — real
+  per-sample acquire cost is fractions of a second), abandons the wedged
+  reader, and **finishes the analysis with the samples already collected**:
+  degraded coverage beats a job that hangs forever.
+- **The blindness: the heartbeat masked the wedge from the revive system.**
+  The staleness-based revive keys off `heartbeat_at`/`updated_at` — and the
+  pipeline heartbeat keeps stamping those while a run is wedged, so
+  "alive but making zero progress" was undetectable *by design*. New
+  **progress-based stall watchdog** in the heartbeat: no REAL progress
+  emit for `PIPELINE_STALL_MINUTES` (default 60 — generous because a
+  40-minute CPU Whisper pass between writes is legitimate; 0 disables) →
+  the run is presumed wedged, the job is requeued with the stall named in
+  its status, and the run TASK is cancelled — which releases the pipeline
+  semaphore even though the wedged native thread can never be killed —
+  then **resumed from its checkpoint** (same attempt cap + kill switch as
+  startup auto-resume: `CLIPAI_MAX_RESUME_ATTEMPTS` / `CLIPAI_AUTO_RESUME`).
+  Attempts exhausted → FAILED with an honest "stage stalled" message, never
+  an eternal spinner. Subtlety that mattered: the pipeline's `CancelledError`
+  is a *custom* Exception for user cancels — the watchdog's task-cancel
+  raises `asyncio.CancelledError` (a BaseException), handled in its own
+  branch so a stall-revive can't masquerade as "Cancelled by user" and a
+  real shutdown cancellation still propagates.
+- **The bulk queue now follows revives and survives restarts.** The
+  sequential runner no longer trusts one `run_analysis` await: it follows
+  each video's job to a TERMINAL status (`_bulk_wait_terminal`), so a
+  stall-revived job's requeue isn't misread as failure. And the whole queue
+  state is persisted to disk on every transition
+  (`companion_bulk_imports.json`); startup recovery reloads it after the
+  per-job auto-resume: terminal items keep their outcomes, a mid-download
+  item re-downloads fresh, a mid-analysis item is adopted and followed to
+  its revived outcome, and the remaining videos import one at a time as
+  before. The Dashboard panel re-attaches automatically via `/active`.
+- Verified: 7 new watchdog tests (fires once with the stage after real
+  silence, touch resets it, 0 disables, requeue-with-attempts / fail-at-cap /
+  auto-resume-off / no-task decisions), 3 new bulk-resilience tests
+  (follows a revived job, persist + restart resume with mid-download reset,
+  resumed runner adopts analyzing + skips terminal + imports the tail);
+  full companion/bulk/archive/reconcile/checkpoint regression batch green
+  (91 passed).
+
+---
+
 # ClipAI — Companion importer feels local; bulk import on the Dashboard; multi-select transcripts
 
 Three user-visible fixes/features from a real session's screenshots.

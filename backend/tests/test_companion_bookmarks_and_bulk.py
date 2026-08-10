@@ -20,6 +20,8 @@ import backend.routers.settings as S
 def _isolate(tmp_path, monkeypatch):
     """Fresh bookmark file + empty bulk registry + a temp /data root per test."""
     monkeypatch.setattr(S, "_BOOKMARKS_PATH", str(tmp_path / "bookmarks.json"))
+    monkeypatch.setattr(S, "_BULK_STATE_PATH", str(tmp_path / "bulk_state.json"))
+    monkeypatch.setattr(S, "_BULK_TERMINAL_POLL_S", 0.01)
     monkeypatch.setattr(S, "_bulk_imports", {})
     monkeypatch.setattr(S, "_bulk_data_root", lambda: str(tmp_path))
     monkeypatch.setattr(S, "_bulk_disk_free", lambda: 10 ** 12)
@@ -352,6 +354,103 @@ def test_bulk_cancel_aborts_inflight_download(_host, monkeypatch, tmp_path):
     assert saved == []                                 # no job was ever created
     # The partial download's job dir was removed.
     assert os.listdir(os.path.join(str(tmp_path), "uploads")) == []
+
+
+def test_bulk_follows_a_stall_revived_job_to_completion(_host, monkeypatch, tmp_path):
+    """A run the stall watchdog cancelled + requeued reports QUEUED again
+    mid-way. The bulk must FOLLOW the revive to its real outcome instead of
+    misreading the requeue as a failure and racing to the next video."""
+    events, _ = _wire_runner(monkeypatch, tmp_path)
+    states = iter(["queued", "transcribing", "complete"])
+
+    async def revived_state(job_id):
+        return (next(states, "complete"), "")
+    monkeypatch.setattr(S, "_bulk_job_state", revived_state)
+
+    bulk_id = _seed_bulk(monkeypatch, ["a.mp4"])
+    asyncio.run(S._run_bulk_import(bulk_id))
+    st = S._bulk_imports[bulk_id]
+    assert [i["status"] for i in st["items"]] == ["complete"]
+    assert st["status"] == "complete" and (st["ok"], st["failed"]) == (1, 0)
+
+
+def test_bulk_state_persists_and_resumes_after_restart(_host, monkeypatch, tmp_path):
+    """The queue itself survives a container restart: the persisted state is
+    reloaded, a mid-download item is reset for a fresh download, and the
+    runner is respawned. Terminal runs are reloaded for display only."""
+    async def _list(h, path):
+        return _vids("a.mp4", "b.mkv")
+    monkeypatch.setattr(S, "_companion_list_videos", _list)
+
+    async def _noop(bulk_id):
+        return None
+    monkeypatch.setattr(S, "_run_bulk_import", _noop)
+    out = asyncio.run(_start_bulk(S.CompanionFolderImportRequest(
+        host_id="h1", path="D:\\media")))
+    bulk_id = out["bulk_id"]
+
+    # Simulate dying mid-download of video 1, plus an older finished run.
+    st = S._bulk_imports[bulk_id]
+    st["items"][0]["status"] = "downloading"
+    st["items"][0]["done_bytes"] = 12345
+    S._bulk_imports["old-done"] = {"status": "complete", "items": [], "total": 0}
+    S._bulk_persist()
+    S._bulk_imports.clear()                    # the process died
+
+    spawned = []
+
+    async def rec_runner(b):
+        spawned.append(b)
+    monkeypatch.setattr(S, "_run_bulk_import", rec_runner)
+
+    async def _resume():
+        n = await S.resume_interrupted_bulk_imports()
+        await asyncio.sleep(0)
+        return n
+    assert asyncio.run(_resume()) == 1
+    assert spawned == [bulk_id]
+    revived = S._bulk_imports[bulk_id]
+    assert revived["items"][0]["status"] == "queued"      # partial file redone
+    assert revived["items"][0]["done_bytes"] == 0
+    assert revived["cancel"] is False
+    # The finished run is visible again but was NOT respawned.
+    assert S._bulk_imports["old-done"]["status"] == "complete"
+
+
+def test_resumed_runner_adopts_analyzing_and_skips_terminal(_host, monkeypatch, tmp_path):
+    """After a restart: terminal items keep their outcome, a mid-analysis item
+    is FOLLOWED (its job was revived by startup auto-resume — never
+    re-downloaded), and the still-queued tail imports normally."""
+    events, saved = _wire_runner(monkeypatch, tmp_path)
+    waited = []
+
+    async def fake_wait(job_id):
+        waited.append(job_id)
+        return ("complete", "")
+    monkeypatch.setattr(S, "_bulk_wait_terminal", fake_wait)
+
+    st = {
+        "bulk_id": "r1", "host_id": "h1", "folder": "D:\\m", "folder_name": "m",
+        "status": "running", "error": "", "total": 3, "done": 1, "ok": 1,
+        "failed": 0, "current": -1, "cancel": False, "started_ms": 1,
+        "source_language": "", "target_language": "",
+        "items": [
+            {"name": "a.mp4", "path": "D:\\m\\a.mp4", "size": 5,
+             "status": "complete", "job_id": "ja", "error": "", "done_bytes": 5},
+            {"name": "b.mkv", "path": "D:\\m\\b.mkv", "size": 5,
+             "status": "analyzing", "job_id": "jb", "error": "", "done_bytes": 5},
+            {"name": "c.mov", "path": "D:\\m\\c.mov", "size": 5,
+             "status": "queued", "job_id": "", "error": "", "done_bytes": 0},
+        ],
+    }
+    S._bulk_imports["r1"] = st
+    asyncio.run(S._run_bulk_import("r1"))
+
+    assert waited[0] == "jb"                    # adopted, not re-imported
+    assert events == ["dl:c.mov", "an:c.mov"]   # only c was downloaded
+    assert [i["status"] for i in st["items"]] == ["complete", "complete", "complete"]
+    assert (st["ok"], st["done"], st["status"]) == (3, 3, "complete")
+    assert [j.filename for j in saved] == ["c.mov"]
 
 
 def test_bulk_progress_endpoint_reports_state_without_cancel_flag(_host, monkeypatch, tmp_path):

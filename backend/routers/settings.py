@@ -1709,6 +1709,93 @@ async def _bulk_job_state(job_id: str) -> tuple:
     return (str(status), getattr(job, "error", "") or "")
 
 
+_BULK_TERMINAL_JOB_STATUSES = {"complete", "failed", "cancelled"}
+_BULK_TERMINAL_POLL_S = 10.0
+_BULK_TERMINAL_MAX_WAIT_S = 6 * 3600.0
+
+
+async def _bulk_wait_terminal(job_id: str) -> tuple:
+    """Follow a job to a TERMINAL status. A run the stall watchdog cancelled
+    and requeued reports QUEUED again mid-way — the bulk sequence must follow
+    that revive to its real outcome instead of misreading the requeue as a
+    failure and racing ahead to the next video."""
+    import time as _t
+    t0 = _t.monotonic()
+    while True:
+        status, err = await _bulk_job_state(job_id)
+        if status in _BULK_TERMINAL_JOB_STATUSES:
+            return (status, err)
+        if _t.monotonic() - t0 >= _BULK_TERMINAL_MAX_WAIT_S:
+            return ("failed",
+                    f"gave up waiting after {int(_BULK_TERMINAL_MAX_WAIT_S / 3600)}h "
+                    f"(status stuck at {status})")
+        await asyncio.sleep(_BULK_TERMINAL_POLL_S)
+
+
+# Bulk-import state survives container restarts: in-memory state alone dies
+# with the process, which read as "my bulk import just vanished". Snapshot on
+# every transition; resume_interrupted_bulk_imports() reloads at startup.
+_BULK_STATE_PATH = os.path.join(_DATA_DIR, "companion_bulk_imports.json")
+
+
+def _bulk_persist() -> None:
+    """Best-effort snapshot of all bulk-import states (transitions only —
+    never per-chunk, so the write load stays trivial)."""
+    try:
+        tmp = _BULK_STATE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_bulk_imports, f, ensure_ascii=False)
+        os.replace(tmp, _BULK_STATE_PATH)
+    except Exception:
+        pass
+
+
+async def resume_interrupted_bulk_imports() -> int:
+    """Reload persisted bulk imports after a container restart and continue
+    any that were mid-flight. Called from startup recovery AFTER the per-job
+    auto-resume queues the interrupted analysis itself:
+
+      * items already terminal keep their outcome (counts included);
+      * an item that was mid-DOWNLOAD is reset to queued (the partial file
+        died with the container) and re-downloaded;
+      * an item that was mid-ANALYSIS is adopted — the runner follows its
+        revived job to a terminal status instead of re-importing it;
+      * everything still queued proceeds exactly as a fresh run.
+
+    Returns the number of runs resumed."""
+    try:
+        with open(_BULK_STATE_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return 0
+    if not isinstance(data, dict):
+        return 0
+    resumed = 0
+    for bulk_id, st in data.items():
+        if not isinstance(st, dict) or bulk_id in _bulk_imports:
+            continue
+        st.setdefault("items", [])
+        if st.get("status") != "running":
+            # Keep terminal summaries so the Dashboard panel can still show
+            # the last run's outcome after a restart.
+            _bulk_imports[bulk_id] = st
+            continue
+        st["cancel"] = False
+        for it in st["items"]:
+            if it.get("status") == "downloading":
+                it["status"] = "queued"
+                it["done_bytes"] = 0
+        _bulk_imports[bulk_id] = st
+        asyncio.create_task(_run_bulk_import(bulk_id))
+        resumed += 1
+        left = sum(1 for it in st["items"]
+                   if it.get("status") in ("queued", "analyzing"))
+        logger.info("Resumed interrupted bulk import %s (%d video(s) left)",
+                    bulk_id, left)
+    _bulk_persist()
+    return resumed
+
+
 async def _bulk_run_analysis(job_id: str) -> None:
     from backend.services.pipeline import run_analysis
     await run_analysis(job_id)     # never raises: failures land on the job row
@@ -1769,111 +1856,136 @@ async def _run_bulk_import(bulk_id: str) -> None:
     comp_token = getattr(h, "token", "") or ""
     total = len(st["items"])
 
+    _ITEM_TERMINAL = {"complete", "failed", "skipped", "no_space", "cancelled"}
+
     def _skip_rest(from_idx: int) -> None:
         for later in st["items"][from_idx:]:
             if later["status"] == "queued":
                 later["status"] = "skipped"
 
     for i, item in enumerate(st["items"]):
+        if item["status"] in _ITEM_TERMINAL:
+            continue        # already decided (a run resumed after a restart)
         if st.get("cancel"):
             st["status"] = "cancelled"
             _skip_rest(i)
             st["current"] = -1
+            _bulk_persist()
             return
         st["current"] = i
 
-        # Free-space gate: the file itself + pipeline scratch (audio WAV,
-        # frames — the pipeline's own pre-check budgets ~30 % of the file
-        # size) while always keeping the floor untouched.
-        need = int(int(item.get("size") or 0) * 1.5) + _BULK_DISK_FLOOR
-        if _bulk_disk_free() < need:
-            item["status"] = "no_space"
-            item["error"] = "not enough free disk space on the ClipAI device"
-            st["status"] = "out_of_space"
-            _skip_rest(i + 1)
-            st["current"] = -1
-            logger.warning("Bulk import %s stopped: out of disk space at %s (%d of %d done)",
-                           bulk_id, item.get("name"), st["ok"], total)
-            return
-
-        import shutil as _sh
-        job_id = str(uuid.uuid4())
-        job_dir = os.path.join(_bulk_data_root(), "uploads", job_id)
-        os.makedirs(job_dir, exist_ok=True)
-        filename = item.get("name") or os.path.basename((item.get("path") or "").replace("\\", "/")) or "import.bin"
-        # Canonical pipeline path (video.<ext>) — same as the single import.
-        _ext = (os.path.splitext(filename)[1].lstrip(".").lower() or "mp4")
-        dest = os.path.join(job_dir, f"video.{_ext}")
-
-        item["status"] = "downloading"
-        _total = int(item.get("size") or 0)
-        _hb = {"t": 0.0, "pct": -1}
-
-        def _on_done(n, _item=item, _t=_total, _jid=job_id, _fn=filename, _idx=i, _hb=_hb):
-            _item["done_bytes"] = n
-            if st.get("cancel"):
-                raise _BulkCancelled()
+        if item["status"] == "analyzing" and item.get("job_id"):
+            # Resumed after a restart mid-analysis: the startup auto-resume
+            # owns reviving the JOB — this loop just follows it to a
+            # terminal status, keeping the one-video-at-a-time sequence.
+            job_id = item["job_id"]
+            _bulk_persist()
             try:
-                pct = int(n * 100 / _t) if _t else 0
-                now = time.monotonic()
-                if now - _hb["t"] >= 1.5 and pct != _hb["pct"]:
-                    _hb["t"] = now
-                    _hb["pct"] = pct
-                    asyncio.create_task(_post_import_hb(
-                        base, comp_token, _jid,
-                        f"Importing {_fn} ({_idx + 1}/{total})", "downloading to ClipAI", pct))
-            except Exception:
-                pass
+                status, err = await _bulk_wait_terminal(job_id)
+            except Exception as e:                   # defensive
+                status, err = ("failed", str(e)[:200])
+        else:
+            # Free-space gate: the file itself + pipeline scratch (audio WAV,
+            # frames — the pipeline's own pre-check budgets ~30 % of the file
+            # size) while always keeping the floor untouched.
+            need = int(int(item.get("size") or 0) * 1.5) + _BULK_DISK_FLOOR
+            if _bulk_disk_free() < need:
+                item["status"] = "no_space"
+                item["error"] = "not enough free disk space on the ClipAI device"
+                st["status"] = "out_of_space"
+                _skip_rest(i + 1)
+                st["current"] = -1
+                _bulk_persist()
+                logger.warning("Bulk import %s stopped: out of disk space at %s (%d of %d done)",
+                               bulk_id, item.get("name"), st["ok"], total)
+                return
 
-        try:
-            size = await _companion_download(
-                read_url, {"path": item["path"]}, headers, dest, _total, _on_done)
-            if size == 0:
-                raise RuntimeError("imported file is empty")
-        except _BulkCancelled:
-            _sh.rmtree(job_dir, ignore_errors=True)
-            item["status"] = "cancelled"
-            st["status"] = "cancelled"
-            _skip_rest(i + 1)
-            st["current"] = -1
-            return
-        except Exception as e:
-            _sh.rmtree(job_dir, ignore_errors=True)
-            item["status"] = "failed"
-            item["error"] = str(e)[:200]
-            st["failed"] += 1
-            st["done"] += 1
-            continue
+            import shutil as _sh
+            job_id = str(uuid.uuid4())
+            job_dir = os.path.join(_bulk_data_root(), "uploads", job_id)
+            os.makedirs(job_dir, exist_ok=True)
+            filename = item.get("name") or os.path.basename((item.get("path") or "").replace("\\", "/")) or "import.bin"
+            # Canonical pipeline path (video.<ext>) — same as the single import.
+            _ext = (os.path.splitext(filename)[1].lstrip(".").lower() or "mp4")
+            dest = os.path.join(job_dir, f"video.{_ext}")
 
-        now_iso = datetime.now(timezone.utc).isoformat()
-        job = JobResult(
-            job_id=job_id, filename=filename, file_path=dest,
-            file_size_mb=round(size / (1024 * 1024), 2),
-            status=JobStatus.QUEUED, progress=0,
-            progress_message=f"Imported from Companion folder ({i + 1} of {total}), waiting for analysis",
-            created_at=now_iso, updated_at=now_iso,
-            language=(st.get("source_language") or "").strip().lower(),
-            subtitle_language=(st.get("target_language") or "").strip().lower(),
-        )
-        try:
-            await _bulk_save_job(job)
-        except Exception as e:
-            _sh.rmtree(job_dir, ignore_errors=True)
-            item["status"] = "failed"
-            item["error"] = f"could not create job: {str(e)[:160]}"
-            st["failed"] += 1
-            st["done"] += 1
-            continue
-        item["job_id"] = job_id
-        item["status"] = "analyzing"
+            item["status"] = "downloading"
+            _bulk_persist()
+            _total = int(item.get("size") or 0)
+            _hb = {"t": 0.0, "pct": -1}
 
-        # THE sequential barrier: run_analysis resolves only when this video's
-        # whole pipeline (transcription → translation → clips) has finished.
-        try:
-            await _bulk_run_analysis(job_id)
-            status, err = await _bulk_job_state(job_id)
-        except Exception as e:                       # defensive; run_analysis is fail-soft
-            status, err = ("failed", str(e)[:200])
+            def _on_done(n, _item=item, _t=_total, _jid=job_id, _fn=filename, _idx=i, _hb=_hb):
+                _item["done_bytes"] = n
+                if st.get("cancel"):
+                    raise _BulkCancelled()
+                try:
+                    pct = int(n * 100 / _t) if _t else 0
+                    now = time.monotonic()
+                    if now - _hb["t"] >= 1.5 and pct != _hb["pct"]:
+                        _hb["t"] = now
+                        _hb["pct"] = pct
+                        asyncio.create_task(_post_import_hb(
+                            base, comp_token, _jid,
+                            f"Importing {_fn} ({_idx + 1}/{total})", "downloading to ClipAI", pct))
+                except Exception:
+                    pass
+
+            try:
+                size = await _companion_download(
+                    read_url, {"path": item["path"]}, headers, dest, _total, _on_done)
+                if size == 0:
+                    raise RuntimeError("imported file is empty")
+            except _BulkCancelled:
+                _sh.rmtree(job_dir, ignore_errors=True)
+                item["status"] = "cancelled"
+                st["status"] = "cancelled"
+                _skip_rest(i + 1)
+                st["current"] = -1
+                _bulk_persist()
+                return
+            except Exception as e:
+                _sh.rmtree(job_dir, ignore_errors=True)
+                item["status"] = "failed"
+                item["error"] = str(e)[:200]
+                st["failed"] += 1
+                st["done"] += 1
+                _bulk_persist()
+                continue
+
+            now_iso = datetime.now(timezone.utc).isoformat()
+            job = JobResult(
+                job_id=job_id, filename=filename, file_path=dest,
+                file_size_mb=round(size / (1024 * 1024), 2),
+                status=JobStatus.QUEUED, progress=0,
+                progress_message=f"Imported from Companion folder ({i + 1} of {total}), waiting for analysis",
+                created_at=now_iso, updated_at=now_iso,
+                language=(st.get("source_language") or "").strip().lower(),
+                subtitle_language=(st.get("target_language") or "").strip().lower(),
+            )
+            try:
+                await _bulk_save_job(job)
+            except Exception as e:
+                _sh.rmtree(job_dir, ignore_errors=True)
+                item["status"] = "failed"
+                item["error"] = f"could not create job: {str(e)[:160]}"
+                st["failed"] += 1
+                st["done"] += 1
+                _bulk_persist()
+                continue
+            item["job_id"] = job_id
+            item["status"] = "analyzing"
+            _bulk_persist()
+
+            # THE sequential barrier: run the analysis, then FOLLOW the job to
+            # a terminal status — if the stall watchdog cancelled a wedged run
+            # and requeued it, the wait tracks the revived run to its real
+            # outcome instead of misreading the requeue as a failure.
+            try:
+                await _bulk_run_analysis(job_id)
+                status, err = await _bulk_wait_terminal(job_id)
+            except Exception as e:                   # defensive; run_analysis is fail-soft
+                status, err = ("failed", str(e)[:200])
+
         if status == "complete":
             item["status"] = "complete"
             st["ok"] += 1
@@ -1883,6 +1995,7 @@ async def _run_bulk_import(bulk_id: str) -> None:
             _skip_rest(i + 1)
             st["current"] = -1
             st["done"] += 1
+            _bulk_persist()
             return
         else:
             # Individually-cancelled or failed job: record it, keep the batch going.
@@ -1890,9 +2003,11 @@ async def _run_bulk_import(bulk_id: str) -> None:
             item["error"] = (err or f"analysis ended with status {status}")[:200]
             st["failed"] += 1
         st["done"] += 1
+        _bulk_persist()
 
     st["current"] = -1
     st["status"] = "cancelled" if st.get("cancel") else "complete"
+    _bulk_persist()
     logger.info("Bulk import %s finished: %d ok, %d failed of %d",
                 bulk_id, st["ok"], st["failed"], total)
 
@@ -1940,6 +2055,7 @@ async def companion_folder_import(req: CompanionFolderImportRequest):
     }
     _bulk_prune_terminal()
     _bulk_imports[bulk_id] = st
+    _bulk_persist()
     asyncio.create_task(_run_bulk_import(bulk_id))
     logger.info("Bulk import %s started: %d video(s) from %s", bulk_id, len(videos), req.path)
     return {"ok": True, "bulk_id": bulk_id, "total": len(videos), "folder": req.path}
@@ -1976,6 +2092,7 @@ async def companion_folder_import_cancel(bulk_id: str):
     if st is None:
         raise HTTPException(status_code=404, detail="unknown bulk import")
     st["cancel"] = True
+    _bulk_persist()
     cur = st.get("current", -1)
     if 0 <= cur < len(st["items"]):
         it = st["items"][cur]

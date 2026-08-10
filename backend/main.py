@@ -1068,6 +1068,18 @@ async def recover_orphaned_jobs():
                 "%d orphan(s) auto-resumed, %d marked failed",
                 completed, resumed, failed,
             )
+
+        # Resume any Companion bulk folder import the restart interrupted.
+        # The per-video jobs were revived above; this revives the QUEUE —
+        # remaining videos still download + analyze one at a time, and an
+        # item that was mid-analysis is followed to its revived outcome.
+        try:
+            from backend.routers.settings import resume_interrupted_bulk_imports
+            n_bulk = await resume_interrupted_bulk_imports()
+            if n_bulk:
+                logger.info("Startup recovery: resumed %d bulk import(s)", n_bulk)
+        except Exception as exc:  # noqa: BLE001 — never block startup
+            logger.warning("Bulk-import resume failed (non-fatal): %s", exc)
     except Exception as exc:
         logger.warning("Orphaned job recovery failed (non-fatal): %s", exc)
 

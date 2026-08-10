@@ -1904,11 +1904,77 @@ async def _await_source_hash(job_id: str, task, video_path: str) -> str:
 
 
 # ── Pipeline heartbeat — prevents >15s gaps in progress updates ──────
+# The asyncio task driving each in-flight run_analysis, so the stall
+# watchdog can cancel a WEDGED run (a native call that never returns can't
+# honor the cooperative cancel event — only cancelling the awaiting task
+# frees the pipeline and its semaphore; the wedged thread is abandoned).
+_run_tasks: dict = {}
+# Jobs whose in-flight cancellation is a stall-REVIVE (requeue + resume
+# from checkpoint) or a stall-FAIL (attempts exhausted) rather than a user
+# cancel — consumed by run_analysis's CancelledError handler.
+_stall_revive_pending: set = set()
+_stall_fail_pending: set = set()
+
+_MAX_STALL_RESUME_ATTEMPTS = max(
+    0, int(os.environ.get("CLIPAI_MAX_RESUME_ATTEMPTS", "3") or 3))
+
+
+def _stall_auto_resume_enabled() -> bool:
+    """Same switch as startup auto-resume: CLIPAI_AUTO_RESUME=0 disables."""
+    return os.environ.get("CLIPAI_AUTO_RESUME", "1").strip().lower() \
+        not in ("0", "false", "no")
+
+
+async def _handle_stalled_run(job_id: str, stage: str, silent_s: float):
+    """A run emitted NO real progress for the stall window: presume a wedged
+    native call (hung decoder, GPU deadlock) that the heartbeat is masking.
+    Requeue for a checkpoint resume (capped attempts) — or fail loudly — then
+    cancel the run task, which releases the pipeline semaphore even though
+    the wedged worker thread never returns."""
+    task = _run_tasks.get(job_id)
+    if task is None or task.done():
+        return
+    job = await database.load_job(job_id)
+    attempts = int(getattr(job, "resume_attempts", 0) or 0) if job else 0
+    if _stall_auto_resume_enabled() and attempts < _MAX_STALL_RESUME_ATTEMPTS:
+        logger.error(
+            "[%s] STALLED: no pipeline progress for %.0f min (stage '%s') — "
+            "presumed wedged; cancelling the run and resuming from "
+            "checkpoint (attempt %d/%d)",
+            job_id, silent_s / 60, stage or "?",
+            attempts + 1, _MAX_STALL_RESUME_ATTEMPTS)
+        await database.update_job_status(
+            job_id, status=JobStatus.QUEUED, progress=0,
+            resume_attempts=attempts + 1,
+            progress_message=(
+                f"Stage '{stage or 'analysis'}' stalled — restarting from "
+                f"checkpoint (attempt {attempts + 1}/"
+                f"{_MAX_STALL_RESUME_ATTEMPTS})…"))
+        _stall_revive_pending.add(job_id)
+    else:
+        logger.error(
+            "[%s] STALLED: no pipeline progress for %.0f min (stage '%s') — "
+            "auto-resume %s; marking FAILED",
+            job_id, silent_s / 60, stage or "?",
+            "disabled" if not _stall_auto_resume_enabled()
+            else f"gave up after {attempts} attempt(s)")
+        await database.update_job_status(
+            job_id, status=JobStatus.FAILED,
+            progress_message=(
+                f"Stage '{stage or 'analysis'}' stalled (no progress for "
+                f"{int(silent_s / 60)} min) — re-analyse to retry."))
+        _stall_fail_pending.add(job_id)
+    task.cancel()
+
+
 class _PipelineHeartbeat:
-    """Emits keepalive messages when no real progress update has been sent."""
+    """Emits keepalive messages when no real progress update has been sent —
+    and watches for a run that has stopped making progress entirely."""
 
     def __init__(self, job_id: str, interval: float = 15.0,
-                 persist_interval: float = 60.0):
+                 persist_interval: float = 60.0,
+                 stall_after_s: float | None = None,
+                 tick: float = 5.0):
         self.job_id = job_id
         self.interval = interval
         # DB liveness stamps are much sparser than WS keepalives — one tiny
@@ -1917,6 +1983,17 @@ class _PipelineHeartbeat:
         self.persist_interval = persist_interval
         self.last_emit = _time.monotonic()
         self._last_persist = _time.monotonic()
+        # Stall watchdog: last REAL progress (touch()), not WS keepalives.
+        # The keepalive/heartbeat_at path is exactly what masks a wedged run
+        # from the staleness-based revive, so the watchdog must key off
+        # touch() alone.
+        if stall_after_s is None:
+            stall_after_s = max(
+                0, int(getattr(settings, "PIPELINE_STALL_MINUTES", 60))) * 60.0
+        self.stall_after_s = stall_after_s
+        self._last_touch = _time.monotonic()
+        self._stall_fired = False
+        self._tick = max(0.05, tick)
         self.current_stage = ""
         self.stage_start = _time.monotonic()
         self._task: asyncio.Task | None = None
@@ -1924,6 +2001,7 @@ class _PipelineHeartbeat:
     def touch(self, stage: str = ""):
         """Call whenever a real progress event is emitted."""
         self.last_emit = _time.monotonic()
+        self._last_touch = _time.monotonic()
         if stage and stage != self.current_stage:
             self.current_stage = stage
             self.stage_start = _time.monotonic()
@@ -1932,7 +2010,19 @@ class _PipelineHeartbeat:
         """Background loop that checks for staleness every 5 seconds."""
         try:
             while True:
-                await asyncio.sleep(5.0)
+                await asyncio.sleep(self._tick)
+                # Stall watchdog: a run with no REAL progress for the whole
+                # window is wedged — hand it to the revive path. Fired once.
+                if (self.stall_after_s > 0 and not self._stall_fired):
+                    silent = _time.monotonic() - self._last_touch
+                    if silent >= self.stall_after_s:
+                        self._stall_fired = True
+                        try:
+                            await _handle_stalled_run(
+                                self.job_id, self.current_stage, silent)
+                        except Exception:
+                            logger.exception(
+                                "[%s] stall handler failed", self.job_id)
                 elapsed_since_emit = _time.monotonic() - self.last_emit
                 if elapsed_since_emit >= self.interval and self.current_stage:
                     stage_elapsed = int(_time.monotonic() - self.stage_start)
@@ -5969,6 +6059,11 @@ async def run_analysis(job_id: str, resume: bool = False):
     )
 
     async with sem:
+        # Register this run's task so the stall watchdog can cancel a WEDGED
+        # run (a hung native call never reaches a cooperative cancel check).
+        _cur_task = asyncio.current_task()
+        if _cur_task is not None:
+            _run_tasks[job_id] = _cur_task
         # Start heartbeat for this job
         hb = _PipelineHeartbeat(job_id, interval=15.0)
         _heartbeats[job_id] = hb
@@ -5999,6 +6094,37 @@ async def run_analysis(job_id: str, resume: bool = False):
                         (_owner_id or "")[:8],
                     )
                 await _run_analysis_inner(job_id, resume=resume)
+        except asyncio.CancelledError:
+            # The TASK was cancelled (asyncio's CancelledError is a
+            # BaseException — nothing below catches it). Two sources: the
+            # stall watchdog killing a WEDGED run, or an external task
+            # cancellation (e.g. server shutdown), which must keep
+            # propagating.
+            if job_id in _stall_revive_pending:
+                # The watchdog already requeued the job — start the resume
+                # now. The new task blocks on the pipeline semaphore until
+                # this run's `async with sem` exits, so runs never overlap.
+                # The wedged worker thread is abandoned (nothing can kill a
+                # thread stuck in native code) but the pipeline, its
+                # semaphore, and the job all move on.
+                _stall_revive_pending.discard(job_id)
+                logger.warning(
+                    "[%s] stalled run cancelled — scheduling checkpoint "
+                    "resume", job_id)
+                asyncio.create_task(run_analysis(job_id, resume=True))
+            elif job_id in _stall_fail_pending:
+                # Watchdog already marked the job FAILED with the stall
+                # message — don't overwrite it with "Cancelled by user".
+                _stall_fail_pending.discard(job_id)
+                try:
+                    await broadcast_ws(job_id, {
+                        "type": "error",
+                        "message": "Analysis stalled and was stopped",
+                    })
+                except Exception:
+                    pass
+            else:
+                raise
         except CancelledError:
             logger.info(f"Job {job_id} cancelled by user")
             await database.update_job_status(
@@ -6031,6 +6157,7 @@ async def run_analysis(job_id: str, resume: bool = False):
             # Stop heartbeat and clean up
             hb.stop()
             _heartbeats.pop(job_id, None)
+            _run_tasks.pop(job_id, None)
             _cancel_events.pop(job_id, None)
             _finalizing_jobs.discard(job_id)
             _last_scalar_progress.pop(job_id, None)

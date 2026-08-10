@@ -821,6 +821,14 @@ class Settings(BaseSettings):
     # divergence discards the early work and re-runs the classic serial
     # chain, so output is byte-identical either way.
     PIPELINE_EARLY_TRANSLATION: bool = True
+    # Stall watchdog: a run that emits NO real progress update for this many
+    # minutes is presumed wedged (e.g. a native decoder hung on a corrupt
+    # file) and is cancelled + auto-resumed from its checkpoint. The pipeline
+    # heartbeat keeps a wedged run LOOKING alive (heartbeat_at advances), so
+    # the staleness-based revive can never catch this case — only a
+    # progress-based watchdog can. Generous by design: a 40-minute CPU
+    # Whisper pass between progress writes is legitimate. 0 disables.
+    PIPELINE_STALL_MINUTES: int = 60
     # Run local CUDA Whisper CONCURRENT with the face-detection loop when the
     # local card has this much FREE VRAM (Whisper turbo ~1.5-2 GB + YOLO-World
     # ~150 MB co-reside easily at 6 GB). Byte-identical: the same transcribe()

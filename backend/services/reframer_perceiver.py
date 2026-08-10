@@ -1856,9 +1856,35 @@ class Perceiver:
         th = _threading.Thread(target=_producer, name='clipai-frame-reader',
                                daemon=True)
         th.start()
+        # A wedged decoder must NOT hang the whole pipeline. cv2's
+        # read()/grab() can block forever inside FFmpeg on a file with
+        # corrupt packets (observed on a bulk import: face loop silent for
+        # 13+ minutes at sample ~370 of 1474 on a video whose audio stream
+        # was full of "Invalid data found when processing input" — the
+        # consumer sat in a blocking q.get() while the reader thread never
+        # returned from OpenCV). A frame acquire that takes this long is
+        # never legitimate (the measured per-sample acquire cost is
+        # fractions of a second), so on timeout we abandon the reader and
+        # finish the analysis with the samples already collected —
+        # degraded coverage beats a job that hangs forever.
+        _stall_s = max(10.0, float(getattr(settings,
+                                           'REFRAMER_ACQUIRE_STALL_S', 120.0)))
         try:
             while True:
-                item = q.get()
+                try:
+                    item = q.get(timeout=_stall_s)
+                except _queue.Empty:
+                    if not th.is_alive():
+                        # Reader died without its sentinel (shouldn't
+                        # happen — the put(None) is in a finally) — done.
+                        break
+                    logger.error(
+                        "Frame reader stalled: no frame for %.0fs (decoder "
+                        "wedged — corrupt stream?). Abandoning the reader "
+                        "and continuing with the samples collected so far.",
+                        _stall_s)
+                    tbuck['acquire_stalls'] = tbuck.get('acquire_stalls', 0) + 1
+                    break
                 if item is None:
                     break
                 if self.cancelled:
