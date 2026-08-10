@@ -45,7 +45,14 @@ export function dispositionName(res) {
  *      losing the name or the file entirely.
  */
 export function saveTextAs(content, filename, mime = 'text/plain;charset=utf-8') {
-  const blob = new Blob([content], { type: mime });
+  return saveBlobAs(new Blob([content], { type: mime }), filename);
+}
+
+/**
+ * Save an existing Blob (e.g. a fetched ZIP) to disk as ``filename`` — the
+ * same load-bearing anchor dance as ``saveTextAs``, for binary responses.
+ */
+export function saveBlobAs(blob, filename) {
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;

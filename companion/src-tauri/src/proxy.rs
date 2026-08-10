@@ -809,6 +809,36 @@ async fn files_roots(State(ctx): State<ProxyCtx>, headers: HeaderMap) -> Respons
     (StatusCode::OK, Json(serde_json::json!({ "roots": items, "share_all": share_all }))).into_response()
 }
 
+/// Strip Windows "verbatim" path prefixes (\\?\C:\… and \\?\UNC\server\…)
+/// that std::fs::canonicalize produces on Windows. resolve_shared_path
+/// canonicalizes, so every listed entry inherited the prefix — which then
+/// leaked into ClipAI's breadcrumbs, bookmarks, and pasted paths as line
+/// noise ("Shared > ? > C:"). The plain form resolves identically.
+fn strip_verbatim(s: String) -> String {
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        s
+    }
+}
+
+#[cfg(test)]
+mod strip_verbatim_tests {
+    use super::strip_verbatim;
+    #[test]
+    fn strips_verbatim_prefixes() {
+        assert_eq!(
+            strip_verbatim(r"\\?\C:\Users\jalon\Videos".into()),
+            r"C:\Users\jalon\Videos"
+        );
+        assert_eq!(strip_verbatim(r"\\?\UNC\nas\media".into()), r"\\nas\media");
+        assert_eq!(strip_verbatim(r"C:\plain".into()), r"C:\plain");
+        assert_eq!(strip_verbatim("/mnt/media".into()), "/mnt/media");
+    }
+}
+
 /// /v1/files/list?path=… → directory entries inside a shared root (dirs first).
 async fn files_list(
     State(ctx): State<ProxyCtx>,
@@ -861,7 +891,7 @@ async fn files_list(
                 .to_lowercase();
             entries.push(serde_json::json!({
                 "name": name,
-                "path": p.to_string_lossy(),
+                "path": strip_verbatim(p.to_string_lossy().into_owned()),
                 "is_dir": is_dir,
                 "size": size,
                 "ext": ext,
@@ -883,7 +913,10 @@ async fn files_list(
     });
     (
         StatusCode::OK,
-        Json(serde_json::json!({ "path": dir.to_string_lossy(), "entries": entries })),
+        Json(serde_json::json!({
+            "path": strip_verbatim(dir.to_string_lossy().into_owned()),
+            "entries": entries,
+        })),
     )
         .into_response()
 }

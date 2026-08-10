@@ -2,6 +2,8 @@ import React, { useState, useEffect, useRef } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import useResponsive from '../hooks/useResponsive';
 import { exportProjectBlocking, exportProjectWithProgress, importProject } from '../utils/projectBundle';
+import { saveBlobAs, dispositionName } from '../utils/downloadFile';
+import BulkImportPanel from '../components/BulkImportPanel';
 
 function formatDuration(seconds) {
   if (!seconds) return '-';
@@ -131,6 +133,34 @@ export default function Dashboard() {
     setExportingId(null);
     setExportPct(0);
     setBulkExport(null);
+  };
+
+  // One click, many transcripts: the backend zips a .srt/.txt per selected
+  // video (translated track preferred) so the browser gets a single download
+  // instead of a blocked burst of files.
+  const [transcriptDl, setTranscriptDl] = useState('');   // '' | 'srt' | 'txt'
+  const downloadTranscripts = async (format) => {
+    const ids = Array.from(selected);
+    if (!ids.length || transcriptDl) return;
+    setTranscriptDl(format);
+    try {
+      const res = await fetch('/api/jobs/transcripts/archive', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ job_ids: ids, format }),
+      });
+      if (!res.ok) {
+        const d = await res.json().catch(() => ({}));
+        window.alert(`Transcript download failed: ${d.detail || `HTTP ${res.status}`}`);
+        return;
+      }
+      const blob = await res.blob();
+      saveBlobAs(blob, dispositionName(res) || `clipai-transcripts-${format}.zip`);
+    } catch (err) {
+      window.alert(`Transcript download failed: ${err.message || err}`);
+    } finally {
+      setTranscriptDl('');
+    }
   };
 
   // Track cancelled job IDs so the 5-second poll never brings them back
@@ -387,6 +417,11 @@ export default function Dashboard() {
         </div>
       )}
 
+      {/* A Companion bulk folder import runs server-side — surface it here so
+          closing the import dialog (or opening this page from another device)
+          never loses sight of it. Renders nothing when no run is active. */}
+      <BulkImportPanel />
+
       {/* Stats bar */}
       <div style={{ display: 'flex', gap: isMobile ? 10 : 16, marginBottom: isMobile ? 20 : 24, flexWrap: 'wrap' }}>
         {[
@@ -570,6 +605,22 @@ export default function Dashboard() {
                 ? `Exporting ${Math.min(bulkExport.done + 1, bulkExport.total)}/${bulkExport.total}${exportPct >= 0 ? ` (${exportPct}%)` : '…'}`
                 : `Export${selected.size ? ` (${selected.size})` : ''}`}
             </span>
+          </button>
+          <button
+            onClick={() => downloadTranscripts('srt')}
+            disabled={selected.size === 0 || !!transcriptDl}
+            style={{ padding: '8px 12px', background: 'var(--bg-elevated)', color: 'var(--text-secondary)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', fontSize: 13, cursor: selected.size > 0 && !transcriptDl ? 'pointer' : 'default' }}
+            title="Download one .srt subtitle file per selected video (translated track when available), zipped"
+          >
+            {transcriptDl === 'srt' ? 'Zipping…' : 'Transcripts (SRT)'}
+          </button>
+          <button
+            onClick={() => downloadTranscripts('txt')}
+            disabled={selected.size === 0 || !!transcriptDl}
+            style={{ padding: '8px 12px', background: 'var(--bg-elevated)', color: 'var(--text-secondary)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', fontSize: 13, cursor: selected.size > 0 && !transcriptDl ? 'pointer' : 'default' }}
+            title="Download one plain-text transcript per selected video, zipped"
+          >
+            {transcriptDl === 'txt' ? 'Zipping…' : 'Transcripts (TXT)'}
           </button>
           <button
             onClick={bulkDelete}

@@ -658,6 +658,91 @@ async def download_srt(
     )
 
 
+class TranscriptArchiveRequest(BaseModel):
+    job_ids: list[str]
+    format: str = "srt"        # "srt" | "txt"
+    translated: bool = True    # prefer the translated track when it exists
+    speakers: bool = True
+
+
+@router.post("/jobs/transcripts/archive")
+async def download_transcripts_archive(req: TranscriptArchiveRequest):
+    """One click, many transcripts: a ZIP with one ``.srt`` or ``.txt`` per
+    selected video, for the Dashboard's multi-select. Browsers block a burst
+    of separate downloads, so a single archive is the only shape that works.
+
+    Same track choice as the single-file download: the translated transcript
+    (sanitized) when present and ``translated`` is true, else the original.
+    Videos without a transcript are skipped and listed in ``_skipped.txt``
+    inside the archive instead of failing the whole request — only when NO
+    selected video has a transcript does this 404."""
+    import io
+    import re as _re
+    import zipfile
+
+    fmt = (req.format or "srt").strip().lower()
+    if fmt not in ("srt", "txt"):
+        raise HTTPException(status_code=400, detail="format must be 'srt' or 'txt'")
+    ids = [i for i in (req.job_ids or []) if i]
+    if not ids:
+        raise HTTPException(status_code=400, detail="job_ids is required")
+
+    buf = io.BytesIO()
+    used_names: set = set()
+    included = 0
+    skipped: list[str] = []
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for job_id in ids:
+            job = await database.load_job(job_id)
+            if not job:
+                skipped.append(f"{job_id}: not found")
+                continue
+            source = job.transcript
+            suffix = ""
+            if req.translated and getattr(job, "translated_transcript", None):
+                source = await _clean_translated_rows(job)
+                suffix = "_translated"
+            if not source:
+                skipped.append(f"{job.filename or job_id}: no transcript yet")
+                continue
+            segments = [TranscriptSegment(**s) if isinstance(s, dict) else s for s in source]
+            if fmt == "srt":
+                content = generate_srt(
+                    segments, include_speakers=req.speakers, fps=await _effective_fps(job))
+            else:
+                lines = []
+                for seg in segments:
+                    text = (getattr(seg, "text", "") or "").strip()
+                    if not text:
+                        continue
+                    spk = (getattr(seg, "speaker", "") or "").strip()
+                    lines.append(f"{spk}: {text}" if req.speakers and spk else text)
+                content = "\n".join(lines) + "\n"
+            base = job.filename.rsplit(".", 1)[0] if "." in (job.filename or "") else (job.filename or "")
+            base = _re.sub(r'[\\/:*?"<>|]+', "_", base).strip() or job_id[:8]
+            name = f"{base}{suffix}.{fmt}"
+            n = 2
+            while name in used_names:               # two uploads of "clip.mp4"
+                name = f"{base}{suffix} ({n}).{fmt}"
+                n += 1
+            used_names.add(name)
+            zf.writestr(name, content)
+            included += 1
+        if skipped:
+            zf.writestr("_skipped.txt", "Not included:\n" + "\n".join(skipped) + "\n")
+    if included == 0:
+        raise HTTPException(
+            status_code=404,
+            detail="None of the selected videos have a transcript yet")
+    buf.seek(0)
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/zip",
+        headers={"Content-Disposition":
+                 f'attachment; filename="clipai-transcripts-{fmt}.zip"'},
+    )
+
+
 @router.get("/jobs/{job_id}/transcript_original.srt")
 async def download_original_srt(job_id: str, speakers: bool = True):
     """Download the original-language transcript (never the translation)."""

@@ -1563,6 +1563,32 @@ _BOOKMARKS_MAX_PER_HOST = 100
 _bookmarks_lock = threading.Lock()
 
 
+def _normalize_companion_path(p: str) -> str:
+    r"""Strip Windows "verbatim" prefixes (\\?\C:\..., \\?\UNC\server\...) that
+    older Companions leaked from canonicalized listings. The plain form
+    resolves identically on the Companion; the prefixed form broke display and
+    equality — a legacy \\?\-prefixed bookmark could never be un-starred by a
+    client sending the clean path."""
+    p = (p or "").strip()
+    if p.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + p[8:]
+    if p.startswith("\\\\?\\"):
+        return p[4:]
+    return p
+
+
+def _normalized_marks(marks: list) -> list:
+    """Bookmarks with verbatim prefixes stripped, deduped on the clean path."""
+    out, seen = [], set()
+    for m in marks or []:
+        p = _normalize_companion_path(str(m.get("path") or ""))
+        if not p or p in seen:
+            continue
+        seen.add(p)
+        out.append({**m, "path": p})
+    return out
+
+
 def _load_bookmarks() -> dict:
     """``{host_id: [{path, name, is_dir, added_ms}, …]}`` — {} when missing/corrupt."""
     try:
@@ -1591,20 +1617,20 @@ class CompanionBookmarkRequest(BaseModel):
 async def companion_bookmarks_list(host_id: str):
     """The starred paths for one Companion (newest first)."""
     with _bookmarks_lock:
-        marks = _load_bookmarks().get(host_id, [])
+        marks = _normalized_marks(_load_bookmarks().get(host_id, []))
     return {"bookmarks": marks}
 
 
 @router.post("/providers/companion-files/bookmarks")
 async def companion_bookmark_add(req: CompanionBookmarkRequest):
     """Star a path. Idempotent on (host_id, path); newest stars sort first."""
-    path = (req.path or "").strip()
+    path = _normalize_companion_path(req.path)
     if not req.host_id or not path:
         raise HTTPException(status_code=400, detail="host_id and path are required")
     name = (req.name or "").strip() or os.path.basename(path.replace("\\", "/").rstrip("/\\")) or path
     with _bookmarks_lock:
         data = _load_bookmarks()
-        marks = [m for m in data.get(req.host_id, []) if m.get("path") != path]
+        marks = [m for m in _normalized_marks(data.get(req.host_id, [])) if m["path"] != path]
         marks.insert(0, {"path": path, "name": name, "is_dir": bool(req.is_dir),
                          "added_ms": int(time.time() * 1000)})
         data[req.host_id] = marks[:_BOOKMARKS_MAX_PER_HOST]
@@ -1615,10 +1641,13 @@ async def companion_bookmark_add(req: CompanionBookmarkRequest):
 
 @router.delete("/providers/companion-files/bookmarks")
 async def companion_bookmark_remove(host_id: str, path: str):
-    """Un-star a path. Removing an unknown path is a no-op, not an error."""
+    """Un-star a path. Removing an unknown path is a no-op, not an error.
+    Compared on the normalized path so a clean ``C:\\…`` removes a legacy
+    ``\\\\?\\C:\\…`` bookmark too."""
+    path = _normalize_companion_path(path)
     with _bookmarks_lock:
         data = _load_bookmarks()
-        marks = [m for m in data.get(host_id, []) if m.get("path") != path]
+        marks = [m for m in _normalized_marks(data.get(host_id, [])) if m["path"] != path]
         data[host_id] = marks
         _save_bookmarks(data)
     return {"ok": True, "bookmarks": marks}

@@ -1,5 +1,6 @@
-import React, { useEffect, useState, useCallback, useMemo } from 'react';
+import React, { useEffect, useState, useCallback, useMemo, useRef } from 'react';
 import { LANGUAGES } from '../constants/languages';
+import BulkImportPanel from './BulkImportPanel';
 
 // Finder + Spotlight-inspired remote file browser for a paired GPU Companion's
 // shared folders. Browse (server-jailed to the shared roots), search/paste a
@@ -41,6 +42,7 @@ const Ic = {
   HardDrive: (p) => <Svg {...p}><path d="M22 12H2" /><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z" /><path d="M6 16h.01" /><path d="M10 16h.01" /></Svg>,
   Home: (p) => <Svg {...p}><path d="M3 9.5 12 3l9 6.5" /><path d="M5 10v10a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V10" /></Svg>,
   Star: (p) => <Svg {...p}><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" /></Svg>,
+  ArrowUp: (p) => <Svg {...p}><path d="M12 19V5" /><path d="m5 12 7-7 7 7" /></Svg>,
   Layers: (p) => <Svg {...p}><path d="m12 2 9 4.9-9 4.9-9-4.9z" /><path d="m3 11.9 9 4.9 9-4.9" /><path d="m3 16.9 9 4.9 9-4.9" /></Svg>,
 };
 
@@ -77,6 +79,46 @@ function iconFor(e, size = 20) {
   return <Ic.FileText s={size} />;
 }
 const looksLikePath = (s) => /^([a-zA-Z]:[\\/]|\/|\\\\)/.test((s || '').trim());
+
+// ── Path plumbing ────────────────────────────────────────────────────────────
+// Older Companions leak Windows "verbatim" prefixes (\\?\C:\…, \\?\UNC\srv\…)
+// from canonicalized listings. They read as line noise, and they broke the
+// breadcrumb ("Shared > ? > C:" with 403 crumbs). Normalize EVERY path at the
+// edges — listings, roots, bookmarks, pasted input — so all downstream logic
+// (crumbs, selection, bookmark equality) sees the plain form, which resolves
+// identically on the Companion.
+const normPath = (p) => {
+  const s = String(p || '');
+  if (s.startsWith('\\\\?\\UNC\\')) return '\\\\' + s.slice(8);
+  if (s.startsWith('\\\\?\\')) return s.slice(4);
+  return s;
+};
+// Pasted input, cleaned: Windows "Copy as path" wraps in quotes.
+const cleanPathInput = (s) => normPath(String(s || '').trim().replace(/^["']+|["']+$/g, ''));
+const sepOf = (p) => (String(p).includes('\\') ? '\\' : '/');
+const trimSep = (p) => String(p).replace(/[\\/]+$/, '') || (String(p).startsWith('/') ? '/' : String(p));
+// Case-insensitive for backslash paths (Windows filesystems are).
+const samePath = (a, b) => {
+  const x = trimSep(normPath(a));
+  const y = trimSep(normPath(b));
+  if (!x || !y) return x === y;
+  return sepOf(x + y) === '\\' ? x.toLowerCase() === y.toLowerCase() : x === y;
+};
+// Parent folder, or '' when already at a filesystem root ('' = the Shared
+// home view). A bare drive letter must never be navigated to — Windows
+// resolves "C:" relative to the drive's current directory — so the drive
+// root is always spelled "C:\".
+const parentOf = (p) => {
+  const s = trimSep(normPath(p));
+  if (!s || s === '/' || /^[a-zA-Z]:$/.test(s)) return '';
+  const sep = sepOf(s);
+  const i = s.lastIndexOf(sep);
+  if (i < 0) return '';
+  const parent = s.slice(0, i);
+  if (/^[a-zA-Z]:$/.test(parent)) return parent + '\\';
+  if (!parent) return sep === '/' ? '/' : '';
+  return parent;
+};
 
 const SORTS = [
   { key: 'az', label: 'Name (A–Z)' },
@@ -151,17 +193,23 @@ export default function CompanionBrowser({ kind = 'video', onClose, onImported }
   };
   // Starred paths for the active Companion (server-persisted).
   const [bookmarks, setBookmarks] = useState([]);
-  // Bulk folder import: confirm step → live server state (polled).
+  // Bulk folder import: this dialog only handles the confirm step and the
+  // kick-off — the live status is the shared BulkImportPanel, which also
+  // lives on the Dashboard so closing this dialog or navigating away never
+  // loses sight of a running import.
   const [pendingBulk, setPendingBulk] = useState(null); // {path, name, count}
-  const [bulkId, setBulkId] = useState('');
-  const [bulk, setBulk] = useState(null);
+  const [bulkStartId, setBulkStartId] = useState('');
+  const [bulkRunning, setBulkRunning] = useState(false);
 
   useEffect(() => {
     (async () => {
       try {
         const res = await fetch('/api/providers/companion-files/roots');
         const data = await res.json();
-        const comps = (data && data.companions) || [];
+        const comps = ((data && data.companions) || []).map((c) => ({
+          ...c,
+          roots: (c.roots || []).map((r) => ({ ...r, path: normPath(r.path) })),
+        }));
         setCompanions(comps);
         const firstOnline = comps.find((c) => c.online && (c.roots || []).length > 0);
         if (firstOnline) setHostId(firstOnline.host_id);
@@ -176,19 +224,22 @@ export default function CompanionBrowser({ kind = 'video', onClose, onImported }
   }, []);
 
   // Load this Companion's bookmarks whenever the active host changes.
+  // Paths normalized on receipt — legacy \\?\-prefixed bookmarks display and
+  // navigate as plain paths.
+  const normMarks = (arr) => (arr || []).map((b) => ({ ...b, path: normPath(b.path) }));
   useEffect(() => {
     if (!hostId) { setBookmarks([]); return; }
     (async () => {
       try {
         const r = await fetch(`/api/providers/companion-files/bookmarks?host_id=${encodeURIComponent(hostId)}`);
-        if (r.ok) { const d = await r.json(); setBookmarks((d && d.bookmarks) || []); }
+        if (r.ok) { const d = await r.json(); setBookmarks(normMarks(d && d.bookmarks)); }
       } catch { /* fail-soft — the browser works fine without bookmarks */ }
     })();
   }, [hostId]);
 
-  const bookmarkedPaths = useMemo(() => new Set(bookmarks.map((b) => b.path)), [bookmarks]);
-  const isMarked = (p) => bookmarkedPaths.has(p);
+  const isMarked = (p) => bookmarks.some((b) => samePath(b.path, p));
   const toggleBookmark = async (path, name) => {
+    path = normPath(path);
     try {
       const r = isMarked(path)
         ? await fetch(`/api/providers/companion-files/bookmarks?host_id=${encodeURIComponent(hostId)}&path=${encodeURIComponent(path)}`, { method: 'DELETE' })
@@ -196,96 +247,162 @@ export default function CompanionBrowser({ kind = 'video', onClose, onImported }
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ host_id: hostId, path, name: name || '', is_dir: true }),
           });
-      if (r.ok) { const d = await r.json(); setBookmarks((d && d.bookmarks) || []); }
+      if (r.ok) { const d = await r.json(); setBookmarks(normMarks(d && d.bookmarks)); }
     } catch { /* fail-soft */ }
   };
-
-  // Re-attach to a bulk import already running on the server (e.g. the user
-  // closed and reopened this dialog mid-run).
-  useEffect(() => {
-    if (kind !== 'video') return;
-    (async () => {
-      try {
-        const r = await fetch('/api/providers/companion-files/import-folder/active');
-        const d = await r.json();
-        if (d && d.bulk_id) setBulkId(d.bulk_id);
-      } catch { /* fail-soft */ }
-    })();
-  }, [kind]);
-
-  // Poll the bulk run while it's active.
-  useEffect(() => {
-    if (!bulkId) return undefined;
-    let stopped = false;
-    let timer = 0;
-    const tick = async () => {
-      try {
-        const r = await fetch(`/api/providers/companion-files/import-folder/progress?bulk_id=${encodeURIComponent(bulkId)}`);
-        if (r.status === 404) { if (!stopped) { setBulk(null); setBulkId(''); } return; }
-        const d = await r.json();
-        if (stopped) return;
-        setBulk(d);
-        if (d.status === 'running') timer = setTimeout(tick, 1200);
-      } catch {
-        if (!stopped) timer = setTimeout(tick, 2500);
-      }
-    };
-    tick();
-    return () => { stopped = true; clearTimeout(timer); };
-  }, [bulkId]);
 
   const activeHost = companions.find((c) => c.host_id === hostId);
   const roots = (activeHost && activeHost.roots) || [];
 
   // Breadcrumb trail from the current path: "⌂ Shared" → root → sub-folders.
   // Each crumb carries the absolute path it navigates to (goTo). Robust to
-  // both POSIX (/) and Windows (\\) separators.
+  // both POSIX (/) and Windows (\\) separators, roots that END in a separator
+  // (a whole shared drive is "C:\", so the old `startsWith(root + '\\')`
+  // check could never match its children), and Windows case-insensitivity.
+  // A drive-letter crumb always navigates to "C:\" — bare "C:" resolves
+  // relative to the drive's current directory on the Companion, which lands
+  // outside every share and 403s ("path is not inside a shared folder").
   const crumbs = useMemo(() => {
-    if (!cwd) return [];
-    const root = roots.find((r) => cwd === r.path
-      || cwd.startsWith(r.path + '/') || cwd.startsWith(r.path + '\\'));
+    const path = normPath(cwd);
+    if (!path) return [];
+    const sep = sepOf(path);
+    const fold = (s) => (sep === '\\' ? s.toLowerCase() : s);
+    const root = roots.find((r) => {
+      const rp = trimSep(normPath(r.path));
+      if (!rp) return false;
+      const q = trimSep(path);
+      return fold(q) === fold(rp) || fold(q).startsWith(fold(rp) + sep);
+    });
     const out = [];
-    let base = '';
-    let rest = cwd;
+    let acc = '';
+    let rest = path;
     if (root) {
-      out.push({ name: root.name, path: root.path });
-      base = root.path;
-      rest = cwd.slice(root.path.length).replace(/^[\\/]+/, '');
+      const rp = trimSep(normPath(root.path));
+      out.push({ name: root.name, path: normPath(root.path) });
+      acc = rp;
+      rest = trimSep(path).slice(rp.length).replace(/^[\\/]+/, '');
     }
-    if (rest) {
-      const sep = (base + cwd).includes('\\') && !(base + cwd).includes('/') ? '\\'
-        : (cwd.includes('/') ? '/' : '\\');
-      const parts = rest.split(/[\\/]+/).filter(Boolean);
-      let acc = base;
-      for (const part of parts) {
-        acc = acc ? acc + sep + part : part;
-        out.push({ name: part, path: acc });
-      }
+    for (const part of rest.split(/[\\/]+/).filter(Boolean)) {
+      acc = acc ? acc + sep + part : part;
+      out.push({ name: part, path: /^[a-zA-Z]:$/.test(acc) ? acc + '\\' : acc });
     }
     return out;
   }, [cwd, roots]);
 
+  // Is a path inside (or equal to) one of this Companion's shared roots?
+  const isUnderSomeRoot = (p) => roots.some((r) => {
+    const rp = trimSep(normPath(r.path));
+    const q = trimSep(normPath(p));
+    if (!rp || !q) return false;
+    const sep = sepOf(rp + q);
+    const fold = (s) => (sep === '\\' ? s.toLowerCase() : s);
+    return fold(q) === fold(rp) || fold(q).startsWith(fold(rp) + sep);
+  });
+
+  // Up one level, like a local file manager. From a shared root (or anywhere
+  // the parent would leave the shared area) it returns to the Shared view.
+  const goUp = () => {
+    if (!cwd) return;
+    const parent = parentOf(cwd);
+    goTo(parent && isUnderSomeRoot(parent) ? parent : '');
+  };
+
+  // ── Listing: cached, race-guarded, file-manager smooth ─────────────────────
+  // dirCache makes revisits (Up, breadcrumbs, back-and-forth) render
+  // INSTANTLY from the last listing while a background fetch refreshes it —
+  // the single biggest "feels local" win. listSeq drops stale responses so a
+  // slow fetch can never clobber a folder the user already left. The previous
+  // listing stays on screen (slightly dimmed) while the next loads, so
+  // navigation never flashes a skeleton.
+  const listSeq = useRef(0);
+  const dirCache = useRef(new Map());
+  const pendingSelectRef = useRef('');   // a pasted FILE path to select on arrival
+  const normEntries = (data) => (((data && data.entries) || [])).map(
+    (e) => ({ ...e, path: normPath(e.path) }));
+
   const listDir = useCallback(async (path) => {
     if (!hostId || !path) { setEntries([]); return; }
-    setListing(true); setListError('');
+    const seq = ++listSeq.current;
+    setListError('');
+    const cached = dirCache.current.get(path);
+    if (cached) setEntries(cached);
+    setListing(true);
     try {
       const res = await fetch(`/api/providers/companion-files/list?host_id=${encodeURIComponent(hostId)}&path=${encodeURIComponent(path)}`);
+      if (seq !== listSeq.current) return;      // user already moved on
       if (!res.ok) {
         const t = await res.text();
-        setListError(`Could not open folder (${res.status}) ${t.slice(0, 140)}`);
-        setEntries([]); return;
+        if (seq !== listSeq.current) return;
+        setListError(res.status === 403
+          ? 'That folder isn’t inside a shared folder — go back, or share it in the Companion app.'
+          : `Could not open folder (${res.status}) ${t.slice(0, 140)}`);
+        setEntries([]);
+        return;
       }
       const data = await res.json();
-      setEntries((data && data.entries) || []);
+      if (seq !== listSeq.current) return;
+      const list = normEntries(data);
+      dirCache.current.set(path, list);
+      setEntries(list);
+      // A pasted FILE path arrives via its parent folder — select + reveal it.
+      if (pendingSelectRef.current) {
+        const want = pendingSelectRef.current;
+        pendingSelectRef.current = '';
+        const hit = list.find((e) => samePath(e.path, want));
+        if (hit && !hit.is_dir) {
+          setSelectedPaths((prev) => { const n = new Set(prev); n.add(hit.path); return n; });
+          setImportMsg(`Selected “${hit.name}” — press Import to pull it in`);
+          setTimeout(() => {
+            try {
+              document.querySelector(`[data-fbpath="${CSS.escape(hit.path)}"]`)
+                ?.scrollIntoView({ block: 'center' });
+            } catch { /* CSS.escape unavailable — selection still applied */ }
+          }, 60);
+        }
+      }
     } catch (e) {
-      setListError(`${e}`); setEntries([]);
+      if (seq === listSeq.current) { setListError(`${e}`); setEntries([]); }
     } finally {
-      setListing(false);
+      if (seq === listSeq.current) setListing(false);
     }
   }, [hostId]);
 
   useEffect(() => { if (cwd) listDir(cwd); }, [cwd, listDir]);
-  const goTo = (path) => { setQuery(''); setCwd(path); };
+  const goTo = (path) => { setQuery(''); setImportMsg(''); setCwd(normPath(path)); };
+
+  // Open a typed/pasted path like a local file manager: quotes and \\?\
+  // prefixes are cleaned; a folder opens directly; a FILE opens its parent
+  // folder with the file selected and scrolled into view, ready to Import.
+  const openPath = async (raw) => {
+    const p = cleanPathInput(raw);
+    if (!p || !hostId) return;
+    setImportMsg('');
+    const listUrl = (q) => `/api/providers/companion-files/list?host_id=${encodeURIComponent(hostId)}&path=${encodeURIComponent(q)}`;
+    try {
+      const res = await fetch(listUrl(p));
+      if (res.ok) {
+        try { dirCache.current.set(p, normEntries(await res.json())); } catch { /* refetched on nav */ }
+        goTo(p);
+        return;
+      }
+      if (res.status === 400) {                 // "not a directory" → a file
+        const parent = parentOf(p);
+        if (parent) {
+          const r2 = await fetch(listUrl(parent));
+          if (r2.ok) {
+            try { dirCache.current.set(parent, normEntries(await r2.json())); } catch { /* ok */ }
+            pendingSelectRef.current = p;
+            goTo(parent);
+            return;
+          }
+        }
+      }
+      const t = await res.text();
+      setImportMsg(res.status === 403
+        ? `“${p}” isn’t inside a shared folder — share it in the Companion app first.`
+        : `Could not open “${p}” (${res.status}) ${t.slice(0, 100)}`);
+    } catch (e) { setImportMsg(`${e}`); }
+  };
 
   // Sort (dirs first, always A–Z) then filter by the live query.
   const shown = useMemo(() => {
@@ -304,7 +421,9 @@ export default function CompanionBrowser({ kind = 'video', onClose, onImported }
     files.sort(sorters[sortBy] || byName);
     const all = [...dirs, ...files];
     const q = query.trim().toLowerCase();
-    return q && !looksLikePath(query) ? all.filter((e) => (e.name || '').toLowerCase().includes(q)) : all;
+    // Pasted paths (including quoted ones) navigate — they never filter.
+    return q && !looksLikePath(cleanPathInput(query))
+      ? all.filter((e) => (e.name || '').toLowerCase().includes(q)) : all;
   }, [entries, sortBy, query]);
 
   const importable = (e) => !e.is_dir && exts.includes((e.ext || '').toLowerCase());
@@ -381,7 +500,6 @@ export default function CompanionBrowser({ kind = 'video', onClose, onImported }
     else mediaResults.forEach((r) => onImported && onImported(r));
   };
   const busy = !!importingPath || !!batchMsg;
-  const bulkRunning = !!(bulk && bulk.status === 'running');
 
   // Ask before bulk-importing a folder: count its videos first so the confirm
   // step can say exactly what will happen ("Import all 12 videos…").
@@ -413,22 +531,13 @@ export default function CompanionBrowser({ kind = 'video', onClose, onImported }
       });
       const data = await res.json();
       if (!res.ok) { setImportMsg(`Folder import failed: ${data.detail || res.status}`); return; }
-      setBulk(null);
-      setBulkId(data.bulk_id);
+      setBulkStartId(data.bulk_id);
     } catch (e) { setImportMsg(`Folder import failed: ${e}`); }
   };
 
-  const cancelBulk = async () => {
-    if (!bulkId) return;
-    try {
-      await fetch(`/api/providers/companion-files/import-folder/cancel?bulk_id=${encodeURIComponent(bulkId)}`, { method: 'POST' });
-    } catch { /* the next poll shows whatever really happened */ }
-  };
-
-  const dismissBulk = () => { setBulk(null); setBulkId(''); };
-
+  const pathQuery = cleanPathInput(query);
   const onSearchKey = (e) => {
-    if (e.key === 'Enter' && looksLikePath(query)) goTo(query.trim());
+    if (e.key === 'Enter' && looksLikePath(pathQuery)) openPath(pathQuery);
   };
 
   // ── Design tokens (mapped onto the app's theme vars so light + dark both
@@ -553,7 +662,7 @@ export default function CompanionBrowser({ kind = 'video', onClose, onImported }
     const sel = selectedPaths.has(e.path);
     const canImport = importable(e);
     return (
-      <div key={e.path}
+      <div key={e.path} data-fbpath={e.path}
         onClick={() => (e.is_dir ? goTo(e.path) : canImport && toggleSel(e.path))}
         style={{
           display: 'flex', alignItems: 'center', gap: 12, minHeight: 56, padding: '0 10px',
@@ -612,7 +721,7 @@ export default function CompanionBrowser({ kind = 'video', onClose, onImported }
     const sel = selectedPaths.has(e.path);
     const canImport = importable(e);
     return (
-      <div key={e.path}
+      <div key={e.path} data-fbpath={e.path}
         onClick={() => (e.is_dir ? goTo(e.path) : canImport && toggleSel(e.path))}
         style={{
           display: 'flex', flexDirection: 'column', borderRadius: 12, overflow: 'hidden',
@@ -664,14 +773,6 @@ export default function CompanionBrowser({ kind = 'video', onClose, onImported }
     color: 'var(--fb-tm)', padding: '10px 10px 4px',
   };
 
-  const spinner = (
-    <span style={{
-      width: 14, height: 14, flex: 'none', borderRadius: '50%', display: 'inline-block',
-      border: '2px solid var(--fb-track)', borderTopColor: 'var(--fb-accent)',
-      animation: 'fbSpin 0.8s linear infinite',
-    }} />
-  );
-
   // Confirm step before a bulk run — says exactly what will happen.
   const bulkConfirmCard = pendingBulk && (
     <div style={{
@@ -698,103 +799,6 @@ export default function CompanionBrowser({ kind = 'video', onClose, onImported }
     </div>
   );
 
-  const bulkItemGlyph = (it, active) => {
-    if (it.status === 'complete') return <span style={{ color: 'var(--fb-ok)', display: 'flex' }}><Ic.Check s={15} sw={2.4} /></span>;
-    if (it.status === 'failed' || it.status === 'no_space') return <span style={{ color: 'var(--fb-danger)', display: 'flex' }}><Ic.X s={15} sw={2.4} /></span>;
-    if (it.status === 'cancelled' || it.status === 'skipped') return <span style={{ color: 'var(--fb-tm)', fontSize: 13 }}>—</span>;
-    if (active) return spinner;
-    return <span style={{ color: 'var(--fb-tm)', fontSize: 13 }}>·</span>;
-  };
-
-  const bulkItemDetail = (it) => {
-    if (it.status === 'downloading') {
-      const pct = it.size > 0 ? Math.min(100, Math.round((it.done_bytes / it.size) * 100)) : null;
-      return pct == null ? 'Downloading…' : `Downloading ${pct}%`;
-    }
-    if (it.status === 'analyzing') {
-      return it.analysis_message || `Analyzing… ${it.analysis_progress != null ? `${it.analysis_progress}%` : ''}`;
-    }
-    if (it.status === 'no_space') return 'Out of disk space';
-    if (it.status === 'failed') return it.error || 'Failed';
-    if (it.status === 'skipped') return 'Skipped';
-    if (it.status === 'complete') return 'Done';
-    if (it.status === 'cancelled') return 'Cancelled';
-    return 'Queued';
-  };
-
-  // Live progress for a running (or just-finished) bulk folder import.
-  const bulkPanel = bulk && (() => {
-    const items = bulk.items || [];
-    const cur = items.find((it) => it.status === 'downloading' || it.status === 'analyzing');
-    // Overall bar: finished items + a fraction for the one in flight
-    // (download ≈ first 20 % of a video's wall-clock, analysis the rest).
-    let frac = 0;
-    if (cur) {
-      if (cur.status === 'downloading') frac = 0.2 * (cur.size > 0 ? cur.done_bytes / cur.size : 0);
-      else frac = 0.2 + 0.8 * (Math.min(100, cur.analysis_progress || 0) / 100);
-    }
-    const overallPct = bulk.total ? Math.min(100, Math.round(((bulk.done + frac) / bulk.total) * 100)) : 0;
-    const headline = bulk.status === 'running'
-      ? `Importing “${bulk.folder_name}” — video ${Math.min(bulk.done + 1, bulk.total)} of ${bulk.total}`
-      : bulk.status === 'complete'
-        ? `Folder import done — ${bulk.ok} of ${bulk.total} video${bulk.total === 1 ? '' : 's'} imported`
-        : bulk.status === 'out_of_space'
-          ? `Stopped — ClipAI ran out of disk space (${bulk.ok} of ${bulk.total} done)`
-          : bulk.status === 'cancelled'
-            ? `Folder import cancelled (${bulk.ok} of ${bulk.total} done)`
-            : `Folder import failed: ${bulk.error || 'unknown error'}`;
-    const headColor = bulk.status === 'out_of_space' || bulk.status === 'error'
-      ? 'var(--fb-danger)' : 'var(--fb-tp)';
-    return (
-      <div style={{
-        flex: 'none', margin: '6px 6px 8px', padding: '12px 14px', borderRadius: 12,
-        background: 'var(--fb-elev)', border: '1px solid var(--fb-border)',
-        display: 'flex', flexDirection: 'column', gap: 9,
-      }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-          {bulk.status === 'running' ? spinner : <span style={{ color: 'var(--fb-accent)', display: 'flex', flex: 'none' }}><Ic.Layers s={17} /></span>}
-          <span style={{ flex: 1, minWidth: 0, fontSize: 13.5, fontWeight: 600, color: headColor, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-            {headline}
-          </span>
-          {bulk.status === 'running' ? (
-            <button onClick={cancelBulk}
-              style={{ flex: 'none', fontSize: 12.5, fontWeight: 600, color: 'var(--fb-danger)', background: 'var(--fb-danger-dim)', padding: '6px 12px', borderRadius: 8, border: 'none', cursor: 'pointer' }}>
-              Cancel import
-            </button>
-          ) : (
-            <button onClick={dismissBulk}
-              style={{ flex: 'none', fontSize: 12.5, fontWeight: 500, color: 'var(--fb-ts)', background: 'transparent', padding: '6px 12px', borderRadius: 8, border: '1px solid var(--fb-border)', cursor: 'pointer' }}>
-              Dismiss
-            </button>
-          )}
-        </div>
-        <div style={{ height: 5, borderRadius: 3, background: 'var(--fb-track)', overflow: 'hidden' }}>
-          <div style={{ height: '100%', width: `${overallPct}%`, background: 'var(--fb-accent)', borderRadius: 3, transition: 'width 0.4s' }} />
-        </div>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 4, maxHeight: 168, overflowY: 'auto' }}>
-          {items.map((it) => {
-            const active = it.status === 'downloading' || it.status === 'analyzing';
-            return (
-              <div key={it.path} style={{ display: 'flex', alignItems: 'center', gap: 9, minHeight: 24 }}>
-                <span style={{ width: 16, flex: 'none', display: 'flex', justifyContent: 'center' }}>{bulkItemGlyph(it, active)}</span>
-                <span style={{ flex: 1, minWidth: 0, fontSize: 12.5, color: active ? 'var(--fb-tp)' : 'var(--fb-ts)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                  {it.name}
-                </span>
-                <span style={{ flex: 'none', maxWidth: '46%', fontFamily: 'var(--fb-mono)', fontSize: 11, color: it.status === 'failed' || it.status === 'no_space' ? 'var(--fb-danger)' : 'var(--fb-tm)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                  {bulkItemDetail(it)}
-                </span>
-              </div>
-            );
-          })}
-        </div>
-        {bulk.status === 'running' && (
-          <div style={{ fontSize: 11.5, color: 'var(--fb-tm)' }}>
-            Runs on the ClipAI server — you can close this window and check back later.
-          </div>
-        )}
-      </div>
-    );
-  })();
 
   return (
     <div onClick={onClose} style={{
@@ -848,8 +852,8 @@ export default function CompanionBrowser({ kind = 'video', onClose, onImported }
               placeholder={cwd ? 'Search this folder, or paste a path…' : 'Paste a full path and press Enter…'}
               style={{ flex: 1, minWidth: 0, background: 'transparent', border: 'none', outline: 'none', color: 'var(--fb-tp)', fontSize: 15 }}
             />
-            {looksLikePath(query) && (
-              <button onClick={() => goTo(query.trim())} style={{ display: 'flex', alignItems: 'center', gap: 5, background: 'var(--fb-accent)', color: '#fff', fontSize: 13, fontWeight: 600, padding: '6px 12px', borderRadius: 8, border: 'none', cursor: 'pointer' }}>Go</button>
+            {looksLikePath(pathQuery) && (
+              <button onClick={() => openPath(pathQuery)} style={{ display: 'flex', alignItems: 'center', gap: 5, background: 'var(--fb-accent)', color: '#fff', fontSize: 13, fontWeight: 600, padding: '6px 12px', borderRadius: 8, border: 'none', cursor: 'pointer' }}>Go</button>
             )}
           </div>
         </div>
@@ -884,6 +888,12 @@ export default function CompanionBrowser({ kind = 'video', onClose, onImported }
         {/* Breadcrumb + view toggle */}
         <div style={{ flex: 'none', display: 'flex', alignItems: 'center', gap: 10, padding: '9px 16px', borderBottom: '1px solid var(--fb-border)', minHeight: 46 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 2, flex: 1, minWidth: 0, overflow: 'hidden' }}>
+            {cwd && (
+              <button onClick={goUp} title="Up one level" aria-label="Up one level"
+                style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', width: 30, height: 30, borderRadius: 7, color: 'var(--fb-ts)', background: 'transparent', border: 'none', cursor: 'pointer', flex: 'none' }}>
+                <Ic.ArrowUp s={16} />
+              </button>
+            )}
             <button onClick={() => goTo('')} title="Shared folders"
               style={{ display: 'flex', alignItems: 'center', gap: 4, padding: '5px 8px', borderRadius: 7, color: cwd ? 'var(--fb-ts)' : 'var(--fb-tp)', background: cwd ? 'transparent' : 'var(--fb-elev)', border: 'none', cursor: 'pointer', flex: 'none' }}>
               <Ic.Home s={16} /><span style={{ fontSize: 13.5, fontWeight: 600 }}>Shared</span>
@@ -921,7 +931,9 @@ export default function CompanionBrowser({ kind = 'video', onClose, onImported }
         {/* Body */}
         <div style={{ flex: 1, overflowY: 'auto', padding: '6px 8px 8px', display: 'flex', flexDirection: 'column', gap: 1 }}>
           {bulkConfirmCard}
-          {bulkPanel}
+          {kind === 'video' && (
+            <BulkImportPanel startId={bulkStartId} onRunningChange={setBulkRunning} />
+          )}
           {loading ? skeleton
           : rootsError && !roots.length ? (
             <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 8, padding: '40px 16px', textAlign: 'center' }}>
@@ -946,7 +958,7 @@ export default function CompanionBrowser({ kind = 'video', onClose, onImported }
                 </div>
               : <div style={{ padding: 24, textAlign: 'center', color: 'var(--fb-tm)', fontSize: 13 }}>This Companion has no shared folders. Add one in the Companion app.</div>
           )
-          : listing ? skeleton
+          : listing && !entries.length ? skeleton
           : listError ? (
             <div style={{ padding: 24, textAlign: 'center', color: 'var(--fb-tm)', fontSize: 13 }}>{listError}</div>
           )
@@ -954,11 +966,11 @@ export default function CompanionBrowser({ kind = 'video', onClose, onImported }
             <div style={{ padding: 40, textAlign: 'center', color: 'var(--fb-tm)', fontSize: 13 }}>{query ? 'No matches.' : 'Empty folder.'}</div>
           )
           : view === 'grid' ? (
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(150px, 1fr))', gap: 12, padding: '4px 2px' }}>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(150px, 1fr))', gap: 12, padding: '4px 2px', opacity: listing ? 0.6 : 1, transition: 'opacity 120ms' }}>
               {shown.map(gridCard)}
             </div>
           ) : (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>{shown.map(listRow)}</div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 1, opacity: listing ? 0.6 : 1, transition: 'opacity 120ms' }}>{shown.map(listRow)}</div>
           )}
         </div>
 

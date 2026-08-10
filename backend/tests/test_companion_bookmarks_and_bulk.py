@@ -95,6 +95,33 @@ def test_bookmark_hosts_are_separate_and_name_defaults_to_basename():
     assert [m["name"] for m in b] == ["movies"]
 
 
+def test_bookmark_normalizes_windows_verbatim_paths():
+    # Adds store the CLEAN path even when the client sends the \\?\ form…
+    asyncio.run(S.companion_bookmark_add(S.CompanionBookmarkRequest(
+        host_id="h1", path="\\\\?\\C:\\Users\\jalon\\Videos")))
+    marks = asyncio.run(S.companion_bookmarks_list("h1"))["bookmarks"]
+    assert marks[0]["path"] == "C:\\Users\\jalon\\Videos"
+    assert marks[0]["name"] == "Videos"
+    # …and re-adding the clean form dedupes instead of duplicating.
+    asyncio.run(S.companion_bookmark_add(S.CompanionBookmarkRequest(
+        host_id="h1", path="C:\\Users\\jalon\\Videos")))
+    assert len(asyncio.run(S.companion_bookmarks_list("h1"))["bookmarks"]) == 1
+
+
+def test_legacy_verbatim_bookmark_reads_clean_and_can_be_unstarred():
+    # A bookmark file written by an older build with the raw \\?\ path.
+    S._save_bookmarks({"h1": [
+        {"path": "\\\\?\\C:\\Antigravity IDE", "name": "Antigravity IDE",
+         "is_dir": True, "added_ms": 1},
+        {"path": "\\\\?\\UNC\\nas\\media", "name": "media", "is_dir": True, "added_ms": 2},
+    ]})
+    marks = asyncio.run(S.companion_bookmarks_list("h1"))["bookmarks"]
+    assert [m["path"] for m in marks] == ["C:\\Antigravity IDE", "\\\\nas\\media"]
+    # Un-starring with the CLEAN path removes the legacy entry.
+    out = asyncio.run(S.companion_bookmark_remove("h1", "C:\\Antigravity IDE"))
+    assert [m["path"] for m in out["bookmarks"]] == ["\\\\nas\\media"]
+
+
 def test_bookmark_rejects_empty_path():
     with pytest.raises(HTTPException) as e:
         asyncio.run(S.companion_bookmark_add(S.CompanionBookmarkRequest(

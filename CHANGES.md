@@ -1,3 +1,53 @@
+# ClipAI — Companion importer feels local; bulk import on the Dashboard; multi-select transcripts
+
+Three user-visible fixes/features from a real session's screenshots.
+
+**1. The import dialog now behaves like a local file browser.** The reported
+breakage — breadcrumb reading `Shared > ? > C:` and "path is not inside a
+shared folder (403)" when going up a folder — was Windows "verbatim" path
+prefixes (`\\?\C:\…`) leaking out of the Companion's canonicalized listings,
+plus two breadcrumb-builder bugs (roots ending in a separator never matched
+their children; a bare `C:` drive crumb resolves drive-relative on Windows
+and lands outside every share). Fixed at every layer:
+
+- Companion (v0.11.10): `strip_verbatim` cleans every path `/v1/files/list`
+  returns (`\\?\C:\…` → `C:\…`, `\\?\UNC\srv\…` → `\\srv\…`).
+- Frontend: normalizes verbatim prefixes at every edge (listings, roots,
+  bookmarks, pasted input) so it's fixed even with an older Companion
+  installed; breadcrumbs rebuilt (root-anchored, separator-suffixed roots,
+  case-insensitive on Windows, drive crumbs always `C:\`).
+- Backend: bookmark paths normalized on read/write/delete — legacy
+  `\\?\`-prefixed bookmarks display clean and can finally be un-starred.
+- New affordances: an **Up** button (goes to the parent; from a shared root,
+  back to the Shared view — never outside the share), pasted paths accept
+  quotes (Windows "Copy as path") and **file** paths (opens the parent
+  folder with the file selected + scrolled into view, ready to Import),
+  listings are cached so revisits render instantly while refreshing in the
+  background, the previous listing stays (dimmed) during navigation instead
+  of flashing a skeleton, and the 403 message explains itself.
+
+**2. Bulk import status lives on the Dashboard now, not just in the popup.**
+The progress panel was extracted into a shared, self-discovering
+`BulkImportPanel` (finds a running import via `/import-folder/active`, polls,
+cancel/dismiss) mounted on the Dashboard AND inside the import dialog. Close
+the popup, navigate away, or open ClipAI from another device — the running
+import is right there, each item linking to its `/analysis/<job_id>` page.
+
+**3. Multi-select transcript download.** The Dashboard's existing
+multi-select gains "Transcripts (SRT)" and "Transcripts (TXT)": one ZIP with
+a `.srt`/`.txt` per selected video (translated track preferred, same
+sanitize + fps treatment as the single-file download; duplicates deduped
+`clip (2).srt`; transcript-less videos listed in `_skipped.txt` instead of
+failing the batch) via new `POST /api/jobs/transcripts/archive`.
+
+- Verified: 6 new archive tests, 2 new bookmark-normalization tests (18
+  total in that suite), 9 CompanionBrowser tests including verbatim
+  breadcrumbs / Up walking / quoted-file-path selection; full frontend suite
+  158 passed + build clean; companion `strip_verbatim` unit test + proxy e2e
+  green; version-sync suite green on 0.11.10.
+
+---
+
 # ClipAI — Build: `sharing=locked` cache mounts wedge forever; use `private`
 
 With the stall watchdog in place the failure finally became legible: two
