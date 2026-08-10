@@ -1,3 +1,46 @@
+# ClipAI — Companion importer: path bookmarks + sequential bulk folder import
+
+Two quality-of-life features for the "Import a file" dialog that browses a
+paired GPU Companion's shared folders (Upload page and Media Library).
+
+- **Bookmark / star paths.** Folders can now be starred from the file list
+  (list rows, grid cards, and the breadcrumb bar's star for the folder you're
+  in). Starred paths appear in a "Bookmarks" section at the top of the Shared
+  home view — one click jumps straight to a deep path like
+  `D:\media\shows\S2`. Bookmarks persist **server-side** per Companion
+  (`companion_bookmarks.json` in the data dir, keyed by `host_id`, capped at
+  100, newest first), so they survive container restarts and follow the user
+  across browsers/devices, unlike localStorage. New endpoints:
+  `GET/POST/DELETE /api/providers/companion-files/bookmarks`.
+- **Bulk folder import — one video at a time.** Folder rows (and the toolbar,
+  for the folder being viewed) gain an "Import all" action for video imports.
+  After a confirm step that names the exact count, ClipAI runs the folder
+  SEQUENTIALLY: download video N over the LAN (same parallel-Range fast path
+  as single imports, with progress heartbeats to the Companion GUI), create
+  the job with the dialog's language picks, and **await the full analysis
+  pipeline** (transcription → translation → clips) before video N+1 even
+  starts downloading. Before each video a free-space gate checks the /data
+  volume (file size × 1.5 + a 2 GB floor); when the ClipAI device runs out
+  of space the run stops honestly — that video is marked "no space", the
+  rest "skipped", and the panel says so. One failed video is recorded and
+  skipped over; the batch keeps going. Cancel aborts an in-flight download
+  immediately and signals the currently-analyzing job.
+  New endpoints: `POST /api/providers/companion-files/import-folder`, plus
+  `/progress`, `/cancel`, and `/active`. The run lives on the server: closing
+  the dialog doesn't stop it, and reopening re-attaches to the live progress
+  panel via `/active`. Only one bulk run at a time (409 otherwise) — that's
+  the sequential contract.
+- No Companion app changes needed: both features ride the existing
+  `/v1/files/roots|list|read` share endpoints.
+- Verified: 16 new backend tests (bookmark CRUD/persistence/cap, strict
+  one-at-a-time ordering, out-of-space stop, failed-video continuation,
+  cancel mid-download and mid-analysis, progress/active endpoints) and 5 new
+  CompanionBrowser component tests; full frontend suite 154 passed, settings
+  router suites green (the 2 pre-existing `test_companion_register` failures
+  reproduce identically on the base commit).
+
+---
+
 # ClipAI — Profiled-run fixes: kill the u2netp tax, grammar-lock translation, canonical names
 
 Driven by a real 24:27 anime run (640x360, GTX 1650 + 12 GB Companion) that

@@ -1553,6 +1553,418 @@ async def companion_import_progress(import_id: str):
     return st
 
 
+# ── Companion path bookmarks ────────────────────────────────────────────────
+# Starred paths in the Companion file browser, persisted server-side (per
+# deployment, keyed by Companion host_id) so they survive container restarts
+# and follow the user across browsers/devices — unlike localStorage.
+
+_BOOKMARKS_PATH = os.path.join(_DATA_DIR, "companion_bookmarks.json")
+_BOOKMARKS_MAX_PER_HOST = 100
+_bookmarks_lock = threading.Lock()
+
+
+def _load_bookmarks() -> dict:
+    """``{host_id: [{path, name, is_dir, added_ms}, …]}`` — {} when missing/corrupt."""
+    try:
+        with open(_BOOKMARKS_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_bookmarks(data: dict) -> None:
+    tmp = _BOOKMARKS_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, _BOOKMARKS_PATH)
+
+
+class CompanionBookmarkRequest(BaseModel):
+    host_id: str
+    path: str
+    name: str = ""
+    is_dir: bool = True
+
+
+@router.get("/providers/companion-files/bookmarks")
+async def companion_bookmarks_list(host_id: str):
+    """The starred paths for one Companion (newest first)."""
+    with _bookmarks_lock:
+        marks = _load_bookmarks().get(host_id, [])
+    return {"bookmarks": marks}
+
+
+@router.post("/providers/companion-files/bookmarks")
+async def companion_bookmark_add(req: CompanionBookmarkRequest):
+    """Star a path. Idempotent on (host_id, path); newest stars sort first."""
+    path = (req.path or "").strip()
+    if not req.host_id or not path:
+        raise HTTPException(status_code=400, detail="host_id and path are required")
+    name = (req.name or "").strip() or os.path.basename(path.replace("\\", "/").rstrip("/\\")) or path
+    with _bookmarks_lock:
+        data = _load_bookmarks()
+        marks = [m for m in data.get(req.host_id, []) if m.get("path") != path]
+        marks.insert(0, {"path": path, "name": name, "is_dir": bool(req.is_dir),
+                         "added_ms": int(time.time() * 1000)})
+        data[req.host_id] = marks[:_BOOKMARKS_MAX_PER_HOST]
+        _save_bookmarks(data)
+        marks = data[req.host_id]
+    return {"ok": True, "bookmarks": marks}
+
+
+@router.delete("/providers/companion-files/bookmarks")
+async def companion_bookmark_remove(host_id: str, path: str):
+    """Un-star a path. Removing an unknown path is a no-op, not an error."""
+    with _bookmarks_lock:
+        data = _load_bookmarks()
+        marks = [m for m in data.get(host_id, []) if m.get("path") != path]
+        data[host_id] = marks
+        _save_bookmarks(data)
+    return {"ok": True, "bookmarks": marks}
+
+
+# ── Bulk folder import (sequential) ─────────────────────────────────────────
+# "Import every video in this shared folder": ClipAI pulls + fully analyzes
+# them ONE AT A TIME (download → transcribe → translate → clips for video N
+# completes before video N+1 even starts downloading), until the folder is
+# done or the ClipAI device runs out of disk space. State lives in memory and
+# survives the dialog being closed; the browser re-attaches via /active.
+
+_BULK_VIDEO_EXTS = {"mp4", "mov", "mkv", "avi", "webm", "m4v", "mpg", "mpeg", "wmv", "flv"}
+_BULK_KEEP_TERMINAL = 8            # finished runs kept for the summary screen
+_BULK_DISK_FLOOR = 2 * 1024 ** 3   # always leave ≥ 2 GB free on /data
+_bulk_imports: dict = {}           # bulk_id -> state (insertion-ordered)
+
+
+class CompanionFolderImportRequest(BaseModel):
+    host_id: str
+    path: str
+    # Same semantics as the single-file import: empty source = auto-detect,
+    # empty target = keep the original language.
+    source_language: str = ""
+    target_language: str = ""
+
+
+class _BulkCancelled(Exception):
+    """Raised inside the download progress callback to abort mid-transfer."""
+
+
+def _bulk_data_root() -> str:
+    """Volume the imports land on — what the free-space check must watch."""
+    return "/data" if os.path.isdir("/data") else "."
+
+
+def _bulk_disk_free() -> int:
+    import shutil
+    try:
+        return shutil.disk_usage(_bulk_data_root()).free
+    except Exception:
+        return 0
+
+
+# Thin awaitable seams around the heavy pipeline/database modules so the bulk
+# runner is unit-testable without importing torch & friends.
+async def _bulk_save_job(job) -> None:
+    from backend import database as _db
+    await _db.save_job(job)
+
+
+async def _bulk_job_state(job_id: str) -> tuple:
+    """(status_value, error) of a job after its analysis run finished."""
+    from backend import database as _db
+    job = await _db.load_job(job_id)
+    if job is None:
+        return ("failed", "job vanished from the database")
+    status = getattr(job.status, "value", job.status)
+    return (str(status), getattr(job, "error", "") or "")
+
+
+async def _bulk_run_analysis(job_id: str) -> None:
+    from backend.services.pipeline import run_analysis
+    await run_analysis(job_id)     # never raises: failures land on the job row
+
+
+def _bulk_request_job_cancel(job_id: str) -> None:
+    try:
+        from backend.services.pipeline import request_cancel
+        request_cancel(job_id)
+    except Exception:
+        pass
+
+
+async def _companion_list_videos(h, path: str) -> list:
+    """The importable videos directly inside one shared folder (A–Z)."""
+    from backend.services import ollama_registry as _oreg
+    base = _oreg.companion_base(h)
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(_oreg.join_url(base, "/v1/files/list"),
+                                 params={"path": path}, headers=_oreg.auth_headers(h))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"companion unreachable: {e}")
+    if r.status_code != 200:
+        raise HTTPException(status_code=r.status_code, detail=r.text[:200])
+    entries = ((r.json() or {}).get("entries")) or []
+    vids = [e for e in entries
+            if not e.get("is_dir") and (e.get("ext") or "").lower() in _BULK_VIDEO_EXTS]
+    vids.sort(key=lambda e: (e.get("name") or "").lower())
+    return vids
+
+
+def _bulk_prune_terminal() -> None:
+    done = [k for k, s in _bulk_imports.items() if s.get("status") != "running"]
+    for k in done[:-_BULK_KEEP_TERMINAL]:
+        _bulk_imports.pop(k, None)
+
+
+async def _run_bulk_import(bulk_id: str) -> None:
+    """The sequential worker: for each queued video — free-space check,
+    download from the Companion, create the job, and AWAIT the full analysis
+    pipeline before touching the next file. One failed video is recorded and
+    skipped over; exhausted disk stops the whole batch."""
+    st = _bulk_imports.get(bulk_id)
+    if st is None:
+        return
+    from datetime import datetime, timezone
+    from backend.services import ollama_registry as _oreg
+    from backend.models import JobResult, JobStatus
+
+    h = _companion_by_id(st["host_id"])
+    if h is None:
+        st.update(status="error", error="companion not found or not connected")
+        return
+    base = _oreg.companion_base(h)
+    read_url = _oreg.join_url(base, "/v1/files/read")
+    headers = _oreg.auth_headers(h)
+    comp_token = getattr(h, "token", "") or ""
+    total = len(st["items"])
+
+    def _skip_rest(from_idx: int) -> None:
+        for later in st["items"][from_idx:]:
+            if later["status"] == "queued":
+                later["status"] = "skipped"
+
+    for i, item in enumerate(st["items"]):
+        if st.get("cancel"):
+            st["status"] = "cancelled"
+            _skip_rest(i)
+            st["current"] = -1
+            return
+        st["current"] = i
+
+        # Free-space gate: the file itself + pipeline scratch (audio WAV,
+        # frames — the pipeline's own pre-check budgets ~30 % of the file
+        # size) while always keeping the floor untouched.
+        need = int(int(item.get("size") or 0) * 1.5) + _BULK_DISK_FLOOR
+        if _bulk_disk_free() < need:
+            item["status"] = "no_space"
+            item["error"] = "not enough free disk space on the ClipAI device"
+            st["status"] = "out_of_space"
+            _skip_rest(i + 1)
+            st["current"] = -1
+            logger.warning("Bulk import %s stopped: out of disk space at %s (%d of %d done)",
+                           bulk_id, item.get("name"), st["ok"], total)
+            return
+
+        import shutil as _sh
+        job_id = str(uuid.uuid4())
+        job_dir = os.path.join(_bulk_data_root(), "uploads", job_id)
+        os.makedirs(job_dir, exist_ok=True)
+        filename = item.get("name") or os.path.basename((item.get("path") or "").replace("\\", "/")) or "import.bin"
+        # Canonical pipeline path (video.<ext>) — same as the single import.
+        _ext = (os.path.splitext(filename)[1].lstrip(".").lower() or "mp4")
+        dest = os.path.join(job_dir, f"video.{_ext}")
+
+        item["status"] = "downloading"
+        _total = int(item.get("size") or 0)
+        _hb = {"t": 0.0, "pct": -1}
+
+        def _on_done(n, _item=item, _t=_total, _jid=job_id, _fn=filename, _idx=i, _hb=_hb):
+            _item["done_bytes"] = n
+            if st.get("cancel"):
+                raise _BulkCancelled()
+            try:
+                pct = int(n * 100 / _t) if _t else 0
+                now = time.monotonic()
+                if now - _hb["t"] >= 1.5 and pct != _hb["pct"]:
+                    _hb["t"] = now
+                    _hb["pct"] = pct
+                    asyncio.create_task(_post_import_hb(
+                        base, comp_token, _jid,
+                        f"Importing {_fn} ({_idx + 1}/{total})", "downloading to ClipAI", pct))
+            except Exception:
+                pass
+
+        try:
+            size = await _companion_download(
+                read_url, {"path": item["path"]}, headers, dest, _total, _on_done)
+            if size == 0:
+                raise RuntimeError("imported file is empty")
+        except _BulkCancelled:
+            _sh.rmtree(job_dir, ignore_errors=True)
+            item["status"] = "cancelled"
+            st["status"] = "cancelled"
+            _skip_rest(i + 1)
+            st["current"] = -1
+            return
+        except Exception as e:
+            _sh.rmtree(job_dir, ignore_errors=True)
+            item["status"] = "failed"
+            item["error"] = str(e)[:200]
+            st["failed"] += 1
+            st["done"] += 1
+            continue
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        job = JobResult(
+            job_id=job_id, filename=filename, file_path=dest,
+            file_size_mb=round(size / (1024 * 1024), 2),
+            status=JobStatus.QUEUED, progress=0,
+            progress_message=f"Imported from Companion folder ({i + 1} of {total}), waiting for analysis",
+            created_at=now_iso, updated_at=now_iso,
+            language=(st.get("source_language") or "").strip().lower(),
+            subtitle_language=(st.get("target_language") or "").strip().lower(),
+        )
+        try:
+            await _bulk_save_job(job)
+        except Exception as e:
+            _sh.rmtree(job_dir, ignore_errors=True)
+            item["status"] = "failed"
+            item["error"] = f"could not create job: {str(e)[:160]}"
+            st["failed"] += 1
+            st["done"] += 1
+            continue
+        item["job_id"] = job_id
+        item["status"] = "analyzing"
+
+        # THE sequential barrier: run_analysis resolves only when this video's
+        # whole pipeline (transcription → translation → clips) has finished.
+        try:
+            await _bulk_run_analysis(job_id)
+            status, err = await _bulk_job_state(job_id)
+        except Exception as e:                       # defensive; run_analysis is fail-soft
+            status, err = ("failed", str(e)[:200])
+        if status == "complete":
+            item["status"] = "complete"
+            st["ok"] += 1
+        elif status == "cancelled" and st.get("cancel"):
+            item["status"] = "cancelled"
+            st["status"] = "cancelled"
+            _skip_rest(i + 1)
+            st["current"] = -1
+            st["done"] += 1
+            return
+        else:
+            # Individually-cancelled or failed job: record it, keep the batch going.
+            item["status"] = "failed"
+            item["error"] = (err or f"analysis ended with status {status}")[:200]
+            st["failed"] += 1
+        st["done"] += 1
+
+    st["current"] = -1
+    st["status"] = "cancelled" if st.get("cancel") else "complete"
+    logger.info("Bulk import %s finished: %d ok, %d failed of %d",
+                bulk_id, st["ok"], st["failed"], total)
+
+
+@router.post("/providers/companion-files/import-folder")
+async def companion_folder_import(req: CompanionFolderImportRequest):
+    """Start a sequential bulk import of every video directly inside one
+    Companion shared folder. Returns a ``bulk_id`` to poll; the run continues
+    server-side even if the browser dialog is closed."""
+    h = _companion_by_id(req.host_id)
+    if h is None:
+        raise HTTPException(status_code=404, detail="companion not found or not connected")
+    if any(s.get("status") == "running" for s in _bulk_imports.values()):
+        raise HTTPException(status_code=409,
+                            detail="a folder import is already running — wait for it to finish or cancel it")
+    videos = await _companion_list_videos(h, req.path)
+    if not videos:
+        raise HTTPException(status_code=400, detail="no videos found in this folder")
+
+    bulk_id = uuid.uuid4().hex[:12]
+    folder = (req.path or "").rstrip("/\\")
+    st = {
+        "bulk_id": bulk_id,
+        "host_id": req.host_id,
+        "folder": req.path,
+        "folder_name": os.path.basename(folder.replace("\\", "/")) or folder,
+        "status": "running",
+        "error": "",
+        "total": len(videos),
+        "done": 0, "ok": 0, "failed": 0,
+        "current": -1,
+        "cancel": False,
+        "started_ms": int(time.time() * 1000),
+        "source_language": req.source_language,
+        "target_language": req.target_language,
+        "items": [{
+            "name": v.get("name") or "",
+            "path": v.get("path") or "",
+            "size": int(v.get("size") or 0),
+            "status": "queued",
+            "job_id": "",
+            "error": "",
+            "done_bytes": 0,
+        } for v in videos],
+    }
+    _bulk_prune_terminal()
+    _bulk_imports[bulk_id] = st
+    asyncio.create_task(_run_bulk_import(bulk_id))
+    logger.info("Bulk import %s started: %d video(s) from %s", bulk_id, len(videos), req.path)
+    return {"ok": True, "bulk_id": bulk_id, "total": len(videos), "folder": req.path}
+
+
+@router.get("/providers/companion-files/import-folder/progress")
+async def companion_folder_import_progress(bulk_id: str):
+    """Live state of a bulk import. While a video is analyzing, its item is
+    enriched with the job's pipeline progress so the dialog can show one
+    honest bar per stage (downloading % → analysis %)."""
+    st = _bulk_imports.get(bulk_id)
+    if st is None:
+        raise HTTPException(status_code=404, detail="unknown bulk import")
+    out = {k: v for k, v in st.items() if k != "cancel"}
+    out["items"] = [dict(it) for it in st["items"]]
+    for it in out["items"]:
+        if it["status"] == "analyzing" and it.get("job_id"):
+            try:
+                from backend import database as _db
+                job = await _db.load_job(it["job_id"])
+                if job is not None:
+                    it["analysis_progress"] = int(getattr(job, "progress", 0) or 0)
+                    it["analysis_message"] = getattr(job, "progress_message", "") or ""
+            except Exception:
+                pass
+    return out
+
+
+@router.post("/providers/companion-files/import-folder/cancel")
+async def companion_folder_import_cancel(bulk_id: str):
+    """Stop a bulk import: aborts an in-flight download immediately, cancels
+    the currently-analyzing job, and skips everything still queued."""
+    st = _bulk_imports.get(bulk_id)
+    if st is None:
+        raise HTTPException(status_code=404, detail="unknown bulk import")
+    st["cancel"] = True
+    cur = st.get("current", -1)
+    if 0 <= cur < len(st["items"]):
+        it = st["items"][cur]
+        if it.get("status") == "analyzing" and it.get("job_id"):
+            _bulk_request_job_cancel(it["job_id"])
+    return {"ok": True}
+
+
+@router.get("/providers/companion-files/import-folder/active")
+async def companion_folder_import_active():
+    """The currently-running bulk import, if any — lets a reopened dialog
+    re-attach to a run started earlier (it keeps going server-side)."""
+    for bulk_id, s in reversed(list(_bulk_imports.items())):
+        if s.get("status") == "running":
+            return {"bulk_id": bulk_id}
+    return {"bulk_id": None}
+
+
 @router.post("/providers/test/{provider_name}")
 async def test_provider(provider_name: str):
     """Live-test a provider by making a real API call and returning detailed status."""

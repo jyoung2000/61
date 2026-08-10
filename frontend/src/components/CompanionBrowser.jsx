@@ -7,6 +7,13 @@ import { LANGUAGES } from '../constants/languages';
 // becomes a queued job (with a live progress bar while it downloads over the
 // LAN); media/fonts land in the library.
 //
+// Folders can be starred (bookmarks persist server-side per Companion, so
+// they survive restarts and follow the user across browsers), and — for
+// videos — a whole folder can be bulk-imported: ClipAI downloads + fully
+// analyzes each video ONE AT A TIME until the folder is done or the device
+// runs out of disk space. The bulk run lives on the server, so closing this
+// dialog doesn't stop it; reopening re-attaches to the live progress.
+//
 // Props:
 //   kind: 'video' | 'media' | 'font'
 //   onClose(): void
@@ -33,6 +40,8 @@ const Ic = {
   FileText: (p) => <Svg {...p}><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7z" /><path d="M14 2v5h5" /><path d="M9 13h6" /><path d="M9 17h6" /></Svg>,
   HardDrive: (p) => <Svg {...p}><path d="M22 12H2" /><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z" /><path d="M6 16h.01" /><path d="M10 16h.01" /></Svg>,
   Home: (p) => <Svg {...p}><path d="M3 9.5 12 3l9 6.5" /><path d="M5 10v10a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V10" /></Svg>,
+  Star: (p) => <Svg {...p}><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" /></Svg>,
+  Layers: (p) => <Svg {...p}><path d="m12 2 9 4.9-9 4.9-9-4.9z" /><path d="m3 11.9 9 4.9 9-4.9" /><path d="m3 16.9 9 4.9 9-4.9" /></Svg>,
 };
 
 const VIDEO_EXT = ['mp4', 'mov', 'mkv', 'avi', 'webm', 'm4v', 'mpg', 'mpeg', 'wmv', 'flv'];
@@ -140,6 +149,12 @@ export default function CompanionBrowser({ kind = 'video', onClose, onImported }
     setTargetLang(v);
     try { localStorage.setItem('companionImportTargetLang', v); } catch { /* private mode */ }
   };
+  // Starred paths for the active Companion (server-persisted).
+  const [bookmarks, setBookmarks] = useState([]);
+  // Bulk folder import: confirm step → live server state (polled).
+  const [pendingBulk, setPendingBulk] = useState(null); // {path, name, count}
+  const [bulkId, setBulkId] = useState('');
+  const [bulk, setBulk] = useState(null);
 
   useEffect(() => {
     (async () => {
@@ -159,6 +174,65 @@ export default function CompanionBrowser({ kind = 'video', onClose, onImported }
       }
     })();
   }, []);
+
+  // Load this Companion's bookmarks whenever the active host changes.
+  useEffect(() => {
+    if (!hostId) { setBookmarks([]); return; }
+    (async () => {
+      try {
+        const r = await fetch(`/api/providers/companion-files/bookmarks?host_id=${encodeURIComponent(hostId)}`);
+        if (r.ok) { const d = await r.json(); setBookmarks((d && d.bookmarks) || []); }
+      } catch { /* fail-soft — the browser works fine without bookmarks */ }
+    })();
+  }, [hostId]);
+
+  const bookmarkedPaths = useMemo(() => new Set(bookmarks.map((b) => b.path)), [bookmarks]);
+  const isMarked = (p) => bookmarkedPaths.has(p);
+  const toggleBookmark = async (path, name) => {
+    try {
+      const r = isMarked(path)
+        ? await fetch(`/api/providers/companion-files/bookmarks?host_id=${encodeURIComponent(hostId)}&path=${encodeURIComponent(path)}`, { method: 'DELETE' })
+        : await fetch('/api/providers/companion-files/bookmarks', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ host_id: hostId, path, name: name || '', is_dir: true }),
+          });
+      if (r.ok) { const d = await r.json(); setBookmarks((d && d.bookmarks) || []); }
+    } catch { /* fail-soft */ }
+  };
+
+  // Re-attach to a bulk import already running on the server (e.g. the user
+  // closed and reopened this dialog mid-run).
+  useEffect(() => {
+    if (kind !== 'video') return;
+    (async () => {
+      try {
+        const r = await fetch('/api/providers/companion-files/import-folder/active');
+        const d = await r.json();
+        if (d && d.bulk_id) setBulkId(d.bulk_id);
+      } catch { /* fail-soft */ }
+    })();
+  }, [kind]);
+
+  // Poll the bulk run while it's active.
+  useEffect(() => {
+    if (!bulkId) return undefined;
+    let stopped = false;
+    let timer = 0;
+    const tick = async () => {
+      try {
+        const r = await fetch(`/api/providers/companion-files/import-folder/progress?bulk_id=${encodeURIComponent(bulkId)}`);
+        if (r.status === 404) { if (!stopped) { setBulk(null); setBulkId(''); } return; }
+        const d = await r.json();
+        if (stopped) return;
+        setBulk(d);
+        if (d.status === 'running') timer = setTimeout(tick, 1200);
+      } catch {
+        if (!stopped) timer = setTimeout(tick, 2500);
+      }
+    };
+    tick();
+    return () => { stopped = true; clearTimeout(timer); };
+  }, [bulkId]);
 
   const activeHost = companions.find((c) => c.host_id === hostId);
   const roots = (activeHost && activeHost.roots) || [];
@@ -307,6 +381,51 @@ export default function CompanionBrowser({ kind = 'video', onClose, onImported }
     else mediaResults.forEach((r) => onImported && onImported(r));
   };
   const busy = !!importingPath || !!batchMsg;
+  const bulkRunning = !!(bulk && bulk.status === 'running');
+
+  // Ask before bulk-importing a folder: count its videos first so the confirm
+  // step can say exactly what will happen ("Import all 12 videos…").
+  const requestBulk = async (path, name) => {
+    if (bulkRunning || pendingBulk) return;
+    setImportMsg('');
+    try {
+      const r = await fetch(`/api/providers/companion-files/list?host_id=${encodeURIComponent(hostId)}&path=${encodeURIComponent(path)}`);
+      if (!r.ok) { setImportMsg(`Could not open folder (${r.status})`); return; }
+      const d = await r.json();
+      const count = (((d && d.entries) || [])).filter(
+        (e) => !e.is_dir && VIDEO_EXT.includes((e.ext || '').toLowerCase())).length;
+      if (!count) { setImportMsg('No videos in that folder.'); return; }
+      setPendingBulk({ path, name, count });
+    } catch (e) { setImportMsg(`${e}`); }
+  };
+
+  const startBulk = async () => {
+    if (!pendingBulk) return;
+    const { path } = pendingBulk;
+    setPendingBulk(null);
+    try {
+      const res = await fetch('/api/providers/companion-files/import-folder', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          host_id: hostId, path,
+          source_language: sourceLang, target_language: targetLang,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) { setImportMsg(`Folder import failed: ${data.detail || res.status}`); return; }
+      setBulk(null);
+      setBulkId(data.bulk_id);
+    } catch (e) { setImportMsg(`Folder import failed: ${e}`); }
+  };
+
+  const cancelBulk = async () => {
+    if (!bulkId) return;
+    try {
+      await fetch(`/api/providers/companion-files/import-folder/cancel?bulk_id=${encodeURIComponent(bulkId)}`, { method: 'POST' });
+    } catch { /* the next poll shows whatever really happened */ }
+  };
+
+  const dismissBulk = () => { setBulk(null); setBulkId(''); };
 
   const onSearchKey = (e) => {
     if (e.key === 'Enter' && looksLikePath(query)) goTo(query.trim());
@@ -329,6 +448,8 @@ export default function CompanionBrowser({ kind = 'video', onClose, onImported }
     '--fb-track': 'var(--border, rgba(255,255,255,0.16))',
     '--fb-danger': 'var(--danger, #FF453A)',
     '--fb-danger-dim': 'var(--danger-dim, rgba(255,59,48,0.14))',
+    '--fb-ok': 'var(--success, #30D158)',
+    '--fb-star': '#FFD60A',
   };
   const onlineHosts = companions.filter((c) => c.online && (c.roots || []).length);
   const statusLine = activeHost
@@ -346,6 +467,51 @@ export default function CompanionBrowser({ kind = 'video', onClose, onImported }
     color: 'var(--fb-accent)', background: 'var(--fb-accent-dim)',
     opacity: active ? 0.6 : 1, transition: 'filter 120ms, transform 120ms',
   });
+
+  // Star toggle for a folder path. Gold when bookmarked; subtle otherwise.
+  const starBtn = (path, name, size = 16) => {
+    const on = isMarked(path);
+    return (
+      <button onClick={(ev) => { ev.stopPropagation(); toggleBookmark(path, name); }}
+        title={on ? 'Remove bookmark' : 'Bookmark this folder'}
+        aria-label={on ? `Remove bookmark for ${name || path}` : `Bookmark ${name || path}`}
+        style={{
+          width: 28, height: 28, flex: 'none', borderRadius: 7, border: 'none', cursor: 'pointer',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          background: 'transparent', color: on ? 'var(--fb-star)' : 'var(--fb-tm)',
+        }}>
+        <Ic.Star s={size} fill={on ? 'currentColor' : 'none'} />
+      </button>
+    );
+  };
+
+  // "Import all" pill on folder rows (video imports only): kicks off the
+  // sequential bulk run after a confirm step.
+  const importAllPill = (path, name) => (
+    <button onClick={(ev) => { ev.stopPropagation(); requestBulk(path, name); }}
+      disabled={bulkRunning} title="Import every video in this folder, one at a time"
+      style={{ ...importPill(bulkRunning), opacity: bulkRunning ? 0.45 : 1 }}>
+      <Ic.Layers s={14} sw={2} />Import all
+    </button>
+  );
+
+  const bookmarkRow = (b) => (
+    <div key={b.path} onClick={() => goTo(b.path)} role="button"
+      style={{
+        display: 'flex', alignItems: 'center', gap: 12, minHeight: 56, padding: '0 10px',
+        borderRadius: 11, cursor: 'pointer', color: 'var(--fb-tp)',
+      }}>
+      <span style={{ width: 40, height: 40, flex: 'none', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--fb-star)' }}>
+        <Ic.Star s={20} fill="currentColor" />
+      </span>
+      <span style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 1 }}>
+        <span style={{ fontSize: 15, fontWeight: 500, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{b.name || b.path}</span>
+        <span style={{ fontFamily: 'var(--fb-mono)', fontSize: 12, color: 'var(--fb-tm)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{b.path}</span>
+      </span>
+      {starBtn(b.path, b.name)}
+      <span style={{ color: 'var(--fb-tm)', display: 'flex', flex: 'none' }}><Ic.ChevR s={17} /></span>
+    </div>
+  );
 
   const rootRow = (r) => (
     <button key={r.path} onClick={() => r.exists && goTo(r.path)} disabled={!r.exists}
@@ -426,7 +592,11 @@ export default function CompanionBrowser({ kind = 'video', onClose, onImported }
           )}
         </div>
         {e.is_dir ? (
-          <span style={{ color: 'var(--fb-tm)', display: 'flex', flex: 'none' }}><Ic.ChevR s={17} /></span>
+          <>
+            {kind === 'video' && importAllPill(e.path, e.name)}
+            {starBtn(e.path, e.name)}
+            <span style={{ color: 'var(--fb-tm)', display: 'flex', flex: 'none' }}><Ic.ChevR s={17} /></span>
+          </>
         ) : canImport ? (
           <button onClick={(ev) => { ev.stopPropagation(); doImport(e); }} disabled={busy} style={importPill(isImporting)}>
             <Ic.Download s={15} sw={2} />{isImporting ? '…' : 'Import'}
@@ -452,6 +622,18 @@ export default function CompanionBrowser({ kind = 'video', onClose, onImported }
         }}>
         <div style={{ position: 'relative', width: '100%', aspectRatio: '16 / 10', overflow: 'hidden' }}>
           <Thumb entry={e} hostId={hostId} variant="grid" />
+          {e.is_dir && (
+            <span onClick={(ev) => { ev.stopPropagation(); toggleBookmark(e.path, e.name); }}
+              title={isMarked(e.path) ? 'Remove bookmark' : 'Bookmark this folder'}
+              style={{
+                position: 'absolute', top: 8, right: 8, width: 24, height: 24, borderRadius: '50%',
+                display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer',
+                background: 'rgba(0,0,0,0.35)',
+                color: isMarked(e.path) ? 'var(--fb-star)' : 'rgba(255,255,255,0.75)',
+              }}>
+              <Ic.Star s={13} fill={isMarked(e.path) ? 'currentColor' : 'none'} />
+            </span>
+          )}
           {canImport && (
             <span style={{
               position: 'absolute', top: 8, right: 8, width: 22, height: 22, borderRadius: '50%',
@@ -476,6 +658,143 @@ export default function CompanionBrowser({ kind = 'video', onClose, onImported }
     color: on ? 'var(--fb-tp)' : 'var(--fb-tm)', background: on ? 'var(--fb-panel)' : 'transparent',
     boxShadow: on ? 'var(--shadow-sm, 0 1px 3px rgba(0,0,0,0.2))' : 'none', border: 'none', cursor: 'pointer',
   });
+
+  const sectionLabel = {
+    fontSize: 11, fontWeight: 700, letterSpacing: 0.6, textTransform: 'uppercase',
+    color: 'var(--fb-tm)', padding: '10px 10px 4px',
+  };
+
+  const spinner = (
+    <span style={{
+      width: 14, height: 14, flex: 'none', borderRadius: '50%', display: 'inline-block',
+      border: '2px solid var(--fb-track)', borderTopColor: 'var(--fb-accent)',
+      animation: 'fbSpin 0.8s linear infinite',
+    }} />
+  );
+
+  // Confirm step before a bulk run — says exactly what will happen.
+  const bulkConfirmCard = pendingBulk && (
+    <div style={{
+      flex: 'none', margin: '6px 6px 8px', padding: '12px 14px', borderRadius: 12,
+      background: 'var(--fb-accent-dim)', border: '1px solid var(--fb-border)',
+      display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap',
+    }}>
+      <span style={{ color: 'var(--fb-accent)', display: 'flex', flex: 'none' }}><Ic.Layers s={20} /></span>
+      <span style={{ flex: 1, minWidth: 200, fontSize: 13.5, color: 'var(--fb-tp)' }}>
+        Import all <b>{pendingBulk.count} video{pendingBulk.count === 1 ? '' : 's'}</b> from
+        “{pendingBulk.name}”? They’ll be downloaded and analyzed one at a time — the run
+        stops early only if ClipAI runs out of disk space.
+      </span>
+      <span style={{ display: 'flex', gap: 8, flex: 'none' }}>
+        <button onClick={() => setPendingBulk(null)}
+          style={{ fontSize: 13, fontWeight: 500, color: 'var(--fb-ts)', padding: '8px 14px', borderRadius: 9, background: 'transparent', border: '1px solid var(--fb-border)', cursor: 'pointer' }}>
+          Cancel
+        </button>
+        <button onClick={startBulk}
+          style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, fontWeight: 600, color: '#fff', background: 'var(--fb-accent)', padding: '8px 14px', borderRadius: 9, border: 'none', cursor: 'pointer' }}>
+          <Ic.Download s={14} sw={2} />Start
+        </button>
+      </span>
+    </div>
+  );
+
+  const bulkItemGlyph = (it, active) => {
+    if (it.status === 'complete') return <span style={{ color: 'var(--fb-ok)', display: 'flex' }}><Ic.Check s={15} sw={2.4} /></span>;
+    if (it.status === 'failed' || it.status === 'no_space') return <span style={{ color: 'var(--fb-danger)', display: 'flex' }}><Ic.X s={15} sw={2.4} /></span>;
+    if (it.status === 'cancelled' || it.status === 'skipped') return <span style={{ color: 'var(--fb-tm)', fontSize: 13 }}>—</span>;
+    if (active) return spinner;
+    return <span style={{ color: 'var(--fb-tm)', fontSize: 13 }}>·</span>;
+  };
+
+  const bulkItemDetail = (it) => {
+    if (it.status === 'downloading') {
+      const pct = it.size > 0 ? Math.min(100, Math.round((it.done_bytes / it.size) * 100)) : null;
+      return pct == null ? 'Downloading…' : `Downloading ${pct}%`;
+    }
+    if (it.status === 'analyzing') {
+      return it.analysis_message || `Analyzing… ${it.analysis_progress != null ? `${it.analysis_progress}%` : ''}`;
+    }
+    if (it.status === 'no_space') return 'Out of disk space';
+    if (it.status === 'failed') return it.error || 'Failed';
+    if (it.status === 'skipped') return 'Skipped';
+    if (it.status === 'complete') return 'Done';
+    if (it.status === 'cancelled') return 'Cancelled';
+    return 'Queued';
+  };
+
+  // Live progress for a running (or just-finished) bulk folder import.
+  const bulkPanel = bulk && (() => {
+    const items = bulk.items || [];
+    const cur = items.find((it) => it.status === 'downloading' || it.status === 'analyzing');
+    // Overall bar: finished items + a fraction for the one in flight
+    // (download ≈ first 20 % of a video's wall-clock, analysis the rest).
+    let frac = 0;
+    if (cur) {
+      if (cur.status === 'downloading') frac = 0.2 * (cur.size > 0 ? cur.done_bytes / cur.size : 0);
+      else frac = 0.2 + 0.8 * (Math.min(100, cur.analysis_progress || 0) / 100);
+    }
+    const overallPct = bulk.total ? Math.min(100, Math.round(((bulk.done + frac) / bulk.total) * 100)) : 0;
+    const headline = bulk.status === 'running'
+      ? `Importing “${bulk.folder_name}” — video ${Math.min(bulk.done + 1, bulk.total)} of ${bulk.total}`
+      : bulk.status === 'complete'
+        ? `Folder import done — ${bulk.ok} of ${bulk.total} video${bulk.total === 1 ? '' : 's'} imported`
+        : bulk.status === 'out_of_space'
+          ? `Stopped — ClipAI ran out of disk space (${bulk.ok} of ${bulk.total} done)`
+          : bulk.status === 'cancelled'
+            ? `Folder import cancelled (${bulk.ok} of ${bulk.total} done)`
+            : `Folder import failed: ${bulk.error || 'unknown error'}`;
+    const headColor = bulk.status === 'out_of_space' || bulk.status === 'error'
+      ? 'var(--fb-danger)' : 'var(--fb-tp)';
+    return (
+      <div style={{
+        flex: 'none', margin: '6px 6px 8px', padding: '12px 14px', borderRadius: 12,
+        background: 'var(--fb-elev)', border: '1px solid var(--fb-border)',
+        display: 'flex', flexDirection: 'column', gap: 9,
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          {bulk.status === 'running' ? spinner : <span style={{ color: 'var(--fb-accent)', display: 'flex', flex: 'none' }}><Ic.Layers s={17} /></span>}
+          <span style={{ flex: 1, minWidth: 0, fontSize: 13.5, fontWeight: 600, color: headColor, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+            {headline}
+          </span>
+          {bulk.status === 'running' ? (
+            <button onClick={cancelBulk}
+              style={{ flex: 'none', fontSize: 12.5, fontWeight: 600, color: 'var(--fb-danger)', background: 'var(--fb-danger-dim)', padding: '6px 12px', borderRadius: 8, border: 'none', cursor: 'pointer' }}>
+              Cancel import
+            </button>
+          ) : (
+            <button onClick={dismissBulk}
+              style={{ flex: 'none', fontSize: 12.5, fontWeight: 500, color: 'var(--fb-ts)', background: 'transparent', padding: '6px 12px', borderRadius: 8, border: '1px solid var(--fb-border)', cursor: 'pointer' }}>
+              Dismiss
+            </button>
+          )}
+        </div>
+        <div style={{ height: 5, borderRadius: 3, background: 'var(--fb-track)', overflow: 'hidden' }}>
+          <div style={{ height: '100%', width: `${overallPct}%`, background: 'var(--fb-accent)', borderRadius: 3, transition: 'width 0.4s' }} />
+        </div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 4, maxHeight: 168, overflowY: 'auto' }}>
+          {items.map((it) => {
+            const active = it.status === 'downloading' || it.status === 'analyzing';
+            return (
+              <div key={it.path} style={{ display: 'flex', alignItems: 'center', gap: 9, minHeight: 24 }}>
+                <span style={{ width: 16, flex: 'none', display: 'flex', justifyContent: 'center' }}>{bulkItemGlyph(it, active)}</span>
+                <span style={{ flex: 1, minWidth: 0, fontSize: 12.5, color: active ? 'var(--fb-tp)' : 'var(--fb-ts)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                  {it.name}
+                </span>
+                <span style={{ flex: 'none', maxWidth: '46%', fontFamily: 'var(--fb-mono)', fontSize: 11, color: it.status === 'failed' || it.status === 'no_space' ? 'var(--fb-danger)' : 'var(--fb-tm)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                  {bulkItemDetail(it)}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+        {bulk.status === 'running' && (
+          <div style={{ fontSize: 11.5, color: 'var(--fb-tm)' }}>
+            Runs on the ClipAI server — you can close this window and check back later.
+          </div>
+        )}
+      </div>
+    );
+  })();
 
   return (
     <div onClick={onClose} style={{
@@ -582,6 +901,8 @@ export default function CompanionBrowser({ kind = 'video', onClose, onImported }
               );
             })}
           </div>
+          {cwd && starBtn(cwd, crumbs.length ? crumbs[crumbs.length - 1].name : cwd, 17)}
+          {cwd && kind === 'video' && shown.some((e) => importable(e)) && importAllPill(cwd, crumbs.length ? crumbs[crumbs.length - 1].name : cwd)}
           {cwd && (
             <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--fb-tm)', flex: 'none' }}>
               <span style={{ whiteSpace: 'nowrap' }}>Sort</span>
@@ -599,6 +920,8 @@ export default function CompanionBrowser({ kind = 'video', onClose, onImported }
 
         {/* Body */}
         <div style={{ flex: 1, overflowY: 'auto', padding: '6px 8px 8px', display: 'flex', flexDirection: 'column', gap: 1 }}>
+          {bulkConfirmCard}
+          {bulkPanel}
           {loading ? skeleton
           : rootsError && !roots.length ? (
             <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 8, padding: '40px 16px', textAlign: 'center' }}>
@@ -610,8 +933,17 @@ export default function CompanionBrowser({ kind = 'video', onClose, onImported }
             </div>
           )
           : !cwd ? (
-            roots.length
-              ? <div style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>{roots.map(rootRow)}</div>
+            (roots.length || bookmarks.length)
+              ? <div style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
+                  {bookmarks.length > 0 && (
+                    <>
+                      <div style={sectionLabel}>Bookmarks</div>
+                      {bookmarks.map(bookmarkRow)}
+                      <div style={sectionLabel}>Shared folders</div>
+                    </>
+                  )}
+                  {roots.map(rootRow)}
+                </div>
               : <div style={{ padding: 24, textAlign: 'center', color: 'var(--fb-tm)', fontSize: 13 }}>This Companion has no shared folders. Add one in the Companion app.</div>
           )
           : listing ? skeleton
