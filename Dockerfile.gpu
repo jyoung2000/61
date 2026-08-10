@@ -79,6 +79,14 @@ ARG BUILD_SHA=unknown
 # discarded and every from-source build reported the repo's base version
 # forever. update-all.sh even logged the version it *thought* it was building.
 ARG COMPANION_BUILD_NUMBER=0
+# Cache-bust token for THIS stage only. The stage is fail-soft, so a failed
+# cross-build caches an EMPTY /out — and BuildKit then reuses that empty
+# result on every later build of the same commit (nothing in the cache key
+# changed). update-all.sh passes a fresh timestamp here when the built image
+# turns out to have no installer, forcing this RUN to re-execute (the cache
+# mounts below stay warm, so the retry is minutes, not tens). Default 0 keeps
+# normal builds fully cached.
+ARG COMPANION_REBUILD=0
 WORKDIR /build
 COPY companion/ ./companion/
 ENV XWIN_ACCEPT_LICENSE=1 XWIN_CACHE_DIR=/xwin-cache
@@ -98,8 +106,10 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/root/.npm \
     set +e; \
     mkdir -p /out; \
+    echo "companion rebuild token: $COMPANION_REBUILD"; \
     if [ "$COMPANION_BUILD_FROM_SOURCE" != "1" ]; then \
       echo "COMPANION_BUILD_FROM_SOURCE!=1 — skipping from-source installer build (GitHub release is the source)"; \
+      echo "skipped: COMPANION_BUILD_FROM_SOURCE!=1" > /out/BUILD_STATUS; \
       exit 0; \
     fi; \
     rm -f /etc/apt/apt.conf.d/docker-clean; \
@@ -122,8 +132,10 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     if [ "$STATUS" = "0" ] && [ -n "$EXE" ]; then \
       cp "$EXE" /out/ \
         && python3 scripts/make_local_manifest.py /out \
+        && echo "ok: $(basename "$EXE") [build $BUILD_SHA]" > /out/BUILD_STATUS \
         && echo "Companion installer built from source: $(basename "$EXE") [build $BUILD_SHA]"; \
     else \
+      echo "failed: tauri build exit status=$STATUS [build $BUILD_SHA]" > /out/BUILD_STATUS; \
       echo "Companion from-source build FAILED (status=$STATUS) — image build continues; the Settings card falls back to the GitHub release"; \
     fi; \
     exit 0

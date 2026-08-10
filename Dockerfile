@@ -66,6 +66,10 @@ ARG COMPANION_BUILD_FROM_SOURCE=0
 # HIGHER than the previous deploy's — the observed alternative was five
 # self-updates in one day all announcing "v0.2.9". 0 keeps the repo version.
 ARG COMPANION_BUILD_NUMBER=0
+# Cache-bust token for THIS stage only (see Dockerfile.gpu for the full
+# story): a failed fail-soft build caches an empty /out forever; update-all.sh
+# passes a fresh timestamp here to force a re-run when the image has no exe.
+ARG COMPANION_REBUILD=0
 WORKDIR /build
 COPY companion/ ./companion/
 ENV XWIN_ACCEPT_LICENSE=1 XWIN_CACHE_DIR=/xwin-cache
@@ -82,8 +86,10 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/root/.npm \
     set +e; \
     mkdir -p /out; \
+    echo "companion rebuild token: $COMPANION_REBUILD"; \
     if [ "$COMPANION_BUILD_FROM_SOURCE" != "1" ]; then \
       echo "COMPANION_BUILD_FROM_SOURCE!=1 — skipping from-source installer build (GitHub release is the source)"; \
+      echo "skipped: COMPANION_BUILD_FROM_SOURCE!=1" > /out/BUILD_STATUS; \
       exit 0; \
     fi; \
     rm -f /etc/apt/apt.conf.d/docker-clean; \
@@ -105,8 +111,10 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     if [ "$STATUS" = "0" ] && [ -n "$EXE" ]; then \
       cp "$EXE" /out/ \
         && python3 scripts/make_local_manifest.py /out \
+        && echo "ok: $(basename "$EXE")" > /out/BUILD_STATUS \
         && echo "Companion installer built from source: $(basename "$EXE")"; \
     else \
+      echo "failed: tauri build exit status=$STATUS" > /out/BUILD_STATUS; \
       echo "Companion from-source build FAILED (status=$STATUS) — image build continues; the Settings card falls back to the GitHub release"; \
     fi; \
     exit 0

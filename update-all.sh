@@ -24,11 +24,21 @@
 # ClipAI — the final install is one "Update" click in the Companion app on the
 # Windows GPU box (that step can't run from Unraid).
 #
+# The companion-builder stage is fail-soft, so a failed cross-build bakes an
+# EMPTY installer dir into the image — and BuildKit then serves that cached
+# empty result on every rebuild of the same commit. When this script finds no
+# .exe (or a stale version) in the built image, it now automatically re-runs
+# JUST the companion cross-build with a cache-bust token and publishes the
+# result straight into ./data/companion-cache (which ClipAI serves) — no app
+# rebuild or restart, and the real build error finally shows in this log.
+# It also no longer wipes the currently-served installer unless a fresh one
+# actually exists to replace it.
+#
 # Usage: bash update-all.sh [branch]
 set -uo pipefail
 cd "$(dirname "$0")"
 
-DEFAULT_BRANCH="claude/video-pipeline-performance-ywh81m"
+DEFAULT_BRANCH="claude/clipai-bookmarks-bulk-upload-0nsv1p"
 BRANCH="${1:-${CLIPAI_UPDATE_BRANCH:-$DEFAULT_BRANCH}}"
 START=$(date +%s)
 log(){ local t=$(( $(date +%s) - START )); printf '\n[all] %02d:%02d %s\n' $((t/60)) $((t%60)) "$*"; }
@@ -105,21 +115,57 @@ fi
 
 log "publishing the fresh Companion installer…"
 mkdir -p ./data/companion-cache
-rm -f ./data/companion-cache/*.exe ./data/companion-cache/manifest.json 2>/dev/null || true
-docker cp clipai-app:/app/static/companion/. ./data/companion-cache/ 2>/dev/null || true
 EXE="$(docker exec clipai-app sh -c 'ls -t /app/static/companion/*.exe 2>/dev/null | head -1' 2>/dev/null)"
+if [ -n "$EXE" ]; then
+  # Only clear the cache once we KNOW a fresh installer replaces it — a build
+  # that produced no exe must never delete the one currently being served.
+  rm -f ./data/companion-cache/*.exe ./data/companion-cache/manifest.json 2>/dev/null || true
+  docker cp clipai-app:/app/static/companion/. ./data/companion-cache/ 2>/dev/null || true
+fi
+
+# The image can lack the installer (or carry a stale one) when BuildKit
+# reused a previously FAILED fail-soft companion-builder layer: the whole
+# build is CACHED in seconds and /out is empty — nothing ever retries it.
+# Detect that here and re-run JUST the companion cross-build with a fresh
+# cache-bust token, exporting the exe + manifest straight into the served
+# ./data/companion-cache dir (no image rebuild, no app restart — the
+# downloads router serves the newest installer across both locations).
+_has_expected() { ls ./data/companion-cache/*"$EXPECTED"*.exe >/dev/null 2>&1; }
+if [ -z "$EXE" ] || ! _has_expected; then
+  ST="$(docker exec clipai-app sh -c 'cat /app/static/companion/BUILD_STATUS 2>/dev/null' 2>/dev/null)"
+  if [ -z "$EXE" ]; then
+    log "no Companion .exe in the image (builder status: ${ST:-unknown — likely a cached failed cross-build})."
+  else
+    log "image's Companion installer is not v$EXPECTED (builder status: ${ST:-unknown})."
+  fi
+  log "retrying the Companion cross-build directly (cache-busted; streams the real build log; 10-30 min cold, minutes when the caches are warm)…"
+  ( while :; do sleep 60; log "…still cross-building the Companion ($(( ($(date +%s)-START)/60 ))m elapsed)"; done ) & HB2=$!
+  if DOCKER_BUILDKIT=1 docker build --target companion-artifacts \
+      --build-arg COMPANION_BUILD_FROM_SOURCE=1 \
+      --build-arg COMPANION_BUILD_NUMBER="$BUILD_NUM" \
+      --build-arg BUILD_SHA="$BUILD_SHA" \
+      --build-arg COMPANION_REBUILD="$(date +%s)" \
+      -f Dockerfile.gpu -o ./data/companion-cache .; then
+    kill "$HB2" 2>/dev/null || true
+    log "companion retry build finished — status: $(cat ./data/companion-cache/BUILD_STATUS 2>/dev/null || echo unknown)"
+  else
+    kill "$HB2" 2>/dev/null || true
+    log "companion retry build FAILED — the real error is in the log above (it needs outbound internet for the MSVC SDK on a cold cache)."
+  fi
+fi
 
 log "===== DONE — container @ $BUILD_SHA ====="
-if [ -n "$EXE" ]; then
-  docker exec clipai-app sh -c "ls -lh '$EXE'" 2>/dev/null || true
-  case "$EXE" in
+SERVED="$(ls -t ./data/companion-cache/*.exe 2>/dev/null | head -1)"
+if [ -n "$SERVED" ]; then
+  ls -lh "$SERVED" 2>/dev/null || true
+  case "$SERVED" in
     *"$EXPECTED"*)
       log "OK: Companion v$EXPECTED is now SERVED by ClipAI." ;
       log "    On the 4070 PC: open the Companion app -> Update (or ClipAI -> Settings -> GPU Companion -> Download) to install it. That last step only runs on Windows." ;;
     *)
-      log "WARN: served installer is NOT v$EXPECTED (got: $EXE)." ;;
+      log "WARN: served installer is NOT v$EXPECTED (got: $(basename "$SERVED")) — the retry above should say why; run CLIPAI_NOCACHE=1 bash update-all.sh to rule out every stale layer." ;;
   esac
 else
-  log "ERROR: no Companion .exe in the image — the from-source build produced none (see the build log above)."
+  log "ERROR: no Companion .exe available at all — the from-source build failed even after the cache-busted retry (see its log above)."
 fi
 log "finished."

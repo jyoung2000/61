@@ -1,3 +1,39 @@
+# ClipAI — Update flow: stop caching a failed Companion cross-build forever
+
+A real deploy hit "ERROR: no Companion .exe in the image" on a 5-second fully
+CACHED build. Root cause chain: the fail-soft `companion-builder` stage bakes
+an EMPTY `/out` when the cross-build fails, BuildKit then reuses that cached
+empty layer on every rebuild of the same commit (nothing in the cache key
+changes), and the publish step *deleted the currently-served installer* from
+`data/companion-cache` before discovering there was nothing to replace it
+with. Fixes:
+
+- **`update-all.sh` auto-retry.** When the built image has no installer (or a
+  stale version), the script now prints the baked `BUILD_STATUS` reason and
+  automatically re-runs JUST the companion cross-build (`companion-artifacts`
+  target) with a fresh `COMPANION_REBUILD` cache-bust token, exporting the
+  exe + manifest straight into the served `./data/companion-cache` dir — no
+  image rebuild, no second app restart, and the real cross-build error
+  finally streams into the update log instead of hiding behind "CACHED".
+- **Never wipe the served installer on a failed build.** The cache dir is now
+  cleared only after confirming the image actually contains a fresh exe.
+- **`COMPANION_REBUILD` build arg** added to the `companion-builder` stage in
+  both Dockerfiles (cache-bust token; default 0 keeps normal builds fully
+  cached), and the stage now writes `/out/BUILD_STATUS`
+  (`ok:`/`failed:`/`skipped:` + reason) so a missing exe is diagnosable.
+- **`DEFAULT_BRANCH` updated** to `claude/clipai-bookmarks-bulk-upload-0nsv1p`
+  — the exact trap the script's own header warns about bit again: the caller
+  reset to the new work branch, then the stale default quietly reset BACK to
+  the old branch and rebuilt old code (the log even said "UP TO DATE ✓" on
+  the wrong branch).
+- Verified: both Dockerfiles' edited RUN blocks executed standalone in skip
+  mode (BUILD_STATUS written, token echoed, continuation structure intact),
+  plus full dry-runs of `update-all.sh` with stubbed docker/git covering the
+  missing-exe → retry → publish path (old installer preserved, correct build
+  args) and the happy path (no retry, normal wipe + publish).
+
+---
+
 # ClipAI — Companion importer: path bookmarks + sequential bulk folder import
 
 Two quality-of-life features for the "Import a file" dialog that browses a
