@@ -96,8 +96,17 @@ ENV XWIN_ACCEPT_LICENSE=1 XWIN_CACHE_DIR=/xwin-cache
 # target dir (incremental — only the changed crate recompiles), the ~1GB MSVC
 # SDK (xwin), the cargo-xwin binary, and the npm cache. First build is
 # unchanged; subsequent builds drop from ~20-40 min to a few minutes.
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+#
+# The apt mounts are `sharing=private`, NOT `sharing=locked`. `locked` makes a
+# build WAIT for the mount if anything else holds it — and a killed docker
+# client does NOT release the server-side BuildKit lease, so one orphaned
+# session wedges every future build FOREVER with zero output. That is exactly
+# what happened: this step and the pip step below each sat 15 minutes without
+# printing a single line, because they never started — they were queued on a
+# lock held by a dead build. `private` gives a concurrent build its own cache
+# instance instead of blocking: no wedge, and no apt-cache corruption either.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=private \
+    --mount=type=cache,target=/var/lib/apt,sharing=private \
     --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/companion/src-tauri/target \
@@ -310,7 +319,11 @@ COPY backend/requirements.txt .
 #  - a 3x retry-with-backoff loop so a dropped read doesn't fail the build.
 # pip itself also retries (PIP_RETRIES) with a long socket timeout
 # (PIP_DEFAULT_TIMEOUT). cu121 index first; PyPI as a fallback.
-RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+# `sharing=private` (see the companion-builder stage): with `locked`, an
+# orphaned BuildKit session held this mount and the step hung silently for 15
+# minutes without executing its first command. pip's cache is content-
+# addressed, so a per-build instance costs nothing but a cold cache.
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=private \
     pip3 install --upgrade pip && \
     for attempt in 1 2 3; do \
         echo "==> torch/CUDA install attempt $attempt/3"; \
@@ -325,7 +338,7 @@ RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
 # the CUDA torch installed above is treated as already-satisfied and pip does
 # NOT swap it for a CPU wheel. pyannote 3.x gets its full dependency tree here
 # in the normal requirements install.
-RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=private \
     pip3 install -r requirements.txt && \
     pip3 install nvidia-cublas-cu12 nvidia-cudnn-cu12==9.* && \
     # FAIL the build if the requirements install swapped torch off the pinned

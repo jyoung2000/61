@@ -1,3 +1,32 @@
+# ClipAI — Build: `sharing=locked` cache mounts wedge forever; use `private`
+
+With the stall watchdog in place the failure finally became legible: two
+consecutive attempts each sat exactly 15 minutes and printed **not one line**
+from the step. The pip step's first command is `pip3 install --upgrade pip`,
+which prints within seconds — silence means the step never began executing.
+Both stalling steps (`stage-4` torch install, `companion-builder`) mount
+caches with `sharing=locked`, which makes a build WAIT for a mount another
+session holds. Killing a docker *client* does not release the server-side
+BuildKit lease, so the orphaned sessions left by the earlier concurrent-run
+pile-up held those mounts and wedged every subsequent build — silently, with
+no output to diagnose from.
+
+- All `sharing=locked` cache mounts in both Dockerfiles are now
+  `sharing=private`: a build that finds the cache in use gets its own
+  instance instead of blocking. No wedge, and no apt-cache corruption either
+  (which is what `locked` was there to prevent). Cost is only a cold cache
+  for a concurrent build — and the update lock makes those rare anyway.
+- This also explains the earlier misdiagnoses. It was never a slow CDN; the
+  pip timeout values were a real latent hazard but not the cause, and the
+  concurrency lock removed the *source* of the orphaned sessions without
+  freeing the leases they already held.
+- Verified: no non-comment `sharing=locked` remains, every `--mount`
+  continuation is intact, and both Dockerfiles keep all other cache mounts
+  (cargo registry, target dir, xwin SDK, npm) untouched so warm-cache rebuild
+  times are unchanged.
+
+---
+
 # ClipAI — Update flow: refuse concurrent runs (the real cause of the 2h hang)
 
 `ps` on the deployment box showed **four** live `update-all.sh` runs (09:06,

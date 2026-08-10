@@ -76,8 +76,11 @@ ENV XWIN_ACCEPT_LICENSE=1 XWIN_CACHE_DIR=/xwin-cache
 # BuildKit cache mounts persist across builds (see Dockerfile.gpu for detail):
 # repeat builds reuse apt debs, the cargo registry, the compiled target dir,
 # the ~1GB MSVC SDK, cargo-xwin, and the npm cache — minutes instead of tens.
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+# `sharing=private` not `locked` — see Dockerfile.gpu: a killed docker client
+# leaves the server-side BuildKit lease held, and `locked` then wedges every
+# later build forever with no output at all.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=private \
+    --mount=type=cache,target=/var/lib/apt,sharing=private \
     --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/companion/src-tauri/target \
