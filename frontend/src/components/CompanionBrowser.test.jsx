@@ -111,6 +111,13 @@ const pressEnter = (el) => act(async () => {
   el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
   await Promise.resolve();
 });
+const setSelect = async (el, value) => {
+  const setter = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, 'value').set;
+  await act(async () => {
+    setter.call(el, value);
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+  });
+};
 
 describe('CompanionBrowser bookmarks', () => {
   it('shows a Bookmarks section on the home view and navigates on click', async () => {
@@ -255,12 +262,19 @@ describe('CompanionBrowser bulk folder import', () => {
 
     expect(document.body.textContent).toContain('Import all');
     expect(document.body.textContent).toContain('2 videos');
+    // The confirm card carries the language choice — pick Japanese → English
+    // right where the run starts and the POST must carry both.
+    await setSelect(document.body.querySelector('[aria-label="Bulk import video language"]'), 'ja');
+    await setSelect(document.body.querySelector('[aria-label="Bulk import translation language"]'), 'en');
     await click(byText('Start'));
     await flush();
     await flush();
 
     const post = fetchCalls.find((c) => c.method === 'POST' && c.url.endsWith('/companion-files/import-folder'));
-    expect(post.body).toMatchObject({ host_id: 'h1', path: 'D:\\media\\Anime' });
+    expect(post.body).toMatchObject({
+      host_id: 'h1', path: 'D:\\media\\Anime',
+      source_language: 'ja', target_language: 'en',
+    });
     expect(document.body.textContent).toContain('Folder import done — 2 of 2 videos imported');
   });
 
@@ -301,6 +315,16 @@ describe('CompanionBrowser bulk folder import', () => {
     await click([...document.body.querySelectorAll('[data-fbpath]')].find((r) => r.textContent.includes('ep2.mkv')));
     await click(byText('Import 2'));
     await flush();
+
+    // Nothing fires yet — the SAME confirm card the folder import uses opens,
+    // with the language choice, so a multi-select run is never started blind.
+    expect(fetchCalls.some((c) => c.method === 'POST'
+      && c.url.endsWith('/companion-files/import-folder'))).toBe(false);
+    expect(document.body.textContent).toContain('2 selected videos');
+    await setSelect(document.body.querySelector('[aria-label="Bulk import video language"]'), 'ja');
+    await setSelect(document.body.querySelector('[aria-label="Bulk import translation language"]'), 'en');
+    await click(byText('Start'));
+    await flush();
     await flush();
 
     // ONE POST to the sequential importer with the selection — never the
@@ -310,9 +334,33 @@ describe('CompanionBrowser bulk folder import', () => {
       { name: 'ep1.mp4', path: 'D:\\media\\ep1.mp4', size: 9000 },
       { name: 'ep2.mkv', path: 'D:\\media\\ep2.mkv', size: 9000 },
     ]);
+    expect(post.body).toMatchObject({ source_language: 'ja', target_language: 'en' });
     expect(fetchCalls.some((c) => c.url.endsWith('/companion-files/import'))).toBe(false);
     // The shared panel takes over with the polled (terminal) state.
     expect(document.body.textContent).toContain('Folder import done — 2 of 2 videos imported');
+  });
+
+  it('confirm-card language picks stay in sync with the sticky toolbar pickers', async () => {
+    // Languages chosen in an EARLIER session (sticky localStorage) prefill the
+    // confirm card; changing them there updates the store for next time.
+    localStorage.setItem('companionImportSourceLang', 'ja');
+    localStorage.setItem('companionImportTargetLang', 'en');
+    await render(<CompanionBrowser kind="video" onClose={() => {}} onImported={() => {}} />);
+    await click([...document.body.querySelectorAll('button')].find((b) => b.textContent.includes('media')));
+    await flush();
+    const pill = [...document.body.querySelectorAll('[title="Import every video in this folder, one at a time"]')].pop();
+    await click(pill);
+    await flush();
+
+    expect(document.body.querySelector('[aria-label="Bulk import video language"]').value).toBe('ja');
+    expect(document.body.querySelector('[aria-label="Bulk import translation language"]').value).toBe('en');
+    await setSelect(document.body.querySelector('[aria-label="Bulk import translation language"]'), 'es');
+    expect(localStorage.getItem('companionImportTargetLang')).toBe('es');
+    await click(byText('Start'));
+    await flush();
+
+    const post = fetchCalls.find((c) => c.method === 'POST' && c.url.endsWith('/companion-files/import-folder'));
+    expect(post.body).toMatchObject({ source_language: 'ja', target_language: 'es' });
   });
 
   it('does not offer bulk import for media/font browsing', async () => {

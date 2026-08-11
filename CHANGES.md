@@ -1,3 +1,31 @@
+# ClipAI — Pick the source + translation language right where a bulk import starts
+
+The language pickers lived only in the browser's top toolbar — easy to miss,
+and the multi-select "Import N" button fired immediately with whatever the
+toolbar happened to hold. The backend already carried
+`source_language`/`target_language` through both bulk modes (and through
+crash-resume persistence); this puts the CHOICE at the decision point:
+
+- **The bulk confirm card now contains both selects** — "Video language"
+  (auto-detect default) and "Translate subtitles to" (no-translation default),
+  applying to every video in the run. Same sticky state as the toolbar
+  pickers (localStorage-backed), so the two locations never disagree and the
+  last choice prefills next time.
+- **Multi-select videos confirm through the same card.** "Import N" no longer
+  fires instantly — it opens the confirm card ("Import the N selected
+  videos?") with the language selects, exactly like the folder "Import all"
+  path. One POST to the sequential importer on Start, selection cleared,
+  shared Dashboard panel takes over. Media/font multi-select is untouched
+  (no pipelines, no languages).
+- Verified: multi-select test now proves NOTHING fires before Start and the
+  POST carries the picked `ja`→`en`; folder-mode test picks languages in the
+  card; a new sticky-sync test proves localStorage prefills the card and a
+  card change updates the store (11 CompanionBrowser tests, 160 frontend
+  total, build clean). Backend already had language coverage: state stores
+  the picks, and every job in the run gets `language`/`subtitle_language`.
+
+---
+
 # Deploy — a rolled-back container can no longer hide behind "up to date"
 
 "The companion app never sees the latest update." It wasn't the Companion: the

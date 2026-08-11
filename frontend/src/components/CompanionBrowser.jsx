@@ -494,20 +494,15 @@ export default function CompanionBrowser({ kind = 'video', onClose, onImported }
         setImportMsg('A sequential import is already running — wait for it to finish or cancel it.');
         return;
       }
-      try {
-        const res = await fetch('/api/providers/companion-files/import-folder', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            host_id: hostId,
-            files: picked.map((e) => ({ name: e.name, path: e.path, size: e.size || 0 })),
-            source_language: sourceLang, target_language: targetLang,
-          }),
-        });
-        const data = await res.json();
-        if (!res.ok) { setImportMsg(`Import failed: ${data.detail || res.status}`); return; }
-        setSelectedPaths(new Set());
-        setBulkStartId(data.bulk_id);
-      } catch (e) { setImportMsg(`Import failed: ${e}`); }
+      if (pendingBulk) return; // confirm card already open
+      // Confirm first — the SAME card the folder "Import all" uses, so the
+      // language choice (spoken language + translation target) is always
+      // offered right where the run is started, not only in the toolbar.
+      setPendingBulk({
+        files: picked.map((e) => ({ name: e.name, path: e.path, size: e.size || 0 })),
+        name: 'your selection',
+        count: picked.length,
+      });
       return;
     }
     // Media / fonts: no analysis pipeline involved — the per-file sequential
@@ -545,20 +540,24 @@ export default function CompanionBrowser({ kind = 'video', onClose, onImported }
 
   const startBulk = async () => {
     if (!pendingBulk) return;
-    const { path } = pendingBulk;
+    const { path, files } = pendingBulk;
     setPendingBulk(null);
     try {
       const res = await fetch('/api/providers/companion-files/import-folder', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          host_id: hostId, path,
+          host_id: hostId,
+          // Whole folder (path) or an explicit multi-selection (files) — the
+          // server runs both through the same sequential queue.
+          ...(files ? { files } : { path }),
           source_language: sourceLang, target_language: targetLang,
         }),
       });
       const data = await res.json();
-      if (!res.ok) { setImportMsg(`Folder import failed: ${data.detail || res.status}`); return; }
+      if (!res.ok) { setImportMsg(`Import failed: ${data.detail || res.status}`); return; }
+      if (files) setSelectedPaths(new Set());
       setBulkStartId(data.bulk_id);
-    } catch (e) { setImportMsg(`Folder import failed: ${e}`); }
+    } catch (e) { setImportMsg(`Import failed: ${e}`); }
   };
 
   const pathQuery = cleanPathInput(query);
@@ -799,29 +798,59 @@ export default function CompanionBrowser({ kind = 'video', onClose, onImported }
     color: 'var(--fb-tm)', padding: '10px 10px 4px',
   };
 
-  // Confirm step before a bulk run — says exactly what will happen.
+  // Confirm step before a bulk run — says exactly what will happen, and lets
+  // the user pick the languages RIGHT HERE (spoken language + translation
+  // target apply to every video in the run). The selects share the sticky
+  // toolbar state, so either place works and they never disagree.
+  const bulkLangSelect = { height: 32, borderRadius: 8, background: 'var(--fb-elev)', color: 'var(--fb-tp)', border: '1px solid var(--fb-border)', fontSize: 12.5, padding: '0 8px', maxWidth: 200 };
   const bulkConfirmCard = pendingBulk && (
     <div style={{
       flex: 'none', margin: '6px 6px 8px', padding: '12px 14px', borderRadius: 12,
       background: 'var(--fb-accent-dim)', border: '1px solid var(--fb-border)',
-      display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap',
+      display: 'flex', flexDirection: 'column', gap: 10,
     }}>
-      <span style={{ color: 'var(--fb-accent)', display: 'flex', flex: 'none' }}><Ic.Layers s={20} /></span>
-      <span style={{ flex: 1, minWidth: 200, fontSize: 13.5, color: 'var(--fb-tp)' }}>
-        Import all <b>{pendingBulk.count} video{pendingBulk.count === 1 ? '' : 's'}</b> from
-        “{pendingBulk.name}”? They’ll be downloaded and analyzed one at a time — the run
-        stops early only if ClipAI runs out of disk space.
-      </span>
-      <span style={{ display: 'flex', gap: 8, flex: 'none' }}>
-        <button onClick={() => setPendingBulk(null)}
-          style={{ fontSize: 13, fontWeight: 500, color: 'var(--fb-ts)', padding: '8px 14px', borderRadius: 9, background: 'transparent', border: '1px solid var(--fb-border)', cursor: 'pointer' }}>
-          Cancel
-        </button>
-        <button onClick={startBulk}
-          style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, fontWeight: 600, color: '#fff', background: 'var(--fb-accent)', padding: '8px 14px', borderRadius: 9, border: 'none', cursor: 'pointer' }}>
-          <Ic.Download s={14} sw={2} />Start
-        </button>
-      </span>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+        <span style={{ color: 'var(--fb-accent)', display: 'flex', flex: 'none' }}><Ic.Layers s={20} /></span>
+        <span style={{ flex: 1, minWidth: 200, fontSize: 13.5, color: 'var(--fb-tp)' }}>
+          {pendingBulk.files
+            ? <>Import the <b>{pendingBulk.count} selected video{pendingBulk.count === 1 ? '' : 's'}</b>?</>
+            : <>Import all <b>{pendingBulk.count} video{pendingBulk.count === 1 ? '' : 's'}</b> from
+              “{pendingBulk.name}”?</>}
+          {' '}They’ll be downloaded and analyzed one at a time — the run
+          stops early only if ClipAI runs out of disk space.
+        </span>
+      </div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12.5, color: 'var(--fb-ts)', minWidth: 0 }}>
+          <span style={{ whiteSpace: 'nowrap' }}>Video language</span>
+          <select value={sourceLang} onChange={(ev) => pickSourceLang(ev.target.value)}
+            aria-label="Bulk import video language" style={bulkLangSelect}>
+            {LANGUAGES.map((l) => (
+              <option key={l.code || 'auto'} value={l.code}>{l.label}</option>
+            ))}
+          </select>
+        </label>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12.5, color: 'var(--fb-ts)', minWidth: 0 }}>
+          <span style={{ whiteSpace: 'nowrap' }}>Translate subtitles to</span>
+          <select value={targetLang} onChange={(ev) => pickTargetLang(ev.target.value)}
+            aria-label="Bulk import translation language" style={bulkLangSelect}>
+            <option value="">No translation (keep original)</option>
+            {LANGUAGES.filter((l) => l.code).map((l) => (
+              <option key={l.code} value={l.code}>{l.label}</option>
+            ))}
+          </select>
+        </label>
+        <span style={{ display: 'flex', gap: 8, flex: 'none', marginLeft: 'auto' }}>
+          <button onClick={() => setPendingBulk(null)}
+            style={{ fontSize: 13, fontWeight: 500, color: 'var(--fb-ts)', padding: '8px 14px', borderRadius: 9, background: 'transparent', border: '1px solid var(--fb-border)', cursor: 'pointer' }}>
+            Cancel
+          </button>
+          <button onClick={startBulk}
+            style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, fontWeight: 600, color: '#fff', background: 'var(--fb-accent)', padding: '8px 14px', borderRadius: 9, border: 'none', cursor: 'pointer' }}>
+            <Ic.Download s={14} sw={2} />Start
+          </button>
+        </span>
+      </div>
     </div>
   );
 
