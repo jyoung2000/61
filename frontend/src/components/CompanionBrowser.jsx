@@ -1,4 +1,5 @@
 import React, { useEffect, useState, useCallback, useMemo, useRef } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { LANGUAGES } from '../constants/languages';
 import BulkImportPanel from './BulkImportPanel';
 
@@ -194,12 +195,13 @@ export default function CompanionBrowser({ kind = 'video', onClose, onImported }
   // Starred paths for the active Companion (server-persisted).
   const [bookmarks, setBookmarks] = useState([]);
   // Bulk folder import: this dialog only handles the confirm step and the
-  // kick-off — the live status is the shared BulkImportPanel, which also
-  // lives on the Dashboard so closing this dialog or navigating away never
-  // loses sight of a running import.
-  const [pendingBulk, setPendingBulk] = useState(null); // {path, name, count}
-  const [bulkStartId, setBulkStartId] = useState('');
+  // kick-off. Starting a run CLOSES the dialog and lands on the Dashboard,
+  // whose shared BulkImportPanel owns the live status — the import runs on
+  // the server, so there is nothing to wait for here. The panel below only
+  // shows a run that was ALREADY going when the dialog opened.
+  const [pendingBulk, setPendingBulk] = useState(null); // {path|files, name, count}
   const [bulkRunning, setBulkRunning] = useState(false);
+  const navigate = useNavigate();
 
   useEffect(() => {
     (async () => {
@@ -556,7 +558,12 @@ export default function CompanionBrowser({ kind = 'video', onClose, onImported }
       const data = await res.json();
       if (!res.ok) { setImportMsg(`Import failed: ${data.detail || res.status}`); return; }
       if (files) setSelectedPaths(new Set());
-      setBulkStartId(data.bulk_id);
+      // The run lives on the server — don't trap the user in this dialog
+      // watching it. Close and land on the Dashboard, where the shared
+      // BulkImportPanel picks the run up (it self-discovers via /active)
+      // and each video links to its analysis page as it starts.
+      if (onClose) onClose();
+      navigate('/');
     } catch (e) { setImportMsg(`Import failed: ${e}`); }
   };
 
@@ -987,7 +994,7 @@ export default function CompanionBrowser({ kind = 'video', onClose, onImported }
         <div style={{ flex: 1, overflowY: 'auto', padding: '6px 8px 8px', display: 'flex', flexDirection: 'column', gap: 1 }}>
           {bulkConfirmCard}
           {kind === 'video' && (
-            <BulkImportPanel startId={bulkStartId} onRunningChange={setBulkRunning} />
+            <BulkImportPanel onRunningChange={setBulkRunning} />
           )}
           {loading ? skeleton
           : rootsError && !roots.length ? (

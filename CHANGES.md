@@ -1,3 +1,22 @@
+# ClipAI — Starting a bulk import leaves the popup and lands on the Dashboard
+
+Starting a bulk run used to leave the user parked on the Upload page watching
+the import popup — even though the run lives entirely on the server and the
+Dashboard already has the shared progress panel. Now clicking Start (folder
+"Import all" or multi-select) closes the dialog and navigates to the
+Dashboard: the shared `BulkImportPanel` there picks the run up on its own
+(`/import-folder/active` self-discovery) and each video links to its analysis
+page as it starts. The panel inside the popup still appears for a run that was
+ALREADY going when the dialog opened (with Cancel/Dismiss as before).
+
+Verified: both start-path tests now assert `onClose` fires and the router
+lands on `/` after Start (a LocationProbe in the test harness); the
+out-of-space rendering test now exercises the panel's self-discovery path,
+which is how an in-dialog run is displayed post-change. 11 CompanionBrowser
+tests, 160 frontend total, production build green.
+
+---
+
 # ClipAI — Pick the source + translation language right where a bulk import starts
 
 The language pickers lived only in the browser's top toolbar — easy to miss,

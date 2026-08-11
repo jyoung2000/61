@@ -9,8 +9,16 @@ import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from 'vite
 import React from 'react';
 import { createRoot } from 'react-dom/client';
 import { act } from 'react';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter, useLocation } from 'react-router-dom';
 import CompanionBrowser from './CompanionBrowser';
+
+// Records the router path so tests can assert "starting a bulk run lands on
+// the Dashboard" without mounting the whole app's routes.
+function LocationProbe() {
+  const loc = useLocation();
+  return <div data-testid="loc">{loc.pathname}</div>;
+}
+const currentPath = () => document.body.querySelector('[data-testid="loc"]')?.textContent;
 
 beforeAll(() => { globalThis.IS_REACT_ACT_ENVIRONMENT = true; });
 
@@ -33,6 +41,7 @@ let mockRoots;
 let listingFor;       // (path) => { status, body }
 let serverBookmarks;
 let bulkProgress;
+let activeBulkId;     // /import-folder/active — a run already going on the server
 
 function mockFetch(url, opts = {}) {
   const method = (opts.method || 'GET').toUpperCase();
@@ -63,7 +72,7 @@ function mockFetch(url, opts = {}) {
     const r = listingFor(path);
     return json(r.body, r.status);
   }
-  if (url.startsWith('/api/providers/companion-files/import-folder/active')) return json({ bulk_id: null });
+  if (url.startsWith('/api/providers/companion-files/import-folder/active')) return json({ bulk_id: activeBulkId });
   if (url.startsWith('/api/providers/companion-files/import-folder/progress')) return json(bulkProgress);
   if (url.startsWith('/api/providers/companion-files/import-folder')) {
     return json({ ok: true, bulk_id: 'bulk1', total: 2, folder: 'D:\\media' });
@@ -80,6 +89,7 @@ beforeEach(() => {
     ? { status: 400, body: { detail: 'not a directory' } }
     : { status: 200, body: LISTING });
   bulkProgress = { status: 'complete', total: 2, done: 2, ok: 2, failed: 0, current: -1, folder_name: 'media', items: [] };
+  activeBulkId = null;
   vi.stubGlobal('fetch', vi.fn(mockFetch));
   localStorage.clear();
   container = document.createElement('div');
@@ -95,6 +105,15 @@ afterEach(async () => {
 const flush = () => act(async () => { await new Promise((r) => setTimeout(r, 0)); });
 const render = async (el) => {
   await act(async () => { root = createRoot(container); root.render(<MemoryRouter>{el}</MemoryRouter>); });
+  await flush();
+};
+// Render "on the Upload page" with a path probe, so a test can assert that
+// starting a bulk run navigates to the Dashboard ('/').
+const renderAt = async (el, path = '/upload') => {
+  await act(async () => {
+    root = createRoot(container);
+    root.render(<MemoryRouter initialEntries={[path]}>{el}<LocationProbe /></MemoryRouter>);
+  });
   await flush();
 };
 const click = (el) => act(async () => { el.click(); await Promise.resolve(); });
@@ -250,8 +269,10 @@ describe('CompanionBrowser path smoothness', () => {
 });
 
 describe('CompanionBrowser bulk folder import', () => {
-  it('confirms with the video count, starts the run, and shows the shared progress panel', async () => {
-    await render(<CompanionBrowser kind="video" onClose={() => {}} onImported={() => {}} />);
+  it('confirms with the video count, then Start closes the dialog and lands on the Dashboard', async () => {
+    const onClose = vi.fn();
+    await renderAt(<CompanionBrowser kind="video" onClose={onClose} onImported={() => {}} />);
+    expect(currentPath()).toBe('/upload');
     await click([...document.body.querySelectorAll('button')].find((b) => b.textContent.includes('media')));
     await flush();
 
@@ -275,10 +296,17 @@ describe('CompanionBrowser bulk folder import', () => {
       host_id: 'h1', path: 'D:\\media\\Anime',
       source_language: 'ja', target_language: 'en',
     });
-    expect(document.body.textContent).toContain('Folder import done — 2 of 2 videos imported');
+    // The run lives on the server — the dialog closes and the user lands on
+    // the Dashboard, whose shared panel owns the live status. No getting
+    // stuck watching the popup on the Upload page.
+    expect(onClose).toHaveBeenCalled();
+    expect(currentPath()).toBe('/');
   });
 
   it('renders per-video statuses and an out-of-space stop honestly', async () => {
+    // A run already on the server: the dialog's panel self-discovers it via
+    // /active (starting a NEW run navigates to the Dashboard instead).
+    activeBulkId = 'bulk1';
     bulkProgress = {
       status: 'out_of_space', total: 3, done: 1, ok: 1, failed: 0, current: -1,
       folder_name: 'media',
@@ -289,12 +317,6 @@ describe('CompanionBrowser bulk folder import', () => {
       ],
     };
     await render(<CompanionBrowser kind="video" onClose={() => {}} onImported={() => {}} />);
-    await click([...document.body.querySelectorAll('button')].find((b) => b.textContent.includes('media')));
-    await flush();
-    const pill = [...document.body.querySelectorAll('[title="Import every video in this folder, one at a time"]')].pop();
-    await click(pill);
-    await flush();
-    await click(byText('Start'));
     await flush();
     await flush();
 
@@ -306,7 +328,8 @@ describe('CompanionBrowser bulk folder import', () => {
   });
 
   it('multi-selected videos import through the sequential server queue', async () => {
-    await render(<CompanionBrowser kind="video" onClose={() => {}} onImported={() => {}} />);
+    const onClose = vi.fn();
+    await renderAt(<CompanionBrowser kind="video" onClose={onClose} onImported={() => {}} />);
     await click([...document.body.querySelectorAll('button')].find((b) => b.textContent.includes('media')));
     await flush();
 
@@ -336,8 +359,10 @@ describe('CompanionBrowser bulk folder import', () => {
     ]);
     expect(post.body).toMatchObject({ source_language: 'ja', target_language: 'en' });
     expect(fetchCalls.some((c) => c.url.endsWith('/companion-files/import'))).toBe(false);
-    // The shared panel takes over with the polled (terminal) state.
-    expect(document.body.textContent).toContain('Folder import done — 2 of 2 videos imported');
+    // Dialog closed, user on the Dashboard — the shared panel there owns the
+    // live status; nobody is stuck watching the Upload-page popup.
+    expect(onClose).toHaveBeenCalled();
+    expect(currentPath()).toBe('/');
   });
 
   it('confirm-card language picks stay in sync with the sticky toolbar pickers', async () => {
