@@ -118,6 +118,8 @@ _PERSISTABLE_KEYS = [
     # container rebuilds just like the model picks above.
     "EDITORIAL_AI_PRIMARY_SPEC", "EDITORIAL_AI_FALLBACK_SPEC",
     "FFMPEG_PRESET", "FFMPEG_CRF", "FFMPEG_THREADS", "FFMPEG_FASTSTART",
+    # How many analysis pipelines may run at once (Settings > Advanced).
+    "CONCURRENT_ANALYSES",
     "GPU_ACCELERATION_ENABLED", "GPU_VENDOR_OVERRIDE",
     "GPU_HWDECODE_ENABLED", "GPU_HEVC_FOR_4K", "GPU_DEVICE_INDEX",
     "GPU_NVENC_PRESET",
@@ -5623,6 +5625,43 @@ class SaveEncodingSettingsRequest(BaseModel):
     crf: Optional[int] = None
     threads: Optional[int] = None
     faststart: Optional[bool] = None
+
+
+class SaveProcessingSettingsRequest(BaseModel):
+    concurrent_analyses: int | None = None
+
+
+@router.get("/processing/settings")
+async def get_processing_settings():
+    """Current pipeline-processing knobs: how many analyses may run at once,
+    and how many are actually running right now (for the Settings UI)."""
+    from backend.services import pipeline as _pipeline
+
+    return {
+        "concurrent_analyses": settings.CONCURRENT_ANALYSES,
+        "active_analyses": _pipeline.active_analyses(),
+    }
+
+
+@router.post("/processing/settings")
+async def save_processing_settings(req: SaveProcessingSettingsRequest):
+    """Save pipeline-processing settings. Applies LIVE — no restart needed:
+    raising the limit admits queued jobs immediately; lowering it lets running
+    analyses finish and admits the next ones under the new cap. Persisted to
+    user_settings.json AND .env so it survives container rebuilds."""
+    if req.concurrent_analyses is not None:
+        from backend.services.pipeline import apply_concurrency
+
+        n = apply_concurrency(req.concurrent_analyses)
+        env_path = _find_env_file()
+        if env_path:
+            _upsert_env_var(env_path, "CONCURRENT_ANALYSES", str(n))
+        _persist_user_settings()
+
+    return {
+        "status": "saved",
+        "concurrent_analyses": settings.CONCURRENT_ANALYSES,
+    }
 
 
 @router.get("/encoding/settings")

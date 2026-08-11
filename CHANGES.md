@@ -1,3 +1,47 @@
+# ClipAI — Concurrent Analyses in Settings + the Companion shows every job separately
+
+Two follow-ups to the sequential-import fix:
+
+- **Concurrent Analyses is now a Settings option** (Settings > Advanced >
+  Concurrent Analyses, buttons 1–4, default "1 · sequential"). Backed by new
+  `GET/POST /api/processing/settings` and a new resizable `AnalysisGate`
+  replacing the fixed `asyncio.Semaphore`: the change applies **live, no
+  container restart** — raising the limit admits queued jobs immediately;
+  lowering it never interrupts running analyses (they finish, then the queue
+  continues under the new cap). Persisted to `user_settings.json` (new
+  `_PERSISTABLE_KEYS` entry) AND upserted into `.env`, so it survives both
+  container restarts and image rebuilds. Values clamp to 1–8 server-side.
+- **The GPU Companion now tracks and shows each ClipAI job separately**
+  (Companion 0.11.10 → 0.11.11). The Windows app kept ONE `reported_job`
+  slot, so when ClipAI ran two pipelines their heartbeats overwrote each
+  other and the GUI flickered between jobs. It now keeps a per-job map
+  (`reported_jobs`, stale entries evicted after the 300 s heartbeat window):
+  - The dashboard renders **one card per running pipeline** — own title,
+    stage, elapsed, progress bar, and its own **Force end** button ("Analyzing
+    (1 of 2) — …"). Force-ending one job never wipes the other, and the GPU
+    is only freed when NO job remains (previously ending one of two evicted
+    the models out from under the survivor — both `end_active_job` and
+    `force_end_everything`/`/v1/jobs/force-end` now account for every job).
+  - "Pipeline activity" job logs keep per-job stage/progress even for
+    heartbeat-only jobs (a pipeline whose stages so far all ran on the
+    server now appears as its own entry instead of not at all), and one
+    job's `X-ClipAI-Job-Ended` clears only that job.
+  - Status payload gains `active_jobs` (oldest started first); `current_job`/
+    `job_progress` stay for the single-job consumers and idle reapers.
+- Note: the Companion GPU intentionally still runs ONE transcription at a
+  time (`whisper_slot`); with 2 concurrent analyses the second pipeline's
+  whisper call queues briefly — the cards make that visible instead of
+  confusing.
+- Verified: 6 new backend tests (`test_processing_settings.py`: endpoint
+  read/write/clamp, live gate resize, raise-admits-immediately,
+  lower-never-interrupts, persistence key) — 45 backend tests green across
+  the touched suites; new e2e section 8 in `proxy_e2e.rs` (two concurrent
+  heartbeats tracked separately, one job's end signal spares the other,
+  suppression after end, per-id force end) — 40 Rust tests green; `tsc`
+  clean; 159 frontend tests + production build green.
+
+---
+
 # ClipAI — Multi-video imports run strictly one pipeline at a time
 
 A dashboard screenshot showed two analyses running side by side (6 % and

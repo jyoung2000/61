@@ -525,17 +525,19 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
     }
   };
 
-  const [endingJob, setEndingJob] = useState(false);
-  const doEndJob = async () => {
-    setEndingJob(true);
+  // Which job id is being force-ended right now ('' = the headline job),
+  // null = none. Per-id so only the clicked card's button shows "Ending…".
+  const [endingJob, setEndingJob] = useState<string | null>(null);
+  const doEndJob = async (jobId?: string) => {
+    setEndingJob(jobId ?? '');
     try {
-      await endActiveJob();
+      await endActiveJob(jobId);
       refresh();
     } catch (e) {
       setSyncMsg(`Could not end job: ${e}`);
       setTimeout(() => setSyncMsg(''), 5000);
     } finally {
-      setEndingJob(false);
+      setEndingJob(null);
     }
   };
 
@@ -685,6 +687,7 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
   };
 
   const job = status.current_job;
+  const activeJobs = status.active_jobs || [];
   const sharedPaths = status.config.shared_paths || [];
   const addSharedPath = async (pathArg?: string) => {
     const p = (pathArg ?? newSharedPath).trim();
@@ -859,7 +862,41 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
         </div>
       )}
 
-      {job && (
+      {/* One card PER pipeline ClipAI is running — several when its Concurrent
+          Analyses setting is raised. Each has its own stage, progress bar and
+          Force-end button, so concurrent jobs never blur into one display. */}
+      {activeJobs.map((aj, i) => (
+        <div key={aj.job_id || i} className="panel" style={{ borderColor: 'var(--success)' }}>
+          <div className="row spread">
+            <div>
+              <strong>
+                {activeJobs.length > 1 ? `Analyzing (${i + 1} of ${activeJobs.length})` : 'Analyzing'}
+                {aj.job_title ? ` — ${aj.job_title}` : ''}
+              </strong>
+              <div className="muted small">
+                {aj.stage ? `stage: ${aj.stage} — ` : ''}{elapsed(aj.started_at_ms)} elapsed
+                {aj.job_id ? ` — job ${aj.job_id.slice(0, 8)}` : ''}
+              </div>
+            </div>
+            <div className="row" style={{ gap: 8, flexShrink: 0 }}>
+              <span className="badge live">{aj.progress}%</span>
+              <button className="secondary" style={{ padding: '3px 10px' }}
+                onClick={() => doEndJob(aj.job_id)} disabled={endingJob !== null}
+                title="Force-end this job on the Companion: clears this card and, once no jobs remain, unloads the models. Use if ClipAI stopped without telling the Companion.">
+                {endingJob === aj.job_id ? 'Ending…' : 'Force end'}
+              </button>
+            </div>
+          </div>
+          {/* Live progress bar for this pipeline (from X-ClipAI-Progress). */}
+          <div className="meter" style={{ marginTop: 8 }}>
+            <div style={{ width: `${Math.max(2, Math.min(100, aj.progress))}%` }} />
+          </div>
+        </div>
+      ))}
+
+      {/* No heartbeats but a request is in flight (an ad-hoc AI call, or a
+          ClipAI old enough not to heartbeat) — the classic single card. */}
+      {activeJobs.length === 0 && job && (
         <div className="panel" style={{ borderColor: 'var(--success)' }}>
           <div className="row spread">
             <div>
@@ -877,9 +914,9 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
                 {status.job_progress != null ? `${status.job_progress}%` : 'Live'}
               </span>
               <button className="secondary" style={{ padding: '3px 10px' }}
-                onClick={doEndJob} disabled={endingJob}
+                onClick={() => doEndJob()} disabled={endingJob !== null}
                 title="Force-end this job on the Companion: clears the display and unloads its models. Use if ClipAI stopped without telling the Companion.">
-                {endingJob ? 'Ending…' : 'Force end'}
+                {endingJob !== null ? 'Ending…' : 'Force end'}
               </button>
             </div>
           </div>

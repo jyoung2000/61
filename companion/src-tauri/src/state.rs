@@ -352,11 +352,15 @@ pub struct AppState {
     pub proxy_bound: AtomicBool,
     /// Last proxy bind error (empty when bound) for the GUI banner.
     pub proxy_last_error: Mutex<String>,
-    /// Progress ClipAI EXPLICITLY reported via POST /v1/progress. During local-
-    /// only pipeline stages (video decode/frame-extract on the SERVER GPU) no AI
-    /// request reaches us, so the in-flight-request view would freeze; this
-    /// heartbeat keeps the GUI bar tracking the container. None until reported.
-    pub reported_job: Mutex<Option<ReportedJob>>,
+    /// Progress ClipAI EXPLICITLY reported via POST /v1/progress, one entry per
+    /// job id. During local-only pipeline stages (video decode/frame-extract on
+    /// the SERVER GPU) no AI request reaches us, so the in-flight-request view
+    /// would freeze; these heartbeats keep the GUI tracking the container. A MAP
+    /// (not a single slot) because ClipAI can run several pipelines at once when
+    /// its Concurrent Analyses setting is raised — with one slot the heartbeats
+    /// overwrote each other and the GUI flickered between jobs instead of
+    /// showing each one. Entries go stale 300 s after their last heartbeat.
+    pub reported_jobs: Mutex<HashMap<String, ReportedJob>>,
     /// Job ids the user Force-ended (or that ClipAI signalled ended) → when.
     /// A Force-ended job must STAY gone even though ClipAI may keep heartbeating
     /// it for a few more seconds (a local-only stage still running, or a
@@ -438,7 +442,7 @@ impl AppState {
             sidecar_available: AtomicBool::new(false),
             proxy_bound: AtomicBool::new(false),
             proxy_last_error: Mutex::new(String::new()),
-            reported_job: Mutex::new(None),
+            reported_jobs: Mutex::new(HashMap::new()),
             suppressed_jobs: Mutex::new(HashMap::new()),
         };
         state.save(); // persist the generated token on first run
@@ -627,35 +631,40 @@ impl AppState {
                 return;
             }
         }
-        let mut slot = self.reported_job.lock().unwrap();
+        let mut jobs = self.reported_jobs.lock().unwrap();
+        // Evict entries whose heartbeats went stale (dead container / job that
+        // ended without an end signal) so the map can't grow without bound.
+        jobs.retain(|_, j| now.saturating_sub(j.updated_ms) < 300_000);
         // Preserve the original start time across heartbeats for the same job;
-        // a new job_id resets it. This keeps the GUI "elapsed" sane.
-        let started_ms = match slot.as_ref() {
-            Some(prev) if prev.job_id == job_id => prev.started_ms,
-            _ => now,
+        // a new job_id gets its own entry. This keeps the GUI "elapsed" sane.
+        let started_ms = match jobs.get(job_id) {
+            Some(prev) => prev.started_ms,
+            None => now,
         };
-        *slot = Some(ReportedJob {
-            job_id: job_id.into(),
-            job_title: job_title.into(),
-            stage: stage.into(),
-            progress: progress.min(100),
-            updated_ms: now,
-            started_ms,
-        });
+        jobs.insert(
+            job_id.to_string(),
+            ReportedJob {
+                job_id: job_id.into(),
+                job_title: job_title.into(),
+                stage: stage.into(),
+                progress: progress.min(100),
+                updated_ms: now,
+                started_ms,
+            },
+        );
     }
 
-    /// Clear the reported active job. When ``job_id`` is non-empty only clears
-    /// it if it matches (so a stale end signal can't wipe a newer job); an empty
-    /// ``job_id`` force-clears whatever is there (the GUI "Force end" button).
+    /// Clear a reported active job. When ``job_id`` is non-empty only that job
+    /// is cleared (so one job's end signal can't wipe the others); an empty
+    /// ``job_id`` force-clears every reported job.
     pub fn clear_reported_job(&self, job_id: &str) {
-        let mut slot = self.reported_job.lock().unwrap();
-        let matches = match slot.as_ref() {
-            Some(j) => job_id.is_empty() || j.job_id == job_id,
-            None => false,
-        };
-        if matches {
-            *slot = None;
+        let mut jobs = self.reported_jobs.lock().unwrap();
+        if job_id.is_empty() {
+            jobs.clear();
+        } else {
+            jobs.remove(job_id);
         }
+        drop(jobs);
         // A specific end signal from ClipAI (cancel/delete via the
         // x-clipai-job-ended header) also SUPPRESSES that job id, so a late
         // in-flight heartbeat racing the end signal can't bring the card back.
@@ -667,22 +676,27 @@ impl AppState {
         }
     }
 
-    /// GUI "Force end": clear the reported job, SUPPRESS its id so a still-
+    /// GUI "Force end": clear a reported job, SUPPRESS its id so a still-
     /// heartbeating ClipAI can't resurrect it, and mark any in-flight activity
     /// entries for it finished so the per-job log stops reading as active.
+    /// ``job_id`` picks WHICH job (each job card has its own button); empty
+    /// falls back to whichever job is headlining — the pre-multi-job behavior.
     /// Returns the ended job id (for logging), if one was showing.
-    pub fn force_end_job(&self) -> Option<String> {
-        // The displayed job is the reported heartbeat if fresh, else the most
-        // recent in-flight proxy request. End whichever is showing.
-        let job_id = {
-            let slot = self.reported_job.lock().unwrap();
-            slot.as_ref().map(|j| j.job_id.clone())
-        }
-        .or_else(|| self.current_job().map(|e| e.job_id));
-
-        *self.reported_job.lock().unwrap() = None;
+    pub fn force_end_job(&self, job_id: &str) -> Option<String> {
+        let job_id = if job_id.is_empty() {
+            // No specific id: end the headline job — the oldest fresh heartbeat,
+            // else the most recent in-flight proxy request.
+            self.reported_jobs_fresh()
+                .into_iter()
+                .next()
+                .map(|j| j.job_id)
+                .or_else(|| self.current_job().map(|e| e.job_id))
+        } else {
+            Some(job_id.to_string())
+        };
 
         if let Some(jid) = job_id.as_ref() {
+            self.reported_jobs.lock().unwrap().remove(jid);
             if !jid.is_empty() {
                 self.suppressed_jobs
                     .lock()
@@ -701,17 +715,35 @@ impl AppState {
         job_id
     }
 
-    /// The reported job if a heartbeat arrived recently (< 300s) — else None so
-    /// a finished/abandoned job stops driving the bar. The window is 300 s (not
-    /// the heartbeat cadence of ~1.5 s) because progress-quiet-but-active
-    /// stages are legitimate: a single clip-export encode may run up to ~180 s
-    /// with sparse heartbeats and no AI traffic, and it must still count as an
-    /// active job so the idle reaper doesn't evict the models mid-job. A dead
-    /// container's job therefore lingers up to 300 s before going stale —
-    /// X-ClipAI-Job-Ended clears it immediately in the normal case.
+    /// Every reported job whose heartbeat arrived recently (< 300s), oldest
+    /// started first — one entry per pipeline ClipAI is running. The window is
+    /// 300 s (not the heartbeat cadence of ~1.5 s) because progress-quiet-but-
+    /// active stages are legitimate: a single clip-export encode may run up to
+    /// ~180 s with sparse heartbeats and no AI traffic, and it must still count
+    /// as an active job so the idle reaper doesn't evict the models mid-job. A
+    /// dead container's jobs therefore linger up to 300 s before going stale —
+    /// X-ClipAI-Job-Ended clears each immediately in the normal case.
+    pub fn reported_jobs_fresh(&self) -> Vec<ReportedJob> {
+        let now = now_ms();
+        let mut jobs: Vec<ReportedJob> = self
+            .reported_jobs
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|j| now.saturating_sub(j.updated_ms) < 300_000)
+            .cloned()
+            .collect();
+        // Oldest started first: the longest-running pipeline headlines, and
+        // card order is stable across refreshes (a HashMap iteration isn't).
+        jobs.sort_by_key(|j| (j.started_ms, j.job_id.clone()));
+        jobs
+    }
+
+    /// The headline job — the oldest fresh reported job, if any. Kept for the
+    /// single-job consumers (idle reapers ask "is ANY job running?"; the
+    /// dashboard headline shows the longest-running pipeline).
     pub fn reported_job_fresh(&self) -> Option<ReportedJob> {
-        let r = self.reported_job.lock().unwrap().clone();
-        r.filter(|j| now_ms().saturating_sub(j.updated_ms) < 300_000)
+        self.reported_jobs_fresh().into_iter().next()
     }
 
     /// True when a real inference/transcription request (not a probe) has been
@@ -758,10 +790,16 @@ impl AppState {
     /// Activity grouped by ClipAI job id, newest job first, so the GUI can show
     /// one log stream per video-analysis pipeline. Health probes are excluded.
     pub fn job_logs(&self) -> Vec<JobLog> {
-        // A fresh progress heartbeat means ClipAI is STILL working this job even
+        // A fresh progress heartbeat means ClipAI is STILL working that job even
         // if it isn't hitting us right now (local-only stage) — so it must not
-        // read as "done". Captured before locking activity (separate mutex).
-        let reported = self.reported_job_fresh();
+        // read as "done". One entry PER job so several concurrent pipelines each
+        // keep their own stage/progress. Captured before locking activity
+        // (separate mutex).
+        let reported: HashMap<String, ReportedJob> = self
+            .reported_jobs_fresh()
+            .into_iter()
+            .map(|j| (j.job_id.clone(), j))
+            .collect();
         let feed = self.activity.lock().unwrap();
         let mut order: Vec<String> = Vec::new();
         let mut groups: HashMap<String, Vec<ActivityEntry>> = HashMap::new();
@@ -776,35 +814,51 @@ impl AppState {
             }
             groups.entry(key).or_default().push(e.clone());
         }
+        drop(feed);
+        // A job that only exists as heartbeats (its stages so far all ran on the
+        // SERVER — e.g. a just-started pipeline still extracting frames) has no
+        // activity entries, so the loop above never saw it. It's still a live
+        // ClipAI job and must show separately — prepend, newest started first.
+        let mut heartbeat_only: Vec<&String> = reported
+            .keys()
+            .filter(|k| !groups.contains_key(*k))
+            .collect();
+        heartbeat_only.sort_by_key(|k| std::cmp::Reverse(reported[*k].started_ms));
+        for k in heartbeat_only {
+            order.insert(0, k.clone());
+            groups.insert(k.clone(), Vec::new());
+        }
         order
             .into_iter()
             .map(|key| {
                 let entries = groups.remove(&key).unwrap_or_default();
+                let rep = reported.get(&key);
                 let job_title = entries
                     .iter()
                     .map(|e| e.job_title.clone())
                     .find(|t| !t.is_empty())
+                    .or_else(|| rep.map(|r| r.job_title.clone()))
                     .unwrap_or_default();
                 // Active if a request is in-flight OR ClipAI is still reporting
                 // progress for this job (covers local-only stages like frame
                 // extraction / offline translation where nothing hits our proxy).
-                let reported_active = reported.as_ref().map(|r| r.job_id == key).unwrap_or(false);
-                let active = reported_active
+                let active = rep.is_some()
                     || entries.iter().any(|e| e.finished_at_ms.is_none());
-                let started_at_ms = entries.iter().map(|e| e.started_at_ms).min().unwrap_or(0);
-                let mut last_activity_ms = entries
+                let started_at_ms = entries
+                    .iter()
+                    .map(|e| e.started_at_ms)
+                    .chain(rep.map(|r| r.started_ms))
+                    .min()
+                    .unwrap_or(0);
+                let last_activity_ms = entries
                     .iter()
                     .map(|e| e.finished_at_ms.unwrap_or(e.started_at_ms))
+                    .chain(rep.map(|r| r.updated_ms))
                     .max()
                     .unwrap_or(0);
-                if reported_active {
-                    if let Some(r) = &reported {
-                        last_activity_ms = last_activity_ms.max(r.updated_ms);
-                    }
-                }
-                let (reported_stage, reported_progress) = match (reported_active, reported.as_ref()) {
-                    (true, Some(r)) => (r.stage.clone(), r.progress as i64),
-                    _ => (String::new(), -1),
+                let (reported_stage, reported_progress) = match rep {
+                    Some(r) => (r.stage.clone(), r.progress as i64),
+                    None => (String::new(), -1),
                 };
                 JobLog {
                     job_id: key,

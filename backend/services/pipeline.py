@@ -2095,8 +2095,62 @@ def is_job_analyzing(job_id: str) -> bool:
 # translation, scheduled after analysis completes).
 _background_tasks: set[asyncio.Task] = set()
 
-# Semaphore to limit concurrent analyses
-_analysis_semaphore: asyncio.Semaphore | None = None
+class AnalysisGate:
+    """Semaphore-like concurrency gate whose limit can be resized at runtime.
+
+    A plain ``asyncio.Semaphore`` can't change size once tasks hold permits —
+    swapping in a fresh one would let old holders release into the discarded
+    object while new acquirers race the replacement, momentarily exceeding the
+    limit. This gate counts active holders under one Condition instead, so the
+    Settings page can change the limit live: raising it wakes queued jobs
+    immediately, lowering it just lets running analyses finish and admits the
+    next ones under the new cap. Same ``async with`` interface as a Semaphore.
+    """
+
+    def __init__(self, limit: int):
+        self._limit = max(1, int(limit))
+        self._active = 0
+        self._cond = asyncio.Condition()
+
+    @property
+    def limit(self) -> int:
+        return self._limit
+
+    @property
+    def active(self) -> int:
+        return self._active
+
+    def set_limit(self, n: int) -> None:
+        self._limit = max(1, int(n))
+
+        # Waking waiters needs the Condition's lock, which a sync caller (the
+        # Settings endpoint handler) doesn't hold — do it in a task. Without
+        # a running loop there are no waiters to wake; the new limit still
+        # applies on the next acquire/release.
+        async def _wake():
+            async with self._cond:
+                self._cond.notify_all()
+
+        try:
+            asyncio.get_running_loop().create_task(_wake())
+        except RuntimeError:
+            pass
+
+    async def __aenter__(self):
+        async with self._cond:
+            await self._cond.wait_for(lambda: self._active < self._limit)
+            self._active += 1
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        async with self._cond:
+            self._active = max(0, self._active - 1)
+            self._cond.notify_all()
+        return False
+
+
+# Gate limiting concurrent analyses (resizable via Settings > Advanced)
+_analysis_semaphore: AnalysisGate | None = None
 
 # WebSocket broadcast registry
 _ws_subscribers: dict[str, list] = {}
@@ -2128,11 +2182,30 @@ def _check_cancelled(job_id: str):
         raise CancelledError(f"Job {job_id} was cancelled by user")
 
 
-def get_semaphore() -> asyncio.Semaphore:
+def get_semaphore() -> AnalysisGate:
     global _analysis_semaphore
     if _analysis_semaphore is None:
-        _analysis_semaphore = asyncio.Semaphore(settings.CONCURRENT_ANALYSES)
+        _analysis_semaphore = AnalysisGate(settings.CONCURRENT_ANALYSES)
     return _analysis_semaphore
+
+
+def apply_concurrency(n: int) -> int:
+    """Set how many analyses may run at once (Settings > Advanced), live.
+
+    Takes effect without a restart: raising the limit admits queued jobs
+    immediately; lowering it never interrupts running analyses — they finish,
+    and the queue drains under the new cap. Returns the effective limit."""
+    n = max(1, min(8, int(n)))
+    settings.CONCURRENT_ANALYSES = n
+    if _analysis_semaphore is not None:
+        _analysis_semaphore.set_limit(n)
+    logger.info("Concurrent analyses limit set to %d", n)
+    return n
+
+
+def active_analyses() -> int:
+    """How many analyses hold a slot right now (0 if none started yet)."""
+    return _analysis_semaphore.active if _analysis_semaphore else 0
 
 
 def register_ws_subscriber(job_id: str, ws):

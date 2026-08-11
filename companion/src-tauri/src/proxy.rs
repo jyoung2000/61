@@ -710,7 +710,19 @@ async fn jobs_force_end(State(ctx): State<ProxyCtx>, req: Request<Body>) -> Resp
 pub(crate) async fn force_end_everything(
     state: &crate::SharedState, reason: &str,
 ) -> (Option<String>, bool, usize) {
-    let ended = state.force_end_job();
+    // End EVERY job showing, not just the headline — ClipAI can run several
+    // pipelines at once (Concurrent Analyses), each with its own card. Each
+    // force_end_job("") ends the current headline and suppresses it, so the
+    // next iteration sees the next job; the cap is a safety net only.
+    let mut ended: Option<String> = None;
+    for _ in 0..100 {
+        match state.force_end_job("") {
+            Some(jid) => {
+                ended.get_or_insert(jid);
+            }
+            None => break,
+        }
+    }
     state.job_progress.store(0, Ordering::Relaxed);
     // Whisper first, unconditionally: free_gpu skips it while a decode holds
     // the slot, but a force-end exists precisely to stop that decode.

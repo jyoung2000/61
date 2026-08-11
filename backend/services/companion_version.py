@@ -30,7 +30,7 @@ logger = logging.getLogger("clipai.companion_version")
 
 # The Companion version this container was built alongside. Bump together
 # with companion/RELEASE (test_companion_version_sync enforces it).
-EXPECTED_COMPANION_VERSION = "0.11.10"
+EXPECTED_COMPANION_VERSION = "0.11.11"
 
 _tasks: set = set()
 # Warn once per (reported_version) per process — every job start re-checks,

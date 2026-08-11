@@ -186,4 +186,61 @@ async fn proxy_auth_routing_and_saturation() {
         "auto",
         "rejected write must not half-apply"
     );
+
+    // 8. multi-job progress: when ClipAI runs several pipelines at once
+    //    (Concurrent Analyses > 1), each job keeps its OWN tracked entry —
+    //    heartbeats never overwrite each other, one job ending never wipes
+    //    another, and a heartbeat-only job (all its stages so far ran on the
+    //    server) still shows up as its own job log.
+    let hb = |id: &str, title: &str, stage: &str, pct: &str| {
+        c.post(format!("{base}/v1/progress"))
+            .bearer_auth(token)
+            .header("X-ClipAI-Job-Id", id.to_string())
+            .header("X-ClipAI-Job-Title", title.to_string())
+            .header("X-ClipAI-Stage", stage.to_string())
+            .header("X-ClipAI-Progress", pct.to_string())
+            .send()
+    };
+    let r = hb("job-a", "first video.mp4", "transcribing", "40").await.unwrap();
+    assert_eq!(r.status(), 200, "progress heartbeat accepted (even while paused)");
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await; // distinct started_ms
+    let r = hb("job-b", "second video.mp4", "extracting frames", "10").await.unwrap();
+    assert_eq!(r.status(), 200);
+    let jobs = st.reported_jobs_fresh();
+    assert_eq!(jobs.len(), 2, "both pipelines tracked separately");
+    assert_eq!(jobs[0].job_id, "job-a", "oldest started first");
+    assert_eq!(jobs[0].progress, 40);
+    assert_eq!(jobs[1].job_id, "job-b");
+    assert_eq!(jobs[1].stage, "extracting frames");
+    let logs = st.job_logs();
+    assert!(
+        logs.iter().any(|j| j.job_id == "job-a" && j.active && j.reported_progress == 40),
+        "job-a keeps its own stage/progress in the job logs"
+    );
+    assert!(
+        logs.iter().any(|j| j.job_id == "job-b" && j.active
+            && j.job_title == "second video.mp4"),
+        "heartbeat-only job-b (no proxy traffic) still gets its own job log"
+    );
+    // one job ending clears ONLY that job…
+    let r = c
+        .post(format!("{base}/v1/progress"))
+        .bearer_auth(token)
+        .header("X-ClipAI-Job-Id", "job-a")
+        .header("X-ClipAI-Job-Ended", "1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let jobs = st.reported_jobs_fresh();
+    assert_eq!(jobs.len(), 1, "ending job-a must not clear job-b");
+    assert_eq!(jobs[0].job_id, "job-b");
+    // …and a late heartbeat for the ended job must NOT resurrect it.
+    let r = hb("job-a", "first video.mp4", "transcribing", "41").await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(st.reported_jobs_fresh().len(), 1, "suppressed job stays gone");
+    // Per-id force end (each GUI card has its own button) ends exactly job-b.
+    let ended = st.force_end_job("job-b");
+    assert_eq!(ended.as_deref(), Some("job-b"));
+    assert!(st.reported_jobs_fresh().is_empty(), "all jobs ended");
 }

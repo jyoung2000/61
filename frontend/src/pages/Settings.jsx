@@ -648,6 +648,10 @@ export default function Settings() {
   const [ffmpegThreadsSaved, setFfmpegThreadsSaved] = useState(4);
   const [ffmpegThreadsSaving, setFfmpegThreadsSaving] = useState(false);
 
+  // Concurrent analyses (pipeline processing)
+  const [concurrentAnalyses, setConcurrentAnalyses] = useState(1);
+  const [concurrencySaving, setConcurrencySaving] = useState(false);
+
   // Prompt customization state
   const [prompts, setPrompts] = useState({ frame_analysis: '', viral_clip_detection: '', summary: '', seo: '' });
   const [promptDefaults, setPromptDefaults] = useState({ frame_analysis: '', viral_clip_detection: '', summary: '', seo: '' });
@@ -820,6 +824,16 @@ export default function Settings() {
         setVocabEnabled(!!data.enabled);
         setVocabSavedEnabled(!!data.enabled);
         setVocabMax(data.max ?? 300);
+      })
+      .catch(() => {});
+  }, []);
+
+  // Load processing settings (concurrent analyses)
+  useEffect(() => {
+    fetch('/api/processing/settings')
+      .then((r) => r.json())
+      .then((data) => {
+        setConcurrentAnalyses(data.concurrent_analyses ?? 1);
       })
       .catch(() => {});
   }, []);
@@ -1545,6 +1559,30 @@ export default function Settings() {
       }
     } catch { showToast('Failed to save FFmpeg thread setting', 'error'); }
     finally { setFfmpegThreadsSaving(false); }
+  };
+
+  const handleSaveConcurrency = async (val) => {
+    setConcurrencySaving(true);
+    try {
+      const res = await fetch('/api/processing/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ concurrent_analyses: val }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setConcurrentAnalyses(data.concurrent_analyses);
+        showToast(
+          data.concurrent_analyses === 1
+            ? 'Analyses now run one at a time (sequential)'
+            : `Up to ${data.concurrent_analyses} analyses can now run at once`,
+          'success',
+        );
+      } else {
+        showToast('Failed to save concurrency setting', 'error');
+      }
+    } catch { showToast('Failed to save concurrency setting', 'error'); }
+    finally { setConcurrencySaving(false); }
   };
 
   // Prompt handlers
@@ -4106,6 +4144,46 @@ export default function Settings() {
                   )}
                 </div>
               )}
+            </div>
+
+            {/* ── Concurrent Analyses ── */}
+            <div style={{ marginBottom: 32 }}>
+              <h3 style={{ fontSize: 14, marginBottom: 4, color: 'var(--text-secondary)' }}>Concurrent Analyses</h3>
+              <p style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 16, lineHeight: 1.5 }}>
+                How many video analysis pipelines may run at the same time. Applies instantly —
+                no restart needed. Imports always queue every video; this controls how many the
+                queue lets run together.
+              </p>
+              <div style={{
+                padding: '12px 16px', background: 'var(--bg-panel)',
+                border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)',
+              }}>
+                <div style={{ display: 'flex', gap: 8 }} role="group" aria-label="Concurrent analyses">
+                  {[1, 2, 3, 4].map((n) => (
+                    <button
+                      key={n}
+                      onClick={() => n !== concurrentAnalyses && handleSaveConcurrency(n)}
+                      disabled={concurrencySaving}
+                      aria-pressed={n === concurrentAnalyses}
+                      style={{
+                        flex: 1, padding: '8px 0', fontSize: 12, fontWeight: 600,
+                        borderRadius: 'var(--radius-sm)', cursor: concurrencySaving ? 'default' : 'pointer',
+                        border: `1px solid ${n === concurrentAnalyses ? 'var(--accent-cyan)' : 'var(--border)'}`,
+                        background: n === concurrentAnalyses ? 'var(--accent-cyan)' : 'var(--bg-elevated)',
+                        color: n === concurrentAnalyses ? 'var(--bg-base)' : 'var(--text-secondary)',
+                        opacity: concurrencySaving ? 0.6 : 1, transition: 'background 0.15s, color 0.15s',
+                      }}
+                    >
+                      {n === 1 ? '1 · sequential' : n}
+                    </button>
+                  ))}
+                </div>
+                <span style={{ fontSize: 10, color: 'var(--text-muted)', display: 'block', marginTop: 8, lineHeight: 1.5 }}>
+                  1 (sequential) is recommended: multiple pipelines split the same CPU/GPU and
+                  usually finish slower in total than back-to-back. Lowering the limit never
+                  interrupts running jobs — they finish, and the queue continues under the new cap.
+                </span>
+              </div>
             </div>
 
             {/* ── FFmpeg Threads ── */}

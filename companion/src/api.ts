@@ -33,6 +33,16 @@ export interface JobLog {
   reported_progress: number;
 }
 
+/** A pipeline ClipAI is running right now (fresh progress heartbeat). */
+export interface ActiveJob {
+  job_id: string;
+  job_title: string;
+  stage: string;
+  progress: number;
+  started_at_ms: number;
+  updated_ms: number;
+}
+
 export interface CompanionStatus {
   /** This app's own version (CARGO_PKG_VERSION). */
   app_version: string;
@@ -87,6 +97,9 @@ export interface CompanionStatus {
   busy: boolean;
   current_job: ActivityEntry | null;
   job_progress: number | null;
+  /** One entry per pipeline ClipAI is running (oldest started first) —
+   *  several when ClipAI's Concurrent Analyses setting is raised. */
+  active_jobs: ActiveJob[];
   proxy_bound: boolean;
   proxy_last_error: string;
   clipai_connected: boolean;
@@ -130,8 +143,11 @@ export const testClipai = () => invoke<ClipaiTest>('test_clipai');
 /** Unload all resident Ollama models to free GPU VRAM now. */
 export const freeVram = () =>
   invoke<{ unloaded: number; whisper_stopped: boolean }>('free_vram');
-export const endActiveJob = () =>
-  invoke<{ unloaded: number; whisper_stopped: boolean; ended_job: string | null }>('end_active_job');
+/** Force-end a ClipAI job's display (each card has its own button). Omitting
+ *  jobId ends the headline job — the pre-multi-job behavior. */
+export const endActiveJob = (jobId?: string) =>
+  invoke<{ unloaded: number; whisper_stopped: boolean; ended_job: string | null }>(
+    'end_active_job', { jobId: jobId ?? null });
 // No API key: ClipAI's register endpoint is LAN-trust (same model as the
 // rest of its settings API). The empty string keeps the Rust command's
 // signature, which still forwards a key if one is ever configured.

@@ -201,7 +201,11 @@ async fn get_status(
     // Prefer the progress ClipAI EXPLICITLY reported (POST /v1/progress) — it
     // covers local-only pipeline stages where no AI request reaches us, so the
     // bar tracks the container instead of freezing on the last in-flight call.
-    let reported = state.reported_job_fresh();
+    // ALL fresh jobs (oldest started first): ClipAI can run several pipelines
+    // at once when its Concurrent Analyses setting is raised, and the GUI
+    // shows each one as its own card instead of flickering between them.
+    let reported_all = state.reported_jobs_fresh();
+    let reported = reported_all.first().cloned();
     let in_flight = state.current_job();
     // Headline: a fresh heartbeat wins; else the in-flight request; else null.
     let current_job: serde_json::Value = if let Some(r) = &reported {
@@ -275,6 +279,16 @@ async fn get_status(
         "busy": state.whisper_busy.load(Ordering::Relaxed),
         "current_job": current_job,
         "job_progress": job_progress,
+        // One entry per pipeline ClipAI is running right now (fresh heartbeats,
+        // oldest started first) — the GUI renders a card per job.
+        "active_jobs": reported_all.iter().map(|r| serde_json::json!({
+            "job_id": r.job_id,
+            "job_title": r.job_title,
+            "stage": r.stage,
+            "progress": r.progress,
+            "started_at_ms": r.started_ms,
+            "updated_ms": r.updated_ms,
+        })).collect::<Vec<_>>(),
         "proxy_bound": state.proxy_bound.load(Ordering::Relaxed),
         "proxy_last_error": state.proxy_last_error.lock().unwrap().clone(),
         "clipai_connected": state.clipai_connected(),
@@ -755,15 +769,29 @@ async fn free_vram(state: tauri::State<'_, SharedState>) -> Result<serde_json::V
 /// (no reverse channel); it just stops the Companion showing a phantom job
 /// and frees the VRAM it was holding.
 #[tauri::command]
-async fn end_active_job(state: tauri::State<'_, SharedState>) -> Result<serde_json::Value, String> {
+async fn end_active_job(
+    state: tauri::State<'_, SharedState>,
+    job_id: Option<String>,
+) -> Result<serde_json::Value, String> {
     // Sticky force-end: clear + SUPPRESS the job id so a still-heartbeating
     // ClipAI can't resurrect the card, and finish its in-flight activity.
-    let ended = state.force_end_job();
+    // ``job_id`` picks which job (each card has its own button); None ends
+    // the headline job, as before.
+    let ended = state.force_end_job(job_id.as_deref().unwrap_or(""));
     state.job_progress.store(0, std::sync::atomic::Ordering::Relaxed);
     let st: SharedState = state.inner().clone();
-    let (whisper_stopped, n) = sidecar::free_gpu(&st, "Force end button").await;
+    // Only free the GPU when NO other ClipAI job is still running — force-
+    // ending one of two concurrent pipelines must not evict the models out
+    // from under the survivor.
+    let others_active =
+        st.reported_job_fresh().is_some() || st.current_job().is_some();
+    let (whisper_stopped, n) = if others_active {
+        (false, 0)
+    } else {
+        sidecar::free_gpu(&st, "Force end button").await
+    };
     log::info!(
-        "end_active_job: force-ended {} + unloaded {n} model(s), whisper_stopped={whisper_stopped}",
+        "end_active_job: force-ended {} + unloaded {n} model(s), whisper_stopped={whisper_stopped}, others_active={others_active}",
         ended.as_deref().unwrap_or("(none)")
     );
     Ok(serde_json::json!({
