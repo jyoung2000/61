@@ -1852,6 +1852,16 @@ def _bulk_request_job_cancel(job_id: str) -> None:
         pass
 
 
+def _bulk_abort_job(job_id: str) -> bool:
+    """Hard-stop a running analysis (cooperative flag + task cancel). True
+    when a live run was actually cancelled."""
+    try:
+        from backend.services.pipeline import abort_analysis
+        return bool(abort_analysis(job_id))
+    except Exception:
+        return False
+
+
 async def _companion_list_videos(h, path: str) -> list:
     """The importable videos directly inside one shared folder (A–Z)."""
     from backend.services import ollama_registry as _oreg
@@ -1906,6 +1916,16 @@ async def _run_bulk_import(bulk_id: str) -> None:
     on the Dashboard and 409-blocked every future import until a restart."""
     try:
         await _run_bulk_import_seq(bulk_id)
+    except asyncio.CancelledError:
+        # Cancel endpoint stopped us mid-flight (its own state flip already
+        # marked the run cancelled) — make sure the snapshot agrees, then let
+        # the cancellation propagate so the task really ends.
+        st = _bulk_imports.get(bulk_id)
+        if st is not None and st.get("status") == "running":
+            st["status"] = "cancelled"
+            st["current"] = -1
+            _bulk_persist()
+        raise
     except Exception as e:
         logger.exception("Bulk import %s runner crashed", bulk_id)
         st = _bulk_imports.get(bulk_id)
@@ -2207,19 +2227,56 @@ async def companion_folder_import_progress(bulk_id: str):
 
 @router.post("/providers/companion-files/import-folder/cancel")
 async def companion_folder_import_cancel(bulk_id: str):
-    """Stop a bulk import: aborts an in-flight download immediately, cancels
-    the currently-analyzing job, and skips everything still queued."""
+    """Stop a bulk import IMMEDIATELY — everything it is doing, at once.
+
+    Cancel used to only raise a flag and ask the running analysis nicely: the
+    pipeline's cooperative cancel is checked between stages, so a job inside a
+    long stage (a whisper decode, a face loop over thousands of frames) kept
+    burning GPU for minutes, the runner sat in its 10 s status poll, and the
+    panel still read "importing". Now the endpoint itself does the work and
+    returns with the run already terminal:
+
+      * every unfinished job in the run is HARD-aborted (cooperative flag +
+        task cancel, landing the job on CANCELLED);
+      * the runner task is cancelled, so an in-flight download stops and it
+        can never start the next video;
+      * the state is marked terminal right here — the UI shows "cancelled" on
+        its very next poll instead of waiting for the runner to agree.
+    """
     st = _bulk_imports.get(bulk_id)
     if st is None:
         raise HTTPException(status_code=404, detail="unknown bulk import")
     st["cancel"] = True
+
+    # 1. Kill every analysis this run started and hasn't finished. (Sequential
+    #    runs have at most one, but a revived/adopted job could leave another.)
+    aborted = 0
+    for it in st.get("items", []):
+        jid = it.get("job_id") or ""
+        if jid and it.get("status") in ("analyzing", "downloading"):
+            if _bulk_abort_job(jid):
+                aborted += 1
+            else:
+                _bulk_request_job_cancel(jid)   # not running here — flag it anyway
+
+    # 2. Stop the runner so it can't advance to the next video (this also
+    #    aborts an in-flight download).
+    task = _bulk_tasks.get(bulk_id)
+    if task is not None and not task.done():
+        task.cancel()
+
+    # 3. Mark the run terminal NOW rather than waiting for the runner.
+    for it in st.get("items", []):
+        if it.get("status") in ("queued",):
+            it["status"] = "skipped"
+        elif it.get("status") in ("downloading", "analyzing"):
+            it["status"] = "cancelled"
+    st["status"] = "cancelled"
+    st["current"] = -1
     _bulk_persist()
-    cur = st.get("current", -1)
-    if 0 <= cur < len(st["items"]):
-        it = st["items"][cur]
-        if it.get("status") == "analyzing" and it.get("job_id"):
-            _bulk_request_job_cancel(it["job_id"])
-    return {"ok": True}
+    logger.info("Bulk import %s cancelled by user (%d running job(s) aborted)",
+                bulk_id, aborted)
+    return {"ok": True, "aborted": aborted}
 
 
 @router.get("/providers/companion-files/import-folder/active")

@@ -160,3 +160,41 @@ def test_stall_handler_noop_without_a_live_task(monkeypatch):
     asyncio.run(P._handle_stalled_run("ghost", "x", 3600))
     assert writes == []
     assert not P._stall_revive_pending and not P._stall_fail_pending
+
+
+# ── User abort ("Cancel import" must stop a run NOW) ────────────────────────
+
+def test_abort_analysis_cancels_the_task_and_flags_a_user_abort():
+    """The cooperative flag alone only lands at the next checkpoint — a run
+    inside a long stage would keep burning GPU for minutes after Cancel."""
+    P._user_abort_pending.clear()
+    task = _FakeTask()
+    P._run_tasks["job-1"] = task
+
+    assert P.abort_analysis("job-1") is True
+    assert task.cancel_calls == 1, "the task itself must be cancelled"
+    assert P.is_cancel_requested("job-1"), "cooperative flag is set too"
+    # Flagged so the CancelledError handler records CANCELLED instead of
+    # re-raising (which would strand the job on PROCESSING).
+    assert "job-1" in P._user_abort_pending
+    P._user_abort_pending.clear()
+    P._cancel_events.pop("job-1", None)
+
+
+def test_abort_analysis_on_a_job_with_no_live_run_is_false():
+    P._user_abort_pending.clear()
+    assert P.abort_analysis("ghost") is False
+    assert "ghost" not in P._user_abort_pending
+    P._cancel_events.pop("ghost", None)
+
+
+def test_abort_analysis_ignores_an_already_finished_task():
+    class _Done(_FakeTask):
+        def done(self):
+            return True
+    P._user_abort_pending.clear()
+    t = _Done()
+    P._run_tasks["job-2"] = t
+    assert P.abort_analysis("job-2") is False
+    assert t.cancel_calls == 0
+    P._cancel_events.pop("job-2", None)

@@ -75,6 +75,7 @@ const itemDetail = (it) => {
 export default function BulkImportPanel({ startId = '', onRunningChange }) {
   const [bulkId, setBulkId] = useState('');
   const [bulk, setBulk] = useState(null);
+  const [cancelling, setCancelling] = useState(false);
   const navigate = useNavigate();
 
   // Adopt a run this page just started.
@@ -123,9 +124,25 @@ export default function BulkImportPanel({ startId = '', onRunningChange }) {
   if (!bulk) return null;
 
   const cancel = async () => {
+    if (cancelling) return;
+    setCancelling(true);
     try {
-      await fetch(`/api/providers/companion-files/import-folder/cancel?bulk_id=${encodeURIComponent(bulkId)}`, { method: 'POST' });
+      const r = await fetch(`/api/providers/companion-files/import-folder/cancel?bulk_id=${encodeURIComponent(bulkId)}`, { method: 'POST' });
+      if (r.ok) {
+        // The endpoint returns with the run ALREADY terminal (it aborts the
+        // running analysis and stops the runner before answering), so reflect
+        // it now instead of leaving "Cancelling…" up until the next poll.
+        setBulk((b) => (b ? {
+          ...b,
+          status: 'cancelled',
+          items: (b.items || []).map((it) => (
+            it.status === 'queued' ? { ...it, status: 'skipped' }
+              : (it.status === 'downloading' || it.status === 'analyzing')
+                ? { ...it, status: 'cancelled' } : it)),
+        } : b));
+      }
     } catch { /* next poll shows the real state */ }
+    finally { setCancelling(false); }
   };
   const dismiss = () => { setBulk(null); setBulkId(''); };
 
@@ -164,9 +181,10 @@ export default function BulkImportPanel({ startId = '', onRunningChange }) {
           {headline}
         </span>
         {running ? (
-          <button onClick={cancel}
-            style={{ flex: 'none', fontSize: 12.5, fontWeight: 600, color: T.danger, background: T.dangerDim, padding: '6px 12px', borderRadius: 8, border: 'none', cursor: 'pointer' }}>
-            Cancel import
+          <button onClick={cancel} disabled={cancelling}
+            title="Stop everything now: the running analysis is aborted and nothing else in the queue starts"
+            style={{ flex: 'none', fontSize: 12.5, fontWeight: 600, color: T.danger, background: T.dangerDim, padding: '6px 12px', borderRadius: 8, border: 'none', cursor: cancelling ? 'default' : 'pointer', opacity: cancelling ? 0.6 : 1 }}>
+            {cancelling ? 'Stopping…' : 'Cancel import'}
           </button>
         ) : (
           <button onClick={dismiss}

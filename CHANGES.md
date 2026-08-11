@@ -1,3 +1,34 @@
+# ClipAI — "Cancel import" now stops everything immediately
+
+Cancel used to only raise a flag and ask the running analysis nicely. The
+pipeline's cancel is COOPERATIVE — checked between stages — so a job inside a
+long stage (a whisper decode, a face loop over thousands of frames) kept
+burning GPU for minutes after the click, the bulk runner sat in its 10 s
+status poll, and the panel still read "importing" the whole time.
+
+- **The running analysis is hard-aborted.** New `pipeline.abort_analysis()`
+  sets the cooperative flag AND cancels the run's asyncio task, so a job
+  mid-stage stops at once. The task kill is registered as a user abort
+  (`_user_abort_pending`) so `run_analysis`'s CancelledError handler records
+  the job **CANCELLED** — a bare task cancel would have stranded the row on
+  PROCESSING forever with no runner behind it, which the bulk queue would
+  then wait on until its 6-hour ceiling.
+- **The runner is stopped, not asked.** Its task is cancelled, so an in-flight
+  download aborts and the next video can never start.
+- **The state is terminal before the endpoint returns** — current video
+  `cancelled`, everything queued `skipped`, run `cancelled` — instead of
+  waiting for the runner to agree. The panel shows the stop on its very next
+  poll, and the button reads "Stopping…" while the request is in flight, then
+  flips the rows locally from the (already-applied) result.
+- Verified: 3 new bulk tests (state terminal the moment cancel returns, the
+  runner task is really cancelled and no next video starts, unknown id 404) +
+  3 new pipeline tests (abort cancels the task and flags a user abort, no-op
+  for a job with no live run, ignores an already-finished task) — 30
+  bulk/bookmark, 46 across the touched backend suites, 163 frontend tests and
+  the production build green.
+
+---
+
 # ClipAI — Deployed updates now actually reach the browser (stale-UI fix)
 
 "The Concurrent Analyses setting never appeared / the app isn't updating."

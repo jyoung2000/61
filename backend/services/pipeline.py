@@ -1914,6 +1914,11 @@ _run_tasks: dict = {}
 # cancel — consumed by run_analysis's CancelledError handler.
 _stall_revive_pending: set = set()
 _stall_fail_pending: set = set()
+# Jobs whose in-flight cancellation is a user ABORT ("Cancel import" — stop
+# NOW, don't wait for a cooperative checkpoint). Consumed by the same handler
+# so the job lands on CANCELLED instead of propagating as a bare task kill
+# that would leave the row stuck on PROCESSING forever.
+_user_abort_pending: set = set()
 
 _MAX_STALL_RESUME_ATTEMPTS = max(
     0, int(os.environ.get("CLIPAI_MAX_RESUME_ATTEMPTS", "3") or 3))
@@ -2180,6 +2185,40 @@ def _check_cancelled(job_id: str):
     """Raise CancelledError if the job has been cancelled."""
     if is_cancel_requested(job_id):
         raise CancelledError(f"Job {job_id} was cancelled by user")
+
+
+def abort_analysis(job_id: str) -> bool:
+    """Stop a running analysis NOW — the "Cancel import" contract.
+
+    ``request_cancel`` alone is COOPERATIVE: the run only notices at the next
+    ``_check_cancelled`` checkpoint, so a long stage (a whisper decode, a face
+    loop over thousands of frames) keeps burning GPU for minutes after the
+    user clicked Cancel. This sets the cooperative flag too — a run sitting
+    right at a checkpoint exits cleanly through the normal path — and then
+    cancels the task so anything mid-stage stops immediately.
+
+    Returns True when a live run was actually cancelled."""
+    task = _run_tasks.get(job_id)
+    if task is None or task.done():
+        # Nothing running here. Still flag any existing cancel event (the job
+        # may be between stages), but don't fabricate one — that would leak an
+        # event for a job this process isn't running.
+        request_cancel(job_id)
+        return False
+    # Set the cooperative flag directly: request_cancel is a no-op when the
+    # event doesn't exist yet, and a run that reaches a checkpoint on its own
+    # should still exit through the clean path.
+    ev = _cancel_events.get(job_id)
+    if ev is None:
+        ev = _cancel_events[job_id] = asyncio.Event()
+    ev.set()
+    # Tell the CancelledError handler this kill is a user abort, so the job
+    # is recorded CANCELLED rather than re-raising (which would leave the row
+    # stuck on PROCESSING with no runner behind it).
+    _user_abort_pending.add(job_id)
+    task.cancel()
+    logger.info("[%s] analysis aborted by user (hard cancel)", job_id)
+    return True
 
 
 def get_semaphore() -> AnalysisGate:
@@ -6193,6 +6232,25 @@ async def run_analysis(job_id: str, resume: bool = False):
                     await broadcast_ws(job_id, {
                         "type": "error",
                         "message": "Analysis stalled and was stopped",
+                    })
+                except Exception:
+                    pass
+            elif job_id in _user_abort_pending:
+                # User abort (Cancel import): record the job CANCELLED — a
+                # bare re-raise would leave it PROCESSING forever with no
+                # task behind it, and the bulk runner waiting on a status
+                # that can never become terminal.
+                _user_abort_pending.discard(job_id)
+                logger.info("[%s] cancelled by user (aborted mid-stage)", job_id)
+                await database.update_job_status(
+                    job_id,
+                    status=JobStatus.CANCELLED,
+                    progress_message="Cancelled by user",
+                )
+                try:
+                    await broadcast_ws(job_id, {
+                        "type": "cancelled",
+                        "message": "Job cancelled by user",
                     })
                 except Exception:
                     pass

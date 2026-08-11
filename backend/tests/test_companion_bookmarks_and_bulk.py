@@ -368,7 +368,7 @@ def test_bulk_cancel_stops_after_current_video(_host, monkeypatch, tmp_path):
     bulk_id = _seed_bulk(monkeypatch, ["a.mp4", "b.mkv", "c.mov"])
 
     cancel_calls = []
-    monkeypatch.setattr(S, "_bulk_request_job_cancel", lambda jid: cancel_calls.append(jid))
+    monkeypatch.setattr(S, "_bulk_abort_job", lambda jid: cancel_calls.append(jid) or True)
 
     async def cancelling_analyze(job_id):
         job = next(j for j in saved if j.job_id == job_id)
@@ -384,7 +384,7 @@ def test_bulk_cancel_stops_after_current_video(_host, monkeypatch, tmp_path):
     asyncio.run(S._run_bulk_import(bulk_id))
     st = S._bulk_imports[bulk_id]
     assert st["status"] == "cancelled"
-    assert cancel_calls == [saved[0].job_id]           # the running job was signalled
+    assert cancel_calls == [saved[0].job_id]           # the running job was aborted
     assert [i["status"] for i in st["items"]] == ["cancelled", "skipped", "skipped"]
     assert events == ["dl:a.mp4", "an:a.mp4"]          # b and c never started
 
@@ -633,3 +633,66 @@ def test_stale_running_state_never_blocks_new_imports(_host, monkeypatch, tmp_pa
     assert out["bulk_id"]                       # no 409 — the ghost was cleared
     assert S._bulk_imports["ghost"]["status"] == "error"
     assert "unexpectedly" in S._bulk_imports["ghost"]["error"]
+
+
+# ── Cancel means STOP NOW ───────────────────────────────────────────────────
+
+def test_cancel_marks_the_run_terminal_before_it_returns(_host, monkeypatch, tmp_path):
+    """Cancel must not depend on the runner noticing: by the time the endpoint
+    returns, the run is already cancelled, the current video is cancelled and
+    everything queued is skipped — so the panel's very next poll shows it."""
+    _wire_runner(monkeypatch, tmp_path)
+    bulk_id = _seed_bulk(monkeypatch, ["a.mp4", "b.mkv", "c.mov"])
+    st = S._bulk_imports[bulk_id]
+    # Pretend video 1 is mid-analysis and the runner is parked in its poll.
+    st["current"] = 0
+    st["items"][0].update(status="analyzing", job_id="job-1")
+
+    aborted = []
+    monkeypatch.setattr(S, "_bulk_abort_job", lambda jid: aborted.append(jid) or True)
+
+    out = asyncio.run(S.companion_folder_import_cancel(bulk_id))
+
+    assert out["ok"] is True and out["aborted"] == 1
+    assert aborted == ["job-1"]                       # hard abort, not a polite flag
+    assert st["status"] == "cancelled"                # terminal ALREADY
+    assert st["current"] == -1
+    assert [i["status"] for i in st["items"]] == ["cancelled", "skipped", "skipped"]
+
+
+def test_cancel_kills_the_runner_task_so_no_next_video_starts(_host, monkeypatch, tmp_path):
+    """The runner must be stopped, not merely asked — otherwise an in-flight
+    download finishes and the NEXT video starts after the user cancelled."""
+    _wire_runner(monkeypatch, tmp_path)
+    monkeypatch.setattr(S, "_bulk_abort_job", lambda jid: False)
+
+    bulk_id = _seed_bulk(monkeypatch, ["a.mp4", "b.mkv"])
+
+    async def scenario():
+        started = asyncio.Event()
+        advanced = []
+
+        async def slow_runner(bid):
+            started.set()
+            await asyncio.sleep(30)          # "downloading / analyzing"
+            advanced.append("next-video")
+
+        monkeypatch.setattr(S, "_run_bulk_import", slow_runner)
+        S._bulk_spawn_runner(bulk_id)
+        await started.wait()
+        task = S._bulk_tasks[bulk_id]
+        assert not task.done()
+
+        await S.companion_folder_import_cancel(bulk_id)
+        await asyncio.sleep(0)
+        assert task.cancelled() or task.done(), "runner task must be cancelled"
+        assert advanced == [], "no further video may start after Cancel"
+        assert S._bulk_imports[bulk_id]["status"] == "cancelled"
+
+    asyncio.run(scenario())
+
+
+def test_cancel_unknown_bulk_404():
+    with pytest.raises(HTTPException) as e:
+        asyncio.run(S.companion_folder_import_cancel("nope"))
+    assert e.value.status_code == 404
