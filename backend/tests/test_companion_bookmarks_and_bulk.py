@@ -23,6 +23,7 @@ def _isolate(tmp_path, monkeypatch):
     monkeypatch.setattr(S, "_BULK_STATE_PATH", str(tmp_path / "bulk_state.json"))
     monkeypatch.setattr(S, "_BULK_TERMINAL_POLL_S", 0.01)
     monkeypatch.setattr(S, "_bulk_imports", {})
+    monkeypatch.setattr(S, "_bulk_tasks", {})
     monkeypatch.setattr(S, "_bulk_data_root", lambda: str(tmp_path))
     monkeypatch.setattr(S, "_bulk_disk_free", lambda: 10 ** 12)
 
@@ -170,26 +171,39 @@ def test_import_folder_creates_state_and_refuses_second_concurrent(_host, monkey
         return _vids("b.mp4", "a.mkv")
     monkeypatch.setattr(S, "_companion_list_videos", _list)
 
-    async def _noop_runner(bulk_id):
-        return None
-    monkeypatch.setattr(S, "_run_bulk_import", _noop_runner)
+    # One loop for the whole scenario: the 409 guard checks the runner TASK is
+    # alive, so the fake runner must genuinely hang while the second start is
+    # refused (a finished noop would read as a phantom run and be cleared).
+    async def scenario():
+        hold = asyncio.Event()
 
-    out = asyncio.run(_start_bulk(S.CompanionFolderImportRequest(
-        host_id="h1", path="D:\\media", source_language="ja", target_language="en")))
-    assert out["ok"] is True and out["total"] == 2
-    st = S._bulk_imports[out["bulk_id"]]
-    assert st["status"] == "running"
-    assert st["source_language"] == "ja" and st["target_language"] == "en"
-    assert all(i["status"] == "queued" for i in st["items"])
+        async def _hanging_runner(bulk_id):
+            await hold.wait()
+        monkeypatch.setattr(S, "_run_bulk_import", _hanging_runner)
 
-    # Only one bulk run at a time — that's the whole "sequential" contract.
-    with pytest.raises(HTTPException) as e:
-        asyncio.run(_start_bulk(S.CompanionFolderImportRequest(host_id="h1", path="D:\\media")))
-    assert e.value.status_code == 409
+        out = await S.companion_folder_import(S.CompanionFolderImportRequest(
+            host_id="h1", path="D:\\media", source_language="ja", target_language="en"))
+        await asyncio.sleep(0)
+        assert out["ok"] is True and out["total"] == 2
+        st = S._bulk_imports[out["bulk_id"]]
+        assert st["status"] == "running"
+        assert st["source_language"] == "ja" and st["target_language"] == "en"
+        assert all(i["status"] == "queued" for i in st["items"])
 
-    # /active re-attaches a reopened dialog to the running bulk.
-    active = asyncio.run(S.companion_folder_import_active())
-    assert active["bulk_id"] == out["bulk_id"]
+        # Only one bulk run at a time — that's the whole "sequential" contract.
+        with pytest.raises(HTTPException) as e:
+            await S.companion_folder_import(
+                S.CompanionFolderImportRequest(host_id="h1", path="D:\\media"))
+        assert e.value.status_code == 409
+
+        # /active re-attaches a reopened dialog to the running bulk.
+        active = await S.companion_folder_import_active()
+        assert active["bulk_id"] == out["bulk_id"]
+
+        hold.set()
+        await asyncio.sleep(0)
+
+    asyncio.run(scenario())
 
 
 def test_import_folder_accepts_explicit_file_selection(_host, monkeypatch):
@@ -258,6 +272,13 @@ def _wire_runner(monkeypatch, tmp_path, *, job_states=None, download_fail=None):
         job = next(j for j in saved_jobs if j.job_id == job_id)
         return (job_states or {}).get(job.filename, ("complete", ""))
     monkeypatch.setattr(S, "_bulk_job_state", fake_state)
+
+    # The Companion is "online" throughout — a persistently failing download
+    # burns its retries fast instead of polling a real /v1/health.
+    async def fake_online(base, headers, st, max_wait_s=None):
+        events.append("wait-online")
+        return True
+    monkeypatch.setattr(S, "_companion_wait_online", fake_online)
     return events, saved_jobs
 
 
@@ -499,3 +520,116 @@ def test_bulk_progress_endpoint_reports_state_without_cancel_flag(_host, monkeyp
     asyncio.run(S._run_bulk_import(bulk_id))
     out = asyncio.run(S.companion_folder_import_progress(bulk_id))
     assert out["status"] == "complete" and out["ok"] == 1
+
+
+# ── Resilience: companion outages and runner crashes ────────────────────────
+
+def test_bulk_download_retries_through_a_companion_blip(_host, monkeypatch, tmp_path):
+    """The observed failure shape: the Companion goes briefly offline mid-run
+    (its self-update restarts it, a reboot, Wi-Fi). The download retries after
+    waiting for it to come back — the item still completes."""
+    events, saved = _wire_runner(monkeypatch, tmp_path)
+    fails = {"a.mp4": 2}  # first two attempts die, third succeeds
+
+    real_download = None
+
+    async def flaky_download(read_url, params, headers, dest, total, on_done):
+        name = os.path.basename(params["path"].replace("\\", "/"))
+        if fails.get(name, 0) > 0:
+            fails[name] -= 1
+            raise RuntimeError("connection reset by peer")
+        with open(dest, "wb") as f:
+            f.write(b"x" * 64)
+        on_done(64)
+        events.append(f"dl:{name}")
+        return 64
+    monkeypatch.setattr(S, "_companion_download", flaky_download)
+
+    bulk_id = _seed_bulk(monkeypatch, ["a.mp4", "b.mkv"])
+    asyncio.run(S._run_bulk_import(bulk_id))
+
+    st = S._bulk_imports[bulk_id]
+    assert st["status"] == "complete"
+    assert (st["ok"], st["failed"]) == (2, 0)
+    # Two waits (one per failed attempt), then the download landed.
+    assert events.count("wait-online") == 2
+    assert "dl:a.mp4" in events and "dl:b.mkv" in events
+
+
+def test_bulk_companion_gone_fails_item_but_run_continues(_host, monkeypatch, tmp_path):
+    """Companion never comes back within the wait budget: the item fails with
+    the real error recorded — and the NEXT item is still attempted (it may be
+    back by then), instead of the run dying wholesale."""
+    events, saved = _wire_runner(monkeypatch, tmp_path)
+
+    calls = {"n": 0}
+
+    async def dead_download(read_url, params, headers, dest, total, on_done):
+        name = os.path.basename(params["path"].replace("\\", "/"))
+        calls["n"] += 1
+        if name == "a.mp4":
+            raise RuntimeError("connection refused")
+        with open(dest, "wb") as f:
+            f.write(b"x" * 64)
+        on_done(64)
+        return 64
+    monkeypatch.setattr(S, "_companion_download", dead_download)
+
+    async def never_online(base, headers, st, max_wait_s=None):
+        return False
+    monkeypatch.setattr(S, "_companion_wait_online", never_online)
+
+    bulk_id = _seed_bulk(monkeypatch, ["a.mp4", "b.mkv"])
+    asyncio.run(S._run_bulk_import(bulk_id))
+
+    st = S._bulk_imports[bulk_id]
+    assert st["status"] == "complete"
+    assert (st["ok"], st["failed"]) == (1, 1)
+    assert st["items"][0]["status"] == "failed"
+    assert "connection refused" in st["items"][0]["error"]
+    assert st["items"][1]["status"] == "complete"
+    # Offline wait returning False stops the retry burn: one download call
+    # for the dead item, one for the healthy one.
+    assert calls["n"] == 2
+
+
+def test_runner_crash_marks_error_never_phantom_running(_host, monkeypatch, tmp_path):
+    """An unexpected exception in the worker must mark the run 'error' —
+    a state stuck on 'running' both lied on the Dashboard and 409-blocked
+    every future import until a container restart."""
+    _wire_runner(monkeypatch, tmp_path)
+    bulk_id = _seed_bulk(monkeypatch, ["a.mp4"])
+
+    async def boom(bid):
+        raise RuntimeError("kaboom")
+    monkeypatch.setattr(S, "_run_bulk_import_seq", boom)
+
+    asyncio.run(S._run_bulk_import(bulk_id))
+    st = S._bulk_imports[bulk_id]
+    assert st["status"] == "error"
+    assert "kaboom" in st["error"]
+    assert st["current"] == -1
+
+
+def test_stale_running_state_never_blocks_new_imports(_host, monkeypatch, tmp_path):
+    """A 'running' state whose runner task is gone (pre-guard crash, lost
+    event loop) is detected, marked error, and does NOT 409 new imports."""
+    S._bulk_imports["ghost"] = {
+        "bulk_id": "ghost", "status": "running", "error": "", "current": 0,
+        "items": [], "total": 0, "done": 0, "ok": 0, "failed": 0,
+    }
+    monkeypatch.setattr(S, "_bulk_tasks", {})  # no live task for it
+
+    async def _list(h, path):
+        return _vids("a.mp4")
+    monkeypatch.setattr(S, "_companion_list_videos", _list)
+
+    async def _noop(bulk_id):
+        return None
+    monkeypatch.setattr(S, "_run_bulk_import", _noop)
+
+    out = asyncio.run(_start_bulk(S.CompanionFolderImportRequest(
+        host_id="h1", path="D:\\media")))
+    assert out["bulk_id"]                       # no 409 — the ghost was cleared
+    assert S._bulk_imports["ghost"]["status"] == "error"
+    assert "unexpectedly" in S._bulk_imports["ghost"]["error"]

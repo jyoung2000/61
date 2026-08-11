@@ -1666,6 +1666,42 @@ _BULK_VIDEO_EXTS = {"mp4", "mov", "mkv", "avi", "webm", "m4v", "mpg", "mpeg", "w
 _BULK_KEEP_TERMINAL = 8            # finished runs kept for the summary screen
 _BULK_DISK_FLOOR = 2 * 1024 ** 3   # always leave ≥ 2 GB free on /data
 _bulk_imports: dict = {}           # bulk_id -> state (insertion-ordered)
+_bulk_tasks: dict = {}             # bulk_id -> asyncio.Task (the live runner)
+# Download resilience: a Companion that goes briefly offline MID-RUN (its
+# self-update restarts it, the PC reboots, Wi-Fi blips) must not fail the
+# current video — and then every remaining one within seconds, which reads
+# as "the bulk import stopped after 1 video". Each download retries, and
+# between attempts the runner WAITS for the Companion to answer /v1/health
+# again (bounded), so an update-sized outage is ridden out.
+_BULK_DL_ATTEMPTS = 4
+_BULK_OFFLINE_WAIT_S = float(os.environ.get("CLIPAI_BULK_OFFLINE_WAIT_S", "600"))
+
+
+def _bulk_spawn_runner(bulk_id: str) -> None:
+    """Start (and register) the sequential runner task for a bulk run. The
+    registration is what lets ``_bulk_run_active`` tell a LIVE run from a
+    phantom 'running' state whose task died."""
+    _bulk_tasks[bulk_id] = asyncio.create_task(_run_bulk_import(bulk_id))
+
+
+def _bulk_run_active() -> bool:
+    """True when a bulk run is genuinely in flight. A state stuck on
+    'running' whose runner task is gone (crashed before the crash guard
+    existed, or lost with a previous event loop) must NOT block new imports
+    forever — it is marked failed here, loudly, instead."""
+    active = False
+    for bid, s in _bulk_imports.items():
+        if s.get("status") != "running":
+            continue
+        t = _bulk_tasks.get(bid)
+        if t is not None and not t.done():
+            active = True
+            continue
+        s["status"] = "error"
+        s["error"] = s.get("error") or "importer stopped unexpectedly — start the import again"
+        s["current"] = -1
+        logger.warning("Bulk import %s was 'running' with no live runner — marked error", bid)
+    return active
 
 
 class CompanionFolderImportRequest(BaseModel):
@@ -1793,7 +1829,7 @@ async def resume_interrupted_bulk_imports() -> int:
                 it["status"] = "queued"
                 it["done_bytes"] = 0
         _bulk_imports[bulk_id] = st
-        asyncio.create_task(_run_bulk_import(bulk_id))
+        _bulk_spawn_runner(bulk_id)
         resumed += 1
         left = sum(1 for it in st["items"]
                    if it.get("status") in ("queued", "analyzing"))
@@ -1841,7 +1877,46 @@ def _bulk_prune_terminal() -> None:
         _bulk_imports.pop(k, None)
 
 
+async def _companion_wait_online(base: str, headers: dict, st: dict,
+                                 max_wait_s: float | None = None) -> bool:
+    """Wait (poll /v1/health) for the Companion to answer again after a blip
+    — its self-update restarting it, a reboot, a Wi-Fi drop. Returns True
+    once reachable, False on cancel or when ``max_wait_s`` runs out."""
+    from backend.services import ollama_registry as _oreg
+    limit = _BULK_OFFLINE_WAIT_S if max_wait_s is None else max_wait_s
+    url = _oreg.join_url(base, "/v1/health")
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < limit:
+        if st.get("cancel"):
+            return False
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                r = await client.get(url, headers=headers)
+            if r.status_code == 200:
+                return True
+        except Exception:
+            pass
+        await asyncio.sleep(5)
+    return False
+
+
 async def _run_bulk_import(bulk_id: str) -> None:
+    """Crash guard around the sequential worker: an unexpected exception must
+    mark the run 'error' — never leave it stuck on 'running', which both lied
+    on the Dashboard and 409-blocked every future import until a restart."""
+    try:
+        await _run_bulk_import_seq(bulk_id)
+    except Exception as e:
+        logger.exception("Bulk import %s runner crashed", bulk_id)
+        st = _bulk_imports.get(bulk_id)
+        if st is not None and st.get("status") == "running":
+            st["status"] = "error"
+            st["error"] = f"importer crashed: {str(e)[:180]}"
+            st["current"] = -1
+            _bulk_persist()
+
+
+async def _run_bulk_import_seq(bulk_id: str) -> None:
     """The sequential worker: for each queued video — free-space check,
     download from the Companion, create the job, and AWAIT the full analysis
     pipeline before touching the next file. One failed video is recorded and
@@ -1937,12 +2012,36 @@ async def _run_bulk_import(bulk_id: str) -> None:
                 except Exception:
                     pass
 
-            try:
-                size = await _companion_download(
-                    read_url, {"path": item["path"]}, headers, dest, _total, _on_done)
-                if size == 0:
-                    raise RuntimeError("imported file is empty")
-            except _BulkCancelled:
+            size = -1
+            last_err = ""
+            cancelled = False
+            for attempt in range(_BULK_DL_ATTEMPTS):
+                try:
+                    item["done_bytes"] = 0
+                    size = await _companion_download(
+                        read_url, {"path": item["path"]}, headers, dest, _total, _on_done)
+                    if size == 0:
+                        raise RuntimeError("imported file is empty")
+                    break
+                except _BulkCancelled:
+                    cancelled = True
+                    break
+                except Exception as e:
+                    last_err = str(e)[:200]
+                    size = -1
+                    if attempt >= _BULK_DL_ATTEMPTS - 1:
+                        break
+                    # The usual mid-run cause: the Companion briefly offline
+                    # (self-update restart, reboot, Wi-Fi). Wait for it to
+                    # come back instead of failing this item — and then every
+                    # remaining one — within seconds.
+                    logger.warning(
+                        "Bulk import %s: download of %s failed (%s) — waiting for the "
+                        "Companion, then retrying (%d/%d)",
+                        bulk_id, item.get("name"), last_err, attempt + 2, _BULK_DL_ATTEMPTS)
+                    if not await _companion_wait_online(base, headers, st):
+                        break
+            if cancelled or st.get("cancel"):
                 _sh.rmtree(job_dir, ignore_errors=True)
                 item["status"] = "cancelled"
                 st["status"] = "cancelled"
@@ -1950,10 +2049,10 @@ async def _run_bulk_import(bulk_id: str) -> None:
                 st["current"] = -1
                 _bulk_persist()
                 return
-            except Exception as e:
+            if size <= 0:
                 _sh.rmtree(job_dir, ignore_errors=True)
                 item["status"] = "failed"
-                item["error"] = str(e)[:200]
+                item["error"] = last_err or "download failed"
                 st["failed"] += 1
                 st["done"] += 1
                 _bulk_persist()
@@ -2028,7 +2127,7 @@ async def companion_folder_import(req: CompanionFolderImportRequest):
     h = _companion_by_id(req.host_id)
     if h is None:
         raise HTTPException(status_code=404, detail="companion not found or not connected")
-    if any(s.get("status") == "running" for s in _bulk_imports.values()):
+    if _bulk_run_active():
         raise HTTPException(status_code=409,
                             detail="a sequential import is already running — wait for it to finish or cancel it")
     if req.files:
@@ -2076,7 +2175,7 @@ async def companion_folder_import(req: CompanionFolderImportRequest):
     _bulk_prune_terminal()
     _bulk_imports[bulk_id] = st
     _bulk_persist()
-    asyncio.create_task(_run_bulk_import(bulk_id))
+    _bulk_spawn_runner(bulk_id)
     logger.info("Bulk import %s started: %d video(s) from %s",
                 bulk_id, len(videos), st["folder"])
     return {"ok": True, "bulk_id": bulk_id, "total": len(videos),

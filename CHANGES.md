@@ -1,3 +1,53 @@
+# ClipAI — Bulk import rides out Companion outages; whisper stops thrashing models
+
+Diagnosed from two Companion diagnostics reports. The observed "bulk import
+stops after 1 video" had two compounding causes: every earlier failing run
+executed on the OLD container code (the stale-branch deploys — no bulk
+persistence, so each container restart forgot the queue and only the already-
+downloaded video finished), and the Companion itself went down mid-run twice
+during the test window (a remote self-update restart at 01:31Z, a GUI Force
+end at 00:53Z) — on the old code, a Companion outage failed the current
+download AND then every remaining video within seconds. Hardening + a big
+log-proven speed fix:
+
+- **Downloads retry through Companion blips.** Each video's download now gets
+  4 attempts, and between attempts the runner WAITS (poll /v1/health, up to
+  `CLIPAI_BULK_OFFLINE_WAIT_S`, default 10 min) for the Companion to answer
+  again — a self-update restart (~40 s), a reboot, or a Wi-Fi drop no longer
+  fails the item, let alone the run. A Companion that never returns fails
+  ONLY the current item (real error recorded) and the run continues to the
+  next video.
+- **A crashed runner can never fake "running".** The sequential worker now
+  has a crash guard: an unexpected exception marks the run `error` (visible
+  on the Dashboard panel) instead of leaving a phantom "running" state that
+  409-blocked every future import until a container restart. The
+  one-run-at-a-time check also verifies the runner TASK is alive — a stale
+  "running" state with no live task is cleared, loudly, instead of blocking
+  imports forever.
+- **Whisper sidecar stops reloading models it doesn't need to** (Companion
+  0.11.12 → 0.11.13). The night's log showed the sidecar restarting
+  large-v3 → medium → large-v3 → small → turbo → medium — each a multi-GB
+  model reload (30–60 s), often SECONDS after the previous model finished
+  warming. A request for a smaller model is now served by the already-loaded
+  larger one (equal-or-better quality, zero reload); only genuine tier
+  UPGRADES or changed decode settings (beam/tuning) restart the sidecar.
+  This also kills the repeated "capped to small → unload Ollama → recover"
+  churn when a big LLM was resident.
+- **Progress-heartbeat failures are no longer silent.** The Companion's
+  per-job cards are fed only by ClipAI's /v1/progress posts; the reports
+  showed a running job with NO heartbeats arriving and nothing logged
+  anywhere. The sender now logs one throttled warning per cause (no
+  registered Companion host / no job id in context / HTTP status /
+  unreachable) so the next diagnostics run says WHY.
+- Verified: 4 new resilience tests (retry-through-blip completes the item;
+  never-returning Companion fails one item and continues; runner crash →
+  status error; stale "running" cleared instead of 409) — 27 bulk/bookmark
+  tests green, 40 across the touched backend suites; 4 new Rust
+  `can_keep_serving` tests (downgrade keeps serving, upgrades restart, decode
+  changes restart) — 48 Rust tests green; 9 version-sync tests green.
+
+---
+
 # ClipAI — Starting a bulk import leaves the popup and lands on the Dashboard
 
 Starting a bulk run used to leave the user parked on the Upload page watching

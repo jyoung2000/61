@@ -213,9 +213,25 @@ pub async fn healthy() -> bool {
         .is_ok()
 }
 
+/// True when the RUNNING sidecar (service key `running`) can serve a request
+/// that resolved to service key `desired` WITHOUT a restart: identical decode
+/// settings (beam/tuning) and a loaded model of EQUAL OR HIGHER tier. A
+/// request for a smaller model never forces a reload — the loaded model
+/// answers it at equal-or-better quality. Real measured thrash this kills:
+/// one evening's log showed large-v3 → medium → large-v3 → small → turbo →
+/// medium restarts, each a multi-GB model reload (30-60 s) seconds after the
+/// previous model finished warming. Only genuine UPGRADES (or changed decode
+/// settings) restart.
+pub(crate) fn can_keep_serving(running: &str, desired: &str) -> bool {
+    let (rm, rr) = running.split_once('|').unwrap_or((running, ""));
+    let (dm, dr) = desired.split_once('|').unwrap_or((desired, ""));
+    rr == dr && crate::state::whisper_rank(rm) >= crate::state::whisper_rank(dm)
+}
+
 /// Ensure the sidecar is running with the model tier the current VRAM
-/// budget allows. Restarts it when the tier changed. Returns the model
-/// in service.
+/// budget allows. Restarts it when a HIGHER tier is needed or the decode
+/// settings changed; a lower-tier request keeps the loaded model (see
+/// ``can_keep_serving``). Returns the model in service.
 pub async fn ensure_running(
     state: &Arc<AppState>,
     resource_dir: PathBuf,
@@ -313,8 +329,24 @@ pub async fn ensure_running(
     let mut guard = state.sidecar.lock().await;
     if let Some(handle) = guard.as_mut() {
         let alive = handle.child.try_wait().map(|s| s.is_none()).unwrap_or(false);
-        if alive && handle.model == service_key && healthy().await {
-            return Ok(model.to_string());
+        if alive && can_keep_serving(&handle.model, &service_key) && healthy().await {
+            // Report the model actually loaded (model_name), not the tier key.
+            let running_model = if handle.model_name.is_empty() {
+                handle
+                    .model
+                    .split_once('|')
+                    .map(|(m, _)| m.to_string())
+                    .unwrap_or_else(|| handle.model.clone())
+            } else {
+                handle.model_name.clone()
+            };
+            if running_model != model {
+                log::info!(
+                    "whisper request '{model}' served by the already-loaded \
+                     '{running_model}' — equal-or-better quality, no reload"
+                );
+            }
+            return Ok(running_model);
         }
         // Say WHY the old sidecar is being retired — this restart used to be
         // silent, which made an unexplained "whisper sidecar stopped" in the
@@ -730,5 +762,48 @@ mod free_window_tests {
     #[test]
     fn both_zero_disables_auto_free() {
         assert_eq!(effective_free_ms(0, 0), 0);
+    }
+}
+
+#[cfg(test)]
+mod keep_serving_tests {
+    use super::can_keep_serving;
+
+    const TUNE: &str = "bs5|mc0|tune:5,0.10,300,150,0.4,0,3,2.0";
+
+    fn key(model: &str) -> String {
+        format!("{model}|{TUNE}")
+    }
+
+    #[test]
+    fn smaller_request_is_served_by_the_loaded_larger_model() {
+        // The observed thrash: large-v3 warm, then a medium request forced a
+        // full reload. Equal decode settings + lower tier → keep serving.
+        assert!(can_keep_serving(&key("large-v3"), &key("medium")));
+        assert!(can_keep_serving(&key("large-v3"), &key("small")));
+        assert!(can_keep_serving(&key("large-v3-turbo"), &key("medium")));
+        assert!(can_keep_serving(&key("large-v3"), &key("large-v3-turbo")));
+    }
+
+    #[test]
+    fn upgrades_still_restart() {
+        assert!(!can_keep_serving(&key("medium"), &key("large-v3")));
+        assert!(!can_keep_serving(&key("small"), &key("large-v3-turbo")));
+        assert!(!can_keep_serving(&key("large-v3-turbo"), &key("large-v3")));
+    }
+
+    #[test]
+    fn same_tier_keeps_serving() {
+        assert!(can_keep_serving(&key("large-v3"), &key("large-v3")));
+        assert!(can_keep_serving(&key("medium"), &key("medium")));
+    }
+
+    #[test]
+    fn changed_decode_settings_always_restart() {
+        // A different beam size (or any tuning change) is a QUALITY contract
+        // change — the bigger loaded model must not mask it.
+        let bs1 = "large-v3|bs1|mc0|tune:5,0.10,300,150,0.4,0,3,2.0";
+        assert!(!can_keep_serving(bs1, &key("medium")));
+        assert!(!can_keep_serving(&key("large-v3"), bs1));
     }
 }

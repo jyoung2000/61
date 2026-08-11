@@ -92,6 +92,21 @@ async def _post_ended(job_id: str) -> None:
         pass
 
 
+# Why-are-heartbeats-not-arriving diagnostics: the Companion GUI's per-job
+# cards are fed ONLY by these posts, and a silently-failing sender leaves the
+# GUI saying "No active job" while a pipeline runs — with nothing in any log
+# to explain it. One throttled line per cause per 10 minutes.
+_diag_last: dict[str, float] = {}
+
+
+def _diag(reason: str) -> None:
+    now = time.monotonic()
+    if now - _diag_last.get(reason, 0.0) >= 600.0:
+        _diag_last[reason] = now
+        logger.warning("Companion progress heartbeat not delivered: %s "
+                       "(the Companion GUI will not show this job)", reason)
+
+
 async def _post() -> None:
     try:
         import httpx
@@ -100,17 +115,24 @@ async def _post() -> None:
 
         host = reg.companion_host()
         if host is None:
+            _diag("no Companion host in the Ollama host registry")
             return
         base = reg.companion_base(host)
         if not base:
+            _diag("registered Companion host has no usable base URL")
             return
         headers = dict(clipai_headers())
+        if not headers.get("X-ClipAI-Job-Id"):
+            _diag("no job id in the request context (contextvars not propagated)")
+            return
         token = getattr(host, "token", "") or ""
         if token:
             headers["Authorization"] = f"Bearer {token}"
         async with httpx.AsyncClient(timeout=3.0) as client:
-            await client.post(f"{base}/v1/progress", headers=headers)
-    except Exception:
+            r = await client.post(f"{base}/v1/progress", headers=headers)
+        if r.status_code != 200:
+            _diag(f"Companion answered HTTP {r.status_code}")
+    except Exception as e:
         # Best-effort: a paused/offline Companion (503/timeout) must never
         # affect the job. The next heartbeat retries.
-        pass
+        _diag(f"unreachable: {type(e).__name__}")
