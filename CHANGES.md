@@ -1,3 +1,28 @@
+# ClipAI — Settings cleanup: series hint + reference subtitles removed
+
+Removed two operator-expertise controls from Settings → AI Provider →
+Transcription Speed, per request:
+
+- **Series / show hint** — the canonical-name pass auto-identifies the work
+  from the transcript's own terms, which handles the common case.
+- **Reference subtitles + conform mode** (paste YouTube captions, adopt/timing)
+  — a power feature that never fit the settings page (a per-VIDEO input stored
+  as a GLOBAL setting: pasted captions for one video would silently conform
+  every later video against them until cleared — an actual footgun).
+
+Removal surface: both UI blocks, the three request-model fields, the GET/POST
+response fields and write blocks in `/api/transcription/settings`, and the
+three `_PERSISTABLE_KEYS` entries. The `backend/config.py` fields remain as
+blank env-only overrides (marked as such) so the pipeline's name-repair and
+conform passes are untouched for anyone driving them from `.env`; saved
+user_settings values for these keys are simply ignored on restore.
+
+- Verified: 45 settings-suite backend tests, 96/97 canonical-name/roster tests
+  (the 1 failure is the pre-existing cv2-missing import error, identical on
+  clean HEAD), 170 frontend tests, production build green.
+
+---
+
 # ClipAI — the "videos at once" picker now lives where users actually look
 
 Fourth report of "there is no concurrency setting" — while the setting existed,

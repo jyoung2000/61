@@ -642,9 +642,6 @@ export default function Settings() {
     gap_fill_enabled: true,
     gap_fill_min_sec: 1.5,
     gap_fill_no_speech_threshold: 0.25,
-    series_hint: '',
-    reference_subtitles: '',
-    reference_mode: 'adopt',
   });
   const [transSaved, setTransSaved] = useState({
     beam_size: 1, vad_filter: true, frame_sample_rate: 10,
@@ -652,9 +649,6 @@ export default function Settings() {
     gap_fill_enabled: true,
     gap_fill_min_sec: 1.5,
     gap_fill_no_speech_threshold: 0.25,
-    series_hint: '',
-    reference_subtitles: '',
-    reference_mode: 'adopt',
   });
   const [transSaving, setTransSaving] = useState(false);
 
@@ -860,9 +854,6 @@ export default function Settings() {
           gap_fill_enabled: data.gap_fill_enabled ?? true,
           gap_fill_min_sec: data.gap_fill_min_sec ?? 1.5,
           gap_fill_no_speech_threshold: data.gap_fill_no_speech_threshold ?? 0.25,
-          series_hint: data.series_hint ?? '',
-          reference_subtitles: data.reference_subtitles ?? '',
-          reference_mode: data.reference_mode ?? 'adopt',
         };
         setTransSettings(s);
         setTransSaved(s);
@@ -1566,9 +1557,6 @@ export default function Settings() {
     || transSettings.gap_fill_enabled !== transSaved.gap_fill_enabled
     || transSettings.gap_fill_min_sec !== transSaved.gap_fill_min_sec
     || transSettings.gap_fill_no_speech_threshold !== transSaved.gap_fill_no_speech_threshold
-    || (transSettings.series_hint || '') !== (transSaved.series_hint || '')
-    || (transSettings.reference_subtitles || '') !== (transSaved.reference_subtitles || '')
-    || (transSettings.reference_mode || 'adopt') !== (transSaved.reference_mode || 'adopt')
   );
 
   const handleSaveTransSettings = async () => {
@@ -1589,9 +1577,6 @@ export default function Settings() {
           gap_fill_enabled: data.gap_fill_enabled,
           gap_fill_min_sec: data.gap_fill_min_sec,
           gap_fill_no_speech_threshold: data.gap_fill_no_speech_threshold,
-          series_hint: data.series_hint ?? '',
-          reference_subtitles: data.reference_subtitles ?? '',
-          reference_mode: data.reference_mode ?? 'adopt',
         };
         setTransSettings(saved);
         setTransSaved(saved);
@@ -2487,68 +2472,6 @@ export default function Settings() {
                   Lower beam size is faster but less accurate.
                 </p>
 
-                {/* Series / show hint — fixes mis-heard character names */}
-                <div style={{ marginBottom: 12, padding: '6px 0' }}>
-                  <label style={{ fontSize: 12, color: 'var(--text-primary)', display: 'block', marginBottom: 4 }}>
-                    Series / show hint <span style={{ color: 'var(--text-muted)', fontWeight: 400 }}>(optional)</span>
-                  </label>
-                  <input
-                    type="text"
-                    value={transSettings.series_hint || ''}
-                    onChange={(e) => setTransSettings((p) => ({ ...p, series_hint: e.target.value }))}
-                    placeholder="e.g. Mobile Suit Gundam Wing"
-                    style={{
-                      width: '100%', boxSizing: 'border-box', padding: '8px 10px',
-                      background: 'var(--bg-base)', border: '1px solid var(--border)',
-                      borderRadius: 'var(--radius-sm)', color: 'var(--text-primary)', fontSize: 12,
-                    }}
-                  />
-                  <span style={{ fontSize: 10, color: 'var(--text-muted)', display: 'block', marginTop: 4, lineHeight: 1.5 }}>
-                    Name the show/film and ClipAI fixes mis-heard character, mecha and place
-                    names to their official spellings (e.g. “Sex Unique” → “Zechs Merquise”,
-                    “Hero Yu” → “Heero Yuy”). Leave blank to auto-detect. Applies to the next run.
-                  </span>
-                </div>
-
-                {/* Reference transcript — conform to a known-good source (YouTube) */}
-                <div style={{ marginBottom: 12, padding: '6px 0' }}>
-                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4, gap: 8 }}>
-                    <label style={{ fontSize: 12, color: 'var(--text-primary)' }}>
-                      Reference subtitles <span style={{ color: 'var(--text-muted)', fontWeight: 400 }}>(optional — match YouTube exactly)</span>
-                    </label>
-                    <select
-                      value={transSettings.reference_mode || 'adopt'}
-                      onChange={(e) => setTransSettings((p) => ({ ...p, reference_mode: e.target.value }))}
-                      style={{
-                        fontSize: 11, padding: '3px 6px', background: 'var(--bg-base)',
-                        border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)',
-                        color: 'var(--text-primary)',
-                      }}
-                      title="adopt = use the reference's words, timing AND cue segmentation; timing = keep ClipAI's words, snap timing only"
-                    >
-                      <option value="adopt">Words + timing</option>
-                      <option value="timing">Timing only</option>
-                    </select>
-                  </div>
-                  <textarea
-                    value={transSettings.reference_subtitles || ''}
-                    onChange={(e) => setTransSettings((p) => ({ ...p, reference_subtitles: e.target.value }))}
-                    placeholder={"Paste YouTube's transcript / .srt / .vtt here…\n0:30 The rain won't fall,\n0:36 so I can't cool this fever"}
-                    rows={5}
-                    style={{
-                      width: '100%', boxSizing: 'border-box', padding: '8px 10px',
-                      background: 'var(--bg-base)', border: '1px solid var(--border)',
-                      borderRadius: 'var(--radius-sm)', color: 'var(--text-primary)',
-                      fontSize: 11, fontFamily: 'var(--font-mono, monospace)', resize: 'vertical',
-                    }}
-                  />
-                  <span style={{ fontSize: 10, color: 'var(--text-muted)', display: 'block', marginTop: 4, lineHeight: 1.5 }}>
-                    Paste a known-good transcript (SRT, VTT, or plain “0:30 text” lines) and ClipAI
-                    conforms its subtitles to it — exact words, timing and cue breaks — keeping its own
-                    speaker colours. The surest way to match YouTube. Blank = ClipAI’s own transcript.
-                    Applies to the next run.
-                  </span>
-                </div>
 
                 {/* VAD Filter toggle */}
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10, padding: '6px 0' }}>

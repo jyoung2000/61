@@ -2120,6 +2120,9 @@ class Settings(BaseSettings):
     # names are known — so with no title and no hint (the observed run) BOTH
     # name-repair passes stay disabled and garbles like "Sex Unique" (Zechs)
     # ship as-is. Blank = fall back to auto-identifying the work from the terms.
+    # ENV-ONLY since the Settings-page control was removed (2026-08-11): the
+    # auto-identification handles the common case; set via .env for the rare
+    # override. The pipeline still honors a non-blank value.
     TRANSLATION_SERIES_HINT: str = ""
     # Once the name pass identifies the series, fetch the OFFICIAL English
     # spellings from Wikipedia (one small API call, cached in a mount-backed
@@ -2134,6 +2137,8 @@ class Settings(BaseSettings):
     # plain timestamped lines ("0:30 text" / "[0:30] text"). ClipAI's speaker
     # diarization is preserved (mapped onto the reference cues by time overlap).
     # Blank = ClipAI's own transcript ships (today's behaviour).
+    # ENV-ONLY since the Settings-page control was removed (2026-08-11); the
+    # conform pass still honors a non-blank value.
     TRANSLATION_REFERENCE_SUBTITLES: str = ""
     # "adopt" = take the reference's words + timing + cue segmentation wholesale
     # (full match). "timing" = keep ClipAI's words but snap cue start/end onto
