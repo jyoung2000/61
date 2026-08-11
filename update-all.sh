@@ -166,6 +166,50 @@ EXPECTED="${BASE_V%.*}.${BUILD_NUM}"
 [ "$BUILD_NUM" = "0" ] && EXPECTED="$BASE_V"
 log "commit $BUILD_SHA — building container + Companion v$EXPECTED (from source; needs internet)"
 
+# ── Rollback guard ──────────────────────────────────────────────────────────
+# The Companion version IS the commit count, so a deploy that lowers it means
+# the container is being rebuilt from OLDER code. That is almost never
+# intended, and it is invisible from the Windows side: the installed Companion
+# is then NEWER than the one the server offers, so its update card says a
+# reassuring "nothing newer" while the container quietly runs stale code.
+#
+# The observed cause: an update command that hard-resets to a stale branch
+# BEFORE running this script. That reset also replaces this file with that
+# branch's copy, whose DEFAULT_BRANCH points back at the stale branch — so the
+# wrong branch re-pins itself on every run and the box never moves forward.
+# (That trap can only be broken from the caller's command line, which is why
+# this refuses loudly rather than trying to "fix" the branch itself.)
+#
+# State lives under ./data/ — gitignored, so `git reset --hard` can't erase the
+# memory of what was last deployed.
+DEPLOY_STATE="./data/.clipai-deploy-state"
+mkdir -p ./data 2>/dev/null || true
+LAST_NUM=""; LAST_BRANCH=""; LAST_SHA=""
+if [ -f "$DEPLOY_STATE" ]; then
+  # shellcheck disable=SC1090
+  . "$DEPLOY_STATE" 2>/dev/null || true
+  LAST_NUM="${CLIPAI_LAST_BUILD_NUM:-}"; LAST_BRANCH="${CLIPAI_LAST_BRANCH:-}"
+  LAST_SHA="${CLIPAI_LAST_SHA:-}"
+fi
+if [ -n "$LAST_NUM" ] && [ "$BUILD_NUM" -lt "$LAST_NUM" ] 2>/dev/null; then
+  log "ROLLBACK REFUSED — this would deploy OLDER code than what is already running."
+  log "  now deployed: build $LAST_NUM (v${BASE_V%.*}.$LAST_NUM) from ${LAST_SHA:-?} on ${LAST_BRANCH:-?}"
+  log "  this run:     build $BUILD_NUM (v$EXPECTED) from $BUILD_SHA on $BRANCH"
+  log ""
+  log "  The commit count went DOWN, so '$BRANCH' is behind what you already run."
+  log "  Usual cause: the command that launched this script hard-resets to a stale"
+  log "  branch first. That reset also overwrites THIS script with the stale branch's"
+  log "  copy, so its DEFAULT_BRANCH re-pins the stale branch every run — the box can"
+  log "  never move forward, and the Companion app sees no update because the server"
+  log "  is serving an OLDER installer than the one already installed."
+  log ""
+  log "  Fix the command so the branch it FETCHES and the branch it RESETS to match:"
+  log "    git fetch origin <branch> && git reset --hard origin/<branch> && bash update-all.sh"
+  log "  Deliberately going back? Re-run with:  CLIPAI_ALLOW_ROLLBACK=1 bash update-all.sh"
+  [ "${CLIPAI_ALLOW_ROLLBACK:-0}" = "1" ] || exit 1
+  log "  CLIPAI_ALLOW_ROLLBACK=1 — proceeding with the downgrade anyway."
+fi
+
 ensure_docker_space || { log "ABORTING before the build — free docker disk first (see above), then re-run: bash update-all.sh"; exit 1; }
 
 # Build with the output tee'd so RECOVERABLE docker failures are detectable:
@@ -316,6 +360,12 @@ for _ in $(seq 1 15); do
 done
 if [ -n "$RUN_SHA" ] && [ "${RUN_SHA:0:7}" = "${BUILD_SHA:0:7}" ]; then
   log "UP TO DATE ✓ — container is running $BUILD_SHA (latest on $BRANCH)"
+  # Remember what is deployed so the next run can spot a rollback. Written only
+  # after the container is CONFIRMED running this commit, and kept under ./data/
+  # (gitignored) so a `git reset --hard` can't wipe the memory.
+  { echo "CLIPAI_LAST_BUILD_NUM=$BUILD_NUM"
+    echo "CLIPAI_LAST_BRANCH=$BRANCH"
+    echo "CLIPAI_LAST_SHA=$BUILD_SHA"; } > "$DEPLOY_STATE" 2>/dev/null || true
 elif [ -n "$RUN_SHA" ]; then
   log "MISMATCH ✗ — container reports '$RUN_SHA' but latest is '$BUILD_SHA'."
   log "    A cached layer may have served stale code. Force a clean rebuild:"

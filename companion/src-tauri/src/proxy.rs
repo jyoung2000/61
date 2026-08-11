@@ -1647,6 +1647,23 @@ mod update_decision_tests {
         assert!(!should_update("0.2.4", "abcdef1", "0.2.4", "unknown"));
         assert!(!should_update("0.2.4", "abcdef1", "0.2.4", "source"));
     }
+
+    #[test]
+    fn server_behind_is_distinguishable_from_up_to_date() {
+        use super::version_lt;
+        // The real incident: the container was rebuilt from a stale branch, so
+        // the server served v0.11.753 while v0.11.760 was installed here. There
+        // is correctly nothing to INSTALL — but this is not "up to date", and
+        // the GUI must be able to tell the two apart (server_behind in
+        // check_app_update keys off exactly this comparison).
+        assert!(!should_update("0.11.760", "4afece2", "0.11.753", "e5953de"));
+        assert!(version_lt("0.11.753", "0.11.760"), "server is behind");
+        // Genuinely up to date: same version, same build → not "behind".
+        assert!(!version_lt("0.11.760", "0.11.760"));
+        // Newer server → an update, never a "behind" warning.
+        assert!(should_update("0.11.760", "4afece2", "0.11.764", "4e515e7"));
+        assert!(!version_lt("0.11.764", "0.11.760"));
+    }
 }
 
 #[cfg(test)]

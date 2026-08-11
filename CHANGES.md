@@ -1,3 +1,47 @@
+# Deploy — a rolled-back container can no longer hide behind "up to date"
+
+"The companion app never sees the latest update." It wasn't the Companion: the
+CONTAINER was being rebuilt from older code on every run, and the update card
+reported that as good news.
+
+The Companion's version IS the repo's commit count (`set_build_version.py`
+stamps `0.11.<git rev-list --count>`). The deploy command fetched one branch
+but hard-reset to a different, older one, landing on commit count 753 — while
+the installed Companion, from an earlier correct build, was 760. The card then
+said "Up to date", because there genuinely was nothing NEWER to install. It
+also printed the LOCAL version in a sentence about what the server serves, so
+the two numbers never appeared side by side.
+
+Worse, it was self-perpetuating: that reset also overwrites `update-all.sh`
+with the stale branch's copy, whose `DEFAULT_BRANCH` points back at the stale
+branch — so every run re-pinned the old branch and the box could never move
+forward. (Only the caller's command can break that loop, which is why the fix
+below refuses loudly instead of pretending to repair the branch itself.)
+
+- **`update-all.sh` refuses a rollback.** The commit count going DOWN means
+  older code. State (`build number / branch / sha`) is recorded under `./data/`
+  — gitignored, so `git reset --hard` can't erase the memory of what is
+  deployed — and written only once the container is CONFIRMED running the new
+  commit. A downgrade aborts before the build with the numbers, both branches,
+  the likely cause, and the corrected command; `CLIPAI_ALLOW_ROLLBACK=1`
+  overrides for a deliberate downgrade. Equal counts (re-deploying the same
+  commit) and first-ever runs pass through untouched.
+- **The Companion says so out loud** (0.11.11 → 0.11.12). `check_app_update`
+  now returns `server_behind` when the served version is strictly older than
+  the running one, and the GUI shows a red panel — on the quiet launch check
+  too, so it announces itself without anyone clicking: "⚠ Your ClipAI server
+  is serving an OLDER Companion (v0.11.753)… the CONTAINER is running older
+  code." The "Up to date" line now quotes the SERVER's version and build id
+  instead of the local one.
+- Verified: the guard exercised end-to-end against this incident's real
+  numbers — refuses 760 → 753 with the full explanation, passes 760 → 764,
+  passes an equal-count re-deploy, passes a first run with no state, and
+  proceeds under `CLIPAI_ALLOW_ROLLBACK=1`; new Rust test pinning
+  `server_behind` as distinct from up-to-date (40 Rust tests), 9 version-sync
+  tests, `tsc` clean.
+
+---
+
 # ClipAI — Concurrent Analyses in Settings + the Companion shows every job separately
 
 Two follow-ups to the sequential-import fix:

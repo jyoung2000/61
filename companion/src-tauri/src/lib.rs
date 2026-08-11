@@ -892,12 +892,22 @@ async fn check_app_update(
     let latest_build = manifest["build_id"].as_str().unwrap_or("").to_string();
     let update_available = has_installer
         && crate::proxy::should_update(current, current_build, &latest, &latest_build);
+    // The server is serving an OLDER Companion than the one running here. That
+    // is never a normal state: it means the CONTAINER was rebuilt from older
+    // code (the observed cause: an update command that hard-resets to a stale
+    // branch, so every run rebuilds backwards). Without this flag the GUI said
+    // a bland "Up to date" — technically "nothing newer to install", but it
+    // hid a rolled-back server for days. Surfaced so it reads as the warning
+    // it is.
+    let server_behind =
+        has_installer && crate::proxy::version_lt(&latest, current);
     Ok(serde_json::json!({
         "current": current,
         "latest": latest,
         "current_build": current_build,
         "latest_build": latest_build,
         "update_available": update_available,
+        "server_behind": server_behind,
         "installer_available": has_installer,
         "platform": UPDATE_PLATFORM,
         "filename": entry["filename"].as_str().unwrap_or(""),

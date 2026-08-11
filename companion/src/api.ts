@@ -163,6 +163,9 @@ export interface AppUpdateCheck {
   current_build?: string;
   latest_build?: string;
   update_available: boolean;
+  /** The server serves an OLDER Companion than the one running here — the
+   *  container was rebuilt from stale code, not a normal "nothing new" state. */
+  server_behind?: boolean;
   installer_available: boolean;
   platform: string;
   filename: string;

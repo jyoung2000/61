@@ -553,9 +553,17 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
       const info = await checkAppUpdate();
       setUpdateInfo(info);
       if (!quiet && !info.update_available) {
-        setUpdateMsg(info.installer_available
-          ? `Up to date — v${info.current}${info.current_build ? ` (build ${info.current_build})` : ''} is the newest installer your ClipAI serves.`
-          : 'Your ClipAI server has no Companion installer yet — on the server, run "Check for Companion updates" in Settings → GPU Companion (or rebuild the container with COMPANION_BUILD_FROM_SOURCE=1).');
+        setUpdateMsg(
+          info.server_behind
+            // Not "up to date": the SERVER went backwards. Say so plainly and
+            // point at the container, since no amount of clicking here can fix
+            // a container that was rebuilt from older code.
+            ? `⚠ Your ClipAI server is serving an OLDER Companion (v${info.latest}) than this app (v${info.current}). `
+              + 'Nothing to install — the CONTAINER is running older code. Re-run the update on the server, '
+              + 'making sure it deploys the branch you expect, then check again.'
+            : info.installer_available
+              ? `Up to date — your ClipAI serves v${info.latest}${info.latest_build ? ` (build ${info.latest_build})` : ''}, the same build running here.`
+              : 'Your ClipAI server has no Companion installer yet — on the server, run "Check for Companion updates" in Settings → GPU Companion (or rebuild the container with COMPANION_BUILD_FROM_SOURCE=1).');
       }
     } catch (e) {
       if (!quiet) setUpdateMsg(String(e));
@@ -1540,6 +1548,26 @@ function Dashboard({ status, refresh, theme, toggleTheme }: {
           Updates download from your ClipAI server over the LAN (no GitHub needed once
           the server has the installer).
         </p>
+        {/* The server is serving an OLDER build than this app — surfaced on the
+            quiet launch check too, so a rolled-back container announces itself
+            instead of hiding behind a bland "up to date". */}
+        {updateInfo?.server_behind && (
+          <div className="panel" style={{
+            marginTop: 8, borderColor: 'var(--danger)',
+            background: 'rgba(244,104,92,0.10)',
+          }}>
+            <strong style={{ color: 'var(--danger)' }}>
+              ⚠ Your ClipAI server is serving an OLDER Companion (v{updateInfo.latest})
+            </strong>
+            <div className="muted small" style={{ marginTop: 4 }}>
+              This app is v{updateInfo.current}, so there is nothing to install — but the
+              CONTAINER is running older code than this app was built from. That happens
+              when the update on the server rebuilds from a stale branch. Re-run the
+              update on the ClipAI box, check that it reports the branch you expect, and
+              then check for updates again here.
+            </div>
+          </div>
+        )}
         {updateInfo?.update_available && (
           <div className="row" style={{ gap: 10, alignItems: 'center' }}>
             <button onClick={doInstallUpdate} disabled={installingUpdate}
