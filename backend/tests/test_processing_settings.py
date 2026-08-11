@@ -164,3 +164,22 @@ def test_concurrent_analyses_is_persisted():
         "the setting must ride user_settings.json so it survives container "
         "rebuilds like every other Settings-page knob"
     )
+
+
+def test_bulk_min_free_gb_roundtrip_and_clamp():
+    c = _client()
+    r = c.post("/api/processing/settings", json={"bulk_min_free_gb": 10})
+    assert r.status_code == 200
+    assert r.json()["bulk_min_free_gb"] == 10.0
+    assert c.get("/api/processing/settings").json()["bulk_min_free_gb"] == 10.0
+    # Clamped to a sane band, never applied raw.
+    assert c.post("/api/processing/settings",
+                  json={"bulk_min_free_gb": 0}).json()["bulk_min_free_gb"] == 0.5
+    assert c.post("/api/processing/settings",
+                  json={"bulk_min_free_gb": 9999}).json()["bulk_min_free_gb"] == 500.0
+
+
+def test_bulk_disk_floor_feeds_the_import_gate(monkeypatch):
+    monkeypatch.setattr(cfg, "BULK_IMPORT_MIN_FREE_GB", 4.0)
+    assert S._bulk_disk_floor() == int(4.0 * 1024 ** 3)
+    assert "BULK_IMPORT_MIN_FREE_GB" in S._PERSISTABLE_KEYS

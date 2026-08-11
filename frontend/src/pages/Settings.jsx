@@ -622,11 +622,6 @@ export default function Settings() {
   const [pendingModels, setPendingModels] = useState({ transcript_model: '', primary_model: '', editorial_model: '', editorial_model_fallback: '', translation_model: '' });
   // Configured vs actually-loaded Whisper model (so the Settings page shows
   // what really ran, including a low-VRAM downgrade — not only what was asked).
-  const [whisperInfo, setWhisperInfo] = useState({
-    whisper_model_selected: '', whisper_model_user_set: false,
-    whisper_model_effective: null, whisper_model_loaded: false,
-    whisper_downgraded: false,
-  });
   const [modelsSaving, setModelsSaving] = useState(false);
   // Live sync-to-Companion progress after a Save (per-model download %).
   const [companionSync, setCompanionSync] = useState(null);
@@ -691,14 +686,22 @@ export default function Settings() {
 
   // NOTE: Whisper testing is now in PipelineDiagnostics component
 
-  // FFmpeg encoding settings
+  // FFmpeg encoding settings — threads + the quality trio (preset/CRF/
+  // faststart). The endpoint accepted all four from day one; only the
+  // threads slider had a control.
   const [ffmpegThreads, setFfmpegThreads] = useState(4);
   const [ffmpegThreadsSaved, setFfmpegThreadsSaved] = useState(4);
   const [ffmpegThreadsSaving, setFfmpegThreadsSaving] = useState(false);
+  const [ffmpegEnc, setFfmpegEnc] = useState({ preset: 'fast', crf: 23, faststart: true });
+  const [ffmpegEncSaved, setFfmpegEncSaved] = useState({ preset: 'fast', crf: 23, faststart: true });
+  const [ffmpegEncSaving, setFfmpegEncSaving] = useState(false);
 
   // Concurrent analyses (pipeline processing)
   const [concurrentAnalyses, setConcurrentAnalyses] = useState(1);
   const [concurrencySaving, setConcurrencySaving] = useState(false);
+  // Bulk-import free-disk floor (GB) — hitting it stops the batch.
+  const [bulkMinFreeGb, setBulkMinFreeGb] = useState(2);
+  const [bulkMinFreeSaved, setBulkMinFreeSaved] = useState(2);
   // Non-empty when the current value could NOT be read from the server, so
   // the shown selection is a default rather than the truth.
   const [concurrencyLoadError, setConcurrencyLoadError] = useState('');
@@ -903,6 +906,13 @@ export default function Settings() {
         const t = data.threads ?? 4;
         setFfmpegThreads(t);
         setFfmpegThreadsSaved(t);
+        const enc = {
+          preset: data.preset || 'fast',
+          crf: data.crf ?? 23,
+          faststart: data.faststart !== false,
+        };
+        setFfmpegEnc(enc);
+        setFfmpegEncSaved(enc);
       })
       .catch(() => {});
   }, []);
@@ -1112,18 +1122,6 @@ export default function Settings() {
       };
       setCurrentModels(resolved);
       setPendingModels(resolved);
-      // Effective (actually-loaded) Whisper model comes back in the same
-      // ``current`` block — surface it so the Analysis Settings row can show
-      // selected-vs-running and flag a downgrade.
-      if (cur && cur.whisper_model_selected !== undefined) {
-        setWhisperInfo({
-          whisper_model_selected: cur.whisper_model_selected || '',
-          whisper_model_user_set: !!cur.whisper_model_user_set,
-          whisper_model_effective: cur.whisper_model_effective ?? null,
-          whisper_model_loaded: !!cur.whisper_model_loaded,
-          whisper_downgraded: !!cur.whisper_downgraded,
-        });
-      }
     } catch {} finally {
       setModelsLoading(false);
     }
@@ -1422,28 +1420,6 @@ export default function Settings() {
   };
 
   // Poll the cheap effective-model endpoint so the row shows the model that
-  // actually loaded (incl. a low-VRAM downgrade), not only the requested one.
-  const refreshWhisperEffective = async () => {
-    try {
-      const res = await fetch('/api/providers/whisper/effective');
-      if (res.ok) setWhisperInfo(await res.json());
-    } catch {}
-  };
-
-  // Whisper dropdown change → save immediately (sets WHISPER_MODEL_USER_SET),
-  // reflect the pick, and refresh the effective-model line.
-  const handleSelectWhisperModel = async (modelId) => {
-    if (!modelId || modelId === currentModels.transcript_model) return;
-    setPendingModels((p) => ({ ...p, transcript_model: modelId }));
-    setCurrentModels((p) => ({ ...p, transcript_model: modelId }));
-    setWhisperInfo((p) => ({
-      ...p, whisper_model_selected: modelId,
-      whisper_downgraded: !!(p.whisper_model_effective && p.whisper_model_effective !== modelId),
-    }));
-    await handleSaveModel('transcript', modelId);
-    await refreshWhisperEffective();
-  };
-
   // Refresh models from OpenRouter
   const handleRefreshModels = async () => {
     setRefreshing(true);
@@ -1610,6 +1586,31 @@ export default function Settings() {
       }
     } catch { showToast('Failed to save FFmpeg thread setting', 'error'); }
     finally { setFfmpegThreadsSaving(false); }
+  };
+
+  const handleSaveFfmpegEncoding = async () => {
+    setFfmpegEncSaving(true);
+    try {
+      const res = await fetch('/api/encoding/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          preset: ffmpegEnc.preset,
+          crf: Number(ffmpegEnc.crf),
+          faststart: !!ffmpegEnc.faststart,
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const enc = { preset: data.preset, crf: data.crf, faststart: data.faststart };
+        setFfmpegEnc(enc);
+        setFfmpegEncSaved(enc);
+        showToast(`Export encoding saved: ${data.preset}, CRF ${data.crf}`, 'success');
+      } else {
+        showToast('Failed to save encoding settings', 'error');
+      }
+    } catch { showToast('Failed to save encoding settings', 'error'); }
+    finally { setFfmpegEncSaving(false); }
   };
 
   const handleSaveConcurrency = async (val) => {
@@ -1949,6 +1950,42 @@ export default function Settings() {
             update it, then reload.
           </span>
         )}
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8, marginTop: 12, paddingTop: 12, borderTop: '1px solid var(--border)' }}>
+          <span style={{ fontSize: 12, color: 'var(--text-primary)' }}>
+            Bulk import: keep free disk
+            <span style={{ fontSize: 10, color: 'var(--text-muted)', display: 'block' }}>
+              A bulk import stops (out of space) rather than dip below this
+            </span>
+          </span>
+          <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            <input
+              type="number" min="0.5" max="500" step="0.5"
+              value={bulkMinFreeGb}
+              onChange={(e) => setBulkMinFreeGb(e.target.value)}
+              onBlur={() => {
+                const v = Math.max(0.5, Math.min(500, Number(bulkMinFreeGb) || 2));
+                setBulkMinFreeGb(v);
+                if (v !== bulkMinFreeSaved) {
+                  fetch('/api/processing/settings', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ bulk_min_free_gb: v }),
+                  }).then((r) => (r.ok ? r.json() : null)).then((d) => {
+                    if (d && typeof d.bulk_min_free_gb === 'number') {
+                      setBulkMinFreeGb(d.bulk_min_free_gb);
+                      setBulkMinFreeSaved(d.bulk_min_free_gb);
+                      showToast(`Bulk imports will keep ${d.bulk_min_free_gb} GB free`, 'success');
+                    }
+                  }).catch(() => showToast('Failed to save disk floor', 'error'));
+                }
+              }}
+              style={{
+                width: 70, fontSize: 12, padding: '5px 8px', background: 'var(--bg-base)',
+                border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', color: 'var(--text-primary)',
+              }}
+            />
+            <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>GB</span>
+          </span>
+        </div>
       </div>
     </div>
   );
@@ -4251,6 +4288,83 @@ export default function Settings() {
               </div>
             </div>
 
+            {/* ── Export Encoding (quality / size) ── */}
+            <div style={{ marginBottom: 32 }}>
+              <h3 style={{ fontSize: 14, marginBottom: 4, color: 'var(--text-secondary)' }}>Export Encoding</h3>
+              <p style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 16, lineHeight: 1.5 }}>
+                Quality vs file size for exported clips (CPU encodes; GPU exports use the
+                NVENC preset). Lower CRF = higher quality and bigger files.
+              </p>
+              <div style={{
+                padding: '12px 16px', background: 'var(--bg-panel)',
+                border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', display: 'grid', gap: 12,
+              }}>
+                <label style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+                  <span style={{ fontSize: 13, color: 'var(--text-primary)' }}>Encoder preset</span>
+                  <select
+                    value={ffmpegEnc.preset}
+                    onChange={(e) => setFfmpegEnc((p) => ({ ...p, preset: e.target.value }))}
+                    style={{
+                      fontSize: 12, padding: '5px 8px', background: 'var(--bg-base)',
+                      border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', color: 'var(--text-primary)',
+                    }}
+                    title="Slower presets compress better at the same quality — export time vs file size"
+                  >
+                    {['ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium', 'slow'].map((pr) => (
+                      <option key={pr} value={pr}>{pr}{pr === 'fast' ? ' (default)' : ''}</option>
+                    ))}
+                  </select>
+                </label>
+                <div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+                    <span style={{ fontSize: 13, color: 'var(--text-primary)' }}>Quality (CRF)</span>
+                    <span style={{ fontSize: 12, fontFamily: 'var(--font-mono)', color: 'var(--accent-cyan)' }}>{ffmpegEnc.crf}</span>
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <span style={{ fontSize: 10, color: 'var(--text-muted)', flexShrink: 0 }}>14 (best)</span>
+                    <input
+                      type="range" min="14" max="34" step="1"
+                      value={ffmpegEnc.crf}
+                      onChange={(e) => setFfmpegEnc((p) => ({ ...p, crf: parseInt(e.target.value, 10) }))}
+                      style={{ flex: 1, accentColor: 'var(--accent-cyan)' }}
+                    />
+                    <span style={{ fontSize: 10, color: 'var(--text-muted)', flexShrink: 0 }}>34 (small)</span>
+                  </div>
+                  <span style={{ fontSize: 10, color: 'var(--text-muted)', display: 'block', marginTop: 4 }}>
+                    23 = default. 18–20 looks visually lossless; each +6 roughly halves file size.
+                  </span>
+                </div>
+                <label style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+                  <span style={{ fontSize: 13, color: 'var(--text-primary)' }}>
+                    Web streaming (faststart)
+                    <span style={{ fontSize: 10, color: 'var(--text-muted)', display: 'block' }}>
+                      Lets exported clips start playing before they fully download
+                    </span>
+                  </span>
+                  <input
+                    type="checkbox" checked={!!ffmpegEnc.faststart}
+                    onChange={(e) => setFfmpegEnc((p) => ({ ...p, faststart: e.target.checked }))}
+                    style={{ width: 16, height: 16, accentColor: 'var(--accent-cyan)' }}
+                  />
+                </label>
+                {(ffmpegEnc.preset !== ffmpegEncSaved.preset
+                  || ffmpegEnc.crf !== ffmpegEncSaved.crf
+                  || !!ffmpegEnc.faststart !== !!ffmpegEncSaved.faststart) && (
+                  <button
+                    onClick={handleSaveFfmpegEncoding}
+                    disabled={ffmpegEncSaving}
+                    style={{
+                      justifySelf: 'start', padding: '4px 14px', background: 'var(--accent-cyan)',
+                      color: 'var(--bg-base)', border: 'none', borderRadius: 'var(--radius-sm)',
+                      fontSize: 11, fontWeight: 600, cursor: 'pointer',
+                    }}
+                  >
+                    {ffmpegEncSaving ? 'Saving...' : 'Save'}
+                  </button>
+                )}
+              </div>
+            </div>
+
             <h3 style={{ fontSize: 14, marginBottom: 16, color: 'var(--text-secondary)' }}>Model Override</h3>
             <p style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 16 }}>
               Browse all OpenRouter models and select custom overrides.
@@ -4266,121 +4380,6 @@ export default function Settings() {
               <ModelBrowser type="editorial" onSelect={(id) => { handleSaveModel('editorial', id); }} />
             </div>
 
-            <h3 style={{ fontSize: 14, marginBottom: 16, color: 'var(--text-secondary)' }}>Analysis Settings</h3>
-
-            <div style={{ display: 'grid', gap: 12 }}>
-              {/* Whisper Model — editable dropdown + the model that ACTUALLY loaded */}
-              <div style={{ padding: '10px 12px', background: 'var(--bg-panel)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)' }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
-                  <span style={{ fontSize: 13 }}>Whisper Model</span>
-                  <select
-                    value={currentModels.transcript_model || whisperInfo.whisper_model_selected || 'small'}
-                    onChange={(e) => handleSelectWhisperModel(e.target.value)}
-                    disabled={modelsSaving}
-                    style={{ ...dropdownStyle, width: 'auto', minWidth: 230, maxWidth: '70%' }}
-                    title="Transcription model — your pick is saved immediately and used on the next analysis"
-                  >
-                    {(availableModels.transcript && availableModels.transcript.length
-                      ? availableModels.transcript.map((m) => ({
-                          id: m.id,
-                          english_only: m.english_only,
-                          hint: (m.desc || '').replace(/\s*\(.*$/, '') || m.quality || '',
-                        }))
-                      : WHISPER_FALLBACK_MODELS
-                    ).map((m) => (
-                      <option key={m.id} value={m.id}>
-                        {m.id}{m.english_only ? ' [EN-only]' : ''}{m.hint ? ` — ${m.hint}` : ''}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-                {/* Effective (actually-loaded) model — the core "show the real one" fix */}
-                <div style={{ marginTop: 8, fontSize: 11, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', color: whisperInfo.whisper_downgraded ? 'var(--warning, #e0a800)' : 'var(--text-muted)' }}>
-                  {whisperInfo.whisper_model_effective ? (
-                    whisperInfo.whisper_downgraded ? (
-                      <span>⚠ Selected: <b>{whisperInfo.whisper_model_selected || currentModels.transcript_model}</b>
-                        {' · Running: '}<b>{whisperInfo.whisper_model_effective}</b>
-                        {' (downgraded — not enough VRAM on this GPU)'}
-                        {!whisperInfo.whisper_model_loaded ? ' [last run]' : ''}</span>
-                    ) : (
-                      <span>Running: <b style={{ color: 'var(--success)' }}>{whisperInfo.whisper_model_effective}</b>
-                        {!whisperInfo.whisper_model_loaded ? ' [last run — not resident now]' : ''}</span>
-                    )
-                  ) : (
-                    <span>Not loaded yet — loads on the next analysis.</span>
-                  )}
-                  <button
-                    onClick={refreshWhisperEffective}
-                    style={{ fontSize: 10, padding: '1px 8px', background: 'transparent', color: 'var(--text-muted)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', cursor: 'pointer' }}
-                    title="Re-check the running model"
-                  >↻ refresh</button>
-                </div>
-                <span style={{ fontSize: 10, color: 'var(--text-muted)', display: 'block', marginTop: 6 }}>
-                  Your pick is saved immediately and used on the next analysis (no restart). On a 4 GB GPU large models may
-                  auto-downgrade — the “Running” line always shows the model that actually loaded.
-                </span>
-              </div>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 12px', background: 'var(--bg-panel)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)' }}>
-                <span style={{ fontSize: 13 }}>Beam Size</span>
-                <span style={{ fontSize: 12, fontFamily: 'var(--font-mono)', color: 'var(--text-secondary)' }}>
-                  {transSaved.beam_size}{transSaved.beam_size === 1 ? ' (fast)' : transSaved.beam_size >= 5 ? ' (accurate)' : ''}
-                </span>
-              </div>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 12px', background: 'var(--bg-panel)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)' }}>
-                <span style={{ fontSize: 13 }}>VAD Filter (Skip Silence)</span>
-                <span style={{ fontSize: 12, fontFamily: 'var(--font-mono)', color: transSaved.vad_filter ? 'var(--success)' : 'var(--text-muted)' }}>
-                  {transSaved.vad_filter ? 'On' : 'Off'}
-                </span>
-              </div>
-
-              {/* Frame Sample Rate — editable slider */}
-              <div style={{ padding: '10px 12px', background: 'var(--bg-panel)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)' }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
-                  <span style={{ fontSize: 13 }}>Frame Sample Rate</span>
-                  <span style={{ fontSize: 12, fontFamily: 'var(--font-mono)', color: 'var(--accent-cyan)' }}>
-                    Every {transSettings.frame_sample_rate}s
-                  </span>
-                </div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                  <span style={{ fontSize: 10, color: 'var(--text-muted)', flexShrink: 0 }}>5s</span>
-                  <input
-                    type="range"
-                    min="5"
-                    max="30"
-                    step="5"
-                    value={transSettings.frame_sample_rate}
-                    onChange={(e) => setTransSettings((p) => ({ ...p, frame_sample_rate: parseInt(e.target.value) }))}
-                    style={{ flex: 1, accentColor: 'var(--accent-cyan)' }}
-                  />
-                  <span style={{ fontSize: 10, color: 'var(--text-muted)', flexShrink: 0 }}>30s</span>
-                </div>
-                <span style={{ fontSize: 10, color: 'var(--text-muted)', display: 'block', marginTop: 4 }}>
-                  Lower = more visual detail but slower. Higher = faster but less detail for clip detection.
-                </span>
-                {transSettings.frame_sample_rate !== transSaved.frame_sample_rate && (
-                  <button
-                    onClick={handleSaveTransSettings}
-                    disabled={transSaving}
-                    style={{
-                      marginTop: 8, padding: '4px 14px', background: 'var(--accent-cyan)',
-                      color: 'var(--bg-base)', border: 'none', borderRadius: 'var(--radius-sm)',
-                      fontSize: 11, fontWeight: 600, cursor: 'pointer',
-                    }}
-                  >
-                    {transSaving ? 'Saving...' : 'Save'}
-                  </button>
-                )}
-              </div>
-
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 12px', background: 'var(--bg-panel)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)' }}>
-                <span style={{ fontSize: 13 }}>Max Clip Candidates</span>
-                <span style={{ fontSize: 12, fontFamily: 'var(--font-mono)', color: 'var(--text-secondary)' }}>12</span>
-              </div>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 12px', background: 'var(--bg-panel)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)' }}>
-                <span style={{ fontSize: 13 }}>Fallback Chain</span>
-                <span style={{ fontSize: 12, fontFamily: 'var(--font-mono)', color: 'var(--text-secondary)' }}>{(statuses._active?.fallback_chain || ['openrouter', 'gemini', 'groq']).join(' \u2192 ')}</span>
-              </div>
-            </div>
 
           </div>
         </div>

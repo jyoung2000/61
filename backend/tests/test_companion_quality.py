@@ -142,3 +142,23 @@ def test_set_quality_no_companion(monkeypatch):
     data = _client().post("/api/providers/companion/quality",
                           json={"speed_profile": "eco"}).json()
     assert data["ok"] is False
+
+
+# ── Companion sync must never overwrite user-saved local knobs ──────────────
+
+def test_beam_size_sync_respects_user_set_flag(monkeypatch):
+    """The model pin had USER_SET protection; beam did not — an explicit
+    Companion quality choice silently overwrote (and persisted) the user's
+    Beam Size slider. Pin the guard."""
+    import re
+    import inspect
+    src = inspect.getsource(S)
+    # The sync's beam write must be gated on WHISPER_BEAM_USER_SET…
+    block = src[src.index("def _sync_companion_whisper"):]
+    block = block[:block.index("\n@router", 1)] if "\n@router" in block else block
+    assert "WHISPER_BEAM_USER_SET" in block, "beam sync lacks the user-set guard"
+    # …and the transcription-settings save must SET the flag.
+    save = src[src.index("Save transcription speed/quality settings"):]
+    save = save[:save.index("def ", 100)]
+    assert "WHISPER_BEAM_USER_SET = True" in save
+    assert "WHISPER_BEAM_USER_SET" in S._PERSISTABLE_KEYS

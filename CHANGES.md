@@ -1,3 +1,61 @@
+# ClipAI — Settings streamlined: no duplicates, one owner per setting, two real gaps filled
+
+Implements the settings-audit recommendations: every control changes exactly
+the thing it names, nothing is controlled from two places, and two settings
+users actually needed now exist.
+
+**Removed (redundant / lying controls):**
+- The entire Tab 4 "Analysis Settings" section — a duplicate Whisper model
+  picker (same endpoint as Tab 0's), a second live Frame Sample Rate slider
+  bound to the same value with its own Save button, read-only Beam/VAD
+  mirrors, a "Max Clip Candidates: 12" that was a hardcoded string read from
+  nowhere, and the fallback-chain echo. Plus its now-orphaned handler/state.
+- ClipGenerationSettings' second "Subtitle platform safe-zone" dropdown — the
+  same backend key as Subtitle Quality's dropdown, last-save-wins, and its
+  blank option was labelled "Inherit from Settings" when blank really means
+  "none". Subtitle Quality owns the profile now.
+- The dead `llm` / `whisper` translation-engine options — the resolver has
+  treated both as "auto" forever (translation is offline-MT only); they're
+  gone from the dropdown AND from endpoint validation. The "Auto" label now
+  lists the real chain (DeepL → Google → FuguMT → Opus-MT → NLLB).
+
+**One card owns cloud polish (and the card now actually works):**
+- The Polish Fallback card (none / auto / pinned model) is the single
+  authority. Its choice now drives BOTH cloud gates —
+  `SUBTITLE_POLISH_CLOUD_FALLBACK` and `SUBTITLE_POLISH_LOCAL_ONLY`. Before,
+  it only set the first, and LOCAL_ONLY (default on) kept suppressing every
+  cloud route: choosing "auto" or a pinned model half-worked with no
+  indication why.
+- The second cloud picker (`PolishModelRecommendation` →
+  `SUBTITLE_POLISH_MODEL`) is removed from Subtitle Quality, its endpoint
+  field dropped, and the key is env-only legacy now — and the card's pin
+  OUTRANKS it in `_resolve_cloud_polish_model` (previously a stale pin
+  silently overrode the card's "auto", so the dropdown lied).
+
+**Bug fixed: Companion sync overwrote the Beam Size slider.** The model pin
+had `WHISPER_MODEL_USER_SET` protection; beam had none — any explicit
+Companion quality choice silently rewrote and PERSISTED the user's beam.
+New `WHISPER_BEAM_USER_SET` flag (set on save, persisted) gives beam the
+same guard.
+
+**Added (the audit's top two gaps):**
+- **Export Encoding** (Advanced, below FFmpeg Threads): encoder preset
+  (ultrafast→slow), quality CRF slider (14–34, with plain-language guidance),
+  and web-streaming faststart — the `/api/encoding/settings` endpoint
+  accepted all of these from day one; only threads ever had a control.
+- **Bulk import disk floor**: the hardcoded "always leave 2 GB free" that
+  aborts a whole batch is now `BULK_IMPORT_MIN_FREE_GB` — a real setting
+  (0.5–500 GB, clamped), editable on the Concurrent Analyses card, persisted
+  to user_settings + .env, read live by the bulk runner.
+
+- Verified: 8 new tests (disk-floor roundtrip/clamp + gate wiring, beam-guard
+  presence in both the sync and the save path, card-drives-both-flags,
+  card-pin-outranks-legacy, second-picker-gone) — 60 passing across the
+  touched backend suites (3 cv2-gated skips run in the container), 170
+  frontend tests, production build green.
+
+---
+
 # ClipAI — Settings cleanup: series hint + reference subtitles removed
 
 Removed two operator-expertise controls from Settings → AI Provider →

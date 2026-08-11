@@ -872,16 +872,19 @@ def _cloud_polish_available() -> bool:
 def _resolve_cloud_polish_model() -> str:
     """The OpenRouter model the cloud path polishes on.
 
-    Order: SUBTITLE_POLISH_MODEL (when it's an OpenRouter-style id) →
-    SUBTITLE_POLISH_CLOUD_MODEL → the first "efficient"-tier entry of the
-    curated shortlist (strong constrained editing at low cost).
+    Order: SUBTITLE_POLISH_CLOUD_MODEL (the Polish Fallback card's pin — the
+    ONE owner of cloud polish) → the legacy env-only SUBTITLE_POLISH_MODEL
+    (when OpenRouter-style) → the first "efficient"-tier entry of the curated
+    shortlist. The card's choice outranking the legacy pin is deliberate:
+    with the old order a stale pinned model silently overrode the card's
+    "auto", so the dropdown lied.
     """
-    pinned = (getattr(settings, "SUBTITLE_POLISH_MODEL", "") or "").strip()
-    if pinned and "/" in pinned:
-        return pinned
     explicit = (getattr(settings, "SUBTITLE_POLISH_CLOUD_MODEL", "") or "").strip()
     if explicit and "/" in explicit:
         return explicit
+    pinned = (getattr(settings, "SUBTITLE_POLISH_MODEL", "") or "").strip()
+    if pinned and "/" in pinned:
+        return pinned
     try:
         from backend.services.providers.openrouter_provider import (
             SUBTITLE_POLISH_SHORTLIST)

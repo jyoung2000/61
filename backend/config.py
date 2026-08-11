@@ -43,9 +43,12 @@ class Settings(BaseSettings):
     GROQ_TRANSCRIBE_MODEL: str = "whisper-large-v3-turbo"
     OPENAI_TRANSCRIBE_MODEL: str = "whisper-1"  # or gpt-4o-transcribe (no word timestamps — forced alignment re-times)
     # ── Subtitle polish model (audit Phase 4.2) ──
-    # Explicit model for transcript polishing (e.g. an OpenRouter id from
-    # the "Recommended for subtitle polish" picker). Takes precedence over
-    # SUBTITLE_POLISH_USES_TRANSLATION_MODEL. Blank = legacy behavior.
+    # ENV-ONLY legacy override since the in-app picker was removed
+    # (2026-08-11): cloud polish is owned by the Polish Fallback card
+    # (SUBTITLE_POLISH_CLOUD_FALLBACK / _CLOUD_MODEL / _LOCAL_ONLY). A
+    # non-blank value here still overrides the local polish model choice and,
+    # when OpenRouter-style AND the card allows cloud, serves as the cloud
+    # model of last resort — but the card's pin outranks it.
     SUBTITLE_POLISH_MODEL: str = ""
     # Cloud safety net for polishing: when the local chain fails a polish
     # batch (Ollama cold-load timeout / circuit breaker / offline chain),
@@ -376,6 +379,9 @@ class Settings(BaseSettings):
     # Analysis settings
     WHISPER_MODEL: str = "small"  # Auto-upgraded to large-v3-turbo when GPU detected
     WHISPER_MODEL_USER_SET: bool = False  # True when user explicitly chose a model in UI
+    # True once the user saved the Beam Size slider — blocks the Companion
+    # quality sync from overwriting it (mirror of WHISPER_MODEL_USER_SET).
+    WHISPER_BEAM_USER_SET: bool = False
     # Opt-in: auto-upgrade targets distil-large-v3 instead of
     # large-v3-turbo. distil is English-focused — near large-v3 English
     # WER at ~2x turbo speed — so only enable on English-only libraries.
@@ -1277,6 +1283,10 @@ class Settings(BaseSettings):
     # and every queued import piles onto the same contention. Raise via env
     # only on hardware that genuinely has headroom for two full pipelines.
     CONCURRENT_ANALYSES: int = 1
+    # Free space (GB) a bulk import must always leave on /data — hitting it
+    # stops the batch (status out_of_space). Was a hardcoded 2 GB constant;
+    # small volumes need it lower, big arrays higher.
+    BULK_IMPORT_MIN_FREE_GB: float = 2.0
     AUTO_ANALYZE: bool = True
     SUBJECT_TRACKING_ENABLED: bool = True
     DENSE_FACE_SAMPLE_RATE: float = 0.5  # seconds between dense face detection frames (0.5 = 2fps)

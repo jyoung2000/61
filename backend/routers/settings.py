@@ -60,6 +60,7 @@ _PERSISTABLE_KEYS = [
     # startup when OLLAMA_HOSTS is set (see main.py startup).
     "OLLAMA_HOSTS",
     "WHISPER_MODEL", "WHISPER_MODEL_USER_SET", "WHISPER_BEAM_SIZE",
+    "WHISPER_BEAM_USER_SET",
     "WHISPER_VAD_FILTER", "FRAME_SAMPLE_RATE", "WHISPER_AUTO_UPGRADE",
     # Remote Whisper (OpenAI-compatible server, e.g. the GPU Companion).
     "WHISPER_REMOTE_URL", "WHISPER_REMOTE_API_KEY", "WHISPER_REMOTE_MODEL",
@@ -85,7 +86,7 @@ _PERSISTABLE_KEYS = [
     "TRANSCRIPT_POLISHING_ENABLED", "TRANSCRIPT_POLISHING_BATCH_SIZE",
     "TRANSCRIPT_FILLER_REMOVAL", "TRANSCRIPT_SENTENCE_REPAIR",
     # Dedicated subtitle-polish model (audit Phase 4.2) + cloud STT provider.
-    "SUBTITLE_POLISH_MODEL", "SUBTITLE_POLISH_CLOUD_FALLBACK",
+    "SUBTITLE_POLISH_CLOUD_FALLBACK", "SUBTITLE_POLISH_LOCAL_ONLY",
     "SUBTITLE_POLISH_CLOUD_MODEL", "SUBTITLE_POLISH_AUTO_GLOSSARY",
     "TRANSCRIPTION_PROVIDER", "OPENAI_API_KEY",
     "GROQ_TRANSCRIBE_MODEL", "OPENAI_TRANSCRIBE_MODEL",
@@ -114,7 +115,7 @@ _PERSISTABLE_KEYS = [
     "EDITORIAL_AI_PRIMARY_SPEC", "EDITORIAL_AI_FALLBACK_SPEC",
     "FFMPEG_PRESET", "FFMPEG_CRF", "FFMPEG_THREADS", "FFMPEG_FASTSTART",
     # How many analysis pipelines may run at once (Settings > Advanced).
-    "CONCURRENT_ANALYSES",
+    "CONCURRENT_ANALYSES", "BULK_IMPORT_MIN_FREE_GB",
     "GPU_ACCELERATION_ENABLED", "GPU_VENDOR_OVERRIDE",
     "GPU_HWDECODE_ENABLED", "GPU_HEVC_FOR_4K", "GPU_DEVICE_INDEX",
     "GPU_NVENC_PRESET",
@@ -984,8 +985,17 @@ async def _sync_companion_whisper(comp) -> dict:
                 settings.WHISPER_MODEL = model
                 changed = True
         if beam > 0 and beam != int(getattr(settings, "WHISPER_BEAM_SIZE", 0) or 0):
-            settings.WHISPER_BEAM_SIZE = beam
-            changed = True
+            if bool(getattr(settings, "WHISPER_BEAM_USER_SET", False)):
+                # Same protection the model pin gets, which beam LACKED: a
+                # user-saved Beam Size slider value was silently overwritten
+                # (and persisted) by any explicit Companion quality choice.
+                logger.debug(
+                    "Companion whisper sync: keeping user-set WHISPER_BEAM_SIZE=%s "
+                    "(Companion currently runs beam %s)",
+                    getattr(settings, "WHISPER_BEAM_SIZE", 0), beam)
+            else:
+                settings.WHISPER_BEAM_SIZE = beam
+                changed = True
         if changed:
             _persist_user_settings()
             _invalidate_status_cache()
@@ -1659,7 +1669,12 @@ async def companion_bookmark_remove(host_id: str, path: str):
 
 _BULK_VIDEO_EXTS = {"mp4", "mov", "mkv", "avi", "webm", "m4v", "mpg", "mpeg", "wmv", "flv"}
 _BULK_KEEP_TERMINAL = 8            # finished runs kept for the summary screen
-_BULK_DISK_FLOOR = 2 * 1024 ** 3   # always leave ≥ 2 GB free on /data
+def _bulk_disk_floor() -> int:
+    """Bytes to always leave free on /data during a bulk import — a real
+    setting (Settings > Concurrent Analyses card), because hitting it aborts
+    the whole batch: a small volume needs it lower, a big array higher."""
+    gb = float(getattr(settings, "BULK_IMPORT_MIN_FREE_GB", 2) or 2)
+    return int(max(0.5, min(500.0, gb)) * 1024 ** 3)
 _bulk_imports: dict = {}           # bulk_id -> state (insertion-ordered)
 _bulk_tasks: dict = {}             # bulk_id -> asyncio.Task (the live runner)
 # Download resilience: a Companion that goes briefly offline MID-RUN (its
@@ -1985,7 +2000,7 @@ async def _run_bulk_import_seq(bulk_id: str) -> None:
             # Free-space gate: the file itself + pipeline scratch (audio WAV,
             # frames — the pipeline's own pre-check budgets ~30 % of the file
             # size) while always keeping the floor untouched.
-            need = int(int(item.get("size") or 0) * 1.5) + _BULK_DISK_FLOOR
+            need = int(int(item.get("size") or 0) * 1.5) + _bulk_disk_floor()
             if _bulk_disk_free() < need:
                 item["status"] = "no_space"
                 item["error"] = "not enough free disk space on the ClipAI device"
@@ -4790,6 +4805,9 @@ async def save_transcription_settings(req: SaveTranscriptionSettingsRequest):
     if req.beam_size is not None:
         clamped = max(1, min(5, req.beam_size))
         settings.WHISPER_BEAM_SIZE = clamped
+        # An explicit save marks beam USER-SET so the Companion quality sync
+        # can never overwrite it (same protection the model pin has).
+        settings.WHISPER_BEAM_USER_SET = True
         if env_path:
             _upsert_env_var(env_path, "WHISPER_BEAM_SIZE", str(clamped))
 
@@ -5501,11 +5519,19 @@ async def get_polish_fallback():
 async def put_polish_fallback(req: SavePolishFallbackRequest):
     """Persist the cloud-polish-fallback choice (none / auto / model id)."""
     choice = (req.choice or "").strip()
+    # This card is the ONE owner of cloud polish, so it drives BOTH flags:
+    # CLOUD_FALLBACK (may the polish spend cloud money) and LOCAL_ONLY (may
+    # the polish chain route to cloud at all). Before this, the card only set
+    # the first — choosing "auto"/a pinned model enabled the fallback while
+    # LOCAL_ONLY (default True) still suppressed every cloud route, so the
+    # card's choice half-worked with no indication why.
     if choice.lower() in ("none", "off", "disabled"):
         settings.SUBTITLE_POLISH_CLOUD_FALLBACK = False
+        settings.SUBTITLE_POLISH_LOCAL_ONLY = True
         # Keep the stored model so re-enabling later restores the pick.
     elif choice.lower() == "auto" or choice == "":
         settings.SUBTITLE_POLISH_CLOUD_FALLBACK = True
+        settings.SUBTITLE_POLISH_LOCAL_ONLY = False
         settings.SUBTITLE_POLISH_CLOUD_MODEL = ""
     else:
         if "/" not in choice:
@@ -5514,6 +5540,7 @@ async def put_polish_fallback(req: SavePolishFallbackRequest):
                 detail=f"{choice!r} is not an OpenRouter model id "
                        "(expected provider/model), 'auto', or 'none'")
         settings.SUBTITLE_POLISH_CLOUD_FALLBACK = True
+        settings.SUBTITLE_POLISH_LOCAL_ONLY = False
         settings.SUBTITLE_POLISH_CLOUD_MODEL = choice
     _persist_user_settings()
     logger.info("Subtitle polish cloud fallback set to %r", _polish_fallback_choice())
@@ -5756,6 +5783,7 @@ class SaveEncodingSettingsRequest(BaseModel):
 
 class SaveProcessingSettingsRequest(BaseModel):
     concurrent_analyses: int | None = None
+    bulk_min_free_gb: float | None = None
 
 
 @router.get("/processing/settings")
@@ -5767,6 +5795,7 @@ async def get_processing_settings():
     return {
         "concurrent_analyses": settings.CONCURRENT_ANALYSES,
         "active_analyses": _pipeline.active_analyses(),
+        "bulk_min_free_gb": float(getattr(settings, "BULK_IMPORT_MIN_FREE_GB", 2.0)),
     }
 
 
@@ -5776,6 +5805,7 @@ async def save_processing_settings(req: SaveProcessingSettingsRequest):
     raising the limit admits queued jobs immediately; lowering it lets running
     analyses finish and admits the next ones under the new cap. Persisted to
     user_settings.json AND .env so it survives container rebuilds."""
+    changed = False
     if req.concurrent_analyses is not None:
         from backend.services.pipeline import apply_concurrency
 
@@ -5783,11 +5813,23 @@ async def save_processing_settings(req: SaveProcessingSettingsRequest):
         env_path = _find_env_file()
         if env_path:
             _upsert_env_var(env_path, "CONCURRENT_ANALYSES", str(n))
+        changed = True
+
+    if req.bulk_min_free_gb is not None:
+        clamped = max(0.5, min(500.0, float(req.bulk_min_free_gb)))
+        settings.BULK_IMPORT_MIN_FREE_GB = clamped
+        env_path = _find_env_file()
+        if env_path:
+            _upsert_env_var(env_path, "BULK_IMPORT_MIN_FREE_GB", str(clamped))
+        changed = True
+
+    if changed:
         _persist_user_settings()
 
     return {
         "status": "saved",
         "concurrent_analyses": settings.CONCURRENT_ANALYSES,
+        "bulk_min_free_gb": float(getattr(settings, "BULK_IMPORT_MIN_FREE_GB", 2.0)),
     }
 
 
@@ -6677,7 +6719,6 @@ def _subtitle_quality_state() -> dict:
             (getattr(settings, "DEEPL_API_KEY", "") or "").strip()
         ),
         # Dedicated subtitle-polish model + cloud STT provider (Phase 4)
-        "subtitle_polish_model": str(getattr(settings, "SUBTITLE_POLISH_MODEL", "") or ""),
         "transcription_provider": str(getattr(settings, "TRANSCRIPTION_PROVIDER", "local") or "local"),
         "openai_configured": bool(
             (getattr(settings, "OPENAI_API_KEY", "") or "").strip()
@@ -6709,12 +6750,16 @@ class SaveSubtitleQualityRequest(BaseModel):
     audio_music_detection: Optional[bool] = None
     google_translate_api_key: Optional[str] = None
     deepl_api_key: Optional[str] = None
-    subtitle_polish_model: Optional[str] = None
     transcription_provider: Optional[str] = None
     openai_api_key: Optional[str] = None
 
 
-_VALID_TRANSLATION_ENGINES = {"auto", "llm", "nllb", "opus-mt", "fugumt", "google", "deepl", "whisper"}
+# "llm" and "whisper" were dropped from the UI AND from validation: the
+# resolver has treated both as "auto" for a long time (translation is
+# offline-MT only — translator._resolve_translation_engine), so offering or
+# accepting them only pretended a choice existed. A previously-saved value
+# still resolves to auto at runtime.
+_VALID_TRANSLATION_ENGINES = {"auto", "nllb", "opus-mt", "fugumt", "google", "deepl"}
 _VALID_NMT_DEVICES = {"auto", "cpu", "cuda"}
 _VALID_PLATFORM_PROFILES = {"", "tiktok", "reels", "shorts", "horizontal", "square"}
 
@@ -6779,9 +6824,6 @@ async def save_subtitle_quality(req: SaveSubtitleQualityRequest):
         settings.GOOGLE_TRANSLATE_API_KEY = req.google_translate_api_key.strip()
     if req.deepl_api_key is not None and req.deepl_api_key.strip():
         settings.DEEPL_API_KEY = req.deepl_api_key.strip()
-    if req.subtitle_polish_model is not None:
-        # Blank explicitly clears the pin (back to translation-model default)
-        settings.SUBTITLE_POLISH_MODEL = req.subtitle_polish_model.strip()
     if req.transcription_provider is not None:
         prov = (req.transcription_provider or "").strip().lower()
         if prov in ("local", "groq", "openai"):

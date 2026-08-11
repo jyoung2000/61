@@ -47,19 +47,15 @@ export default function ClipGenerationSettings() {
     videollama3_refinement_pass: true,
     videollama3_keyframe_analysis: true,
     videollama3_fps: 2,
-    subtitle_platform_profile: '',
   });
 
   useEffect(() => {
     let alive = true;
-    // Load both clip-generation defaults AND the subtitle platform
-    // profile in parallel so the dropdown reflects the current backend
-    // setting on first paint.
-    Promise.all([
-      fetch('/api/clip-generation/settings').then((r) => r.json()),
-      fetch('/api/subtitle-quality/settings').then((r) => r.json()).catch(() => ({})),
-    ])
-      .then(([d, sub]) => {
+    // The subtitle platform profile is OWNED by Subtitle Quality (one control
+    // per setting) — this card used to carry a second dropdown for the same
+    // key with a wrong "Inherit" label for blank, and last-save-wins fights.
+    fetch('/api/clip-generation/settings').then((r) => r.json())
+      .then((d) => {
         if (!alive) return;
         setDefaults(d.defaults || null);
         setDefaultPrompt(d.default_discovery_prompt || '');
@@ -76,7 +72,6 @@ export default function ClipGenerationSettings() {
           videollama3_refinement_pass: d.videollama3_refinement_pass ?? true,
           videollama3_keyframe_analysis: d.videollama3_keyframe_analysis ?? true,
           videollama3_fps: d.videollama3_fps ?? 2,
-          subtitle_platform_profile: sub.subtitle_platform_profile || '',
         });
       })
       .catch(() => { if (alive) setError('Could not load clip-generation settings.'); })
@@ -130,15 +125,6 @@ export default function ClipGenerationSettings() {
             videollama3_fps: Math.max(1, Math.min(4, Number(form.videollama3_fps) || 2)),
           }),
         }),
-        // Save the platform profile separately so it lives next to the
-        // other subtitle-quality settings in the backend.
-        fetch('/api/subtitle-quality/settings', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            subtitle_platform_profile: form.subtitle_platform_profile || '',
-          }),
-        }).catch(() => null),
       ]);
       if (!res.ok) throw new Error('save failed');
       const d = await res.json();
@@ -224,29 +210,6 @@ export default function ClipGenerationSettings() {
             onChange={(e) => set('avoid_subjects', e.target.value)}
           />
         </div>
-      </div>
-
-      {/* subtitle safe-zone platform */}
-      <div style={{ marginBottom: 14 }}>
-        <label style={labelStyle}>Subtitle platform safe-zone (for exports)</label>
-        <select
-          value={form.subtitle_platform_profile || ''}
-          onChange={(e) => set('subtitle_platform_profile', e.target.value)}
-          style={{
-            ...inputStyle, padding: '6px 10px', fontSize: 12,
-          }}
-        >
-          <option value="">Inherit from Settings</option>
-          <option value="tiktok">TikTok (1080×1920)</option>
-          <option value="reels">Instagram Reels (1080×1920)</option>
-          <option value="shorts">YouTube Shorts (1080×1920)</option>
-          <option value="horizontal">Horizontal (16:9)</option>
-          <option value="square">Square (1:1)</option>
-        </select>
-        <p style={{ fontSize: 10, color: 'var(--text-muted)', margin: '4px 0 0', lineHeight: 1.5 }}>
-          Controls subtitle margins so they avoid the platform's UI overlays
-          (creator badges, captions, subscribe buttons).
-        </p>
       </div>
 
       {/* editable discovery prompt */}

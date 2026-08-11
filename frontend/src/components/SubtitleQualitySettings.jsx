@@ -42,14 +42,12 @@ const PLATFORM_OPTIONS = [
 ];
 
 const ENGINE_OPTIONS = [
-  { value: 'auto',    label: 'Auto (DeepL → Google → Opus-MT → NLLB → LLM)' },
+  { value: 'auto',    label: 'Auto (DeepL → Google → FuguMT → Opus-MT → NLLB)' },
   { value: 'deepl',   label: 'DeepL (cloud, best fluency, requires key)' },
   { value: 'google',  label: 'Google Cloud Translation (requires key)' },
   { value: 'fugumt',  label: 'FuguMT (local, Japanese↔English specialist — best for JA)' },
   { value: 'opus-mt', label: 'Opus-MT (local, fastest, per-pair download)' },
   { value: 'nllb',    label: 'NLLB-200 (local, 200 languages, ~600 MB)' },
-  { value: 'llm',     label: 'LLM via orchestrator (legacy)' },
-  { value: 'whisper', label: 'Whisper translate (legacy, lower quality)' },
 ];
 
 // ISO 639-1 codes shared with the Upload page language picker. Used to
@@ -109,7 +107,6 @@ export default function SubtitleQualitySettings() {
     deepl_api_key: '',
     google_translate_configured: false,
     deepl_configured: false,
-    subtitle_polish_model: '',
     transcription_provider: 'local',
     openai_api_key: '',
     openai_configured: false,
@@ -334,11 +331,6 @@ export default function SubtitleQualitySettings() {
           />
           <span>Sentence boundary repair</span>
         </label>
-        <PolishModelRecommendation
-          selected={form.subtitle_polish_model}
-          onSelect={(id) => set('subtitle_polish_model', id)}
-          disabled={!form.transcript_polishing_enabled}
-        />
       </div>
 
       {/* Cloud transcription provider */}
@@ -579,140 +571,3 @@ export default function SubtitleQualitySettings() {
 }
 
 
-// ── "Recommended for subtitle polish" picker (audit Phase 4.2) ─────────
-// Fetches the curated-shortlist ∩ live-OpenRouter intersection, shows the
-// top pick per tier with rationale + $/1M cost, lets the user pin one as
-// SUBTITLE_POLISH_MODEL, and runs the built-in 20-case benchmark.
-function PolishModelRecommendation({ selected, onSelect, disabled }) {
-  const [models, setModels] = useState([]);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState('');
-  const [testing, setTesting] = useState('');
-
-  const load = () => {
-    setLoading(true);
-    setError('');
-    fetch('/api/providers/models/recommended/subtitle-polish')
-      .then((r) => r.json())
-      .then((d) => {
-        if (d.error) setError(d.error);
-        setModels(d.models || []);
-      })
-      .catch(() => setError('Could not load recommendations.'))
-      .finally(() => setLoading(false));
-  };
-
-  useEffect(load, []);
-
-  const runTest = async (id) => {
-    setTesting(id);
-    try {
-      const res = await fetch('/api/providers/models/polish-benchmark', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: id }),
-      });
-      const d = await res.json();
-      if (d.error) setError(d.error);
-      else load(); // refresh — scores fold into the ranking
-    } catch {
-      setError('Benchmark failed — check server logs.');
-    } finally {
-      setTesting('');
-    }
-  };
-
-  const recommended = models.filter((m) => m.recommended);
-  const rest = models.filter((m) => !m.recommended);
-
-  return (
-    <div style={{ marginTop: 10, opacity: disabled ? 0.5 : 1 }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
-        <span style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-primary)' }}>
-          Recommended for subtitle polish
-        </span>
-        <button
-          onClick={load} disabled={loading || disabled}
-          style={{
-            padding: '2px 8px', fontSize: 10, background: 'var(--bg-base)',
-            color: 'var(--text-muted)', border: '1px solid var(--border)',
-            borderRadius: 'var(--radius-sm)', cursor: 'pointer',
-          }}
-        >
-          {loading ? 'Refreshing…' : '↻ Refresh'}
-        </button>
-        {selected && (
-          <button
-            onClick={() => onSelect('')} disabled={disabled}
-            style={{
-              padding: '2px 8px', fontSize: 10, background: 'var(--bg-base)',
-              color: 'var(--text-muted)', border: '1px solid var(--border)',
-              borderRadius: 'var(--radius-sm)', cursor: 'pointer',
-            }}
-          >
-            Clear pin (use translation model)
-          </button>
-        )}
-      </div>
-      {error && <div style={{ fontSize: 10, color: 'var(--accent-red, #ff6b6b)', marginBottom: 6 }}>{error}</div>}
-      {[...recommended, ...rest].slice(0, 8).map((m) => (
-        <div
-          key={m.id}
-          style={{
-            display: 'flex', alignItems: 'center', gap: 8, padding: '5px 8px',
-            marginBottom: 4, borderRadius: 'var(--radius-sm)',
-            border: `1px solid ${selected === m.id ? 'var(--accent-cyan)' : 'var(--border)'}`,
-            background: selected === m.id ? 'rgba(0,217,255,0.06)' : 'var(--bg-base)',
-            fontSize: 11,
-          }}
-        >
-          <input
-            type="radio" name="polish-model" checked={selected === m.id}
-            onChange={() => onSelect(m.id)} disabled={disabled}
-          />
-          <div style={{ flex: 1, minWidth: 0 }}>
-            <div style={{ display: 'flex', gap: 6, alignItems: 'baseline', flexWrap: 'wrap' }}>
-              <span style={{ color: 'var(--text-primary)', fontWeight: m.recommended ? 600 : 400 }}>
-                {m.name}
-              </span>
-              <span style={{
-                fontSize: 9, padding: '1px 5px', borderRadius: 3,
-                background: m.tier === 'premium' ? 'rgba(167,139,250,0.15)'
-                  : m.tier === 'efficient' ? 'rgba(16,185,129,0.15)' : 'rgba(0,217,255,0.12)',
-                color: 'var(--text-muted)', textTransform: 'uppercase',
-              }}>
-                {m.tier}{m.recommended ? ' · top pick' : ''}
-              </span>
-              <span style={{ fontSize: 9, color: 'var(--text-muted)' }}>{m.cost_display}</span>
-              {m.benchmark && (
-                <span style={{ fontSize: 9, color: 'var(--accent-cyan)' }}>
-                  bench: {Math.round(m.benchmark.exact_fix_rate * 100)}% fixes,{' '}
-                  {Math.round(m.benchmark.format_compliance * 100)}% format
-                </span>
-              )}
-            </div>
-            <div style={{ fontSize: 9, color: 'var(--text-muted)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-              {m.rationale}
-            </div>
-          </div>
-          <button
-            onClick={() => runTest(m.id)} disabled={!!testing || disabled}
-            title="Run the built-in 20-segment polish benchmark on this model"
-            style={{
-              padding: '2px 8px', fontSize: 10, background: 'var(--bg-base)',
-              color: 'var(--text-muted)', border: '1px solid var(--border)',
-              borderRadius: 'var(--radius-sm)', cursor: 'pointer', flexShrink: 0,
-            }}
-          >
-            {testing === m.id ? 'Testing…' : 'Test'}
-          </button>
-        </div>
-      ))}
-      {!loading && models.length === 0 && !error && (
-        <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>
-          No recommendations available — configure an OpenRouter API key first.
-        </div>
-      )}
-    </div>
-  );
-}
