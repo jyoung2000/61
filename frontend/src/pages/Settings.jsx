@@ -519,9 +519,18 @@ export default function Settings() {
   const [statuses, setStatuses] = useState({});
   const viralAlgorithmRef = useRef(null);
 
-  // Auto-scroll to section when navigated with ?section=viral-algorithm
+  // Auto-scroll to section when navigated with ?section=…
+  //
+  // Tabs are conditionally rendered, so a setting on an INACTIVE tab is not in
+  // the DOM at all — browser Ctrl+F finds nothing and the setting reads as
+  // "missing" (this cost a user three rounds hunting for Concurrent
+  // Analyses). Deep links are the fix: ?tab=<name>&section=<id> opens the
+  // right tab AND scrolls to the control, so a setting can always be pointed
+  // at with a URL. Any section with a matching DOM id works; viral-algorithm
+  // keeps its ref-based path.
   useEffect(() => {
     const section = searchParams.get('section');
+    if (!section) return undefined;
     if (section === 'viral-algorithm' && settingsTab === 1) {
       // Small delay to let the tab content render
       const timer = setTimeout(() => {
@@ -529,6 +538,17 @@ export default function Settings() {
       }, 150);
       return () => clearTimeout(timer);
     }
+    const timer = setTimeout(() => {
+      const el = document.getElementById(section);
+      if (!el) return;
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      // Brief highlight — on a long tab, "it scrolled somewhere" isn't the
+      // same as "here it is".
+      el.style.transition = 'box-shadow 0.4s';
+      el.style.boxShadow = '0 0 0 2px var(--accent-cyan)';
+      setTimeout(() => { el.style.boxShadow = ''; }, 2200);
+    }, 150);
+    return () => clearTimeout(timer);
   }, [settingsTab, searchParams]);
 
   // Per-provider API key state
@@ -4147,8 +4167,11 @@ export default function Settings() {
             </div>
 
             {/* ── Concurrent Analyses ── */}
-            <div style={{ marginBottom: 32 }}>
-              <h3 style={{ fontSize: 14, marginBottom: 4, color: 'var(--text-secondary)' }}>Concurrent Analyses</h3>
+            {/* id: deep-linkable as /settings?tab=advanced&section=concurrency */}
+            <div id="concurrency" style={{ marginBottom: 32, borderRadius: 'var(--radius-sm)' }}>
+              <h3 style={{ fontSize: 14, marginBottom: 4, color: 'var(--text-secondary)' }}>
+                Concurrent Analyses <span style={{ fontWeight: 400, color: 'var(--text-muted)' }}>(bulk import speed)</span>
+              </h3>
               <p style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 16, lineHeight: 1.5 }}>
                 How many video analysis pipelines may run at the same time. Applies instantly —
                 no restart needed. Imports always queue every video; this controls how many the

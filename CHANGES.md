@@ -1,3 +1,37 @@
+# ClipAI — Settings you can link to (the "Concurrent Analyses is missing" trap)
+
+Concurrent Analyses was reported missing three times while being present and
+deployed the whole time. The cause is structural, not a typo: **Settings tabs
+are conditionally rendered**, so a control on an inactive tab is not in the
+DOM at all — a browser Ctrl+F for "concur" from the AI Provider tab returns
+0/0 and the setting is, for all practical purposes, invisible. No amount of
+"it's on the Advanced tab" fixes that for the next setting, or the next user.
+
+- **Deep links to a control, not just a tab.** `?tab=` already selected a tab;
+  `?section=<id>` now scrolls to any element with that id and flashes an
+  accent ring for ~2 s (on a long tab, "it scrolled somewhere" isn't the same
+  as "here it is"). The Concurrent Analyses block carries `id="concurrency"`,
+  so it is reachable at
+  `/settings?tab=advanced&section=concurrency` — a URL that can be pasted,
+  bookmarked, or linked from anywhere in the app.
+- **Linked from where bulk imports actually run.** The BulkImportPanel's
+  running note now reads "Videos run one at a time — change how many run at
+  once", linking straight to the control. The user thought of it as
+  "concurrency for bulk importing"; that is where the pointer belongs.
+- **The heading says what it affects** — "Concurrent Analyses (bulk import
+  speed)" — so scanning the Advanced tab finds it by either name.
+- **Deep links can't silently rot.** New source-scan tests pin the two ways
+  they break with no error anywhere: `TAB_NAME_TO_INDEX` drifting out of sync
+  with `SETTINGS_TABS` (insert or reorder a tab → every `?tab=` link opens the
+  WRONG tab), and a `?section=` link pointing at an id that no longer exists.
+  A third test pins that Concurrent Analyses really does live inside the
+  `settingsTab === 4` block, and a fourth that the bulk panel links to it.
+- Verified: 4 new tests (167 frontend total), production build green, and the
+  built bundle confirmed to contain both `id="concurrency"` and the panel's
+  deep link.
+
+---
+
 # ClipAI — "Cancel import" now stops everything immediately
 
 Cancel used to only raise a flag and ask the running analysis nicely. The

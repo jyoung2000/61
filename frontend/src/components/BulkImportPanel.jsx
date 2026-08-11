@@ -226,6 +226,19 @@ export default function BulkImportPanel({ startId = '', onRunningChange }) {
       {running && (
         <div style={{ fontSize: 11.5, color: T.tm }}>
           Runs on the ClipAI server — safe to close this window or navigate away; progress also shows on the Dashboard.
+          {' '}Videos run one at a time —{' '}
+          {/* The setting lives on an inactive Settings tab, so it is invisible
+              to browser find; link to it from where bulk imports actually
+              happen (deep link opens the tab AND scrolls to the control). */}
+          <span
+            role="link"
+            tabIndex={0}
+            onClick={() => navigate('/settings?tab=advanced&section=concurrency')}
+            onKeyDown={(e) => { if (e.key === 'Enter') navigate('/settings?tab=advanced&section=concurrency'); }}
+            style={{ color: T.accent, cursor: 'pointer', textDecoration: 'underline' }}
+          >
+            change how many run at once
+          </span>.
         </div>
       )}
     </div>
