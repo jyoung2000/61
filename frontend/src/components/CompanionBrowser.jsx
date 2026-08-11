@@ -202,6 +202,33 @@ export default function CompanionBrowser({ kind = 'video', onClose, onImported }
   const [pendingBulk, setPendingBulk] = useState(null); // {path|files, name, count}
   const [bulkRunning, setBulkRunning] = useState(false);
   const navigate = useNavigate();
+  // How many videos analyze at once (rest stay queued) — shown IN the confirm
+  // card so the choice lives where the run starts, not on a Settings tab the
+  // user has to hunt for. Server-backed (/api/processing/settings), applies
+  // live, shared with the Settings-page control.
+  const [concurrency, setConcurrency] = useState(1);
+  useEffect(() => {
+    if (kind !== 'video') return;
+    fetch('/api/processing/settings')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        if (d && typeof d.concurrent_analyses === 'number') setConcurrency(d.concurrent_analyses);
+      })
+      .catch(() => {});
+  }, [kind]);
+  const saveConcurrency = async (n) => {
+    setConcurrency(n); // optimistic — the server clamps and confirms
+    try {
+      const r = await fetch('/api/processing/settings', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ concurrent_analyses: n }),
+      });
+      if (r.ok) {
+        const d = await r.json();
+        if (typeof d.concurrent_analyses === 'number') setConcurrency(d.concurrent_analyses);
+      }
+    } catch { /* Settings page shows load errors; keep the optimistic value */ }
+  };
 
   useEffect(() => {
     (async () => {
@@ -844,6 +871,16 @@ export default function CompanionBrowser({ kind = 'video', onClose, onImported }
             <option value="">No translation (keep original)</option>
             {LANGUAGES.filter((l) => l.code).map((l) => (
               <option key={l.code} value={l.code}>{l.label}</option>
+            ))}
+          </select>
+        </label>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12.5, color: 'var(--fb-ts)', minWidth: 0 }}>
+          <span style={{ whiteSpace: 'nowrap' }}>Videos at once</span>
+          <select value={concurrency} onChange={(ev) => saveConcurrency(Number(ev.target.value))}
+            aria-label="Videos analyzed at once" style={bulkLangSelect}
+            title="How many videos analyze at the same time — the rest stay queued until a slot frees. Saves instantly (shared with Settings), and one at a time is fastest overall on shared hardware.">
+            {[1, 2, 3, 4].map((n) => (
+              <option key={n} value={n}>{n === 1 ? '1 — one at a time' : n}</option>
             ))}
           </select>
         </label>

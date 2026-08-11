@@ -1912,6 +1912,62 @@ export default function Settings() {
     // change retriggers the load.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user?.id]);
+  // "How many videos analyze at once" — rendered on BOTH the AI Provider tab
+  // (where users demonstrably scroll looking for it) and the top of the
+  // Advanced tab. Only one tab mounts at a time, so the id stays unique.
+  // Deep link: /settings?tab=advanced&section=concurrency (works via ?section
+  // on the AI Provider tab too since the id exists there when it's active).
+  const concurrencyCard = (
+    <div id="concurrency" style={{ marginBottom: 32, borderRadius: 'var(--radius-sm)' }}>
+      <h3 style={{ fontSize: 14, marginBottom: 4, color: 'var(--text-secondary)' }}>
+        Concurrent Analyses <span style={{ fontWeight: 400, color: 'var(--text-muted)' }}>— how many videos analyze at once</span>
+      </h3>
+      <p style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 16, lineHeight: 1.5 }}>
+        Bulk imports and uploads queue every video; this picks how many run at the
+        same time — the rest stay queued until a slot frees. Applies instantly, no
+        restart needed.
+      </p>
+      <div style={{
+        padding: '12px 16px', background: 'var(--bg-panel)',
+        border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)',
+      }}>
+        <div style={{ display: 'flex', gap: 8 }} role="group" aria-label="Concurrent analyses">
+          {[1, 2, 3, 4].map((n) => (
+            <button
+              key={n}
+              onClick={() => n !== concurrentAnalyses && handleSaveConcurrency(n)}
+              disabled={concurrencySaving}
+              aria-pressed={n === concurrentAnalyses}
+              style={{
+                flex: 1, padding: '8px 0', fontSize: 12, fontWeight: 600,
+                borderRadius: 'var(--radius-sm)', cursor: concurrencySaving ? 'default' : 'pointer',
+                border: `1px solid ${n === concurrentAnalyses ? 'var(--accent-cyan)' : 'var(--border)'}`,
+                background: n === concurrentAnalyses ? 'var(--accent-cyan)' : 'var(--bg-elevated)',
+                color: n === concurrentAnalyses ? 'var(--bg-base)' : 'var(--text-secondary)',
+                opacity: concurrencySaving ? 0.6 : 1, transition: 'background 0.15s, color 0.15s',
+              }}
+            >
+              {n === 1 ? '1 · sequential' : n}
+            </button>
+          ))}
+        </div>
+        <span style={{ fontSize: 10, color: 'var(--text-muted)', display: 'block', marginTop: 8, lineHeight: 1.5 }}>
+          1 (sequential) is recommended: multiple pipelines split the same CPU/GPU and
+          usually finish slower in total than back-to-back. Lowering the limit never
+          interrupts running jobs — they finish, and the queue continues under the new cap.
+        </span>
+        {concurrencyLoadError && (
+          <span style={{ fontSize: 10, color: 'var(--accent-orange, #f0a020)', display: 'block', marginTop: 6, lineHeight: 1.5 }}>
+            ⚠ Couldn’t read the current value from the server ({concurrencyLoadError}) —
+            the selection above is the default, not necessarily what the container is using.
+            An older container without <code>/api/processing/settings</code> does this;
+            update it, then reload.
+          </span>
+        )}
+      </div>
+    </div>
+  );
+
   const SETTINGS_TABS = [
     'AI Provider', 'Prompts', 'Fonts', 'Presets', 'Advanced',
     'Usage & Costs', 'API Access', 'About',
@@ -2262,6 +2318,12 @@ export default function Settings() {
             {/* Remote VRAM control: auto-allocate + manual budget on the Companion */}
             {statuses._active?.companion && <CompanionVramCard showToast={showToast} />}
             {statuses._active?.companion && <CompanionQualityCard showToast={showToast} />}
+
+            {/* Also lives at the top of Advanced; rendered here too because
+                this is the tab users actually scroll when hunting for
+                bulk-import behavior (reported "missing" four times while it
+                existed on Advanced only). */}
+            {concurrencyCard}
 
             {/* Cloud fallback for subtitle polish — none / auto / pinned model */}
             <PolishFallbackCard isMobile={isMobile} />
@@ -3535,6 +3597,10 @@ export default function Settings() {
         <div>
           <div style={{ maxWidth: isMobile ? '100%' : 480 }}>
 
+            {/* First thing on the tab — repeatedly reported "missing" while it
+                sat below ~500 lines of GPU sections. */}
+            {concurrencyCard}
+
             {/* ── Cloud Storage ── */}
             <div style={{ marginBottom: 32 }}>
               <h3 style={{ fontSize: 14, marginBottom: 16, color: 'var(--text-secondary)' }}>Cloud Storage</h3>
@@ -4210,57 +4276,6 @@ export default function Settings() {
                   )}
                 </div>
               )}
-            </div>
-
-            {/* ── Concurrent Analyses ── */}
-            {/* id: deep-linkable as /settings?tab=advanced&section=concurrency */}
-            <div id="concurrency" style={{ marginBottom: 32, borderRadius: 'var(--radius-sm)' }}>
-              <h3 style={{ fontSize: 14, marginBottom: 4, color: 'var(--text-secondary)' }}>
-                Concurrent Analyses <span style={{ fontWeight: 400, color: 'var(--text-muted)' }}>(bulk import speed)</span>
-              </h3>
-              <p style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 16, lineHeight: 1.5 }}>
-                How many video analysis pipelines may run at the same time. Applies instantly —
-                no restart needed. Imports always queue every video; this controls how many the
-                queue lets run together.
-              </p>
-              <div style={{
-                padding: '12px 16px', background: 'var(--bg-panel)',
-                border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)',
-              }}>
-                <div style={{ display: 'flex', gap: 8 }} role="group" aria-label="Concurrent analyses">
-                  {[1, 2, 3, 4].map((n) => (
-                    <button
-                      key={n}
-                      onClick={() => n !== concurrentAnalyses && handleSaveConcurrency(n)}
-                      disabled={concurrencySaving}
-                      aria-pressed={n === concurrentAnalyses}
-                      style={{
-                        flex: 1, padding: '8px 0', fontSize: 12, fontWeight: 600,
-                        borderRadius: 'var(--radius-sm)', cursor: concurrencySaving ? 'default' : 'pointer',
-                        border: `1px solid ${n === concurrentAnalyses ? 'var(--accent-cyan)' : 'var(--border)'}`,
-                        background: n === concurrentAnalyses ? 'var(--accent-cyan)' : 'var(--bg-elevated)',
-                        color: n === concurrentAnalyses ? 'var(--bg-base)' : 'var(--text-secondary)',
-                        opacity: concurrencySaving ? 0.6 : 1, transition: 'background 0.15s, color 0.15s',
-                      }}
-                    >
-                      {n === 1 ? '1 · sequential' : n}
-                    </button>
-                  ))}
-                </div>
-                <span style={{ fontSize: 10, color: 'var(--text-muted)', display: 'block', marginTop: 8, lineHeight: 1.5 }}>
-                  1 (sequential) is recommended: multiple pipelines split the same CPU/GPU and
-                  usually finish slower in total than back-to-back. Lowering the limit never
-                  interrupts running jobs — they finish, and the queue continues under the new cap.
-                </span>
-                {concurrencyLoadError && (
-                  <span style={{ fontSize: 10, color: 'var(--accent-orange, #f0a020)', display: 'block', marginTop: 6, lineHeight: 1.5 }}>
-                    ⚠ Couldn’t read the current value from the server ({concurrencyLoadError}) —
-                    the selection above is the default, not necessarily what the container is using.
-                    An older container without <code>/api/processing/settings</code> does this;
-                    update it, then reload.
-                  </span>
-                )}
-              </div>
             </div>
 
             {/* ── FFmpeg Threads ── */}

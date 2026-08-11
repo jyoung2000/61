@@ -42,6 +42,7 @@ let listingFor;       // (path) => { status, body }
 let serverBookmarks;
 let bulkProgress;
 let activeBulkId;     // /import-folder/active — a run already going on the server
+let serverConcurrency; // /api/processing/settings — videos analyzed at once
 
 function mockFetch(url, opts = {}) {
   const method = (opts.method || 'GET').toUpperCase();
@@ -72,6 +73,13 @@ function mockFetch(url, opts = {}) {
     const r = listingFor(path);
     return json(r.body, r.status);
   }
+  if (url.startsWith('/api/processing/settings')) {
+    if (method === 'POST') {
+      const b = JSON.parse(opts.body);
+      serverConcurrency = Math.max(1, Math.min(8, b.concurrent_analyses));
+    }
+    return json({ concurrent_analyses: serverConcurrency, active_analyses: 0 });
+  }
   if (url.startsWith('/api/providers/companion-files/import-folder/active')) return json({ bulk_id: activeBulkId });
   if (url.startsWith('/api/providers/companion-files/import-folder/progress')) return json(bulkProgress);
   if (url.startsWith('/api/providers/companion-files/import-folder')) {
@@ -90,6 +98,7 @@ beforeEach(() => {
     : { status: 200, body: LISTING });
   bulkProgress = { status: 'complete', total: 2, done: 2, ok: 2, failed: 0, current: -1, folder_name: 'media', items: [] };
   activeBulkId = null;
+  serverConcurrency = 1;
   vi.stubGlobal('fetch', vi.fn(mockFetch));
   localStorage.clear();
   container = document.createElement('div');
@@ -363,6 +372,29 @@ describe('CompanionBrowser bulk folder import', () => {
     // live status; nobody is stuck watching the Upload-page popup.
     expect(onClose).toHaveBeenCalled();
     expect(currentPath()).toBe('/');
+  });
+
+  it('the confirm card lets the user pick how many videos analyze at once', async () => {
+    // The setting was reported "missing" four times while it lived only on a
+    // Settings tab — so it now sits IN the confirm card, at the point of use.
+    serverConcurrency = 2;   // an earlier choice, loaded from the server
+    await renderAt(<CompanionBrowser kind="video" onClose={() => {}} onImported={() => {}} />);
+    await click([...document.body.querySelectorAll('button')].find((b) => b.textContent.includes('media')));
+    await flush();
+    const pill = [...document.body.querySelectorAll('[title="Import every video in this folder, one at a time"]')].pop();
+    await click(pill);
+    await flush();
+
+    const sel = document.body.querySelector('[aria-label="Videos analyzed at once"]');
+    expect(sel).toBeTruthy();
+    expect(sel.value).toBe('2');                    // server value pre-selected
+
+    await setSelect(sel, '3');
+    await flush();
+    // Saved to the shared server setting immediately (live gate resize).
+    const post = fetchCalls.find((c) => c.method === 'POST' && c.url.startsWith('/api/processing/settings'));
+    expect(post.body).toEqual({ concurrent_analyses: 3 });
+    expect(sel.value).toBe('3');
   });
 
   it('confirm-card language picks stay in sync with the sticky toolbar pickers', async () => {

@@ -1,3 +1,29 @@
+# ClipAI — the "videos at once" picker now lives where users actually look
+
+Fourth report of "there is no concurrency setting" — while the setting existed,
+deployed, on Settings → Advanced. Each report came with a screenshot of the
+AI Provider tab. The conclusion isn't "tell them the tab again", it's that the
+placement failed. The control is now in three places:
+
+- **In the bulk-import confirm card** ("Videos at once", next to the language
+  pickers) — set it in the same breath as starting the run. Saves to the
+  shared server setting immediately (live gate resize; queued videos admit
+  the moment the limit rises).
+- **On the AI Provider tab**, right below the GPU Companion cards — the tab
+  every "missing" screenshot showed. Same card, same state.
+- **At the top of Advanced** (was buried under ~500 lines of GPU sections).
+
+One shared card component, one server setting behind all three; only one tab
+mounts at a time so the deep-link id stays unique. Subtitle now says what it
+does in the user's words: "how many videos analyze at once… the rest stay
+queued until a slot frees."
+
+- Verified: new confirm-card test (server value pre-selected, change POSTs the
+  shared setting), deep-link test updated to pin BOTH tab renders — 170
+  frontend tests, production build green, bundle carries the new strings.
+
+---
+
 # Companion — a loaded turbo must never answer a translate-tier request (0.11.14)
 
 Post-run audit of the first fully-green bulk import (4/4 videos, no stalls, no

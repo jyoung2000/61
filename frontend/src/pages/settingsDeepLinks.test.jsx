@@ -59,18 +59,22 @@ describe('Settings deep links', () => {
     }
   });
 
-  it('advanced is the tab that actually holds Concurrent Analyses', () => {
-    const map = nameToIndex();
-    expect(map.advanced).toBe(4);
-    // The control renders inside the {settingsTab === 4 && …} block: the
-    // Concurrent Analyses markup must appear AFTER that guard and BEFORE the
-    // next tab guard.
-    const guard = SETTINGS.indexOf('{settingsTab === 4 && (');
-    const nextGuard = SETTINGS.indexOf('{settingsTab === 5 && (');
-    const control = SETTINGS.indexOf('Concurrent Analyses');
-    expect(guard).toBeGreaterThan(-1);
-    expect(control).toBeGreaterThan(guard);
-    if (nextGuard > -1) expect(control).toBeLessThan(nextGuard);
+  it('Concurrent Analyses renders on BOTH the AI Provider and Advanced tabs', () => {
+    // The control was reported "missing" four times while it lived on one
+    // tab only — it is now a shared card rendered on the tab users actually
+    // scroll (AI Provider, index 0) AND at the top of Advanced (index 4).
+    expect(nameToIndex().advanced).toBe(4);
+    expect(SETTINGS).toContain('const concurrencyCard = (');
+    const tab0 = SETTINGS.indexOf('{settingsTab === 0 && (');
+    const tab4 = SETTINGS.indexOf('{settingsTab === 4 && (');
+    const tab5 = SETTINGS.indexOf('{settingsTab === 5 && (');
+    const renders = [...SETTINGS.matchAll(/\{concurrencyCard\}/g)].map((m) => m.index);
+    expect(renders.length).toBe(2);
+    expect(tab0).toBeGreaterThan(-1);
+    expect(tab4).toBeGreaterThan(-1);
+    // One render inside tab 0's block, one inside tab 4's.
+    expect(renders.some((i) => i > tab0 && i < tab4)).toBe(true);
+    expect(renders.some((i) => i > tab4 && (tab5 === -1 || i < tab5))).toBe(true);
   });
 
   it('links to ?section=<id> point at ids that exist in the markup', () => {
