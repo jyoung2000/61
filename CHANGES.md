@@ -1,3 +1,39 @@
+# Companion — a loaded turbo must never answer a translate-tier request (0.11.14)
+
+Post-run audit of the first fully-green bulk import (4/4 videos, no stalls, no
+retries) confirmed the keep-serving optimization worked as designed — twice the
+log shows "whisper request 'medium' served by the already-loaded 'large-v3' —
+no reload", exactly the thrash-kill it was built for. The same log exposed the
+one case where the rank rule is WRONG:
+
+- ClipAI's audio→English pass requests `medium` precisely BECAUSE
+  large-v3-turbo cannot translate ("large-v3-turbo cannot translate (distilled
+  without the task) — requesting medium", verbatim in the run log). Under the
+  pure rank rule, a LOADED turbo (rank 3) would keep-serve that medium
+  (rank 2) request — handing a translate task to a model that cannot perform
+  it, silently yielding source-language output instead of English. It didn't
+  bite this run only because quality="max" had full large-v3 loaded (which CAN
+  translate); on "balanced"/"auto" profiles turbo is the resident model and
+  every translated bulk video would have been affected.
+- Rule now: turbo substitutes only for turbo; every non-turbo model still
+  covers everything at or below its rank (large-v3 keeps covering turbo's
+  requests). The measured thrash-kill survives; the correctness hole is closed.
+- Verified: new `turbo_never_substitutes_for_a_non_turbo_request` test + the
+  adjusted matrix — 45 Rust tests green; 9 version-sync tests green.
+
+Run audit notes (no code changes): 4 videos / 5h12m of footage in 2h50m wall
+(0.55× realtime), all transcripts clean (no hallucination loops, music cues
+marked). Measured large-v3+flash-attn decode on the 4070: 150 min of audio in
+~14 min (~0.095× RT) — "max" quality is affordable at this speed. Known
+accepted costs seen in the log: the full audio is decoded twice when
+translating (transcribe + whisper-native translate — a deliberate quality
+pass), one ~85 s sidecar reload per video from the release-for-LLM-phase
+handoff (documented trade: a resident whisper CPU-spills the LLM phase, which
+costs more), and ~60 s of video 3's gap-fill decoded on `small` while the 14b
+judge held VRAM (the Companion's unload-and-recover corrected it mid-burst).
+
+---
+
 # ClipAI — The long transcription no longer looks stuck (and can't be killed as "stalled")
 
 Reported as "why is it taking forever to release the GPU?". The GPU release had

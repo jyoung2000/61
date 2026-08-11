@@ -225,7 +225,22 @@ pub async fn healthy() -> bool {
 pub(crate) fn can_keep_serving(running: &str, desired: &str) -> bool {
     let (rm, rr) = running.split_once('|').unwrap_or((running, ""));
     let (dm, dr) = desired.split_once('|').unwrap_or((desired, ""));
-    rr == dr && crate::state::whisper_rank(rm) >= crate::state::whisper_rank(dm)
+    if rr != dr {
+        return false;
+    }
+    // large-v3-turbo is distilled WITHOUT the translate task. ClipAI's
+    // audio→English pass deliberately requests `medium` BECAUSE turbo can't
+    // translate ("large-v3-turbo cannot translate (distilled without the
+    // task) — requesting medium", observed in a real run) — so substituting
+    // a loaded turbo for that request would hand a translate task to a model
+    // that cannot perform it. Turbo therefore substitutes only for itself;
+    // every non-turbo model can run everything at or below its rank
+    // (full large-v3 translates, so it covers turbo's requests too).
+    let turbo = |m: &str| m.to_ascii_lowercase().contains("turbo");
+    if turbo(rm) && !turbo(dm) {
+        return false;
+    }
+    crate::state::whisper_rank(rm) >= crate::state::whisper_rank(dm)
 }
 
 /// Ensure the sidecar is running with the model tier the current VRAM
@@ -781,7 +796,21 @@ mod keep_serving_tests {
         // full reload. Equal decode settings + lower tier → keep serving.
         assert!(can_keep_serving(&key("large-v3"), &key("medium")));
         assert!(can_keep_serving(&key("large-v3"), &key("small")));
-        assert!(can_keep_serving(&key("large-v3-turbo"), &key("medium")));
+        assert!(can_keep_serving(&key("large-v3"), &key("large-v3-turbo")));
+    }
+
+    #[test]
+    fn turbo_never_substitutes_for_a_non_turbo_request() {
+        // large-v3-turbo is distilled WITHOUT the translate task. ClipAI's
+        // audio→English pass requests `medium` precisely BECAUSE turbo can't
+        // translate — a loaded turbo answering that request would run a
+        // translate task on a model that cannot perform it, silently
+        // producing source-language output instead of English.
+        assert!(!can_keep_serving(&key("large-v3-turbo"), &key("medium")));
+        assert!(!can_keep_serving(&key("large-v3-turbo"), &key("small")));
+        // Turbo still serves turbo requests without a reload…
+        assert!(can_keep_serving(&key("large-v3-turbo"), &key("large-v3-turbo")));
+        // …and full large-v3 covers turbo's requests (it CAN translate).
         assert!(can_keep_serving(&key("large-v3"), &key("large-v3-turbo")));
     }
 
