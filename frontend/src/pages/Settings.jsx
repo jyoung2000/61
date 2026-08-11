@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import ModelBrowser from '../components/ModelBrowser';
 import PipelineDiagnostics from '../components/PipelineDiagnostics';
@@ -37,6 +37,10 @@ const dropdownStyle = {
 };
 
 const TAB_NAME_TO_INDEX = { 'ai-provider': 0, prompts: 1, fonts: 2, presets: 3, advanced: 4, 'usage-costs': 5, 'api-access': 6, 'about': 7, 'users': 8 };
+// Reverse map so selecting a tab can write the URL back (bookmarkable,
+// shareable, survives reload — see the sync effect in Settings()).
+const TAB_INDEX_TO_NAME = Object.fromEntries(
+  Object.entries(TAB_NAME_TO_INDEX).map(([name, i]) => [i, name]));
 
 const OPT_ROW = {
   padding: '7px 12px', fontSize: 12, fontFamily: 'var(--font-mono)', cursor: 'pointer',
@@ -511,11 +515,41 @@ function CompanionQualityCard({ showToast }) {
 
 export default function Settings() {
   const { isMobile } = useResponsive();
-  const [searchParams] = useSearchParams();
+  const [searchParams, setSearchParams] = useSearchParams();
   const [settingsTab, setSettingsTab] = useState(() => {
     const tab = searchParams.get('tab');
     return tab && TAB_NAME_TO_INDEX[tab] !== undefined ? TAB_NAME_TO_INDEX[tab] : 0;
   });
+
+  // Keep the tab and the URL in lockstep, BOTH ways.
+  //
+  // The initializer above runs once at mount, which made ?tab= a half-working
+  // feature: navigating to /settings?tab=advanced while ALREADY on /settings
+  // doesn't remount the route, so the tab never changed and the link silently
+  // did nothing (same for browser back/forward between two ?tab= URLs). And
+  // because a tab click never wrote the URL back, the page could not be
+  // bookmarked, shared, or reloaded into — every reload dumped the user back
+  // on "AI Provider", which is precisely how a setting on another tab reads
+  // as "missing".
+  useEffect(() => {
+    const tab = searchParams.get('tab');
+    const idx = tab ? TAB_NAME_TO_INDEX[tab] : undefined;
+    if (idx !== undefined && idx !== settingsTab) setSettingsTab(idx);
+    // Intentionally NOT keyed on settingsTab: this effect follows the URL,
+    // selectTab drives the URL, and keying on both would fight.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams]);
+
+  const selectTab = useCallback((i) => {
+    setSettingsTab(i);
+    const name = TAB_INDEX_TO_NAME[i];
+    const next = new URLSearchParams(searchParams);
+    if (name) next.set('tab', name); else next.delete('tab');
+    // A ?section= from an earlier deep link must not re-scroll on every
+    // later tab change.
+    next.delete('section');
+    setSearchParams(next, { replace: true });
+  }, [searchParams, setSearchParams]);
   const [statuses, setStatuses] = useState({});
   const viralAlgorithmRef = useRef(null);
 
@@ -671,6 +705,9 @@ export default function Settings() {
   // Concurrent analyses (pipeline processing)
   const [concurrentAnalyses, setConcurrentAnalyses] = useState(1);
   const [concurrencySaving, setConcurrencySaving] = useState(false);
+  // Non-empty when the current value could NOT be read from the server, so
+  // the shown selection is a default rather than the truth.
+  const [concurrencyLoadError, setConcurrencyLoadError] = useState('');
 
   // Prompt customization state
   const [prompts, setPrompts] = useState({ frame_analysis: '', viral_clip_detection: '', summary: '', seo: '' });
@@ -848,14 +885,23 @@ export default function Settings() {
       .catch(() => {});
   }, []);
 
-  // Load processing settings (concurrent analyses)
+  // Load processing settings (concurrent analyses).
+  // A swallowed failure here is worse than it looks: the buttons still render
+  // with "1 · sequential" selected, so a 404 from an older server (or a proxy
+  // error page) shows a value that was never read from the server as though
+  // it were the truth. Record the failure and say so under the control.
   useEffect(() => {
     fetch('/api/processing/settings')
-      .then((r) => r.json())
-      .then((data) => {
-        setConcurrentAnalyses(data.concurrent_analyses ?? 1);
+      .then((r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
       })
-      .catch(() => {});
+      .then((data) => {
+        if (typeof data?.concurrent_analyses !== 'number') throw new Error('bad payload');
+        setConcurrentAnalyses(data.concurrent_analyses);
+        setConcurrencyLoadError('');
+      })
+      .catch((e) => setConcurrencyLoadError(String(e?.message || e)));
   }, []);
 
   // Load FFmpeg encoding settings
@@ -1910,7 +1956,7 @@ export default function Settings() {
         {SETTINGS_TABS.map((t, i) => (
           <button
             key={t}
-            onClick={() => setSettingsTab(i)}
+            onClick={() => selectTab(i)}
             style={{
               padding: isMobile ? '10px 14px' : '10px 20px', background: 'none', border: 'none',
               borderBottom: settingsTab === i ? '2px solid var(--accent-cyan)' : '2px solid transparent',
@@ -4206,6 +4252,14 @@ export default function Settings() {
                   usually finish slower in total than back-to-back. Lowering the limit never
                   interrupts running jobs — they finish, and the queue continues under the new cap.
                 </span>
+                {concurrencyLoadError && (
+                  <span style={{ fontSize: 10, color: 'var(--accent-orange, #f0a020)', display: 'block', marginTop: 6, lineHeight: 1.5 }}>
+                    ⚠ Couldn’t read the current value from the server ({concurrencyLoadError}) —
+                    the selection above is the default, not necessarily what the container is using.
+                    An older container without <code>/api/processing/settings</code> does this;
+                    update it, then reload.
+                  </span>
+                )}
               </div>
             </div>
 

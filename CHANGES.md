@@ -1,3 +1,39 @@
+# ClipAI — Settings tabs sync with the URL (three defects behind "the setting is missing")
+
+An adversarial verification pass (three independent lenses on the render path,
+then a judge) confirmed the Concurrent Analyses control is unconditionally
+reachable on the Advanced tab — its ONLY gate in the whole path is
+`settingsTab === 4`, with no flag, role, or data dependency. But the same pass
+found three real defects that together reproduce "it isn't there" on every
+visit:
+
+- **`?tab=` was read once, at mount.** Navigating to `/settings?tab=advanced`
+  while ALREADY on `/settings` doesn't remount the route, so the tab never
+  changed and the URL silently no-opped — including browser back/forward
+  between two `?tab=` URLs. A sync effect now follows the URL.
+- **Tab clicks never wrote the URL back**, so the page couldn't be
+  bookmarked, shared, or reloaded into: every reload dumped the user back on
+  "AI Provider" (index 0). `selectTab` now writes `?tab=<name>` (replace, and
+  it clears a stale `?section=` so an old deep link can't re-scroll later).
+  Together these make the in-app link from the bulk panel actually work — it
+  previously only worked by accident, when navigating in from another route.
+- **A failed load showed a fabricated value as truth.** The fetch's
+  `.catch(() => {})` swallowed 404s (older container), proxy HTML error pages
+  and network failures, leaving "1 · sequential" selected as though it had
+  been read from the server. Non-OK status and bad payloads are now detected
+  and reported under the control, naming the likely cause.
+- **A near-miss caught in the process:** `useCallback` was used in
+  Settings.jsx while the import line still read
+  `{ useState, useEffect, useRef, useMemo }` — a `ReferenceError` and a white
+  Settings page, invisible to the whole suite because nothing renders that
+  component. There is no ESLint here, so a new `reactHookImports` test scans
+  every source file and asserts each React hook used is imported. Verified by
+  removing the import and watching it fail.
+- Verified: 169 frontend tests (2 new files), production build green, and the
+  built bundle confirmed to carry the new strings.
+
+---
+
 # ClipAI — Settings you can link to (the "Concurrent Analyses is missing" trap)
 
 Concurrent Analyses was reported missing three times while being present and
