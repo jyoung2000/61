@@ -187,6 +187,12 @@ async def _startup_build_stamp():
         except Exception:
             pass
     logger.info("ClipAI build: %s — %s", sha or "unknown", subject or "(no subject)")
+    # Expose the resolved build to /api/server-build so the UI (and a human
+    # with curl) can VERIFY a deploy actually took effect — "the settings
+    # aren't updating" turned out to be a stale browser-cached bundle, and
+    # nothing anywhere said which build was serving.
+    app.state.build_sha = sha or "unknown"
+    app.state.build_subject = subject or ""
 
     # Masked fingerprint (last-4 + length) of every API key loaded from the
     # environment, so the active key is confirmable at boot without exposing
@@ -1650,6 +1656,17 @@ async def serve_remote_gpu_doc():
 
 
 # Serve frontend static files
+@app.get("/api/server-build")
+async def server_build():
+    """Which build this container is running — the ground truth for "did my
+    update actually take effect?". The UI compares its own bundle against
+    this + the freshly-served index.html and offers a reload when stale."""
+    return {
+        "sha": getattr(app.state, "build_sha", "unknown"),
+        "subject": getattr(app.state, "build_subject", ""),
+    }
+
+
 static_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static")
 _assets_dir = os.path.join(static_dir, "assets")
 _index_path = os.path.join(static_dir, "index.html")
@@ -1657,12 +1674,25 @@ _index_path = os.path.join(static_dir, "index.html")
 if os.path.isdir(static_dir) and os.path.isdir(_assets_dir) and os.path.isfile(_index_path):
     app.mount("/assets", StaticFiles(directory=_assets_dir), name="assets")
 
+    # The app shell must NEVER be cached: index.html references the build's
+    # hashed bundle, and without an explicit Cache-Control the browser
+    # heuristically caches it — after a container update the user keeps
+    # loading the OLD app (observed as "the new settings never appeared"
+    # while the container demonstrably ran the new code). The hashed
+    # /assets/* files stay long-cacheable; it's only the entry points that
+    # must always revalidate.
+    _NO_STORE = "no-store, no-cache, must-revalidate, max-age=0"
+
     @app.get("/{path:path}")
     async def serve_spa(path: str):
         # Serve index.html for all non-API, non-asset routes (SPA routing)
         file_path = os.path.join(static_dir, path)
         if path and os.path.isfile(file_path):
-            return FileResponse(file_path)
+            resp = FileResponse(file_path)
+            # Root-level static files (sw.js, icons) are unhashed — same
+            # staleness trap as index.html.
+            resp.headers["Cache-Control"] = _NO_STORE
+            return resp
 
         # Inject site customisation (title, favicon) into index.html so
         # user settings persist visually across restarts without a flash.
@@ -1691,10 +1721,13 @@ if os.path.isdir(static_dir) and os.path.isdir(_assets_dir) and os.path.isfile(_
                         f'<link rel="icon" href="/api/site-uploads/{cfg["favicon"]}" />',
                         html,
                     )
-                return Response(content=html, media_type="text/html")
+                return Response(content=html, media_type="text/html",
+                                headers={"Cache-Control": _NO_STORE})
         except Exception:
             pass
-        return FileResponse(index_path)
+        resp = FileResponse(index_path)
+        resp.headers["Cache-Control"] = _NO_STORE
+        return resp
 else:
     if os.path.isdir(static_dir):
         logger.warning(

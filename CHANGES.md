@@ -1,3 +1,35 @@
+# ClipAI — Deployed updates now actually reach the browser (stale-UI fix)
+
+"The Concurrent Analyses setting never appeared / the app isn't updating."
+The container WAS running the new code (it built and served the very
+Companion installers that updated the desktop app) — but ``index.html`` was
+served with NO ``Cache-Control`` header, so the browser heuristically cached
+the app shell and kept loading the OLD hashed bundle after every container
+update. Hard refresh fixed it — but nothing ever said so. Three-part fix:
+
+- **The app shell is never cached.** ``index.html`` (all serve paths,
+  including the title/favicon-customised one) and root-level static files
+  (``sw.js``, icons) are now served ``no-store``; the hashed ``/assets/*``
+  bundles stay long-cacheable, so page loads are as fast as before — the
+  browser just always re-checks WHICH bundle is current.
+- **``GET /api/server-build``** returns the running container's git sha +
+  commit subject — the ground truth for "did my update take effect?"
+  (``curl http://<server>:1353/api/server-build``).
+- **A stale tab tells you.** New ``UpdateNudge`` banner (mounted in Layout,
+  every page): every 5 minutes and on window focus it fetches a fresh
+  ``index.html`` (``no-store``), compares the hashed bundle it references
+  against the one this tab is running, and on mismatch shows "ClipAI was
+  updated on the server — Reload now". Covers tabs left open across
+  updates AND browsers that cached the shell before this fix shipped.
+- Verified: 3 new UpdateNudge tests (hidden on match, banner + reload button
+  on mismatch, quiet when the check can't reach the server) — 163 frontend
+  tests, production build green; ``backend/main.py`` compile-checked (the
+  container-only imports aren't installable in CI here).
+- One-time note: the first deploy of this fix still needs one manual hard
+  refresh (Ctrl+Shift+R) — the old cached shell predates the banner.
+
+---
+
 # ClipAI — Bulk import rides out Companion outages; whisper stops thrashing models
 
 Diagnosed from two Companion diagnostics reports. The observed "bulk import

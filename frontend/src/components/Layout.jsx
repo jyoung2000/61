@@ -3,6 +3,7 @@ import { Link, useLocation, useNavigate } from 'react-router-dom';
 import { showToast } from './Toast';
 import ProviderStatus from './ProviderStatus';
 import ConnectionStatus from './ConnectionStatus';
+import UpdateNudge from './UpdateNudge';
 import UserMenu from './UserMenu';
 import useResponsive from '../hooks/useResponsive';
 import useTheme from '../hooks/useTheme';
@@ -233,6 +234,8 @@ export default function Layout({ children }) {
 
   return (
     <div style={{ display: 'flex', minHeight: '100vh', flexDirection: isMobile ? 'column' : 'row' }}>
+      {/* Banner when the server is serving a newer UI than this tab runs */}
+      <UpdateNudge />
       {/* ═══ Desktop Sidebar ═══ */}
       <aside
         className="desktop-sidebar"
