@@ -993,6 +993,49 @@ class RemoteWhisperEngine:
         audio_min = len(wav_bytes) / 32000.0 / 60.0
         return max(base, min(cap, base + audio_min * per_min))
 
+    # Keepalive tick. Comfortably under PIPELINE_STALL_MINUTES (60 min) and
+    # cheap; module-level so tests can shorten it.
+    _KEEPALIVE_TICK_S = 30.0
+
+    @staticmethod
+    def _start_transcribe_keepalive(payload_bytes: int):
+        """Keep the job's heartbeat alive (and its label honest) while the
+        blocking transcription request runs. Returns a stop() callable.
+
+        Runs on a daemon thread because ``_post_wav`` is synchronous: it ticks
+        every 30 s, re-labelling the keepalive with the elapsed minutes so the
+        UI says what is actually happening, and — critically — refreshing the
+        stall watchdog's progress clock so a legitimately long decode is not
+        mistaken for a wedged run."""
+        stop = threading.Event()
+        try:
+            from backend.services.request_context import current_job_id
+            job_id = current_job_id()
+        except Exception:
+            job_id = ""
+        if not job_id:
+            return lambda: None
+        audio_min = payload_bytes / 32000.0 / 60.0
+
+        def _tick():
+            t0 = _time.monotonic()
+            while not stop.wait(RemoteWhisperClient._KEEPALIVE_TICK_S):
+                mins = int((_time.monotonic() - t0) / 60)
+                try:
+                    from backend.services.pipeline import set_heartbeat_stage
+                    set_heartbeat_stage(
+                        job_id,
+                        f"transcribing on the Companion GPU "
+                        f"({audio_min:.0f} min audio, {mins}m elapsed)")
+                except Exception:
+                    return
+
+        threading.Thread(target=_tick, name="whisper-keepalive", daemon=True).start()
+
+        def _stop():
+            stop.set()
+        return _stop
+
     def _headers(self) -> dict:
         headers = {}
         if self.api_key:
@@ -1016,6 +1059,20 @@ class RemoteWhisperEngine:
         "Too much data for declared Content-Length" failure). Returns
         (ok, payload, retryable, detail, retry_after_s)."""
         import httpx
+        # This single request is the LONGEST step in the pipeline and emits no
+        # progress of its own: full large-v3 at beam 5 decodes at ~0.5-0.7×RT
+        # (see _timeout_for), so 150 min of audio is 75-105 min inside this
+        # one call. Two things break without a keepalive:
+        #   * the UI freezes on whatever stage label preceded it — observed as
+        #     "Releasing face detection models — freeing GPU for Whisper…"
+        #     sitting there for an hour while transcription was really running;
+        #   * the pipeline STALL WATCHDOG (PIPELINE_STALL_MINUTES, default 60)
+        #     sees no progress, declares the run wedged, cancels it and
+        #     resumes from checkpoint — which restarts this same decode, stalls
+        #     again, and burns all the resume attempts before failing. A remote
+        #     HTTP call already has its own timeout, so keeping the heartbeat
+        #     alive here cannot mask a genuinely hung run.
+        keepalive = self._start_transcribe_keepalive(len(wav_bytes))
         try:
             files = {"file": (filename, wav_bytes, "audio/wav")}
             resp = httpx.post(
@@ -1024,6 +1081,8 @@ class RemoteWhisperEngine:
                 timeout=timeout_s if timeout_s else self.TIMEOUT_S)
         except Exception as e:  # network / connection reset / timeout
             return (False, None, True, f"{type(e).__name__}: {str(e)[:120]}", 0.0)
+        finally:
+            keepalive()
         if resp.status_code == 200:
             try:
                 _body = resp.json()

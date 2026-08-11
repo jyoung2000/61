@@ -7,6 +7,7 @@ whose face loop went silent for 13+ minutes on a corrupt file while the job
 looked alive)."""
 
 import asyncio
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -198,3 +199,63 @@ def test_abort_analysis_ignores_an_already_finished_task():
     assert P.abort_analysis("job-2") is False
     assert t.cancel_calls == 0
     P._cancel_events.pop("job-2", None)
+
+
+# ── Long remote transcription must not read as a stalled run ────────────────
+
+def _ra():
+    """reframer_audio, skipped where its native deps aren't installed."""
+    pytest.importorskip("cv2")
+    import backend.services.reframer_audio as RA
+    return RA
+
+
+def test_remote_whisper_keepalive_touches_the_stall_clock(monkeypatch):
+    """The single transcription POST is the longest step in the pipeline and
+    emits no progress of its own: full large-v3 at beam 5 decodes at ~0.5-0.7×
+    realtime, so 150 min of audio sits inside ONE call for 75-105 minutes.
+    With PIPELINE_STALL_MINUTES=60 and no keepalive the watchdog declared the
+    run wedged, cancelled it, and resumed from checkpoint — restarting the
+    same decode, stalling again, and burning every resume attempt."""
+    RA = _ra()
+    from backend.services import request_context as RC
+
+    touches = []
+    monkeypatch.setattr(P, "set_heartbeat_stage",
+                        lambda jid, stage: touches.append((jid, stage)))
+    monkeypatch.setattr(RA.RemoteWhisperClient, "_KEEPALIVE_TICK_S", 0.02)
+    RC.set_job("job-x", "video.mp4")
+    try:
+        payload = 150 * 60 * 32000          # 150 min of 16 kHz mono s16 PCM
+        stop = RA.RemoteWhisperClient._start_transcribe_keepalive(payload)
+        deadline = time.monotonic() + 3.0
+        while not touches and time.monotonic() < deadline:
+            time.sleep(0.02)
+        stop()
+    finally:
+        RC.clear()
+
+    assert touches, "the stall clock must be refreshed while the request runs"
+    job_id, stage = touches[0]
+    assert job_id == "job-x"
+    # The label names the REAL work, so the UI can never freeze on the
+    # PREVIOUS stage's text ("Releasing face detection models…") for an hour.
+    assert "transcribing on the Companion GPU" in stage
+    assert "150 min audio" in stage
+
+
+def test_keepalive_is_a_noop_without_a_job_context(monkeypatch):
+    """Outside a pipeline run (ad-hoc transcription, tests) there is no job to
+    keep alive — no thread, no touches, no raise."""
+    RA = _ra()
+    from backend.services import request_context as RC
+
+    touches = []
+    monkeypatch.setattr(P, "set_heartbeat_stage",
+                        lambda jid, stage: touches.append(jid))
+    monkeypatch.setattr(RA.RemoteWhisperClient, "_KEEPALIVE_TICK_S", 0.02)
+    RC.clear()
+    stop = RA.RemoteWhisperClient._start_transcribe_keepalive(32000 * 60)
+    time.sleep(0.1)
+    stop()
+    assert touches == []

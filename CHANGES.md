@@ -1,3 +1,49 @@
+# ClipAI — The long transcription no longer looks stuck (and can't be killed as "stalled")
+
+Reported as "why is it taking forever to release the GPU?". The GPU release had
+already finished — the UI was frozen on the stage message that preceded the
+real work. Reconstructed from a container log and the Companion's diagnostics
+export taken at the same instant:
+
+- 03:28:19 face detection + remote transcription start together
+- 03:31:47 `Remote Whisper upload: 275.3 MB (150 min audio)` — one POST
+- 03:31:48 → 03:44:42 the Companion's own feed shows that request still in
+  flight at **12m54s**, decoding on **full large-v3, beam 5** (its quality
+  profile is "max", which upgrades the requested large-v3-turbo)
+- in between: not one progress line — only health polls
+
+Two defects, one cause — the pipeline's single longest step emits no progress:
+
+- **The stage label froze.** "Releasing face detection models — freeing GPU for
+  Whisper…" is simply the last message set before the request, and it stays up
+  for the entire decode. At this repo's own documented rate (~0.5-0.7× realtime
+  for large-v3 beam-5, see `_timeout_for`), 150 min of audio is **75-105
+  minutes** of that message sitting there.
+- **The stall watchdog would have killed it.** `PIPELINE_STALL_MINUTES` is 60.
+  A decode that legitimately runs 75-105 minutes with no progress touch gets
+  declared wedged, cancelled, and resumed from checkpoint — which restarts the
+  same decode, stalls again, and burns every resume attempt before failing. Any
+  video over ~2 hours at max quality was on a path to fail after hours of GPU
+  time.
+
+Fix: `_post_wav` now runs a keepalive for the life of the request (daemon
+thread, 30 s tick) that re-labels the heartbeat *and* refreshes the stall
+watchdog's progress clock — "transcribing on the Companion GPU (150 min audio,
+23m elapsed)". A remote HTTP call already carries its own timeout, so keeping
+the heartbeat alive here cannot mask a genuinely hung run.
+
+Speed note (no code change): the Companion's transcription quality of "max"
+forces full large-v3 at beam 5, the slowest configuration it offers. Setting it
+to "balanced" keeps large-v3-turbo (~0.25× realtime by the same table) and cuts
+this step to roughly a third.
+
+- Verified: 2 new tests (the keepalive really touches the stall clock with the
+  right label under a job context; a no-op without one). They skip where cv2
+  isn't installed and run in the container. 46 backend tests green across the
+  touched suites.
+
+---
+
 # ClipAI — Settings tabs sync with the URL (three defects behind "the setting is missing")
 
 An adversarial verification pass (three independent lenses on the render path,
