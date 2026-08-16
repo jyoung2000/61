@@ -201,6 +201,131 @@ def test_abort_analysis_ignores_an_already_finished_task():
     P._cancel_events.pop("job-2", None)
 
 
+def test_abort_analysis_clears_lingering_stall_flags():
+    """A stall verdict whose task.cancel() never landed (the run finished at
+    that exact moment) leaves its pending flag behind. Without clearing it, a
+    later user cancel of the SAME job would hit the revive branch and
+    resurrect the job the user just cancelled."""
+    P._user_abort_pending.clear()
+    task = _FakeTask()
+    P._run_tasks["job-9"] = task
+    P._stall_revive_pending.add("job-9")
+    P._stall_fail_pending.add("job-9")
+
+    assert P.abort_analysis("job-9") is True
+    assert "job-9" not in P._stall_revive_pending, "user intent outranks a stall verdict"
+    assert "job-9" not in P._stall_fail_pending
+    assert "job-9" in P._user_abort_pending
+    P._user_abort_pending.clear()
+    P._cancel_events.pop("job-9", None)
+
+
+# ── has_live_run: the revive guard's in-process ownership signal ────────────
+
+def test_has_live_run_covers_the_gate_wait():
+    """A run registers its cancel event BEFORE waiting on the concurrency
+    gate and its heartbeat only once admitted — has_live_run must be True in
+    BOTH windows, because the gate wait writes no heartbeat and would
+    otherwise read as a dead job to the staleness-based revive (which then
+    spawns a second concurrent run of the same job)."""
+    assert not P.has_live_run("g1")
+    # Window 1: queued behind the gate — only the cancel event exists.
+    P._cancel_events["g1"] = asyncio.Event()
+    assert P.has_live_run("g1")
+    P._cancel_events.pop("g1")
+    assert not P.has_live_run("g1")
+    # Window 2: admitted — the heartbeat is registered.
+    P._heartbeats["g1"] = object()
+    assert P.has_live_run("g1")
+    P._heartbeats.pop("g1")
+    assert not P.has_live_run("g1")
+
+
+def test_spawn_analysis_holds_a_strong_reference(monkeypatch):
+    """asyncio only weakly references bare create_task results — an
+    unreferenced analysis task can be garbage-collected mid-run. Every
+    fire-and-forget spawn (stall revive, Companion import) must ride
+    spawn_analysis, which anchors the task until it finishes."""
+    ran = []
+
+    async def stub(job_id, resume=False):
+        ran.append((job_id, resume))
+    monkeypatch.setattr(P, "run_analysis", stub)
+
+    async def main():
+        t = P.spawn_analysis("jz", resume=True)
+        assert t in P._BACKGROUND_TASKS, "the task must be strongly referenced"
+        await t
+        await asyncio.sleep(0)          # let the done-callback run
+        assert t not in P._BACKGROUND_TASKS, "and released once done"
+    asyncio.run(main())
+    assert ran == [("jz", True)]
+
+
+# ── End-to-end: user abort vs a lingering stall-revive flag ─────────────────
+
+def test_user_abort_outranks_a_lingering_revive_flag(monkeypatch):
+    """Full run_analysis pass with the inner pipeline hung: the user's hard
+    cancel must land the job on CANCELLED — never on the revive branch, even
+    when a stale _stall_revive_pending flag is present — and the finally
+    cleanup must leave no registry entries or pending flags behind."""
+    from types import SimpleNamespace as NS
+
+    writes, spawned = [], []
+
+    async def upd(jid, **kw):
+        writes.append((jid, kw))
+
+    async def load(jid):
+        return NS(owner_user_id="", filename="v.mp4")
+
+    async def noop(*a, **kw):
+        pass
+
+    old_gate = P._analysis_semaphore
+    P._analysis_semaphore = None
+    monkeypatch.setattr(P.database, "update_job_status", upd)
+    monkeypatch.setattr(P.database, "load_job", load)
+    monkeypatch.setattr(P, "_update_progress", noop)
+    monkeypatch.setattr(P, "broadcast_ws", noop)
+    monkeypatch.setattr(P, "_warm_seo_intelligence", lambda jid: None)
+    monkeypatch.setattr(P, "spawn_analysis",
+                        lambda jid, resume=False: spawned.append((jid, resume)))
+    import backend.services.companion_models as CM
+    import backend.services.companion_version as CV
+    import backend.services.companion_progress as CP
+    monkeypatch.setattr(CM, "ensure_companion_models", lambda jid: None)
+    monkeypatch.setattr(CV, "check_companion_version", lambda jid: None)
+    monkeypatch.setattr(CP, "job_ended", lambda jid: None)
+
+    async def main():
+        started = asyncio.Event()
+
+        async def hang_inner(job_id, resume=False):
+            started.set()
+            await asyncio.Event().wait()        # wedged forever
+        monkeypatch.setattr(P, "_run_analysis_inner", hang_inner)
+
+        task = asyncio.create_task(P.run_analysis("jx"))
+        await asyncio.wait_for(started.wait(), 5)
+        assert P.has_live_run("jx")
+        # The lingering flag from a stall verdict whose cancel never landed:
+        P._stall_revive_pending.add("jx")
+        assert P.abort_analysis("jx") is True
+        await asyncio.wait_for(task, 5)
+    try:
+        asyncio.run(main())
+    finally:
+        P._analysis_semaphore = old_gate
+
+    final_status = [kw for _, kw in writes if "status" in kw][-1]
+    assert final_status["status"] == P.JobStatus.CANCELLED
+    assert spawned == [], "a user cancel must never be turned into a resume"
+    assert "jx" not in P._stall_revive_pending
+    assert "jx" not in P._user_abort_pending
+    assert not P.has_live_run("jx"), "finally-cleanup must clear every registry"
+
+
 # ── Long remote transcription must not read as a stalled run ────────────────
 
 def _ra():

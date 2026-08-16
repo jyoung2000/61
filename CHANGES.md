@@ -1,3 +1,70 @@
+# ClipAI — Checkpoint & recovery audit: no more double-runs, lost resumes, or resurrected cancels
+
+Deep audit of the job checkpoint/recovery machinery (engine + stage
+checkpoints, startup auto-resume, mid-session revive, stall watchdog, bulk
+adoption). The save/load/signature layer came out clean — every defect found
+was in the RECOVERY orchestration, and all are fixed:
+
+**Fixed: the revive could start a second concurrent run of a queued job.**
+A run waiting for a Concurrent Analyses slot writes no heartbeat (the
+heartbeat starts once the gate admits it), so a job queued behind a
+90-minute video looked DEAD to the 15-minute staleness revive — which then
+re-queued it and started a second `run_analysis` for the same job. At
+concurrency ≥ 2 both runs execute at once on the same job directory,
+trampling each other's frames/audio; at concurrency 1 the job silently ran
+twice. New `pipeline.has_live_run()` (cancel-event registered before the
+gate wait + heartbeat once admitted) now guards every reconcile/revive pass:
+a job this process owns is never completed, failed, or re-queued out from
+under itself.
+
+**Fixed: the auto-resume drainer re-ran cancelled/deleted jobs.** Queued
+resumes execute up to 30 s + N runs later. If the user cancelled or deleted
+the job in between, the drainer still ran it — and `run_analysis`'s
+deliberate terminal-state reset flipped the CANCELLED job back to QUEUED and
+re-analyzed it. The drainer now re-checks at drain time and skips jobs that
+are gone, already terminal, or already running.
+
+**Fixed: a lingering stall verdict could resurrect a job the user
+cancelled.** When the watchdog's `task.cancel()` raced a run that finished
+at that exact moment, its `_stall_revive_pending` flag was never consumed.
+The next user cancel of that job hit the revive branch first — recording it
+QUEUED and scheduling a RESUME of the job the user just cancelled. Three
+layers now prevent this: the CancelledError handler checks the user-abort
+flag FIRST (user intent outranks any stall verdict), `abort_analysis`
+clears both stall flags, and `run_analysis`'s finally discards all pending
+flags so nothing can linger into the next run.
+
+**Fixed: fire-and-forget analysis tasks could be garbage-collected
+mid-run.** asyncio holds only weak references to bare `create_task`
+results. The stall-revive respawn, the single Companion import's analysis
+start, and the import downloader task were all unreferenced — any of them
+could vanish silently between stages, which reads as "the job just stopped".
+New `pipeline.spawn_analysis()` anchors every fire-and-forget analysis task
+until it finishes (same pattern for the import downloader).
+
+**Hardened: a dying run can no longer strip its successor's wiring.** The
+finally-cleanup popped `_cancel_events` / `_heartbeats` / `_run_tasks` by
+job id alone; a stall-revived successor registers while the old run is
+still unwinding, so the old cleanup could remove the NEW run's entries
+(breaking its cancel button and watchdog). Every pop is now
+identity-guarded — a run only removes its own registrations.
+
+**Verified clean (no change needed):** atomic checkpoint writes with
+meta-last ordering + verify-after-save; signature gating on source SHA /
+language / fps / vocal-sep / planner fingerprint / ASR model; fresh runs
+clearing ALL checkpoints (engine + translation) while resume keeps them;
+the shared engine-cache only consulted on resume; translation stage
+checkpoint keyed on the exact deduped cue hash (deterministic across
+resumes); `resume_attempts` reset on completion and on user re-analyze;
+bulk adoption following a revived job instead of re-importing it; startup
+passes completing finished work before resuming the rest.
+
+Tests: 4 new in `test_pipeline_stall_watchdog.py` — has_live_run covers the
+gate wait, spawn_analysis holds a strong reference, abort clears lingering
+stall flags, and an end-to-end run proving a user abort beats a lingering
+revive flag and leaves no registry residue. Full backend suite: identical
+pass/fail set to the pre-change baseline (no regressions).
+
 # ClipAI — Settings streamlined: no duplicates, one owner per setting, two real gaps filled
 
 Implements the settings-audit recommendations: every control changes exactly

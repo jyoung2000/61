@@ -1112,6 +1112,10 @@ class CompanionImportRequest(BaseModel):
 # import_id. The browser polls /companion-files/import-progress to drive a real
 # progress bar (video files can be many hundreds of MB over the LAN).
 _import_progress: dict = {}
+# Strong references to in-flight import downloader tasks — asyncio only weakly
+# references bare create_task results, so an unreferenced download task could
+# be garbage-collected mid-transfer and strand the import at "downloading".
+_import_tasks: set = set()
 
 
 async def _post_import_hb(base: str, token: str, job_id: str, title: str, stage: str, pct: int):
@@ -1480,16 +1484,21 @@ async def companion_file_import(req: CompanionImportRequest):
                 # START the analysis pipeline — saving a QUEUED job does NOT
                 # enqueue it (uploads call run_analysis explicitly); without this
                 # the imported video sits at "waiting for analysis" forever.
+                # spawn_analysis holds a strong reference to the task — a bare
+                # create_task is only weakly referenced by the loop and can be
+                # garbage-collected mid-run, silently killing the analysis.
                 try:
-                    from backend.services.pipeline import run_analysis
-                    asyncio.create_task(run_analysis(job_id))
+                    from backend.services.pipeline import spawn_analysis
+                    spawn_analysis(job_id)
                 except Exception as _an_err:
                     logger.error("Imported job %s: failed to start analysis: %s", job_id, _an_err)
             except Exception as e:
                 _sh.rmtree(job_dir, ignore_errors=True)
                 _import_progress[import_id].update({"status": "error", "error": str(e)[:200]})
 
-        asyncio.create_task(_bg_import())
+        _bg_task = asyncio.create_task(_bg_import())
+        _import_tasks.add(_bg_task)
+        _bg_task.add_done_callback(_import_tasks.discard)
         return {"ok": True, "kind": "video", "import_id": import_id,
                 "job_id": job_id, "filename": filename}
 

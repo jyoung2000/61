@@ -2095,6 +2095,33 @@ def is_job_analyzing(job_id: str) -> bool:
     with the live offline pipeline (which is what stalled the preview player)."""
     return job_id in _heartbeats
 
+
+def has_live_run(job_id: str) -> bool:
+    """True while THIS process has a ``run_analysis`` task for the job — from
+    the moment the run registers its cancel event (BEFORE it waits on the
+    concurrency gate) until its ``finally`` cleanup.
+
+    The gate wait is the crucial difference from :func:`is_job_analyzing`:
+    a queued run writes no heartbeat while it waits for a slot (the heartbeat
+    only starts once the gate admits it), so a job stuck behind a 90-minute
+    video looks DEAD to the staleness-based revive after 15 minutes. The
+    revive must consult this instead of spawning a second, concurrent run of
+    the same job (same job dir, same frames — they'd trample each other)."""
+    return job_id in _cancel_events or job_id in _heartbeats
+
+
+def spawn_analysis(job_id: str, *, resume: bool = False) -> asyncio.Task:
+    """Start ``run_analysis`` as a fire-and-forget task the event loop can't
+    garbage-collect mid-run — asyncio holds only WEAK references to bare
+    ``create_task`` results, so an unreferenced analysis task can vanish
+    silently between stages. Every fire-and-forget analysis spawn must come
+    through here."""
+    task = asyncio.get_running_loop().create_task(
+        run_analysis(job_id, resume=resume))
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+    return task
+
 # Strong references to in-flight background tasks so the asyncio loop
 # doesn't garbage-collect them mid-flight (transcript polish + subtitle
 # translation, scheduled after analysis completes).
@@ -2214,7 +2241,11 @@ def abort_analysis(job_id: str) -> bool:
     ev.set()
     # Tell the CancelledError handler this kill is a user abort, so the job
     # is recorded CANCELLED rather than re-raising (which would leave the row
-    # stuck on PROCESSING with no runner behind it).
+    # stuck on PROCESSING with no runner behind it). User intent also outranks
+    # any in-flight (or lingering) stall verdict: without these discards a
+    # stale revive flag would RESURRECT the job the user just cancelled.
+    _stall_revive_pending.discard(job_id)
+    _stall_fail_pending.discard(job_id)
     _user_abort_pending.add(job_id)
     task.cancel()
     logger.info("[%s] analysis aborted by user (hard cancel)", job_id)
@@ -6128,8 +6159,11 @@ async def run_analysis(job_id: str, resume: bool = False):
     # Clear any stale finalization gate from a previous run so this run's
     # progress writes (and the QUEUED reset below) aren't suppressed.
     _finalizing_jobs.discard(job_id)
-    # Set up cancellation event for this job
-    _cancel_events[job_id] = asyncio.Event()
+    # Set up cancellation event for this job. Keep a handle on THIS run's
+    # event so the finally-cleanup only pops its own registration — a revived
+    # run registers its event while the dying run is still unwinding, and an
+    # unguarded pop would strip the NEW run's cancel wiring.
+    _my_cancel_event = _cancel_events[job_id] = asyncio.Event()
     sem = get_semaphore()
 
     # Warm today's SEO intelligence in the background, alongside everything
@@ -6212,34 +6246,13 @@ async def run_analysis(job_id: str, resume: bool = False):
             # stall watchdog killing a WEDGED run, or an external task
             # cancellation (e.g. server shutdown), which must keep
             # propagating.
-            if job_id in _stall_revive_pending:
-                # The watchdog already requeued the job — start the resume
-                # now. The new task blocks on the pipeline semaphore until
-                # this run's `async with sem` exits, so runs never overlap.
-                # The wedged worker thread is abandoned (nothing can kill a
-                # thread stuck in native code) but the pipeline, its
-                # semaphore, and the job all move on.
-                _stall_revive_pending.discard(job_id)
-                logger.warning(
-                    "[%s] stalled run cancelled — scheduling checkpoint "
-                    "resume", job_id)
-                asyncio.create_task(run_analysis(job_id, resume=True))
-            elif job_id in _stall_fail_pending:
-                # Watchdog already marked the job FAILED with the stall
-                # message — don't overwrite it with "Cancelled by user".
-                _stall_fail_pending.discard(job_id)
-                try:
-                    await broadcast_ws(job_id, {
-                        "type": "error",
-                        "message": "Analysis stalled and was stopped",
-                    })
-                except Exception:
-                    pass
-            elif job_id in _user_abort_pending:
+            if job_id in _user_abort_pending:
                 # User abort (Cancel import): record the job CANCELLED — a
                 # bare re-raise would leave it PROCESSING forever with no
                 # task behind it, and the bulk runner waiting on a status
-                # that can never become terminal.
+                # that can never become terminal. Checked FIRST: user intent
+                # outranks a concurrent stall verdict, so a job the user
+                # cancelled is never resurrected by the revive branch.
                 _user_abort_pending.discard(job_id)
                 logger.info("[%s] cancelled by user (aborted mid-stage)", job_id)
                 await database.update_job_status(
@@ -6251,6 +6264,32 @@ async def run_analysis(job_id: str, resume: bool = False):
                     await broadcast_ws(job_id, {
                         "type": "cancelled",
                         "message": "Job cancelled by user",
+                    })
+                except Exception:
+                    pass
+            elif job_id in _stall_revive_pending:
+                # The watchdog already requeued the job — start the resume
+                # now. The new task blocks on the pipeline semaphore until
+                # this run's `async with sem` exits, so runs never overlap.
+                # The wedged worker thread is abandoned (nothing can kill a
+                # thread stuck in native code) but the pipeline, its
+                # semaphore, and the job all move on. spawn_analysis holds a
+                # strong reference — a bare create_task is only weakly
+                # referenced by the loop and can be GC'd mid-run, silently
+                # killing the revived run.
+                _stall_revive_pending.discard(job_id)
+                logger.warning(
+                    "[%s] stalled run cancelled — scheduling checkpoint "
+                    "resume", job_id)
+                spawn_analysis(job_id, resume=True)
+            elif job_id in _stall_fail_pending:
+                # Watchdog already marked the job FAILED with the stall
+                # message — don't overwrite it with "Cancelled by user".
+                _stall_fail_pending.discard(job_id)
+                try:
+                    await broadcast_ws(job_id, {
+                        "type": "error",
+                        "message": "Analysis stalled and was stopped",
                     })
                 except Exception:
                     pass
@@ -6285,11 +6324,24 @@ async def run_analysis(job_id: str, resume: bool = False):
                 "message": f"Analysis failed: {str(e)}",
             })
         finally:
-            # Stop heartbeat and clean up
+            # Stop heartbeat and clean up. Every registry pop is guarded to
+            # only remove THIS run's own entry: a stall-revived successor
+            # starts registering while this run is still unwinding, and an
+            # unguarded pop would strip the new run's wiring instead.
             hb.stop()
-            _heartbeats.pop(job_id, None)
-            _run_tasks.pop(job_id, None)
-            _cancel_events.pop(job_id, None)
+            if _heartbeats.get(job_id) is hb:
+                _heartbeats.pop(job_id, None)
+            if _run_tasks.get(job_id) is _cur_task:
+                _run_tasks.pop(job_id, None)
+            if _cancel_events.get(job_id) is _my_cancel_event:
+                _cancel_events.pop(job_id, None)
+            # Any pending-verdict flag still standing here is stale — every
+            # branch that acts on one consumed it above, and a leftover flag
+            # would corrupt the NEXT run's cancellation handling (e.g. a
+            # lingering revive flag turning a user cancel into a resume).
+            _stall_revive_pending.discard(job_id)
+            _stall_fail_pending.discard(job_id)
+            _user_abort_pending.discard(job_id)
             _finalizing_jobs.discard(job_id)
             _last_scalar_progress.pop(job_id, None)
             try:

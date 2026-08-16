@@ -764,6 +764,21 @@ from backend.services.job_liveness import (  # noqa: E402
 )
 
 
+def _has_live_run(job_id: str) -> bool:
+    """Whether THIS process already has a ``run_analysis`` task for the job —
+    including one still WAITING on the concurrency gate. The gate wait writes
+    no heartbeat (the heartbeat starts once a slot is acquired), so a job
+    queued behind a 90-minute video goes 'stale' by the liveness math while
+    being perfectly owned; re-queuing it would spawn a second concurrent run
+    of the same job (same job dir — the runs trample each other). Fail-closed
+    to False when the pipeline stack isn't importable."""
+    try:
+        from backend.services.pipeline import has_live_run
+        return has_live_run(job_id)
+    except Exception:
+        return False
+
+
 def _has_complete_results(job) -> bool:
     """Whether a non-terminal job has results complete enough to mark COMPLETE
     (vs. needing a resume to finish).
@@ -821,6 +836,11 @@ async def _recover_stale_jobs(
     for job in await _db.list_jobs(include_unowned=True, light=True):
         if job.status not in _NON_TERMINAL_STATUSES:
             continue
+        # A run this process owns — running OR waiting for a gate slot — is
+        # never completed/failed out from under itself. (No-op at startup:
+        # the registries are empty in a fresh process.)
+        if _has_live_run(job.job_id):
+            continue
         # A mid-export crash leaves the full clip LIST but only some MP4s — treat
         # that as "needs resume", not "complete" (see _has_complete_results).
         has_results = _has_complete_results(job)
@@ -871,6 +891,12 @@ async def _resume_stale_jobs(stale_s: float) -> tuple[int, int]:
         if _has_complete_results(job):
             continue  # the complete-branch of _recover_stale_jobs owns these
         if not _is_stale(job, stale_s):
+            continue
+        if _has_live_run(job.job_id):
+            # This process already owns a run for the job — most commonly one
+            # QUEUED behind the concurrency gate, which writes no heartbeat
+            # while it waits and so LOOKS dead. Re-queuing it here would start
+            # a second concurrent run of the same job.
             continue
         if job.job_id in _resume_queue:
             continue  # already queued — don't double-bump the attempt counter
@@ -974,9 +1000,30 @@ async def _drain_resume_queue() -> None:
         # Let the GPU/Whisper preload + model warmup + auth/settings seeding
         # finish so the resumed pipeline sees a ready system.
         await asyncio.sleep(delay)
+    import backend.database as _db
     while _resume_queue:
         jid = _resume_queue.pop(0)
         try:
+            # Re-check at DRAIN time: every revive path set the job QUEUED
+            # when it scheduled it, so a terminal status now means something
+            # intervened (user cancel/delete, a reconcile verdict) — running
+            # anyway would flip that terminal state back to QUEUED
+            # (run_analysis's deliberate protect_terminal=False reset) and
+            # re-analyze a job nobody wants run.
+            job = await _db.load_job(jid)
+            if job is None:
+                logger.info("Auto-resume: skipping %s — deleted since it was queued", jid)
+                continue
+            status = str(getattr(job.status, "value", job.status) or "")
+            if status in _TERMINAL_STATUSES:
+                logger.info(
+                    "Auto-resume: skipping %s — already %s since it was queued",
+                    jid, status)
+                continue
+            if _has_live_run(jid):
+                logger.info(
+                    "Auto-resume: skipping %s — a run is already active", jid)
+                continue
             logger.info("Auto-resume: starting deferred run for %s", jid)
             # resume=True: this job was interrupted mid-analysis, so reuse its
             # saved checkpoint (detection + transcription) to continue where it
@@ -1004,6 +1051,8 @@ async def _auto_resume_interrupted_jobs() -> tuple[int, int]:
     for job in await _db.list_jobs(include_unowned=True, light=True):
         if job.status not in _NON_TERMINAL_STATUSES:
             continue
+        if _has_live_run(job.job_id):
+            continue  # a live run owns it (no-op in a fresh process)
         # Same gate as Pass 1: a job that died mid-export (full clip list but
         # missing MP4s) is NOT complete — fall through and re-queue it so the
         # export finishes the clips it never reached.
