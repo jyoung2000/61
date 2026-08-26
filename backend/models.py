@@ -588,6 +588,10 @@ class ExportRequest(BaseModel):
     # overrode before exporting. Ground truth for reframe-grade calibration —
     # every manual pin is a place the auto-reframe wasn't good enough.
     manual_crop_overrides: int = 0
+    # Profanity censor: mask blocked words in burned subtitles + beep their
+    # audio window. None = follow the server default (CENSOR_ENABLED_DEFAULT);
+    # the export dialog always sends an explicit choice.
+    censor_enabled: Optional[bool] = None
 
 
 class FullVideoExportRequest(BaseModel):
@@ -623,6 +627,8 @@ class FullVideoExportRequest(BaseModel):
     pip_size_pct: float = 25.0
     hook_text: str = ""
     subject_keyframes: Optional[list[dict]] = None  # Frontend-computed [{time, x}] for export crop parity
+    # Profanity censor — same contract as ExportRequest.censor_enabled.
+    censor_enabled: Optional[bool] = None
 
 
 class UpdateClipTitleRequest(BaseModel):

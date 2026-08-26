@@ -6222,6 +6222,8 @@ async def export_clip(
     layout_timeline_data: list | None = None,
     hook_text: str = "",
     frontend_subject_keyframes: list[dict] | None = None,
+    censor_enabled: bool = False,
+    censor_source_transcript: list | None = None,
 ) -> str:
     """Export a clip from video using FFmpeg.
 
@@ -6255,6 +6257,20 @@ async def export_clip(
     clip_dur = end - start
     output_dir = f"/data/outputs/{job_id}/clips"
     os.makedirs(output_dir, exist_ok=True)
+
+    # Profanity censor (audio half): snapshot the UNMASKED segments now —
+    # the subtitle block below rebinds ``transcript`` to a masked copy, and
+    # masked text no longer contains the words the beep scan looks for.
+    # ``censor_source_transcript`` (the source-language track) wins so beeps
+    # follow what is actually SPOKEN even when translated subs are burned;
+    # it also covers exports with subtitles disabled entirely.
+    _censor_beep_segments = None
+    if censor_enabled:
+        # Union of both tracks — overlapping hits merge into one beep, and a
+        # curse visible only in the burned track still gets covered.
+        _censor_beep_segments = (
+            list(censor_source_transcript or []) + list(transcript or [])
+        )
 
     # Quality tag for filename
     quality_tag = export_quality.upper() if export_quality else "1080P"
@@ -6507,6 +6523,17 @@ async def export_clip(
         # Generate ASS subtitle file if subtitles are enabled
         if subtitles_enabled and transcript:
             settings = subtitle_settings or {}
+            # Profanity censor (text half): mask blocked words in the cues —
+            # and their per-word karaoke entries — BEFORE ASS generation, so
+            # neither the burned line nor the active-word highlight can ever
+            # show the unmasked word. The audio half (beep) runs as a
+            # post-pass after encoding.
+            if censor_enabled:
+                from backend.services.censor import censor_segments
+                transcript, _n_masked = censor_segments(transcript)
+                if _n_masked:
+                    logger.info("Censor: masked %d word(s) in the subtitle "
+                                "track for clip %s", _n_masked, clip_id)
             transcript_segments = [
                 TranscriptSegment(**s) if isinstance(s, dict) else s
                 for s in transcript
@@ -8386,6 +8413,35 @@ async def export_clip(
             subtitles_enabled=subtitles_enabled,
             export_quality=export_quality,
         )
+
+        # ── Profanity censor (audio half): beep the blocked words ──
+        # A dedicated post-pass on the finished file — video stream-copied,
+        # audio muted + beeped per interval — so the main filter graph stays
+        # untouched. Intervals are found in SOURCE time (word timestamps or
+        # char-weight interpolation) and remapped through trim + speed into
+        # OUTPUT time. Failure RAISES: silently shipping uncensored audio
+        # after the user toggled the censor is not an acceptable export.
+        if censor_enabled and _censor_beep_segments:
+            from backend.services import censor as _censor
+            _abs_iv = _censor.profane_intervals(_censor_beep_segments, start, end)
+            if _abs_iv:
+                _out_iv = _censor.map_to_output_time(
+                    _abs_iv, start, end, speed=speed, segments=segments)
+                _sr = await _probe_audio_sample_rate(output_path)
+                if _out_iv and _sr is None:
+                    logger.warning(
+                        "Censor: %d interval(s) found but the export has no "
+                        "audio stream — nothing to beep", len(_out_iv))
+                elif _out_iv:
+                    await _notify(
+                        f"Censoring {len(_out_iv)} word(s) — beeping audio...")
+                    n = await _censor.apply_censor_beeps(
+                        output_path, _out_iv, sample_rate=_sr)
+                    logger.info("Censor: beeped %d interval(s) in clip %s",
+                                n, clip_id)
+            else:
+                logger.info("Censor: no blocked words in %.1f-%.1fs — audio "
+                            "unchanged", start, end)
 
         logger.info(f"Exported clip {clip_id} to {output_path}")
 

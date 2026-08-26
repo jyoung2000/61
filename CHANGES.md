@@ -1,3 +1,56 @@
+# ClipAI — Profanity censor: beep the curse, mask the subtitle
+
+New censor mode for exports from the video editor. Toggle "Censor
+profanity" in the Export dialog and every blocked word is masked in the
+burned subtitles — first and last letter kept ("shit" → "s**t") — and its
+audio window is muted under a beep.
+
+**How it works:**
+- The block list, the mask symbol, and the beep sound are configured in
+  Settings → Profanity Censor (on the Prompts & Quality tab, under Subtitle
+  Quality). A built-in list of common curse words + variants ships as the
+  default; edit the box for a custom list, clear it to restore the default.
+- Mask symbol is user-picked (*, #, @, !, •, █ or any custom symbol);
+  letters/digits are rejected — they'd leak into the mask.
+- The beep is a classic 1 kHz broadcast bleep by default, or upload any
+  short sound (mp3/wav/m4a/aac/ogg/flac, ≤5 MB) to play instead. One custom
+  sound at a time; deleting it falls back to the tone.
+- "Censor new exports by default" makes the Export-dialog toggle start ON.
+
+**Word timing:** word-level Whisper timestamps drive the beep window when
+present; cues without them interpolate the word's position by character
+weight. Windows get ±60 ms padding and adjacent hits merge into one beep.
+Beeps follow what is SPOKEN (the source-language track) even when a
+translated subtitle track is burned — and both tracks are scanned, so a
+curse visible only in the burned text is covered too.
+
+**Engineering shape:** the text half masks the transcript (cue text AND
+per-word karaoke entries, so the active-word highlight can't flash the raw
+word) right before ASS generation. The audio half is a dedicated ffmpeg
+post-pass on the finished export — video stream-copied, audio muted +
+beep-mixed per interval — so the 8,000-line main filter graph
+(crop/overlays/speed/subtitles) is never touched, and it works identically
+in the global-speed and per-segment-speed export paths. Intervals are
+remapped from source time through trim + global/per-segment speeds into
+output time with the same walk the duration math uses. A failed beep pass
+FAILS the export — silently shipping uncensored audio after the user
+toggled the censor is the one outcome this feature must never produce.
+Browser (client-side) export can't beep, so a censored export auto-routes
+to server export, like preserve-pitch already does.
+
+Endpoints: GET/POST /api/censor/settings, POST/DELETE /api/censor/sound.
+Both export endpoints (clip + full video) accept `censor_enabled`; absent =
+follow the Settings default. All four settings persist via
+user_settings.json (custom-list reset stored as a sentinel so clearing the
+list survives restarts too).
+
+Tests: 29 new in backend/tests/test_censor.py — masking (boundaries, case,
+CJK, symbols), interval detection (word-times, interpolation, merge,
+clamp), output-time mapping (global + per-segment speeds), ffmpeg command
+shape (mute expression, beep mixing, custom-sound looping), settings
+endpoints (roundtrip, validation, upload/delete), and the fail-loud
+contract. Frontend: 170 tests + build green.
+
 # ClipAI — Checkpoint & recovery audit: no more double-runs, lost resumes, or resurrected cancels
 
 Deep audit of the job checkpoint/recovery machinery (engine + stage

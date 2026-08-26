@@ -114,6 +114,9 @@ _PERSISTABLE_KEYS = [
     # container rebuilds just like the model picks above.
     "EDITORIAL_AI_PRIMARY_SPEC", "EDITORIAL_AI_FALLBACK_SPEC",
     "FFMPEG_PRESET", "FFMPEG_CRF", "FFMPEG_THREADS", "FFMPEG_FASTSTART",
+    # Profanity censor (block list, mask symbol, beep choice, default state).
+    "CENSOR_ENABLED_DEFAULT", "CENSOR_WORDS", "CENSOR_MASK_CHAR",
+    "CENSOR_BEEP_SOUND",
     # How many analysis pipelines may run at once (Settings > Advanced).
     "CONCURRENT_ANALYSES", "BULK_IMPORT_MIN_FREE_GB",
     "GPU_ACCELERATION_ENABLED", "GPU_VENDOR_OVERRIDE",
@@ -5888,6 +5891,124 @@ async def save_encoding_settings(req: SaveEncodingSettingsRequest):
         "threads": settings.FFMPEG_THREADS,
         "faststart": settings.FFMPEG_FASTSTART,
     }
+
+
+# ── Profanity censor (Settings > Profanity Censor + export toggle) ──────
+
+class SaveCensorSettingsRequest(BaseModel):
+    enabled_default: Optional[bool] = None
+    words: Optional[list[str]] = None      # [] / omitted list = built-in
+    mask_char: Optional[str] = None        # single symbol, e.g. * # @ !
+    sound: Optional[str] = None            # "beep" | "custom"
+
+
+def _censor_state() -> dict:
+    from backend.services import censor as _c
+    custom = _c.custom_sound_path()
+    return {
+        "enabled_default": bool(settings.CENSOR_ENABLED_DEFAULT),
+        "words": _c.censor_word_list(),
+        "using_default_words": str(
+            getattr(settings, "CENSOR_WORDS", "") or "").strip().lower()
+            in ("", "default"),
+        "default_words": list(_c.DEFAULT_CENSOR_WORDS),
+        "mask_char": _c.mask_char(),
+        "sound": str(getattr(settings, "CENSOR_BEEP_SOUND", "beep")),
+        "has_custom_sound": custom is not None,
+        "custom_sound_name": os.path.basename(custom) if custom else None,
+    }
+
+
+@router.get("/censor/settings")
+async def get_censor_settings():
+    """Current profanity-censor config: block list, mask symbol, beep sound,
+    and whether new exports censor by default."""
+    return _censor_state()
+
+
+@router.post("/censor/settings")
+async def save_censor_settings(req: SaveCensorSettingsRequest):
+    """Save the profanity-censor config. An empty words list resets to the
+    built-in default list (stored as the "default" sentinel so the reset
+    itself persists — the settings store drops empty strings)."""
+    env_path = _find_env_file()
+    if req.enabled_default is not None:
+        settings.CENSOR_ENABLED_DEFAULT = bool(req.enabled_default)
+        if env_path:
+            _upsert_env_var(env_path, "CENSOR_ENABLED_DEFAULT",
+                            str(bool(req.enabled_default)))
+    if req.words is not None:
+        cleaned = [w.strip().lower() for w in req.words if w and w.strip()]
+        # Cap entries + entry length so a pasted novel can't be stored.
+        cleaned = [w[:64] for w in cleaned[:500]]
+        settings.CENSOR_WORDS = ",".join(cleaned) if cleaned else "default"
+    if req.mask_char is not None:
+        ch = str(req.mask_char).strip()
+        # One visible symbol; letters/digits would leak into the mask.
+        if ch and not ch[0].isalnum():
+            settings.CENSOR_MASK_CHAR = ch[0]
+    if req.sound is not None and req.sound in ("beep", "custom"):
+        from backend.services import censor as _c
+        # "custom" only sticks when an uploaded file actually exists.
+        if req.sound == "beep" or _c.custom_sound_path():
+            settings.CENSOR_BEEP_SOUND = req.sound
+    _persist_user_settings()
+    return {"status": "saved", **_censor_state()}
+
+
+_CENSOR_SOUND_MAX_BYTES = 5 * 1024 * 1024
+
+
+@router.post("/censor/sound")
+async def upload_censor_sound(file: UploadFile = File(...)):
+    """Upload a custom censor sound (replaces the default beep tone)."""
+    from backend.services import censor as _c
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    if ext not in _c.CENSOR_SOUND_EXTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unsupported audio type {ext or '(none)'} — use one of "
+                   f"{', '.join(_c.CENSOR_SOUND_EXTS)}")
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="empty file")
+    if len(data) > _CENSOR_SOUND_MAX_BYTES:
+        raise HTTPException(status_code=400,
+                            detail="sound file too large (max 5 MB)")
+    os.makedirs(_c.CENSOR_SOUND_DIR, exist_ok=True)
+    # One custom sound at a time — drop any previous upload (any extension).
+    for old_ext in _c.CENSOR_SOUND_EXTS:
+        old = os.path.join(_c.CENSOR_SOUND_DIR,
+                           _c.CENSOR_SOUND_BASENAME + old_ext)
+        if os.path.isfile(old):
+            try:
+                os.unlink(old)
+            except OSError:
+                pass
+    dest = os.path.join(_c.CENSOR_SOUND_DIR, _c.CENSOR_SOUND_BASENAME + ext)
+    with open(dest, "wb") as f:
+        f.write(data)
+    settings.CENSOR_BEEP_SOUND = "custom"
+    _persist_user_settings()
+    return {"status": "saved", **_censor_state()}
+
+
+@router.delete("/censor/sound")
+async def delete_censor_sound():
+    """Remove the custom censor sound and fall back to the beep tone."""
+    from backend.services import censor as _c
+    removed = False
+    for ext in _c.CENSOR_SOUND_EXTS:
+        p = os.path.join(_c.CENSOR_SOUND_DIR, _c.CENSOR_SOUND_BASENAME + ext)
+        if os.path.isfile(p):
+            try:
+                os.unlink(p)
+                removed = True
+            except OSError:
+                pass
+    settings.CENSOR_BEEP_SOUND = "beep"
+    _persist_user_settings()
+    return {"status": "saved", "removed": removed, **_censor_state()}
 
 
 # ── GPU Hardware Acceleration ────────────────────────────────────

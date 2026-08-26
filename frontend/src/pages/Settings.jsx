@@ -11,6 +11,7 @@ import CompanionDownloadCard from '../components/CompanionDownloadCard';
 import PolishFallbackCard from '../components/PolishFallbackCard';
 import SelfHostedSettings from '../components/SelfHostedSettings';
 import SubtitleQualitySettings from '../components/SubtitleQualitySettings';
+import CensorSettings from '../components/CensorSettings';
 import { useAuth } from '../auth/AuthContext';
 import { showToast } from '../components/Toast';
 import useResponsive from '../hooks/useResponsive';
@@ -3182,6 +3183,8 @@ export default function Settings() {
               <ClipGenerationSettings />
 
               <SubtitleQualitySettings />
+
+              <CensorSettings />
 
               {/* Viral Algorithm Section */}
               <div ref={viralAlgorithmRef} style={{

@@ -198,6 +198,11 @@ async def export_clip_endpoint(
 
     export_key = f"{job_id}_{req.clip_id}"
 
+    # Profanity censor: the dialog sends an explicit choice; None (older
+    # clients / API callers) follows the Settings default.
+    _censor_on = (req.censor_enabled if req.censor_enabled is not None
+                  else bool(settings.CENSOR_ENABLED_DEFAULT))
+
     # Prevent duplicate exports: if an export for this clip is already
     # in progress, reject the second request instead of creating a
     # parallel task that would race and double-export.
@@ -400,6 +405,13 @@ async def export_clip_endpoint(
                 layout_timeline_data=getattr(job, 'layout_timeline', None),
                 hook_text=req.hook_text,
                 frontend_subject_keyframes=req.subject_keyframes,
+                censor_enabled=_censor_on,
+                # Source-language track for beep timing — what is SPOKEN,
+                # independent of which track is burned (or none at all).
+                censor_source_transcript=(
+                    [s.model_dump() if hasattr(s, "model_dump") else s
+                     for s in (job.transcript or [])]
+                    if _censor_on else None),
             )
 
             elapsed = int(time.monotonic() - export_start)
@@ -506,6 +518,10 @@ async def export_full_video_endpoint(
     if not job.file_path or not job.duration:
         raise HTTPException(status_code=400, detail="Video file or duration not available")
 
+    # Profanity censor — explicit dialog choice, else the Settings default.
+    _fv_censor_on = (req.censor_enabled if req.censor_enabled is not None
+                     else bool(settings.CENSOR_ENABLED_DEFAULT))
+
     vid_w, vid_h = 1920, 1080
     if job.resolution:
         try:
@@ -608,6 +624,11 @@ async def export_full_video_endpoint(
                 pip_size_pct=req.pip_size_pct,
                 hook_text=req.hook_text or "",
                 frontend_subject_keyframes=req.subject_keyframes,
+                censor_enabled=_fv_censor_on,
+                censor_source_transcript=(
+                    [s.model_dump() if hasattr(s, "model_dump") else s
+                     for s in (job.transcript or [])]
+                    if _fv_censor_on else None),
             )
 
             elapsed = int(time.monotonic() - export_start)

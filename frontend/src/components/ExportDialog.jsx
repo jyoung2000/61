@@ -77,6 +77,17 @@ export default function ExportDialog({
   const [platformId, setPlatformId] = useState(null);
   const [aspectOverride, setAspectOverride] = useState(null);
   const [showSafeZones, setShowSafeZones] = useState(false);
+  // Profanity censor: mask blocked words in burned subtitles + beep their
+  // audio. Initial state follows Settings > Profanity Censor's default.
+  const [censorOn, setCensorOn] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    fetch('/api/censor/settings')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => { if (alive && d) setCensorOn(!!d.enabled_default); })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, []);
   const effectiveAspect = aspectOverride ?? aspectRatio;
   const activePlatform = PLATFORM_PRESETS.find((p) => p.id === platformId) || null;
 
@@ -221,6 +232,9 @@ export default function ExportDialog({
         clip_id: parseInt(clipId) || 0,
         export_quality: preset.id,
         clip_title: clipTitle || undefined,
+        // Explicit choice every time — the server only falls back to its
+        // own default when the field is absent (older clients).
+        censor_enabled: !!censorOn,
       };
 
       // Map camelCase clipSettings → snake_case backend fields (not a blind spread)
@@ -383,6 +397,11 @@ export default function ExportDialog({
       setExportMode('server');
       return;
     }
+    if (censorOn) {
+      setError('Profanity censoring (beep + subtitle masking) runs on the server. Switched to server export — press Export again.');
+      setExportMode('server');
+      return;
+    }
     if (!renderEngine) {
       setError('Client-side export is not available in this browser. Use server export.');
       return;
@@ -442,7 +461,7 @@ export default function ExportDialog({
     startTime, endTime, aspectRatio, onServerExport, onClose, subtitleQA,
     jobId, clipId, clipTitle, timelineMediaLibrary, transcript, exportFPS,
     scenes, sourceWidth, sourceHeight, subjectX, needsServerForPitch,
-    aspectOverride, effectiveAspect, subjectKeyframes,
+    aspectOverride, effectiveAspect, subjectKeyframes, censorOn,
   ]);
 
   const handleCancel = useCallback(() => {
@@ -539,6 +558,33 @@ export default function ExportDialog({
             Exporting as {aspectOverride} for {activePlatform.label} (editor aspect unchanged).
           </p>
         )}
+
+        {/* Profanity censor toggle */}
+        <label
+          style={{
+            display: 'flex', alignItems: 'center', gap: 8, marginTop: 10,
+            fontSize: 12, cursor: 'pointer', color: 'var(--text-primary, inherit)',
+          }}
+        >
+          <input
+            type="checkbox"
+            checked={censorOn}
+            onChange={(e) => setCensorOn(e.target.checked)}
+            aria-label="Censor profanity"
+          />
+          <span>
+            <strong>Censor profanity</strong> — beep curse words and mask them in
+            subtitles (s**t)
+          </span>
+        </label>
+        {censorOn && (
+          <p className="ve-export-dialog__notice ve-export-dialog__notice--small">
+            Word list, mask symbol and beep sound:{' '}
+            <a href="/settings?tab=prompts&section=censor" target="_blank" rel="noreferrer">
+              Settings → Profanity Censor
+            </a>
+          </p>
+        )}
       </div>
 
       {/* Cost / quota preview ─ informational only ─────────────── */}
@@ -576,6 +622,11 @@ export default function ExportDialog({
         {needsServerForPitch && exportMode === 'client' && (
           <p className="ve-export-dialog__notice">
             This clip uses a preserve-pitch speed change — browser export renders audio varispeed only. Server export will be used for faithful pitch.
+          </p>
+        )}
+        {censorOn && exportMode === 'client' && (
+          <p className="ve-export-dialog__notice">
+            Profanity censoring (beep + subtitle masking) runs on the server — server export will be used.
           </p>
         )}
         {exportFPS > 30 && (

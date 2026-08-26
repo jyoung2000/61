@@ -1297,6 +1297,14 @@ class Settings(BaseSettings):
     FFMPEG_THREADS: int = 4          # Limit threads to control memory usage (0=auto risks OOM)
     FFMPEG_FASTSTART: bool = True    # -movflags +faststart for web streaming
 
+    # Profanity censor (Settings > Profanity Censor + the export dialog
+    # toggle). Masks blocked words in burned subtitles (first + last letter
+    # kept) and beeps their audio window on export — see services/censor.py.
+    CENSOR_ENABLED_DEFAULT: bool = False  # default state of the export toggle
+    CENSOR_WORDS: str = "default"    # comma/newline list; "default" = built-in
+    CENSOR_MASK_CHAR: str = "*"      # single masking symbol (e.g. * # @ !)
+    CENSOR_BEEP_SOUND: str = "beep"  # "beep" = 1 kHz tone | "custom" = upload
+
     # GPU Hardware Acceleration — user toggle persisted to user_settings.json
     # Auto-enabled at startup when NVIDIA GPU is detected (see main.py)
     GPU_ACCELERATION_ENABLED: bool = False   # Toggle in Settings > Advanced
