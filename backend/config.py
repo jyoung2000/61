@@ -1304,6 +1304,12 @@ class Settings(BaseSettings):
     CENSOR_WORDS: str = "default"    # comma/newline list; "default" = built-in
     CENSOR_MASK_CHAR: str = "*"      # single masking symbol (e.g. * # @ !)
     CENSOR_BEEP_SOUND: str = "beep"  # "beep" = 1 kHz tone | "custom" = upload
+    # Universal loudness multiplier for the censor sound (tone or custom):
+    # 1.0 = the built-in baselines, 0.5 = half, 2.0 = double. Clamped 0.1-3.0.
+    CENSOR_BEEP_VOLUME: float = 1.0
+    # Also mux the beeps as a SECOND audio track ("Censor beeps") so editors
+    # can grab or drop them; track 1 keeps the normal censored mix either way.
+    CENSOR_SEPARATE_TRACK: bool = False
 
     # GPU Hardware Acceleration — user toggle persisted to user_settings.json
     # Auto-enabled at startup when NVIDIA GPU is detected (see main.py)

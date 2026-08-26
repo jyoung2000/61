@@ -307,43 +307,75 @@ def build_censor_audio_cmd(
     beep_path: Optional[str] = None,
     sample_rate: int = 48000,
     faststart: bool = True,
+    volume: float = 1.0,
+    separate_track: bool = False,
 ) -> list[str]:
     """The ffmpeg post-pass: mute each interval on the main track and mix a
     beep over it. Video is stream-copied — only the audio is re-encoded, so
-    the pass is fast and can't disturb the picture."""
+    the pass is fast and can't disturb the picture.
+
+    volume: universal loudness multiplier on the censor sound (1.0 = the
+    built-in baselines: tone at 0.5 full-scale, custom file at its own
+    recorded loudness).
+
+    separate_track: additionally mux a SECOND audio track carrying only the
+    beeps (silence elsewhere, titled "Censor beeps") so an editor can grab
+    or drop them; track 1 keeps the normal censored mix and stays the
+    default, so ordinary players sound identical either way."""
     mute_terms = "+".join(
         f"between(t,{a:.3f},{b:.3f})" for a, b in intervals_out
     )
-    fc = [f"[0:a]volume=enable='{mute_terms}':volume=0[am]"]
+    if separate_track:
+        # A filtergraph pad is single-use — split the source audio so both
+        # the censored mix and the beep-only track's silent bed can tap it.
+        fc = [
+            "[0:a]asplit=2[a_main][a_bed]",
+            f"[a_main]volume=enable='{mute_terms}':volume=0[am]",
+            "[a_bed]volume=0[sil]",
+        ]
+    else:
+        fc = [f"[0:a]volume=enable='{mute_terms}':volume=0[am]"]
 
     total_dur = max(b for _, b in intervals_out) + 1.0
+    v = max(0.0, float(volume or 1.0))
     if beep_path:
         beep_input = ["-i", beep_path]
         # Loop the uploaded sound so it covers intervals longer than itself,
         # and resample to the main track's rate for amix.
         src_chain = (f"aloop=loop=-1:size=2147483647,"
                      f"aresample={sample_rate}")
-        gain = 1.0
+        gain = 1.0 * v
     else:
         beep_input = [
             "-f", "lavfi", "-t", f"{total_dur:.3f}",
             "-i", f"sine=frequency={_BEEP_FREQ_HZ}:sample_rate={sample_rate}",
         ]
         src_chain = ""
-        gain = _BEEP_GAIN
+        gain = _BEEP_GAIN * v
 
-    beep_labels = []
+    beep_main, beep_sep = [], []
     for i, (a, b) in enumerate(intervals_out):
         dur = b - a
         chain = f"[1:a]{src_chain + ',' if src_chain else ''}" \
                 f"atrim=0:{dur:.3f},asetpts=PTS-STARTPTS," \
-                f"volume={gain:.3f},adelay={int(a * 1000)}:all=1[b{i}]"
+                f"volume={gain:.3f},adelay={int(a * 1000)}:all=1"
+        if separate_track:
+            # Each beep feeds BOTH mixes — pads are single-use, so split.
+            chain += f",asplit=2[bm{i}][bs{i}]"
+            beep_main.append(f"[bm{i}]")
+            beep_sep.append(f"[bs{i}]")
+        else:
+            chain += f"[b{i}]"
+            beep_main.append(f"[b{i}]")
         fc.append(chain)
-        beep_labels.append(f"[b{i}]")
 
-    n = len(beep_labels) + 1
-    fc.append(f"[am]{''.join(beep_labels)}amix=inputs={n}:duration=first:"
+    n = len(beep_main) + 1
+    fc.append(f"[am]{''.join(beep_main)}amix=inputs={n}:duration=first:"
               f"normalize=0[aout]")
+    if separate_track:
+        # Silent bed keeps the beep track exactly as long as the main one.
+        fc.append(f"[sil]{''.join(beep_sep)}amix=inputs={n}:duration=first:"
+                  f"normalize=0[beeps]")
 
     cmd = [
         "ffmpeg", "-y",
@@ -351,8 +383,18 @@ def build_censor_audio_cmd(
         *beep_input,
         "-filter_complex", ";".join(fc),
         "-map", "0:v?", "-c:v", "copy",
-        "-map", "[aout]", "-c:a", "aac", "-b:a", "192k",
+        "-map", "[aout]",
     ]
+    if separate_track:
+        cmd += ["-map", "[beeps]"]
+    cmd += ["-c:a", "aac", "-b:a", "192k"]
+    if separate_track:
+        cmd += [
+            "-metadata:s:a:0", "title=Censored audio",
+            "-metadata:s:a:1", "title=Censor beeps",
+            "-disposition:a:0", "default",
+            "-disposition:a:1", "0",
+        ]
     if faststart:
         cmd += ["-movflags", "+faststart"]
     cmd.append(output_path)
@@ -380,11 +422,18 @@ async def apply_censor_beeps(
             logger.warning("Censor: custom sound selected but no file found "
                            "— using the default beep tone")
     sr = sample_rate or 48000
+    try:
+        vol = float(getattr(settings, "CENSOR_BEEP_VOLUME", 1.0) or 1.0)
+    except (TypeError, ValueError):
+        vol = 1.0
+    vol = max(0.1, min(3.0, vol))
     base, ext = os.path.splitext(video_path)
     tmp_path = f"{base}.censor_tmp{ext or '.mp4'}"
     cmd = build_censor_audio_cmd(
         video_path, tmp_path, intervals_out, beep_path=beep, sample_rate=sr,
         faststart=bool(getattr(settings, "FFMPEG_FASTSTART", True)),
+        volume=vol,
+        separate_track=bool(getattr(settings, "CENSOR_SEPARATE_TRACK", False)),
     )
     logger.info("Censor beep pass (%d interval(s)): %s",
                 len(intervals_out), " ".join(cmd))

@@ -1,3 +1,34 @@
+# ClipAI — Censor v2: beep volume, sound preview, separate beep track
+
+Three refinements to the profanity censor, all in Settings → Profanity
+Censor:
+
+**Beep volume slider (10–300%).** One universal loudness multiplier for
+the censor sound — tone and custom uploads alike. 100% = the previous
+defaults (1 kHz tone at half scale, custom file at its recorded loudness);
+drag down for subtle, up to 3× for unmissable. Clamped server-side and
+persisted like every other censor setting.
+
+**▶ Preview button.** Hear the censor sound before saving — it plays the
+currently SELECTED sound at the currently SET slider volume, so you can
+dial it in by ear. The default tone is synthesized in the browser with the
+exact export baseline (1 kHz sine × 0.5); custom uploads stream from the
+new GET /api/censor/sound endpoint (previews cap at 3 s).
+
+**Separate beep track.** Optional: exports carry a SECOND audio track,
+"Censor beeps", holding only the beeps on a silent bed the same length as
+the video. Track 1 remains the normal censored mix and stays the default
+track, so every ordinary player sounds identical — the extra track exists
+for editors who want to grab, replace, or drop the beeps without touching
+dialogue. Implemented with asplit taps into a dual amix graph; both tracks
+labeled (Censored audio / Censor beeps) with track 1 marked default.
+
+Settings persist as CENSOR_BEEP_VOLUME / CENSOR_SEPARATE_TRACK; the POST
+endpoint clamps volume 0.1–3.0. 5 new tests: gain math for both sound
+kinds, the split-graph shape (asplit taps, silent bed, dual amix, track
+metadata + default disposition), no-split guarantee for the single-track
+path, endpoint roundtrip + clamps, and the sound-serving endpoint.
+
 # ClipAI — Profanity censor: beep the curse, mask the subtitle
 
 New censor mode for exports from the video editor. Toggle "Censor

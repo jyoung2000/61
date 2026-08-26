@@ -167,6 +167,44 @@ def test_build_censor_cmd_default_beep():
     assert "-c:v copy" in joined and "[aout]" in joined
 
 
+def test_build_censor_cmd_volume_scales_both_sound_kinds():
+    # Tone baseline is 0.5 full-scale; the multiplier scales it directly.
+    fc = " ".join(C.build_censor_audio_cmd(
+        "i.mp4", "o.mp4", [(1.0, 2.0)], sample_rate=48000, volume=2.0))
+    assert "volume=1.000,adelay" in fc, "tone: 0.5 baseline x 2.0 = 1.0"
+    # Custom file baseline is its own loudness (1.0); multiplier applies too.
+    fc = " ".join(C.build_censor_audio_cmd(
+        "i.mp4", "o.mp4", [(1.0, 2.0)], beep_path="s.mp3",
+        sample_rate=48000, volume=0.5))
+    assert "volume=0.500,adelay" in fc, "custom: 1.0 baseline x 0.5 = 0.5"
+
+
+def test_build_censor_cmd_separate_track():
+    cmd = C.build_censor_audio_cmd(
+        "in.mp4", "out.mp4", [(1.0, 1.5), (3.0, 3.4)],
+        sample_rate=48000, separate_track=True)
+    joined = " ".join(cmd)
+    fc = cmd[cmd.index("-filter_complex") + 1]
+    # Source split once (both mixes tap it), each beep split into both buses.
+    assert "[0:a]asplit=2[a_main][a_bed]" in fc
+    assert "asplit=2[bm0][bs0]" in fc and "asplit=2[bm1][bs1]" in fc
+    # Main mix unchanged in spirit; beep-only bus rides a silent bed so the
+    # second track is exactly as long as the first.
+    assert "[am][bm0][bm1]amix=inputs=3:duration=first:normalize=0[aout]" in fc
+    assert "[a_bed]volume=0[sil]" in fc
+    assert "[sil][bs0][bs1]amix=inputs=3:duration=first:normalize=0[beeps]" in fc
+    # Both tracks mapped; track 1 stays the default, track 2 is labeled.
+    assert joined.count("-map") == 3  # 0:v? + [aout] + [beeps]
+    assert "title=Censor beeps" in joined
+    assert "-disposition:a:0 default" in joined
+
+
+def test_build_censor_cmd_single_track_has_no_split():
+    fc = " ".join(C.build_censor_audio_cmd(
+        "in.mp4", "out.mp4", [(1.0, 1.5)], sample_rate=48000))
+    assert "asplit" not in fc and "[beeps]" not in fc
+
+
 def test_build_censor_cmd_custom_sound_loops():
     cmd = C.build_censor_audio_cmd("in.mp4", "out.mp4", [(0.5, 4.5)],
                                    beep_path="/data/config/censor_sound.mp3",
@@ -195,7 +233,7 @@ def _isolate(monkeypatch, tmp_path):
     monkeypatch.setattr(C, "CENSOR_SOUND_DIR", str(tmp_path / "config"))
     old = {k: getattr(cfg, k) for k in (
         "CENSOR_ENABLED_DEFAULT", "CENSOR_WORDS", "CENSOR_MASK_CHAR",
-        "CENSOR_BEEP_SOUND")}
+        "CENSOR_BEEP_SOUND", "CENSOR_BEEP_VOLUME", "CENSOR_SEPARATE_TRACK")}
     yield
     for k, v in old.items():
         setattr(cfg, k, v)
@@ -268,8 +306,38 @@ def test_sound_upload_rejects_bad_type_and_empty():
 
 def test_censor_keys_are_persisted():
     for key in ("CENSOR_ENABLED_DEFAULT", "CENSOR_WORDS",
-                "CENSOR_MASK_CHAR", "CENSOR_BEEP_SOUND"):
+                "CENSOR_MASK_CHAR", "CENSOR_BEEP_SOUND",
+                "CENSOR_BEEP_VOLUME", "CENSOR_SEPARATE_TRACK"):
         assert key in S._PERSISTABLE_KEYS
+
+
+def test_beep_volume_and_separate_track_roundtrip_with_clamp():
+    c = _client()
+    d = c.get("/api/censor/settings").json()
+    assert d["beep_volume"] == pytest.approx(1.0)
+    assert d["separate_track"] is False
+    d = c.post("/api/censor/settings",
+               json={"beep_volume": 1.75, "separate_track": True}).json()
+    assert d["beep_volume"] == pytest.approx(1.75)
+    assert d["separate_track"] is True
+    assert cfg.CENSOR_BEEP_VOLUME == pytest.approx(1.75)
+    assert cfg.CENSOR_SEPARATE_TRACK is True
+    # Out-of-range volumes clamp instead of applying raw or erroring.
+    assert c.post("/api/censor/settings",
+                  json={"beep_volume": 99}).json()["beep_volume"] == pytest.approx(3.0)
+    assert c.post("/api/censor/settings",
+                  json={"beep_volume": 0}).json()["beep_volume"] == pytest.approx(0.1)
+
+
+def test_get_censor_sound_serves_upload_and_404s_without():
+    c = _client()
+    assert c.get("/api/censor/sound").status_code == 404
+    c.post("/api/censor/sound",
+           files={"file": ("bleep.wav", b"RIFF....WAVE", "audio/wav")})
+    r = c.get("/api/censor/sound")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("audio/wav")
+    assert r.content == b"RIFF....WAVE"
 
 
 def test_export_requests_accept_censor_flag():

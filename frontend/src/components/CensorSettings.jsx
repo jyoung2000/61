@@ -15,8 +15,11 @@ export default function CensorSettings() {
   const [maskChar, setMaskChar] = useState('*');
   const [enabledDefault, setEnabledDefault] = useState(false);
   const [sound, setSound] = useState('beep');
+  const [beepVolume, setBeepVolume] = useState(100); // percent; 100 = baseline
+  const [separateTrack, setSeparateTrack] = useState(false);
   const [saving, setSaving] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [previewing, setPreviewing] = useState(false);
   const fileRef = useRef(null);
 
   const applyState = (d) => {
@@ -25,6 +28,8 @@ export default function CensorSettings() {
     setMaskChar(d.mask_char || '*');
     setEnabledDefault(!!d.enabled_default);
     setSound(d.sound || 'beep');
+    setBeepVolume(Math.round((d.beep_volume ?? 1.0) * 100));
+    setSeparateTrack(!!d.separate_track);
   };
 
   useEffect(() => {
@@ -48,6 +53,8 @@ export default function CensorSettings() {
           words,
           mask_char: maskChar,
           sound,
+          beep_volume: beepVolume / 100,
+          separate_track: separateTrack,
           ...overrides,
         }),
       });
@@ -79,6 +86,50 @@ export default function CensorSettings() {
     } finally {
       setUploading(false);
       if (fileRef.current) fileRef.current.value = '';
+    }
+  };
+
+  // Play the currently SELECTED sound at the currently SET volume — both
+  // read from the unsaved UI state, so the user can dial it in by ear
+  // before hitting Save. The default tone is synthesized locally (same
+  // 1 kHz sine × 0.5 baseline the export uses); the custom file streams
+  // from /api/censor/sound. WebAudio gain allows >100% unlike <audio>.
+  const previewSound = async () => {
+    if (previewing) return;
+    setPreviewing(true);
+    const done = () => setPreviewing(false);
+    try {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      const ctx = new Ctx();
+      const gainNode = ctx.createGain();
+      gainNode.connect(ctx.destination);
+      const v = beepVolume / 100;
+      const cleanup = () => { ctx.close().catch(() => {}); done(); };
+      if (sound === 'custom' && data?.has_custom_sound) {
+        const res = await fetch(`/api/censor/sound?t=${Date.now()}`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const buf = await ctx.decodeAudioData(await res.arrayBuffer());
+        const src = ctx.createBufferSource();
+        src.buffer = buf;
+        gainNode.gain.value = v;
+        src.connect(gainNode);
+        src.onended = cleanup;
+        src.start();
+        // Safety stop for long files — a preview is a taste, not a concert.
+        src.stop(ctx.currentTime + Math.min(buf.duration, 3));
+      } else {
+        const osc = ctx.createOscillator();
+        osc.type = 'sine';
+        osc.frequency.value = 1000;
+        gainNode.gain.value = 0.5 * v; // export baseline for the tone
+        osc.connect(gainNode);
+        osc.onended = cleanup;
+        osc.start();
+        osc.stop(ctx.currentTime + 0.6);
+      }
+    } catch {
+      showToast('Preview failed — check the sound file', 'error');
+      done();
     }
   };
 
@@ -186,9 +237,24 @@ export default function CensorSettings() {
 
           {/* Beep sound */}
           <div style={{ margin: '10px 0' }}>
-            <span style={{ display: 'block', fontSize: 11, color: 'var(--text-secondary)', marginBottom: 6 }}>
-              Censor sound (played over the muted word)
-            </span>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+              <span style={{ fontSize: 11, color: 'var(--text-secondary)', flex: 1 }}>
+                Censor sound (played over the muted word)
+              </span>
+              <button
+                onClick={previewSound}
+                disabled={previewing}
+                aria-label="Preview censor sound"
+                style={{
+                  padding: '4px 12px', fontSize: 11, borderRadius: 'var(--radius-sm)',
+                  border: '1px solid var(--accent-cyan)', background: 'var(--bg-base)',
+                  color: 'var(--accent-cyan)', cursor: previewing ? 'wait' : 'pointer',
+                  fontWeight: 600,
+                }}
+              >
+                {previewing ? 'Playing…' : '▶ Preview'}
+              </button>
+            </div>
             <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, marginBottom: 4, cursor: 'pointer' }}>
               <input
                 type="radio"
@@ -235,6 +301,57 @@ export default function CensorSettings() {
               )}
             </div>
           </div>
+
+          {/* Universal loudness for the censor sound */}
+          <div style={{ margin: '10px 0' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+              <span style={{ fontSize: 11, color: 'var(--text-secondary)', flex: 1 }}>
+                Beep volume — applies to the tone and custom sounds alike
+              </span>
+              <span style={{
+                fontSize: 11, fontFamily: 'var(--font-mono)', minWidth: 42,
+                textAlign: 'right',
+                color: beepVolume === 100 ? 'var(--text-muted)' : 'var(--accent-cyan)',
+              }}>
+                {beepVolume}%
+              </span>
+            </div>
+            <input
+              type="range"
+              min={10}
+              max={300}
+              step={5}
+              value={beepVolume}
+              onChange={(e) => setBeepVolume(parseInt(e.target.value, 10))}
+              aria-label="Beep volume percent"
+              style={{ width: '100%' }}
+            />
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 9, color: 'var(--text-muted)' }}>
+              <span>quieter</span>
+              <span>100% = default</span>
+              <span>louder</span>
+            </div>
+          </div>
+
+          {/* Separate beep track */}
+          <label style={{
+            display: 'flex', alignItems: 'flex-start', gap: 8, fontSize: 12,
+            color: 'var(--text-primary)', margin: '10px 0', cursor: 'pointer',
+          }}>
+            <input
+              type="checkbox"
+              checked={separateTrack}
+              onChange={(e) => setSeparateTrack(e.target.checked)}
+              style={{ marginTop: 2 }}
+            />
+            <span>
+              Also put the beeps on a <strong>separate audio track</strong> ("Censor beeps")
+              <span style={{ display: 'block', fontSize: 10, color: 'var(--text-muted)', marginTop: 2 }}>
+                Track 1 stays the normal censored mix, so players sound identical — the extra
+                track lets an editor grab or drop the beeps on their own.
+              </span>
+            </span>
+          </label>
 
           <button
             onClick={() => save()}

@@ -114,9 +114,10 @@ _PERSISTABLE_KEYS = [
     # container rebuilds just like the model picks above.
     "EDITORIAL_AI_PRIMARY_SPEC", "EDITORIAL_AI_FALLBACK_SPEC",
     "FFMPEG_PRESET", "FFMPEG_CRF", "FFMPEG_THREADS", "FFMPEG_FASTSTART",
-    # Profanity censor (block list, mask symbol, beep choice, default state).
+    # Profanity censor (block list, mask symbol, beep choice, default state,
+    # loudness multiplier, separate beep track).
     "CENSOR_ENABLED_DEFAULT", "CENSOR_WORDS", "CENSOR_MASK_CHAR",
-    "CENSOR_BEEP_SOUND",
+    "CENSOR_BEEP_SOUND", "CENSOR_BEEP_VOLUME", "CENSOR_SEPARATE_TRACK",
     # How many analysis pipelines may run at once (Settings > Advanced).
     "CONCURRENT_ANALYSES", "BULK_IMPORT_MIN_FREE_GB",
     "GPU_ACCELERATION_ENABLED", "GPU_VENDOR_OVERRIDE",
@@ -5900,6 +5901,8 @@ class SaveCensorSettingsRequest(BaseModel):
     words: Optional[list[str]] = None      # [] / omitted list = built-in
     mask_char: Optional[str] = None        # single symbol, e.g. * # @ !
     sound: Optional[str] = None            # "beep" | "custom"
+    beep_volume: Optional[float] = None    # loudness multiplier, 0.1-3.0
+    separate_track: Optional[bool] = None  # mux beeps as a 2nd audio track
 
 
 def _censor_state() -> dict:
@@ -5916,6 +5919,8 @@ def _censor_state() -> dict:
         "sound": str(getattr(settings, "CENSOR_BEEP_SOUND", "beep")),
         "has_custom_sound": custom is not None,
         "custom_sound_name": os.path.basename(custom) if custom else None,
+        "beep_volume": float(getattr(settings, "CENSOR_BEEP_VOLUME", 1.0)),
+        "separate_track": bool(getattr(settings, "CENSOR_SEPARATE_TRACK", False)),
     }
 
 
@@ -5952,11 +5957,40 @@ async def save_censor_settings(req: SaveCensorSettingsRequest):
         # "custom" only sticks when an uploaded file actually exists.
         if req.sound == "beep" or _c.custom_sound_path():
             settings.CENSOR_BEEP_SOUND = req.sound
+    if req.beep_volume is not None:
+        try:
+            settings.CENSOR_BEEP_VOLUME = max(0.1, min(3.0, float(req.beep_volume)))
+        except (TypeError, ValueError):
+            pass
+    if req.separate_track is not None:
+        settings.CENSOR_SEPARATE_TRACK = bool(req.separate_track)
     _persist_user_settings()
     return {"status": "saved", **_censor_state()}
 
 
 _CENSOR_SOUND_MAX_BYTES = 5 * 1024 * 1024
+
+_CENSOR_SOUND_MIME = {
+    ".mp3": "audio/mpeg", ".wav": "audio/wav", ".m4a": "audio/mp4",
+    ".aac": "audio/aac", ".ogg": "audio/ogg", ".flac": "audio/flac",
+}
+
+
+@router.get("/censor/sound")
+async def get_censor_sound():
+    """Serve the uploaded custom censor sound — the Settings card's Preview
+    button plays this through WebAudio (the default tone is synthesized
+    client-side, so only the custom file needs an endpoint)."""
+    from fastapi.responses import FileResponse
+    from backend.services import censor as _c
+    p = _c.custom_sound_path()
+    if p is None:
+        raise HTTPException(status_code=404, detail="no custom censor sound uploaded")
+    ext = os.path.splitext(p)[1].lower()
+    return FileResponse(
+        p, media_type=_CENSOR_SOUND_MIME.get(ext, "application/octet-stream"),
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @router.post("/censor/sound")
